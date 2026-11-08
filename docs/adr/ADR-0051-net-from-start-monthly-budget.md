@@ -309,7 +309,7 @@ limit."
 
 | Failure | Required behavior |
 | --- | --- |
-| Postgres/projection unavailable | No new entries; no incomplete in-memory production fallback; existing protection continues; durable visible alarm. |
+| Postgres/projection unavailable | No new entries; no incomplete in-memory production fallback; existing protection continues; durable visible alarm; an admission that fails before the executor keeps its Armed position's detector under backoff, and the position resumes when the database returns. A failure from the executor on leaves it without one until reconciliation, a restart or the operator resolves it (Amendment 2026-11-07, Recovery). |
 | Income endpoint unavailable or stale | Settlement reservations remain; new entries fail closed after the freshness bound; retry with backoff. |
 | Exchange position inventory unavailable | Use the full durable local risk-bearing set conservatively; do not omit positions; deny new entries and expose staleness. |
 | Concurrent admissions/accounting updates | Serialized reservation or versioned compare-and-swap; loser retries from a new snapshot. |
@@ -429,10 +429,9 @@ not a new guarantee for an unknown basis:
   rules must be fetched, so the halt and admission each re-read the basis at their
   decision point. A write after that read is after the decision: a halt or an entry
   decided on a valid basis a moment earlier stands. A re-read that fails defers the
-  halt and denies the entry. That denial re-arms only if its audit write succeeds on
-  the same database; otherwise the signal or approval returns an error and the Armed
-  position has no detector, as after any database failure once the detector is
-  killed. This path predates the amendment and enters nothing.
+  halt and denies the entry. If that denial's audit write fails too, the signal or
+  approval returns an error and the position re-arms like any admission that fails
+  before the executor (see Recovery). Either way it enters nothing.
 
 Admission stays closed without the latch: the gate, `can_admit`, `slots_available`
 and `with_capital` each refuse the basis, and they survive a restart, which the
@@ -460,9 +459,50 @@ corrects the row with evidence. Admission reads the basis on every attempt, so
 entries resume with no restart and no reset. A position already Armed re-arms
 after a denied signal or approval and may then enter through the normal gate. The
 exception is a signal on an `Immediate` position, which is cancelled as on any
-margin refusal. Database recovery alone does not restore a detector lost to a
-database failure during admission: restart the daemon, which respawns detectors for
-Armed positions, or disarm and arm again.
+margin refusal.
+
+A database failure during admission needs no restart either. Detectors are
+single-shot, so an admission that returned an error used to leave its position Armed
+with no detector until a restart, or a disarm and arm. Now any error before the
+executor re-arms the detector under the governed backoff: in a signal, in an approval
+the flow has taken from the queue, and in the expiry task when it cannot record an
+expiry. The backoff starts at 5 s and doubles to 15 minutes, and resets once an
+admission reaches the executor or the approval queue. During an outage each fire
+costs one failed write and a longer wait. Once the database is back the position
+resumes within one backoff period, then waits for its entry condition. Every retry is
+a full admission: its query audit writes before the order (`accepted`, `processing`,
+`risk_checked`, `acting`, and `authorized` after an approval) must succeed, so no
+order goes out without them. The `EntryApprovalPending` domain event stays best
+effort, as before. Not re-armed: a failure from the executor on, where an order may
+exist or the admission is half written (ADR-0052). Reconciliation, a restart or a
+disarm and arm resolves it, and until then a position still Armed has no detector.
+Nor a signal that MonthlyHalt drops, or a position that is no longer Armed, waits for
+approval, or needs an operator re-arm. A refusal that ends an `Immediate` arm still
+ends it when its own record fails. Each re-arm happens under `entry_flow_lock` on the
+position as it stands then, the expiry task's included, so a disarm cannot leave a
+stray detector. MonthlyHalt stops every running detector as it latches, before the
+disarms that fail at their first write when the database is down, and a re-arm checks
+for the halt under the lock that stop takes, so no re-armed detector outlives a halt.
+An arm already past its own halt check is not covered by this.
+`robsond_detector_rearms_after_failure_total{flow}` counts the re-arms, a record the
+event log cannot keep while the database is down.
+
+The re-armed detector is the one the position had before it fired, as after a
+restart. In a strategy mode it reads candles on each matching market tick, as any
+Armed position's detector does, so the backoff bounds admissions, not those reads.
+
+What this leaves on the table: errors are not sorted by cause, so a fault before the
+executor that never clears retries every 15 minutes, with an error log and a count
+each time, instead of going quiet. An `Immediate` position re-arms as on a governed
+denial, so it can enter when the database returns rather than when it was armed.
+Disarm it to prevent that.
+
+Rollout and rollback of this recovery: no schema or event-format change. After the
+deploy, `/metrics` exports the counter at 0 for `signal`, `approval` and
+`approval_expiry`. Before merging, record the running `sha-*` tag from the
+`rbx-infra` pin as the rollback target; it already includes PR #300. Rolling back to
+it only brings back the lost detectors: an admission that fails before the executor
+again leaves its position without one until a restart, or a disarm and arm.
 
 | Option | On an invalid basis | Gain | Cost | Decision |
 | --- | --- | --- | --- | --- |
@@ -490,11 +530,13 @@ Armed positions, or disarm and arm again.
   invalid", but only while someone is looking. The alert is what reaches an absent
   operator.
 
-**Rollout and rollback.** A `robsond` merge promotes automatically, so the alerts
-go first: merge the `rbx-infra` rules and confirm Prometheus has loaded them before
-merging this change. A rule with no series stays silent. After the deploy, confirm
-`/metrics` exports the gauge at 0 with the last-read timestamp advancing. There is
-no schema or event-format change. The worker opens one more database connection.
+**Rollout and rollback.** This covers the invalid-basis change, PR #300; the
+detector recovery under Recovery has its own. A `robsond` merge promotes
+automatically, so the alerts go first: merge the `rbx-infra` rules and confirm
+Prometheus has loaded them before merging this change. A rule with no series stays
+silent. After the deploy, confirm `/metrics` exports the gauge at 0 with the
+last-read timestamp advancing. There is no schema or event-format change. The
+worker opens one more database connection.
 
 The rollback target is the image running before this deploy: record its `sha-*` tag
 from the `rbx-infra` pin before merging, confirm it is in the registry
@@ -507,9 +549,10 @@ automatic liquidation on an invalid basis, so first confirm the basis is valid o
 exchange book is flat, in-flight entries included. Afterwards, check the pod's health
 and `/status`.
 
-**Failure modes.** Database down: the snapshot fails, admission fails closed, the
-halt is not evaluated, the gauge keeps its last value, and a signal that fires in
-that window leaves its position without a detector (see Recovery). Daemon down: the row
+**Failure modes.** Database down: admission fails closed at its first audit write
+or at the snapshot, the halt is not evaluated, the gauge keeps its last value, and a
+signal that fires in that window re-arms its detector under a growing backoff until a
+retry gets through (see Recovery). Daemon down: the row
 persists and the alarm returns on the first tick after restart. Exchange down:
 the rule reads no exchange data; exchange-side stops are unaffected. Alertmanager
 or Prometheus down: the `/status` flag and logs remain.
