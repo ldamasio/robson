@@ -1992,6 +1992,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         event_bus: Arc<EventBus>,
         ohlcv_port: Arc<dyn OhlcvPort>,
         detectors: Arc<RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>>,
+        circuit_breaker: &CircuitBreaker,
         shutdown_token: CancellationToken,
         reason: &'static str,
         stop_invalidation_guard_enabled: bool,
@@ -2016,8 +2017,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 if let Some(delay) = initial_fire_delay {
                     detector = detector.with_initial_fire_delay(delay);
                 }
-                let handle = detector.spawn();
+                // Checked under the map's lock, which `panic_close_all` takes to
+                // stop every detector once MonthlyHalt latches: a re-arm lands
+                // before that stop or sees the halt.
                 let mut detectors = detectors.write().await;
+                if circuit_breaker.blocks_new_entries().await {
+                    info!(%position_id, %reason, "MonthlyHalt latched — detector not re-armed");
+                    return false;
+                }
+                let handle = detector.spawn();
                 if let Some(replaced) = detectors.insert(position_id, handle) {
                     replaced.abort();
                 }
@@ -2194,6 +2202,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Arc::clone(&self.event_bus),
             Arc::clone(&self.ohlcv_port),
             Arc::clone(&self.detectors),
+            &self.circuit_breaker,
             self.shutdown_token.clone(),
             reason,
             self.stop_invalidation_guard_enabled,
@@ -2440,6 +2449,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                             event_bus,
                             ohlcv_port,
                             detectors,
+                            &circuit_breaker,
                             shutdown_token,
                             "approval expired",
                             stop_invalidation_guard_enabled,
@@ -5010,6 +5020,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ///   orders.
     pub async fn panic_close_all(&self) -> DaemonResult<Vec<PositionId>> {
         warn!("PANIC: Emergency close all positions");
+
+        // Under MonthlyHalt no detector runs: stop them all before the disarms
+        // below, which fail at their first audit write when the database is
+        // down. A re-arm checks the halt under this same lock.
+        if self.circuit_breaker.blocks_new_entries().await {
+            for (_, detector) in self.detectors.write().await.drain() {
+                detector.abort();
+            }
+        }
 
         // find_active() returns open core-lifecycle states only:
         // Armed, Entering, Active, Exiting.
@@ -8495,6 +8514,84 @@ mod tests {
         }
     }
 
+    /// MonthlyHalt latched at a random moment while an expiry re-arms during a
+    /// write outage, so the halt's own disarms fail: no detector outlives the
+    /// halt, the re-armed one or an ordinary one.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_halt_during_an_outage_leaves_no_detector_running(pool: sqlx::PgPool) {
+        use proptest::{
+            strategy::{Strategy, ValueTree},
+            test_runner::TestRunner,
+        };
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+
+        set_month_basis(&pool, dec!(10000)).await;
+        let mut runner = TestRunner::deterministic();
+
+        for _ in 0..24 {
+            let halt_after_ms = (0u64..80).new_tree(&mut runner).unwrap().current();
+            let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+            let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+            manager.entry_policies.write().await.insert(
+                armed.id,
+                EntryPolicyConfig::new(
+                    EntryPolicy::ConfirmedTrend,
+                    DomainApprovalPolicy::HumanConfirmation,
+                ),
+            );
+            manager.handle_signal(signal).await.unwrap();
+            let query_id = manager.get_pending_approvals().await[0].id;
+            let other = save_armed_position_with_policy(
+                &manager,
+                "ETHUSDT",
+                Side::Long,
+                EntryPolicyConfig::default(),
+            )
+            .await;
+            manager.detectors.write().await.insert(
+                other.id,
+                tokio::spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    None
+                }),
+            );
+
+            // Every write fails; the expiry's only after 50 ms.
+            inject_event_log_fault(
+                &pool,
+                "TRUE",
+                &format!(
+                    "IF {} THEN PERFORM pg_sleep(0.05); END IF; \
+                     RAISE EXCEPTION 'injected event log failure';",
+                    audit_write("expired")
+                ),
+            )
+            .await;
+            manager.spawn_approval_expiration_task(query_id, chrono::Utc::now());
+            tokio::time::sleep(std::time::Duration::from_millis(halt_after_ms)).await;
+            let _ = manager.trigger_monthly_halt("test".to_string()).await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !manager.get_pending_approvals().await.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the approval must leave the queue");
+            drop(manager.entry_flow_lock.lock().await);
+            restore_event_log_writes(&pool).await;
+
+            let detectors = manager.detectors.read().await;
+            for position_id in [armed.id, other.id] {
+                assert!(
+                    !detectors.get(&position_id).is_some_and(|handle| !handle.is_finished()),
+                    "halt after {halt_after_ms}ms: a detector outlived the halt"
+                );
+            }
+        }
+    }
+
     /// Holds the next snapshot on `positions_current`, which it reads after the
     /// basis.
     #[cfg(feature = "postgres")]
@@ -10178,6 +10275,28 @@ mod tests {
             Event::EntryAttemptExhausted { reason_code, .. }
                 if reason_code == "admission_evidence_present"
         )));
+    }
+
+    /// No re-arm lands while MonthlyHalt is latched, whatever path asks for
+    /// it: the check sits under the lock the halt's stop takes.
+    #[tokio::test]
+    async fn no_detector_is_rearmed_under_monthly_halt() {
+        let manager = create_test_manager().await;
+        let position = save_armed_position_with_policy(
+            &manager,
+            "BTCUSDT",
+            Side::Long,
+            EntryPolicyConfig::default(),
+        )
+        .await;
+        manager.circuit_breaker.trigger_halt("test".to_string()).await;
+
+        assert!(
+            !manager
+                .rearm_detector_after_governed_block(position.id, &position, "test")
+                .await
+        );
+        assert!(!manager.detectors.read().await.contains_key(&position.id));
     }
 
     /// A latched MonthlyHalt drops the signal, and the failure re-arm leaves
