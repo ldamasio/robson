@@ -61,8 +61,13 @@ fn map_daemon_result(result: DaemonResult<()>) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // `.env` first, as `Config::from_env` loads it: a production marker that
+    // only exists there must be refused before any connection is built.
     #[cfg(feature = "crash-points")]
-    robson_exec::crash_points::arm_from_env();
+    {
+        let _ = dotenvy::dotenv();
+        robson_exec::crash_points::arm_from_env();
+    }
 
     // 8 MiB worker stacks (default 2 MiB): robsond aborted twice in
     // production (2026-06-30, 2026-07-02) with tokio-runtime-worker stack

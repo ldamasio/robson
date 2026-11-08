@@ -88,6 +88,8 @@ impl Harness {
             crash_point: crash_point.map(str::to_string),
             deadline: DAEMON_DEADLINE,
             extra_env: extra_env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            removed_env: Vec::new(),
+            dotenv: String::new(),
         })
         .expect("spawn robsond")
     }
@@ -188,6 +190,8 @@ fn stuck_spec(work_dir: PathBuf) -> DaemonSpec {
         crash_point: None,
         deadline: DAEMON_DEADLINE,
         extra_env: Vec::new(),
+        removed_env: Vec::new(),
+        dotenv: String::new(),
     }
 }
 
@@ -217,6 +221,42 @@ async fn a_crash_points_build_refuses_production_and_unknown_points() {
     assert_eq!(status.code(), Some(101), "{}", daemon.log_tail());
     assert!(daemon.log_tail().contains("no_such_point"), "{}", daemon.log_tail());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The sequence the inherited-environment check alone would miss: `ROBSON_ENV`
+/// is absent from the environment and `production` only in `.env`.
+#[tokio::test]
+async fn production_arriving_through_dotenv_is_refused() {
+    let dir = scratch_dir();
+    let mut spec = stuck_spec(dir.clone());
+    spec.removed_env.push("ROBSON_ENV".to_string());
+    spec.dotenv = "ROBSON_ENV=production\n".to_string();
+    let daemon = DaemonProcess::spawn(&spec).expect("spawn");
+
+    let status = daemon.wait_exit(STEP).await.expect("refused at start");
+    assert_eq!(status.code(), Some(101), "{}", daemon.log_tail());
+    assert!(daemon.log_tail().contains("ROBSON_ENV=production"), "{}", daemon.log_tail());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The child's empty local `.env` stops discovery, so a `.env` further up
+/// (a checkout's, say) reaches it neither for production nor for anything else.
+#[tokio::test]
+async fn a_dotenv_in_a_parent_directory_does_not_reach_the_child() {
+    let parent = scratch_dir();
+    std::fs::write(parent.join(".env"), "ROBSON_ENV=production\n").expect("parent .env");
+    let work_dir = parent.join("child");
+    std::fs::create_dir_all(&work_dir).expect("child dir");
+    let mut spec = stuck_spec(work_dir);
+    spec.removed_env.push("ROBSON_ENV".to_string());
+    // Lives until its own watchdog: it has an unreachable database to retry.
+    spec.extra_env.push(("ROBSON_CRASH_WATCHDOG_SECS".to_string(), "1".to_string()));
+    let daemon = DaemonProcess::spawn(&spec).expect("spawn");
+
+    let status = daemon.wait_exit(STEP).await.expect("killed by its own watchdog");
+    assert_eq!(status.signal(), Some(9), "not refused, so it ran: {}", daemon.log_tail());
+    assert!(daemon.log_tail().contains("development"), "{}", daemon.log_tail());
+    let _ = std::fs::remove_dir_all(parent);
 }
 
 /// The child-side watchdog: with no test-side deadline in play the child still

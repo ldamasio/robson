@@ -44,6 +44,12 @@ pub struct DaemonSpec {
     pub deadline: Duration,
     /// Further environment for the daemon.
     pub extra_env: Vec<(String, String)>,
+    /// Variables the daemon must not inherit from the settings above.
+    pub removed_env: Vec<String>,
+    /// Contents of the `.env` written to `work_dir`. Empty is the normal case:
+    /// dotenv stops at the first `.env` it finds, so this keeps a checkout's
+    /// own from being discovered through the parent directories.
+    pub dotenv: String,
 }
 
 /// A running daemon. Dropping it SIGKILLs and reaps the process.
@@ -64,11 +70,11 @@ impl DaemonProcess {
         let log_path = spec.work_dir.join(format!("robsond-{run_id}.log"));
         let marker_path = spec.work_dir.join(format!("crash-marker-{run_id}"));
         let log = std::fs::File::create(&log_path).context("daemon log file")?;
+        std::fs::write(spec.work_dir.join(".env"), &spec.dotenv).context("daemon .env")?;
 
         let mut command = Command::new(&spec.binary);
         command
             .env_clear()
-            // No .env from a checkout is picked up from here.
             .current_dir(&spec.work_dir)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
@@ -96,6 +102,9 @@ impl DaemonProcess {
             command.env("ROBSON_CRASH_POINT", point);
         }
         command.envs(spec.extra_env.iter().map(|(key, value)| (key, value)));
+        for name in &spec.removed_env {
+            command.env_remove(name);
+        }
 
         let child = command.spawn().context("spawn robsond")?;
         let process = Self {
