@@ -83,6 +83,31 @@ pub enum BinanceRestError {
     PositionNotFound(String),
 }
 
+/// The origin of a crash-harness venue URL, parsed and checked here so that a
+/// lookalike such as `http://127.0.0.1:80@evil.example` cannot leave loopback.
+/// The port must be explicit, and credentials, paths and queries are refused.
+#[cfg(any(test, feature = "crash-points"))]
+fn harness_origin(base_url: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(base_url).map_err(|error| format!("{base_url}: {error}"))?;
+    let host = url.host_str().unwrap_or_default();
+    let loopback = host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    let bare_origin = url.path() == "/" && url.query().is_none() && url.fragment().is_none();
+    let no_credentials = url.username().is_empty() && url.password().is_none();
+    if url.scheme() != "http"
+        || !loopback
+        || url.port().is_none()
+        || !bare_origin
+        || !no_credentials
+    {
+        return Err(format!("{base_url} is not an http://<loopback>:<port> origin"));
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
 // =============================================================================
 // Binance REST Client
 // =============================================================================
@@ -136,17 +161,17 @@ impl BinanceRestClient {
         }
     }
 
-    /// Crash harness: every request goes to the fake venue at `base_url`,
-    /// which must be on loopback. Exists only with the `crash-points` feature.
+    /// Crash harness: every request goes to the fake venue at `base_url`.
+    /// Exists only with the `crash-points` feature.
+    ///
+    /// # Panics
+    /// Unless `base_url` is an `http://<loopback>:<port>` origin.
     #[cfg(feature = "crash-points")]
     pub fn with_harness_base_url(base_url: String, api_key: String, api_secret: String) -> Self {
-        let authority = base_url.strip_prefix("http://").unwrap_or_default();
-        assert!(
-            authority.starts_with("127.0.0.1:") || authority.starts_with("localhost:"),
-            "the crash harness venue must be on loopback, got {base_url}"
-        );
+        let origin = harness_origin(&base_url)
+            .unwrap_or_else(|refused| panic!("crash harness venue refused: {refused}"));
         Self {
-            local_base_url: Some(base_url),
+            local_base_url: Some(origin),
             ..Self::new(api_key, api_secret)
         }
     }
@@ -1609,6 +1634,35 @@ mod tests {
         assert_eq!(klines[0].volume, dec!(148976.11427815));
         assert_eq!(klines[0].close_time_ms, 1_499_644_799_999);
         assert_eq!(klines[0].trades, 308);
+    }
+
+    #[test]
+    fn the_harness_venue_url_must_be_a_loopback_origin() {
+        for accepted in [
+            "http://127.0.0.1:41000",
+            "http://localhost:41000",
+            "http://[::1]:41000",
+        ] {
+            assert_eq!(harness_origin(accepted).as_deref(), Ok(accepted));
+        }
+        for refused in [
+            // `127.0.0.1:80` is user information; the host is evil.example.
+            "http://127.0.0.1:80@evil.example",
+            // Not a port at all.
+            "http://localhost:80.evil",
+            "http://127.0.0.1:41000@evil.example:41000",
+            "http://user:secret@127.0.0.1:41000",
+            "https://127.0.0.1:41000",
+            "http://evil.example:41000",
+            "http://localhost.evil:41000",
+            "http://127.0.0.1.evil.example:41000",
+            "http://127.0.0.1",
+            "http://127.0.0.1:41000/fapi",
+            "http://127.0.0.1:41000?a=1",
+            "not a url",
+        ] {
+            assert!(harness_origin(refused).is_err(), "{refused} must be refused");
+        }
     }
 
     #[tokio::test]
