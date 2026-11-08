@@ -309,7 +309,7 @@ limit."
 
 | Failure | Required behavior |
 | --- | --- |
-| Postgres/projection unavailable | No new entries; no incomplete in-memory production fallback; existing protection continues; durable visible alarm; Armed positions keep a detector under backoff and resume when it returns (Amendment 2026-11-07, Recovery). |
+| Postgres/projection unavailable | No new entries; no incomplete in-memory production fallback; existing protection continues; durable visible alarm; an admission that fails before the executor keeps its Armed position's detector under backoff, and the position resumes when the database returns. A failure from the executor on leaves it without one until reconciliation, a restart or the operator resolves it (Amendment 2026-11-07, Recovery). |
 | Income endpoint unavailable or stale | Settlement reservations remain; new entries fail closed after the freshness bound; retry with backoff. |
 | Exchange position inventory unavailable | Use the full durable local risk-bearing set conservatively; do not omit positions; deny new entries and expose staleness. |
 | Concurrent admissions/accounting updates | Serialized reservation or versioned compare-and-swap; loser retries from a new snapshot. |
@@ -473,16 +473,17 @@ resumes within one backoff period, then waits for its entry condition. Every ret
 a full admission: its query audit writes before the order (`accepted`, `processing`,
 `risk_checked`, `acting`, and `authorized` after an approval) must succeed, so no
 order goes out without them. The `EntryApprovalPending` domain event stays best
-effort, as before. Not re-armed: a failure after the executor, where an order may
-exist and the fill path and reconciliation decide; a signal that MonthlyHalt drops; a
-position that is no longer Armed, waits for approval, or needs an operator re-arm. A
-refusal that ends an `Immediate` arm still ends it when its own record fails. Each
-re-arm happens under `entry_flow_lock` on the position as it stands then, the expiry
-task's included, so a disarm cannot leave a stray detector. MonthlyHalt stops every
-running detector as it latches, before the disarms that fail at their first write when
-the database is down, and a re-arm checks for the halt under the lock that stop takes,
-so no re-armed detector outlives a halt. An arm already past its own halt check is not
-covered by this.
+effort, as before. Not re-armed: a failure from the executor on, where an order may
+exist or the admission is half written (ADR-0052). Reconciliation, a restart or a
+disarm and arm resolves it, and until then a position still Armed has no detector.
+Nor a signal that MonthlyHalt drops, or a position that is no longer Armed, waits for
+approval, or needs an operator re-arm. A refusal that ends an `Immediate` arm still
+ends it when its own record fails. Each re-arm happens under `entry_flow_lock` on the
+position as it stands then, the expiry task's included, so a disarm cannot leave a
+stray detector. MonthlyHalt stops every running detector as it latches, before the
+disarms that fail at their first write when the database is down, and a re-arm checks
+for the halt under the lock that stop takes, so no re-armed detector outlives a halt.
+An arm already past its own halt check is not covered by this.
 `robsond_detector_rearms_after_failure_total{flow}` counts the re-arms, a record the
 event log cannot keep while the database is down.
 
