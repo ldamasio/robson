@@ -478,7 +478,11 @@ exist and the fill path and reconciliation decide; a signal that MonthlyHalt dro
 position that is no longer Armed, waits for approval, or needs an operator re-arm. A
 refusal that ends an `Immediate` arm still ends it when its own record fails. Each
 re-arm happens under `entry_flow_lock` on the position as it stands then, the expiry
-task's included, so a disarm or a halt cannot leave a stray detector.
+task's included, so a disarm cannot leave a stray detector. MonthlyHalt stops every
+running detector as it latches, before the disarms that fail at their first write when
+the database is down, and a re-arm checks for the halt under the lock that stop takes,
+so no re-armed detector outlives a halt. An arm already past its own halt check is not
+covered by this.
 `robsond_detector_rearms_after_failure_total{flow}` counts the re-arms, a record the
 event log cannot keep while the database is down.
 
