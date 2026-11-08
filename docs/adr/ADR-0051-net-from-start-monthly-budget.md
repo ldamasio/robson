@@ -309,7 +309,7 @@ limit."
 
 | Failure | Required behavior |
 | --- | --- |
-| Postgres/projection unavailable | No new entries; no incomplete in-memory production fallback; existing protection continues; durable visible alarm. |
+| Postgres/projection unavailable | No new entries; no incomplete in-memory production fallback; existing protection continues; durable visible alarm; Armed positions keep a detector under backoff and resume when it returns (Amendment 2026-11-07, Recovery). |
 | Income endpoint unavailable or stale | Settlement reservations remain; new entries fail closed after the freshness bound; retry with backoff. |
 | Exchange position inventory unavailable | Use the full durable local risk-bearing set conservatively; do not omit positions; deny new entries and expose staleness. |
 | Concurrent admissions/accounting updates | Serialized reservation or versioned compare-and-swap; loser retries from a new snapshot. |
@@ -429,10 +429,9 @@ not a new guarantee for an unknown basis:
   rules must be fetched, so the halt and admission each re-read the basis at their
   decision point. A write after that read is after the decision: a halt or an entry
   decided on a valid basis a moment earlier stands. A re-read that fails defers the
-  halt and denies the entry. That denial re-arms only if its audit write succeeds on
-  the same database; otherwise the signal or approval returns an error and the Armed
-  position has no detector, as after any database failure once the detector is
-  killed. This path predates the amendment and enters nothing.
+  halt and denies the entry. If that denial's audit write fails too, the signal or
+  approval returns an error and the position re-arms like any admission that fails
+  before the executor (see Recovery). Either way it enters nothing.
 
 Admission stays closed without the latch: the gate, `can_admit`, `slots_available`
 and `with_capital` each refuse the basis, and they survive a restart, which the
@@ -460,9 +459,29 @@ corrects the row with evidence. Admission reads the basis on every attempt, so
 entries resume with no restart and no reset. A position already Armed re-arms
 after a denied signal or approval and may then enter through the normal gate. The
 exception is a signal on an `Immediate` position, which is cancelled as on any
-margin refusal. Database recovery alone does not restore a detector lost to a
-database failure during admission: restart the daemon, which respawns detectors for
-Armed positions, or disarm and arm again.
+margin refusal.
+
+A database failure during admission needs no restart either. Detectors are
+single-shot, so an admission that returned an error used to leave its position Armed
+with no detector until a restart, or a disarm and arm. Now any error before the
+executor re-arms the detector under the governed backoff: in a signal, in an approval
+the flow has taken from the queue, and in the expiry task when it cannot record an
+expiry. The backoff starts at 5 s and doubles to 15 minutes, and resets once an
+admission reaches the executor or the approval queue. During an outage each fire
+costs one failed write and a longer wait. Once the database is back the position
+resumes within one backoff period, then waits for its entry condition. Every retry is
+a full admission whose audit writes come before the order, so nothing enters without
+its record. Not re-armed: a failure after the executor, where an order may exist and
+the fill path and reconciliation decide; a signal that MonthlyHalt drops; a position
+that is no longer Armed, waits for approval, or needs an operator re-arm.
+`robsond_detector_rearms_after_failure_total{flow}` counts the re-arms, a record the
+event log cannot keep while the database is down.
+
+What this leaves on the table: errors are not sorted by cause, so a fault before the
+executor that never clears retries every 15 minutes, with an error log and a count
+each time, instead of going quiet. An `Immediate` position re-arms as on a governed
+denial, so it can enter when the database returns rather than when it was armed.
+Disarm it to prevent that.
 
 | Option | On an invalid basis | Gain | Cost | Decision |
 | --- | --- | --- | --- | --- |
@@ -507,9 +526,10 @@ automatic liquidation on an invalid basis, so first confirm the basis is valid o
 exchange book is flat, in-flight entries included. Afterwards, check the pod's health
 and `/status`.
 
-**Failure modes.** Database down: the snapshot fails, admission fails closed, the
-halt is not evaluated, the gauge keeps its last value, and a signal that fires in
-that window leaves its position without a detector (see Recovery). Daemon down: the row
+**Failure modes.** Database down: admission fails closed at its first audit write
+or at the snapshot, the halt is not evaluated, the gauge keeps its last value, and a
+signal that fires in that window re-arms its detector under a growing backoff until a
+retry gets through (see Recovery). Daemon down: the row
 persists and the alarm returns on the first tick after restart. Exchange down:
 the rule reads no exchange data; exchange-side stops are unaffected. Alertmanager
 or Prometheus down: the `/status` flag and logs remain.
