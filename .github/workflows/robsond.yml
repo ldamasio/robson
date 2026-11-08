@@ -41,6 +41,10 @@ jobs:
   test:
     name: Rust Tests
     runs-on: ubuntu-latest
+    # libtest has no per-test limit and only warns after 60 s, so a hung test
+    # would hold the runner until GitHub's 6 h default. The job takes 3 to 8
+    # minutes (2026-11-07), so 20 leaves room for a slow runner.
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16-alpine
