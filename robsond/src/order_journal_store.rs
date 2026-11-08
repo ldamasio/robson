@@ -6,7 +6,10 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use robson_exec::order_journal::{CommitFailure, JournalBackend, JournalBatch};
+use rust_decimal::Decimal;
+use serde_json::Value;
 use sqlx::{pool::PoolConnection, postgres::PgPoolOptions, Connection, PgPool, Postgres};
 use uuid::Uuid;
 
@@ -230,4 +233,160 @@ impl JournalBackend for PgJournalBackend {
         read.finished = true;
         Ok(states)
     }
+}
+
+/// What an operator recorded about an outstanding intent.
+#[derive(Debug, Clone)]
+pub struct Disposition {
+    pub intent_id: Uuid,
+    /// `Some` is terminal evidence naming `order_ref`; `None` is accepted risk.
+    pub terminal_evidence: Option<TerminalEvidence>,
+    pub treatment: &'static str,
+    pub note: String,
+    pub actor: String,
+    pub auth_kind: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalEvidence {
+    pub order_ref: String,
+    pub filled_qty: Decimal,
+    pub document: Value,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DispositionError {
+    #[error("no such intent")]
+    NotFound,
+    #[error("intent has a definite outcome or was never sent; there is nothing to dispose of")]
+    NotOutstanding,
+    #[error("the evidence names another order")]
+    EvidenceForAnotherOrder,
+    #[error("the evidence reports more than the order asked for")]
+    ImpossibleQuantity,
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispositionReceipt {
+    pub decision_id: Uuid,
+    /// Intents still blocking rollback boundary B.
+    pub boundary_b_blockers: i64,
+}
+
+/// The quantity the intent asked for, when it recorded one.
+fn ordered_quantity(params: &Value) -> Option<Decimal> {
+    match params.get("quantity")? {
+        Value::String(quantity) => quantity.parse().ok(),
+        Value::Number(quantity) => quantity.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Record a disposition in one transaction: the intent's disposition and an
+/// append-only decision row. The latest disposition stands; the decisions keep
+/// them all, so a retry after a lost acknowledgement adds a second decision and
+/// changes nothing else. It writes no venue outcome and no event, and it does
+/// not check the attached record against the venue: the record is what the
+/// named operator attached.
+pub async fn record_disposition(
+    pool: &PgPool,
+    disposition: &Disposition,
+) -> Result<DispositionReceipt, DispositionError> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query_as::<_, (String, Option<String>, bool, bool, Value)>(
+        r#"
+        SELECT client_order_id, cancels_order_id, venue_outcome IS NOT NULL, not_sent, params
+        FROM order_intents WHERE intent_id = $1 FOR UPDATE
+        "#,
+    )
+    .bind(disposition.intent_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((client_order_id, cancels_order_id, has_outcome, not_sent, params)) = row else {
+        return Err(DispositionError::NotFound);
+    };
+    if has_outcome || not_sent {
+        return Err(DispositionError::NotOutstanding);
+    }
+    if let Some(evidence) = &disposition.terminal_evidence {
+        // A cancellation's own id is local and never reached the venue: its
+        // evidence is about the order it cancelled.
+        if evidence.order_ref != cancels_order_id.unwrap_or(client_order_id) {
+            return Err(DispositionError::EvidenceForAnotherOrder);
+        }
+        if ordered_quantity(&params).is_some_and(|ordered| evidence.filled_qty > ordered) {
+            return Err(DispositionError::ImpossibleQuantity);
+        }
+    }
+
+    let now = Utc::now();
+    let (kind, document, accepted_at, accepted_by, accepted_auth, accepted_note) =
+        match &disposition.terminal_evidence {
+            Some(evidence) => {
+                ("terminal_evidence", Some(&evidence.document), None, None, None, None)
+            },
+            None => (
+                "accepted_risk",
+                None,
+                Some(now),
+                Some(disposition.actor.as_str()),
+                Some(disposition.auth_kind),
+                Some(disposition.note.as_str()),
+            ),
+        };
+    sqlx::query(
+        r#"
+        UPDATE order_intents SET
+            disposition_kind = $2,
+            disposition_treatment = $3,
+            disposition_evidence = $4,
+            risk_accepted_at = $5,
+            risk_accepted_by = $6,
+            risk_accepted_auth = $7,
+            risk_accepted_note = $8
+        WHERE intent_id = $1
+        "#,
+    )
+    .bind(disposition.intent_id)
+    .bind(kind)
+    .bind(disposition.treatment)
+    .bind(document)
+    .bind(accepted_at)
+    .bind(accepted_by)
+    .bind(accepted_auth)
+    .bind(accepted_note)
+    .execute(&mut *tx)
+    .await?;
+
+    let decision_id = Uuid::now_v7();
+    let payload = serde_json::json!({ "disposition_kind": kind });
+    sqlx::query(
+        r#"
+        INSERT INTO journal_decisions (
+            decision_id, kind, intent_id, actor, auth_kind, note, treatment, evidence, payload,
+            decided_at
+        ) VALUES ($1, 'disposition', $2, $3, $4, $5, $6, $7, $8, $9)
+        "#,
+    )
+    .bind(decision_id)
+    .bind(disposition.intent_id)
+    .bind(&disposition.actor)
+    .bind(disposition.auth_kind)
+    .bind(&disposition.note)
+    .bind(disposition.treatment)
+    .bind(document)
+    .bind(&payload)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    let boundary_b_blockers = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::BIGINT FROM order_intents_blocking_rollback",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(DispositionReceipt { decision_id, boundary_b_blockers })
 }

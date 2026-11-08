@@ -91,6 +91,78 @@ pub fn init_detector_rearms_after_failure() {
     }
 }
 
+/// 1 once a bounded send went out without its journal row or journal history
+/// was discarded (ADR-0056 step 7). Stays until restart. Nothing acts on it
+/// yet: later PRs of step 7 close admissions on it. The journal gauges are
+/// defined here and published by the daemon once the journal is wired in.
+pub static JOURNAL_LATCH: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_journal_latch",
+        "1 when a send went out without its journal row or journal history was discarded"
+    )
+    .expect("failed to register robsond_journal_latch")
+});
+
+/// Intents with something that has not landed in the journal yet.
+pub static JOURNAL_RETRY_SET_DEPTH: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_journal_retry_set_depth",
+        "Intents waiting for their journal rows to land"
+    )
+    .expect("failed to register robsond_journal_retry_set_depth")
+});
+
+/// Sends the journal authorized without being able to keep their id, so
+/// non-reuse rests on the id being fresh. Process-local: it resets on restart.
+/// It counts those authorizations, not a verified inventory of orders with no
+/// row: a later write may still land, or the adapter may refuse locally.
+pub static JOURNAL_NON_REUSE_IDS_LOST: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_journal_non_reuse_ids_lost",
+        "Sends whose client id the order journal could not retain"
+    )
+    .expect("failed to register robsond_journal_non_reuse_ids_lost")
+});
+
+/// Statements charged to the journal (guardrails §1.1): what each commit plans
+/// to run, so a commit that failed before sending anything is charged in full.
+pub static JOURNAL_STATEMENTS: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_journal_statements",
+        "Statements charged by the order journal: planned per commit"
+    )
+    .expect("failed to register robsond_journal_statements")
+});
+
+/// The most statements charged to one journal operation since the start. The
+/// reviewed bound is `OPERATION_STATEMENT_BOUND`.
+pub static JOURNAL_OPERATION_STATEMENTS_MAX: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_journal_operation_statements_max",
+        "Most statements charged to one order journal operation"
+    )
+    .expect("failed to register robsond_journal_operation_statements_max")
+});
+
+/// Journal operations that went past their reviewed statement bound.
+pub static JOURNAL_OPERATIONS_OVER_STATEMENT_BOUND: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_journal_operations_over_statement_bound",
+        "Order journal operations past their reviewed statement bound"
+    )
+    .expect("failed to register robsond_journal_operations_over_statement_bound")
+});
+
+/// Publish the journal's latch, retry-set depth and statement counts.
+pub fn observe_order_journal(journal: &robson_exec::order_journal::OrderJournal) {
+    JOURNAL_LATCH.set(if journal.latch_set() { 1.0 } else { 0.0 });
+    JOURNAL_RETRY_SET_DEPTH.set(journal.retry_set_depth() as f64);
+    JOURNAL_NON_REUSE_IDS_LOST.set(journal.non_reuse_ids_lost() as f64);
+    JOURNAL_STATEMENTS.set(journal.statements_total() as f64);
+    JOURNAL_OPERATION_STATEMENTS_MAX.set(f64::from(journal.operation_statements_max()));
+    JOURNAL_OPERATIONS_OVER_STATEMENT_BOUND.set(journal.operations_over_statement_bound() as f64);
+}
+
 /// Realized PnL per closed position (gauge — set once per close event).
 pub static POSITION_PNL: LazyLock<GaugeVec> = LazyLock::new(|| {
     register_gauge_vec!("robsond_position_pnl", "Realized PnL for closed positions", &[
@@ -478,6 +550,22 @@ mod tests {
         let rendered = render();
         assert!(rendered.contains("robsond_monthly_budget_basis_invalid"));
         assert!(rendered.contains("robsond_monthly_budget_basis_last_read_timestamp_seconds"));
+    }
+
+    #[test]
+    fn the_journal_gauges_are_exported() {
+        observe_order_journal(&robson_exec::order_journal::OrderJournal::unpersisted());
+
+        let rendered = render();
+        assert!(rendered.contains("robsond_journal_latch 0"), "{rendered}");
+        assert!(rendered.contains("robsond_journal_retry_set_depth 0"), "{rendered}");
+        assert!(rendered.contains("robsond_journal_non_reuse_ids_lost 0"), "{rendered}");
+        assert!(rendered.contains("robsond_journal_statements "), "{rendered}");
+        assert!(rendered.contains("robsond_journal_operation_statements_max "), "{rendered}");
+        assert!(
+            rendered.contains("robsond_journal_operations_over_statement_bound "),
+            "{rendered}"
+        );
     }
 
     #[test]
