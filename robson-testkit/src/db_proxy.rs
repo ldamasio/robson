@@ -37,8 +37,11 @@ pub enum ProxyMode {
     /// Keep connections open and swallow everything: nothing arrives anywhere,
     /// the client only ever sees its own timeout.
     Blackhole,
-    /// The next commit reaches the server and is applied; its acknowledgement
-    /// is dropped and that connection closes. The mode then returns to `Pass`.
+    /// The next commit sent as a simple query, which is how
+    /// `Transaction::commit` sends it, reaches the server and is applied; its
+    /// acknowledgement is dropped and that connection closes. The mode then
+    /// returns to `Pass`. A `COMMIT` through the extended protocol is not
+    /// covered: it passes through, acknowledged, and the mode stays armed.
     DropCommitAck,
 }
 
@@ -46,6 +49,7 @@ pub enum ProxyMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProxyStats {
     pub connections: u64,
+    /// `COMMIT`s sent as a simple query.
     pub commits: u64,
     pub commit_acks_dropped: u64,
 }
@@ -209,7 +213,7 @@ async fn frontend_to_backend(
         if shared.blackholed() {
             continue;
         }
-        if is_commit(tag, &body) {
+        if is_simple_query_commit(tag, &body) {
             shared.counters.commits.fetch_add(1, Ordering::Relaxed);
             if shared.claim_commit_ack_drop() {
                 // Set before the commit is forwarded, so the backend half has
@@ -261,16 +265,15 @@ async fn write_message(stream: &mut OwnedWriteHalf, tag: u8, body: &[u8]) -> std
     stream.write_all(&message).await
 }
 
-/// `Q` (simple query, how SQLx sends `COMMIT`) or `P` (parse) carrying a
-/// `COMMIT` statement.
-fn is_commit(tag: u8, body: &[u8]) -> bool {
-    let statement = match tag {
-        b'Q' => body,
-        b'P' => body.splitn(2, |byte| *byte == 0).nth(1).unwrap_or_default(),
-        _ => return false,
-    };
-    let end = statement.iter().position(|byte| *byte == 0).unwrap_or(statement.len());
-    let statement = String::from_utf8_lossy(&statement[..end]);
+/// A simple query (`Q`) that is a `COMMIT`. In the extended protocol `Parse`
+/// only prepares a statement and execution comes later, so this does not look
+/// there; see [`ProxyMode::DropCommitAck`].
+fn is_simple_query_commit(tag: u8, body: &[u8]) -> bool {
+    if tag != b'Q' {
+        return false;
+    }
+    let end = body.iter().position(|byte| *byte == 0).unwrap_or(body.len());
+    let statement = String::from_utf8_lossy(&body[..end]);
     statement.trim().trim_end_matches(';').trim().eq_ignore_ascii_case("COMMIT")
 }
 
@@ -279,13 +282,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_commit_statement_is_a_commit() {
-        assert!(is_commit(b'Q', b"COMMIT\0"));
-        assert!(is_commit(b'Q', b" commit ;\0"));
-        assert!(is_commit(b'P', b"stmt1\0COMMIT\0\0\0"));
-        assert!(!is_commit(b'Q', b"SELECT 'COMMIT'\0"));
-        assert!(!is_commit(b'Q', b"COMMIT AND CHAIN\0"));
-        assert!(!is_commit(b'B', b"COMMIT\0"));
+    fn only_a_simple_query_commit_is_a_commit() {
+        assert!(is_simple_query_commit(b'Q', b"COMMIT\0"));
+        assert!(is_simple_query_commit(b'Q', b" commit ;\0"));
+        assert!(!is_simple_query_commit(b'Q', b"SELECT 'COMMIT'\0"));
+        assert!(!is_simple_query_commit(b'Q', b"COMMIT AND CHAIN\0"));
+        // Parse prepares; it executes nothing.
+        assert!(!is_simple_query_commit(b'P', b"\0COMMIT\0\0\0"));
+        assert!(!is_simple_query_commit(b'B', b"COMMIT\0"));
     }
 
     fn message(tag: u8, body: &[u8]) -> Vec<u8> {

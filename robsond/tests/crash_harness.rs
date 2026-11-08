@@ -386,6 +386,24 @@ async fn proxy_drops_the_commit_ack_after_the_commit_landed(pool: PgPool) {
     assert_eq!(harness.proxy.mode(), ProxyMode::Pass, "one-shot");
 }
 
+/// `sqlx::query("COMMIT")` uses the extended protocol, which the fault does not
+/// cover: it is acknowledged, not counted, and leaves the fault armed.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn proxy_leaves_an_extended_protocol_commit_alone(pool: PgPool) {
+    let (harness, mut connection) = proxied_connection(pool).await;
+
+    harness.proxy.set_mode(ProxyMode::DropCommitAck);
+    sqlx::query("BEGIN").execute(&mut connection).await.unwrap();
+    insert_probe(1).execute(&mut connection).await.unwrap();
+    sqlx::query("COMMIT").execute(&mut connection).await.expect("acknowledged");
+
+    assert_eq!(probe_rows(&harness.pool).await, 1);
+    let stats = harness.proxy.stats();
+    assert_eq!((stats.commits, stats.commit_acks_dropped), (0, 0));
+    assert_eq!(harness.proxy.mode(), ProxyMode::DropCommitAck, "still armed");
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn proxy_passes_a_commit_through(pool: PgPool) {
