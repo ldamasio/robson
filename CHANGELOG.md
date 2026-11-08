@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Every order written to the journal (ADR-0056 step 7, PR J, part 3)
+
+- An entry does not go out without its row. Reductions, protective stops and cancels try for 500 ms and go
+  out anyway, setting `robsond_journal_latch` if the row did not land.
+- Outcomes are recorded only: uncertainty is journaled and does not close admissions until the fence ships.
+- The governed re-arm backoff now resets only after an entry reached the venue's send, on success and failure
+  alike. A proven no-send on an `ExecutableSpan` leg ends the attempt (`entry_not_sent`); a legacy leg re-arms.
+
 ### Added - Disposition endpoint and journal metrics (ADR-0056 step 7, PR J, part 2)
 
 - `POST /recovery/disposition` records an operator's terminal evidence or accepted risk for an outstanding

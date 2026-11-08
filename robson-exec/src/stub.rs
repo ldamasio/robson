@@ -185,6 +185,7 @@ pub struct StubExchange {
     /// When set, the next market order or protective stop is authoritatively
     /// rejected by the simulated venue.
     reject_order_next: RwLock<bool>,
+    refuse_before_send_next: RwLock<bool>,
     /// Futures market orders attempted via `place_market_order`, rejected or
     /// not, so tests can assert how many exit attempts reached the exchange.
     market_order_calls: RwLock<u64>,
@@ -267,6 +268,7 @@ impl StubExchange {
             open_orders_fail: RwLock::new(false),
             market_order_client_ids: RwLock::new(Vec::new()),
             reject_order_next: RwLock::new(false),
+            refuse_before_send_next: RwLock::new(false),
             market_order_calls: RwLock::new(0),
             trading_rules: RwLock::new(HashMap::new()),
             venue_rules: RwLock::new(HashMap::new()),
@@ -297,6 +299,12 @@ impl StubExchange {
     /// Number of simulated trading-rules resolutions for one symbol.
     pub fn set_venue_rules(&self, rules: robson_domain::SymbolTradingRules) {
         self.venue_rules.write().unwrap().insert(rules.symbol().as_pair(), rules);
+    }
+
+    /// The next market order fails inside the adapter, before any request: what
+    /// a real adapter does on an entry with no fresh metadata.
+    pub fn set_refuse_before_send_next(&self, refuse: bool) {
+        *self.refuse_before_send_next.write().unwrap() = refuse;
     }
 
     /// Refuse the next `count` placements with `ExecError::RulesRejected`.
@@ -747,6 +755,9 @@ impl venue::TradingPort for StubExchange {
         client_order_id: &str,
         intent: EntryOrReduce,
     ) -> Result<OrderResult, ExecError> {
+        if std::mem::take(&mut *self.refuse_before_send_next.write().unwrap()) {
+            return Err(ExecError::Exchange("Simulated refusal before the send".to_string()));
+        }
         *self.market_order_calls.write().unwrap() += 1;
         self.market_order_client_ids.write().unwrap().push(client_order_id.to_string());
         let attempt = self.submit_attempts.begin(client_order_id);
@@ -995,7 +1006,8 @@ impl venue::TradingPort for StubExchange {
                 fills: None,
             });
         }
-        Ok(STUB_FINALITY.classify_not_found(self.submit_attempts.evidence(client_order_id)))
+        Ok(STUB_FINALITY
+            .classify_not_found(self.submit_attempts.final_evidence(client_order_id).await))
     }
 
     async fn open_protective_orders(
@@ -1484,6 +1496,10 @@ impl venue::AccountPort for StubExchange {
 }
 
 impl venue::Venue for StubExchange {
+    fn attach_order_journal(&self, journal: std::sync::Arc<crate::order_journal::OrderJournal>) {
+        self.submit_attempts.attach_journal(journal);
+    }
+
     fn id(&self) -> &VenueId {
         &self.venue_id
     }

@@ -49,6 +49,7 @@ use uuid::Uuid;
 use crate::{
     error::ExecError,
     ports::StopCancelOutcome,
+    quantize::Submission,
     venue::{AttemptEvidence, VenueId},
 };
 
@@ -79,16 +80,17 @@ pub const DISCARDED_CAPACITY: usize = 4096;
 /// |---|---|
 /// | Entry (pre-send commit, result) | 9 |
 /// | Exit, stop or sweep close (one quantisation retry adds 4) | 9, 13 |
+/// | The same with a refused retry replaced by a fresh intent | 22 |
 /// | Cancel | 9 |
-/// | Stop placement with its predecessor's cancel | 22 |
-/// | Software exit: cancel, then exit | 22 |
-/// | Placement that withdraws both stops | 31 |
+/// | Stop placement with its predecessor's cancel | 31 |
+/// | Software exit: cancel, then exit | 31 |
+/// | Placement that withdraws both stops | 40 |
 ///
 /// Above the guardrails' default review threshold of 15, on purpose: the
 /// writes are few and small, each ordered pair is one order's durability, and
 /// the alternative is folding them into one statement per commit, which saves
 /// statements but not commits.
-pub const OPERATION_STATEMENT_BOUND: u32 = 31;
+pub const OPERATION_STATEMENT_BOUND: u32 = 40;
 /// The operated account: one per venue until a venue has several.
 pub const DEFAULT_ACCOUNT_SCOPE: &str = "operated";
 
@@ -495,6 +497,12 @@ struct IntentMemory {
     /// The pre-send commit itself is uncertain: not a proven no-send.
     commit_uncertain: bool,
     ticket_issued: bool,
+    /// Sends reported under this id, one per request that left.
+    tickets: u32,
+    /// The journal refused a further attempt on this id before it left.
+    retry_refused: bool,
+    /// The one fresh intent that took over after that refusal.
+    replaced_by: Option<JournaledIntent>,
     in_retry_set: bool,
 }
 
@@ -712,6 +720,9 @@ impl OrderJournal {
             sealed: false,
             commit_uncertain: false,
             ticket_issued: false,
+            tickets: 0,
+            retry_refused: false,
+            replaced_by: None,
             in_retry_set: false,
         });
         handle
@@ -745,6 +756,13 @@ impl OrderJournal {
                 return Err(SendRefusal::NotSent("operation is not registered".to_string()));
             }
             if state.discarded.contains(&intent.client_order_id) {
+                // Refused for good, but on the handle that sent it this is a
+                // refused retry like any other, eligible for a fresh id.
+                if let Some(memory) = state.intents.get_mut(&intent.client_order_id) {
+                    if memory.row.intent_id == intent.intent_id {
+                        memory.retry_refused = !memory.attempts.is_empty();
+                    }
+                }
                 return Err(SendRefusal::NotSent("the id was discarded".to_string()));
             }
             let Some(memory) = state.intents.get_mut(&intent.client_order_id) else {
@@ -754,6 +772,7 @@ impl OrderJournal {
                 return Err(SendRefusal::NotSent("the id is in use".to_string()));
             }
             if memory.sealed {
+                memory.retry_refused = !memory.attempts.is_empty();
                 return Err(SendRefusal::NotSent(
                     "an earlier commit on this id failed".to_string(),
                 ));
@@ -802,6 +821,7 @@ impl OrderJournal {
             return Err(SendRefusal::NotSent("the id's history is gone".to_string()));
         };
         memory.sealed = true;
+        memory.retry_refused = !first;
         match failure {
             CommitFailure::IdSpent => {
                 memory.attempts.retain(|attempt| attempt.row.attempt_id != attempt_id);
@@ -834,6 +854,82 @@ impl OrderJournal {
         error!(%client_order_id, "Journal cannot keep this send's id; non-reuse rests on freshness");
     }
 
+    /// Authorize one submission of a bounded reduction and return the client id
+    /// to send it under.
+    pub async fn authorize_reduction(
+        &self,
+        intent: &JournaledIntent,
+        submission: Submission,
+        fresh_client_order_id: impl FnOnce() -> String,
+    ) -> Result<String, ExecError> {
+        match submission {
+            Submission::First | Submission::SameIdRetry => {
+                self.before_send(intent, WriteClass::Bounded).await?;
+                Ok(intent.client_order_id.clone())
+            },
+            Submission::FreshIdAfterRefusedRetry { rules_rejection } => {
+                let fresh = self
+                    .replace_refused_retry(intent, fresh_client_order_id(), rules_rejection)
+                    .await?;
+                Ok(fresh.client_order_id)
+            },
+        }
+    }
+
+    /// Open the one fresh intent that replaces a refused resubmission. Only for
+    /// an intent whose retry the journal refused with exactly one request gone
+    /// out, the first, and only once; the refused id stays closed. It is a
+    /// bounded first attempt like any other.
+    async fn replace_refused_retry(
+        &self,
+        intent: &JournaledIntent,
+        fresh_client_order_id: String,
+        rules_rejection: String,
+    ) -> Result<JournaledIntent, SendRefusal> {
+        let spec = {
+            let state = self.lock();
+            let Some(memory) = state.intents.get(&intent.client_order_id) else {
+                return Err(SendRefusal::NotSent("the id's history is gone".to_string()));
+            };
+            if memory.row.intent_id != intent.intent_id
+                || !memory.retry_refused
+                || memory.tickets != 1
+                || memory.replaced_by.is_some()
+            {
+                return Err(SendRefusal::NotSent("this retry cannot be replaced".to_string()));
+            }
+            let mut params = memory.row.params.clone();
+            if let Value::Object(fields) = &mut params {
+                fields.insert(
+                    "replaces_client_order_id".to_string(),
+                    Value::String(intent.client_order_id.clone()),
+                );
+                fields.insert("first_rejection".to_string(), Value::String(rules_rejection));
+            }
+            IntentSpec {
+                position_id: memory.row.position_id,
+                kind: memory.row.kind,
+                client_order_id: fresh_client_order_id,
+                cancels_order_id: None,
+                params,
+            }
+        };
+        let fresh = self.open_intent(spec);
+        if let Some(memory) = self.lock().intents.get_mut(&intent.client_order_id) {
+            memory.replaced_by = Some(fresh.clone());
+        }
+        self.before_send(&fresh, WriteClass::Bounded).await?;
+        Ok(fresh)
+    }
+
+    fn replacement_of(&self, intent: &JournaledIntent) -> Option<JournaledIntent> {
+        let state = self.lock();
+        state
+            .intents
+            .get(&intent.client_order_id)
+            .and_then(|memory| memory.replaced_by.clone())
+    }
+
     /// Whether a request under this intent reached the venue adapter's send.
     pub fn ticket_issued(&self, intent: &JournaledIntent) -> bool {
         self.lock()
@@ -848,6 +944,7 @@ impl OrderJournal {
             return;
         };
         memory.ticket_issued = true;
+        memory.tickets += 1;
         let operation = memory.operation;
         if let Some(listed) = state.operations.get_mut(&operation) {
             if let Some(entry) = listed.iter_mut().find(|e| e.client_order_id == client_order_id) {
@@ -866,9 +963,15 @@ impl OrderJournal {
         }
     }
 
-    /// The venue accepted the order.
+    /// The venue accepted the order. After a replacement the acceptance is the
+    /// fresh intent's, and the refused one ends on its own attempts.
     pub async fn finish_success(&self, intent: &JournaledIntent, evidence: Option<Value>) {
-        self.write_outcome(intent, OutcomeRow {
+        let replacement = self.replacement_of(intent);
+        if replacement.is_some() {
+            self.finish_failed_own(intent).await;
+        }
+        let accepted = replacement.as_ref().unwrap_or(intent);
+        self.write_outcome(accepted, OutcomeRow {
             venue_outcome: Some(VenueOutcome::Success),
             venue_evidence: evidence,
             ..OutcomeRow::default()
@@ -880,6 +983,13 @@ impl OrderJournal {
     /// was authoritatively refused, marked not sent if no request left,
     /// otherwise uncertain.
     pub async fn finish_failed(&self, intent: &JournaledIntent) {
+        if let Some(fresh) = self.replacement_of(intent) {
+            self.finish_failed_own(&fresh).await;
+        }
+        self.finish_failed_own(intent).await;
+    }
+
+    async fn finish_failed_own(&self, intent: &JournaledIntent) {
         let outcome = {
             let mut state = self.lock();
             let Some(memory) = state.intents.get_mut(&intent.client_order_id) else {
@@ -1861,18 +1971,84 @@ mod tests {
     async fn an_operation_past_its_bound_is_counted() {
         let (_backend, journal) = journal();
         let ((), operation) = in_op(&journal, async {
-            for index in 0..4 {
+            for index in 0..5 {
                 let intent = journal.open_intent(spec(&format!("o{index}"), IntentKind::Exit));
                 journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
                 journal.finish_failed(&intent).await;
             }
         })
         .await;
-        assert_eq!(operation.journal_statements(), 36);
+        assert_eq!(operation.journal_statements(), 45);
         assert_eq!(journal.operations_over_statement_bound(), 0, "counted when it ends");
         drop(operation);
         assert_eq!(journal.operations_over_statement_bound(), 1);
-        assert_eq!(journal.operation_statements_max(), 36);
+        assert_eq!(journal.operation_statements_max(), 45);
+    }
+
+    /// A refused retry with one request out may be replaced, once; the refused
+    /// id stays closed.
+    #[tokio::test]
+    async fn a_refused_retry_is_replaced_once_and_its_id_stays_closed() {
+        let (backend, journal) = journal();
+        let ledger = SubmitAttemptLedger::new(8);
+        let ((), _op) = in_op(&journal, async {
+            let intent = journal.open_intent(spec("a", IntentKind::Exit));
+            journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
+            let _ = ledger.begin("a");
+            backend.push_fault(JournalFault::Known);
+            journal.before_send(&intent, WriteClass::Bounded).await.unwrap_err();
+
+            let fresh = journal
+                .replace_refused_retry(&intent, "b".to_string(), "rules".to_string())
+                .await
+                .unwrap();
+            assert_eq!(fresh.client_order_id(), "b");
+            let again = journal
+                .replace_refused_retry(&intent, "c".to_string(), "rules".to_string())
+                .await;
+            assert!(again.is_err(), "one fallback only: {again:?}");
+            assert!(journal.before_send(&intent, WriteClass::Bounded).await.is_err());
+
+            let _ = ledger.begin("b");
+            journal.finish_success(&intent, None).await;
+        })
+        .await;
+        let sealed = backend.row("a").unwrap();
+        assert!(
+            sealed.outcome.unwrap().uncertain_at.is_some(),
+            "the refused id is not a success"
+        );
+        let fresh = backend.row("b").unwrap();
+        assert_eq!(fresh.outcome.unwrap().venue_outcome, Some(VenueOutcome::Success));
+        assert_eq!(fresh.intent.unwrap().params["replaces_client_order_id"], "a");
+    }
+
+    /// Nothing refused, or a retry that did leave: no replacement.
+    #[tokio::test]
+    async fn a_retry_that_was_not_refused_or_did_leave_cannot_be_replaced() {
+        let (backend, journal) = journal();
+        let ledger = SubmitAttemptLedger::new(8);
+        let ((), _op) = in_op(&journal, async {
+            let accepted = journal.open_intent(spec("a", IntentKind::Exit));
+            journal.before_send(&accepted, WriteClass::Bounded).await.unwrap();
+            let _ = ledger.begin("a");
+            let not_refused =
+                journal.replace_refused_retry(&accepted, "b".to_string(), "r".to_string()).await;
+            assert!(not_refused.is_err(), "{not_refused:?}");
+
+            // Two requests left under this id, then a third was refused.
+            let twice = journal.open_intent(spec("t", IntentKind::Exit));
+            journal.before_send(&twice, WriteClass::Bounded).await.unwrap();
+            let _ = ledger.begin("t");
+            journal.before_send(&twice, WriteClass::Bounded).await.unwrap();
+            let _ = ledger.begin("t");
+            backend.push_fault(JournalFault::Known);
+            journal.before_send(&twice, WriteClass::Bounded).await.unwrap_err();
+            let out_twice =
+                journal.replace_refused_retry(&twice, "u".to_string(), "r".to_string()).await;
+            assert!(out_twice.is_err(), "{out_twice:?}");
+        })
+        .await;
     }
 
     // Rule 4 ------------------------------------------------------------------

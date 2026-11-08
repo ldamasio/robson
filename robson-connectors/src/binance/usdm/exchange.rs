@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol, SymbolTradingRules};
 use robson_exec::{
+    order_journal::OrderJournal,
     ports::{
         ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord, IncomeType,
         OpenOrderRecord, SpotBalance, SpotOrder, SpotOrderQuantity, SpotOrderRequest,
@@ -1070,9 +1071,8 @@ impl TradingPort for BinanceExchangeAdapter {
         }
         match self.client.query_algo_order_by_client_id(client_order_id).await {
             Ok(detail) => self.algo_order_lookup(symbol, &detail).await,
-            Err(BinanceRestError::ApiError { code: -2013, .. }) => {
-                Ok(USDM_FINALITY.classify_not_found(self.submit_attempts.evidence(client_order_id)))
-            },
+            Err(BinanceRestError::ApiError { code: -2013, .. }) => Ok(USDM_FINALITY
+                .classify_not_found(self.submit_attempts.final_evidence(client_order_id).await)),
             Err(error) => Err(Self::map_error(error)),
         }
     }
@@ -1470,6 +1470,10 @@ impl AccountPort for BinanceExchangeAdapter {
 }
 
 impl Venue for BinanceExchangeAdapter {
+    fn attach_order_journal(&self, journal: Arc<OrderJournal>) {
+        self.submit_attempts.attach_journal(journal);
+    }
+
     fn id(&self) -> &VenueId {
         &self.venue_id
     }
@@ -2034,7 +2038,7 @@ mod submit_attempt_evidence {
             Quantity::new(dec!(0.0015)).unwrap(),
             None,
             quantize::METADATA_WAIT_BOUND,
-            |submitted, _| {
+            |submitted, _, _| {
                 TradingPort::place_market_order(
                     &*venue,
                     &symbol,
@@ -2075,7 +2079,7 @@ mod submit_attempt_evidence {
             Quantity::new(dec!(0.0005)).unwrap(),
             Some(&held),
             quantize::METADATA_WAIT_BOUND,
-            |submitted, _| {
+            |submitted, _, _| {
                 assert_eq!(submitted.as_decimal(), dec!(0.0005), "raw, not refused locally");
                 TradingPort::place_market_order(
                     &*venue,

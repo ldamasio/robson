@@ -15,6 +15,7 @@ use robson_domain::{
     ReconciliationEvidence, Side, Symbol, UserTradeEvidence,
 };
 use robson_exec::{
+    order_journal::{IntentKind, IntentSpec},
     quantize::{self, ReductionOutcome},
     ExchangePort, ExchangePosition, ExecError, OpenOrderRecord, OrderResult, UserTradeRecord,
 };
@@ -621,8 +622,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                     "Orphan insurance-stop order detected; cancelling"
                 );
 
-                match self.exchange.cancel_stop_market_order(symbol, &order.exchange_order_id).await
-                {
+                let journal = self.position_manager.read().await.order_journal();
+                let operation = journal.begin_operation();
+                let cancelled = operation
+                    .scope(journal.journaled_cancel(
+                        None,
+                        &order.exchange_order_id,
+                        self.exchange.cancel_stop_market_order(symbol, &order.exchange_order_id),
+                    ))
+                    .await;
+                match cancelled {
                     // An orphan stop is not attached to any tracked position, so
                     // either outcome leaves the exchange in the desired state:
                     // the order is gone.
@@ -922,28 +931,69 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         // be off the grid after a lot-rule change, so it rounds on the rules held
         // and a rules rejection earns one refresh and one resubmission. Whatever
         // rounding leaves is reported by the next scan.
-        let outcome = quantize::submit_reduction(
-            &*self.exchange,
-            &exchange_position.symbol,
-            exchange_position.quantity,
-            None,
-            quantize::METADATA_WAIT_BOUND,
-            |quantity, _rules| {
-                self.exchange.close_position_market(
+        let journal = self.position_manager.read().await.order_journal();
+        let operation = journal.begin_operation();
+        let outcome = operation
+            .scope(async {
+                let journaled = journal.open_intent(IntentSpec {
+                    position_id: None,
+                    kind: IntentKind::SweepClose,
+                    client_order_id: client_order_id.clone(),
+                    cancels_order_id: None,
+                    params: serde_json::json!({
+                        "symbol": exchange_position.symbol.as_pair(),
+                        "side": exchange_position.side,
+                        "quantity": exchange_position.quantity.as_decimal(),
+                    }),
+                });
+                let outcome = quantize::submit_reduction(
+                    &*self.exchange,
                     &exchange_position.symbol,
-                    exchange_position.side,
-                    quantity,
-                    &client_order_id,
+                    exchange_position.quantity,
+                    None,
+                    quantize::METADATA_WAIT_BOUND,
+                    |quantity, _rules, submission| {
+                        let (journal, journaled, position) =
+                            (&journal, &journaled, &exchange_position);
+                        async move {
+                            let client_order_id = journal
+                                .authorize_reduction(journaled, submission, || {
+                                    Uuid::now_v7().to_string()
+                                })
+                                .await?;
+                            self.exchange
+                                .close_position_market(
+                                    &position.symbol,
+                                    position.side,
+                                    quantity,
+                                    &client_order_id,
+                                )
+                                .await
+                        }
+                    },
                 )
-            },
-        )
-        .await
-        .and_then(|outcome| match outcome {
-            ReductionOutcome::Submitted { accepted, .. } => Ok(accepted),
-            ReductionOutcome::NotExecutable { residual, .. } => Err(ExecError::OrderRejected(
-                format!("{residual} rounds below the lot minimum; nothing can be submitted"),
-            )),
-        });
+                .await
+                .and_then(|outcome| match outcome {
+                    ReductionOutcome::Submitted { accepted, .. } => Ok(accepted),
+                    ReductionOutcome::NotExecutable { residual, .. } => {
+                        Err(ExecError::OrderRejected(format!(
+                            "{residual} rounds below the lot minimum; nothing can be submitted"
+                        )))
+                    },
+                });
+                match &outcome {
+                    Ok(order) => {
+                        let evidence = serde_json::json!({
+                            "exchange_order_id": order.exchange_order_id,
+                            "filled_quantity": order.filled_quantity.as_decimal(),
+                        });
+                        journal.finish_success(&journaled, Some(evidence)).await;
+                    },
+                    Err(_) => journal.finish_failed(&journaled).await,
+                }
+                outcome
+            })
+            .await;
         match outcome {
             Ok(order) => {
                 info!(
@@ -1224,7 +1274,10 @@ mod tests {
         Symbol, TradingPolicy,
     };
     use robson_engine::Engine;
-    use robson_exec::{Executor, IntentJournal, OrderResult, StubExchange, UserTradeRecord};
+    use robson_exec::{
+        order_journal::{OrderJournal, StubJournalBackend},
+        Executor, IntentJournal, OrderResult, StubExchange, UserTradeRecord,
+    };
     use robson_store::{MemoryStore, Store};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -1234,13 +1287,68 @@ mod tests {
     use super::*;
     use crate::query_engine::TracingQueryRecorder;
 
+    /// A worker whose manager writes to a scripted journal.
+    fn journaled_worker(
+        exchange: Arc<StubExchange>,
+        store: Arc<MemoryStore>,
+        event_bus: Arc<EventBus>,
+    ) -> (ReconciliationWorker<StubExchange, MemoryStore>, Arc<StubJournalBackend>) {
+        let (worker, backend, _) = journaled_worker_and_journal(exchange, store, event_bus);
+        (worker, backend)
+    }
+
+    fn journaled_worker_and_journal(
+        exchange: Arc<StubExchange>,
+        store: Arc<MemoryStore>,
+        event_bus: Arc<EventBus>,
+    ) -> (
+        ReconciliationWorker<StubExchange, MemoryStore>,
+        Arc<StubJournalBackend>,
+        Arc<OrderJournal>,
+    ) {
+        let backend = Arc::new(StubJournalBackend::default());
+        let journal = Arc::new(OrderJournal::new(
+            backend.clone(),
+            &robson_exec::venue::VenueId::new("test:venue"),
+        ));
+        let position_manager = create_journaled_position_manager(
+            exchange.clone(),
+            store.clone(),
+            event_bus.clone(),
+            Some(journal.clone()),
+        );
+        let worker = ReconciliationWorker::new_with_missing_grace(
+            exchange,
+            position_manager,
+            store,
+            event_bus,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            CancellationToken::new(),
+        );
+        (worker, backend, journal)
+    }
+
     fn create_position_manager(
         exchange: Arc<StubExchange>,
         store: Arc<MemoryStore>,
         event_bus: Arc<EventBus>,
     ) -> Arc<RwLock<PositionManager<StubExchange, MemoryStore>>> {
+        create_journaled_position_manager(exchange, store, event_bus, None)
+    }
+
+    fn create_journaled_position_manager(
+        exchange: Arc<StubExchange>,
+        store: Arc<MemoryStore>,
+        event_bus: Arc<EventBus>,
+        order_journal: Option<Arc<OrderJournal>>,
+    ) -> Arc<RwLock<PositionManager<StubExchange, MemoryStore>>> {
         let journal = Arc::new(IntentJournal::new());
-        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let executor = Executor::new(exchange, journal, store.clone());
+        let executor = Arc::new(match order_journal {
+            Some(order_journal) => executor.with_order_journal(order_journal),
+            None => executor,
+        });
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
 
@@ -1560,6 +1668,141 @@ mod tests {
 
         let second = receiver.recv().await.unwrap().unwrap();
         assert!(matches!(second, DaemonEvent::SafetyExitExecuted { .. }));
+    }
+
+    /// ADR-0056 step 7: an UNTRACKED close is a reduction like any other, with
+    /// its own intent and its result on it.
+    #[tokio::test]
+    async fn an_untracked_close_is_journaled_as_a_sweep_close() {
+        use robson_exec::order_journal::{IntentKind, VenueOutcome};
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        exchange.set_open_position(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        let (worker, backend) = journaled_worker(exchange, store, event_bus);
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        let row = backend.rows().pop().expect("a row");
+        assert_eq!(row.intent.unwrap().kind, IntentKind::SweepClose);
+        assert_eq!(row.attempts.len(), 1);
+        assert_eq!(row.outcome.unwrap().venue_outcome, Some(VenueOutcome::Success));
+    }
+
+    /// A sweep close is a reduction: it goes out with the journal's memories
+    /// full and its writes failing.
+    #[tokio::test]
+    async fn a_saturated_failing_journal_stops_no_sweep_close() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        exchange.set_open_position(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        let (worker, backend, journal) =
+            journaled_worker_and_journal(exchange.clone(), store, event_bus);
+        backend.saturate(&journal).await;
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(exchange.open_positions_len(), 0, "the close reached the venue");
+        assert!(journal.non_reuse_ids_lost() > 0);
+    }
+
+    /// A sweep close has the same resubmission and the same fallback.
+    #[tokio::test]
+    async fn a_refused_sweep_retry_closes_under_a_fresh_id() {
+        use robson_exec::order_journal::{IntentKind, JournalFault};
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        exchange.set_open_position(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        exchange.set_trading_rules(
+            robson_domain::SymbolTradingRules::new(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                dec!(0.1),
+                dec!(0),
+                dec!(0.001),
+                dec!(0.001),
+                dec!(120),
+                dec!(0),
+                2,
+                3,
+            )
+            .unwrap(),
+        );
+        exchange.set_rules_rejections_next(1);
+        let (worker, backend) = journaled_worker(exchange.clone(), store, event_bus);
+        backend.fail_commit(1, Some(JournalFault::Known));
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(exchange.open_positions_len(), 0, "the fresh close reached the venue");
+        let closes = backend
+            .rows()
+            .into_iter()
+            .filter(|row| row.intent.as_ref().unwrap().kind == IntentKind::SweepClose)
+            .count();
+        assert_eq!(closes, 2, "the sealed intent and the fresh one");
+    }
+
+    /// An orphan's cancel is its own intent, naming the order it cancels.
+    #[tokio::test]
+    async fn an_orphan_cancel_is_journaled_against_the_order_it_cancels() {
+        use robson_exec::order_journal::IntentKind;
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol.clone(), Side::Long);
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some("CURRENT-STOP".to_string());
+        }
+        position.insurance_stop_id = Some("CURRENT-STOP".to_string());
+        store.positions().save(&position).await.unwrap();
+        let orphan = exchange
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.010)).unwrap(),
+                Price::new(dec!(99)).unwrap(),
+                "ins-orphan-1",
+            )
+            .await
+            .unwrap();
+        exchange.set_open_position(
+            symbol,
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        let (worker, backend) = journaled_worker(exchange.clone(), store, event_bus);
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert!(!exchange.has_stop_order(&orphan.exchange_order_id));
+        let cancel = backend
+            .rows()
+            .into_iter()
+            .find(|row| row.intent.as_ref().unwrap().kind == IntentKind::Cancel)
+            .expect("the cancel is journaled");
+        assert_eq!(
+            cancel.intent.unwrap().cancels_order_id.as_deref(),
+            Some(orphan.exchange_order_id.as_str())
+        );
     }
 
     #[tokio::test]
