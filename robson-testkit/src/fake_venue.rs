@@ -349,48 +349,53 @@ mod tests {
 
     #[tokio::test]
     async fn counts_follow_what_the_venue_did() {
-        let venue = FakeVenue::start().await.unwrap();
-        let base = venue.url();
+        let exchange = async {
+            let venue = FakeVenue::start().await.unwrap();
+            let base = venue.url();
 
-        let order = |id: &str, side: &str, reduce: &str| {
-            format!(
-                "{base}/fapi/v1/order?symbol={FAKE_SYMBOL}&side={side}&type=MARKET&quantity=2\
+            let order = |id: &str, side: &str, reduce: &str| {
+                format!(
+                    "{base}/fapi/v1/order?symbol={FAKE_SYMBOL}&side={side}&type=MARKET&quantity=2\
                  &newClientOrderId={id}&reduceOnly={reduce}"
-            )
-        };
-        assert!(post(order("entry-1", "BUY", "false")).await.status().is_success());
-        assert_eq!(venue.position(FAKE_SYMBOL), Decimal::from(2));
+                )
+            };
+            assert!(post(order("entry-1", "BUY", "false")).await.status().is_success());
+            assert_eq!(venue.position(FAKE_SYMBOL), Decimal::from(2));
 
-        // The same client id is refused and changes nothing.
-        let duplicate = post(order("entry-1", "BUY", "false")).await;
-        assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(venue.counts(), VenueCounts { accepted_orders: 1, fills: 1, cancels: 0 });
+            // The same client id is refused and changes nothing.
+            let duplicate = post(order("entry-1", "BUY", "false")).await;
+            assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(venue.counts(), VenueCounts { accepted_orders: 1, fills: 1, cancels: 0 });
 
-        let stop = post(format!(
+            let stop = post(format!(
             "{base}/fapi/v1/algoOrder?symbol={FAKE_SYMBOL}&side=SELL&quantity=2&triggerPrice=96\
              &reduceOnly=true&clientAlgoId=ins-1"
         ))
-        .await
-        .json::<Value>()
-        .await
-        .unwrap();
-        let algo_id = stop["algoId"].as_i64().unwrap();
-        let cancel = |id: i64| format!("{base}/fapi/v1/algoOrder?algoId={id}");
-        let client = reqwest::Client::new();
-        assert!(client.delete(cancel(algo_id)).send().await.unwrap().status().is_success());
-        // Already gone: refused, not counted twice.
-        assert_eq!(
-            client.delete(cancel(algo_id)).send().await.unwrap().status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(venue.counts(), VenueCounts { accepted_orders: 2, fills: 1, cancels: 1 });
+            .await
+            .json::<Value>()
+            .await
+            .unwrap();
+            let algo_id = stop["algoId"].as_i64().unwrap();
+            let cancel = |id: i64| format!("{base}/fapi/v1/algoOrder?algoId={id}");
+            let client = reqwest::Client::new();
+            assert!(client.delete(cancel(algo_id)).send().await.unwrap().status().is_success());
+            // Already gone: refused, not counted twice.
+            assert_eq!(
+                client.delete(cancel(algo_id)).send().await.unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(venue.counts(), VenueCounts { accepted_orders: 2, fills: 1, cancels: 1 });
 
-        assert!(post(order("close-1", "SELL", "true")).await.status().is_success());
-        assert!(venue.position(FAKE_SYMBOL).is_zero());
-        assert_eq!(venue.counts(), VenueCounts { accepted_orders: 3, fills: 2, cancels: 1 });
-        assert!(venue.unserved_requests().is_empty());
+            assert!(post(order("close-1", "SELL", "true")).await.status().is_success());
+            assert!(venue.position(FAKE_SYMBOL).is_zero());
+            assert_eq!(venue.counts(), VenueCounts { accepted_orders: 3, fills: 2, cancels: 1 });
+            assert!(venue.unserved_requests().is_empty());
 
-        assert_eq!(post(format!("{base}/nope")).await.status(), StatusCode::NOT_FOUND);
-        assert_eq!(venue.unserved_requests(), ["POST /nope"]);
+            assert_eq!(post(format!("{base}/nope")).await.status(), StatusCode::NOT_FOUND);
+            assert_eq!(venue.unserved_requests(), ["POST /nope"]);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), exchange)
+            .await
+            .expect("the venue self-test hung");
     }
 }

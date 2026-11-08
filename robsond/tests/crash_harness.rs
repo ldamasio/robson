@@ -13,7 +13,7 @@
 
 #![cfg(all(feature = "postgres", feature = "crash-points"))]
 
-use std::{os::unix::process::ExitStatusExt, path::PathBuf, time::Duration};
+use std::{future::Future, os::unix::process::ExitStatusExt, path::PathBuf, time::Duration};
 
 use robson_exec::crash_points::{ENTRY_AFTER_ACK, ENTRY_BEFORE_SEND};
 use robson_testkit::{
@@ -30,6 +30,15 @@ use uuid::Uuid;
 const DAEMON_DEADLINE: Duration = Duration::from_secs(90);
 /// Time a step may take before the test fails with the daemon's log.
 const STEP: Duration = Duration::from_secs(60);
+
+/// Whole-test limits: a stuck database or daemon wait fails the test. Dropping
+/// the test future also kills and reaps any daemon it still holds.
+const DAEMON_TEST_LIMIT: Duration = Duration::from_secs(240);
+const PROXY_TEST_LIMIT: Duration = Duration::from_secs(30);
+
+async fn within<T>(limit: Duration, test: impl Future<Output = T>) -> T {
+    tokio::time::timeout(limit, test).await.expect("the test exceeded its limit")
+}
 
 /// One test's world: the fake venue, the proxy in front of the test database,
 /// and a direct connection for reading ground truth around the proxy.
@@ -139,44 +148,55 @@ fn arm_immediate(api_url: String) -> tokio::task::JoinHandle<Result<Value, Strin
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn killed_after_the_venue_acked_the_fill_exists_only_on_the_venue(pool: PgPool) {
-    let harness = Harness::start(pool).await;
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
 
-    let daemon = harness.daemon(Some(ENTRY_AFTER_ACK));
-    daemon.wait_ready(STEP).await.expect("daemon ready");
-    assert!(
-        harness.proxy.stats().connections > 0,
-        "the daemon reaches the database via the proxy"
-    );
-    let request = arm_immediate(daemon.api_url());
-    daemon
-        .wait_killed_at(ENTRY_AFTER_ACK, STEP)
-        .await
-        .expect("killed at the crash point");
-    assert!(request.await.unwrap().is_err(), "the caller never got an answer");
+        let daemon = harness.daemon(Some(ENTRY_AFTER_ACK));
+        daemon.wait_ready(STEP).await.expect("daemon ready");
+        assert!(
+            harness.proxy.stats().connections > 0,
+            "the daemon reaches the database via the proxy"
+        );
+        let request = arm_immediate(daemon.api_url());
+        daemon
+            .wait_killed_at(ENTRY_AFTER_ACK, STEP)
+            .await
+            .expect("killed at the crash point");
+        assert!(request.await.unwrap().is_err(), "the caller never got an answer");
 
-    assert_eq!(harness.venue.counts(), VenueCounts { accepted_orders: 1, fills: 1, cancels: 0 });
-    assert!(
-        harness.venue.position(FAKE_SYMBOL) > Decimal::ZERO,
-        "the fill is open on the venue"
-    );
-    assert!(
-        harness.venue.unserved_requests().is_empty(),
-        "{:?}",
-        harness.venue.unserved_requests()
-    );
-    let events = harness.event_types().await;
-    assert!(events.iter().any(|e| e == "position_armed"), "{events:?}");
-    assert!(!events.iter().any(|e| e == "entry_order_accepted"), "{events:?}");
-    drop(daemon);
+        assert_eq!(harness.venue.counts(), VenueCounts {
+            accepted_orders: 1,
+            fills: 1,
+            cancels: 0
+        });
+        assert!(
+            harness.venue.position(FAKE_SYMBOL) > Decimal::ZERO,
+            "the fill is open on the venue"
+        );
+        assert!(
+            harness.venue.unserved_requests().is_empty(),
+            "{:?}",
+            harness.venue.unserved_requests()
+        );
+        let events = harness.event_types().await;
+        assert!(events.iter().any(|e| e == "position_armed"), "{events:?}");
+        assert!(!events.iter().any(|e| e == "entry_order_accepted"), "{events:?}");
+        drop(daemon);
 
-    // The projection still reads Armed, so the restart stops at the startup
-    // gate (exit 78) before any sweep. Nothing is closed: the fill stays open
-    // on the venue with no stop.
-    let restarted = harness.daemon(None);
-    let status = restarted.wait_exit(STEP).await.expect("the restart stops by itself");
-    assert_eq!(status.code(), Some(78), "startup gate\n{}", restarted.log_tail());
-    assert_eq!(harness.venue.counts(), VenueCounts { accepted_orders: 1, fills: 1, cancels: 0 });
-    assert!(harness.venue.position(FAKE_SYMBOL) > Decimal::ZERO);
+        // The projection still reads Armed, so the restart stops at the startup
+        // gate (exit 78) before any sweep. Nothing is closed: the fill stays open
+        // on the venue with no stop.
+        let restarted = harness.daemon(None);
+        let status = restarted.wait_exit(STEP).await.expect("the restart stops by itself");
+        assert_eq!(status.code(), Some(78), "startup gate\n{}", restarted.log_tail());
+        assert_eq!(harness.venue.counts(), VenueCounts {
+            accepted_orders: 1,
+            fills: 1,
+            cancels: 0
+        });
+        assert!(harness.venue.position(FAKE_SYMBOL) > Decimal::ZERO);
+    })
+    .await;
 }
 
 fn stuck_spec(work_dir: PathBuf) -> DaemonSpec {
@@ -281,21 +301,24 @@ async fn a_stuck_daemon_kills_itself_at_its_own_deadline() {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn killed_before_the_send_the_venue_saw_nothing(pool: PgPool) {
-    let harness = Harness::start(pool).await;
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
 
-    let daemon = harness.daemon(Some(ENTRY_BEFORE_SEND));
-    daemon.wait_ready(STEP).await.expect("daemon ready");
-    let request = arm_immediate(daemon.api_url());
-    daemon
-        .wait_killed_at(ENTRY_BEFORE_SEND, STEP)
-        .await
-        .expect("killed at the crash point");
-    assert!(request.await.unwrap().is_err(), "the caller never got an answer");
+        let daemon = harness.daemon(Some(ENTRY_BEFORE_SEND));
+        daemon.wait_ready(STEP).await.expect("daemon ready");
+        let request = arm_immediate(daemon.api_url());
+        daemon
+            .wait_killed_at(ENTRY_BEFORE_SEND, STEP)
+            .await
+            .expect("killed at the crash point");
+        assert!(request.await.unwrap().is_err(), "the caller never got an answer");
 
-    assert_eq!(harness.venue.counts(), VenueCounts::default());
-    assert!(harness.venue.position(FAKE_SYMBOL).is_zero());
-    let events = harness.event_types().await;
-    assert!(events.iter().any(|e| e == "position_armed"), "{events:?}");
+        assert_eq!(harness.venue.counts(), VenueCounts::default());
+        assert!(harness.venue.position(FAKE_SYMBOL).is_zero());
+        let events = harness.event_types().await;
+        assert!(events.iter().any(|e| e == "position_armed"), "{events:?}");
+    })
+    .await;
 }
 
 /// The fake venue is good enough for the whole healthy path of the real
@@ -304,43 +327,50 @@ async fn killed_before_the_send_the_venue_saw_nothing(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn with_no_crash_point_the_real_binary_runs_a_full_position(pool: PgPool) {
-    let harness = Harness::start(pool).await;
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
 
-    let daemon = harness.daemon_with_env(None, &[("ROBSON_RECONCILIATION_INTERVAL_SECS", "1")]);
-    daemon.wait_ready(STEP).await.expect("daemon ready");
-    let armed = arm_immediate(daemon.api_url()).await.unwrap().expect("arm succeeds");
-    // Cancels are asserted at the end: the 1 s scan can run at any moment.
-    let after_arm = harness.venue.counts();
-    assert_eq!((after_arm.accepted_orders, after_arm.fills), (2, 1), "{after_arm:?}");
-    assert!(harness.venue.orders()[1].conditional, "{:?}", harness.venue.orders());
+        let daemon = harness.daemon_with_env(None, &[("ROBSON_RECONCILIATION_INTERVAL_SECS", "1")]);
+        daemon.wait_ready(STEP).await.expect("daemon ready");
+        let armed = arm_immediate(daemon.api_url()).await.unwrap().expect("arm succeeds");
+        // Cancels are asserted at the end: the 1 s scan can run at any moment.
+        let after_arm = harness.venue.counts();
+        assert_eq!((after_arm.accepted_orders, after_arm.fills), (2, 1), "{after_arm:?}");
+        assert!(harness.venue.orders()[1].conditional, "{:?}", harness.venue.orders());
 
-    let position_id = armed["position_id"].as_str().expect("position id");
-    let response = reqwest::Client::new()
-        .delete(format!("{}/positions/{position_id}", daemon.api_url()))
-        .timeout(STEP)
-        .send()
-        .await
-        .expect("close");
-    assert!(response.status().is_success(), "{}", daemon.log_tail());
-    let after_close = harness.venue.counts();
-    assert_eq!((after_close.accepted_orders, after_close.fills), (3, 2), "{after_close:?}");
+        let position_id = armed["position_id"].as_str().expect("position id");
+        let response = reqwest::Client::new()
+            .delete(format!("{}/positions/{position_id}", daemon.api_url()))
+            .timeout(STEP)
+            .send()
+            .await
+            .expect("close");
+        assert!(response.status().is_success(), "{}", daemon.log_tail());
+        let after_close = harness.venue.counts();
+        assert_eq!((after_close.accepted_orders, after_close.fills), (3, 2), "{after_close:?}");
 
-    // The next scan treats the now uncovered stop as an orphan and cancels it.
-    let swept = async {
-        while harness.venue.counts().cancels == 0 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    };
-    tokio::time::timeout(STEP, swept)
-        .await
-        .expect("the sweep cancels the orphan stop");
-    assert_eq!(harness.venue.counts(), VenueCounts { accepted_orders: 3, fills: 2, cancels: 1 });
-    assert!(harness.venue.position(FAKE_SYMBOL).is_zero());
-    assert!(
-        harness.venue.unserved_requests().is_empty(),
-        "{:?}",
-        harness.venue.unserved_requests()
-    );
+        // The next scan treats the now uncovered stop as an orphan and cancels it.
+        let swept = async {
+            while harness.venue.counts().cancels == 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::time::timeout(STEP, swept)
+            .await
+            .expect("the sweep cancels the orphan stop");
+        assert_eq!(harness.venue.counts(), VenueCounts {
+            accepted_orders: 3,
+            fills: 2,
+            cancels: 1
+        });
+        assert!(harness.venue.position(FAKE_SYMBOL).is_zero());
+        assert!(
+            harness.venue.unserved_requests().is_empty(),
+            "{:?}",
+            harness.venue.unserved_requests()
+        );
+    })
+    .await;
 }
 
 fn insert_probe(
@@ -373,17 +403,20 @@ async fn proxied_connection(pool: PgPool) -> (Harness, PgConnection) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn proxy_drops_the_commit_ack_after_the_commit_landed(pool: PgPool) {
-    let (harness, mut connection) = proxied_connection(pool).await;
+    within(PROXY_TEST_LIMIT, async move {
+        let (harness, mut connection) = proxied_connection(pool).await;
 
-    harness.proxy.set_mode(ProxyMode::DropCommitAck);
-    let mut tx = connection.begin().await.unwrap();
-    insert_probe(1).execute(&mut *tx).await.unwrap();
-    assert!(tx.commit().await.is_err(), "the client must see no acknowledgement");
+        harness.proxy.set_mode(ProxyMode::DropCommitAck);
+        let mut tx = connection.begin().await.unwrap();
+        insert_probe(1).execute(&mut *tx).await.unwrap();
+        assert!(tx.commit().await.is_err(), "the client must see no acknowledgement");
 
-    assert_eq!(probe_rows(&harness.pool).await, 1, "the commit landed on the server");
-    let stats = harness.proxy.stats();
-    assert_eq!((stats.commits, stats.commit_acks_dropped), (1, 1));
-    assert_eq!(harness.proxy.mode(), ProxyMode::Pass, "one-shot");
+        assert_eq!(probe_rows(&harness.pool).await, 1, "the commit landed on the server");
+        let stats = harness.proxy.stats();
+        assert_eq!((stats.commits, stats.commit_acks_dropped), (1, 1));
+        assert_eq!(harness.proxy.mode(), ProxyMode::Pass, "one-shot");
+    })
+    .await;
 }
 
 /// `sqlx::query("COMMIT")` uses the extended protocol, which the fault does not
@@ -391,46 +424,55 @@ async fn proxy_drops_the_commit_ack_after_the_commit_landed(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn proxy_leaves_an_extended_protocol_commit_alone(pool: PgPool) {
-    let (harness, mut connection) = proxied_connection(pool).await;
+    within(PROXY_TEST_LIMIT, async move {
+        let (harness, mut connection) = proxied_connection(pool).await;
 
-    harness.proxy.set_mode(ProxyMode::DropCommitAck);
-    sqlx::query("BEGIN").execute(&mut connection).await.unwrap();
-    insert_probe(1).execute(&mut connection).await.unwrap();
-    sqlx::query("COMMIT").execute(&mut connection).await.expect("acknowledged");
+        harness.proxy.set_mode(ProxyMode::DropCommitAck);
+        sqlx::query("BEGIN").execute(&mut connection).await.unwrap();
+        insert_probe(1).execute(&mut connection).await.unwrap();
+        sqlx::query("COMMIT").execute(&mut connection).await.expect("acknowledged");
 
-    assert_eq!(probe_rows(&harness.pool).await, 1);
-    let stats = harness.proxy.stats();
-    assert_eq!((stats.commits, stats.commit_acks_dropped), (0, 0));
-    assert_eq!(harness.proxy.mode(), ProxyMode::DropCommitAck, "still armed");
+        assert_eq!(probe_rows(&harness.pool).await, 1);
+        let stats = harness.proxy.stats();
+        assert_eq!((stats.commits, stats.commit_acks_dropped), (0, 0));
+        assert_eq!(harness.proxy.mode(), ProxyMode::DropCommitAck, "still armed");
+    })
+    .await;
 }
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn proxy_passes_a_commit_through(pool: PgPool) {
-    let (harness, mut connection) = proxied_connection(pool).await;
+    within(PROXY_TEST_LIMIT, async move {
+        let (harness, mut connection) = proxied_connection(pool).await;
 
-    let mut tx = connection.begin().await.unwrap();
-    insert_probe(1).execute(&mut *tx).await.unwrap();
-    tx.commit().await.expect("acknowledged");
+        let mut tx = connection.begin().await.unwrap();
+        insert_probe(1).execute(&mut *tx).await.unwrap();
+        tx.commit().await.expect("acknowledged");
 
-    assert_eq!(probe_rows(&harness.pool).await, 1);
-    assert_eq!(harness.proxy.stats().commits, 1);
+        assert_eq!(probe_rows(&harness.pool).await, 1);
+        assert_eq!(harness.proxy.stats().commits, 1);
+    })
+    .await;
 }
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn proxy_sever_closes_connections_until_passing_again(pool: PgPool) {
-    let (harness, mut connection) = proxied_connection(pool).await;
+    within(PROXY_TEST_LIMIT, async move {
+        let (harness, mut connection) = proxied_connection(pool).await;
 
-    harness.proxy.set_mode(ProxyMode::Sever);
-    assert!(insert_probe(1).execute(&mut connection).await.is_err());
-    assert!(PgConnection::connect(&harness.database_url).await.is_err());
-    assert_eq!(probe_rows(&harness.pool).await, 0);
+        harness.proxy.set_mode(ProxyMode::Sever);
+        assert!(insert_probe(1).execute(&mut connection).await.is_err());
+        assert!(PgConnection::connect(&harness.database_url).await.is_err());
+        assert_eq!(probe_rows(&harness.pool).await, 0);
 
-    harness.proxy.set_mode(ProxyMode::Pass);
-    let mut fresh = PgConnection::connect(&harness.database_url).await.expect("recovered");
-    insert_probe(2).execute(&mut fresh).await.unwrap();
-    assert_eq!(probe_rows(&harness.pool).await, 1);
+        harness.proxy.set_mode(ProxyMode::Pass);
+        let mut fresh = PgConnection::connect(&harness.database_url).await.expect("recovered");
+        insert_probe(2).execute(&mut fresh).await.unwrap();
+        assert_eq!(probe_rows(&harness.pool).await, 1);
+    })
+    .await;
 }
 
 /// A blackholed statement never reaches the server, and the client learns
@@ -438,10 +480,13 @@ async fn proxy_sever_closes_connections_until_passing_again(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn proxy_blackhole_leaves_the_client_to_its_own_timeout(pool: PgPool) {
-    let (harness, mut connection) = proxied_connection(pool).await;
+    within(PROXY_TEST_LIMIT, async move {
+        let (harness, mut connection) = proxied_connection(pool).await;
 
-    harness.proxy.set_mode(ProxyMode::Blackhole);
-    let statement = insert_probe(1).execute(&mut connection);
-    assert!(tokio::time::timeout(Duration::from_millis(500), statement).await.is_err());
-    assert_eq!(probe_rows(&harness.pool).await, 0, "nothing reached the server");
+        harness.proxy.set_mode(ProxyMode::Blackhole);
+        let statement = insert_probe(1).execute(&mut connection);
+        assert!(tokio::time::timeout(Duration::from_millis(500), statement).await.is_err());
+        assert_eq!(probe_rows(&harness.pool).await, 0, "nothing reached the server");
+    })
+    .await;
 }

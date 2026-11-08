@@ -305,6 +305,14 @@ mod tests {
         packet
     }
 
+    /// Every exchange of a test runs inside this, so a proxy that stops
+    /// forwarding or closing fails the test instead of hanging it.
+    async fn bounded<T>(exchange: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(10), exchange)
+            .await
+            .expect("the proxy self-test hung")
+    }
+
     /// A scripted server: after the startup packet, answers each message with
     /// `CommandComplete` and `ReadyForQuery`, reporting what it received.
     async fn scripted_server() -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
@@ -344,52 +352,63 @@ mod tests {
 
     #[tokio::test]
     async fn a_dropped_commit_ack_reaches_the_server_and_closes_the_client() {
-        let (upstream, mut received) = scripted_server().await;
-        let proxy = DbProxy::start(upstream).await.unwrap();
-        let mut client = connected(&proxy).await;
+        bounded(async {
+            let (upstream, mut received) = scripted_server().await;
+            let proxy = DbProxy::start(upstream).await.unwrap();
+            let mut client = connected(&proxy).await;
 
-        client.write_all(&message(b'Q', b"INSERT\0")).await.unwrap();
-        assert_eq!(read_reply(&mut client).await.unwrap(), (b'C', b'Z'));
+            client.write_all(&message(b'Q', b"INSERT\0")).await.unwrap();
+            assert_eq!(read_reply(&mut client).await.unwrap(), (b'C', b'Z'));
 
-        proxy.set_mode(ProxyMode::DropCommitAck);
-        client.write_all(&message(b'Q', b"COMMIT\0")).await.unwrap();
+            proxy.set_mode(ProxyMode::DropCommitAck);
+            client.write_all(&message(b'Q', b"COMMIT\0")).await.unwrap();
 
-        assert_eq!(received.recv().await.unwrap(), b"INSERT\0".to_vec());
-        assert_eq!(received.recv().await.unwrap(), b"COMMIT\0".to_vec());
-        assert!(read_reply(&mut client).await.is_err());
-        assert_eq!(proxy.stats(), ProxyStats {
-            connections: 1,
-            commits: 1,
-            commit_acks_dropped: 1
-        });
-        assert_eq!(proxy.mode(), ProxyMode::Pass);
+            assert_eq!(received.recv().await.unwrap(), b"INSERT\0".to_vec());
+            assert_eq!(received.recv().await.unwrap(), b"COMMIT\0".to_vec());
+            assert!(read_reply(&mut client).await.is_err());
+            assert_eq!(proxy.stats(), ProxyStats {
+                connections: 1,
+                commits: 1,
+                commit_acks_dropped: 1
+            });
+            assert_eq!(proxy.mode(), ProxyMode::Pass);
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn sever_closes_the_connection() {
-        let (upstream, _received) = scripted_server().await;
-        let proxy = DbProxy::start(upstream).await.unwrap();
-        let mut client = connected(&proxy).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        bounded(async {
+            let (upstream, _received) = scripted_server().await;
+            let proxy = DbProxy::start(upstream).await.unwrap();
+            let mut client = connected(&proxy).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        proxy.set_mode(ProxyMode::Sever);
-        assert!(read_reply(&mut client).await.is_err());
+            proxy.set_mode(ProxyMode::Sever);
+            assert!(read_reply(&mut client).await.is_err());
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn a_blackhole_delivers_nothing_in_either_direction() {
-        let (upstream, mut received) = scripted_server().await;
-        let proxy = DbProxy::start(upstream).await.unwrap();
-        let mut client = connected(&proxy).await;
-        client.write_all(&message(b'Q', b"SELECT 1\0")).await.unwrap();
-        assert_eq!(read_reply(&mut client).await.unwrap(), (b'C', b'Z'));
+        bounded(async {
+            let (upstream, mut received) = scripted_server().await;
+            let proxy = DbProxy::start(upstream).await.unwrap();
+            let mut client = connected(&proxy).await;
+            client.write_all(&message(b'Q', b"SELECT 1\0")).await.unwrap();
+            assert_eq!(read_reply(&mut client).await.unwrap(), (b'C', b'Z'));
 
-        proxy.set_mode(ProxyMode::Blackhole);
-        client.write_all(&message(b'Q', b"SELECT 2\0")).await.unwrap();
-        let reply =
-            tokio::time::timeout(std::time::Duration::from_millis(200), read_reply(&mut client));
-        assert!(reply.await.is_err(), "the client must see only its own timeout");
-        assert_eq!(received.recv().await.unwrap(), b"SELECT 1\0".to_vec());
-        assert!(received.try_recv().is_err());
+            proxy.set_mode(ProxyMode::Blackhole);
+            client.write_all(&message(b'Q', b"SELECT 2\0")).await.unwrap();
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                read_reply(&mut client),
+            );
+            assert!(reply.await.is_err(), "the client must see only its own timeout");
+            assert_eq!(received.recv().await.unwrap(), b"SELECT 1\0".to_vec());
+            assert!(received.try_recv().is_err());
+        })
+        .await;
     }
 }
