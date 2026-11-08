@@ -48,7 +48,7 @@ use rust_decimal::Decimal;
 #[cfg(feature = "postgres")]
 use sqlx::PgPool;
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{Mutex, MutexGuard, RwLock},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -149,8 +149,9 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// detector re-arming aligned with the policy event emitted at ARM time.
     entry_policies: Arc<RwLock<HashMap<PositionId, EntryPolicyConfig>>>,
     /// Consecutive governed re-arms per position (risk denial, expired
-    /// approval). Drives the exponential backoff on the re-armed detector's
-    /// first evaluation; cleared when a signal passes the risk gate.
+    /// approval, an admission that failed before the executor). Drives the
+    /// exponential backoff on the re-armed detector's first evaluation;
+    /// cleared when an admission reaches the executor or the approval queue.
     governed_rearm_counts: Arc<RwLock<HashMap<PositionId, u32>>>,
     /// Entry-time invalidation guard level captured from the detector signal
     /// (ADR-0042), keyed by position. Populated when a signal carrying a guard
@@ -378,6 +379,22 @@ fn governed_rearm_backoff(attempt: u32) -> std::time::Duration {
     const MAX_SECS: u64 = 900;
     let shift = attempt.saturating_sub(1).min(8);
     std::time::Duration::from_secs((BASE_SECS << shift).min(MAX_SECS))
+}
+
+/// How far an admission flow got, which decides what an error leaves behind
+/// (ADR-0051 Recovery).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionReach {
+    /// Nothing consumed yet: the pending approval is still queued.
+    Untouched,
+    /// The position's detector fired, or its pending approval was taken, and
+    /// nothing went to the executor. An error here leaves the position Armed
+    /// with no detector, since detectors are single-shot.
+    DetectorSpent(PositionId),
+    /// The entry's actions went to the executor. An order may be on the
+    /// exchange, so the flow never re-arms from here: the fill path and
+    /// reconciliation own the position.
+    Executor,
 }
 
 pub(crate) struct MonthlyRiskState {
@@ -1977,7 +1994,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         stop_invalidation_guard_enabled: bool,
         stop_invalidation_lookback_candles: usize,
         initial_fire_delay: Option<std::time::Duration>,
-    ) {
+    ) -> bool {
         let cancel_token = shutdown_token.child_token();
         match DetectorTask::from_position_with_policy(
             &position,
@@ -2000,6 +2017,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 let mut detectors = detectors.write().await;
                 detectors.insert(position_id, handle);
                 info!(%position_id, %reason, "Detector re-armed");
+                true
             },
             Err(e) => {
                 warn!(
@@ -2008,6 +2026,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     error = %e,
                     "Failed to re-arm detector — position requires manual re-arm"
                 );
+                false
             },
         }
     }
@@ -2128,7 +2147,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         position_id: PositionId,
         position: &Position,
         reason: &'static str,
-    ) {
+    ) -> bool {
         // ADR-0050 §2: a position in needs_operator_rearm never re-arms
         // autonomously.
         if self.is_entry_exhausted(position_id).await {
@@ -2137,7 +2156,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 %reason,
                 "Skipping governed re-arm: position needs operator re-arm (ADR-0050)"
             );
-            return;
+            return false;
         }
         // Exponential backoff on consecutive governed blocks. Without it, an
         // Immediate-mode re-arm refires instantly and a persistent governed
@@ -2176,12 +2195,68 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             self.stop_invalidation_lookback_candles,
             Some(delay),
         )
-        .await;
+        .await
     }
 
-    /// Reset the governed re-arm backoff once a signal clears the risk gate.
+    /// Reset the governed re-arm backoff once an admission reaches the
+    /// executor or the approval queue. Not earlier: a failure that recurs
+    /// after the risk gate would otherwise re-arm every 5 s for good.
     async fn clear_governed_rearm_backoff(&self, position_id: PositionId) {
         self.governed_rearm_counts.write().await.remove(&position_id);
+    }
+
+    /// ADR-0051 Recovery: an admission that failed before the executor leaves
+    /// the position Armed with its single-shot detector spent, which only a
+    /// restart used to repair. Re-arm it under the governed backoff so it
+    /// resumes once the failure clears. Each retry runs the whole admission
+    /// again, audit writes before the executor included, so nothing enters
+    /// without its record. Runs under `entry_flow_lock`.
+    async fn rearm_detector_after_failed_admission(
+        &self,
+        position_id: PositionId,
+        flow: &'static str,
+        error: &DaemonError,
+    ) {
+        // A latched MonthlyHalt refuses entries and disarms Armed positions.
+        if self.circuit_breaker.blocks_new_entries().await {
+            return;
+        }
+        // A detector here is a governed re-arm the flow made before its error;
+        // a pending approval waits for the operator.
+        if self.detectors.read().await.contains_key(&position_id)
+            || self.has_pending_approval_for_position(position_id).await
+        {
+            return;
+        }
+        let position = match self.store.positions().find_by_id(position_id).await {
+            Ok(Some(position)) if matches!(position.state, PositionState::Armed) => position,
+            Ok(_) => return,
+            Err(e) => {
+                warn!(
+                    %position_id,
+                    flow,
+                    error = %e,
+                    "Cannot read the position after a failed admission — position requires manual re-arm"
+                );
+                return;
+            },
+        };
+        if self
+            .rearm_detector_after_governed_block(
+                position_id,
+                &position,
+                "admission failed before the executor",
+            )
+            .await
+        {
+            crate::metrics::DETECTOR_REARMS_AFTER_FAILURE.with_label_values(&[flow]).inc();
+            warn!(
+                %position_id,
+                flow,
+                %error,
+                "Admission failed before the executor — detector re-armed with backoff"
+            );
+        }
     }
 
     fn emit_query_awaiting_approval(&self, query: &ExecutionQuery) {
@@ -2254,27 +2329,43 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     };
 
                     if let Some(mut record_inner) = record.take() {
-                        if let Err(error) = query_engine.expire(&mut record_inner.query, "expired").await {
-                            let error_message = format!("Approval expiry transition error: {}", error);
-                            record_inner.query.fail(error_message.clone(), "awaiting_approval".to_string());
-                            if let Err(audit_error) = query_engine
-                                .on_state_change(&record_inner.query, "failed")
-                                .await
-                            {
+                        // A failed expiry still removed the approval, and with it
+                        // the position's only way to an entry: it re-arms like an
+                        // expiry (ADR-0051 Recovery).
+                        let expiry_failed = match query_engine
+                            .expire(&mut record_inner.query, "expired")
+                            .await
+                        {
+                            Ok(()) => {
+                                event_bus.send(DaemonEvent::QueryExpired {
+                                    query_id: record_inner.query.id,
+                                    position_id: record_inner.query.position_id,
+                                    expired_at: chrono::Utc::now(),
+                                });
+                                false
+                            },
+                            Err(error) => {
+                                let error_message = format!("Approval expiry transition error: {}", error);
+                                record_inner.query.fail(error_message.clone(), "awaiting_approval".to_string());
+                                if let Err(audit_error) = query_engine
+                                    .on_state_change(&record_inner.query, "failed")
+                                    .await
+                                {
+                                    warn!(
+                                        query_id = %record_inner.query.id,
+                                        error = %audit_error,
+                                        "Failed to persist failed approval expiry snapshot"
+                                    );
+                                }
                                 warn!(
                                     query_id = %record_inner.query.id,
-                                    error = %audit_error,
-                                    "Failed to persist failed approval expiry snapshot"
+                                    position_id = %record_inner.position.id,
+                                    %error,
+                                    "Approval expiry failed — re-arming the detector with backoff"
                                 );
-                            }
-                            return;
-                        }
-
-                        event_bus.send(DaemonEvent::QueryExpired {
-                            query_id: record_inner.query.id,
-                            position_id: record_inner.query.position_id,
-                            expired_at: chrono::Utc::now(),
-                        });
+                                true
+                            },
+                        };
 
                         let entry_policy = {
                             let policies = entry_policies.read().await;
@@ -2295,7 +2386,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         };
                         let delay = governed_rearm_backoff(attempt);
 
-                        PositionManager::<E, S>::rearm_detector(
+                        let rearmed = PositionManager::<E, S>::rearm_detector(
                             venue,
                             record_inner.position.id,
                             record_inner.position,
@@ -2311,6 +2402,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                             Some(delay),
                         )
                         .await;
+                        if rearmed && expiry_failed {
+                            crate::metrics::DETECTOR_REARMS_AFTER_FAILURE
+                                .with_label_values(&["approval_expiry"])
+                                .inc();
+                        }
                     }
                 }
             }
@@ -2362,6 +2458,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         &self,
         query: &mut ExecutionQuery,
         governed: GovernedAction,
+        reach: &mut AdmissionReach,
     ) -> DaemonResult<()> {
         let position_id = query
             .position_id
@@ -2379,6 +2476,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
         self.record_query_transition(query, "acting").await?;
 
+        // From here an order may reach the exchange: an error no longer
+        // re-arms the detector.
+        *reach = AdmissionReach::Executor;
+        self.clear_governed_rearm_backoff(position_id).await;
         let results = match self.execute_and_persist(governed.into_actions()).await {
             Ok(r) => r,
             Err(e) => {
@@ -3351,6 +3452,45 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// signal (ADR-0050 §2). Immediate exhausts (terminal, operator re-arm);
     /// strategy modes re-arm the detector under governed backoff, requiring
     /// a fresh trigger by construction.
+    /// An `Immediate` arm refused on margin is cancelled, not retried.
+    async fn margin_denial_cancels(&self, position_id: PositionId, query: &ExecutionQuery) -> bool {
+        matches!(&query.state, QueryState::Denied { check, .. } if check == "insufficient_margin")
+            && self.entry_policy_for_position(position_id).await.mode == EntryPolicy::Immediate
+    }
+
+    async fn cancel_immediate_arm_on_margin(
+        &self,
+        position_id: PositionId,
+        query_id: Uuid,
+    ) -> DaemonResult<()> {
+        info!(
+            %position_id,
+            %query_id,
+            "Immediate entry denied by margin policy - cancelling Armed position"
+        );
+        self.invalidate_pending_approvals_for_position(
+            position_id,
+            "immediate entry denied by insufficient margin",
+        )
+        .await;
+        self.kill_detector(position_id).await;
+        self.execute_and_persist(vec![EngineAction::EmitEvent(Event::PositionDisarmed {
+            position_id,
+            reason: "risk_denied_insufficient_margin".to_string(),
+            timestamp: chrono::Utc::now(),
+        })])
+        .await?;
+        self.event_bus.send(DaemonEvent::PositionStateChanged {
+            position_id,
+            previous_state: "Armed".to_string(),
+            new_state: "Cancelled".to_string(),
+            timestamp: chrono::Utc::now(),
+        });
+        self.entry_policies.write().await.remove(&position_id);
+        self.clear_governed_rearm_backoff(position_id).await;
+        Ok(())
+    }
+
     async fn handle_signal_domain_rejection(
         &self,
         position: &Position,
@@ -3390,7 +3530,27 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     pub async fn handle_signal(&self, signal: DetectorSignal) -> DaemonResult<()> {
-        let _entry_flow_guard = self.entry_flow_lock.lock().await;
+        let mut entry_flow_guard = Some(self.entry_flow_lock.lock().await);
+        let position_id = signal.position_id;
+        // The detector is single-shot: its handle is spent once its signal is
+        // here, so a handle found after the flow is a re-arm the flow made.
+        self.kill_detector(position_id).await;
+        let mut reach = AdmissionReach::DetectorSpent(position_id);
+        let result = self.process_signal(signal, &mut entry_flow_guard, &mut reach).await;
+        if let (Err(error), AdmissionReach::DetectorSpent(position_id), Some(_)) =
+            (&result, reach, &entry_flow_guard)
+        {
+            self.rearm_detector_after_failed_admission(position_id, "signal", error).await;
+        }
+        result
+    }
+
+    async fn process_signal(
+        &self,
+        signal: DetectorSignal,
+        entry_flow_guard: &mut Option<MutexGuard<'_, ()>>,
+        reach: &mut AdmissionReach,
+    ) -> DaemonResult<()> {
         let position_id = signal.position_id;
 
         // MonthlyHalt blocks new entries — a detector signal that would
@@ -3468,9 +3628,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             );
             return Ok(());
         }
-
-        // Kill detector (it's single-shot)
-        self.kill_detector(position_id).await;
 
         if let Err(blocked) = self.check_no_unresolved_residual().await {
             let reason = blocked.to_string();
@@ -3575,8 +3732,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 // return Ok so no opaque 500/ERROR surfaces.
                 let error_text = domain_error.to_string();
                 query.fail(error_text.clone(), "processing".to_string());
-                self.record_query_failure(&query).await?;
+                // Resolved even when its record fails, so the failure re-arm
+                // cannot retry an Immediate arm this makes terminal.
+                let recorded = self.record_query_failure(&query).await;
                 self.handle_signal_domain_rejection(&position, &signal, &domain_error).await?;
+                recorded?;
                 return Ok(());
             },
             Err(e) => {
@@ -3679,7 +3839,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                                 reason: reason_str.clone(),
                                 triggered_at: chrono::Utc::now(),
                             });
-                            drop(_entry_flow_guard);
+                            drop(entry_flow_guard.take());
                             if let Err(e) = self.panic_close_all().await {
                                 error!(
                                     error = %e,
@@ -3700,37 +3860,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     crate::metrics::RISK_DENIALS.with_label_values(&[check]).inc();
                 }
 
-                let entry_policy = self.entry_policy_for_position(position_id).await;
-                if entry_policy.mode == EntryPolicy::Immediate
-                    && denied_check.as_deref() == Some("insufficient_margin")
-                {
-                    info!(
-                        %position_id,
-                        query_id = %query.id,
-                        "Immediate entry denied by margin policy - cancelling Armed position"
-                    );
-                    self.invalidate_pending_approvals_for_position(
-                        position_id,
-                        "immediate entry denied by insufficient margin",
-                    )
-                    .await;
-                    self.kill_detector(position_id).await;
-                    self.execute_and_persist(vec![EngineAction::EmitEvent(
-                        Event::PositionDisarmed {
-                            position_id,
-                            reason: "risk_denied_insufficient_margin".to_string(),
-                            timestamp: chrono::Utc::now(),
-                        },
-                    )])
-                    .await?;
-                    self.event_bus.send(DaemonEvent::PositionStateChanged {
-                        position_id,
-                        previous_state: "Armed".to_string(),
-                        new_state: "Cancelled".to_string(),
-                        timestamp: chrono::Utc::now(),
-                    });
-                    self.entry_policies.write().await.remove(&position_id);
-                    self.clear_governed_rearm_backoff(position_id).await;
+                if self.margin_denial_cancels(position_id, &query).await {
+                    self.cancel_immediate_arm_on_margin(position_id, query.id).await?;
                     return Ok(());
                 }
 
@@ -3756,13 +3887,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 return Err(DaemonError::Config(err_str));
             },
             Err(CheckRiskError::Audit(e)) => {
+                // The gate may have refused before its record failed. A refusal
+                // that cancels still cancels: the failure re-arm must not retry
+                // it.
+                if self.margin_denial_cancels(position_id, &query).await {
+                    self.cancel_immediate_arm_on_margin(position_id, query.id).await?;
+                }
                 return Err(e.into());
             },
         };
-
-        // Signal cleared the risk gate: reset the governed re-arm backoff so a
-        // future governed block starts from the shortest delay again.
-        self.clear_governed_rearm_backoff(position_id).await;
 
         // Domain ApprovalPolicy is authoritative over the notional-threshold adapter.
         let domain_approval = self.entry_policy_for_position(position_id).await.approval;
@@ -3773,7 +3906,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .await
         {
             Ok(ApprovalCheckResult::Ready(governed)) => {
-                self.execute_signal_query(&mut query, governed).await?;
+                self.execute_signal_query(&mut query, governed, reach).await?;
                 Ok(())
             },
             Ok(ApprovalCheckResult::AwaitingApproval(governed)) => {
@@ -3805,6 +3938,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 }
 
                 self.store_pending_approval(query, position.clone(), proposed, governed).await;
+                self.clear_governed_rearm_backoff(position_id).await;
 
                 info!(
                     %position_id,
@@ -3825,8 +3959,23 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
     /// Approve a pending query and resume execution.
     pub async fn approve_query(&self, query_id: Uuid) -> DaemonResult<ExecutionQuery> {
-        let _entry_flow_guard = self.entry_flow_lock.lock().await;
+        let mut entry_flow_guard = Some(self.entry_flow_lock.lock().await);
+        let mut reach = AdmissionReach::Untouched;
+        let result = self.process_approval(query_id, &mut entry_flow_guard, &mut reach).await;
+        if let (Err(error), AdmissionReach::DetectorSpent(position_id), Some(_)) =
+            (&result, reach, &entry_flow_guard)
+        {
+            self.rearm_detector_after_failed_admission(position_id, "approval", error).await;
+        }
+        result
+    }
 
+    async fn process_approval(
+        &self,
+        query_id: Uuid,
+        entry_flow_guard: &mut Option<MutexGuard<'_, ()>>,
+        reach: &mut AdmissionReach,
+    ) -> DaemonResult<ExecutionQuery> {
         // Approval resume is a new entry — respect MonthlyHalt.
         // The query was approved by the operator, but the system may have
         // entered MonthlyHalt between when the query was queued and now.
@@ -3842,6 +3991,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 .remove(&query_id)
                 .ok_or(DaemonError::QueryNotFound(query_id))?
         };
+        // The approval was the position's only way to an entry.
+        *reach = AdmissionReach::DetectorSpent(record.position.id);
 
         let expired = record
             .query
@@ -3944,7 +4095,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                                 reason: reason_str.clone(),
                                 triggered_at: chrono::Utc::now(),
                             });
-                            drop(_entry_flow_guard);
+                            drop(entry_flow_guard.take());
                             if let Err(e) = self.panic_close_all().await {
                                 error!(
                                     error = %e,
@@ -3989,7 +4140,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
 
         self.emit_query_authorized(&record.query);
-        self.execute_signal_query(&mut record.query, record.governed).await?;
+        self.execute_signal_query(&mut record.query, record.governed, reach).await?;
 
         Ok(record.query)
     }
@@ -7414,6 +7565,8 @@ mod tests {
                     .err(),
             );
             assert_eq!(manager.exchange().market_order_call_count(), orders);
+            // The block re-armed it; its error must not re-arm it a second time.
+            assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), Some(&1));
             let armed = manager.get_position(armed.id).await.unwrap().unwrap();
             assert!(matches!(armed.state, PositionState::Armed), "{:?}", armed.state);
 
@@ -7760,6 +7913,465 @@ mod tests {
 
         assert!(matches!(result, Err(DaemonError::ApprovalDenied { .. })), "{result:?}");
         assert_denied_and_book_kept(&manager, &armed, &leg).await;
+    }
+
+    /// The production query recorder on the same database as the event log, so
+    /// a failed audit write fails the admission as in production.
+    /// `TracingQueryRecorder` never fails.
+    #[cfg(feature = "postgres")]
+    fn create_audited_postgres_test_manager(
+        pool: sqlx::PgPool,
+        approval_ttl_seconds: u64,
+    ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        let journal = Arc::new(IntentJournal::new());
+        let store = Arc::new(MemoryStore::new());
+        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let engine = Engine::new(RiskConfig::new(dec!(10000)).unwrap());
+        let tenant_id = Uuid::now_v7();
+
+        Arc::new(
+            PositionManager::with_approval_policy(
+                engine,
+                executor,
+                store,
+                Arc::new(EventBus::new(100)),
+                Arc::new(crate::query_engine::EventLogQueryRecorder::new(
+                    pool.clone(),
+                    tenant_id,
+                    "robson:daemon",
+                )),
+                ApprovalPolicy::new(Decimal::from(100u32), approval_ttl_seconds),
+                TradingPolicy::default(),
+            )
+            .with_event_log(pool, tenant_id),
+        )
+    }
+
+    /// Fails every event-log insert that matches `condition`, SQL over `NEW`,
+    /// until `restore_event_log_writes`. Injected on the server, so no client
+    /// cache can hide it.
+    #[cfg(feature = "postgres")]
+    async fn fail_event_log_writes(pool: &sqlx::PgPool, condition: &str) {
+        let function = format!(
+            r#"
+            CREATE OR REPLACE FUNCTION injected_event_log_failure() RETURNS trigger
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                IF {condition} THEN
+                    RAISE EXCEPTION 'injected event log failure';
+                END IF;
+                RETURN NEW;
+            END
+            $$
+            "#
+        );
+        sqlx::query(&function).execute(pool).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER injected_event_log_failure BEFORE INSERT ON event_log \
+             FOR EACH ROW EXECUTE FUNCTION injected_event_log_failure()",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn restore_event_log_writes(pool: &sqlx::PgPool) {
+        sqlx::query("DROP TRIGGER injected_event_log_failure ON event_log")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// The `fail_event_log_writes` condition for one query audit write.
+    #[cfg(feature = "postgres")]
+    fn audit_write(transition_cause: &str) -> String {
+        format!(
+            "NEW.event_type = '{}' AND NEW.payload->>'transition_cause' = '{transition_cause}'",
+            robson_eventlog::QUERY_STATE_CHANGED_EVENT_TYPE
+        )
+    }
+
+    /// A position's query audit trail, in write order.
+    #[cfg(feature = "postgres")]
+    async fn audit_trail(pool: &sqlx::PgPool, position_id: PositionId) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT payload->>'transition_cause' FROM event_log \
+             WHERE event_type = $1 AND payload->>'position_id' = $2 ORDER BY seq",
+        )
+        .bind(robson_eventlog::QUERY_STATE_CHANGED_EVENT_TYPE)
+        .bind(position_id.to_string())
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn position_event_count(
+        pool: &sqlx::PgPool,
+        position_id: PositionId,
+        event_type: &str,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_log WHERE stream_key = $1 AND event_type = $2",
+        )
+        .bind(format!("position:{position_id}"))
+        .bind(event_type)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// `armed_position_and_signal` with the arm on record in the event log, as
+    /// an entry's projection requires.
+    #[cfg(feature = "postgres")]
+    async fn recorded_armed_position_and_signal(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> (Position, DetectorSignal) {
+        let (armed, signal) = armed_position_and_signal(manager).await;
+        manager
+            .persist_event_to_log(&Event::PositionArmed {
+                position_id: armed.id,
+                account_id: armed.account_id,
+                symbol: armed.symbol.clone(),
+                side: armed.side,
+                tech_stop_distance: armed.tech_stop_distance,
+                stop_policy: armed.stop_policy,
+                stop_buffer_bps_at_arm: armed.stop_buffer_bps_at_arm,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        (armed, signal)
+    }
+
+    /// The handle a detector leaves in the map once it has fired: finished,
+    /// since detectors are single-shot. Replaces, and stops, a re-armed one.
+    #[cfg(feature = "postgres")]
+    async fn detector_fired(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        position_id: PositionId,
+    ) {
+        let spent = tokio::spawn(async { None });
+        while !spent.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        if let Some(rearmed) = manager.detectors.write().await.insert(position_id, spent) {
+            rearmed.abort();
+        }
+    }
+
+    /// The re-armed detector fires again.
+    #[cfg(feature = "postgres")]
+    fn signal_again(signal: &DetectorSignal) -> DetectorSignal {
+        DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            timestamp: chrono::Utc::now(),
+            ..signal.clone()
+        }
+    }
+
+    /// Still Armed, nothing on the exchange, and a detector back under the
+    /// governed backoff.
+    #[cfg(feature = "postgres")]
+    async fn assert_rearmed_and_nothing_entered(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        armed: &Position,
+        attempt: u32,
+        case: &str,
+    ) {
+        let position = manager.get_position(armed.id).await.unwrap().unwrap();
+        assert!(matches!(position.state, PositionState::Armed), "{case}: {:?}", position.state);
+        assert_eq!(manager.exchange().market_order_call_count(), 0, "{case}");
+        assert!(
+            manager
+                .detectors
+                .read()
+                .await
+                .get(&armed.id)
+                .is_some_and(|handle| !handle.is_finished()),
+            "{case}: detector lost"
+        );
+        assert_eq!(
+            manager.governed_rearm_counts.read().await.get(&armed.id),
+            Some(&attempt),
+            "{case}"
+        );
+    }
+
+    /// The query audit writes of an automatic entry, in order. The executor
+    /// runs between `acting` and `completed`.
+    #[cfg(feature = "postgres")]
+    const ADMISSION_AUDIT: [&str; 5] = [
+        "accepted",
+        "processing",
+        "risk_checked",
+        "acting",
+        "completed",
+    ];
+
+    /// ADR-0051 Recovery, through the production recorder: the audit write
+    /// `ADMISSION_AUDIT[failing]` fails. The position keeps a detector and
+    /// nothing reaches the exchange. Once writes succeed the next signal
+    /// enters, with every write before the order on record.
+    #[cfg(feature = "postgres")]
+    async fn assert_failed_admission_write_rearms(pool: sqlx::PgPool, failing: usize) {
+        let cause = ADMISSION_AUDIT[failing];
+        set_month_basis(&pool, dec!(10000)).await;
+        let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+        let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+
+        // Twice: a failure that recurs keeps backing off, wherever it is.
+        fail_event_log_writes(&pool, &audit_write(cause)).await;
+        for attempt in 1..=2 {
+            detector_fired(&manager, armed.id).await;
+            let result = manager.handle_signal(signal_again(&signal)).await;
+            assert!(result.is_err(), "{cause}: {result:?}");
+            assert_rearmed_and_nothing_entered(&manager, &armed, attempt, cause).await;
+        }
+        restore_event_log_writes(&pool).await;
+
+        detector_fired(&manager, armed.id).await;
+        manager.handle_signal(signal_again(&signal)).await.unwrap();
+
+        assert_eq!(manager.exchange().market_order_call_count(), 1, "{cause}");
+        let entered = manager.get_position(armed.id).await.unwrap().unwrap();
+        assert!(
+            matches!(entered.state, PositionState::Active { .. }),
+            "{cause}: {:?}",
+            entered.state
+        );
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), None, "{cause}");
+        let expected: Vec<String> = ADMISSION_AUDIT[..failing]
+            .iter()
+            .chain(ADMISSION_AUDIT[..failing].iter())
+            .chain(ADMISSION_AUDIT.iter())
+            .map(|cause| cause.to_string())
+            .collect();
+        assert_eq!(audit_trail(&pool, armed.id).await, expected, "{cause}");
+        assert_eq!(
+            position_event_count(&pool, armed.id, "entry_signal_received").await,
+            1,
+            "{cause}"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_failed_accepted_write_rearms_the_detector(pool: sqlx::PgPool) {
+        assert_failed_admission_write_rearms(pool, 0).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_failed_processing_write_rearms_the_detector(pool: sqlx::PgPool) {
+        assert_failed_admission_write_rearms(pool, 1).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_failed_risk_checked_write_rearms_the_detector(pool: sqlx::PgPool) {
+        assert_failed_admission_write_rearms(pool, 2).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_failed_acting_write_rearms_the_detector(pool: sqlx::PgPool) {
+        assert_failed_admission_write_rearms(pool, 3).await;
+    }
+
+    /// A database that refuses every write: each fire costs one failed write
+    /// and re-arms with a longer backoff, so an outage is no loop, and the
+    /// entry once writes succeed resets it.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_write_outage_backs_the_detector_off_until_it_ends(pool: sqlx::PgPool) {
+        set_month_basis(&pool, dec!(10000)).await;
+        let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+        let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+        let rearms =
+            || crate::metrics::DETECTOR_REARMS_AFTER_FAILURE.with_label_values(&["signal"]);
+        let rearms_before = rearms().get();
+
+        fail_event_log_writes(&pool, "TRUE").await;
+        for attempt in 1..=3 {
+            detector_fired(&manager, armed.id).await;
+            let result = manager.handle_signal(signal_again(&signal)).await;
+            assert!(result.is_err(), "{result:?}");
+            assert_rearmed_and_nothing_entered(&manager, &armed, attempt, "outage").await;
+        }
+        restore_event_log_writes(&pool).await;
+
+        assert!(audit_trail(&pool, armed.id).await.is_empty());
+        assert!(rearms().get() >= rearms_before + 3.0, "each re-arm must be counted");
+
+        manager.handle_signal(signal_again(&signal)).await.unwrap();
+        assert_eq!(manager.exchange().market_order_call_count(), 1);
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), None);
+    }
+
+    /// The approval flow. A failed `awaiting_approval` write queues nothing,
+    /// and a failed write after the operator approves has already taken the
+    /// approval. Both re-arm, and the operator approves the next signal.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_failed_audit_write_in_the_approval_flow_rearms_the_detector(pool: sqlx::PgPool) {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+
+        set_month_basis(&pool, dec!(10000)).await;
+        let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+        let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+        manager.entry_policies.write().await.insert(
+            armed.id,
+            EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::HumanConfirmation),
+        );
+
+        fail_event_log_writes(&pool, &audit_write("awaiting_approval")).await;
+        let result = manager.handle_signal(signal_again(&signal)).await;
+        restore_event_log_writes(&pool).await;
+        assert!(result.is_err(), "{result:?}");
+        assert!(manager.get_pending_approvals().await.is_empty());
+        assert_rearmed_and_nothing_entered(&manager, &armed, 1, "awaiting_approval").await;
+
+        for cause in ["authorized", "acting"] {
+            manager.handle_signal(signal_again(&signal)).await.unwrap();
+            let query_id = manager.get_pending_approvals().await[0].id;
+            assert!(!manager.detectors.read().await.contains_key(&armed.id), "{cause}");
+
+            fail_event_log_writes(&pool, &audit_write(cause)).await;
+            let result = manager.approve_query(query_id).await;
+            restore_event_log_writes(&pool).await;
+
+            assert!(result.is_err(), "{cause}: {result:?}");
+            assert!(manager.get_pending_approvals().await.is_empty(), "{cause}");
+            // Queuing the approval reset the backoff.
+            assert_rearmed_and_nothing_entered(&manager, &armed, 1, cause).await;
+        }
+
+        manager.handle_signal(signal_again(&signal)).await.unwrap();
+        let query_id = manager.get_pending_approvals().await[0].id;
+        manager.approve_query(query_id).await.unwrap();
+        assert_eq!(manager.exchange().market_order_call_count(), 1);
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), None);
+    }
+
+    /// The boundary: once the entry's actions reach the executor an order may
+    /// exist, so no failure from there re-arms. Before the order: the first
+    /// entry event fails to persist, which also keeps the order back
+    /// (ADR-0052). After it: the last audit write fails.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_failure_once_the_executor_has_the_entry_does_not_rearm(pool: sqlx::PgPool) {
+        set_month_basis(&pool, dec!(10000)).await;
+        let cases = [
+            ("NEW.event_type = 'entry_signal_received'".to_string(), 0),
+            (audit_write("completed"), 1),
+        ];
+
+        for (condition, orders) in cases {
+            let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+            let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+
+            fail_event_log_writes(&pool, &condition).await;
+            let result = manager.handle_signal(signal).await;
+            restore_event_log_writes(&pool).await;
+
+            assert!(result.is_err(), "{condition}: {result:?}");
+            assert_eq!(manager.exchange().market_order_call_count(), orders, "{condition}");
+            assert!(!manager.detectors.read().await.contains_key(&armed.id), "{condition}");
+            assert_eq!(
+                manager.governed_rearm_counts.read().await.get(&armed.id),
+                None,
+                "{condition}"
+            );
+        }
+    }
+
+    /// The failure re-arm never retries a refusal that ends an `Immediate` arm,
+    /// even when the refusal's own record fails: a domain rejection still needs
+    /// the operator (ADR-0050 §2), and a margin refusal still cancels.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_failed_record_does_not_turn_an_immediate_refusal_into_a_retry(pool: sqlx::PgPool) {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        let immediate =
+            EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::Automatic);
+
+        // A stop too tight for the bounds, and its `failed` record fails.
+        set_month_basis(&pool, dec!(10000)).await;
+        let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+        let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+        manager.entry_policies.write().await.insert(armed.id, immediate);
+        fail_event_log_writes(&pool, &audit_write("failed")).await;
+        let result = manager
+            .handle_signal(DetectorSignal {
+                stop_loss: Price::new(dec!(94990)).unwrap(),
+                ..signal_again(&signal)
+            })
+            .await;
+        restore_event_log_writes(&pool).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(manager.is_entry_exhausted(armed.id).await);
+        assert!(!manager.detectors.read().await.contains_key(&armed.id));
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+
+        // A basis too small for the size, and the `risk_denied` record fails.
+        set_month_basis(&pool, dec!(100)).await;
+        let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+        let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+        manager.entry_policies.write().await.insert(armed.id, immediate);
+        fail_event_log_writes(&pool, &audit_write("risk_denied")).await;
+        let result = manager.handle_signal(signal).await;
+        restore_event_log_writes(&pool).await;
+
+        assert!(result.is_err(), "{result:?}");
+        let cancelled = manager.get_position(armed.id).await.unwrap().unwrap();
+        assert!(!matches!(cancelled.state, PositionState::Armed), "{:?}", cancelled.state);
+        assert!(!manager.detectors.read().await.contains_key(&armed.id));
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+    }
+
+    /// An approval that expires while writes fail is gone all the same, so the
+    /// expiry task re-arms as on a recorded expiry.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_failed_expiry_write_rearms_the_detector(pool: sqlx::PgPool) {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+
+        set_month_basis(&pool, dec!(10000)).await;
+        let manager = create_audited_postgres_test_manager(pool.clone(), 2);
+        let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+        manager.entry_policies.write().await.insert(
+            armed.id,
+            EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::HumanConfirmation),
+        );
+        manager.handle_signal(signal).await.unwrap();
+        assert_eq!(manager.get_pending_approvals().await.len(), 1);
+
+        fail_event_log_writes(&pool, &audit_write("expired")).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !manager.detectors.read().await.contains_key(&armed.id) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the expiry task must re-arm the detector");
+        restore_event_log_writes(&pool).await;
+
+        assert!(manager.get_pending_approvals().await.is_empty());
+        assert_rearmed_and_nothing_entered(&manager, &armed, 1, "expired").await;
+        assert!(!audit_trail(&pool, armed.id).await.iter().any(|cause| cause == "expired"));
     }
 
     /// Holds the next snapshot on `positions_current`, which it reads after the
@@ -9445,6 +10057,38 @@ mod tests {
             Event::EntryAttemptExhausted { reason_code, .. }
                 if reason_code == "admission_evidence_present"
         )));
+    }
+
+    /// A latched MonthlyHalt drops the signal, and the failure re-arm leaves
+    /// the position alone: the halt disarms Armed positions.
+    #[tokio::test]
+    async fn a_signal_dropped_by_monthly_halt_is_not_rearmed() {
+        let manager = create_test_manager().await;
+        let position = save_armed_position_with_policy(
+            &manager,
+            "BTCUSDT",
+            Side::Long,
+            EntryPolicyConfig::default(),
+        )
+        .await;
+        manager.circuit_breaker.trigger_halt("test".to_string()).await;
+
+        let result = manager
+            .handle_signal(DetectorSignal {
+                signal_id: Uuid::now_v7(),
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: Side::Long,
+                entry_price: Price::new(dec!(95000)).unwrap(),
+                stop_loss: Price::new(dec!(90250)).unwrap(),
+                technical_stop_analysis: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await;
+
+        assert!(matches!(result, Err(DaemonError::MonthlyHaltActive { .. })), "{result:?}");
+        assert!(!manager.detectors.read().await.contains_key(&position.id));
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&position.id), None);
     }
 
     /// Disarm resolves needs_operator_rearm; governed re-arm is refused

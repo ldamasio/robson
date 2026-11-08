@@ -5,6 +5,8 @@
 //! - `robsond_cycles_total` — completed engine cycles (market tick processing)
 //! - `robsond_orders_total` — exchange orders placed (entry + exit)
 //! - `robsond_risk_denials_total` — risk gate rejections, labelled by check
+//! - `robsond_detector_rearms_after_failure_total` — detectors re-armed after
+//!   an admission failed before the executor, labelled by flow
 //! - `robsond_position_pnl` — realized PnL per closed position
 //! - `robsond_active_positions` — currently open position count
 //! - `robsond_stale_active_positions` — open book positions missing on exchange
@@ -66,6 +68,19 @@ pub static RISK_DENIALS: LazyLock<CounterVec> = LazyLock::new(|| {
         &["check"] // check: max_open_positions, total_exposure, etc.
     )
     .expect("failed to register robsond_risk_denials_total")
+});
+
+/// Detectors re-armed after an admission failed before the executor (ADR-0051
+/// Recovery), labelled by flow: `signal`, `approval`, `approval_expiry`. Each
+/// is a position a database failure would otherwise have left Armed and idle
+/// until a restart. A rate that keeps rising means admissions keep failing.
+pub static DETECTOR_REARMS_AFTER_FAILURE: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        "robsond_detector_rearms_after_failure_total",
+        "Detectors re-armed after an admission failed before the executor",
+        &["flow"]
+    )
+    .expect("failed to register robsond_detector_rearms_after_failure_total")
 });
 
 /// Realized PnL per closed position (gauge — set once per close event).
