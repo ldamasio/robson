@@ -8,6 +8,8 @@ license.workspace = true
 [features]
 default = []
 postgres = ["robson-store/postgres", "sqlx"]
+# Test harness only (ADR-0056 step 7): never in a production build.
+crash-points = ["robson-exec/crash-points", "robson-connectors/crash-points"]
 
 [[bin]]
 name = "robsond"

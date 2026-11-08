@@ -98,7 +98,7 @@ pub struct BinanceRestClient {
     /// Use testnet
     testnet: bool,
     /// Test seam: serve every endpoint from a local listener.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "crash-points"))]
     local_base_url: Option<String>,
 }
 
@@ -110,7 +110,7 @@ impl BinanceRestClient {
             api_key,
             api_secret,
             testnet: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "crash-points"))]
             local_base_url: None,
         }
     }
@@ -122,7 +122,7 @@ impl BinanceRestClient {
             api_key,
             api_secret,
             testnet: true,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "crash-points"))]
             local_base_url: None,
         }
     }
@@ -133,6 +133,21 @@ impl BinanceRestClient {
         Self {
             local_base_url: Some(base_url),
             ..Self::new("key".to_string(), "secret".to_string())
+        }
+    }
+
+    /// Crash harness: every request goes to the fake venue at `base_url`,
+    /// which must be on loopback. Exists only with the `crash-points` feature.
+    #[cfg(feature = "crash-points")]
+    pub fn with_harness_base_url(base_url: String, api_key: String, api_secret: String) -> Self {
+        let authority = base_url.strip_prefix("http://").unwrap_or_default();
+        assert!(
+            authority.starts_with("127.0.0.1:") || authority.starts_with("localhost:"),
+            "the crash harness venue must be on loopback, got {base_url}"
+        );
+        Self {
+            local_base_url: Some(base_url),
+            ..Self::new(api_key, api_secret)
         }
     }
 
@@ -154,7 +169,7 @@ impl BinanceRestClient {
     }
 
     fn endpoint_base_url(&self, endpoint: &str) -> &str {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "crash-points"))]
         if let Some(local) = &self.local_base_url {
             return local;
         }

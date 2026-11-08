@@ -61,6 +61,9 @@ fn map_daemon_result(result: DaemonResult<()>) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "crash-points")]
+    robson_exec::crash_points::arm_from_env();
+
     // 8 MiB worker stacks (default 2 MiB): robsond aborted twice in
     // production (2026-06-30, 2026-07-02) with tokio-runtime-worker stack
     // overflows that leave no backtrace. Larger stacks close that crash

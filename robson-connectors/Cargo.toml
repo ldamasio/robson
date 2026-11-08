@@ -5,6 +5,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Test harness only: lets a local fake venue stand in for Binance.
+crash-points = ["robson-exec/crash-points"]
+
 [dependencies]
 robson-domain = { path = "../robson-domain" }
 robson-exec = { path = "../robson-exec" }
