@@ -322,8 +322,9 @@ async fn killed_before_the_send_the_venue_saw_nothing(pool: PgPool) {
 }
 
 /// The fake venue is good enough for the whole healthy path of the real
-/// binary: entry, exchange stop, operator close, and the reconciliation sweep
-/// cancelling the stop that the close left behind.
+/// binary: entry, exchange stop and operator close are served and counted, and
+/// a cancel from the reconciliation sweep reaches the venue. When the sweep
+/// cancels relative to the close is not controlled here.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn with_no_crash_point_the_real_binary_runs_a_full_position(pool: PgPool) {
@@ -349,7 +350,7 @@ async fn with_no_crash_point_the_real_binary_runs_a_full_position(pool: PgPool) 
         let after_close = harness.venue.counts();
         assert_eq!((after_close.accepted_orders, after_close.fills), (3, 2), "{after_close:?}");
 
-        // The next scan treats the now uncovered stop as an orphan and cancels it.
+        // A scan cancels the stop, at some moment since the arm.
         let swept = async {
             while harness.venue.counts().cancels == 0 {
                 tokio::time::sleep(Duration::from_millis(100)).await;

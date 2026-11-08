@@ -4,12 +4,15 @@
 //! each rule set under test has a negative control: the same generator must
 //! find a violation once the rule is weakened, or the property proves nothing.
 //!
-//! - The attempt rules of §2.1, against a world in which commits and venue
-//!   answers can be lost: `Absent` is never reported for an order the venue
-//!   holds, and no id is sent after an uncertain commit.
+//! - The attempt rules of §2.1, in a model where commits and venue answers can
+//!   be lost: `Absent` is never reported for an order the venue holds, and no
+//!   further attempt on an id follows an uncertain commit. The first bounded
+//!   send on an id after an uncertain commit is permitted, as §2.2 allows.
 //! - The real `SubmitAttemptLedger` against an independent count of attempts.
-//! - The per-stream persistence of §2.5: no append after a failure on the same
-//!   stream, and `last_seq` never skips an appended event.
+//! - The per-stream persistence of §2.5, in a model where a simulated lock
+//!   holder serializes the writers: no append after a failure on the same
+//!   stream, and `last_seq` never skips an appended event. Production locking
+//!   is not exercised here; it arrives with its own PR.
 
 use std::collections::{HashMap, HashSet};
 
@@ -241,7 +244,8 @@ fn run_attempts(rules: Rules) -> Vec<String> {
 }
 
 #[test]
-fn absent_never_covers_an_order_the_venue_holds_and_no_id_is_sent_after_an_uncertain_commit() {
+fn in_the_attempt_model_absent_never_covers_a_held_order_and_no_further_attempt_follows_an_uncertain_commit(
+) {
     assert_eq!(run_attempts(DESIGN), Vec::<String>::new());
 }
 
@@ -373,9 +377,9 @@ struct StreamWorld {
     violations: Vec<String>,
 }
 
-/// One step of writer `w`: check, append, apply. With `serialize`, the writer
-/// holds the stream lock through the whole sequence; without it, a failure can
-/// land between another writer's check and its append.
+/// One step of writer `w`: check, append, apply. With `serialize`, a simulated
+/// holder keeps the stream for the writer through the whole sequence; without
+/// it, a failure can land between another writer's check and its append.
 fn step_writer(
     world: &mut StreamWorld,
     pc: &mut Pc,
@@ -457,11 +461,11 @@ fn run_writers(serialize: bool) -> Vec<String> {
 }
 
 #[test]
-fn serialized_writers_never_append_after_a_failure_or_skip_a_sequence() {
+fn with_a_simulated_stream_lock_writers_never_append_after_a_failure_or_skip_a_sequence() {
     assert_eq!(run_writers(true), Vec::<String>::new());
 }
 
 #[test]
-fn unserialized_writers_break_the_property() {
+fn without_the_simulated_stream_lock_the_writers_break_the_property() {
     assert!(!run_writers(false).is_empty(), "the property must detect a missing stream lock");
 }
