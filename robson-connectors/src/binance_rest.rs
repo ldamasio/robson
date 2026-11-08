@@ -83,31 +83,6 @@ pub enum BinanceRestError {
     PositionNotFound(String),
 }
 
-/// The origin of a crash-harness venue URL, parsed and checked here so that a
-/// lookalike such as `http://127.0.0.1:80@evil.example` cannot leave loopback.
-/// The port must be explicit, and credentials, paths and queries are refused.
-#[cfg(any(test, feature = "crash-points"))]
-fn harness_origin(base_url: &str) -> Result<String, String> {
-    let url = reqwest::Url::parse(base_url).map_err(|error| format!("{base_url}: {error}"))?;
-    let host = url.host_str().unwrap_or_default();
-    let loopback = host == "localhost"
-        || host
-            .trim_matches(['[', ']'])
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
-    let bare_origin = url.path() == "/" && url.query().is_none() && url.fragment().is_none();
-    let no_credentials = url.username().is_empty() && url.password().is_none();
-    if url.scheme() != "http"
-        || !loopback
-        || url.port().is_none()
-        || !bare_origin
-        || !no_credentials
-    {
-        return Err(format!("{base_url} is not an http://<loopback>:<port> origin"));
-    }
-    Ok(url.origin().ascii_serialization())
-}
-
 // =============================================================================
 // Binance REST Client
 // =============================================================================
@@ -1535,6 +1510,31 @@ fn parse_field_error(
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// The origin of a crash-harness venue URL, parsed and checked here so that a
+/// lookalike such as `http://127.0.0.1:80@evil.example` cannot leave loopback.
+/// The port must be explicit, and credentials, paths and queries are refused.
+#[cfg(any(test, feature = "crash-points"))]
+fn harness_origin(base_url: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(base_url).map_err(|error| format!("{base_url}: {error}"))?;
+    let host = url.host_str().unwrap_or_default();
+    let loopback = host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    let bare_origin = url.path() == "/" && url.query().is_none() && url.fragment().is_none();
+    let no_credentials = url.username().is_empty() && url.password().is_none();
+    if url.scheme() != "http"
+        || !loopback
+        || url.port().is_none()
+        || !bare_origin
+        || !no_credentials
+    {
+        return Err(format!("{base_url} is not an http://<loopback>:<port> origin"));
+    }
+    Ok(url.origin().ascii_serialization())
+}
 
 #[cfg(test)]
 mod tests {
