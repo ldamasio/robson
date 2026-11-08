@@ -2298,6 +2298,7 @@ dependencies = [
  "robson-exec",
  "robson-projector",
  "robson-store",
+ "robson-testkit",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",

@@ -58,4 +58,5 @@ robson-domain = { path = "../robson-domain" }
 robson-engine = { path = "../robson-engine" }
 robson-exec = { path = "../robson-exec" }
 robson-store = { path = "../robson-store" }
+robson-testkit = { path = "../robson-testkit" }
 anyhow = { workspace = true }
