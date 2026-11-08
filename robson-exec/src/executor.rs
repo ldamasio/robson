@@ -367,10 +367,12 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         // 5. Execute on exchange exactly once. A timeout/transport failure after
         // order acceptance is ambiguous for MARKET orders; automatic retry can
         // create duplicate real positions. Reconciliation must resolve drift.
+        crate::crash_point!(ENTRY_BEFORE_SEND);
         let result = self
             .exchange
             .place_market_order(&symbol, side, quantity, &client_order_id, false)
             .await;
+        crate::crash_point!(ENTRY_AFTER_ACK);
 
         // 6. Record result and emit appropriate domain event
         match &result {

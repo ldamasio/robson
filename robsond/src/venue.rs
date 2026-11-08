@@ -329,6 +329,12 @@ fn usdm_credential(config: &Config) -> Option<Exchange> {
 fn usdm_client(config: &Config, credential: Exchange) -> Option<Arc<BinanceRestClient>> {
     let api_key = config.binance.api_key.clone()?;
     let api_secret = config.binance.api_secret.clone()?;
+    #[cfg(feature = "crash-points")]
+    if let Ok(base_url) = std::env::var(robson_exec::crash_points::VENUE_URL_ENV) {
+        return Some(Arc::new(BinanceRestClient::with_harness_base_url(
+            base_url, api_key, api_secret,
+        )));
+    }
     Some(Arc::new(match credential {
         Exchange::Binance => BinanceRestClient::new(api_key, api_secret),
         Exchange::BinanceTestnet => BinanceRestClient::testnet(api_key, api_secret),

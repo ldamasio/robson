@@ -17,9 +17,13 @@
 # Usage:
 #   DATABASE_URL=postgres://... bash scripts/test-pg.sh
 #   DATABASE_URL=postgres://... bash scripts/test-pg.sh --test crash_recovery
+#   DATABASE_URL=postgres://... bash scripts/test-pg.sh --crash-harness
 #
 # What runs:
 #   cargo test --features postgres -- --ignored [extra args]
+#   With --crash-harness (robsond/tests/crash_harness.rs, ADR-0056 step 7):
+#     cargo test -p robsond --features postgres,crash-points --test crash_harness
+#                --no-fail-fast -- --include-ignored --test-threads=2 [extra args]
 #
 # How sqlx::test works:
 #   Each test receives an isolated PgPool. sqlx::test:
@@ -88,8 +92,23 @@ for _pattern in "prod" "production" "live"; do
     fi
 done
 
+# Exported, so sqlx::test uses this checked value and never finds one in .env.
+export DATABASE_URL
+
 # ─── Run tests ─────────────────────────────────────────────────────────────────
 cd "${WORKSPACE_ROOT}"
+
+if [[ "${1:-}" == "--crash-harness" ]]; then
+    shift
+    info "Running the crash harness (real robsond, fake venue, database proxy)..."
+    warn "sqlx::test creates temporary databases on the server — expected, safe, ephemeral."
+    echo ""
+    cargo test -p robsond --features postgres,crash-points --test crash_harness \
+        --no-fail-fast -- --include-ignored --test-threads=2 "$@"
+    echo ""
+    success "Crash harness passed."
+    exit 0
+fi
 
 echo ""
 info "Running Postgres integration tests..."

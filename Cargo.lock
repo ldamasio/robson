@@ -2186,6 +2186,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "libc",
  "robson-domain",
  "robson-engine",
  "robson-store",
@@ -2262,9 +2263,12 @@ name = "robson-testkit"
 version = "2.5.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
+ "reqwest",
  "robson-eventlog",
  "robson-projector",
+ "rust_decimal",
  "serde_json",
  "sqlx",
  "tokio",
@@ -2294,6 +2298,7 @@ dependencies = [
  "robson-exec",
  "robson-projector",
  "robson-store",
+ "robson-testkit",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",

@@ -124,6 +124,38 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/robson_migration_ci
         run: cargo test --workspace --exclude robson-connectors --features postgres --no-fail-fast -- --ignored
 
+      # Crash harness (ADR-0056 step 7): the crash-points feature must never
+      # reach a release build. robson-exec carries the compile_error!.
+      - name: Reject the crash-points feature in a release build
+        timeout-minutes: 5
+        run: |
+          if out=$(cargo check --release -p robson-exec --features crash-points 2>&1); then
+            echo "::error::crash-points compiled in a release build"
+            exit 1
+          fi
+          grep -F "must never be combined with a release build" <<<"$out"
+          # Inverted on purpose: a forward tree never lists the root package's
+          # feature edges, so it would pass even with the feature on. Captured
+          # first, so a failing cargo tree fails this step instead of reading
+          # as "no match".
+          tree=$(cargo tree -p robsond --features postgres -e features,normal -i robson-exec)
+          test -n "$tree"
+          if grep -q crash-points <<<"$tree"; then
+            echo "::error::the production feature set enables crash-points"
+            exit 1
+          fi
+
+      # Real robsond killed at named crash points, against the fake venue and
+      # the database proxy (robson-testkit). DATABASE_URL points at the postgres
+      # service above; each test gets a sqlx::test database, nothing is spawned
+      # here. timeout-minutes bounds the step; the child watchdogs in
+      # DaemonProcess bound each robsond, so a stuck child cannot hold the run.
+      - name: Run the crash harness
+        timeout-minutes: 15
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/robson_migration_ci
+        run: cargo test -p robsond --features postgres,crash-points --test crash_harness --no-fail-fast -- --include-ignored --test-threads=2
+
       # Pinned, not rolling. rustfmt.toml enables unstable options
       # (wrap_comments, comment_width, normalize_comments,
       # format_code_in_doc_comments, imports_granularity, group_imports), whose
