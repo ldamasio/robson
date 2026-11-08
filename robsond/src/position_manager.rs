@@ -3791,6 +3791,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 // cannot retry an Immediate arm this makes terminal.
                 let recorded = self.record_query_failure(&query).await;
                 self.handle_signal_domain_rejection(&position, &signal, &domain_error).await?;
+                if recorded.is_err() && self.detectors.read().await.contains_key(&position_id) {
+                    // Re-armed by the rejection itself, so the failure re-arm
+                    // will skip it; count the failure here instead.
+                    crate::metrics::DETECTOR_REARMS_AFTER_FAILURE
+                        .with_label_values(&["signal"])
+                        .inc();
+                }
                 recorded?;
                 return Ok(());
             },
@@ -8411,6 +8418,34 @@ mod tests {
         assert!(!matches!(cancelled.state, PositionState::Armed), "{:?}", cancelled.state);
         assert!(!manager.detectors.read().await.contains_key(&armed.id));
         assert_eq!(manager.exchange().market_order_call_count(), 0);
+    }
+
+    /// A strategy-mode rejection re-arms on its own, so when its `failed`
+    /// record fails the failure re-arm skips it, and the count happens there.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_strategy_rejection_whose_record_fails_is_counted(pool: sqlx::PgPool) {
+        set_month_basis(&pool, dec!(10000)).await;
+        let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+        let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+        let rearms =
+            || crate::metrics::DETECTOR_REARMS_AFTER_FAILURE.with_label_values(&["signal"]);
+        let rearms_before = rearms().get();
+
+        fail_event_log_writes(&pool, &audit_write("failed")).await;
+        let result = manager
+            .handle_signal(DetectorSignal {
+                stop_loss: Price::new(dec!(94990)).unwrap(),
+                ..signal_again(&signal)
+            })
+            .await;
+        restore_event_log_writes(&pool).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(!manager.is_entry_exhausted(armed.id).await);
+        assert_rearmed_and_nothing_entered(&manager, &armed, 1, "strategy rejection").await;
+        assert!(rearms().get() >= rearms_before + 1.0, "the re-arm must be counted");
     }
 
     /// An approval that expires while writes fail is gone all the same, so the
