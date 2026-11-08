@@ -324,6 +324,7 @@ fn the_real_ledger_reports_an_attempt_as_unresolved_until_it_is_rejected() {
             let case = format!("id {id} in {schedule:?}: {evidence:?}");
             match evidence {
                 AttemptEvidence::Truncated => assert!(truncated, "{case}"),
+                AttemptEvidence::Unavailable => panic!("this ledger has no journal: {case}"),
                 AttemptEvidence::NoRecord => {
                     assert!(truncated || !seen.contains(&id), "{case}")
                 },

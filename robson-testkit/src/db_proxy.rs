@@ -6,6 +6,7 @@
 //! a database; it only sits in front of one the test environment provides.
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -43,6 +44,11 @@ pub enum ProxyMode {
     /// returns to `Pass`. A `COMMIT` through the extended protocol is not
     /// covered: it passes through, acknowledged, and the mode stays armed.
     DropCommitAck,
+    /// [`Self::DropCommitAck`], for the first commit of a transaction that
+    /// executed a statement containing this text. Follows `Parse`, `Bind` and
+    /// `Execute` on each connection, so a statement SQLx cached and sends with
+    /// no `Parse` still counts, and a commit of any other work passes.
+    DropCommitAckOf(&'static str),
 }
 
 /// Connection and commit counts.
@@ -52,6 +58,8 @@ pub struct ProxyStats {
     /// `COMMIT`s sent as a simple query.
     pub commits: u64,
     pub commit_acks_dropped: u64,
+    /// Statements executed: simple queries plus extended-protocol `Execute`s.
+    pub statements: u64,
 }
 
 #[derive(Default)]
@@ -59,6 +67,7 @@ struct Counters {
     connections: AtomicU64,
     commits: AtomicU64,
     commit_acks_dropped: AtomicU64,
+    statements: AtomicU64,
 }
 
 struct Shared {
@@ -72,15 +81,79 @@ impl Shared {
         *self.mode.borrow() == ProxyMode::Blackhole
     }
 
-    /// Claim a pending `DropCommitAck`, so only one connection fires it.
-    fn claim_commit_ack_drop(&self) -> bool {
+    /// Claim a pending commit-ack drop, so only one connection fires it.
+    fn claim_commit_ack_drop(&self, transaction: &TransactionWatch) -> bool {
         self.mode.send_if_modified(|mode| {
-            let fires = *mode == ProxyMode::DropCommitAck;
+            let fires = match *mode {
+                ProxyMode::DropCommitAck => true,
+                ProxyMode::DropCommitAckOf(text) => transaction.executed(text),
+                _ => false,
+            };
             if fires {
                 *mode = ProxyMode::Pass;
             }
             fires
         })
+    }
+}
+
+/// What one connection executed in its current explicit transaction. A
+/// statement is known by name once parsed and is run through a portal, so
+/// execution is only visible by following both. Outside `BEGIN`…`COMMIT` a
+/// statement commits on its own and belongs to no later transaction.
+#[derive(Default)]
+struct TransactionWatch {
+    statements: HashMap<Vec<u8>, String>,
+    portal_statement: HashMap<Vec<u8>, String>,
+    in_transaction: bool,
+    executed: Vec<String>,
+}
+
+impl TransactionWatch {
+    /// Note one frontend message.
+    fn observe(&mut self, tag: u8, body: &[u8]) {
+        let mut fields = body.splitn(3, |byte| *byte == 0);
+        match tag {
+            b'P' => {
+                if let (Some(name), Some(text)) = (fields.next(), fields.next()) {
+                    self.statements
+                        .insert(name.to_vec(), String::from_utf8_lossy(text).into_owned());
+                }
+            },
+            b'B' => {
+                if let (Some(portal), Some(statement)) = (fields.next(), fields.next()) {
+                    let text = self.statements.get(statement).cloned().unwrap_or_default();
+                    self.portal_statement.insert(portal.to_vec(), text);
+                }
+            },
+            b'E' => {
+                let text = fields.next().and_then(|p| self.portal_statement.get(p)).cloned();
+                if let Some(text) = text {
+                    self.executed_statement(text);
+                }
+            },
+            b'Q' => self.executed_statement(simple_query_text(body)),
+            _ => {},
+        }
+    }
+
+    /// One statement ran. Transaction control moves the boundary; anything
+    /// else counts only inside a transaction.
+    fn executed_statement(&mut self, text: String) {
+        let control = text.trim().trim_end_matches(';').trim().to_ascii_uppercase();
+        if control == "BEGIN" || control.starts_with("BEGIN ") {
+            self.in_transaction = true;
+            self.executed.clear();
+        } else if control == "COMMIT" || control == "ROLLBACK" {
+            self.in_transaction = false;
+            self.executed.clear();
+        } else if self.in_transaction {
+            self.executed.push(text);
+        }
+    }
+
+    fn executed(&self, text: &str) -> bool {
+        self.executed.iter().any(|statement| statement.contains(text))
     }
 }
 
@@ -134,6 +207,7 @@ impl DbProxy {
             connections: counters.connections.load(Ordering::Relaxed),
             commits: counters.commits.load(Ordering::Relaxed),
             commit_acks_dropped: counters.commit_acks_dropped.load(Ordering::Relaxed),
+            statements: counters.statements.load(Ordering::Relaxed),
         }
     }
 }
@@ -208,6 +282,7 @@ async fn frontend_to_backend(
     shared: &Shared,
     commit_ack_pending: &AtomicBool,
 ) -> std::io::Result<()> {
+    let mut transaction = TransactionWatch::default();
     loop {
         let (tag, body) = read_message(&mut client).await?;
         if shared.blackholed() {
@@ -215,12 +290,16 @@ async fn frontend_to_backend(
         }
         if is_simple_query_commit(tag, &body) {
             shared.counters.commits.fetch_add(1, Ordering::Relaxed);
-            if shared.claim_commit_ack_drop() {
+            if shared.claim_commit_ack_drop(&transaction) {
                 // Set before the commit is forwarded, so the backend half has
                 // always seen it by the time the reply arrives.
                 commit_ack_pending.store(true, Ordering::SeqCst);
             }
         }
+        if matches!(tag, b'Q' | b'E') {
+            shared.counters.statements.fetch_add(1, Ordering::Relaxed);
+        }
+        transaction.observe(tag, &body);
         write_message(&mut server, tag, &body).await?;
     }
 }
@@ -272,14 +351,56 @@ fn is_simple_query_commit(tag: u8, body: &[u8]) -> bool {
     if tag != b'Q' {
         return false;
     }
+    simple_query_text(body).eq_ignore_ascii_case("COMMIT")
+}
+
+fn simple_query_text(body: &[u8]) -> String {
     let end = body.iter().position(|byte| *byte == 0).unwrap_or(body.len());
     let statement = String::from_utf8_lossy(&body[..end]);
-    statement.trim().trim_end_matches(';').trim().eq_ignore_ascii_case("COMMIT")
+    statement.trim().trim_end_matches(';').trim().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A named statement is run through a portal, and on later runs SQLx sends
+    /// no `Parse`: the transaction still counts as having run it.
+    #[test]
+    fn a_cached_statement_counts_as_executed() {
+        let mut watch = TransactionWatch::default();
+        watch.observe(b'Q', b"BEGIN\0");
+        watch.observe(b'P', b"s_1\0INSERT INTO order_intents VALUES (1)\0\0\0");
+        watch.observe(b'B', b"\0s_1\0\0\0");
+        assert!(!watch.executed("order_intents"), "bound is not executed");
+        watch.observe(b'E', b"\0\0\0\0\0");
+        assert!(watch.executed("order_intents"));
+
+        watch.observe(b'Q', b"COMMIT\0");
+        assert!(!watch.executed("order_intents"));
+        watch.observe(b'Q', b"BEGIN\0");
+        watch.observe(b'B', b"\0s_1\0\0\0");
+        watch.observe(b'E', b"\0\0\0\0\0");
+        assert!(watch.executed("order_intents"), "no Parse this time");
+    }
+
+    /// An autocommit statement commits by itself: it does not count towards
+    /// the transaction that happens to come next.
+    #[test]
+    fn an_autocommit_statement_is_not_in_the_next_transaction() {
+        let mut watch = TransactionWatch::default();
+        watch.observe(b'P', b"s_1\0SELECT * FROM order_intents\0\0\0");
+        watch.observe(b'B', b"\0s_1\0\0\0");
+        watch.observe(b'E', b"\0\0\0\0\0");
+        assert!(!watch.executed("order_intents"));
+
+        watch.observe(b'Q', b"BEGIN\0");
+        watch.observe(b'P', b"s_2\0INSERT INTO other VALUES (1)\0\0\0");
+        watch.observe(b'B', b"\0s_2\0\0\0");
+        watch.observe(b'E', b"\0\0\0\0\0");
+        assert!(!watch.executed("order_intents"));
+        assert!(watch.executed("other"));
+    }
 
     #[test]
     fn only_a_simple_query_commit_is_a_commit() {
@@ -369,7 +490,8 @@ mod tests {
             assert_eq!(proxy.stats(), ProxyStats {
                 connections: 1,
                 commits: 1,
-                commit_acks_dropped: 1
+                commit_acks_dropped: 1,
+                statements: 2,
             });
             assert_eq!(proxy.mode(), ProxyMode::Pass);
         })
