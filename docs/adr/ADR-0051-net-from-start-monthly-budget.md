@@ -470,18 +470,34 @@ expiry. The backoff starts at 5 s and doubles to 15 minutes, and resets once an
 admission reaches the executor or the approval queue. During an outage each fire
 costs one failed write and a longer wait. Once the database is back the position
 resumes within one backoff period, then waits for its entry condition. Every retry is
-a full admission whose audit writes come before the order, so nothing enters without
-its record. Not re-armed: a failure after the executor, where an order may exist and
-the fill path and reconciliation decide; a signal that MonthlyHalt drops; a position
-that is no longer Armed, waits for approval, or needs an operator re-arm.
+a full admission: its query audit writes before the order (`accepted`, `processing`,
+`risk_checked`, `acting`, and `authorized` after an approval) must succeed, so no
+order goes out without them. The `EntryApprovalPending` domain event stays best
+effort, as before. Not re-armed: a failure after the executor, where an order may
+exist and the fill path and reconciliation decide; a signal that MonthlyHalt drops; a
+position that is no longer Armed, waits for approval, or needs an operator re-arm. A
+refusal that ends an `Immediate` arm still ends it when its own record fails. Each
+re-arm happens under `entry_flow_lock` on the position as it stands then, the expiry
+task's included, so a disarm or a halt cannot leave a stray detector.
 `robsond_detector_rearms_after_failure_total{flow}` counts the re-arms, a record the
 event log cannot keep while the database is down.
+
+The re-armed detector is the one the position had before it fired, as after a
+restart. In a strategy mode it reads candles on each matching market tick, as any
+Armed position's detector does, so the backoff bounds admissions, not those reads.
 
 What this leaves on the table: errors are not sorted by cause, so a fault before the
 executor that never clears retries every 15 minutes, with an error log and a count
 each time, instead of going quiet. An `Immediate` position re-arms as on a governed
 denial, so it can enter when the database returns rather than when it was armed.
 Disarm it to prevent that.
+
+Rollout and rollback of this recovery: no schema or event-format change. After the
+deploy, `/metrics` exports the counter at 0 for `signal`, `approval` and
+`approval_expiry`. Before merging, record the running `sha-*` tag from the
+`rbx-infra` pin as the rollback target; it already includes PR #300. Rolling back to
+it only brings back the lost detectors: an admission that fails before the executor
+again leaves its position without one until a restart, or a disarm and arm.
 
 | Option | On an invalid basis | Gain | Cost | Decision |
 | --- | --- | --- | --- | --- |
@@ -509,11 +525,13 @@ Disarm it to prevent that.
   invalid", but only while someone is looking. The alert is what reaches an absent
   operator.
 
-**Rollout and rollback.** A `robsond` merge promotes automatically, so the alerts
-go first: merge the `rbx-infra` rules and confirm Prometheus has loaded them before
-merging this change. A rule with no series stays silent. After the deploy, confirm
-`/metrics` exports the gauge at 0 with the last-read timestamp advancing. There is
-no schema or event-format change. The worker opens one more database connection.
+**Rollout and rollback.** This covers the invalid-basis change, PR #300; the
+detector recovery under Recovery has its own. A `robsond` merge promotes
+automatically, so the alerts go first: merge the `rbx-infra` rules and confirm
+Prometheus has loaded them before merging this change. A rule with no series stays
+silent. After the deploy, confirm `/metrics` exports the gauge at 0 with the
+last-read timestamp advancing. There is no schema or event-format change. The
+worker opens one more database connection.
 
 The rollback target is the image running before this deploy: record its `sha-*` tag
 from the `rbx-infra` pin before merging, confirm it is in the registry
