@@ -83,6 +83,14 @@ pub static DETECTOR_REARMS_AFTER_FAILURE: LazyLock<CounterVec> = LazyLock::new(|
     .expect("failed to register robsond_detector_rearms_after_failure_total")
 });
 
+/// Zero series for every flow, so the counter exports from startup and the
+/// first re-arm shows as an increase.
+pub fn init_detector_rearms_after_failure() {
+    for flow in ["signal", "approval", "approval_expiry"] {
+        DETECTOR_REARMS_AFTER_FAILURE.with_label_values(&[flow]);
+    }
+}
+
 /// Realized PnL per closed position (gauge — set once per close event).
 pub static POSITION_PNL: LazyLock<GaugeVec> = LazyLock::new(|| {
     register_gauge_vec!("robsond_position_pnl", "Realized PnL for closed positions", &[
@@ -470,6 +478,21 @@ mod tests {
         let rendered = render();
         assert!(rendered.contains("robsond_monthly_budget_basis_invalid"));
         assert!(rendered.contains("robsond_monthly_budget_basis_last_read_timestamp_seconds"));
+    }
+
+    #[test]
+    fn detector_rearm_counter_exports_every_flow_from_startup() {
+        init_detector_rearms_after_failure();
+
+        let rendered = render();
+        for flow in ["signal", "approval", "approval_expiry"] {
+            assert!(
+                rendered.contains(&format!(
+                    "robsond_detector_rearms_after_failure_total{{flow=\"{flow}\"}}"
+                )),
+                "{flow}"
+            );
+        }
     }
 
     #[test]

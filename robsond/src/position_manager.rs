@@ -205,8 +205,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// Pending approvals held in runtime memory for Phase 3.
     pending_approvals: Arc<RwLock<HashMap<Uuid, PendingApprovalRecord>>>,
     /// Serializes entry-governance flows so pending reservations remain
-    /// coherent.
-    entry_flow_lock: Mutex<()>,
+    /// coherent. Shared with the approval-expiry tasks.
+    entry_flow_lock: Arc<Mutex<()>>,
     /// Query engine for lifecycle tracking and audit persistence
     query_engine: Arc<QueryEngine<Arc<dyn QueryRecorder>>>,
     /// Binary MonthlyHalt gate (v3 policy: 4% drawdown → halt).
@@ -380,6 +380,8 @@ fn governed_rearm_backoff(attempt: u32) -> std::time::Duration {
     let shift = attempt.saturating_sub(1).min(8);
     std::time::Duration::from_secs((BASE_SECS << shift).min(MAX_SECS))
 }
+
+type DetectorMap = RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>;
 
 /// How far an admission flow got, which decides what an error leaves behind
 /// (ADR-0051 Recovery).
@@ -968,6 +970,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         approval_policy: ApprovalPolicy,
         trading_policy: TradingPolicy,
     ) -> Self {
+        crate::metrics::init_detector_rearms_after_failure();
         let shutdown_token = CancellationToken::new();
         let query_engine = Arc::new(QueryEngine::with_approval_policy(
             query_recorder,
@@ -1005,7 +1008,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             tech_stop_audits: Arc::new(RwLock::new(HashMap::new())),
             entry_exhausted: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
-            entry_flow_lock: Mutex::new(()),
+            entry_flow_lock: Arc::new(Mutex::new(())),
             query_engine,
             circuit_breaker: Arc::new(CircuitBreaker::default()),
             trading_policy,
@@ -2015,7 +2018,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 }
                 let handle = detector.spawn();
                 let mut detectors = detectors.write().await;
-                detectors.insert(position_id, handle);
+                if let Some(replaced) = detectors.insert(position_id, handle) {
+                    replaced.abort();
+                }
                 info!(%position_id, %reason, "Detector re-armed");
                 true
             },
@@ -2217,29 +2222,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         flow: &'static str,
         error: &DaemonError,
     ) {
-        // A latched MonthlyHalt refuses entries and disarms Armed positions.
-        if self.circuit_breaker.blocks_new_entries().await {
+        let Some(position) = Self::position_to_recover(
+            &self.store,
+            &self.circuit_breaker,
+            &self.entry_exhausted,
+            &self.pending_approvals,
+            &self.detectors,
+            position_id,
+        )
+        .await
+        else {
             return;
-        }
-        // A detector here is a governed re-arm the flow made before its error;
-        // a pending approval waits for the operator.
-        if self.detectors.read().await.contains_key(&position_id)
-            || self.has_pending_approval_for_position(position_id).await
-        {
-            return;
-        }
-        let position = match self.store.positions().find_by_id(position_id).await {
-            Ok(Some(position)) if matches!(position.state, PositionState::Armed) => position,
-            Ok(_) => return,
-            Err(e) => {
-                warn!(
-                    %position_id,
-                    flow,
-                    error = %e,
-                    "Cannot read the position after a failed admission — position requires manual re-arm"
-                );
-                return;
-            },
         };
         if self
             .rearm_detector_after_governed_block(
@@ -2256,6 +2249,40 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 %error,
                 "Admission failed before the executor — detector re-armed with backoff"
             );
+        }
+    }
+
+    /// The position a recovery path may re-arm, read as it stands now: still
+    /// Armed, outside MonthlyHalt (which disarms Armed positions), not waiting
+    /// for the operator, and without a detector, which here can only be a
+    /// re-arm made by the failed flow itself. Callers hold `entry_flow_lock`,
+    /// so no disarm or admission runs in between.
+    async fn position_to_recover(
+        store: &S,
+        circuit_breaker: &CircuitBreaker,
+        entry_exhausted: &RwLock<HashMap<PositionId, EntryRejectionRecord>>,
+        pending_approvals: &RwLock<HashMap<Uuid, PendingApprovalRecord>>,
+        detectors: &DetectorMap,
+        position_id: PositionId,
+    ) -> Option<Position> {
+        if circuit_breaker.blocks_new_entries().await
+            || entry_exhausted.read().await.contains_key(&position_id)
+            || detectors.read().await.contains_key(&position_id)
+            || pending_approvals.read().await.values().any(|r| r.position.id == position_id)
+        {
+            return None;
+        }
+        match store.positions().find_by_id(position_id).await {
+            Ok(Some(position)) if matches!(position.state, PositionState::Armed) => Some(position),
+            Ok(_) => None,
+            Err(e) => {
+                warn!(
+                    %position_id,
+                    error = %e,
+                    "Cannot read the position to re-arm its detector — position requires manual re-arm"
+                );
+                None
+            },
         }
     }
 
@@ -2300,6 +2327,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         query_id: Uuid,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) {
+        let entry_flow_lock = Arc::clone(&self.entry_flow_lock);
+        let store = Arc::clone(&self.store);
+        let circuit_breaker = Arc::clone(&self.circuit_breaker);
+        let entry_exhausted = Arc::clone(&self.entry_exhausted);
         let pending_approvals = Arc::clone(&self.pending_approvals);
         let query_engine = Arc::clone(&self.query_engine);
         let venue = self.venue.clone();
@@ -2323,6 +2354,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             tokio::select! {
                 _ = shutdown_token.cancelled() => {}
                 _ = tokio::time::sleep(wait_duration) => {
+                    // Serialized with disarm and admission: a disarm either
+                    // took the approval first, or comes after the re-arm and
+                    // stops it.
+                    let _entry_flow_guard = entry_flow_lock.lock().await;
                     let mut record = {
                         let mut pending = pending_approvals.write().await;
                         pending.remove(&query_id)
@@ -2367,12 +2402,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                             },
                         };
 
+                        // The position as it stands now, not as it was queued.
+                        let Some(position) = PositionManager::<E, S>::position_to_recover(
+                            &store,
+                            &circuit_breaker,
+                            &entry_exhausted,
+                            &pending_approvals,
+                            &detectors,
+                            record_inner.position.id,
+                        )
+                        .await
+                        else {
+                            return;
+                        };
                         let entry_policy = {
                             let policies = entry_policies.read().await;
-                            policies
-                                .get(&record_inner.position.id)
-                                .copied()
-                                .unwrap_or_default()
+                            policies.get(&position.id).copied().unwrap_or_default()
                         };
 
                         // Approval expiry is a governed block too: back off the
@@ -2380,7 +2425,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         // through repeated unattended approvals.
                         let attempt = {
                             let mut counts = governed_rearm_counts.write().await;
-                            let count = counts.entry(record_inner.position.id).or_insert(0);
+                            let count = counts.entry(position.id).or_insert(0);
                             *count = count.saturating_add(1);
                             *count
                         };
@@ -2388,8 +2433,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
                         let rearmed = PositionManager::<E, S>::rearm_detector(
                             venue,
-                            record_inner.position.id,
-                            record_inner.position,
+                            position.id,
+                            position,
                             entry_policy,
                             technical_stop_config,
                             event_bus,
@@ -7953,13 +7998,21 @@ mod tests {
     /// cache can hide it.
     #[cfg(feature = "postgres")]
     async fn fail_event_log_writes(pool: &sqlx::PgPool, condition: &str) {
+        inject_event_log_fault(pool, condition, "RAISE EXCEPTION 'injected event log failure';")
+            .await;
+    }
+
+    /// Runs `action`, PL/pgSQL, on every event-log insert that matches
+    /// `condition`, until `restore_event_log_writes`.
+    #[cfg(feature = "postgres")]
+    async fn inject_event_log_fault(pool: &sqlx::PgPool, condition: &str, action: &str) {
         let function = format!(
             r#"
             CREATE OR REPLACE FUNCTION injected_event_log_failure() RETURNS trigger
             LANGUAGE plpgsql AS $$
             BEGIN
                 IF {condition} THEN
-                    RAISE EXCEPTION 'injected event log failure';
+                    {action}
                 END IF;
                 RETURN NEW;
             END
@@ -8372,6 +8425,74 @@ mod tests {
         assert!(manager.get_pending_approvals().await.is_empty());
         assert_rearmed_and_nothing_entered(&manager, &armed, 1, "expired").await;
         assert!(!audit_trail(&pool, armed.id).await.iter().any(|cause| cause == "expired"));
+    }
+
+    /// The approval-expiry task against a disarm and MonthlyHalt over random
+    /// schedules, with the expiry's audit write slowed and sometimes failing: a
+    /// detector survives only on a position still Armed outside MonthlyHalt.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn an_expiry_racing_a_disarm_or_a_halt_leaves_no_stray_detector(pool: sqlx::PgPool) {
+        use proptest::{prelude::*, strategy::ValueTree, test_runner::TestRunner};
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+
+        set_month_basis(&pool, dec!(10000)).await;
+        let schedules = (any::<bool>(), any::<bool>(), any::<bool>(), 0u64..40);
+        let mut runner = TestRunner::deterministic();
+
+        for _ in 0..24 {
+            let (write_fails, disarm, halt, disarm_after_ms) =
+                schedules.new_tree(&mut runner).unwrap().current();
+            let case = format!(
+                "write_fails={write_fails} disarm={disarm} halt={halt} after={disarm_after_ms}ms"
+            );
+            let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+            let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+            manager.entry_policies.write().await.insert(
+                armed.id,
+                EntryPolicyConfig::new(
+                    EntryPolicy::ConfirmedTrend,
+                    DomainApprovalPolicy::HumanConfirmation,
+                ),
+            );
+            manager.handle_signal(signal).await.unwrap();
+            let query_id = manager.get_pending_approvals().await[0].id;
+
+            let action = if write_fails {
+                "PERFORM pg_sleep(0.05); RAISE EXCEPTION 'injected event log failure';"
+            } else {
+                "PERFORM pg_sleep(0.05);"
+            };
+            inject_event_log_fault(&pool, &audit_write("expired"), action).await;
+            if halt {
+                manager.circuit_breaker.trigger_halt("test".to_string()).await;
+            }
+
+            manager.spawn_approval_expiration_task(query_id, chrono::Utc::now());
+            if disarm {
+                tokio::time::sleep(std::time::Duration::from_millis(disarm_after_ms)).await;
+                manager.disarm_position(armed.id).await.unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !manager.get_pending_approvals().await.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the approval must leave the queue");
+            // An expiry still inside its critical section finishes first.
+            drop(manager.entry_flow_lock.lock().await);
+            restore_event_log_writes(&pool).await;
+
+            let live_detector = manager
+                .detectors
+                .read()
+                .await
+                .get(&armed.id)
+                .is_some_and(|handle| !handle.is_finished());
+            assert_eq!(live_detector, !disarm && !halt, "{case}");
+        }
     }
 
     /// Holds the next snapshot on `positions_current`, which it reads after the
