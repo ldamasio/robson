@@ -7,9 +7,9 @@
 //!
 //! The database comes from the environment, as for every `DATABASE_URL`-gated
 //! test: `sqlx::test` creates one per test on the provisioned server and drops
-//! it. The harness starts no database. Run with
-//! `DATABASE_URL=… cargo test -p robsond --features postgres,crash-points
-//!  --test crash_harness -- --include-ignored`.
+//! it. The harness starts no database. Run it through the canonical wrapper,
+//! whose guard refuses a production URL before SQLx connects:
+//! `DATABASE_URL=… bash scripts/test-pg.sh --crash-harness`.
 
 #![cfg(all(feature = "postgres", feature = "crash-points"))]
 
