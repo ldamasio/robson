@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Order journal storage and rules (ADR-0056 step 7, PR J, part 1)
+
+- Migration 31 adds the order journal's tables and the rollback view
+  `order_intents_blocking_rollback`. Nothing calls the journal yet.
+
 ### Fixed - A month row no longer gets a zero capital base without account evidence
 
 - The entry and close counters inserted `capital_base = 0` when the month's row

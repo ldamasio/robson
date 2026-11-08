@@ -42,6 +42,7 @@ pub mod crash_points;
 pub mod error;
 pub mod executor;
 pub mod intent;
+pub mod order_journal;
 pub mod ports;
 pub mod quantize;
 pub mod stub;

@@ -325,7 +325,7 @@ commission.
   `Selected` (as before), `Recovery` (the selected venue has no funding; finishes started sagas on the implied route,
   expires unstarted quotes, never touches the selected venue's capital) and `Blocked` (the route's credentials are
   unusable; writes nothing, liabilities retained). Evidence for `Blocked` is `blocked_reason` on the funding views and the
-  gauge `robsond_funding_sagas_blocked`. **Owner of durable per-saga routing and per-route workers: step 7**, whose legacy
+  gauge `robsond_funding_sagas_blocked`. **Owner of durable per-saga routing and per-route workers: step 8** (moved from step 7 on 2026-11-08), whose legacy
   mapping must also account for sagas a simulator created earlier on the same database.
 - **Simulated venues.** A factory-built stub has no funding surface, so it can neither create nor execute a persisted saga.
 - **Conversion exclusion.** Excluding governed inventory and reserving conversion quantities is not delivered. It is
@@ -605,6 +605,58 @@ account exists.
 | 6 | Quantisation and metadata rules (§5) with before/after fixtures per order kind | **changing** | revert alone only with a verified empty book (the old helper is incompatible with spot lots) **and no `residual_inventory_recorded` row in `event_log`**, since an older binary's projector returns `MissingHandler` on it and its event enum cannot read it; the additive `rules_snapshot` needs no such condition |
 | 7 | Durable intent journal in the store (migration): intents and results persisted in order relative to reservations, stable venue-scoped client ids, durable attempt evidence (§2), explicit unresolved states, transition intents (§2.2); **durable venue/account routing on every risk-bearing and unsettled leg**, with the legacy mapping of every existing position to `binance:usdm`; process-kill tests at every external-call/persistence boundary | preserving (adds evidence and identity) | revert alone with an empty book; after step 8 only together with step 8 |
 | 8 | Spot venue acceptance behind `ROBSON_VENUE=binance_spot`: `InventoryPort`, protection protocol per N1, settlement from fills, conformance suite green; the long-only entry gate is a separate ADR | new venue | disabling a venue stops new admissions on it but **keeps managing its open and unsettled legs** through the step-7 routing; a binary rollback requires a verified empty book on that venue |
+
+**Step 7 is delivered in parts, and this is what is implemented so far (operational rollout pending).** Step 7's scope is
+the venue-independent core; routing, booking and everything else that needs the spot design moved to step 8 by operator
+decision on 2026-11-08 (`Fence and manual recovery`, `Core now`). The parts land in the order harness, journal, cancels,
+stop, persistence, fence, ownership races. The row above is the original statement.
+
+*Harness (PR H).* Named crash points, a fake venue, a database proxy, CI step. No production behaviour.
+
+*Order journal, part 1 (store and rules).* Migration 31 adds `order_intents` (one row per logical order, unique per venue,
+account scope and client id), `submit_attempts` and `journal_decisions`, and the view `order_intents_blocking_rollback`.
+`robson_exec::order_journal` holds the rules and `robsond::order_journal_store` the PostgreSQL side.
+
+- **Attempt rules.** An attempt goes `started → rejected` and nothing else, and an upsert lets `rejected` absorb `started`, so
+  replays and lost acknowledgements converge. A further attempt on a client id commits together with every earlier attempt on
+  it, including attempts known only in memory; a failed or uncertain commit refuses that send, and the id is closed for the
+  rest of the process. A later process cannot use a client id that landed. An id whose row never landed and whose process
+  died cannot be detected as used: that case rests on ids never being minted twice.
+- **Write classes.** Strict: the intent and first attempt commit before the request, waiting at most 500 ms. A known failure is
+  a proven no-send; a timeout or a commit with no answer is uncertain and no request goes out. Bounded: the commit is tried for
+  at most 500 ms on the journal's own pool of 2 connections and the request goes out anyway, setting the latch if the row did
+  not land. A client id already spent is refused on either class. **"Known failure" means the `COMMIT` was never sent**, since a
+  transaction that never sent it cannot be durable: a statement error before it is known, which is broader than "before the
+  statement was sent"; every timeout stays uncertain.
+- **Results and retry.** A result write never fails its caller. It is registered in the retry set before the wait, so a future
+  dropped mid-commit stays there, counted on the gauge and flushed; the set holds at most 1,024 intents, and one retry pass stops
+  starting commits after 2 s, so it holds its loop for at most 2.5 s. Overflow discards that intent's history and sets the latch.
+- **Discarded ids stay refused while they can be kept.** An id that leaves memory either has a durable row, which the unique index
+  holds for good, or was never sent, except one sent with no row and no room in the retry set. Those go to a set of at most 4,096 ids
+  (about 400 KB) kept for the life of the process, and are refused through any handle. **A full journal never stops a bounded first
+  send.** With both full the send goes out and its id is not kept, so its non-reuse rests on the id being fresh, the same reliance as
+  a process that died with no row. Every bounded path mints a fresh id per intent. The loss is logged at ERROR and counted, and the
+  count only grows until restart.
+- **Cancellation of a read or a write.** A connection whose read or write did not finish is closed, not returned to the pool, so a
+  dropped future cannot leave the two connections waiting on replies that will never come. An interrupted cancel intent is uncertain, never
+  `not_sent`: `not_sent` needs a ticket as proof, and a cancel has none.
+- **Query bounds (guardrails §1.1).** Every write is one explicit transaction ending in a simple-query `COMMIT`; nothing commits
+  implicitly. Reviewed bounds per handled operation, `BEGIN` and `COMMIT` included: an order 9 (13 with one quantisation retry), a
+  cancel 9, a stop placement with its predecessor's cancel 22, a cancel-first exit 22, a placement that withdraws both stops 31.
+  They are above the guardrails' default review threshold of 15 on purpose: the writes are small and each pair is one order's
+  durability. Each operation's count is kept and the bound (31) is checked when it ends. These are charged counts: a commit is charged
+  what it plans to run, so one that fails before sending anything is charged in full. They are not a measure of executed SQL.
+
+**Rollback across this schema is boundary B:** with the daemon stopped, `SELECT * FROM order_intents_blocking_rollback` must be
+empty. It lists every intent with no definite outcome that is not proven unsent and has no disposition. Read on a running process
+it is a snapshot, not an authorization. An older binary ignores the new tables, which is why ignoring them needs this check first.
+
+**A rollback image must keep migration 31.** SQLx's migrator rejects an applied migration missing from its embedded set
+(`VersionMissing`), and `robsond db migrate` runs in the deployment's Sync hook. So once migration 31 is applied, pinning straight back to
+`sha-179898cf` is rejected by that image's migration hook. Rollback means an image that keeps migration 31, or a compatible
+migration-job image.
+
+Part 1 changes nothing at runtime: nothing calls the journal yet.
 
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze

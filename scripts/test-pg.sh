@@ -20,7 +20,10 @@
 #   DATABASE_URL=postgres://... bash scripts/test-pg.sh --crash-harness
 #
 # What runs:
-#   cargo test --features postgres -- --ignored [extra args]
+#   cargo test --workspace --exclude robson-connectors --features postgres
+#              -- --ignored [extra args]
+#   robson-connectors is excluded, as in CI: its ignored tests call the live
+#   Binance API and need no database.
 #   With --crash-harness (robsond/tests/crash_harness.rs, ADR-0056 step 7):
 #     cargo test -p robsond --features postgres,crash-points --test crash_harness
 #                --no-fail-fast -- --include-ignored --test-threads=2 [extra args]
@@ -119,7 +122,7 @@ echo ""
 warn "sqlx::test creates temporary databases on the server — expected, safe, ephemeral."
 echo ""
 
-cargo test --features postgres -- --ignored "$@"
+cargo test --workspace --exclude robson-connectors --features postgres -- --ignored "$@"
 
 echo ""
 success "All Postgres integration tests passed."

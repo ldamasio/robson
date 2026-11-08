@@ -31,6 +31,12 @@ pub enum ExecError {
     #[error("Exchange error: {0}")]
     ReduceOnlyRejected(String),
 
+    /// The order journal would not authorize this send, so no request left
+    /// under this client id (ADR-0056 step 7). The caller mints a new id on its
+    /// next try.
+    #[error("Exchange error: {0}")]
+    SendRefused(String),
+
     /// Intent journal error
     #[error("Intent journal error: {0}")]
     IntentJournal(String),

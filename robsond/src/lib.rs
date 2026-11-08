@@ -65,6 +65,8 @@ pub mod venue;
 pub mod budget_basis_alarm;
 #[cfg(feature = "postgres")]
 pub mod income_ledger;
+#[cfg(feature = "postgres")]
+pub mod order_journal_store;
 
 #[cfg(feature = "postgres")]
 pub mod projection_worker;

@@ -20,7 +20,7 @@ use std::{
     collections::HashMap,
     fmt,
     future::Future,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::Duration,
 };
 
@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::ExecError,
+    order_journal::{report_rejected, report_send_started, OrderJournal},
     ports::{
         ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord, OpenOrderRecord,
         OrderResult, SpotBalance, SpotOrder, SpotOrderRequest, Transfer, TransferId,
@@ -132,6 +133,7 @@ impl VenueFinalityRule {
                 AttemptEvidence::AllRejected { .. } => OrderLookup::Absent { finality: self },
                 AttemptEvidence::NoRecord
                 | AttemptEvidence::Truncated
+                | AttemptEvidence::Unavailable
                 | AttemptEvidence::Unresolved { .. } => OrderLookup::Unknown,
             },
         }
@@ -149,6 +151,8 @@ pub enum AttemptEvidence {
     /// The ledger dropped evidence for capacity, so nothing can be concluded
     /// about any client id.
     Truncated,
+    /// The durable evidence could not be read: nothing can be concluded.
+    Unavailable,
     /// `unresolved` attempts are not proven rejected (in flight, dropped,
     /// accepted or indeterminate); `rejected` others were refused.
     Unresolved { unresolved: u64, rejected: u64 },
@@ -187,21 +191,22 @@ struct LedgerState {
 /// indeterminate attempt is evicted, a rejected retry starts a fresh record
 /// that reads `AllRejected`.
 ///
-/// **Restart limitation.** The evidence is in memory until ADR-0056 step 7
-/// persists it, and a restart has the same false-fresh shape: an attempt by an
-/// earlier (or any other) process left no record here, so a rejected retry
-/// with the same client id reads `AllRejected` and a not-found becomes a false
-/// `Absent`, although the other attempt may have been accepted. Without a
-/// retry the empty ledger reads `NoRecord`, which is `Unknown`. Until step 7,
-/// no caller may act on `Absent` for a client id that another process may have
-/// submitted. Step 7 must persist each attempt durably before its request is
-/// sent and each rejection when observed, reload them on startup, treat an
-/// attempt without a persisted rejection as unresolved, and keep the truncated
-/// state across restarts.
+/// **Across a restart.** On its own this ledger cannot see an earlier
+/// process's attempts. With the [`OrderJournal`] attached,
+/// [`Self::final_evidence`] answers from the durable rows; `evidence` stays
+/// the in-memory view. A daemon with no database has neither, and every
+/// not-found on an earlier process's id stays `Unknown`.
 #[derive(Debug)]
 pub struct SubmitAttemptLedger {
     capacity: usize,
     state: Mutex<LedgerState>,
+    journal: OnceLock<Arc<OrderJournal>>,
+}
+
+impl fmt::Debug for OrderJournal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OrderJournal")
+    }
 }
 
 impl SubmitAttemptLedger {
@@ -210,15 +215,23 @@ impl SubmitAttemptLedger {
         Self {
             capacity,
             state: Mutex::new(LedgerState::default()),
+            journal: OnceLock::new(),
         }
+    }
+
+    /// Answer the finality rule from the durable journal from now on.
+    pub fn attach_journal(&self, journal: Arc<OrderJournal>) {
+        let _ = self.journal.set(journal);
     }
 
     fn lock(&self) -> MutexGuard<'_, LedgerState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Register one attempt, unresolved until [`SubmitAttempt::rejected`].
+    /// Register one attempt, unresolved until [`SubmitAttempt::rejected`], and
+    /// report the send ticket to the journal: every send passes here last.
     pub fn begin<'a>(&'a self, client_order_id: &'a str) -> SubmitAttempt<'a> {
+        report_send_started(client_order_id);
         let mut state = self.lock();
         if !state.truncated {
             if let Some(counts) = state.attempts.get_mut(client_order_id) {
@@ -259,6 +272,31 @@ impl SubmitAttemptLedger {
         result
     }
 
+    /// The evidence the finality rule decides on (ADR-0056 step 7, rule 4):
+    /// with a journal attached, the durable rows and the journal's memory, and
+    /// an attempt unresolved here can only keep it unresolved. Without one,
+    /// this ledger alone.
+    pub async fn final_evidence(&self, client_order_id: &str) -> AttemptEvidence {
+        let local = self.evidence(client_order_id);
+        let Some(journal) = self.journal.get() else {
+            return local;
+        };
+        let durable = journal.attempt_evidence(client_order_id).await;
+        match (durable, self.evidence(client_order_id), local) {
+            (
+                AttemptEvidence::AllRejected { .. },
+                unresolved @ AttemptEvidence::Unresolved { .. },
+                _,
+            )
+            | (
+                AttemptEvidence::AllRejected { .. },
+                _,
+                unresolved @ AttemptEvidence::Unresolved { .. },
+            ) => unresolved,
+            (durable, ..) => durable,
+        }
+    }
+
     /// The evidence for `client_order_id` as of now.
     pub fn evidence(&self, client_order_id: &str) -> AttemptEvidence {
         let state = self.lock();
@@ -289,6 +327,7 @@ impl SubmitAttempt<'_> {
     /// The venue authoritatively refused this attempt. Consumes the handle, so
     /// one attempt cannot be counted twice.
     pub fn rejected(self) {
+        report_rejected(self.client_order_id);
         let mut state = self.ledger.lock();
         // Missing only after truncation, when nothing is recorded any more.
         if let Some(counts) = state.attempts.get_mut(self.client_order_id) {
@@ -667,12 +706,9 @@ pub trait TradingPort: Send + Sync {
     /// id, read after the not-found responses returned; otherwise it is
     /// `Unknown`, however much time has passed. A request failure is `Err`.
     ///
-    /// **Restart limitation.** The evidence does not survive a restart until
-    /// ADR-0056 step 7 persists it. An attempt by an earlier (or any other)
-    /// process is not on record, so a rejected retry with the same client id
-    /// yields a false `Absent` although that attempt may have been accepted.
-    /// Until then, no caller may act on `Absent` for a client id that another
-    /// process may have submitted. The ledger states what step 7 must do.
+    /// With the order journal attached the evidence is durable and spans
+    /// restarts (ADR-0056 step 7, rule 4): at least one row, all rejected,
+    /// nothing unlanded in memory.
     async fn order_by_client_id(
         &self,
         symbol: &Symbol,
@@ -830,6 +866,9 @@ pub trait FundingPort: Send + Sync {
 /// accessors for the account-kind specific and optional ones.
 pub trait Venue: TradingPort + AccountPort {
     fn id(&self) -> &VenueId;
+    /// Give the venue's attempt ledger the durable journal. A venue without a
+    /// ledger has nothing to attach.
+    fn attach_order_journal(&self, _journal: Arc<OrderJournal>) {}
     fn position_account(&self) -> Option<&dyn PositionAccountPort>;
     fn inventory(&self) -> Option<&dyn InventoryPort>;
     fn settlement(&self) -> &dyn SettlementPort;
@@ -906,13 +945,14 @@ pub async fn replace_place_then_cancel<T: TradingPort + ?Sized>(
     {
         Ok(placed) => placed,
         Err(error) => {
-            return Ok(match attempts.evidence(&new.client_order_id) {
+            return Ok(match attempts.final_evidence(&new.client_order_id).await {
                 AttemptEvidence::AllRejected { .. } => {
                     ReplaceOutcome::OldKeptNewRejected { reason: error.to_string() }
                 },
                 // The successor may exist.
                 AttemptEvidence::NoRecord
                 | AttemptEvidence::Truncated
+                | AttemptEvidence::Unavailable
                 | AttemptEvidence::Unresolved { .. } => ReplaceOutcome::Unknown { new: None },
             });
         },
