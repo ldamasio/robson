@@ -151,7 +151,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// Consecutive governed re-arms per position (risk denial, expired
     /// approval, an admission that failed before the executor). Drives the
     /// exponential backoff on the re-armed detector's first evaluation;
-    /// cleared when an admission reaches the executor or the approval queue.
+    /// cleared when an admission's entry reaches the venue's send or the
+    /// approval queue.
     governed_rearm_counts: Arc<RwLock<HashMap<PositionId, u32>>>,
     /// Entry-time invalidation guard level captured from the detector signal
     /// (ADR-0042), keyed by position. Populated when a signal carrying a guard
@@ -395,7 +396,8 @@ enum AdmissionReach {
     DetectorSpent(PositionId),
     /// The entry's actions went to the executor. An order may be on the
     /// exchange, so the flow never re-arms from here: the fill path and
-    /// reconciliation own the position.
+    /// reconciliation own the position. A proven no-send on a leg with no
+    /// admission evidence goes back to `DetectorSpent`.
     Executor,
 }
 
@@ -1662,7 +1664,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
             let should_stop = matches!(
                 result,
-                ActionResult::OrderFailed { .. } | ActionResult::EntryExecutionRejected { .. }
+                ActionResult::OrderFailed { .. }
+                    | ActionResult::EntryExecutionRejected { .. }
+                    | ActionResult::EntryNotSent { .. }
             );
             results.push(result);
             if should_stop {
@@ -2212,9 +2216,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         .await
     }
 
-    /// Reset the governed re-arm backoff once an admission reaches the
-    /// executor or the approval queue. Not earlier: a failure that recurs
-    /// after the risk gate would otherwise re-arm every 5 s for good.
+    /// Reset the governed re-arm backoff once an admission's entry reaches the
+    /// venue's send (it holds a ticket) or the approval queue. Not earlier: a
+    /// failure that recurs before either would otherwise re-arm every 5 s for
+    /// good.
     async fn clear_governed_rearm_backoff(&self, position_id: PositionId) {
         self.governed_rearm_counts.write().await.remove(&position_id);
     }
@@ -2509,6 +2514,52 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         queries
     }
 
+    /// A proven no-send, nothing on the venue. With ADR-0052 admission evidence
+    /// on the leg no second admission can succeed (the engine refuses one
+    /// against an existing ruler, and the ruler is immutable), so the attempt
+    /// ends now with its own reason and the operator re-arms. `true` means the
+    /// attempt is over and nothing may re-arm.
+    ///
+    /// If the exhaustion cannot be appended the error is returned and this
+    /// process still holds the record, so it re-arms nothing. A restart loses
+    /// that record: it can restore the detector, and the engine's evidence
+    /// check then rejects the next signal and makes it terminal.
+    async fn end_attempt_on_admission_evidence(
+        &self,
+        position_id: PositionId,
+        signal_id: Option<Uuid>,
+        reason: &str,
+    ) -> DaemonResult<bool> {
+        let Some(position) = self.store.positions().find_by_id(position_id).await? else {
+            return Ok(true);
+        };
+        if !position.carries_admission_evidence() {
+            return Ok(false);
+        }
+        self.mark_entry_exhausted(position_id, signal_id, "entry_not_sent", reason)
+            .await?;
+        Ok(true)
+    }
+
+    /// The executor proved nothing went out. Without admission evidence the
+    /// detector goes back under the governed backoff. An error leaves `reach`
+    /// alone: the detector stays spent.
+    async fn recover_from_entry_not_sent(
+        &self,
+        position_id: PositionId,
+        signal_id: Uuid,
+        reason: &str,
+        reach: &mut AdmissionReach,
+    ) -> DaemonResult<()> {
+        if !self
+            .end_attempt_on_admission_evidence(position_id, Some(signal_id), reason)
+            .await?
+        {
+            *reach = AdmissionReach::DetectorSpent(position_id);
+        }
+        Ok(())
+    }
+
     async fn execute_signal_query(
         &self,
         query: &mut ExecutionQuery,
@@ -2532,10 +2583,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.record_query_transition(query, "acting").await?;
 
         // From here an order may reach the exchange: an error no longer
-        // re-arms the detector.
+        // re-arms the detector, unless the executor proves nothing was sent.
         *reach = AdmissionReach::Executor;
-        self.clear_governed_rearm_backoff(position_id).await;
-        let results = match self.execute_and_persist(governed.into_actions()).await {
+        let operation = self.executor.order_journal().begin_operation();
+        let executed = operation.scope(self.execute_and_persist(governed.into_actions())).await;
+        // On Ok and Err alike, and whatever became of persisting the result: a
+        // ticket means this admission reached the venue's send (ADR-0056 step 7).
+        let ticket_issued = operation.entry_ticket_issued();
+        drop(operation);
+        if ticket_issued {
+            self.clear_governed_rearm_backoff(position_id).await;
+        }
+        let results = match executed {
             Ok(r) => r,
             Err(e) => {
                 query.fail(format!("{}", e), "acting".to_string());
@@ -2597,8 +2656,30 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         "Entry order rejected before fill"
                     );
                     query.fail(error.clone(), "acting".to_string());
-                    self.record_query_failure(query).await?;
+                    // Nothing went out either, and the safety event stands. A
+                    // legacy leg behaves as before: spent, no re-arm.
+                    let signal_id = match &event {
+                        Event::EntryExecutionRejected { signal_id, .. } => Some(*signal_id),
+                        _ => None,
+                    };
+                    let ended = self
+                        .end_attempt_on_admission_evidence(position_id, signal_id, &error)
+                        .await;
+                    let recorded = self.record_query_failure(query).await;
+                    ended?;
+                    recorded?;
                     return Err(DaemonError::Exec(ExecError::InvalidState(error)));
+                },
+                ActionResult::EntryNotSent { signal_id, reason } => {
+                    warn!(%position_id, %reason, "Entry not sent");
+                    query.fail(reason.clone(), "acting".to_string());
+                    let recovered = self
+                        .recover_from_entry_not_sent(position_id, signal_id, &reason, reach)
+                        .await;
+                    let recorded = self.record_query_failure(query).await;
+                    recovered?;
+                    recorded?;
+                    return Err(DaemonError::Exec(ExecError::SendRefused(reason)));
                 },
                 ActionResult::ExitNotExecutable { .. } | ActionResult::ExitFailed { .. } => {
                     warn!(%position_id, "Unexpected exit outcome in an entry flow");
@@ -3053,6 +3134,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
     /// Returns an `Arc` to the circuit breaker so API handlers can read/write
     /// it.
+    pub fn order_journal(&self) -> Arc<robson_exec::order_journal::OrderJournal> {
+        self.executor.order_journal()
+    }
+
     pub fn circuit_breaker(&self) -> Arc<CircuitBreaker> {
         Arc::clone(&self.circuit_breaker)
     }
@@ -4625,7 +4710,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     if matches!(
                         e,
                         DaemonError::Exec(
-                            ExecError::RulesRejected(_) | ExecError::ReduceOnlyRejected(_)
+                            ExecError::RulesRejected(_)
+                                | ExecError::ReduceOnlyRejected(_)
+                                | ExecError::SendRefused(_)
                         )
                     ) {
                         warn!(
@@ -6069,6 +6156,15 @@ mod tests {
         event_bus: Arc<EventBus>,
         approval_policy: ApprovalPolicy,
     ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        create_test_manager_with_order_journal(store, event_bus, approval_policy, None).await
+    }
+
+    async fn create_test_manager_with_order_journal(
+        store: Arc<MemoryStore>,
+        event_bus: Arc<EventBus>,
+        approval_policy: ApprovalPolicy,
+        order_journal: Option<Arc<robson_exec::order_journal::OrderJournal>>,
+    ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         exchange.set_trading_rules(
             robson_domain::SymbolTradingRules::new(
@@ -6085,7 +6181,11 @@ mod tests {
             .unwrap(),
         );
         let journal = Arc::new(IntentJournal::new());
-        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let executor = Executor::new(exchange, journal, store.clone());
+        let executor = Arc::new(match order_journal {
+            Some(order_journal) => executor.with_order_journal(order_journal),
+            None => executor,
+        });
         let risk_config = RiskConfig::new(dec!(10000)).unwrap(); // 1% cap
         let engine = Engine::new(risk_config);
 
@@ -7885,7 +7985,6 @@ mod tests {
     }
 
     /// An Armed BTCUSDT position and the signal that would enter it.
-    #[cfg(feature = "postgres")]
     async fn armed_position_and_signal(
         manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
     ) -> (Position, DetectorSignal) {
@@ -7994,10 +8093,23 @@ mod tests {
         pool: sqlx::PgPool,
         approval_ttl_seconds: u64,
     ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        audited_postgres_test_manager_with_journal(pool, approval_ttl_seconds, None)
+    }
+
+    #[cfg(feature = "postgres")]
+    fn audited_postgres_test_manager_with_journal(
+        pool: sqlx::PgPool,
+        approval_ttl_seconds: u64,
+        order_journal: Option<Arc<robson_exec::order_journal::OrderJournal>>,
+    ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
-        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let executor = Executor::new(exchange, journal, store.clone());
+        let executor = Arc::new(match order_journal {
+            Some(order_journal) => executor.with_order_journal(order_journal),
+            None => executor,
+        });
         let engine = Engine::new(RiskConfig::new(dec!(10000)).unwrap());
         let tenant_id = Uuid::now_v7();
 
@@ -8370,6 +8482,384 @@ mod tests {
                 manager.governed_rearm_counts.read().await.get(&armed.id),
                 None,
                 "{condition}"
+            );
+        }
+    }
+
+    // ---- ADR-0056 step 7, PR J: typed refusal and the backoff reset ------------
+
+    /// A manager whose order journal answers from a scripted backend.
+    async fn journaled_manager() -> (
+        Arc<PositionManager<StubExchange, MemoryStore>>,
+        Arc<robson_exec::order_journal::StubJournalBackend>,
+    ) {
+        let backend = Arc::new(robson_exec::order_journal::StubJournalBackend::default());
+        let journal = Arc::new(
+            robson_exec::order_journal::OrderJournal::new(
+                backend.clone(),
+                &robson_exec::venue::VenueId::new("test:venue"),
+            )
+            .with_commit_bound(std::time::Duration::from_millis(20)),
+        );
+        let manager = create_test_manager_with_order_journal(
+            Arc::new(MemoryStore::new()),
+            Arc::new(EventBus::new(100)),
+            ApprovalPolicy::new(Decimal::from(100u32), 300),
+            Some(journal),
+        )
+        .await;
+        (manager, backend)
+    }
+
+    /// A position with `failures` earlier governed re-arms behind it.
+    async fn armed_with_backoff(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        failures: u32,
+    ) -> (Position, DetectorSignal) {
+        let (armed, signal) = armed_position_and_signal(manager).await;
+        manager.governed_rearm_counts.write().await.insert(armed.id, failures);
+        (armed, signal)
+    }
+
+    /// A position armed the production way: `ExecutableSpan`, with its signal.
+    async fn production_policy_position_and_signal(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> (Position, DetectorSignal) {
+        manager.exchange().set_trading_rules(
+            robson_domain::SymbolTradingRules::new(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                dec!(0.01),
+                Decimal::ZERO,
+                dec!(0.000001),
+                dec!(0.000001),
+                dec!(1000000),
+                Decimal::ZERO,
+                2,
+                6,
+            )
+            .unwrap(),
+        );
+        let position = manager
+            .arm_position(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                create_test_risk_config(),
+                None,
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(position.stop_policy, StopPolicy::ExecutableSpan);
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol: position.symbol.clone(),
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(90250)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+        (position, signal)
+    }
+
+    /// ADR-0052: a proven no-send has already written the immutable ruler, so a
+    /// re-arm could never admit. The attempt ends with its own reason, audited,
+    /// nothing went out, and a later signal stays refused.
+    #[tokio::test]
+    async fn a_no_send_on_a_production_policy_leg_ends_the_attempt() {
+        use robson_exec::order_journal::JournalFault;
+        for refuse_in_adapter in [false, true] {
+            let (manager, backend) = journaled_manager().await;
+            let (armed, signal) = production_policy_position_and_signal(&manager).await;
+            if refuse_in_adapter {
+                manager.exchange().set_refuse_before_send_next(true);
+            } else {
+                backend.push_fault(JournalFault::Known);
+            }
+
+            let result = manager.handle_signal(signal.clone()).await;
+
+            assert!(
+                matches!(result, Err(DaemonError::Exec(ExecError::SendRefused(_)))),
+                "{result:?}"
+            );
+            assert_eq!(manager.exchange().market_order_call_count(), 0);
+            assert!(!manager.detectors.read().await.contains_key(&armed.id), "no re-arm");
+            assert!(manager.is_entry_exhausted(armed.id).await);
+            let stored = manager.get_position(armed.id).await.unwrap().unwrap();
+            assert!(matches!(stored.state, PositionState::Armed));
+            assert!(stored.carries_admission_evidence(), "the ruler was not cleared");
+            let events = manager.store.events().find_by_position(armed.id).await.unwrap();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                Event::EntryAttemptExhausted { reason_code, signal_id, .. }
+                    if reason_code == "entry_not_sent" && *signal_id == Some(signal.signal_id)
+            )));
+
+            // The next signal changes nothing and sends nothing.
+            let _ = manager
+                .handle_signal(DetectorSignal { signal_id: Uuid::now_v7(), ..signal })
+                .await;
+            assert_eq!(manager.exchange().market_order_call_count(), 0);
+            assert!(!manager.detectors.read().await.contains_key(&armed.id));
+        }
+    }
+
+    /// The account's futures settings refuse the entry after the ruler was
+    /// written. It is a proven no-send: the safety event stands and the attempt
+    /// ends, as for any other.
+    #[tokio::test]
+    async fn a_futures_settings_refusal_on_a_production_policy_leg_ends_the_attempt() {
+        let (manager, _backend) = journaled_manager().await;
+        let (armed, signal) = production_policy_position_and_signal(&manager).await;
+        manager.exchange().set_futures_settings("Hedge", 1);
+
+        let result = manager.handle_signal(signal.clone()).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert!(!manager.detectors.read().await.contains_key(&armed.id), "no re-arm");
+        assert!(manager.is_entry_exhausted(armed.id).await);
+        let stored = manager.get_position(armed.id).await.unwrap().unwrap();
+        assert!(stored.carries_admission_evidence());
+        let events = manager.store.events().find_by_position(armed.id).await.unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::EntryExecutionRejected { .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::EntryAttemptExhausted { reason_code, signal_id, .. }
+                if reason_code == "entry_not_sent" && *signal_id == Some(signal.signal_id)
+        )));
+    }
+
+    /// A legacy leg keeps exactly what it had: the safety event, a spent
+    /// detector, no exhaustion and no new re-arm.
+    #[tokio::test]
+    async fn a_futures_settings_refusal_on_a_legacy_leg_changes_nothing() {
+        let (manager, _backend) = journaled_manager().await;
+        let (armed, signal) = armed_with_backoff(&manager, 2).await;
+        manager.exchange().set_futures_settings("Hedge", 1);
+
+        let result = manager.handle_signal(signal).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(!manager.detectors.read().await.contains_key(&armed.id), "no re-arm");
+        assert!(!manager.is_entry_exhausted(armed.id).await);
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), Some(&2));
+        let events = manager.store.events().find_by_position(armed.id).await.unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::EntryExecutionRejected { .. })));
+        assert!(!events.iter().any(|e| matches!(e, Event::EntryAttemptExhausted { .. })));
+    }
+
+    /// The exhaustion itself cannot be recorded: the detector stays spent, and
+    /// nothing re-arms.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn an_exhaustion_that_cannot_be_recorded_leaves_the_detector_spent(pool: sqlx::PgPool) {
+        use robson_exec::order_journal::{JournalFault, OrderJournal, StubJournalBackend};
+        let backend = Arc::new(StubJournalBackend::default());
+        let journal = Arc::new(OrderJournal::new(
+            backend.clone(),
+            &robson_exec::venue::VenueId::new("test:venue"),
+        ));
+        let manager = audited_postgres_test_manager_with_journal(pool.clone(), 300, Some(journal));
+        let (armed, signal) = production_policy_position_and_signal(&manager).await;
+        backend.push_fault(JournalFault::Known);
+
+        fail_event_log_writes(&pool, "NEW.event_type = 'entry_attempt_exhausted'").await;
+        let result = manager.handle_signal(signal).await;
+        restore_event_log_writes(&pool).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert!(!manager.detectors.read().await.contains_key(&armed.id), "no re-arm");
+    }
+
+    /// #301's paths: a failure before the executor has written no evidence, so
+    /// on a production-policy leg the re-arm does recover.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_failure_before_the_executor_leaves_no_evidence_and_the_rearm_recovers(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+        let (armed, signal) = production_policy_position_and_signal(&manager).await;
+
+        fail_event_log_writes(&pool, &audit_write("acting")).await;
+        let result = manager.handle_signal(signal.clone()).await;
+        restore_event_log_writes(&pool).await;
+
+        assert!(result.is_err(), "{result:?}");
+        let stored = manager.get_position(armed.id).await.unwrap().unwrap();
+        assert!(!stored.carries_admission_evidence(), "the failure came before the ruler");
+        assert!(manager.detectors.read().await.contains_key(&armed.id), "re-armed");
+
+        detector_fired(&manager, armed.id).await;
+        manager.handle_signal(signal_again(&signal)).await.expect("the re-arm admits");
+        assert_eq!(manager.exchange().market_order_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_strict_commit_known_failure_re_arms_under_the_growing_backoff() {
+        use robson_exec::order_journal::JournalFault;
+        let (manager, backend) = journaled_manager().await;
+        let (armed, signal) = armed_with_backoff(&manager, 2).await;
+        // The two pre-send barrier events are not journal writes: the first
+        // journal commit is the entry's.
+        backend.push_fault(JournalFault::Known);
+        let signal_for_retry = signal.clone();
+
+        let result = manager.handle_signal(signal).await;
+
+        assert!(
+            matches!(result, Err(DaemonError::Exec(ExecError::SendRefused(_)))),
+            "{result:?}"
+        );
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert!(manager.detectors.read().await.contains_key(&armed.id), "re-armed");
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), Some(&3));
+
+        // On a legacy leg the re-arm is real: the next signal admits.
+        if let Some(rearmed) = manager.detectors.write().await.remove(&armed.id) {
+            rearmed.abort();
+        }
+        manager
+            .handle_signal(DetectorSignal {
+                signal_id: Uuid::now_v7(),
+                ..signal_for_retry
+            })
+            .await
+            .expect("the re-arm admits");
+        assert_eq!(manager.exchange().market_order_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_inside_the_adapter_before_the_send_re_arms() {
+        let (manager, _backend) = journaled_manager().await;
+        let (armed, signal) = armed_with_backoff(&manager, 1).await;
+        manager.exchange().set_refuse_before_send_next(true);
+
+        let result = manager.handle_signal(signal).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(manager.detectors.read().await.contains_key(&armed.id), "re-armed");
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), Some(&2));
+    }
+
+    /// An uncertain commit may have left a row, so it stays executor-class:
+    /// no re-arm, and with no ticket the backoff is not reset either.
+    #[tokio::test]
+    async fn an_uncertain_commit_neither_re_arms_nor_resets_the_backoff() {
+        use robson_exec::order_journal::JournalFault;
+        for fault in [
+            JournalFault::AckLost,
+            JournalFault::NotLandedUncertain,
+            JournalFault::Hang,
+        ] {
+            let (manager, backend) = journaled_manager().await;
+            let (armed, signal) = armed_with_backoff(&manager, 2).await;
+            backend.push_fault(fault);
+
+            let result = manager.handle_signal(signal).await;
+
+            assert!(result.is_err(), "{fault:?}: {result:?}");
+            assert_eq!(manager.exchange().market_order_call_count(), 0, "{fault:?}");
+            assert!(!manager.detectors.read().await.contains_key(&armed.id), "{fault:?}");
+            assert_eq!(
+                manager.governed_rearm_counts.read().await.get(&armed.id),
+                Some(&2),
+                "{fault:?}"
+            );
+        }
+    }
+
+    /// #301's reset, after the ticket: a failed send still reached the venue.
+    #[tokio::test]
+    async fn a_ticketed_entry_that_failed_resets_the_backoff_and_does_not_re_arm() {
+        let (manager, _backend) = journaled_manager().await;
+        let (armed, signal) = armed_with_backoff(&manager, 3).await;
+        manager.exchange().set_order_fail_next(true);
+
+        let result = manager.handle_signal(signal).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(manager.exchange().market_order_call_count(), 1);
+        assert!(!manager.detectors.read().await.contains_key(&armed.id));
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), None);
+    }
+
+    /// The journal's result write fails, in each way it can: the fill is kept
+    /// and the exchange stop still goes on.
+    #[tokio::test]
+    async fn a_failed_journal_result_write_keeps_the_fill_and_places_the_stop() {
+        use robson_exec::order_journal::JournalFault;
+        for fault in [
+            JournalFault::Known,
+            JournalFault::AckLost,
+            JournalFault::NotLandedUncertain,
+            JournalFault::Hang,
+        ] {
+            let (manager, backend) = journaled_manager().await;
+            let (armed, signal) = armed_with_backoff(&manager, 1).await;
+            backend.fail_commit(1, Some(fault));
+
+            manager
+                .handle_signal(signal)
+                .await
+                .unwrap_or_else(|e| panic!("{fault:?}: {e:?}"));
+
+            let position = manager.get_position(armed.id).await.unwrap().unwrap();
+            assert!(matches!(position.state, PositionState::Active { .. }), "{fault:?}");
+            assert_eq!(manager.exchange().protection_call_count(), 1, "{fault:?}");
+            assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), None);
+        }
+    }
+
+    /// The second half of the boundary at the top: the entry reached the venue,
+    /// so the backoff resets although `execute_and_persist` returned `Err`, and
+    /// the flow does not re-arm.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_ticketed_entry_that_returned_err_resets_the_backoff(pool: sqlx::PgPool) {
+        let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+        let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+        manager.governed_rearm_counts.write().await.insert(armed.id, 4);
+
+        fail_event_log_writes(&pool, "NEW.event_type = 'entry_order_accepted'").await;
+        let result = manager.handle_signal(signal).await;
+        restore_event_log_writes(&pool).await;
+
+        assert!(matches!(result, Err(DaemonError::EventLog(_))), "{result:?}");
+        assert_eq!(manager.exchange().market_order_call_count(), 1);
+        assert!(!manager.detectors.read().await.contains_key(&armed.id));
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), None);
+    }
+
+    /// A failed pre-send barrier is no ticket: the backoff stands, and it is
+    /// still not a no-send the flow can re-arm from. A barrier stays a barrier.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_failed_pre_send_barrier_keeps_the_backoff_and_sends_nothing(pool: sqlx::PgPool) {
+        for event in ["entry_signal_received", "entry_order_requested"] {
+            let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+            let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+            manager.governed_rearm_counts.write().await.insert(armed.id, 4);
+
+            let condition = format!("NEW.event_type = '{event}'");
+            fail_event_log_writes(&pool, &condition).await;
+            let result = manager.handle_signal(signal).await;
+            restore_event_log_writes(&pool).await;
+
+            assert!(result.is_err(), "{event}: {result:?}");
+            assert_eq!(manager.exchange().market_order_call_count(), 0, "{event}");
+            assert_eq!(
+                manager.governed_rearm_counts.read().await.get(&armed.id),
+                Some(&4),
+                "{event}"
             );
         }
     }

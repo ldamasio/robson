@@ -2592,6 +2592,7 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::Exec(robson_exec::ExecError::Exchange(_))
         | DaemonError::Exec(robson_exec::ExecError::RulesRejected(_))
         | DaemonError::Exec(robson_exec::ExecError::ReduceOnlyRejected(_))
+        | DaemonError::Exec(robson_exec::ExecError::SendRefused(_))
         | DaemonError::Exec(robson_exec::ExecError::Timeout(_)) => StatusCode::BAD_GATEWAY,
         DaemonError::Exec(_) => StatusCode::BAD_REQUEST,
         DaemonError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,

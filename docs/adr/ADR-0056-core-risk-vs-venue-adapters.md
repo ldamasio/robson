@@ -193,9 +193,10 @@ look like a fresh record. What counts as an authoritative rejection is per venue
 Binance documents as execution-status-unknown. This reads the codes' documented meanings; Binance gives no explicit
 finality guarantee, and the HTTP condition is an inference that fails safe to `Unknown`.
 
-The evidence is in memory until step 7 persists it. An attempt by an earlier or another process leaves no record, so a
-rejected retry with the same client id would read as all-rejected. Until step 7, no caller may act on `Absent` for a
-client id that another process may have submitted.
+The adapter's ledger is in memory and speaks for one process. With the order journal attached (step 7, §8) the finality
+rule reads the durable attempt rows and the journal's memory instead: at least one row, all rejected, nothing unlanded in
+memory, then the venue's not-found. A send with no row reads `Unknown` for ever, and so does a failed read. A daemon with
+no database has no journal and keeps the in-memory limitation, and no production path acts on `Absent` yet.
 
 **2.1 Protection kind.** An eligible venue must provide exchange-resident protection that triggers **market** execution at
 the resolved executable trigger: `ProtectionKind::MarketOnTrigger`. Binance USDⓈ-M: conditional `STOP_MARKET`. Binance
@@ -641,10 +642,11 @@ account scope and client id), `submit_attempts` and `journal_decisions`, and the
   dropped future cannot leave the two connections waiting on replies that will never come. An interrupted cancel intent is uncertain, never
   `not_sent`: `not_sent` needs a ticket as proof, and a cancel has none.
 - **Query bounds (guardrails §1.1).** Every write is one explicit transaction ending in a simple-query `COMMIT`; nothing commits
-  implicitly. Reviewed bounds per handled operation, `BEGIN` and `COMMIT` included: an order 9 (13 with one quantisation retry), a
-  cancel 9, a stop placement with its predecessor's cancel 22, a cancel-first exit 22, a placement that withdraws both stops 31.
+  implicitly. Reviewed bounds per handled operation, `BEGIN` and `COMMIT` included: an order 9 (13 with one quantisation retry, 22 with a
+  refused retry replaced by a fresh intent), a cancel 9, a stop placement with its predecessor's cancel 31, a cancel-first exit 31, a
+  placement that withdraws both stops 40.
   They are above the guardrails' default review threshold of 15 on purpose: the writes are small and each pair is one order's
-  durability. Each operation's count is kept and the bound (31) is checked when it ends. These are charged counts: a commit is charged
+  durability. Each operation's count is kept and the bound (40) is checked when it ends. These are charged counts: a commit is charged
   what it plans to run, so one that fails before sending anything is charged in full. They are not a measure of executed SQL.
 
 **Rollback across this schema is boundary B:** with the daemon stopped, `SELECT * FROM order_intents_blocking_rollback` must be
@@ -675,6 +677,47 @@ Metrics, defined here and published from part 3 on: `robsond_journal_latch`, `ro
 `robsond_journal_operation_statements_max`, `robsond_journal_operations_over_statement_bound`.
 `robsond_journal_non_reuse_ids_lost` is process-local, resets on restart, and counts sends authorized without their id being kept, not
 a verified inventory of orders with no row.
+
+*Order journal, part 3 (wiring).* Every order path writes through the journal: entry (strict); exit, protective stop, replacement,
+withdrawal, software-exit and orphan cancels, and the UNTRACKED sweep close (bounded). Funding conversions are not journaled and are
+never evidence for `Absent`. The daemon checks the journal at startup, which also warms its pool: it refuses to start when the journal's
+tables are missing or when the whole check, probes and retries included, has not finished within 10 s, and a stalled probe's connection is
+closed. On a slow database this is new: a boot that used to carry on now exits with an error if the journal cannot answer in that time, and
+the pod restarts.
+
+- **Outcome classes are recorded only.** An intent ends as a success, a rejection (every attempt authoritatively refused), not sent,
+  or uncertain. **Between this PR and the fence PR, uncertainty is journaled but does not fence, exactly as today:** no incident
+  opens, no admission closes, and the latch shows only on its metric. A failed result write never discards a venue result and never
+  prevents protection. Event persistence after a venue result can still abort the flow as before; that is a later PR.
+- **Tickets and the re-arm backoff.** The attempt ledger reports a send ticket just before a request leaves. The backoff reset moved
+  from before the executor to after it, on `Ok` and `Err` alike, and only when the entry holds a ticket. An adapter refusing locally
+  before the send is therefore a proven no-send too.
+- **A proven no-send (design D15, amended).** ADR-0052 makes admission evidence on an `Armed` leg something to recover explicitly, and
+  the engine refuses a second admission against it, so a re-arm could never admit. On a leg with evidence (`ExecutableSpan`, the
+  production default) the attempt ends at once through `mark_entry_exhausted`, reason `entry_not_sent`, audited and with no re-arm;
+  the evidence is neither cleared nor re-admitted against, and the operator re-arms. On a leg with none (legacy policy) the detector
+  goes back under the governed backoff. A refusal by the account's futures settings is the same case: its safety event stands and a leg with
+  evidence ends the same way, while a legacy leg keeps today's behaviour there, with no exhaustion and no re-arm. If the exhaustion cannot be
+  appended, this process still holds the record and re-arms nothing, but that is a same-process statement: a restart can restore the detector,
+  and the engine's evidence check then rejects the next signal and makes it terminal. Across a restart what holds is that no second admission
+  happens. An uncertain commit is not a no-send: no re-arm and no reset.
+- **A refused resubmission does not wait.** A rules rejection earns one resubmission under the same id, and the completeness rule can
+  refuse it. The refused id stays closed, and when the first submission ended in that rules rejection and only that first request left, the
+  refreshed order goes out once under a fresh id in the same call, as a bounded first attempt, so a cancel-first exit is not left with no stop
+  and no exit until a later tick. One fallback, no loop: if it fails or is refused, the ordinary error path applies. Exit, initial stop,
+  replacement and sweep close share this through `submit_reduction`; a cancel has no resubmission, and an entry stays strict and has no
+  fallback. The refused intent ends uncertain and the fresh one carries the venue's answer.
+- **Cancels.** Only an exact `Cancelled` is definite here; the typed classifier is the next PR, so until then an "already gone" cancel
+  is recorded as uncertain and changes nothing else.
+
+Trade-off: an entry is refused rather than sent when the journal cannot record it, and a slow database adds up to 500 ms per write to
+an order's path. After an entry fill, the result write plus the stop's pre-send write can add 1 s before the stop's request; a cancel-first
+exit likewise. "Does not wait" above means no later tick or backoff, not zero journal waiting: the fallback adds another bounded pre-send write and
+another outcome write, so up to 2 s of journal waits can pass after the cancel acknowledgement before the fresh request, and 2.5 s in total for a
+replaced retry. These waits sit under existing locks: detector handling and the API's close and panic hold the manager write lock across
+them, so they can delay unrelated protective work. Nothing acts on uncertainty or the latch yet. `applied_at` and `uncertain_generation`
+exist but are not written. In J an entry's operation ends before its stop is placed; the permit PR widens it. Not verified: behaviour on a
+real venue or in the cluster.
 
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze
@@ -741,6 +784,7 @@ only).
 | Dependency / event | What happens | Degraded mode | Visibility |
 |---|---|---|---|
 | Database dies | no admission, no new legs; already-installed protection remains on the exchange; inventory in an N1-a transition may remain unprotected without a duration or loss bound; no cancellation starts without a durable intent, and unfinished transitions retain liabilities and alerts and resume from that intent on recovery; intent results cannot be persisted → in-flight operations enter `Unknown`; recovery looks them up, a lookup may stay `Unknown`, and then the reservation stays held until step 7's explicit resolution path | read-only `/status` from memory; arms refused | `/readyz.database=false`; `unprotected_inventory` gauge; recovery events |
+| Journal database down or slow (step 7, PR J) | an entry's strict commit that fails is refused, no request; a leg with admission evidence ends its attempt, a legacy leg re-arms under its backoff. One that times out is uncertain, no request and no re-arm. Reductions, stops and cancels wait at most 500 ms per write and go out anyway, also with the journal's memories full | entries refused, protection and reductions continue; unlanded rows retry through a bounded set | `robsond_journal_latch`, `robsond_journal_retry_set_depth`, warnings in the logs; no fence yet |
 | Venue REST dies | rules/costs/valuation stale → basis invalid, admission fails closed; risk reduction proceeds on the last validated rules or the persisted snapshot, with one refresh and resubmit per rejection; a leg holding neither waits for the lookup, then a decided exit goes out as given and a tick fails closed (§5) | reads from cache until TTL; protection on the venue, except a leg whose exit failed, until the heal | per-venue `eligible=false` + reasons; alert |
 | Venue feed silent | watchdog after `ROBSON_FEED_SILENCE_MAX`; REST snapshot resync; trailing advances continue on REST ticks within the request budget | bounded REST polling | silent-feed metric, event |
 | Daemon dies mid fan-out | accepted legs are protected on their venues except for a leg killed between entry fill and protection placement, which recovery protects or flattens first | startup recovery reads the durable journal and each venue's observation; completes, protects or releases per evidence | recovery events per leg |
@@ -820,7 +864,10 @@ Budget model for multi-venue:
   `robson-store/src/postgres.rs` (a close exactly at month start belongs to that month),
   `robsond/src/{position_manager,daemon,api,error,metrics,reconciliation_worker,startup_recovery,venue}.rs`, usdm adapter; bronze
   contract 1.2.0; before/after fixtures.
-- Step 7: `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
+- Step 7: delivered in parts (§8). PR J: `robson-exec/src/{order_journal,executor,venue,stub,error}.rs`,
+  `robsond/src/{order_journal_store,api,auth,daemon,metrics,position_manager,reconciliation_worker,venue}.rs`, migration 31; the
+  attempt rows are read from the database rather than reloaded. What follows here is the original statement of the step, with its
+  open obligations. `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
   mapping); process-kill tests. Before any caller acts on `order_by_client_id` or `replace_protection`, this step must:
   persist each attempt durably before its request is sent and each rejection when observed, reload them on startup, treat
   an attempt without a persisted rejection as unresolved, and keep the truncated state across restarts. It must also give
@@ -901,6 +948,12 @@ Budget model for multi-venue:
   `validate_futures_settings` to position accounts. No risk number or operator decision changed. Codex **APPROVE** on
   round 1, with four P3s applied (the `/events/history` exposure above, a missing-versus-null assertion, fixture provenance
   and the stale DB-gated count).
+- v12 (2026-11-08): §2's finality paragraph, §8 and the failure modes aligned with step 7 PR J as implemented in three stacked PRs,
+  against design note v8. Codex round 1 on the first draft: REQUEST_CHANGES (3 P1, 5 P2); interrupted cancels, cancelled result
+  writes, the no-send recovery on `ExecutableSpan` legs, discarded ids, pool exhaustion, evidence validation, fault targeting and
+  query bounds fixed. Round 4: PR 3 REQUEST_CHANGES (1 P2, 1 P3); a retry refused on a discarded id takes the same fallback. Round 3: PR 3 REQUEST_CHANGES (1 P2); a resubmission the journal refuses now goes out once under a fresh id. Round 2: REQUEST_CHANGES (1 P1, 5 P2, P3s); a full journal no longer refuses a bounded first send, reads and the startup
+  probe retire their connections, a cancellation's evidence names the cancelled order, and typed no-sends and returned futures-settings rejections reach the amended policy, while the retained pre-send barriers and other error returns do not. States that uncertainty is journaled and does not fence until the fence PR, and boundary B as a view. No risk
+  number changed.
 - v11 (2026-11-07): the header, §2, §2.2, §2.3, §3, §5, §8, §10, the failure modes and the Implementation Notes aligned with
   step 6 as implemented on `refactor/venue-step6-quantize`. Codex rejected two wider USDⓈ-M designs. Rounds 1 and 2: exit-first with
   a cancel-then-resubmit fallback, a partial exit reducing the leg's quantity with P&L accumulated while open, and inventory with no

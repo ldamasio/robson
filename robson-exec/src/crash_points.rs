@@ -31,6 +31,8 @@ crash_points! {
     ENTRY_BEFORE_SEND = "entry_before_send";
     // The venue answered the entry order; nothing has recorded the answer.
     ENTRY_AFTER_ACK = "entry_after_ack";
+    // A protective stop's intent is committed; the request has not left.
+    PROTECTION_BEFORE_SEND = "protection_before_send";
 }
 
 /// Crash point to arm.

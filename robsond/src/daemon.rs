@@ -28,8 +28,8 @@ use robson_engine::Engine;
 #[cfg(feature = "postgres")]
 use robson_eventlog::{query_events, query_stream_in_seq_order, EventEnvelope, QueryOptions};
 use robson_exec::{
-    venue::Venue, ExchangePort, Executor, IntentJournal, OhlcvPort, StubExchange, StubTradeFeed,
-    TradeFeedPort,
+    order_journal::OrderJournal, venue::Venue, ExchangePort, Executor, IntentJournal, OhlcvPort,
+    StubExchange, StubTradeFeed, TradeFeedPort,
 };
 // Optional projection recovery for crash recovery
 #[cfg(feature = "postgres")]
@@ -152,6 +152,44 @@ fn initial_month_check() -> Arc<RwLock<(i32, u32)>> {
     // first poll always runs handle_month_boundary, which consults persisted
     // MonthBoundaryReset evidence and no-ops when the reset already exists.
     Arc::new(RwLock::new((0, 0)))
+}
+
+/// Give the executor the durable order journal, when there is a database for
+/// it, on its own small pool (ADR-0056 step 7).
+#[cfg(feature = "postgres")]
+fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
+    executor: Executor<E, S>,
+    venue: &Arc<E>,
+    pool: &Option<Arc<sqlx::PgPool>>,
+    config: &Config,
+) -> Executor<E, S> {
+    let (Some(pool), Some(tenant_id)) = (pool, config.projection.tenant_id) else {
+        return executor;
+    };
+    let backend = Arc::new(crate::order_journal_store::PgJournalBackend::new(pool, tenant_id));
+    let journal = Arc::new(OrderJournal::new(backend, venue.id()));
+    venue.attach_order_journal(Arc::clone(&journal));
+    executor.with_order_journal(journal)
+}
+
+/// Keep writing what did not land, and publish the journal's gauges.
+async fn run_order_journal_retry(
+    journal: Arc<OrderJournal>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tick.tick() => {},
+        }
+        journal.flush_pending().await;
+        crate::metrics::observe_order_journal(&journal);
+    }
+    // One last pass; the clean stop of a later PR makes this complete.
+    journal.flush_pending().await;
+    crate::metrics::observe_order_journal(&journal);
 }
 
 impl Daemon<StubExchange, MemoryStore> {
@@ -461,7 +499,8 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
 
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
-        let executor = Arc::new(Executor::new(Arc::clone(&venue), journal, store.clone()));
+        let executor = Executor::new(Arc::clone(&venue), journal, store.clone());
+        let executor = Arc::new(with_durable_order_journal(executor, &venue, &pg_pool, &config));
         let event_bus = Arc::new(EventBus::new(1000));
 
         let query_recorder: Arc<dyn QueryRecorder> =
@@ -622,6 +661,16 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
 
         // Shutdown token for coordinating graceful shutdown
         let shutdown_sig = shutdown.clone();
+
+        // The journal must take writes before anything can be sent: this warms
+        // its pool and refuses a schema without its tables (ADR-0056 step 7).
+        self.position_manager
+            .read()
+            .await
+            .order_journal()
+            .check_ready()
+            .await
+            .map_err(|error| DaemonError::Config(format!("Order journal not ready: {error}")))?;
 
         // 0. Initialize capital from exchange (best-effort)
         self.initialize_capital().await;
@@ -827,6 +876,12 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         #[cfg(not(feature = "postgres"))]
         let income_ledger_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+        // 7a. Keep the order journal's retry set moving (ADR-0056 step 7).
+        let order_journal = self.position_manager.read().await.order_journal();
+        crate::metrics::observe_order_journal(&order_journal);
+        let order_journal_handle =
+            tokio::spawn(run_order_journal_retry(order_journal, shutdown.clone()));
+
         // 8. Subscribe to event bus
         let mut event_receiver = self.event_bus.subscribe();
 
@@ -882,6 +937,8 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
 
         info!("Waiting for reconciliation worker to finish...");
         let _ = tokio::time::timeout(Duration::from_secs(10), reconciliation_handle).await;
+
+        let _ = tokio::time::timeout(Duration::from_secs(10), order_journal_handle).await;
 
         info!(count = ws_handles.len(), "Waiting for WebSocket clients to finish...");
         for handle in ws_handles {
@@ -1767,7 +1824,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             funding: self.config.funding.clone(),
             funding_route_mode: self.funding_worker_route().1,
             venue_feed,
-            order_journal: Arc::new(robson_exec::order_journal::OrderJournal::unpersisted()),
+            order_journal: self.position_manager.read().await.order_journal(),
         });
 
         let router = create_router(state);

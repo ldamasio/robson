@@ -59,9 +59,10 @@ impl ExchangePort for TimeoutExchange {
         _symbol: &Symbol,
         _side: OrderSide,
         _quantity: Quantity,
-        _client_order_id: &str,
+        client_order_id: &str,
         _reduce_only: bool,
     ) -> Result<robson_exec::OrderResult, ExecError> {
+        robson_exec::order_journal::report_send_started(client_order_id);
         self.attempts.fetch_add(1, Ordering::SeqCst);
         Err(ExecError::Timeout("simulated exchange timeout".to_string()))
     }

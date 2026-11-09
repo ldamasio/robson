@@ -15,7 +15,7 @@
 
 use std::{future::Future, os::unix::process::ExitStatusExt, path::PathBuf, time::Duration};
 
-use robson_exec::crash_points::{ENTRY_AFTER_ACK, ENTRY_BEFORE_SEND};
+use robson_exec::crash_points::{ENTRY_AFTER_ACK, ENTRY_BEFORE_SEND, PROTECTION_BEFORE_SEND};
 use robson_testkit::{
     daemon_process::{database_url_through, DaemonProcess, DaemonSpec},
     db_proxy::{DbProxy, ProxyMode},
@@ -31,8 +31,10 @@ const DAEMON_DEADLINE: Duration = Duration::from_secs(90);
 /// Time a step may take before the test fails with the daemon's log.
 const STEP: Duration = Duration::from_secs(60);
 
-/// Whole-test limits: a stuck database or daemon wait fails the test. Dropping
-/// the test future also kills and reaps any daemon it still holds.
+/// Test-body limits: a stuck database or daemon wait inside the body fails the
+/// test, and dropping the test future kills and reaps any daemon it still
+/// holds. SQLx's per-test setup and cleanup sit outside them, and a failed test
+/// can leave its database behind on the server.
 const DAEMON_TEST_LIMIT: Duration = Duration::from_secs(240);
 const PROXY_TEST_LIMIT: Duration = Duration::from_secs(30);
 
@@ -101,6 +103,43 @@ impl Harness {
             dotenv: String::new(),
         })
         .expect("spawn robsond")
+    }
+
+    /// The journal's view of its intents of `kind`: client id, outcome,
+    /// `uncertain_at` set, in creation order.
+    async fn intents(&self, kind: &str) -> Vec<(String, Option<String>, bool)> {
+        sqlx::query_as(
+            "SELECT client_order_id, venue_outcome, uncertain_at IS NOT NULL
+             FROM order_intents WHERE kind = $1 ORDER BY created_at",
+        )
+        .bind(kind)
+        .fetch_all(&self.pool)
+        .await
+        .expect("read order_intents")
+    }
+
+    async fn blockers(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM order_intents_blocking_rollback")
+            .fetch_one(&self.pool)
+            .await
+            .expect("read the boundary view")
+    }
+
+    /// Wait until `done` holds on the database, for writes that land through
+    /// the journal's retry loop.
+    async fn until<F, Fut>(&self, what: &str, mut done: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let waiting = async {
+            while !done().await {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::time::timeout(STEP, waiting)
+            .await
+            .unwrap_or_else(|_| panic!("timed out: {what}"));
     }
 
     async fn event_types(&self) -> Vec<String> {
@@ -181,6 +220,12 @@ async fn killed_after_the_venue_acked_the_fill_exists_only_on_the_venue(pool: Pg
         let events = harness.event_types().await;
         assert!(events.iter().any(|e| e == "position_armed"), "{events:?}");
         assert!(!events.iter().any(|e| e == "entry_order_accepted"), "{events:?}");
+        // The intent is on record and nothing says how it ended. It blocks a
+        // rollback across this schema until an operator decides on it.
+        let intents = harness.intents("entry").await;
+        assert_eq!(intents.len(), 1, "{intents:?}");
+        assert_eq!((intents[0].1.clone(), intents[0].2), (None, false));
+        assert_eq!(harness.blockers().await, 1);
         drop(daemon);
 
         // The projection still reads Armed, so the restart stops at the startup
@@ -195,6 +240,7 @@ async fn killed_after_the_venue_acked_the_fill_exists_only_on_the_venue(pool: Pg
             cancels: 0
         });
         assert!(harness.venue.position(FAKE_SYMBOL) > Decimal::ZERO);
+        assert_eq!(harness.intents("entry").await, intents, "a restart invents no outcome");
     })
     .await;
 }
@@ -317,6 +363,204 @@ async fn killed_before_the_send_the_venue_saw_nothing(pool: PgPool) {
         assert!(harness.venue.position(FAKE_SYMBOL).is_zero());
         let events = harness.event_types().await;
         assert!(events.iter().any(|e| e == "position_armed"), "{events:?}");
+
+        // The commit came first: the row outlives the process.
+        let intents = harness.intents("entry").await;
+        assert_eq!(intents.len(), 1, "{intents:?}");
+        assert_eq!(intents[0].1, None);
+        drop(daemon);
+
+        // A later process finds the id spent: whatever it does next, it never
+        // sends that id again.
+        let restarted = harness.daemon(None);
+        restarted.wait_ready(STEP).await.expect("daemon ready");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            harness.venue.orders().iter().all(|order| order.client_id != intents[0].0),
+            "{:?}",
+            harness.venue.orders()
+        );
+    })
+    .await;
+}
+
+/// SIGKILL with a stop's intent committed and its request not sent. The entry
+/// is on record as a success and the stop is outstanding, across the process's
+/// death. Whatever the next process sends, it does not use the journaled id.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn killed_with_a_committed_stop_intent_the_row_outlives_the_process(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        let daemon = harness.daemon(Some(PROTECTION_BEFORE_SEND));
+        daemon.wait_ready(STEP).await.expect("daemon ready");
+        let request = arm_immediate(daemon.api_url());
+        daemon
+            .wait_killed_at(PROTECTION_BEFORE_SEND, STEP)
+            .await
+            .expect("killed at the crash point");
+        assert!(request.await.unwrap().is_err(), "the caller never got an answer");
+
+        let entries = harness.intents("entry").await;
+        assert_eq!(entries[0].1.as_deref(), Some("success"), "{entries:?}");
+        let stops = harness.intents("protection").await;
+        assert_eq!(stops.len(), 1, "{stops:?}");
+        assert_eq!(stops[0].1, None);
+        assert_eq!(harness.blockers().await, 1);
+        assert_eq!(harness.venue.counts().accepted_orders, 1, "the stop never left");
+        drop(daemon);
+
+        let restarted = harness.daemon(None);
+        restarted.wait_ready(STEP).await.expect("daemon ready");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let orders = harness.venue.orders();
+        assert!(
+            orders.iter().all(|order| order.client_id != stops[0].0),
+            "{orders:?}\n{}",
+            restarted.log_tail()
+        );
+        assert_eq!(harness.intents("protection").await, stops, "no outcome is invented");
+    })
+    .await;
+}
+
+/// The acknowledgement of a real entry commit is lost in the real daemon. The
+/// row landed and nothing tells it, so nothing is sent and the detector is not
+/// handed back. Aimed at the journal's commit; every other write of the daemon
+/// passes.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_lost_ack_on_the_entrys_commit_sends_nothing(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        let daemon = harness.daemon(None);
+        daemon.wait_ready(STEP).await.expect("daemon ready");
+
+        harness.proxy.set_mode(ProxyMode::DropCommitAckOf("order_intents"));
+        let answer = arm_immediate(daemon.api_url()).await.unwrap();
+
+        assert!(answer.is_err(), "{answer:?}");
+        assert_eq!(harness.proxy.stats().commit_acks_dropped, 1);
+        assert_eq!(harness.venue.counts(), VenueCounts::default(), "{}", daemon.log_tail());
+        // The journal's retry writes the stamp on the row the lost commit left.
+        harness
+            .until("the uncertain stamp", || async {
+                harness.intents("entry").await.first().is_some_and(|intent| intent.2)
+            })
+            .await;
+        let intents = harness.intents("entry").await;
+        assert_eq!((intents.len(), intents[0].1.clone()), (1, None));
+        assert_eq!(harness.blockers().await, 1);
+    })
+    .await;
+}
+
+/// A stalled journal: the entry's commit times out at its bound and nothing is
+/// sent. Once the journal recovers the row lands as uncertain.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_timeout_on_the_entrys_commit_sends_nothing(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        let daemon = harness.daemon(None);
+        daemon.wait_ready(STEP).await.expect("daemon ready");
+        for statement in [
+            "CREATE FUNCTION stall_journal() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN PERFORM pg_sleep(2); RETURN NEW; END $$",
+            "CREATE TRIGGER stall_journal BEFORE INSERT ON order_intents
+             FOR EACH ROW EXECUTE FUNCTION stall_journal()",
+        ] {
+            sqlx::query(statement).execute(&harness.pool).await.expect("stall");
+        }
+
+        let answer = arm_immediate(daemon.api_url()).await.unwrap();
+        assert!(answer.is_err(), "{answer:?}");
+        assert_eq!(harness.venue.counts(), VenueCounts::default(), "{}", daemon.log_tail());
+
+        sqlx::query("DROP TRIGGER stall_journal ON order_intents")
+            .execute(&harness.pool)
+            .await
+            .expect("recover");
+        harness
+            .until("the uncertain row", || async {
+                harness.intents("entry").await.first().is_some_and(|intent| intent.2)
+            })
+            .await;
+    })
+    .await;
+}
+
+/// A journal schema that is not there stops the daemon at startup, before it
+/// could send anything.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_daemon_refuses_to_start_without_the_journal_tables(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        for statement in [
+            "DROP VIEW order_intents_blocking_rollback",
+            "DROP TABLE submit_attempts",
+        ] {
+            sqlx::query(statement).execute(&harness.pool).await.expect("drop");
+        }
+
+        let daemon = harness.daemon(None);
+        let status = daemon.wait_exit(STEP).await.expect("the start is refused");
+
+        assert_ne!(status.code(), Some(0), "{}", daemon.log_tail());
+        assert!(daemon.log_tail().contains("Order journal not ready"), "{}", daemon.log_tail());
+        assert_eq!(harness.venue.counts(), VenueCounts::default());
+    })
+    .await;
+}
+
+/// An outstanding intent from a dead process is decided on through the real
+/// endpoint, with the identity recorded, and the boundary then holds. No
+/// outcome is invented.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn an_operator_disposition_clears_the_rollback_boundary(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        let daemon = harness.daemon(Some(ENTRY_BEFORE_SEND));
+        daemon.wait_ready(STEP).await.expect("daemon ready");
+        let request = arm_immediate(daemon.api_url());
+        daemon.wait_killed_at(ENTRY_BEFORE_SEND, STEP).await.expect("killed");
+        let _ = request.await;
+        drop(daemon);
+        assert_eq!(harness.blockers().await, 1);
+
+        let token = "harness-only-token";
+        let restarted = harness.daemon_with_env(None, &[("ROBSON_LEGACY_API_TOKEN", token)]);
+        restarted.wait_ready(STEP).await.expect("daemon ready");
+        let intent_id: Uuid = sqlx::query_scalar("SELECT intent_id FROM order_intents LIMIT 1")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the intent");
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/recovery/disposition", restarted.api_url()))
+            .bearer_auth(token)
+            .timeout(STEP)
+            .json(&json!({
+                "intent_id": intent_id,
+                "disposition_kind": "accepted_risk",
+                "treatment": "unbooked_accepted",
+                "note": "harness",
+            }))
+            .send()
+            .await
+            .expect("the endpoint answers");
+        assert!(response.status().is_success(), "{}", restarted.log_tail());
+        let body: Value = response.json().await.expect("json");
+        assert_eq!(body["boundary_b_blockers"], 0, "{body}");
+        let outcome: Option<String> =
+            sqlx::query_scalar("SELECT venue_outcome FROM order_intents WHERE intent_id = $1")
+                .bind(intent_id)
+                .fetch_one(&harness.pool)
+                .await
+                .expect("the intent");
+        assert_eq!(outcome, None);
     })
     .await;
 }
