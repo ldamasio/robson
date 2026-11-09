@@ -26,6 +26,8 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+#[cfg(feature = "postgres")]
+use chrono::DateTime;
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, Utc};
 use robson_domain::{
     ApprovalPolicy as DomainApprovalPolicy, DetectorSignal, EntryPolicy, EntryPolicyConfig,
@@ -34,6 +36,7 @@ use robson_domain::{
 #[cfg(feature = "postgres")]
 use robson_eventlog::{query_events, QueryOptions};
 use robson_exec::{
+    order_journal::OrderJournal,
     venue::{MarketKind, Venue, VenueId},
     ExchangePort, ExchangePosition, UniversalTransferType,
 };
@@ -48,7 +51,10 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    auth::{constant_time_eq, looks_like_jwt, verify_google_id_token, GoogleAuthConfig},
+    auth::{
+        constant_time_eq, looks_like_jwt, verify_google_id_token, GoogleAuthConfig,
+        OperatorIdentity,
+    },
     circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot},
     config::FundingConfig,
     error::DaemonError,
@@ -90,6 +96,9 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     pub funding_route_mode: FundingRouteMode,
     /// What `/readyz.venue` reads about the venue's feed.
     pub(crate) venue_feed: VenueFeedView,
+    /// The order journal, for what its memory knows about an intent. Never
+    /// reached through the position manager, whose lock an incident can hold.
+    pub order_journal: Arc<OrderJournal>,
 }
 
 /// The venue's feed as `/readyz` sees it: a handle on the price cache taken at
@@ -664,7 +673,7 @@ where
     // TEMPORARY: dual-accept bridge during ADR-0054 rollout, remove after
     // cutover — see ADR-0054 migration plan.
     let legacy_api_token = state.legacy_api_token.clone();
-    let auth_layer = axum::middleware::from_fn(move |req: Request, next: Next| {
+    let auth_layer = axum::middleware::from_fn(move |mut req: Request, next: Next| {
         let google_auth = google_auth.clone();
         let legacy_api_token = legacy_api_token.clone();
         async move {
@@ -695,7 +704,10 @@ where
                     return unauthorized();
                 };
                 match verify_google_id_token(value, cfg).await {
-                    Ok(_claims) => next.run(req).await,
+                    Ok(claims) => {
+                        req.extensions_mut().insert(OperatorIdentity::from_claims(&claims));
+                        next.run(req).await
+                    },
                     Err(e) => {
                         warn!(error = %e, "Google ID token verification failed");
                         unauthorized()
@@ -710,6 +722,7 @@ where
                             "Authenticated via deprecated legacy bearer token bridge \
                              (ADR-0054 rollout); migrate this caller to Google OAuth"
                         );
+                        req.extensions_mut().insert(OperatorIdentity::legacy_token());
                         next.run(req).await
                     },
                     _ => unauthorized(),
@@ -754,9 +767,11 @@ where
     let authenticated = authenticated
         .route("/funding/:id", get(funding_get_handler::<E, S>))
         .route("/funding", get(funding_list_handler::<E, S>))
-        .route("/capital/refresh", post(capital_refresh_handler::<E, S>))
-        .layer(auth_layer)
-        .with_state(state);
+        .route("/capital/refresh", post(capital_refresh_handler::<E, S>));
+    #[cfg(feature = "postgres")]
+    let authenticated =
+        authenticated.route("/recovery/disposition", post(recovery_disposition_handler::<E, S>));
+    let authenticated = authenticated.layer(auth_layer).with_state(state);
 
     read_only.merge(authenticated).layer(build_cors_layer())
 }
@@ -793,6 +808,208 @@ fn build_cors_layer() -> CorsLayer {
 ///
 /// Returns all registered metrics in the Prometheus exposition format.
 /// Unauthenticated (read-only).
+// =============================================================================
+// Recovery (ADR-0056 step 7)
+// =============================================================================
+
+/// What to do about the liabilities an intent may have left. One choice in the
+/// core; booking comes with step 8.
+#[cfg(feature = "postgres")]
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LiabilityTreatment {
+    UnbookedAccepted,
+}
+
+#[cfg(feature = "postgres")]
+impl LiabilityTreatment {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UnbookedAccepted => "unbooked_accepted",
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalStatus {
+    Filled,
+    Cancelled,
+    Expired,
+    Rejected,
+}
+
+/// Evidence about one named order and its terminal state, with the venue's own
+/// record of it attached. An observation that the account is empty has no shape
+/// here, and neither does an operator's bare assertion: without a record, the
+/// disposition to make is `accepted_risk`.
+#[cfg(feature = "postgres")]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalEvidenceBody {
+    /// The intent's client id, or for a cancel the venue reference of the order
+    /// it cancels: a cancel's own id never reached the venue.
+    order_ref: String,
+    terminal_status: TerminalStatus,
+    filled_qty: Decimal,
+    /// Where the operator read it.
+    source: String,
+    observed_at: DateTime<Utc>,
+    /// The venue's record of the order, as it was returned.
+    venue_record: serde_json::Map<String, serde_json::Value>,
+}
+
+#[cfg(feature = "postgres")]
+impl TerminalEvidenceBody {
+    /// What no real order could have reported.
+    fn impossibility(&self, now: DateTime<Utc>) -> Option<&'static str> {
+        if self.filled_qty.is_sign_negative() && !self.filled_qty.is_zero() {
+            return Some("filled_qty cannot be negative");
+        }
+        match self.terminal_status {
+            TerminalStatus::Filled if self.filled_qty.is_zero() => {
+                return Some("a filled order has a filled quantity");
+            },
+            TerminalStatus::Rejected if !self.filled_qty.is_zero() => {
+                return Some("a rejected order filled nothing");
+            },
+            _ => {},
+        }
+        if self.source.trim().is_empty() {
+            return Some("evidence needs its source");
+        }
+        if self.observed_at > now {
+            return Some("evidence cannot come from the future");
+        }
+        if self.venue_record.is_empty() {
+            return Some("evidence needs the venue's record");
+        }
+        None
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DispositionKindBody {
+    TerminalEvidence,
+    AcceptedRisk,
+}
+
+#[cfg(feature = "postgres")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispositionBody {
+    intent_id: Uuid,
+    disposition_kind: DispositionKindBody,
+    treatment: LiabilityTreatment,
+    note: String,
+    evidence: Option<TerminalEvidenceBody>,
+}
+
+#[cfg(feature = "postgres")]
+#[derive(Debug, Serialize)]
+struct DispositionResponse {
+    decision_id: Uuid,
+    boundary_b_blockers: i64,
+}
+
+/// `POST /recovery/disposition`: the operator's decision about one outstanding
+/// intent, for the rollback boundary and the audit trail. It never sets a venue
+/// outcome, never books and never touches admissions. Takes no manager lock.
+#[cfg(feature = "postgres")]
+async fn recovery_disposition_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    identity: Option<axum::Extension<OperatorIdentity>>,
+    Json(body): Json<DispositionBody>,
+) -> Result<Json<DispositionResponse>, (StatusCode, Json<ErrorResponse>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    use crate::order_journal_store::{
+        record_disposition, Disposition, DispositionError, TerminalEvidence,
+    };
+
+    let fail = |status: StatusCode, message: &str| {
+        (status, Json(ErrorResponse { error: message.to_string() }))
+    };
+    let Some(axum::Extension(identity)) = identity else {
+        return Err(fail(StatusCode::UNAUTHORIZED, "a verified identity is required"));
+    };
+    let note = body.note.trim();
+    if note.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "a note is required"));
+    }
+    let terminal_evidence = match (body.disposition_kind, body.evidence) {
+        (DispositionKindBody::TerminalEvidence, Some(evidence)) => {
+            if let Some(impossibility) = evidence.impossibility(Utc::now()) {
+                return Err(fail(StatusCode::BAD_REQUEST, impossibility));
+            }
+            Some(TerminalEvidence {
+                order_ref: evidence.order_ref.clone(),
+                filled_qty: evidence.filled_qty,
+                document: serde_json::to_value(&evidence)
+                    .map_err(|_| fail(StatusCode::BAD_REQUEST, "unusable evidence"))?,
+            })
+        },
+        (DispositionKindBody::TerminalEvidence, None) => {
+            return Err(fail(StatusCode::BAD_REQUEST, "terminal_evidence needs evidence"));
+        },
+        (DispositionKindBody::AcceptedRisk, None) => None,
+        (DispositionKindBody::AcceptedRisk, Some(_)) => {
+            return Err(fail(StatusCode::BAD_REQUEST, "accepted_risk carries no evidence"));
+        },
+    };
+    let Some(pool) = &state.pg_pool else {
+        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "no database is configured"));
+    };
+
+    let client_order_id: Option<String> =
+        sqlx::query_scalar("SELECT client_order_id FROM order_intents WHERE intent_id = $1")
+            .bind(body.intent_id)
+            .fetch_optional(pool.as_ref())
+            .await
+            .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"))?;
+    let Some(client_order_id) = client_order_id else {
+        return Err(fail(StatusCode::NOT_FOUND, "no such intent"));
+    };
+    // Still being worked on here, or not fully written: too early to decide.
+    if state.order_journal.is_live(&client_order_id) {
+        return Err(fail(StatusCode::CONFLICT, "the intent is still in flight"));
+    }
+
+    let disposition = Disposition {
+        intent_id: body.intent_id,
+        terminal_evidence,
+        treatment: body.treatment.as_str(),
+        note: note.to_string(),
+        actor: identity.subject,
+        auth_kind: identity.auth.as_str(),
+    };
+    match record_disposition(pool, &disposition).await {
+        Ok(receipt) => Ok(Json(DispositionResponse {
+            decision_id: receipt.decision_id,
+            boundary_b_blockers: receipt.boundary_b_blockers,
+        })),
+        Err(error @ DispositionError::NotFound) => {
+            Err(fail(StatusCode::NOT_FOUND, &error.to_string()))
+        },
+        Err(error @ DispositionError::NotOutstanding) => {
+            Err(fail(StatusCode::CONFLICT, &error.to_string()))
+        },
+        Err(
+            error @ (DispositionError::EvidenceForAnotherOrder
+            | DispositionError::ImpossibleQuantity),
+        ) => Err(fail(StatusCode::BAD_REQUEST, &error.to_string())),
+        Err(DispositionError::Database(error)) => {
+            tracing::error!(%error, "Recording a disposition failed");
+            Err(fail(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"))
+        },
+    }
+}
+
 async fn metrics_handler() -> impl IntoResponse {
     let body = crate::metrics::render();
     (
@@ -3017,6 +3234,8 @@ mod tests {
     use robson_store::MemoryStore;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+    #[cfg(feature = "postgres")]
+    use serde_json::{json, Value};
     use tokio::time::timeout;
     use tower::ServiceExt;
 
@@ -3224,6 +3443,7 @@ mod tests {
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
+            order_journal: Arc::new(OrderJournal::unpersisted()),
         })
     }
 
@@ -3503,6 +3723,7 @@ mod tests {
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
+            order_journal: Arc::new(OrderJournal::unpersisted()),
         }));
 
         // Each close is a net loss of 100 on a base of 10000: budget 400, one
@@ -3788,6 +4009,7 @@ mod tests {
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
+            order_journal: Arc::new(OrderJournal::unpersisted()),
         });
 
         (create_router(state), event_bus, position_manager, exchange)
@@ -3830,6 +4052,7 @@ mod tests {
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
+            order_journal: Arc::new(OrderJournal::unpersisted()),
         });
 
         create_router(state)
@@ -3920,6 +4143,419 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ---- ADR-0056 step 7, PR J: POST /recovery/disposition
+    // -----------------------
+
+    #[cfg(feature = "postgres")]
+    const LEGACY: &str = "legacy-test-token";
+
+    #[cfg(feature = "postgres")]
+    async fn disposition_app(
+        pool: sqlx::PgPool,
+        journal: Arc<OrderJournal>,
+        legacy: Option<&str>,
+    ) -> Router {
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        let store = Arc::new(MemoryStore::new());
+        let executor = Arc::new(Executor::new(
+            Arc::clone(&exchange),
+            Arc::new(IntentJournal::new()),
+            store.clone(),
+        ));
+        let event_bus = Arc::new(EventBus::new(10));
+        let manager = PositionManager::new(
+            Engine::new(RiskConfig::new(dec!(10000)).unwrap()),
+            executor,
+            store,
+            Arc::clone(&event_bus),
+            Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
+        );
+        let position_manager = Arc::new(RwLock::new(manager));
+        let circuit_breaker = position_manager.read().await.circuit_breaker();
+        create_router(Arc::new(ApiState {
+            exchange,
+            position_manager,
+            event_bus,
+            circuit_breaker,
+            wallet_balance_cache: Mutex::new(None),
+            pg_pool: Some(Arc::new(pool)),
+            tenant_id: None,
+            google_auth: legacy.is_some().then(test_google_auth_config),
+            legacy_api_token: legacy.map(str::to_string),
+            funding: FundingConfig::default(),
+            funding_route_mode: FundingRouteMode::Selected,
+            venue_feed: VenueFeedView::default(),
+            order_journal: journal,
+        }))
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn seed_intent(pool: &sqlx::PgPool, id: &str, cancels: Option<&str>) -> Uuid {
+        use robson_exec::order_journal::{IntentKind, IntentSpec, JournalBackend, WriteClass};
+        let backend = crate::order_journal_store::PgJournalBackend::new(pool, Uuid::now_v7());
+        let backend: Arc<dyn JournalBackend> = Arc::new(backend);
+        let journal = Arc::new(OrderJournal::new(backend, &VenueId::new("test:venue")));
+        let operation = journal.begin_operation();
+        let intent = operation
+            .scope(async {
+                let intent = journal.open_intent(IntentSpec {
+                    position_id: None,
+                    kind: if cancels.is_some() {
+                        IntentKind::Cancel
+                    } else {
+                        IntentKind::Exit
+                    },
+                    client_order_id: id.to_string(),
+                    cancels_order_id: cancels.map(str::to_string),
+                    params: json!({}),
+                });
+                journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
+                intent
+            })
+            .await;
+        std::mem::forget(operation);
+        intent.intent_id()
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn post_disposition(
+        app: &Router,
+        bearer: Option<&str>,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/recovery/disposition")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(bearer) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    #[cfg(feature = "postgres")]
+    fn accepted_risk(intent_id: Uuid) -> Value {
+        json!({
+            "intent_id": intent_id,
+            "disposition_kind": "accepted_risk",
+            "treatment": "unbooked_accepted",
+            "note": "operator read the account",
+        })
+    }
+
+    #[cfg(feature = "postgres")]
+    fn terminal_evidence(intent_id: Uuid, order_ref: &str) -> Value {
+        json!({
+            "intent_id": intent_id,
+            "disposition_kind": "terminal_evidence",
+            "treatment": "unbooked_accepted",
+            "note": "order history shows it terminal",
+            "evidence": {
+                "order_ref": order_ref,
+                "terminal_status": "cancelled",
+                "filled_qty": "0",
+                "source": "venue order history",
+                "observed_at": "2026-11-08T12:00:00Z",
+                "venue_record": { "status": "CANCELED", "executedQty": "0" },
+            },
+        })
+    }
+
+    #[cfg(feature = "postgres")]
+    type VenueSide = (Option<String>, Option<Value>, i64);
+
+    /// `venue_outcome`, `venue_evidence` and event-log rows, so a test can show
+    /// a disposition changed none of them.
+    #[cfg(feature = "postgres")]
+    async fn venue_side(pool: &sqlx::PgPool, intent_id: Uuid) -> VenueSide {
+        let (outcome, evidence): (Option<String>, Option<Value>) = sqlx::query_as(
+            "SELECT venue_outcome, venue_evidence FROM order_intents WHERE intent_id = $1",
+        )
+        .bind(intent_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM event_log")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        (outcome, evidence, events)
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_verified_operator_accepts_risk_and_the_venue_side_is_untouched(pool: sqlx::PgPool) {
+        let journal = Arc::new(OrderJournal::unpersisted());
+        let intent_id = seed_intent(&pool, "c1", None).await;
+        let before = venue_side(&pool, intent_id).await;
+        let app = disposition_app(pool.clone(), journal, Some(LEGACY)).await;
+        let token = make_test_google_token(TestGoogleClaims::default());
+
+        let (status, body) = post_disposition(&app, Some(&token), accepted_risk(intent_id)).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["boundary_b_blockers"], 0);
+        assert_eq!(venue_side(&pool, intent_id).await, before, "never a venue outcome");
+        let (kind, treatment, by, auth): (String, String, String, String) = sqlx::query_as(
+            "SELECT disposition_kind, disposition_treatment, risk_accepted_by, risk_accepted_auth
+             FROM order_intents WHERE intent_id = $1",
+        )
+        .bind(intent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (kind.as_str(), treatment.as_str(), by.as_str(), auth.as_str()),
+            ("accepted_risk", "unbooked_accepted", TEST_ALLOWED_EMAIL, "verified")
+        );
+        let decision: (String, String, String) = sqlx::query_as(
+            "SELECT actor, auth_kind, note FROM journal_decisions WHERE intent_id = $1",
+        )
+        .bind(intent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(decision.0, TEST_ALLOWED_EMAIL);
+        assert_eq!(decision.1, "verified");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn the_legacy_token_is_recorded_as_asserted(pool: sqlx::PgPool) {
+        let intent_id = seed_intent(&pool, "c1", None).await;
+        let app =
+            disposition_app(pool.clone(), Arc::new(OrderJournal::unpersisted()), Some(LEGACY))
+                .await;
+
+        let (status, body) = post_disposition(&app, Some(LEGACY), accepted_risk(intent_id)).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let auth: String =
+            sqlx::query_scalar("SELECT auth_kind FROM journal_decisions WHERE intent_id = $1")
+                .bind(intent_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(auth, "asserted");
+    }
+
+    /// Terminal evidence is not accepted risk and not a venue outcome.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn terminal_evidence_names_the_order_and_stays_apart_from_finality(pool: sqlx::PgPool) {
+        let intent_id = seed_intent(&pool, "c1", None).await;
+        let before = venue_side(&pool, intent_id).await;
+        let app =
+            disposition_app(pool.clone(), Arc::new(OrderJournal::unpersisted()), Some(LEGACY))
+                .await;
+
+        let (status, _) =
+            post_disposition(&app, Some(LEGACY), terminal_evidence(intent_id, "other")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "evidence for another order");
+
+        let (status, body) =
+            post_disposition(&app, Some(LEGACY), terminal_evidence(intent_id, "c1")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(venue_side(&pool, intent_id).await, before);
+        let (kind, accepted_at): (String, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
+            "SELECT disposition_kind, risk_accepted_at FROM order_intents WHERE intent_id = $1",
+        )
+        .bind(intent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kind, "terminal_evidence");
+        assert_eq!(accepted_at, None, "no risk was accepted");
+
+        // For a cancel, the evidence is about the order it cancels: its local
+        // id never reached the venue, so nothing there can be its record.
+        let cancel_id = seed_intent(&pool, "cxl-1", Some("777")).await;
+        let (status, _) =
+            post_disposition(&app, Some(LEGACY), terminal_evidence(cancel_id, "cxl-1")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "the local cancellation id");
+        let (status, body) =
+            post_disposition(&app, Some(LEGACY), terminal_evidence(cancel_id, "777")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// An empty-account observation has no shape the endpoint will take.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn an_empty_account_observation_is_not_terminal_evidence(pool: sqlx::PgPool) {
+        let intent_id = seed_intent(&pool, "c1", None).await;
+        let app =
+            disposition_app(pool.clone(), Arc::new(OrderJournal::unpersisted()), Some(LEGACY))
+                .await;
+        let mut body = terminal_evidence(intent_id, "c1");
+        body["evidence"] = json!({
+            "positions": [],
+            "source": "account page",
+            "observed_at": "2026-11-08T12:00:00Z",
+        });
+
+        let (status, _) = post_disposition(&app, Some(LEGACY), body).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let blockers: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM order_intents_blocking_rollback")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(blockers, 1, "still blocks the boundary");
+    }
+
+    /// What no real order could have reported, and an operator's assertion
+    /// with no venue record, stay outstanding.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn impossible_or_unattached_evidence_is_refused(pool: sqlx::PgPool) {
+        let intent_id = seed_intent(&pool, "c1", None).await;
+        let app =
+            disposition_app(pool.clone(), Arc::new(OrderJournal::unpersisted()), Some(LEGACY))
+                .await;
+        let mut too_much = terminal_evidence(intent_id, "c1");
+        too_much["evidence"]["filled_qty"] = json!("0.5");
+        too_much["evidence"]["terminal_status"] = json!("filled");
+        sqlx::query("UPDATE order_intents SET params = '{\"quantity\": \"0.1\"}'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let tamper = |field: &str, value: Value| {
+            let mut body = terminal_evidence(intent_id, "c1");
+            body["evidence"][field] = value;
+            body
+        };
+        let mut filled_nothing = tamper("filled_qty", json!("0"));
+        filled_nothing["evidence"]["terminal_status"] = json!("filled");
+        let mut rejected_with_fill = tamper("filled_qty", json!("0.01"));
+        rejected_with_fill["evidence"]["terminal_status"] = json!("rejected");
+        for (case, body) in [
+            ("negative", tamper("filled_qty", json!("-1"))),
+            ("blank source", tamper("source", json!("  "))),
+            ("future", tamper("observed_at", json!("2999-01-01T00:00:00Z"))),
+            ("empty record", tamper("venue_record", json!({}))),
+            ("filled nothing", filled_nothing),
+            ("rejected with a fill", rejected_with_fill),
+            ("more than ordered", too_much),
+        ] {
+            let (status, reply) = post_disposition(&app, Some(LEGACY), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {reply}");
+        }
+        // A record that is missing altogether does not even deserialize.
+        let mut assertion = terminal_evidence(intent_id, "c1");
+        assertion["evidence"].as_object_mut().unwrap().remove("venue_record");
+        assert_eq!(
+            post_disposition(&app, Some(LEGACY), assertion).await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let blockers: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM order_intents_blocking_rollback")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(blockers, 1);
+
+        // The same operator may still accept the risk knowingly.
+        let (status, reply) = post_disposition(&app, Some(LEGACY), accepted_risk(intent_id)).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_disposition_is_refused_when_it_cannot_apply(pool: sqlx::PgPool) {
+        let intent_id = seed_intent(&pool, "c1", None).await;
+        let journal = Arc::new(OrderJournal::unpersisted());
+        let app = disposition_app(pool.clone(), journal, Some(LEGACY)).await;
+
+        // Not authenticated.
+        let (status, _) = post_disposition(&app, None, accepted_risk(intent_id)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Unknown intent, empty note, evidence that does not belong.
+        let (status, _) = post_disposition(&app, Some(LEGACY), accepted_risk(Uuid::now_v7())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let mut blank = accepted_risk(intent_id);
+        blank["note"] = json!("   ");
+        assert_eq!(post_disposition(&app, Some(LEGACY), blank).await.0, StatusCode::BAD_REQUEST);
+        let mut evidence_on_risk = terminal_evidence(intent_id, "c1");
+        evidence_on_risk["disposition_kind"] = json!("accepted_risk");
+        assert_eq!(
+            post_disposition(&app, Some(LEGACY), evidence_on_risk).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let mut no_evidence = terminal_evidence(intent_id, "c1");
+        no_evidence.as_object_mut().unwrap().remove("evidence");
+        assert_eq!(
+            post_disposition(&app, Some(LEGACY), no_evidence).await.0,
+            StatusCode::BAD_REQUEST
+        );
+
+        // A definite outcome is not outstanding.
+        sqlx::query("UPDATE order_intents SET venue_outcome = 'success' WHERE intent_id = $1")
+            .bind(intent_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            post_disposition(&app, Some(LEGACY), accepted_risk(intent_id)).await.0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    /// With auth disabled there is no identity to record, so nothing is.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn without_an_identity_there_is_no_disposition(pool: sqlx::PgPool) {
+        let intent_id = seed_intent(&pool, "c1", None).await;
+        let app = disposition_app(pool.clone(), Arc::new(OrderJournal::unpersisted()), None).await;
+        let (status, _) = post_disposition(&app, None, accepted_risk(intent_id)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// An intent this process is still working on cannot be decided on.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn an_intent_still_in_flight_cannot_be_decided_on(pool: sqlx::PgPool) {
+        use robson_exec::order_journal::{IntentKind, IntentSpec};
+        let intent_id = seed_intent(&pool, "c1", None).await;
+        let journal = Arc::new(OrderJournal::unpersisted());
+        let operation = journal.begin_operation();
+        operation
+            .scope(async {
+                journal.open_intent(IntentSpec {
+                    position_id: None,
+                    kind: IntentKind::Exit,
+                    client_order_id: "c1".to_string(),
+                    cancels_order_id: None,
+                    params: json!({}),
+                });
+            })
+            .await;
+        let app = disposition_app(pool.clone(), journal.clone(), Some(LEGACY)).await;
+
+        let (status, _) = post_disposition(&app, Some(LEGACY), accepted_risk(intent_id)).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        drop(operation);
     }
 
     /// ADR-0056 §5: a fill closes the position, however short of it, and the
@@ -5432,6 +6068,7 @@ mod tests {
                 funding: FundingConfig::default(),
                 funding_route_mode: FundingRouteMode::Selected,
                 venue_feed: VenueFeedView::default(),
+                order_journal: Arc::new(OrderJournal::unpersisted()),
             });
 
             (create_router(state), event_bus, position_manager)

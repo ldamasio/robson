@@ -658,6 +658,24 @@ migration-job image.
 
 Part 1 changes nothing at runtime: nothing calls the journal yet.
 
+*Order journal, part 2 (disposition and metrics).* **`POST /recovery/disposition`** (authenticated; a verified Google identity is
+recorded as `verified`, the legacy token as `asserted`) records, per outstanding intent, `terminal_evidence` or `accepted_risk`,
+plus the accounting treatment of what remains (`unbooked_accepted` in the core). It writes no venue outcome and no event, books
+nothing and affects no admission. Terminal evidence names the order (for a cancellation, the venue reference of the order it cancelled, never its local `cxl-` id, which
+never reached the venue), states a terminal status consistent with its filled quantity,
+which cannot be negative or more than the order asked for, gives its source and a past observation time, and **attaches the venue's
+own record of the order**. Without a record, what the operator has is an assertion, and the disposition to make is `accepted_risk`.
+The endpoint does not check the record against the venue: it is what the named operator attached. So an observation that the account
+is empty never satisfies B. A disposition is not a venue outcome and does not discharge liabilities; the recorded treatment does.
+Each request appends to `journal_decisions` and the latest stands, so a retry after a lost acknowledgement adds a second decision
+and changes nothing else.
+
+Metrics, defined here and published from part 3 on: `robsond_journal_latch`, `robsond_journal_retry_set_depth`,
+`robsond_journal_non_reuse_ids_lost`, `robsond_journal_statements` (charged, not executed),
+`robsond_journal_operation_statements_max`, `robsond_journal_operations_over_statement_bound`.
+`robsond_journal_non_reuse_ids_lost` is process-local, resets on restart, and counts sends authorized without their id being kept, not
+a verified inventory of orders with no row.
+
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze
 contract 1.2.0; `rbx-data` vendors its own registry copy (1.1.3) and must re-vendor before any export runs. Every rollback

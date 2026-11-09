@@ -1767,6 +1767,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             funding: self.config.funding.clone(),
             funding_route_mode: self.funding_worker_route().1,
             venue_feed,
+            order_journal: Arc::new(robson_exec::order_journal::OrderJournal::unpersisted()),
         });
 
         let router = create_router(state);

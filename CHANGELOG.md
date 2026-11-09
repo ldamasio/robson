@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Disposition endpoint and journal metrics (ADR-0056 step 7, PR J, part 2)
+
+- `POST /recovery/disposition` records an operator's terminal evidence or accepted risk for an outstanding
+  intent, with the verified identity. It never sets a venue outcome.
+
 ### Added - Order journal storage and rules (ADR-0056 step 7, PR J, part 1)
 
 - Migration 31 adds the order journal's tables and the rollback view
