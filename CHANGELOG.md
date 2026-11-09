@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed - Typed classification of stop cancels (ADR-0056 step 7, PR C)
+
+- Every production stop cancel is classified the same way, with its class on its own journal intent. Only a
+  typed `Cancelled` or an "already gone" with a final state is definite; no error type or message can be.
+- A software-exit cancel answered by a broad order error now emits `InsuranceStopFailed` and keeps the stop
+  id, instead of being read as cancelled. Uncertainty is journaled and does not close admissions until the
+  fence ships.
+- That cancel is not rate-limited: while the id stays on the leg it repeats once per exit attempt, with its
+  own journal intent and failure event, because a retried cancel can be what lets the next exit through.
+- An `InsuranceStopFailed` no longer changes a stop heal's deadline on record, overdue included; only a leg
+  with none gets a new window. A heal left outstanding by the last process is rebuilt from the event log at
+  startup.
+
 ### Added - Every order written to the journal (ADR-0056 step 7, PR J, part 3)
 
 - An entry does not go out without its row. Reductions, protective stops and cancels try for 500 ms and go

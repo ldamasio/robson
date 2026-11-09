@@ -36,6 +36,7 @@
 
 #![warn(clippy::all)]
 
+pub mod cancel;
 mod compat;
 #[cfg(feature = "crash-points")]
 pub mod crash_points;

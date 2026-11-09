@@ -87,7 +87,10 @@ impl ExchangePort for TimeoutExchange {
         _symbol: &Symbol,
         _algo_id: &str,
     ) -> Result<StopCancelOutcome, ExecError> {
-        Ok(StopCancelOutcome::Cancelled)
+        Ok(StopCancelOutcome::Cancelled {
+            filled_before_cancel: Decimal::ZERO,
+            fills: None,
+        })
     }
 
     async fn get_open_orders(

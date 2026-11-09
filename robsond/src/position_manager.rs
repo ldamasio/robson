@@ -1389,16 +1389,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     error,
                     ..
                 }) => {
-                    stale.insert(
-                        *position_id,
-                        std::time::Instant::now() + INSURANCE_STOP_RETRY_BACKOFF,
-                    );
+                    // Any deadline on record stands, overdue included, so failures
+                    // cannot keep postponing the heal. The heal pushes its own
+                    // window before it acts, so a failed heal still backs off.
+                    let now = std::time::Instant::now();
+                    let retry_at =
+                        *stale.entry(*position_id).or_insert(now + INSURANCE_STOP_RETRY_BACKOFF);
                     changed = true;
                     warn!(
                         %position_id,
                         stop_price = %stop_price.as_decimal(),
                         %error,
-                        retry_in_secs = INSURANCE_STOP_RETRY_BACKOFF.as_secs(),
+                        retry_in_secs = retry_at.saturating_duration_since(now).as_secs(),
                         "Exchange insurance stop is behind the software stop plan; re-placement scheduled (ADR-0039)"
                     );
                 },
@@ -1498,6 +1500,31 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             retry_in_secs = INSURANCE_STOP_RETRY_BACKOFF.as_secs(),
             "Active leg has no exchange stop; re-placement scheduled (ADR-0039)"
         );
+    }
+
+    /// A leg's latest stop event is a failure and this is a new process
+    /// (ADR-0056 step 7): the retry window does not survive a restart, and an
+    /// id still on record hides the leg from the check above. An entry
+    /// already here stands.
+    pub(crate) async fn schedule_stop_heal_after_restart(&self, position_id: PositionId) {
+        let mut stale = self.insurance_stop_stale.write().await;
+        stale
+            .entry(position_id)
+            .or_insert_with(|| std::time::Instant::now() + INSURANCE_STOP_RETRY_BACKOFF);
+        crate::metrics::INSURANCE_STOP_STALE_POSITIONS.set(stale.len() as f64);
+        warn!(
+            %position_id,
+            retry_in_secs = INSURANCE_STOP_RETRY_BACKOFF.as_secs(),
+            "Latest stop event of this leg is a failure; re-placement scheduled after a restart (ADR-0039)"
+        );
+    }
+
+    #[cfg(all(test, feature = "postgres"))]
+    pub(crate) async fn stop_heal_deadline_for_test(
+        &self,
+        position_id: PositionId,
+    ) -> Option<std::time::Instant> {
+        self.insurance_stop_stale.read().await.get(&position_id).copied()
     }
 
     /// The orphan sweep found this leg's recorded stop gone from the venue's
@@ -10537,6 +10564,368 @@ mod tests {
         }
         let events = manager.store.events().find_by_position(position.id).await.unwrap();
         assert!(events.iter().any(|event| matches!(event, Event::PositionClosed { .. })));
+    }
+
+    /// ADR-0056 step 7, §2.3 item 5: a stop-out whose software cancel finds the
+    /// order gone with no final state, then an overtaken close. The close
+    /// never resolves the cancel: its row stays uncertain, with the leg closed.
+    #[tokio::test]
+    async fn an_overtaken_close_never_resolves_an_uncertain_cancel() {
+        let (manager, backend) = journaled_manager().await;
+        let mut position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let entry_price = Price::new(dec!(100)).unwrap();
+        let trailing_stop = Price::new(dec!(90)).unwrap();
+        position.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(entry_price, trailing_stop));
+        let exchange = manager.executor.exchange();
+        let stop = exchange
+            .place_stop_market_order(
+                &position.symbol,
+                position.side.exit_action(),
+                position.quantity,
+                trailing_stop,
+                "ins-test-overtaken",
+            )
+            .await
+            .unwrap()
+            .exchange_order_id;
+        position.insurance_stop_id = Some(stop.clone());
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some(stop.clone());
+        }
+        manager.store.positions().save(&position).await.unwrap();
+
+        exchange.set_price("BTCUSDT", trailing_stop.as_decimal());
+        exchange.fill_stop_order(&stop).unwrap();
+        exchange.set_reject_reduce_only_next(true);
+        exchange.set_stop_cancel_outcome_next(Ok(
+            robson_exec::venue::StopCancelOutcome::AlreadyGone {
+                final_state: robson_exec::venue::OrderLookup::Unknown,
+            },
+        ));
+
+        manager
+            .process_market_data(MarketData {
+                venue: test_venue(),
+                symbol: position.symbol.clone(),
+                price: Price::new(dec!(89)).unwrap(),
+                timestamp: chrono::Utc::now(),
+                source: crate::event_bus::MarketDataSource::Ws,
+            })
+            .await
+            .unwrap();
+
+        let closed = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(closed.state, PositionState::Closed { .. }), "{:?}", closed.state);
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(!events.iter().any(|e| matches!(e, Event::InsuranceStopCancelled { .. })));
+        let cancel = backend
+            .rows()
+            .into_iter()
+            .find(|r| {
+                r.intent.as_ref().unwrap().kind == robson_exec::order_journal::IntentKind::Cancel
+            })
+            .expect("the cancel is journaled");
+        assert_eq!(cancel.intent.unwrap().cancels_order_id.as_deref(), Some(stop.as_str()));
+        let outcome = cancel.outcome.expect("its outcome is written");
+        assert_eq!(outcome.cancel_class, Some("gone_unresolved"));
+        assert_eq!(outcome.venue_outcome, None, "the close settles nothing about the cancel");
+        assert!(outcome.uncertain_at.is_some());
+    }
+
+    /// ADR-0056 step 7, PR C: a leg crossing its stop, a broad cancel error, an
+    /// exit failing with a generic error, later ticks. The cancel goes out
+    /// again before every exit attempt, the heal's deadline stands, and a batch
+    /// that finishes after that deadline leaves it due for the next tick.
+    #[tokio::test]
+    async fn repeated_crossing_ticks_repeat_the_cancel_and_do_not_starve_the_heal() {
+        let (manager, backend) = journaled_manager().await;
+        let (position, stop) = active_leg_with_live_stop(&manager).await;
+        let exchange = manager.exchange();
+        let broad = || Err(ExecError::Exchange("order gateway unavailable".to_string()));
+        let cancel_rows = || {
+            backend
+                .rows()
+                .iter()
+                .filter(|r| {
+                    r.intent.as_ref().unwrap().kind
+                        == robson_exec::order_journal::IntentKind::Cancel
+                })
+                .count()
+        };
+        let failures = || async {
+            let events = manager.store.events().find_by_position(position.id).await.unwrap();
+            events.iter().filter(|e| matches!(e, Event::InsuranceStopFailed { .. })).count()
+        };
+
+        exchange.set_stop_cancel_outcome_next(broad());
+        exchange.set_order_fail_next(true);
+        let first = stop_crossing_tick(&manager, &position).await;
+        assert!(first.is_err(), "the exit failed: {first:?}");
+        assert_eq!(exchange.stop_cancel_call_count(), 1);
+        assert_eq!(exchange.market_order_call_count(), 1);
+        assert_eq!(failures().await, 1);
+        assert_eq!(cancel_rows(), 1);
+        let deadline = manager.insurance_stop_stale.read().await[&position.id];
+
+        for tick in 2..=4u64 {
+            exchange.set_stop_cancel_outcome_next(broad());
+            exchange.set_order_fail_next(true);
+            let again = stop_crossing_tick(&manager, &position).await;
+            assert!(again.is_err(), "tick {tick}: the exit failed again: {again:?}");
+            assert_eq!(exchange.stop_cancel_call_count(), tick, "tick {tick}: cancelled again");
+            assert_eq!(exchange.market_order_call_count(), tick, "tick {tick}: the exit ran");
+            assert_eq!(failures().await, tick as usize, "tick {tick}: its own audit");
+            assert_eq!(cancel_rows(), tick as usize, "tick {tick}: its own intent");
+            assert_eq!(
+                manager.insurance_stop_stale.read().await[&position.id],
+                deadline,
+                "tick {tick}: the heal's deadline stands"
+            );
+        }
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert_eq!(leg.insurance_stop_id.as_deref(), Some(stop.as_str()), "the id was kept");
+
+        // This batch started with the deadline ahead and its bookkeeping runs
+        // after the deadline has passed: the overdue deadline stays.
+        let overdue = std::time::Instant::now();
+        let stale = Arc::clone(&manager.insurance_stop_stale);
+        let id = position.id;
+        exchange.set_after_next_stop_cancel(move || {
+            stale.try_write().unwrap().insert(id, overdue);
+        });
+        exchange.set_stop_cancel_outcome_next(broad());
+        exchange.set_order_fail_next(true);
+        assert!(stop_crossing_tick(&manager, &position).await.is_err());
+        assert_eq!(manager.insurance_stop_stale.read().await[&position.id], overdue);
+
+        // The next tick sees it due and replaces the stop against the kept id.
+        let placements = exchange.protection_call_count();
+        stop_crossing_tick(&manager, &position).await.unwrap();
+        assert_eq!(exchange.protection_call_count(), placements + 1, "the heal placed a stop");
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::InsuranceStopReplaced { previous_order_id, .. }
+                    if previous_order_id == &stop
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// Codex round 2 on PR C: a timed-out cancel leaves the stop live and the
+    /// exit fails. On the next tick the cancel goes out again before the exit,
+    /// so a stop that can now be cancelled is gone when the exit goes out.
+    #[tokio::test]
+    async fn a_retried_cancel_clears_a_live_stop_before_the_next_exit() {
+        let (manager, backend) = journaled_manager().await;
+        let (position, stop) = active_leg_with_live_stop(&manager).await;
+        let exchange = manager.exchange();
+        exchange.set_stop_cancel_outcome_next(Err(ExecError::Timeout("no answer".to_string())));
+        exchange.set_order_fail_next(true);
+        assert!(stop_crossing_tick(&manager, &position).await.is_err());
+        assert!(exchange.has_stop_order(&stop), "the timed-out cancel left it live");
+
+        let exits_at_cancel = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let (seen, venue) = (Arc::clone(&exits_at_cancel), Arc::clone(&exchange));
+        exchange.set_after_next_stop_cancel(move || {
+            seen.store(venue.market_order_call_count(), std::sync::atomic::Ordering::SeqCst);
+        });
+        stop_crossing_tick(&manager, &position).await.unwrap();
+
+        assert_eq!(
+            exits_at_cancel.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the cancel went out before this tick's exit"
+        );
+        assert_eq!(exchange.stop_cancel_call_count(), 2);
+        assert!(!exchange.has_stop_order(&stop), "the retried cancel took the stop");
+        assert_eq!(exchange.market_order_call_count(), 2, "and the exit followed it");
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::InsuranceStopCancelled { .. })));
+        let classes: Vec<_> = backend
+            .rows()
+            .iter()
+            .filter_map(|r| r.outcome.as_ref().and_then(|o| o.cancel_class))
+            .collect();
+        assert!(classes.contains(&"error") && classes.contains(&"cancelled"), "{classes:?}");
+    }
+
+    /// ADR-0056 step 7, PR C, Codex round 3: a new process over a leg whose
+    /// latest stop event is a failure, price back above the stop, open-orders
+    /// reads failing, placement available. The rebuilt retry still comes due
+    /// and replaces the stop against the id it kept.
+    #[tokio::test]
+    async fn a_heal_rebuilt_at_restart_replaces_the_kept_stop_with_open_orders_failing() {
+        let manager = create_test_manager().await;
+        let (position, stop) = active_leg_with_live_stop(&manager).await;
+        let exchange = manager.exchange();
+        exchange.set_open_orders_fail(true);
+
+        // Without the rebuild nothing here would notice the leg.
+        quiet_tick(&manager, &position).await;
+        assert!(!manager.insurance_stop_stale.read().await.contains_key(&position.id));
+
+        manager.schedule_stop_heal_after_restart(position.id).await;
+        let window = stop_retry_in(&manager, position.id).await;
+        assert!(window > std::time::Duration::from_secs(25), "{window:?}");
+        assert!(window <= INSURANCE_STOP_RETRY_BACKOFF, "{window:?}");
+        let placements = exchange.protection_call_count();
+        quiet_tick(&manager, &position).await;
+        assert_eq!(exchange.protection_call_count(), placements, "not due yet");
+
+        manager
+            .insurance_stop_stale
+            .write()
+            .await
+            .insert(position.id, std::time::Instant::now());
+        quiet_tick(&manager, &position).await;
+
+        assert_eq!(exchange.protection_call_count(), placements + 1, "the heal placed a stop");
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::InsuranceStopReplaced { previous_order_id, .. }
+                    if previous_order_id == &stop
+            )),
+            "{events:?}"
+        );
+        assert!(!manager.insurance_stop_stale.read().await.contains_key(&position.id));
+    }
+
+    #[tokio::test]
+    async fn a_heal_rebuilt_at_restart_keeps_an_entry_already_there() {
+        let manager = create_test_manager().await;
+        let id = Uuid::now_v7();
+        let ahead = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        manager.insurance_stop_stale.write().await.insert(id, ahead);
+
+        manager.schedule_stop_heal_after_restart(id).await;
+
+        assert_eq!(manager.insurance_stop_stale.read().await[&id], ahead);
+    }
+
+    /// A successful startup-recovery placement or replacement clears the
+    /// rebuilt retry through the ordinary bookkeeping.
+    #[tokio::test]
+    async fn a_startup_recovery_stop_clears_the_rebuilt_retry() {
+        let manager = create_test_manager().await;
+        let (position, stop) = active_leg_with_live_stop(&manager).await;
+        let replace = EngineAction::ReplaceInsuranceStop {
+            position_id: position.id,
+            symbol: position.symbol.clone(),
+            side: position.side.exit_action(),
+            quantity: position.quantity,
+            previous_order_id: stop,
+            new_stop_price: Price::new(dec!(91)).unwrap(),
+        };
+        let place = EngineAction::PlaceInsuranceStop {
+            position_id: position.id,
+            symbol: position.symbol.clone(),
+            side: position.side.exit_action(),
+            quantity: position.quantity,
+            stop_price: Price::new(dec!(91)).unwrap(),
+        };
+
+        for action in [replace, place] {
+            manager.schedule_stop_heal_after_restart(position.id).await;
+            manager.execute_and_persist_recovery(vec![action]).await.unwrap();
+            assert!(!manager.insurance_stop_stale.read().await.contains_key(&position.id));
+        }
+    }
+
+    fn stop_failed(position_id: PositionId) -> ActionResult {
+        ActionResult::EventEmitted(Event::InsuranceStopFailed {
+            position_id,
+            stop_price: Price::zero(),
+            error: "venue".to_string(),
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
+    /// Only an absent deadline gets a new window: one on record stands,
+    /// overdue included.
+    #[tokio::test]
+    async fn a_stop_failure_keeps_any_heal_deadline_on_record() {
+        let manager = create_test_manager().await;
+        let id = Uuid::now_v7();
+
+        manager.note_insurance_stop_results(&[stop_failed(id)]).await;
+        assert!(stop_retry_in(&manager, id).await > std::time::Duration::from_secs(25), "absent");
+
+        let ahead = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        manager.insurance_stop_stale.write().await.insert(id, ahead);
+        manager.note_insurance_stop_results(&[stop_failed(id)]).await;
+        assert_eq!(manager.insurance_stop_stale.read().await[&id], ahead, "ahead");
+
+        let overdue = std::time::Instant::now();
+        manager.insurance_stop_stale.write().await.insert(id, overdue);
+        manager.note_insurance_stop_results(&[stop_failed(id)]).await;
+        assert_eq!(manager.insurance_stop_stale.read().await[&id], overdue, "overdue");
+
+        manager
+            .note_insurance_stop_results(&[ActionResult::ProtectionNotExecutable {
+                position_id: id,
+            }])
+            .await;
+        assert!(stop_retry_in(&manager, id).await > INSURANCE_STOP_RETRY_BACKOFF, "long window");
+    }
+
+    /// A failed trailing replacement finding an overdue deadline leaves it due,
+    /// and the heal that follows pushes its window first: one heal, not one on
+    /// every tick.
+    #[tokio::test]
+    async fn a_failed_replacement_on_an_overdue_deadline_is_not_a_heal_on_every_tick() {
+        let manager = create_test_manager().await;
+        let (position, stop) = active_leg_with_live_stop(&manager).await;
+        let exchange = manager.exchange();
+        let overdue = std::time::Instant::now();
+        manager.insurance_stop_stale.write().await.insert(position.id, overdue);
+
+        exchange.set_order_fail_next(true);
+        manager
+            .execute_and_persist(vec![EngineAction::ReplaceInsuranceStop {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: position.side.exit_action(),
+                quantity: position.quantity,
+                previous_order_id: stop,
+                new_stop_price: Price::new(dec!(91)).unwrap(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(manager.insurance_stop_stale.read().await[&position.id], overdue);
+
+        exchange.set_order_fail_next(true);
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(manager.retry_stale_insurance_stop(&leg).await, "it was due");
+        assert!(
+            stop_retry_in(&manager, position.id).await > std::time::Duration::from_secs(25),
+            "the heal pushed its window before it failed"
+        );
+
+        let placements = exchange.protection_call_count();
+        assert!(!manager.retry_stale_insurance_stop(&leg).await, "not due again");
+        assert_eq!(exchange.protection_call_count(), placements);
+    }
+
+    /// A heal pushes its own window before it acts, so one that fails still
+    /// backs off although a deadline ahead now stands.
+    #[tokio::test]
+    async fn a_failed_heal_still_backs_off() {
+        let manager = create_test_manager().await;
+        let (position, _) = active_leg_with_live_stop(&manager).await;
+        manager.exchange().set_order_fail_next(true);
+
+        retry_stop_now(&manager, position.id).await;
+
+        assert!(
+            stop_retry_in(&manager, position.id).await > std::time::Duration::from_secs(25),
+            "the failed heal waits a full window"
+        );
     }
 
     /// Regression for #142: while fill evidence is not visible yet, later
