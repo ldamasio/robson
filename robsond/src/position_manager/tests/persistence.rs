@@ -1252,3 +1252,35 @@ async fn a_suffix_with_a_non_position_type_is_not_repaired(pool: sqlx::PgPool) {
     assert_eq!(repair_state(&pool, id).await, (1, None, None, true, false));
     assert!(process.event_streams.position_suspended(id));
 }
+
+/// The bad type sits on the second validation page: the whole suffix is
+/// validated before anything applies, so not even the first page's valid
+/// events apply.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_non_position_type_on_a_later_page_stops_the_whole_repair(pool: sqlx::PgPool) {
+    let tenant_id = Uuid::now_v7();
+    let id = suspended_leg(&pool, tenant_id).await;
+    let mut suffix = trailing_updates(id, 1000..1600);
+    // Seq 552, on the second page of 500.
+    suffix.insert(
+        550,
+        ("capital_base_recalibrated".to_string(), serde_json::json!({ "probe": true })),
+    );
+    append_unapplied(&pool, tenant_id, id, suffix).await;
+    let process = process_of(&pool, tenant_id);
+    process.load_stream_suspensions().await.unwrap();
+
+    assert_eq!(process.repair_suspended_position_streams().await, (0, 1));
+
+    assert_eq!(repair_state(&pool, id).await, (1, None, None, true, false));
+    let error: String =
+        sqlx::query_scalar("SELECT repair_error FROM stream_suspensions WHERE stream_key = $1")
+            .bind(format!("position:{id}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(error.starts_with("seq 552: capital_base_recalibrated"), "{error}");
+    assert!(process.event_streams.position_suspended(id));
+}
