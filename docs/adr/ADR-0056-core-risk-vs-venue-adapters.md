@@ -838,7 +838,9 @@ the process exits then, inside the pod's `terminationGracePeriodSeconds` of 30 u
 installed first thing in `main`, before configuration and the database connection; as PID 1 the process receives SIGTERM only once one is,
 so only its first instructions run with SIGTERM ignored. A signal during the start's preparation, before any venue work (configuration,
 the database connection with its retries and backoff, the schema check, the journal's readiness check, the epoch's insert), ends the start
-there: nothing has been sent, no marker is written, and the process exits 0, even if the database comes back after the signal. Once the
+there: nothing has been sent, no marker is written, and the process exits 0 once it reaches its cancellation point, even if the
+database comes back after the signal. That exit 0 is the cooperative outcome: preparation stuck where it cannot reach that point (a
+blocked log write, say) ends at the hard bound with 70, and an ordinary start-up error keeps its own exit code. Once the
 startup phase runs under its permit, a signal drains it like any other operation: venue requests may already have been made, and more may
 follow under that permit until it ends or the deadline drops it. The `db` commands keep the default handling.
 
