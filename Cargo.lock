@@ -2287,6 +2287,7 @@ dependencies = [
  "dotenvy",
  "http-body-util",
  "jsonwebtoken",
+ "libc",
  "prometheus",
  "proptest",
  "reqwest",

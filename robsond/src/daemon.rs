@@ -193,92 +193,6 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     executor.with_order_journal(journal)
 }
 
-/// Ask for the stop on the first SIGTERM or SIGINT (ADR-0056 step 7), its clock
-/// started at that signal, then wait out the process's hard bound.
-///
-/// Signals are received on a thread of their own, with its own small runtime:
-/// a worker of the daemon's runtime stalled in synchronous code can leave that
-/// runtime's I/O and timers unattended, and neither the stop nor the hard bound
-/// may wait on it. Asking for the stop from this thread wakes the daemon's
-/// runtime. Both handlers are installed before this returns, so no later signal
-/// is lost. Without a signal the thread ends when `stop` is asked for otherwise
-/// or the returned guard is dropped.
-async fn listen_for_stop_signals(stop: StopRequest) -> DaemonResult<StopSignals> {
-    let quit = tokio_util::sync::CancellationToken::new();
-    let (installed, installing) = tokio::sync::oneshot::channel();
-    let quitting = quit.clone();
-    std::thread::Builder::new()
-        .name("robsond-stop-signal".to_string())
-        .spawn(move || watch_stop_signals(stop, quitting, installed))
-        .map_err(|error| {
-            DaemonError::Config(format!("Failed to start the signal thread: {error}"))
-        })?;
-    match installing.await {
-        Ok(Ok(())) => Ok(StopSignals { quit }),
-        Ok(Err(error)) => Err(DaemonError::Config(format!(
-            "Failed to install the stop signal handlers: {error}"
-        ))),
-        Err(_) => Err(DaemonError::Config("The signal thread ended at its start".to_string())),
-    }
-}
-
-/// The signal thread: installs both handlers on its own runtime, says so
-/// through `installed`, then waits for a signal, the stop asked for otherwise,
-/// or `quit`. After a signal it never returns.
-fn watch_stop_signals(
-    stop: StopRequest,
-    quit: tokio_util::sync::CancellationToken,
-    installed: tokio::sync::oneshot::Sender<Result<(), String>>,
-) {
-    use tokio::signal::unix::{signal, SignalKind};
-
-    let runtime = match tokio::runtime::Builder::new_current_thread().enable_io().build() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            let _ = installed.send(Err(error.to_string()));
-            return;
-        },
-    };
-    let asked = stop.clone();
-    let received = runtime.block_on(async move {
-        let handlers = signal(SignalKind::terminate())
-            .and_then(|terminate| Ok((terminate, signal(SignalKind::interrupt())?)));
-        let (mut terminate, mut interrupt) = match handlers {
-            Ok(handlers) => handlers,
-            Err(error) => {
-                let _ = installed.send(Err(error.to_string()));
-                return None;
-            },
-        };
-        let _ = installed.send(Ok(()));
-        tokio::select! {
-            _ = terminate.recv() => Some("SIGTERM"),
-            _ = interrupt.recv() => Some("SIGINT"),
-            _ = asked.asked() => None,
-            _ = quit.cancelled() => None,
-        }
-    });
-    let Some(received) = received else {
-        return;
-    };
-    let at = std::time::Instant::now();
-    crate::stop::signal_received(at);
-    stop.ask_at(tokio::time::Instant::from_std(at));
-    info!(signal = received, "Stop requested by signal");
-    crate::stop::hard_exit_after(at)
-}
-
-/// Ends the signal thread when dropped, unless a signal came first.
-struct StopSignals {
-    quit: tokio_util::sync::CancellationToken,
-}
-
-impl Drop for StopSignals {
-    fn drop(&mut self) {
-        self.quit.cancel();
-    }
-}
-
 /// `work`, unless the stop has its result first: then that result, and `work`
 /// is dropped. A stop has a result before its deadline only when no permit is
 /// held, so this never cuts short an operation the stop is waiting for.
@@ -823,20 +737,20 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     ///
     /// This method blocks until shutdown is requested (SIGINT/SIGTERM).
     pub async fn run(self) -> DaemonResult<()> {
-        self.run_until(StopRequest::default()).await
+        let stop = StopRequest::default();
+        let _signals = crate::stop::listen_for_signals(&stop).map_err(DaemonError::Config)?;
+        self.run_until(stop).await
     }
 
-    async fn run_until(self, stop: StopRequest) -> DaemonResult<()> {
+    /// Run the daemon until `stop` is asked for, for a caller that listens for
+    /// the stop signals itself, as `main` does from its start (ADR-0056 step
+    /// 7). A stop already asked for starts nothing.
+    pub async fn run_until(self, stop: StopRequest) -> DaemonResult<()> {
         info!(
             version = env!("CARGO_PKG_VERSION"),
             environment = %self.config.environment,
             "Starting Robson daemon"
         );
-
-        // SIGTERM or SIGINT asks for the two-phase stop (ADR-0056 step 7). As
-        // PID 1 the daemon receives SIGTERM only once a handler is installed,
-        // so this comes first.
-        let _signals = listen_for_stop_signals(stop.clone()).await?;
 
         let journal = Arc::clone(&self.order_journal);
         crate::metrics::init_operation_gate_metrics();
@@ -852,7 +766,10 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         let marker = tokio::select! {
             biased;
             _ = stop.asked() => {
-                warn!("Stop requested before the start completed: nothing started, epoch left unmarked");
+                warn!(
+                    cause = stop.cause(),
+                    "Stop requested before the start completed: nothing started, no marker written"
+                );
                 return Ok(());
             },
             prepared = Box::pin(self.prepare_start(&journal)) => prepared?,

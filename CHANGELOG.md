@@ -16,12 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operations in flight finish.
 - From the signal, the stop has its result by 25 s and the process exits by 27 s, inside the pod's 30 s grace:
   nothing still running is waited for after the deadline, the runtime's teardown is bounded, and a thread of
-  its own exits the process with code 70 at 27 s if anything is still stuck. A signal during the start's
-  readiness check or epoch insert ends the start with nothing sent.
-- A clean stop marks the process's epoch (`clean_stop_at`, `marker_version = 1`); a deadline, an aborted
-  operation, the latch or anything unlanded leaves it unmarked. An entry reached while draining is refused at
-  its send. A cancel-first exit cut short by the stop can leave its leg without an exchange stop until the
-  next process heals it.
+  its own exits the process with code 70 at 27 s if anything is still stuck, without waiting on logging or
+  stdio. Signals are handled from the start of `main`: one at any point of the start, the database
+  connection retries included, ends it with nothing sent, even if the database comes back.
+- A clean stop marks the process's epoch (`clean_stop_at`, `marker_version = 1`); a stop that fails a check
+  (deadline, aborted operation, latch, anything unlanded) writes no marker. A marker write that times out or
+  fails is unconfirmed: its update may have committed, and the log says so. A version-1 marker records only
+  those checks: it stands if teardown work that holds no permit later keeps the process to the hard bound.
+  An entry reached while draining is refused at its send. A cancel-first exit cut short by the stop can
+  leave its leg without an exchange stop until the next process heals it.
 
 ### Added - Process epochs (ADR-0056 step 7, PR S, part 2)
 

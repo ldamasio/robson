@@ -833,9 +833,10 @@ named in `ROBSON_VENUE` or selected from credentials, is refused there, before a
 
 *Part 3, the two-phase stop.* SIGTERM or SIGINT starts the stop. Its clock starts at the signal: the stop has its result by 25 s after
 it and the process exits by 27 s after it, inside the pod's `terminationGracePeriodSeconds` of 30 under `Recreate` with one replica. The
-handlers are installed first thing in the daemon's run; as PID 1 the process receives SIGTERM only once one is, so during the database
-connection retries before it a SIGTERM is ignored, as today, with nothing sent. A signal during the journal's readiness check or the epoch's
-insert ends the start there: nothing has been sent, no epoch is marked, and the process exits 0.
+handlers are installed first thing in `main`, before configuration and the database connection; as PID 1 the process receives SIGTERM only
+once one is, so only its first instructions run with SIGTERM ignored. A signal at any point of the start (the database connection retries
+and their backoff, the schema check, the journal's readiness check, the epoch's insert) ends the start there: nothing has been sent, no
+marker is written, and the process exits 0, even if the database comes back after the signal. The `db` commands keep the default handling.
 
 1. **Draining.** The ordinary API class answers 503 `stopping`; ticks, heals, exits, sweeps, the internal loops and the protective class
    continue. An entry the main loop reaches meanwhile is refused at its send: a no-send, and on a leg with admission evidence the attempt
@@ -845,20 +846,28 @@ insert ends the start there: nothing has been sent, no epoch is marked, and the 
    flushed, retried until the deadline. A reduction's rules refresh after a rejection is skipped while closing.
 3. **Marker.** Only when every permit was released in time, none was aborted, the latch is clear and the journal holds nothing in memory or in
    its retry set, `clean_stop_at` and `marker_version = 1` are written on this epoch. Otherwise the stop does not write it. A marker write
-   that times out is a `deadline` result but cannot prove the marker stayed unwritten: the update may commit after the timeout, or have
-   committed with its answer lost. Every check came before it, so such a marker is still true of the stop.
+   that times out (a `deadline` result) or fails (`marker_failed`) cannot prove the marker stayed unwritten: the update may commit after the
+   timeout, or have committed with its answer lost, and the log calls the write unconfirmed. Every check came before it, so such a marker is
+   still true of the stop. A version-1 marker records those checks and nothing else: it stands if teardown work that holds no permit later
+   keeps the process to its hard bound, and it is not the fence PR's incident clearance.
 
 **Bounds.** Once the stop has its result the daemon waits for nothing it was running. A startup phase or a main-loop event still holding its
 permit at the deadline is dropped there, aborted; what holds no permit (projection, income ledger, alarm, feeds) gets what is left of the
 deadline, and the runtime's teardown the rest, abandoning any task or thread still running. A stop has its result before the deadline only
 when no permit is held, so no operation holding one is cut short earlier. Signals are received on a thread of their own, with its own small
 runtime, not on the daemon's: a worker stalled in synchronous code can leave the daemon runtime's I/O and timers unattended, and a SIGTERM
-handled there was, in the real binary, never seen. Asking for the stop from that thread wakes the daemon's runtime again. The same thread
-then waits out 27 s from the signal: should the process still be alive, as when the thread running the daemon's start is itself stalled, it
-exits it with code 70 and an error, writing no marker. Otherwise the process exits 0 whatever the stop's result. In the real binary against
-the fake venue: an operation that never ends (a thread stalled after the venue's ack, its permit held) exits 0 at the deadline, measured
-25.04 s after the signal, with the epoch unmarked; a startup whose own thread is stalled exits 70 at the hard bound, measured 27.03 s; a
-signal while the epoch's insert waits in the database exits 0 in 54 ms with nothing sent and no epoch.
+handled there was, in the real binary, never seen. On a signal that thread first starts the hard bound's thread, then asks for the stop,
+which wakes the daemon's runtime; neither thread logs, writes to stdio or takes an application lock before the exit is armed, and the
+daemon's runtime logs the request when it takes it up. At 27 s after the signal, should the process still be alive, as when the thread
+running the daemon's start is stalled or every log write blocks on a pipe no one reads, the hard bound makes one non-blocking write of a
+notice to stderr and calls `_exit(70)`: no stdio flush and no atexit handler, so neither a full pipe nor a writer stuck holding stdout's
+lock can hold it, where `std::process::exit` flushes stdout first. It writes no marker. Otherwise the process exits 0 whatever the stop's
+result. In the real binary against the fake venue: an operation that never ends (a thread stalled after the venue's ack, its permit held)
+exits 0 at the deadline, measured 25.04 s after the signal, with the epoch unmarked; a startup whose own thread is stalled exits 70 at the
+hard bound, measured 27.03 s; with stdout and stderr on a full pipe no one reads, it exits 70 at the hard bound, measured 27.03 s, the stop
+blocked at its first log line and no marker written; a signal while the epoch's insert waits in the database exits 0 in 54 ms with nothing
+sent and no epoch; one during the database connection retries, the database back right after it, exits 0 in 54 ms with nothing sent and no
+epoch.
 
 **What a deploy costs.** Today PID 1 ignores SIGTERM: every deploy waits the whole 30 s grace for SIGKILL, and the old process keeps
 managing the account until it dies. From this part on, management stops as Closing begins. The time no daemon manages the account is then
@@ -950,7 +959,7 @@ only).
 | Database dies | no admission, no new legs; already-installed protection remains on the exchange; inventory in an N1-a transition may remain unprotected without a duration or loss bound; no cancellation starts without a durable intent, and unfinished transitions retain liabilities and alerts and resume from that intent on recovery; intent results cannot be persisted → in-flight operations enter `Unknown`; recovery looks them up, a lookup may stay `Unknown`, and then the reservation stays held until step 7's explicit resolution path | read-only `/status` from memory; arms refused | `/readyz.database=false`; `unprotected_inventory` gauge; recovery events |
 | Journal database down or slow (step 7, PR J) | an entry's strict commit that fails is refused, no request; a leg with admission evidence ends its attempt, a legacy leg re-arms under its backoff. One that times out is uncertain, no request and no re-arm. Reductions, stops and cancels wait at most 500 ms per write and go out anyway, also with the journal's memories full | entries refused, protection and reductions continue; unlanded rows retry through a bounded set | `robsond_journal_latch`, `robsond_journal_retry_set_depth`, warnings in the logs; no fence yet |
 | Cancel outcome unknown (step 7, PR C) | an error, an indeterminate answer or an "already gone" with no final state is uncertain on the cancel's own intent; the protective action behind it proceeds | journaled only until the fence PR | `order_intents.cancel_class` and `uncertain_at`; boundary B |
-| Daemon asked to stop: SIGTERM or SIGINT (step 7, PR S) | Draining (ordinary API refused, protection continues) for at most 12 s, then Closing (everything new refused) until the operations in flight end and the journal is flushed; the stop's result by 25 s after the signal, the process's exit by 27 s (code 70 at that hard bound); the epoch is marked only on a clean pass. During the start's readiness check or epoch insert: no start, nothing sent | exchange stops cover the `Active` legs that keep one while no daemon runs; a cancel-first exit cut short can leave its leg without one until a later process heals it | the epoch's `clean_stop_at`; the next start's `robsond_unclean_start`; `robsond_graceful_stop_total{result}` if scraped |
+| Daemon asked to stop: SIGTERM or SIGINT (step 7, PR S) | Draining (ordinary API refused, protection continues) for at most 12 s, then Closing (everything new refused) until the operations in flight end and the journal is flushed; the stop's result by 25 s after the signal, the process's exit by 27 s (code 70 at that hard bound); the epoch is marked only on a clean pass. During the start, from the database connection on: no start, nothing sent | exchange stops cover the `Active` legs that keep one while no daemon runs; a cancel-first exit cut short can leave its leg without one until a later process heals it | the epoch's `clean_stop_at`; the next start's `robsond_unclean_start`; `robsond_graceful_stop_total{result}` if scraped |
 | API slot class full (step 7, PR S) | 503 `busy` at once, nothing done; the other classes keep their slots | the caller retries | `robsond_api_slot_busy_total{class}` |
 | Venue mutation without a permit (step 7, PR S) | while open: sent, counted, latch set; while stopping: refused, nothing sent | — | `robsond_unpermitted_mutations_total`, `robsond_journal_latch` |
 | Operation dropped mid-flight: a panic, a cancelled internal future (step 7, PR S) | each intent it left open is sealed: one whose send may have started ends uncertain, one proven unsent ends not sent, both through the retry set; one with nothing to record is dropped. The permit counts as aborted and sets the latch, so the stop cannot mark clean | — | `robsond_aborted_operations_total`, `robsond_journal_latch` |
@@ -1039,7 +1048,7 @@ Budget model for multi-venue:
   attempt rows are read from the database rather than reloaded. PR C: `robson-exec/src/{cancel,compat,executor,order_journal,ports,stub}.rs`,
   `robsond/src/{daemon,position_manager,reconciliation_worker}.rs`, no migration. PR S: `robson-exec/src/{gate,order_journal,venue,stub,quantize,
   crash_points}.rs`, `robson-connectors/src/binance_rest.rs` and the USD-M adapter, `robsond/src/{api,daemon,main,stop,process_epoch,metrics,
-  reconciliation_worker,position_manager,venue,error}.rs` and `funding/worker.rs`, `robson-testkit`, migration 32. What follows here is the original statement of the step, with its
+  reconciliation_worker,position_manager,venue,error}.rs` (with `libc` for the hard bound's `_exit`) and `funding/worker.rs`, `robson-testkit`, migration 32. What follows here is the original statement of the step, with its
   open obligations. `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
   mapping); process-kill tests. Before any caller acts on `order_by_client_id` or `replace_protection`, this step must:
   persist each attempt durably before its request is sent and each rejection when observed, reload them on startup, treat
@@ -1127,7 +1136,8 @@ Budget model for multi-venue:
   process from the signal, through the start, the main loop and teardown, with a hard exit at 27 s; an unpermitted mutation is latched
   under the gate's mutex; a venue that can trade does not start without an epoch; the `/panic` capacity test closes a real leg; an API
   operation runs in its own task, so a client's disconnect no longer cancels it; the stop's stated guarantees are narrowed to what holds.
-  No risk number changed.
+  Codex round 2: S1 and S2 APPROVE; S3 REQUEST_CHANGES (1 P1, 1 P2, 1 P3). Since then the hard bound does not wait on logging or stdio,
+  signals are handled from the start of `main`, and a marker write that timed out or failed is called unconfirmed. No risk number changed.
 - v13 (2026-11-09): §8 and the failure modes aligned with step 7 PR C as implemented against design note v8: typed cancel classification,
   uncertainty journaled and not fencing until the fence PR. No risk number changed.
 - v12 (2026-11-08): §2's finality paragraph, §8 and the failure modes aligned with step 7 PR J as implemented in three stacked PRs,

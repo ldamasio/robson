@@ -46,6 +46,8 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 async-stream = "0.3"
 prometheus = { workspace = true }
+# `_exit` and one non-blocking write for the stop's hard bound (ADR-0056 step 7).
+libc = "0.2"
 
 [dev-dependencies]
 proptest = "1"

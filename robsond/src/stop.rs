@@ -11,20 +11,27 @@
 //! 2. **Closing.** Every new operation is refused, and the main loop, the
 //!    workers, the detectors and the API listener are cancelled. The operations
 //!    already holding a permit finish, then the journal is flushed.
-//! 3. **Marker.** Only a clean pass marks the epoch: every permit released in
+//! 3. **Marker.** Only a clean pass writes the marker: every permit released in
 //!    time, none aborted, the journal holding nothing unlanded and its latch
-//!    clear. A deadline, an abort or a latch leaves the epoch unmarked, and the
-//!    next start sees an unclean predecessor.
+//!    clear. A stop that fails a check writes none, and the next start sees an
+//!    unclean predecessor. A marker write that times out or fails is
+//!    unconfirmed: its update may have committed. A marker records those
+//!    conditions only; it stands even if teardown work that holds no permit
+//!    later keeps the process to its hard bound.
 //!
 //! The daemon stops waiting for anything once the stop has its result, and the
 //! runtime's teardown gets what is left of the deadline. Signals are received
-//! on a thread of their own, outside the daemon's runtime, which then waits out
-//! [`HARD_EXIT`]: should the process still be alive then, it exits it with
-//! [`HARD_EXIT_CODE`], writing no marker.
+//! on a thread of their own, outside the daemon's runtime, from the start of
+//! `main`. On a signal that thread first arms the hard bound, a thread that
+//! exits the process with [`HARD_EXIT_CODE`] at [`HARD_EXIT`] after it. Neither
+//! logs, writes to stdio or takes an application lock before the exit is
+//! armed, and the exit itself cannot wait on a log: a blocked log pipe holds
+//! the stop, never the bound.
 //!
 //! The stop never takes the manager lock and never awaits under a sync lock.
 
 use std::{
+    os::fd::RawFd,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -33,7 +40,7 @@ use async_trait::async_trait;
 use robson_exec::order_journal::OrderJournal;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Longest Draining.
 pub const DRAIN_LIMIT: Duration = Duration::from_secs(12);
@@ -65,19 +72,26 @@ impl Default for StopTimings {
     }
 }
 
-/// A request to stop, and when it was first made: the stop's clock starts
-/// there, not when the stop gets to run.
+/// A request to stop, when it was first made and by what: the stop's clock
+/// starts there, not when the stop gets to run.
 #[derive(Debug, Clone, Default)]
 pub struct StopRequest {
     token: CancellationToken,
     asked_at: Arc<OnceLock<Instant>>,
+    cause: Arc<OnceLock<&'static str>>,
 }
 
 impl StopRequest {
+    /// Ask for the stop at `at`, for `cause`; a later ask keeps the first.
+    pub fn ask_by(&self, at: Instant, cause: &'static str) {
+        self.asked_at.get_or_init(|| at);
+        self.cause.get_or_init(|| cause);
+        self.token.cancel();
+    }
+
     /// Ask for the stop at `at`; a later ask keeps the first time.
     pub fn ask_at(&self, at: Instant) {
-        self.asked_at.get_or_init(|| at);
-        self.token.cancel();
+        self.ask_by(at, "request");
     }
 
     /// Ask for the stop now.
@@ -89,6 +103,11 @@ impl StopRequest {
         self.token.is_cancelled()
     }
 
+    /// What asked for the stop: a signal's name, or `request`.
+    pub fn cause(&self) -> &'static str {
+        self.cause.get().copied().unwrap_or("request")
+    }
+
     /// Wait for the stop to be asked for. When it was.
     pub async fn asked(&self) -> Instant {
         self.token.cancelled().await;
@@ -96,16 +115,115 @@ impl StopRequest {
     }
 }
 
+/// Ask `stop` for the stop on the first SIGTERM or SIGINT, its clock started at
+/// that signal, and arm the process's hard bound there (ADR-0056 step 7).
+///
+/// Signals are received on a thread of their own, with its own small runtime:
+/// a worker of the daemon's runtime stalled in synchronous code can leave that
+/// runtime's I/O and timers unattended, and neither the stop nor the hard bound
+/// may wait on it. Asking for the stop from this thread wakes the daemon's
+/// runtime. `main` calls this first, before the database connection, so a
+/// signal during the start is not lost either. Both handlers are installed
+/// before this returns; it blocks only for that. Without a signal the thread
+/// ends when `stop` is asked for otherwise or the returned guard is dropped.
+///
+/// # Errors
+/// The thread, its runtime or a handler could not be set up.
+pub fn listen_for_signals(stop: &StopRequest) -> Result<StopSignals, String> {
+    let quit = CancellationToken::new();
+    let (installed, installing) = std::sync::mpsc::sync_channel(1);
+    let (stop, quitting) = (stop.clone(), quit.clone());
+    std::thread::Builder::new()
+        .name("robsond-stop-signal".to_string())
+        .spawn(move || watch_signals(stop, quitting, installed))
+        .map_err(|error| format!("the signal thread did not start: {error}"))?;
+    match installing.recv() {
+        Ok(Ok(())) => Ok(StopSignals { quit }),
+        Ok(Err(error)) => Err(format!("the stop signal handlers were not installed: {error}")),
+        Err(_) => Err("the signal thread ended at its start".to_string()),
+    }
+}
+
+/// Ends the signal thread when dropped, unless a signal came first.
+#[derive(Debug)]
+pub struct StopSignals {
+    quit: CancellationToken,
+}
+
+impl Drop for StopSignals {
+    fn drop(&mut self) {
+        self.quit.cancel();
+    }
+}
+
+/// The signal thread: installs both handlers on its own runtime, says so
+/// through `installed`, then waits for a signal, the stop asked for otherwise,
+/// or `quit`. On a signal it arms the hard bound before anything else, and it
+/// never logs: a blocked log must not hold it.
+fn watch_signals(
+    stop: StopRequest,
+    quit: CancellationToken,
+    installed: std::sync::mpsc::SyncSender<Result<(), String>>,
+) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_io().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = installed.send(Err(error.to_string()));
+            return;
+        },
+    };
+    let asked = stop.clone();
+    let received = runtime.block_on(async move {
+        let handlers = signal(SignalKind::terminate())
+            .and_then(|terminate| Ok((terminate, signal(SignalKind::interrupt())?)));
+        let (mut terminate, mut interrupt) = match handlers {
+            Ok(handlers) => handlers,
+            Err(error) => {
+                let _ = installed.send(Err(error.to_string()));
+                return None;
+            },
+        };
+        let _ = installed.send(Ok(()));
+        tokio::select! {
+            _ = terminate.recv() => Some("SIGTERM"),
+            _ = interrupt.recv() => Some("SIGINT"),
+            _ = asked.asked() => None,
+            _ = quit.cancelled() => None,
+        }
+    });
+    let Some(received) = received else {
+        return;
+    };
+    let at = std::time::Instant::now();
+    let armed = arm_hard_exit(at);
+    signal_received(at);
+    // The daemon's runtime logs the request when it takes it up.
+    stop.ask_by(Instant::from_std(at), received);
+    if !armed {
+        wait_then_exit(at);
+    }
+}
+
 /// A stop signal received at `at`: from here, the runtime's teardown gets what
 /// is left of the deadline.
-pub fn signal_received(at: std::time::Instant) {
+fn signal_received(at: std::time::Instant) {
     let _ = SIGNALLED_AT.set(at);
 }
 
-/// Wait out the hard bound of a stop signal received at `at` on the calling
-/// thread, then exit the process, unclean, unless it has exited by then. Call
-/// it on a thread of its own: nothing the async runtime does can hold it back.
-pub fn hard_exit_after(at: std::time::Instant) -> ! {
+/// Start the thread that exits the process at `at` + [`HARD_EXIT`]. Whether it
+/// started.
+fn arm_hard_exit(at: std::time::Instant) -> bool {
+    std::thread::Builder::new()
+        .name("robsond-hard-exit".to_string())
+        .spawn(move || wait_then_exit(at))
+        .is_ok()
+}
+
+/// Sleep until `at` + [`HARD_EXIT`], then exit, unless the process has exited
+/// by then.
+fn wait_then_exit(at: std::time::Instant) -> ! {
     let exit_at = at + HARD_EXIT;
     loop {
         let now = std::time::Instant::now();
@@ -114,13 +232,37 @@ pub fn hard_exit_after(at: std::time::Instant) -> ! {
         }
         std::thread::sleep(exit_at - now);
     }
-    error!(
-        after_ms = HARD_EXIT.as_millis(),
-        code = HARD_EXIT_CODE,
-        "Stop: hard bound reached with the process still running; exiting unclean, epoch left \
-         unmarked"
-    );
-    std::process::exit(HARD_EXIT_CODE)
+    hard_exit()
+}
+
+/// What the hard bound says on its way out, if stderr can take it at once.
+const HARD_EXIT_NOTICE: &[u8] = b"robsond: stop hard bound reached 27 s after the signal; exiting \
+    with code 70, writing no marker (one a clean stop wrote earlier stands)\n";
+
+/// Exit with [`HARD_EXIT_CODE`] now. Nothing here can wait: the notice is one
+/// write that cannot block, and `_exit` runs no atexit handler and flushes no
+/// stdio buffer, so neither a stdio lock held by a blocked log writer nor a
+/// full pipe can hold the exit, as `std::process::exit` could through its
+/// stdout flush.
+fn hard_exit() -> ! {
+    write_without_blocking(2, HARD_EXIT_NOTICE);
+    // SAFETY: `_exit` takes only the exit code and does not return.
+    unsafe { libc::_exit(HARD_EXIT_CODE) }
+}
+
+/// One write of `message` to `fd` that cannot block: the descriptor is made
+/// non-blocking first, and what does not fit is dropped. Only for the moment
+/// before the process exits: the flag stays on the shared description.
+fn write_without_blocking(fd: RawFd, message: &[u8]) {
+    // SAFETY: `fcntl` and `write` read only their integer arguments and
+    // `message`, which outlives the call; every failure is ignored.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        libc::write(fd, message.as_ptr().cast(), message.len());
+    }
 }
 
 /// How long the runtime's teardown may take: what is left of the stop's
@@ -161,10 +303,21 @@ impl StopResult {
     }
 }
 
+/// What became of the marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerWrite {
+    /// A check failed first, or there is no epoch to mark: none was written.
+    NotAttempted,
+    Written,
+    /// The write timed out or failed: its update may still have committed.
+    Unconfirmed,
+}
+
 /// What a stop did and how long each phase took.
 #[derive(Debug, Clone, Copy)]
 pub struct StopReport {
     pub result: StopResult,
+    pub marker: MarkerWrite,
     /// From the request to the end of Draining.
     pub draining: Duration,
     /// From the end of Draining to the result.
@@ -189,19 +342,28 @@ pub async fn stop_when_asked(
     timings: StopTimings,
 ) -> StopReport {
     let asked_at = stop.asked().await;
-    info!(waited_ms = asked_at.elapsed().as_millis(), "Stop requested: draining");
+    info!(
+        cause = stop.cause(),
+        waited_ms = asked_at.elapsed().as_millis(),
+        "Stop requested: draining"
+    );
     let report = run_stop(&journal, asked_at, close, marker.as_deref(), timings).await;
     crate::metrics::GRACEFUL_STOP.with_label_values(&[report.result.label()]).inc();
     crate::metrics::observe_order_journal(&journal);
     let (draining_ms, closing_ms) = (report.draining.as_millis(), report.closing.as_millis());
-    match report.result {
-        StopResult::Clean => info!(draining_ms, closing_ms, "Stop: clean, epoch marked"),
-        result => warn!(
+    let result = report.result.label();
+    match (report.result, report.marker) {
+        (StopResult::Clean, MarkerWrite::Written) => {
+            info!(draining_ms, closing_ms, "Stop: clean, epoch marked");
+        },
+        (StopResult::Clean, _) => info!(draining_ms, closing_ms, "Stop: clean, no epoch to mark"),
+        (_, MarkerWrite::Unconfirmed) => warn!(
             draining_ms,
             closing_ms,
-            result = result.label(),
-            "Stop: not clean, epoch left unmarked"
+            result,
+            "Stop: not clean, the marker write is unconfirmed and may have committed"
         ),
+        _ => warn!(draining_ms, closing_ms, result, "Stop: not clean, no marker written"),
     }
     report
 }
@@ -224,9 +386,10 @@ pub async fn run_stop(
     gate.begin_closing();
     info!(draining_ms = draining.as_millis(), "Stop: closing");
     close();
-    let result = closing(journal, marker, deadline).await;
+    let (result, marker) = closing(journal, marker, deadline).await;
     StopReport {
         result,
+        marker,
         draining,
         closing: asked_at.elapsed().saturating_sub(draining),
         deadline,
@@ -237,46 +400,47 @@ async fn closing(
     journal: &OrderJournal,
     marker: Option<&dyn StopMarker>,
     deadline: Instant,
-) -> StopResult {
+) -> (StopResult, MarkerWrite) {
+    let unmarked = |result| (result, MarkerWrite::NotAttempted);
     if !journal.gate().wait_no_permits(deadline).await {
-        return StopResult::Deadline;
+        return unmarked(StopResult::Deadline);
     }
     // The final flush: every pass is bounded, and a database that takes
     // nothing is retried until the deadline.
     while journal.retry_set_depth() > 0 {
         match tokio::time::timeout_at(deadline, journal.flush_pending()).await {
-            Err(_) => return StopResult::Deadline,
+            Err(_) => return unmarked(StopResult::Deadline),
             Ok(0) => {
                 tokio::time::sleep_until((Instant::now() + FLUSH_RETRY_PAUSE).min(deadline)).await;
                 if Instant::now() >= deadline {
-                    return StopResult::Deadline;
+                    return unmarked(StopResult::Deadline);
                 }
             },
             Ok(_) => {},
         }
     }
     if journal.gate().snapshot().aborted > 0 {
-        return StopResult::Aborted;
+        return unmarked(StopResult::Aborted);
     }
     if journal.latch_set() {
-        return StopResult::Latched;
+        return unmarked(StopResult::Latched);
     }
     if !journal.is_quiescent() {
-        return StopResult::Unlanded;
+        return unmarked(StopResult::Unlanded);
     }
     let Some(marker) = marker else {
-        return StopResult::Clean;
+        return unmarked(StopResult::Clean);
     };
     robson_exec::crash_point!(STOP_BEFORE_MARKER);
     let marked = match tokio::time::timeout_at(deadline, marker.mark_clean()).await {
         // The update may still commit, or have committed with its answer
         // lost: every check above passed, so the marker it leaves is true.
-        Err(_) => StopResult::Deadline,
+        Err(_) => (StopResult::Deadline, MarkerWrite::Unconfirmed),
         Ok(Err(error)) => {
-            warn!(%error, "Stop: the clean-stop marker was not written");
-            StopResult::MarkerFailed
+            warn!(%error, "Stop: the clean-stop marker write failed; unconfirmed");
+            (StopResult::MarkerFailed, MarkerWrite::Unconfirmed)
         },
-        Ok(Ok(())) => StopResult::Clean,
+        Ok(Ok(())) => (StopResult::Clean, MarkerWrite::Written),
     };
     robson_exec::crash_point!(STOP_AFTER_MARKER);
     marked
@@ -346,7 +510,7 @@ mod tests {
             StopTimings::default(),
         )
         .await;
-        assert_eq!(report.result, StopResult::Clean);
+        assert_eq!((report.result, report.marker), (StopResult::Clean, MarkerWrite::Written));
         assert_eq!((report.draining, report.closing), (Duration::ZERO, Duration::ZERO));
         assert_eq!(marker.marked.load(Ordering::SeqCst), 1);
         assert!(closed.load(Ordering::SeqCst));
@@ -432,7 +596,10 @@ mod tests {
         let started = Instant::now();
         let report =
             run_stop(&journal, Instant::now(), || {}, Some(&marker), StopTimings::default()).await;
-        assert_eq!(report.result, StopResult::Deadline);
+        assert_eq!(
+            (report.result, report.marker),
+            (StopResult::Deadline, MarkerWrite::NotAttempted)
+        );
         assert_eq!((report.draining, report.closing), (DRAIN_LIMIT, STOP_DEADLINE - DRAIN_LIMIT));
         assert_eq!(started.elapsed(), STOP_DEADLINE);
         assert_eq!(marker.marked.load(Ordering::SeqCst), 0);
@@ -538,20 +705,27 @@ mod tests {
         drop(operation);
     }
 
-    /// A marker the database refuses, or never answers, is not a clean stop.
+    /// A marker the database refuses, or never answers, is not a clean stop,
+    /// and its write is unconfirmed: the update may have committed.
     #[tokio::test(start_paused = true)]
     async fn a_marker_that_fails_or_hangs_is_not_a_clean_stop() {
         let (_backend, journal) = stub_journal();
         let failing = Marker { fails: true, ..Marker::default() };
         let report =
             run_stop(&journal, Instant::now(), || {}, Some(&failing), StopTimings::default()).await;
-        assert_eq!(report.result, StopResult::MarkerFailed);
+        assert_eq!(
+            (report.result, report.marker),
+            (StopResult::MarkerFailed, MarkerWrite::Unconfirmed)
+        );
 
         let (_backend, journal) = stub_journal();
         let hanging = Marker { hangs: true, ..Marker::default() };
         let report =
             run_stop(&journal, Instant::now(), || {}, Some(&hanging), StopTimings::default()).await;
-        assert_eq!(report.result, StopResult::Deadline);
+        assert_eq!(
+            (report.result, report.marker),
+            (StopResult::Deadline, MarkerWrite::Unconfirmed)
+        );
         assert_eq!(report.draining + report.closing, STOP_DEADLINE);
     }
 
@@ -582,6 +756,34 @@ mod tests {
         assert_eq!(report.deadline, asked_at + STOP_DEADLINE);
         assert_eq!(running.elapsed(), STOP_DEADLINE - secs(10));
         assert_eq!((report.draining, report.closing), (DRAIN_LIMIT, STOP_DEADLINE - DRAIN_LIMIT));
+    }
+
+    /// The hard bound's notice cannot hold the exit: on a full pipe whose
+    /// descriptor blocks, the write returns at once and drops the notice.
+    #[test]
+    fn the_hard_bound_notice_never_blocks_on_a_full_pipe() {
+        use std::{io::Write, os::fd::AsRawFd};
+
+        let (_reader, mut writer) = std::io::pipe().unwrap();
+        let fd = writer.as_raw_fd();
+        // SAFETY: `fcntl` on a descriptor this test owns.
+        let set_flags = |flags: libc::c_int| unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+        // SAFETY: as above.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        set_flags(flags | libc::O_NONBLOCK);
+        while writer.write(&[0; 4096]).is_ok() {}
+        while writer.write(&[0]).is_ok() {}
+        set_flags(flags & !libc::O_NONBLOCK);
+
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            write_without_blocking(fd, HARD_EXIT_NOTICE);
+            let _ = done.send(writer);
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the notice blocked on the full pipe"
+        );
     }
 
     /// Without a signal, teardown gets one whole deadline.
