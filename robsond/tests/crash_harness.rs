@@ -1174,7 +1174,6 @@ async fn a_stuck_operation_holds_the_process_no_longer_than_the_deadline(pool: P
         let log = plain(daemon.log());
         assert!(log.contains("Stop: not clean, no marker written"), "{}", daemon.log_tail());
         assert!(log.contains("deadline"), "{}", daemon.log_tail());
-        assert!(!log.contains("hard bound reached"), "{}", daemon.log_tail());
         assert_eq!(harness.epochs().await, [(false, None)]);
         assert!(arm.await.unwrap().is_err(), "the stalled arm never answered");
     })
@@ -1184,8 +1183,8 @@ async fn a_stuck_operation_holds_the_process_no_longer_than_the_deadline(pool: P
 /// The hard bound. The startup's own thread stalls for good, the startup
 /// permit held, so nothing the async runtime does can end the process. On
 /// SIGTERM the stop ends unclean at its deadline, and the thread started at
-/// the signal exits the process at the hard bound, non-zero, with an error.
-/// No marker.
+/// the signal exits the process at the hard bound with code 70, its only
+/// record. No marker.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn a_process_that_cannot_finish_is_ended_by_the_hard_bound(pool: PgPool) {
@@ -1210,7 +1209,6 @@ async fn a_process_that_cannot_finish_is_ended_by_the_hard_bound(pool: PgPool) {
         );
         let log = plain(daemon.log());
         assert!(log.contains("Stop: not clean, no marker written"), "{}", daemon.log_tail());
-        assert!(log.contains("hard bound reached"), "{}", daemon.log_tail());
         assert!(!daemon.watchdog_fired());
         assert_eq!(harness.epochs().await, [(false, None)]);
     })

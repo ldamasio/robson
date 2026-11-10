@@ -1,9 +1,9 @@
 //! The two-phase stop (ADR-0056 step 7, PR S).
 //!
-//! SIGTERM or SIGINT starts it. Its clock starts at the signal: the stop ends
-//! by [`STOP_DEADLINE`] after it, and the process exits by [`HARD_EXIT`] after
-//! it whatever is still running, inside the 30 s Kubernetes gives the pod
-//! before SIGKILL.
+//! SIGTERM or SIGINT starts it. Its clock starts at the signal: the stop works
+//! to end by [`STOP_DEADLINE`] after it, and the process exits by
+//! [`HARD_EXIT`] after it whatever is still running, the stop included, inside
+//! the 30 s Kubernetes gives the pod before SIGKILL.
 //!
 //! 1. **Draining.** The ordinary API class is refused; ticks, heals, exits,
 //!    sweeps, internal loops and protective API operations continue. It ends at
@@ -24,14 +24,14 @@
 //! on a thread of their own, outside the daemon's runtime, from the start of
 //! `main`. On a signal that thread first arms the hard bound, a thread that
 //! exits the process with [`HARD_EXIT_CODE`] at [`HARD_EXIT`] after it. Neither
-//! logs, writes to stdio or takes an application lock before the exit is
-//! armed, and the exit itself cannot wait on a log: a blocked log pipe holds
-//! the stop, never the bound.
+//! logs, writes to stdio or takes an application lock, and the exit writes
+//! nothing: a blocked log holds the stop, never the bound. [`STOP_DEADLINE`]
+//! is the stop's own, cooperative deadline; a stop that is itself blocked
+//! reports nothing by then, and only the bound ends the process.
 //!
 //! The stop never takes the manager lock and never awaits under a sync lock.
 
 use std::{
-    os::fd::RawFd,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -200,10 +200,23 @@ fn watch_signals(
     let armed = arm_hard_exit(at);
     signal_received(at);
     // The daemon's runtime logs the request when it takes it up.
-    stop.ask_by(Instant::from_std(at), received);
-    if !armed {
-        wait_then_exit(at);
+    if armed {
+        stop.ask_by(Instant::from_std(at), received);
+        return;
     }
+    // No thread for the bound: this one is it, its time fixed at the signal.
+    // The request goes to a thread of its own when one starts. Otherwise it is
+    // made here first: that takes only the token's and the runtime's internal
+    // locks, each held for a push or a wake and never across I/O or a log, so
+    // a blocked log cannot hold it.
+    let asking = stop.clone();
+    let handed = std::thread::Builder::new()
+        .name("robsond-stop-ask".to_string())
+        .spawn(move || asking.ask_by(Instant::from_std(at), received));
+    if handed.is_err() {
+        stop.ask_by(Instant::from_std(at), received);
+    }
+    wait_then_exit(at)
 }
 
 /// A stop signal received at `at`: from here, the runtime's teardown gets what
@@ -235,34 +248,13 @@ fn wait_then_exit(at: std::time::Instant) -> ! {
     hard_exit()
 }
 
-/// What the hard bound says on its way out, if stderr can take it at once.
-const HARD_EXIT_NOTICE: &[u8] = b"robsond: stop hard bound reached 27 s after the signal; exiting \
-    with code 70, writing no marker (one a clean stop wrote earlier stands)\n";
-
-/// Exit with [`HARD_EXIT_CODE`] now. Nothing here can wait: the notice is one
-/// write that cannot block, and `_exit` runs no atexit handler and flushes no
-/// stdio buffer, so neither a stdio lock held by a blocked log writer nor a
-/// full pipe can hold the exit, as `std::process::exit` could through its
-/// stdout flush.
+/// Exit with [`HARD_EXIT_CODE`] now, and nothing else: no log, no notice, no
+/// stdio. `_exit` skips all exit-time cleanup, stdio flushes and atexit
+/// handlers alike, so nothing a stalled log or file holds can delay it. The
+/// exit code, 70, is the only record the hard bound leaves.
 fn hard_exit() -> ! {
-    write_without_blocking(2, HARD_EXIT_NOTICE);
     // SAFETY: `_exit` takes only the exit code and does not return.
     unsafe { libc::_exit(HARD_EXIT_CODE) }
-}
-
-/// One write of `message` to `fd` that cannot block: the descriptor is made
-/// non-blocking first, and what does not fit is dropped. Only for the moment
-/// before the process exits: the flag stays on the shared description.
-fn write_without_blocking(fd: RawFd, message: &[u8]) {
-    // SAFETY: `fcntl` and `write` read only their integer arguments and
-    // `message`, which outlives the call; every failure is ignored.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-        libc::write(fd, message.as_ptr().cast(), message.len());
-    }
 }
 
 /// How long the runtime's teardown may take: what is left of the stop's
@@ -402,7 +394,10 @@ async fn closing(
     deadline: Instant,
 ) -> (StopResult, MarkerWrite) {
     let unmarked = |result| (result, MarkerWrite::NotAttempted);
-    if !journal.gate().wait_no_permits(deadline).await {
+    // A wait that ended after the deadline is the deadline, whatever it saw,
+    // as when this task was held past it while the last permit went: nothing
+    // more is started.
+    if !journal.gate().wait_no_permits(deadline).await || Instant::now() >= deadline {
         return unmarked(StopResult::Deadline);
     }
     // The final flush: every pass is bounded, and a database that takes
@@ -427,6 +422,12 @@ async fn closing(
     }
     if !journal.is_quiescent() {
         return unmarked(StopResult::Unlanded);
+    }
+    // Nor after a flush that landed at the deadline: Tokio's timeout polls its
+    // future before its timer, so an expired one would not keep the marker's
+    // update from starting.
+    if Instant::now() >= deadline {
+        return unmarked(StopResult::Deadline);
     }
     let Some(marker) = marker else {
         return unmarked(StopResult::Clean);
@@ -705,6 +706,51 @@ mod tests {
         drop(operation);
     }
 
+    /// A stop that gets past its waits only after the deadline, as when its
+    /// own task was held by a blocked log while the last permit went, starts
+    /// nothing more: no flush, no marker.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_past_its_deadline_starts_neither_the_flush_nor_the_marker() {
+        let (backend, journal) = stub_journal();
+        unlanded_result(&backend, &journal).await;
+        backend.set_fail_all(None);
+        let asked_at = Instant::now();
+        tokio::time::advance(STOP_DEADLINE + secs(1)).await;
+
+        let marker = Marker::default();
+        let report =
+            run_stop(&journal, asked_at, || {}, Some(&marker), StopTimings::default()).await;
+        assert_eq!(
+            (report.result, report.marker),
+            (StopResult::Deadline, MarkerWrite::NotAttempted)
+        );
+        assert_eq!(marker.marked.load(Ordering::SeqCst), 0, "no marker started");
+        assert_eq!(journal.retry_set_depth(), 1, "no flush started");
+    }
+
+    /// A flush that lands right at the deadline leaves no time for the marker,
+    /// which is not started after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_landing_at_the_deadline_is_not_followed_by_the_marker() {
+        let (backend, journal) = stub_journal();
+        unlanded_result(&backend, &journal).await;
+        backend.set_fail_all(None);
+        backend.set_commit_delay(Duration::from_millis(20));
+        let timings = StopTimings {
+            drain_limit: Duration::ZERO,
+            deadline: Duration::from_millis(20),
+        };
+
+        let marker = Marker::default();
+        let report = run_stop(&journal, Instant::now(), || {}, Some(&marker), timings).await;
+        assert_eq!(journal.retry_set_depth(), 0, "the flush landed, at the deadline");
+        assert_eq!(
+            (report.result, report.marker),
+            (StopResult::Deadline, MarkerWrite::NotAttempted)
+        );
+        assert_eq!(marker.marked.load(Ordering::SeqCst), 0, "no marker started");
+    }
+
     /// A marker the database refuses, or never answers, is not a clean stop,
     /// and its write is unconfirmed: the update may have committed.
     #[tokio::test(start_paused = true)]
@@ -756,34 +802,6 @@ mod tests {
         assert_eq!(report.deadline, asked_at + STOP_DEADLINE);
         assert_eq!(running.elapsed(), STOP_DEADLINE - secs(10));
         assert_eq!((report.draining, report.closing), (DRAIN_LIMIT, STOP_DEADLINE - DRAIN_LIMIT));
-    }
-
-    /// The hard bound's notice cannot hold the exit: on a full pipe whose
-    /// descriptor blocks, the write returns at once and drops the notice.
-    #[test]
-    fn the_hard_bound_notice_never_blocks_on_a_full_pipe() {
-        use std::{io::Write, os::fd::AsRawFd};
-
-        let (_reader, mut writer) = std::io::pipe().unwrap();
-        let fd = writer.as_raw_fd();
-        // SAFETY: `fcntl` on a descriptor this test owns.
-        let set_flags = |flags: libc::c_int| unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-        // SAFETY: as above.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        set_flags(flags | libc::O_NONBLOCK);
-        while writer.write(&[0; 4096]).is_ok() {}
-        while writer.write(&[0]).is_ok() {}
-        set_flags(flags & !libc::O_NONBLOCK);
-
-        let (done, finished) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            write_without_blocking(fd, HARD_EXIT_NOTICE);
-            let _ = done.send(writer);
-        });
-        assert!(
-            finished.recv_timeout(Duration::from_secs(5)).is_ok(),
-            "the notice blocked on the full pipe"
-        );
     }
 
     /// Without a signal, teardown gets one whole deadline.
