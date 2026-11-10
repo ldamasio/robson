@@ -1,0 +1,883 @@
+//! ADR-0056 step 7, PR P: results never dropped, per-stream serialization,
+//! suspension, and admissions closed on the latch.
+//!
+//! The tests with no database suspend a stream by hand, as a failed write
+//! would, and run on a manager with no event log: in a PostgreSQL build the
+//! suspension is checked before anything else, so every later write to the
+//! stream is refused exactly as in production. The `DATABASE_URL` tests make
+//! real writes fail.
+
+use super::*;
+
+/// Suspend `position_id`'s stream the way a failed write does: refused from
+/// here on, recorded through the retry set, latch set.
+#[cfg(feature = "postgres")]
+fn suspend_leg(manager: &PositionManager<StubExchange, MemoryStore>, position_id: PositionId) {
+    let row = manager
+        .event_streams
+        .suspend(&format!("position:{position_id}"), None, "injected")
+        .expect("not suspended yet");
+    manager.executor.order_journal().record_suspension(row);
+}
+
+fn latched(manager: &PositionManager<StubExchange, MemoryStore>) -> bool {
+    manager.executor.order_journal().latch_set()
+}
+
+/// A long of `quantity` at 100 with its live exchange stop at 90.
+#[cfg(feature = "postgres")]
+async fn leg_of(
+    manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+    quantity: Decimal,
+) -> (Position, String) {
+    let (mut position, stop_id) = active_leg_with_live_stop(manager).await;
+    position.quantity = Quantity::new(quantity).unwrap();
+    manager.store.positions().save(&position).await.unwrap();
+    (position, stop_id)
+}
+
+fn is_closed(position: &Position) -> bool {
+    matches!(position.state, PositionState::Closed { .. })
+}
+
+// =============================================================================
+// Admissions close on the latch, and on this month's suspended system stream
+// =============================================================================
+
+/// Every latch source closes admissions until a restart, at each of the three
+/// doors, before anything is written: a governed refusal, and the signal's
+/// detector re-arms under the backoff, as for a residual.
+#[tokio::test]
+async fn the_latch_closes_admissions_at_every_door() {
+    let closed = |result: Option<DaemonError>| {
+        assert!(matches!(result, Some(DaemonError::AdmissionsClosed { .. })), "{result:?}");
+    };
+    let manager = create_test_manager().await;
+    let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+    let entry = Price::new(dec!(100)).unwrap();
+    let stop = Price::new(dec!(98)).unwrap();
+    let arm = || {
+        manager.arm_position(
+            symbol.clone(),
+            Side::Long,
+            create_test_risk_config(),
+            Some(TechnicalStopDistance::from_entry_and_stop(entry, stop)),
+            Uuid::now_v7(),
+        )
+    };
+    let armed = arm().await.unwrap();
+    // A venue mutation with no permit, one of the latch's sources since PR S.
+    manager.executor.order_journal().gate().mutation("POST /order").unwrap();
+    assert!(latched(&manager));
+
+    closed(arm().await.err());
+    closed(manager.approve_query(Uuid::now_v7()).await.err());
+    closed(
+        manager
+            .handle_signal(DetectorSignal {
+                signal_id: Uuid::now_v7(),
+                position_id: armed.id,
+                symbol: symbol.clone(),
+                side: Side::Long,
+                entry_price: entry,
+                stop_loss: stop,
+                technical_stop_analysis: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .err(),
+    );
+    assert_eq!(manager.exchange().market_order_call_count(), 0);
+    assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), Some(&1));
+    let armed = manager.get_position(armed.id).await.unwrap().unwrap();
+    assert!(matches!(armed.state, PositionState::Armed), "{:?}", armed.state);
+    assert!(!armed.carries_admission_evidence(), "refused before any evidence");
+}
+
+/// A suspended system stream of the current month, loaded at start, keeps
+/// admissions closed with the latch clear; a past month's does not.
+#[tokio::test]
+async fn a_suspended_stream_of_this_month_keeps_admissions_closed() {
+    let now = chrono::Utc::now();
+    let last_month = now.with_day(1).unwrap() - chrono::Duration::days(1);
+    for (year, month, closes) in [
+        (now.year(), now.month(), true),
+        (last_month.year(), last_month.month(), false),
+    ] {
+        let manager = create_test_manager().await;
+        manager.event_streams.restore([(
+            format!("system:month_boundary:{year:04}-{month:02}"),
+            crate::event_streams::Suspended {
+                suspension_id: Uuid::now_v7(),
+                stream: crate::event_streams::ManagedStream::Month { year, month },
+                repaired_through_seq: None,
+            },
+        )]);
+        assert!(!latched(&manager));
+
+        let armed = manager
+            .arm_position(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                create_test_risk_config(),
+                None,
+                Uuid::now_v7(),
+            )
+            .await;
+        assert_eq!(
+            matches!(armed, Err(DaemonError::AdmissionsClosed { .. })),
+            closes,
+            "{year}-{month}: {armed:?}"
+        );
+    }
+}
+
+// =============================================================================
+// Results never dropped: reductions on a suspended leg reach the venue
+// =============================================================================
+
+/// The software exit on a suspended leg: cancel and exit reach the venue and
+/// the leg closes in memory, though nothing more of it persists.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_software_exit_on_a_suspended_leg_reaches_the_venue_and_closes_it() {
+    let manager = create_test_manager().await;
+    let (position, stop_id) = active_leg_with_live_stop(&manager).await;
+    suspend_leg(&manager, position.id);
+    manager.exchange().set_price("BTCUSDT", dec!(90));
+    let mut events = manager.event_bus.subscribe();
+
+    stop_crossing_tick(&manager, &position).await.unwrap();
+
+    assert_eq!(manager.exchange().market_order_call_count(), 1);
+    assert!(!manager.exchange().has_stop_order(&stop_id), "the cancel went out");
+    assert!(is_closed(&manager.get_position(position.id).await.unwrap().unwrap()));
+    let mut closed_on_the_bus = false;
+    while let Ok(Some(Ok(event))) =
+        tokio::time::timeout(std::time::Duration::from_millis(20), events.recv()).await
+    {
+        closed_on_the_bus |= matches!(event, DaemonEvent::CorePositionClosed { .. });
+    }
+    assert!(closed_on_the_bus, "what follows the close still ran");
+    assert!(latched(&manager));
+}
+
+/// `handle_exit_fill` keeps a close that did not persist, and MonthlyHalt is
+/// still evaluated on it: here the close exhausts the month's budget.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn an_exit_fill_whose_close_did_not_persist_still_evaluates_the_halt() {
+    let manager = create_test_manager().await;
+    let (position, _) = leg_of(&manager, dec!(50)).await;
+    suspend_leg(&manager, position.id);
+    manager.exchange().set_price("BTCUSDT", dec!(90));
+
+    stop_crossing_tick(&manager, &position).await.unwrap();
+
+    let leg = manager.get_position(position.id).await.unwrap().unwrap();
+    assert!(is_closed(&leg), "{:?}", leg.state);
+    assert!(
+        manager.circuit_breaker.blocks_new_entries().await,
+        "a 500 loss halts a 400 budget"
+    );
+}
+
+/// `panic_close_all` reports a leg it closed as closed although its close did
+/// not persist.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn panic_reports_a_leg_closed_when_its_close_did_not_persist() {
+    let manager = create_test_manager().await;
+    let (position, _) = active_leg_with_live_stop(&manager).await;
+    suspend_leg(&manager, position.id);
+
+    let closed = manager.panic_close_all().await.unwrap();
+
+    assert_eq!(closed, vec![position.id]);
+    assert_eq!(manager.exchange().market_order_call_count(), 1);
+    assert!(is_closed(&manager.get_position(position.id).await.unwrap().unwrap()));
+}
+
+/// `reconcile_close` keeps a close that did not persist, and MonthlyHalt is
+/// still evaluated on it.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_reconciled_close_that_did_not_persist_still_evaluates_the_halt() {
+    let manager = create_test_manager().await;
+    let (position, stop_id) = leg_of(&manager, dec!(50)).await;
+    manager.exchange().set_price("BTCUSDT", dec!(90));
+    let input = stop_fill_of(&manager, &position, &stop_id, dec!(50)).await;
+    suspend_leg(&manager, position.id);
+
+    let outcome = manager.reconcile_close(input).await.unwrap();
+
+    assert!(matches!(outcome, ReconcileCloseOutcome::Closed), "{outcome:?}");
+    assert!(is_closed(&manager.get_position(position.id).await.unwrap().unwrap()));
+    assert!(
+        manager.circuit_breaker.blocks_new_entries().await,
+        "a 500 loss halts a 400 budget"
+    );
+}
+
+/// The trailing replacement of a suspended leg reaches the venue.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_trailing_replacement_on_a_suspended_leg_reaches_the_venue() {
+    let manager = create_test_manager().await;
+    let (position, stop_id) = active_leg_with_live_stop(&manager).await;
+    suspend_leg(&manager, position.id);
+    let placements = manager.exchange().protection_call_count();
+
+    manager
+        .process_market_data(MarketData {
+            venue: test_venue(),
+            symbol: position.symbol.clone(),
+            price: Price::new(dec!(110)).unwrap(),
+            timestamp: chrono::Utc::now(),
+            source: crate::event_bus::MarketDataSource::Ws,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(manager.exchange().protection_call_count(), placements + 1);
+    assert!(!manager.exchange().has_stop_order(&stop_id), "the old stop was replaced");
+    let leg = manager.get_position(position.id).await.unwrap().unwrap();
+    match &leg.state {
+        PositionState::Active { trailing_stop, insurance_stop_id, .. } => {
+            assert_eq!(*trailing_stop, Price::new(dec!(100)).unwrap());
+            assert_ne!(insurance_stop_id.as_deref(), Some(stop_id.as_str()));
+        },
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A due heal of a suspended leg re-places its stop.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_heal_on_a_suspended_leg_places_its_stop() {
+    let manager = create_test_manager().await;
+    let (position, stop_id) = active_leg_with_live_stop(&manager).await;
+    suspend_leg(&manager, position.id);
+    let placements = manager.exchange().protection_call_count();
+
+    // Due now, and run.
+    retry_stop_now(&manager, position.id).await;
+
+    assert_eq!(manager.exchange().protection_call_count(), placements + 1);
+    let leg = manager.get_position(position.id).await.unwrap().unwrap();
+    let healed = leg.insurance_stop_id.expect("the stop is on the leg in memory");
+    assert_ne!(healed, stop_id);
+    assert!(manager.exchange().has_stop_order(&healed));
+}
+
+/// One leg's refused batch never skips the other legs on that tick: the
+/// suspended leg is put first in the tick's order, and the healthy one behind
+/// it still exits.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_suspended_leg_never_starves_the_others_on_its_tick() {
+    for _ in 0..64 {
+        let manager = create_test_manager().await;
+        // Advances its favourable extreme at 90, an event-only batch.
+        let mut suspended =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(80), dec!(1)).await;
+        suspended.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(dec!(80)).unwrap(),
+            Price::new(dec!(60)).unwrap(),
+        ));
+        if let PositionState::Active { trailing_stop, .. } = &mut suspended.state {
+            *trailing_stop = Price::new(dec!(60)).unwrap();
+        }
+        manager.store.positions().save(&suspended).await.unwrap();
+        let (healthy, _) = active_leg_with_live_stop(&manager).await;
+        let order = manager.store.positions().find_active().await.unwrap();
+        if order[0].id != suspended.id {
+            continue;
+        }
+        suspend_leg(&manager, suspended.id);
+        manager.exchange().set_price("BTCUSDT", dec!(90));
+
+        stop_crossing_tick(&manager, &healthy).await.unwrap();
+
+        let events = manager.store.events().find_by_position(suspended.id).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, Event::FavorableExtremeAdvanced { .. })),
+            "the suspended leg's batch ran, and was refused: {events:?}"
+        );
+        assert!(is_closed(&manager.get_position(healthy.id).await.unwrap().unwrap()));
+        return;
+    }
+    panic!("the suspended leg never came first");
+}
+
+/// The exit's own journal result write fails: the leg still closes, the write
+/// waits in the retry set, and that alone sets no latch (PR J's rule; the
+/// entry's counterpart is
+/// `a_failed_journal_result_write_keeps_the_fill_and_places_the_stop`).
+#[tokio::test]
+async fn a_failed_journal_result_write_after_an_exit_keeps_the_close() {
+    use robson_exec::order_journal::JournalFault;
+    let (manager, backend) = journaled_manager().await;
+    let (position, _) = active_leg_with_live_stop(&manager).await;
+    manager.exchange().set_price("BTCUSDT", dec!(90));
+    // The cancel's two writes, the exit's pre-send write, then its result.
+    backend.fail_commit(3, Some(JournalFault::Known));
+
+    stop_crossing_tick(&manager, &position).await.unwrap();
+
+    assert_eq!(manager.exchange().market_order_call_count(), 1);
+    assert!(is_closed(&manager.get_position(position.id).await.unwrap().unwrap()));
+    assert!(manager.executor.order_journal().retry_set_depth() >= 1);
+    assert!(!latched(&manager));
+}
+
+// =============================================================================
+// DATABASE_URL: real writes that fail
+// =============================================================================
+
+/// The rows of `position_id`'s stream, in seq order.
+#[cfg(feature = "postgres")]
+async fn stream_rows(pool: &sqlx::PgPool, position_id: PositionId) -> Vec<(i64, String)> {
+    sqlx::query_as("SELECT seq, event_type FROM event_log WHERE stream_key = $1 ORDER BY seq")
+        .bind(format!("position:{position_id}"))
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// Fails the projection apply of `position_id`'s rows, after they landed:
+/// every update of its `positions_current` row that matches `condition`.
+#[cfg(feature = "postgres")]
+async fn fail_projection_updates(pool: &sqlx::PgPool, position_id: PositionId, condition: &str) {
+    let function = format!(
+        r#"
+        CREATE OR REPLACE FUNCTION injected_projection_failure() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.position_id = '{position_id}' AND {condition} THEN
+                RAISE EXCEPTION 'injected projection failure';
+            END IF;
+            RETURN NEW;
+        END
+        $$
+        "#
+    );
+    sqlx::query(&function).execute(pool).await.unwrap();
+    sqlx::query(
+        "CREATE TRIGGER injected_projection_failure BEFORE UPDATE ON positions_current \
+         FOR EACH ROW EXECUTE FUNCTION injected_projection_failure()",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// The entry filled and its accepted event did not land: the result is kept,
+/// the stop goes on, the stream refuses everything after the failure, and the
+/// latch is set. The backoff still resets: the entry was ticketed.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn an_entry_whose_accepted_event_did_not_land_still_gets_its_stop(pool: sqlx::PgPool) {
+    let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+    let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+    manager.governed_rearm_counts.write().await.insert(armed.id, 4);
+
+    fail_event_log_writes(&pool, "NEW.event_type = 'entry_order_accepted'").await;
+    manager.handle_signal(signal).await.unwrap();
+    restore_event_log_writes(&pool).await;
+
+    assert_eq!(manager.exchange().market_order_call_count(), 1);
+    assert_eq!(manager.exchange().protection_call_count(), 1, "the stop went on");
+    let leg = manager.get_position(armed.id).await.unwrap().unwrap();
+    assert!(matches!(leg.state, PositionState::Active { .. }), "{:?}", leg.state);
+    assert!(leg.insurance_stop_id.is_some());
+    assert!(latched(&manager));
+    assert!(manager.event_streams.position_suspended(armed.id));
+    let types: Vec<String> = stream_rows(&pool, armed.id).await.into_iter().map(|r| r.1).collect();
+    assert_eq!(types.last().map(String::as_str), Some("entry_order_requested"), "{types:?}");
+    assert!(!manager.detectors.read().await.contains_key(&armed.id));
+    assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), None);
+}
+
+/// The accepted event landed and its apply failed: the suspension names that
+/// seq, nothing lands after it, and the stop still goes on.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn an_entry_whose_accepted_event_did_not_apply_still_gets_its_stop(pool: sqlx::PgPool) {
+    use robson_exec::order_journal::{OrderJournal, StubJournalBackend};
+    let backend = Arc::new(StubJournalBackend::default());
+    let journal =
+        Arc::new(OrderJournal::new(backend.clone(), &robson_exec::venue::VenueId::new("test:v")));
+    let manager = audited_postgres_test_manager_with_journal(pool.clone(), 300, Some(journal));
+    let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+
+    fail_projection_updates(&pool, armed.id, "NEW.state = 'entering'").await;
+    manager.handle_signal(signal).await.unwrap();
+
+    assert_eq!(manager.exchange().protection_call_count(), 1, "the stop went on");
+    let rows = stream_rows(&pool, armed.id).await;
+    let (accepted_seq, last) = rows.last().cloned().unwrap();
+    assert_eq!(last, "entry_order_accepted", "{rows:?}");
+    manager.executor.order_journal().flush_pending().await;
+    let recorded = backend.suspensions();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].stream_key, format!("position:{}", armed.id));
+    assert_eq!(
+        (recorded[0].stream_kind, recorded[0].failed_seq),
+        ("position", Some(accepted_seq))
+    );
+    assert!(latched(&manager));
+}
+
+/// An exit's events cannot reach the log at all: the exit still went out, its
+/// result came back, and the latch is set.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn eventlog_failure_during_exit_cycle_keeps_the_result(pool: sqlx::PgPool) {
+    let manager = create_postgres_test_manager(pool.clone());
+    pool.close().await;
+
+    let position_id = Uuid::now_v7();
+    let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+    let quantity = Quantity::new(dec!(0.01)).unwrap();
+    let trigger = Price::new(dec!(94000)).unwrap();
+    let actions = vec![
+        EngineAction::EmitEvent(Event::ExitTriggered {
+            position_id,
+            reason: robson_domain::ExitReason::TrailingStop,
+            trigger_price: trigger,
+            stop_price: trigger,
+            timestamp: chrono::Utc::now(),
+        }),
+        EngineAction::PlaceExitOrder {
+            position_id,
+            cycle_id: Some(Uuid::now_v7()),
+            symbol,
+            side: Side::Long.exit_action(),
+            quantity,
+            reason: robson_domain::ExitReason::TrailingStop,
+        },
+    ];
+
+    let results = manager.execute_and_persist(actions).await.unwrap();
+    assert!(
+        results.iter().any(|r| matches!(r, ActionResult::OrderPlaced {
+            event: Some(Event::ExitOrderPlaced { .. }),
+            ..
+        })),
+        "{results:?}"
+    );
+    assert_eq!(manager.exchange().market_order_call_count(), 1);
+    assert!(manager.event_streams.position_suspended(position_id));
+    assert!(latched(&manager));
+}
+
+/// Two writers on one stream: the first fails slowly while the second waits
+/// on the stream's lock; the second sees the suspension and appends nothing.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_writer_queued_behind_a_failure_sees_the_suspension(pool: sqlx::PgPool) {
+    let manager = create_postgres_test_manager(pool.clone());
+    let position_id = Uuid::now_v7();
+    inject_event_log_fault(
+        &pool,
+        "NEW.event_type = 'exit_triggered'",
+        "PERFORM pg_sleep(0.3); RAISE EXCEPTION 'injected event log failure';",
+    )
+    .await;
+    let event = |reason| Event::ExitTriggered {
+        position_id,
+        reason,
+        trigger_price: Price::new(dec!(94000)).unwrap(),
+        stop_price: Price::new(dec!(94000)).unwrap(),
+        timestamp: chrono::Utc::now(),
+    };
+    let failing = event(robson_domain::ExitReason::TrailingStop);
+    let first = manager.persist_event_to_log(&failing);
+    let second = async {
+        // Queued on the lock while the first is inside its append.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        manager
+            .persist_event_to_log(&Event::InsuranceStopFailed {
+                position_id,
+                stop_price: Price::new(dec!(94000)).unwrap(),
+                error: "second writer".to_string(),
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+    };
+    let (first, second) = tokio::join!(first, second);
+    restore_event_log_writes(&pool).await;
+
+    assert!(matches!(first, Err(DaemonError::EventLog(_))), "{first:?}");
+    assert!(matches!(second, Err(DaemonError::StreamSuspended { .. })), "{second:?}");
+    assert!(stream_rows(&pool, position_id).await.is_empty());
+    assert_eq!(manager.event_streams.lock_entries(), 0, "idle locks are dropped");
+    // Another stream is untouched.
+    let other = Uuid::now_v7();
+    manager
+        .persist_event_to_log(&Event::InsuranceStopFailed {
+            position_id: other,
+            stop_price: Price::new(dec!(94000)).unwrap(),
+            error: "another stream".to_string(),
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(stream_rows(&pool, other).await.len(), 1);
+}
+
+/// A manager of `tenant_id` whose journal is the PostgreSQL one, so its
+/// suspensions land in `stream_suspensions`: one process of that tenant.
+#[cfg(feature = "postgres")]
+fn process_of(
+    pool: &sqlx::PgPool,
+    tenant_id: Uuid,
+) -> Arc<PositionManager<StubExchange, MemoryStore>> {
+    let order_journal = Arc::new(robson_exec::order_journal::OrderJournal::new(
+        Arc::new(crate::order_journal_store::PgJournalBackend::new(pool, tenant_id)),
+        &VenueId::new("test:venue"),
+    ));
+    let store = Arc::new(MemoryStore::new());
+    let executor = Executor::new(
+        Arc::new(StubExchange::new(dec!(95000))),
+        Arc::new(IntentJournal::new()),
+        store.clone(),
+    )
+    .with_order_journal(order_journal);
+    Arc::new(
+        PositionManager::with_approval_policy(
+            Engine::new(RiskConfig::new(dec!(10000)).unwrap()),
+            Arc::new(executor),
+            store,
+            Arc::new(EventBus::new(100)),
+            Arc::new(TracingQueryRecorder),
+            ApprovalPolicy::new(Decimal::from(100u32), 300),
+            TradingPolicy::default(),
+        )
+        .with_event_log(pool.clone(), tenant_id),
+    )
+}
+
+#[cfg(feature = "postgres")]
+fn stop_failed(position_id: PositionId, error: &str) -> Event {
+    Event::InsuranceStopFailed {
+        position_id,
+        stop_price: Price::new(dec!(94000)).unwrap(),
+        error: error.to_string(),
+        timestamp: chrono::Utc::now(),
+    }
+}
+
+/// The suspension lands in `stream_suspensions` through the retry set, the
+/// next start of the same tenant loads it, and the stream refuses appends
+/// there too.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_suspension_is_recorded_and_the_next_start_refuses_the_stream(pool: sqlx::PgPool) {
+    let tenant_id = Uuid::now_v7();
+    let manager = process_of(&pool, tenant_id);
+    let position_id = Uuid::now_v7();
+    fail_event_log_writes(&pool, "NEW.event_type = 'insurance_stop_failed'").await;
+    let failed = manager.persist_event_to_log(&stop_failed(position_id, "first")).await;
+    restore_event_log_writes(&pool).await;
+    assert!(matches!(failed, Err(DaemonError::EventLog(_))), "{failed:?}");
+    assert!(latched(&manager));
+    assert_eq!(manager.executor.order_journal().retry_set_depth(), 1);
+
+    assert_eq!(manager.executor.order_journal().flush_pending().await, 1);
+    let row = sqlx::query_as::<_, (Uuid, String, Option<i64>, bool)>(
+        "SELECT tenant_id, stream_kind, failed_seq, cleared_at IS NULL FROM stream_suspensions \
+         WHERE stream_key = $1",
+    )
+    .bind(format!("position:{position_id}"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row, (tenant_id, "position".to_string(), None, true));
+
+    // The next start of this tenant, and one of another.
+    let next = process_of(&pool, tenant_id);
+    assert_eq!(next.load_stream_suspensions().await.unwrap(), 1);
+    assert!(next.event_streams.position_suspended(position_id));
+    let refused = next.persist_event_to_log(&stop_failed(position_id, "after restart")).await;
+    assert!(matches!(refused, Err(DaemonError::StreamSuspended { .. })), "{refused:?}");
+    assert!(stream_rows(&pool, position_id).await.is_empty());
+    assert!(!latched(&next), "the latch is this process's");
+    assert_eq!(process_of(&pool, Uuid::now_v7()).load_stream_suspensions().await.unwrap(), 0);
+}
+
+/// A pool through a proxy in front of this test's database.
+#[cfg(feature = "postgres")]
+async fn through_proxy(pool: &sqlx::PgPool) -> (robson_testkit::db_proxy::DbProxy, sqlx::PgPool) {
+    let options = pool.connect_options();
+    let upstream = tokio::net::lookup_host((options.get_host(), options.get_port()))
+        .await
+        .unwrap()
+        .next()
+        .unwrap();
+    let proxy = robson_testkit::db_proxy::DbProxy::start(upstream).await.unwrap();
+    let database = options.get_database().expect("sqlx::test names its database");
+    let url = robson_testkit::daemon_process::database_url_through(
+        &std::env::var("DATABASE_URL").unwrap(),
+        proxy.addr(),
+        database,
+    )
+    .unwrap();
+    let proxied = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    (proxy, proxied)
+}
+
+/// A month's recalibration lands in the log and its acknowledgement is lost,
+/// so its apply never runs and the month's stream is suspended. The peak then
+/// advances at runtime. At the next start nothing replays it: the stream stays
+/// suspended, the base and the peak are what they were, and with that month
+/// current admissions stay closed (ADR-0056 step 7, design R6-2).
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_system_stream_suspended_by_a_lost_ack_is_not_replayed_at_the_next_start(
+    pool: sqlx::PgPool,
+) {
+    use robson_testkit::db_proxy::ProxyMode;
+    let tenant_id = Uuid::now_v7();
+    let now = chrono::Utc::now();
+    sqlx::query(
+        "INSERT INTO monthly_state (year, month, capital_base, boundary_reset_at) \
+         VALUES ($1, $2, 1000, NOW())",
+    )
+    .bind(now.year() as i16)
+    .bind(now.month() as i16)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let month = || async {
+        sqlx::query_as::<_, (Decimal, Decimal)>(
+            "SELECT capital_base, month_peak_net FROM monthly_state WHERE year = $1 AND month = $2",
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let stream_key = format!("system:month_boundary:{:04}-{:02}", now.year(), now.month());
+    let rows = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM event_log WHERE stream_key = $1")
+            .bind(&stream_key)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let recalibrated = |new_capital_base| Event::CapitalBaseRecalibrated {
+        previous_capital_base: dec!(1000),
+        new_capital_base,
+        wallet_balance: new_capital_base,
+        carried_risk: Decimal::ZERO,
+        reason: "manual_account_change".to_string(),
+        evidence: "test".to_string(),
+        month: now.month(),
+        year: now.year(),
+        timestamp: chrono::Utc::now(),
+    };
+
+    let (proxy, proxied) = through_proxy(&pool).await;
+    let manager = process_of(&proxied, tenant_id);
+    proxy.set_mode(ProxyMode::DropCommitAckOf("INSERT INTO event_log"));
+    let lost = manager.emit_domain_event(recalibrated(dec!(900))).await;
+    assert!(matches!(lost, Err(DaemonError::EventLog(_))), "{lost:?}");
+    assert_eq!(proxy.stats().commit_acks_dropped, 1);
+    assert_eq!(rows().await, 1, "the recalibration landed");
+    assert_eq!(month().await, (dec!(1000), Decimal::ZERO), "and was never applied");
+    assert!(manager.event_streams.month_suspended(now.year(), now.month()));
+    assert_eq!(manager.executor.order_journal().flush_pending().await, 1);
+    // The runtime peak, written as `refresh_month_peak_net_from_snapshot` does.
+    sqlx::query("UPDATE monthly_state SET month_peak_net = 50 WHERE year = $1 AND month = $2")
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let next = process_of(&pool, tenant_id);
+    assert_eq!(next.load_stream_suspensions().await.unwrap(), 1);
+    let armed = next
+        .arm_position(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+            create_test_risk_config(),
+            None,
+            Uuid::now_v7(),
+        )
+        .await;
+    assert!(matches!(armed, Err(DaemonError::AdmissionsClosed { .. })), "{armed:?}");
+    assert!(!latched(&next));
+    let refused = next.emit_domain_event(recalibrated(dec!(800))).await;
+    assert!(matches!(refused, Err(DaemonError::StreamSuspended { .. })), "{refused:?}");
+    assert_eq!(rows().await, 1);
+    assert_eq!(month().await, (dec!(1000), dec!(50)), "nothing replayed; the peak stands");
+}
+
+/// Design §8, generated interleavings 2: writers on one or two streams, run
+/// concurrently with an injected failure, a failed append or a failed apply.
+/// On each stream nothing is appended after the failed write, every appended
+/// event but a failed apply is applied, and `last_seq` skips none of them.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn generated_writers_never_append_past_a_failure(pool: sqlx::PgPool) {
+    use proptest::{
+        prelude::*,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+
+    let strategy = (
+        1usize..=2,
+        2usize..=6,
+        prop::option::of((0usize..6, any::<bool>())),
+        prop::collection::vec(0u64..4, 6),
+    );
+    let mut runner = TestRunner::deterministic();
+    // What the sampled cases covered, so the property cannot pass vacuously.
+    let (mut append_failures, mut apply_failures, mut refusals) = (0, 0, 0);
+    for case in 0..32 {
+        let (streams, writers, failure, delays) = strategy.new_tree(&mut runner).unwrap().current();
+        let failure = failure.filter(|(writer, _)| *writer < writers);
+        let manager = process_of(&pool, Uuid::now_v7());
+        let legs: Vec<PositionId> = (0..streams).map(|_| Uuid::now_v7()).collect();
+        for leg in &legs {
+            manager
+                .persist_event_to_log(&Event::PositionArmed {
+                    position_id: *leg,
+                    account_id: Uuid::now_v7(),
+                    symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+                    side: Side::Long,
+                    tech_stop_distance: None,
+                    stop_policy: StopPolicy::ExecutableSpan,
+                    stop_buffer_bps_at_arm: None,
+                    timestamp: chrono::Utc::now(),
+                })
+                .await
+                .unwrap();
+        }
+        // The failing write carries `human_confirmation`; no other does.
+        match failure {
+            Some((_, true)) => {
+                fail_event_log_writes(
+                    &pool,
+                    "NEW.payload->>'approval_policy' = 'human_confirmation'",
+                )
+                .await
+            },
+            Some((writer, false)) => {
+                let condition = "NEW.approval_mode = 'human_confirmation'";
+                fail_projection_updates(&pool, legs[writer % streams], condition).await;
+            },
+            None => {},
+        }
+        let base = chrono::Utc::now();
+        let mut tasks = Vec::new();
+        for writer in 0..writers {
+            let manager = Arc::clone(&manager);
+            let leg = legs[writer % streams];
+            let delay = delays[writer];
+            let fails = failure.is_some_and(|(w, _)| w == writer);
+            tasks.push(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                let event = Event::EntryPolicyResolved {
+                    position_id: leg,
+                    entry_policy: EntryPolicy::ConfirmedTrend,
+                    approval_policy: if fails {
+                        robson_domain::ApprovalPolicy::HumanConfirmation
+                    } else {
+                        robson_domain::ApprovalPolicy::Automatic
+                    },
+                    // The event log dedupes on everything but timestamps.
+                    strategy_id: Some(robson_domain::StrategyId {
+                        name: format!("writer-{writer}"),
+                        version: 1,
+                    }),
+                    timestamp: base + chrono::Duration::milliseconds(writer as i64),
+                };
+                (leg, fails, manager.persist_event_to_log(&event).await)
+            }));
+        }
+        let mut outcomes = Vec::new();
+        for task in tasks {
+            outcomes.push(task.await.unwrap());
+        }
+        sqlx::query("DROP TRIGGER IF EXISTS injected_event_log_failure ON event_log")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER IF EXISTS injected_projection_failure ON positions_current")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for leg in &legs {
+            let label = format!("case {case}: {streams} streams, {writers} writers, {failure:?}");
+            let mine: Vec<_> = outcomes.iter().filter(|(l, _, _)| l == leg).collect();
+            let ok = mine.iter().filter(|(_, _, r)| r.is_ok()).count();
+            let failed: Vec<_> = mine
+                .iter()
+                .filter(|(_, _, r)| matches!(r, Err(DaemonError::EventLog(_))))
+                .collect();
+            let refused = mine
+                .iter()
+                .filter(|(_, _, r)| matches!(r, Err(DaemonError::StreamSuspended { .. })))
+                .count();
+            assert_eq!(ok + failed.len() + refused, mine.len(), "{label}");
+            assert!(failed.len() <= 1, "{label}");
+            assert!(
+                failed.iter().all(|(_, fails, _)| *fails),
+                "{label}: only the marked write fails"
+            );
+            assert!(refused == 0 || failed.len() == 1, "{label}: refused only behind a failure");
+            refusals += refused;
+            if failed.len() == 1 {
+                match failure {
+                    Some((_, true)) => append_failures += 1,
+                    _ => apply_failures += 1,
+                }
+            }
+            assert_eq!(
+                manager.event_streams.position_suspended(*leg),
+                failed.len() == 1,
+                "{label}"
+            );
+
+            let rows: Vec<i64> =
+                stream_rows(&pool, *leg).await.into_iter().map(|(seq, _)| seq).skip(1).collect();
+            assert_eq!(rows, (2..2 + rows.len() as i64).collect::<Vec<_>>(), "{label}: contiguous");
+            let apply_failed = failed.len() == 1 && matches!(failure, Some((_, false)));
+            assert_eq!(
+                rows.len(),
+                ok + usize::from(apply_failed),
+                "{label}: nothing after the failure"
+            );
+            let last_seq: i64 =
+                sqlx::query_scalar("SELECT last_seq FROM positions_current WHERE position_id = $1")
+                    .bind(leg)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let applied_through = 1 + ok as i64;
+            assert_eq!(last_seq, applied_through, "{label}: last_seq skips nothing applied");
+        }
+    }
+    assert!(
+        append_failures > 0 && apply_failures > 0 && refusals > 0,
+        "{append_failures} {apply_failures} {refusals}"
+    );
+}

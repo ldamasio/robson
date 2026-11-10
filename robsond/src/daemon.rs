@@ -754,6 +754,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
 
         let journal = Arc::clone(&self.order_journal);
         crate::metrics::init_operation_gate_metrics();
+        crate::metrics::observe_streams_suspended(0, 0);
         journal.gate().set_observer(Arc::new(crate::metrics::GateMetrics));
 
         // Cancelled when the stop enters Closing: the main loop, the workers,
@@ -862,6 +863,18 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     async fn start_up(&self, shutdown: &tokio_util::sync::CancellationToken) -> DaemonResult<()> {
         // 0. Initialize capital from exchange (best-effort)
         self.initialize_capital().await;
+
+        // 0a. The streams earlier processes left suspended (ADR-0056 step 7):
+        // they take no appends, and a suspended system stream of this month
+        // keeps admissions closed.
+        #[cfg(feature = "postgres")]
+        {
+            let manager = self.position_manager.read().await;
+            let loaded = manager.load_stream_suspensions().await?;
+            if loaded > 0 {
+                warn!(loaded, "Event streams suspended by an earlier process");
+            }
+        }
 
         // 1. Rebuild store from event log (crash recovery)
         self.rebuild_store().await?;
@@ -1129,6 +1142,11 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         let start =
             crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION")).await?;
         crate::process_epoch::record_start(&start);
+        self.position_manager
+            .read()
+            .await
+            .event_streams()
+            .set_epoch(start.epoch.epoch_id);
         Ok(Some(Box::new(EpochMarker {
             pool: Arc::clone(pool),
             epoch: start.epoch,

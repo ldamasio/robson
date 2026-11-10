@@ -25,8 +25,8 @@ use proptest::{
 use robson_exec::{
     order_journal::{
         AttemptRow, CommitFailure, IntentKind, IntentRow, IntentSpec, JournalBackend, JournalBatch,
-        JournaledIntent, Operation, OrderJournal, OutcomeRow, SendRefusal, VenueOutcome,
-        WriteClass, DEFAULT_ACCOUNT_SCOPE,
+        JournaledIntent, Operation, OrderJournal, OutcomeRow, SendRefusal, StreamSuspensionRow,
+        VenueOutcome, WriteClass, DEFAULT_ACCOUNT_SCOPE,
     },
     venue::{AttemptEvidence, OrderLookup, SubmitAttemptLedger, VenueFinalityRule, VenueId},
     ExecError, StopCancelOutcome,
@@ -830,6 +830,13 @@ impl JournalBackend for Injecting {
         client_order_id: &str,
     ) -> Result<Vec<bool>, String> {
         self.real.attempt_states(venue_id, account_scope, client_order_id).await
+    }
+
+    async fn record_suspension(
+        &self,
+        suspension: &StreamSuspensionRow,
+    ) -> Result<(), CommitFailure> {
+        self.real.record_suspension(suspension).await
     }
 }
 

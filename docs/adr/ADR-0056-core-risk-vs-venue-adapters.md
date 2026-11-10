@@ -691,7 +691,7 @@ the pod restarts.
 - **Outcome classes are recorded only.** An intent ends as a success, a rejection (every attempt authoritatively refused), not sent,
   or uncertain. **Between this PR and the fence PR, uncertainty is journaled but does not fence, exactly as today:** no incident
   opens, no admission closes, and the latch shows only on its metric. A failed result write never discards a venue result and never
-  prevents protection. Event persistence after a venue result can still abort the flow as before; that is a later PR.
+  prevents protection. Event persistence after a venue result can still abort the flow as before; PR P (below) ends that.
 - **Tickets and the re-arm backoff.** The attempt ledger reports a send ticket just before a request leaves. The backoff reset moved
   from before the executor to after it, on `Ok` and `Err` alike, and only when the entry holds a ticket. An adapter refusing locally
   before the send is therefore a proven no-send too.
@@ -717,7 +717,7 @@ an order's path. After an entry fill, the result write plus the stop's pre-send 
 exit likewise. "Does not wait" above means no later tick or backoff, not zero journal waiting: the fallback adds another bounded pre-send write and
 another outcome write, so up to 2 s of journal waits can pass after the cancel acknowledgement before the fresh request, and 2.5 s in total for a
 replaced retry. These waits sit under existing locks: detector handling and the API's close and panic hold the manager write lock across
-them, so they can delay unrelated protective work. Nothing acts on uncertainty or the latch yet. `applied_at` and `uncertain_generation`
+them, so they can delay unrelated protective work. Nothing acts on uncertainty or the latch yet (from PR P the latch closes admissions). `applied_at` and `uncertain_generation`
 exist but are not written. In J an entry's operation ended before its stop was placed; PR S makes them one operation. Not verified: behaviour on a
 real venue or in the cluster.
 
@@ -913,6 +913,60 @@ enum itself, so a new event with no route fails CI. An older binary returns the 
 this adds no rollback condition. The daemon also refuses to start with a `PROJECTION_STREAM_KEY` beginning with `position:` or
 `system:`: the projection worker applies the stream it polls with no stream lock, beside the position manager's own writer.
 Production uses `robson:daemon`, the default.
+
+*Part 2, results kept, serialization, suspension.*
+
+- **A venue result is never dropped.** `execute_and_persist` keeps the results of a batch that reached the venue when their
+  events fail to persist, so an entry still reaches `handle_entry_fill` and its stop is placed, and an exit still reaches
+  `handle_exit_fill`, so its leg closes in memory and any remainder is untracked and swept as today. The same holds where a close
+  is recorded after a venue fill: `handle_exit_fill`, the panic close and `reconcile_close` keep the close, log it at ERROR and go
+  on, `evaluate_monthly_halt()` included, and `/panic` reports such a leg as closed. The failure itself suspends the stream and
+  sets the latch. Unchanged: the entry's pre-send barriers (`EntrySignalReceived`, `EntryOrderRequested`, and the event of a
+  futures-settings refusal, which sent nothing), and a batch with no venue action, whose failure is still an error. On the tick
+  path such an error fails that leg's query only: the other legs on the tick still trail and exit; startup recovery likewise
+  goes on through such a batch, so a suspended leg's missed stop and the legs after it are still checked. A failed journal result write
+  keeps PR J's rule: the result stands, the write waits in the retry set, and only an overflow sets the latch. No reduction
+  path has a pre-send event write, so a suspension never stops a software exit, a stop placement, a heal, a trailing
+  replacement, `/panic` or a reconciled close from reaching the venue.
+- **Per-stream serialization.** `persist_event_to_log`, the one production writer to `position:{id}` and
+  `system:month_boundary:YYYY-MM`, holds the stream's async lock through the suspension check, the append, the projection apply
+  and, on a failure, marking the stream suspended, so a writer queued behind a failure sees the suspension first. A lock entry
+  lives while it is held or awaited. Lock order: the manager lock, a stream's lock, the gate mutex, the journal's memory mutex;
+  the two stream registries are sync leaves, never held across an await or while another lock is taken.
+- **Suspension.** Any failed append or apply suspends its stream: it refuses every later append in this process
+  (`StreamSuspended`), so its projection lags its log by exactly the suffix that did not apply. Migration 33 adds
+  `stream_suspensions` (stream key, kind, the seq that did not apply, NULL when the append itself failed or its seq is
+  unknown, the month of a system stream, error, epoch; one open row per stream). The row goes through the journal's retry set,
+  which carries suspensions beside intents within its 1,024 entries, and recording it sets the latch. The next start loads the
+  open rows before anything is appended. Like any retry-set entry, a suspension that has not landed when its process ends, the
+  database down or the stop past its final flush, is lost: the next start does not know that stream is suspended and its
+  projection stays behind its log, as before P; the latch kept that stop from marking itself clean. `robsond_streams_suspended{kind}` exports `position` and `system`, at 0 from startup.
+  A position stream that stays suspended invalidates its leg's snapshot through the latent-failure path: while the leg is
+  risk-open, the budget's remaining capacity is zero. Until part 3 nothing repairs a position stream, so after part 2 alone it
+  stays suspended across restarts.
+- **The latch closes admissions until a restart,** whatever set it: a bounded send whose row did not land, discarded history,
+  an `IdSpent` conflict, an aborted operation, a venue mutation without a permit, a suspended stream. It is checked at the three
+  admission sites beside the residual check, before any admission evidence is written (an arm and an approval answer
+  `AdmissionsClosed`, 503; a signal re-arms its detector under the governed backoff, `admissions_closed`), and again at an
+  entry's send in `begin_send`, a typed no-send for an admission already past its check. **Production effect: a journal blip on
+  any bounded send now closes admissions until the pod restarts.** Protection, exits, sweeps and the protective API continue.
+- **A suspended system stream of the current month keeps admissions closed after a restart**, through the same admission checks.
+  This is P's stopgap for the window before the fence PR, which replaces it with the exact accounting-invalid contract and its
+  release. In P there is no release, so admissions stay closed while that month is current, until the fence PR ships. P does not
+  suppress automatic MonthlyHalt on that month and does not mark its month view invalid; both are the fence PR's. Legs open
+  before the restart stay managed. "No suspended system stream" is therefore a deploy check. **It replaces a self-heal:** today a
+  month reset whose write failed is retried by the next boundary poll, within 60 s, and that retry appends a fresh reset (or, if
+  deduplicated, applies the landed one again) and heals the month. From P the stream is suspended, the retry is refused on every
+  poll and the month stays as it was: fail-closed. Accepted, per the design's R6-2: replaying a reset whose apply landed and
+  whose acknowledgement was lost erases a peak recorded since, and a replay guard would have to cover five writers of
+  `monthly_state`, two of them not event-sourced.
+
+**Rollback across PR P is boundary B,** checked with the daemon stopped after a restart of this binary, so that the latch, which
+lives in memory, is clear, **plus no open suspension**: `SELECT COUNT(*) FROM stream_suspensions WHERE cleared_at IS NULL` must be 0.
+An older binary ignores the table and would append to a suspended stream past its gap, leaving an interior gap the projection never
+applies. With part 2 alone nothing clears a suspension, so one suspended stream blocks that rollback until it is resolved by hand. The
+rollback image must keep migrations 31, 32 and 33: SQLx's migrator rejects an applied migration missing from its embedded set, and
+`robsond db migrate` runs in the Sync hook, so pinning back to `sha-217cde03` is refused by that image's hook.
 
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze

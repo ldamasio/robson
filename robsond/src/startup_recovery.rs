@@ -971,6 +971,32 @@ mod tests {
         );
     }
 
+    /// ADR-0056 step 7, PR P: a leg whose stream is suspended refuses the
+    /// replay's event-only batches, here its favourable extreme. The replay
+    /// goes on in memory, and its missed stop still closes it.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn recovery_still_closes_a_suspended_leg_whose_stop_was_crossed() {
+        let position = btcusdt_long_position(Uuid::now_v7());
+        let extreme_at = match position.state {
+            PositionState::Active { extreme_at, .. } => extreme_at,
+            _ => panic!("expected Active state"),
+        };
+        let ohlcv = Arc::new(StubOhlcv::new(crash_candles(extreme_at))) as Arc<dyn OhlcvPort>;
+        let pm = create_manager(ohlcv, dec!(75000)).await;
+        pm.store().positions().save(&position).await.unwrap();
+        assert!(pm
+            .event_streams()
+            .suspend(&format!("position:{}", position.id), None, "injected")
+            .is_some());
+
+        let report = run_startup_recovery(&pm, &pm.ohlcv_port()).await.unwrap();
+
+        assert_eq!(report.positions_closed, 1);
+        let loaded = pm.store().positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Closed { .. }), "{:?}", loaded.state);
+    }
+
     /// If the gap crossed the stop but the live price recovered before
     /// reconciliation, the position must remain Active.
     #[tokio::test]
@@ -1976,7 +2002,21 @@ async fn process_recovery_tick<E: ExchangePort + 'static, S: Store + 'static>(
         return Ok(RecoveryTickOutcome { exit_triggered, closed: false });
     }
 
-    let results = pm.execute_and_persist_recovery(actions).await?;
+    let results = match pm.execute_and_persist_recovery(actions).await {
+        Ok(results) => results,
+        // An event-only batch that did not persist, as on a suspended stream:
+        // applied in memory. The replay goes on, so this leg's exit check and
+        // the legs after it still run (ADR-0056 step 7, PR P).
+        Err(error) if error.is_event_not_persisted() => {
+            error!(
+                position_id = %position.id,
+                %error,
+                "startup-recovery: tick batch did not persist; continuing"
+            );
+            Vec::new()
+        },
+        Err(error) => return Err(error),
+    };
 
     if materialize_exit {
         for result in &results {
