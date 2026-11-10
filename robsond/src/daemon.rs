@@ -1248,11 +1248,17 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 .expect("midnight must be valid"),
             chrono::Utc,
         );
-        // A failed read appends no reset: counting Armed risk as zero would
-        // overstate the basis for the whole month. The next poll retries.
+        let all_open_positions = self.store.positions().find_active().await?;
+        let armed_count = all_open_positions
+            .iter()
+            .filter(|p| matches!(p.state, PositionState::Armed))
+            .count() as u32;
+        // Only the base the previous month's reset recorded. A failed read
+        // appends no reset: counting Armed risk as zero would overstate the
+        // basis for the whole month. The next poll retries.
         let prev_capital = {
             let manager = self.position_manager.read().await;
-            manager.load_capital_base_for_month(prev_month).await
+            manager.recorded_capital_base(prev_month).await
         };
         let prev_capital = prev_capital.inspect_err(|e| {
             error!(
@@ -1263,12 +1269,26 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                  read; no reset appended, retrying at the next poll"
             );
         })?;
-        let all_open_positions = self.store.positions().find_active().await?;
-        let armed_count = all_open_positions
-            .iter()
-            .filter(|p| matches!(p.state, PositionState::Armed))
-            .count() as u32;
-        let armed_risk = prev_capital * Decimal::new(1, 2) * Decimal::from(armed_count);
+        let armed_risk = match prev_capital {
+            Some(prev_capital) => prev_capital * Decimal::new(1, 2) * Decimal::from(armed_count),
+            // Bootstrap: with nothing Armed the previous base reserves nothing.
+            None if armed_count == 0 => Decimal::ZERO,
+            None => {
+                let reason = format!(
+                    "{armed_count} Armed position(s) need the previous month's capital base for \
+                     their reservation, and no reset recorded one; disarm them or record that \
+                     base"
+                );
+                error!(
+                    year = now.year(),
+                    month = now.month(),
+                    armed_count,
+                    "Month boundary reset deferred: {reason}; no reset appended, retrying at the \
+                     next poll"
+                );
+                return Err(DaemonError::MonthBoundaryDeferred { reason });
+            },
+        };
         let carried_risk = carried_risk_committed + armed_risk;
 
         // current_equity per ADR-0024 §6: wallet balance from the exchange.
@@ -3469,9 +3489,20 @@ mod tests {
         assert_eq!(pending.get(), 0.0);
     }
 
+    /// An Armed leg in the in-memory book, to be reserved at the boundary.
+    #[cfg(feature = "postgres")]
+    async fn save_armed(daemon: &Daemon<StubExchange, MemoryStore>) {
+        let mut armed =
+            Position::new(uuid::Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        armed.state = PositionState::Armed;
+        daemon.store.positions().save(&armed).await.unwrap();
+    }
+
     /// The previous month's base cannot be read (a NaN, which no `Decimal`
     /// holds), so Armed risk is unknown: the boundary appends no reset rather
-    /// than count it as zero. Once the row reads, the next poll appends it.
+    /// than count it as zero. Once the row reads, the next poll appends it,
+    /// reserving 1% of that recorded base (9,000), not of the configured
+    /// capital (10,000), for the Armed leg.
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "Requires DATABASE_URL to be set"]
@@ -3492,6 +3523,7 @@ mod tests {
         config.projection.tenant_id = Some(tenant_id);
         let mut daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
         let pending = watch_month_boundary_pending(&mut daemon);
+        save_armed(&daemon).await;
         let boundary = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 1).single().unwrap();
 
         let error = daemon.poll_month_boundary(boundary).await.unwrap_err();
@@ -3511,7 +3543,60 @@ mod tests {
         assert!(daemon.poll_month_boundary(retry).await.unwrap());
 
         assert_eq!(month_reset_events(&pool, tenant_id).await, 1);
-        assert_eq!(month_row(&pool, boundary).await, Some((dec!(10000), Some(retry))));
+        assert_eq!(month_row(&pool, boundary).await, Some((dec!(9910), Some(retry))));
+        assert_eq!(month_resets(&daemon).await, vec![(dec!(9910), dec!(90), 6, 2026)]);
+        assert_eq!(pending.get(), 0.0);
+    }
+
+    /// With an Armed leg, a previous month with no recorded base, no row or a
+    /// row no reset stamped, defers the reset instead of reserving 1% of the
+    /// configured capital. Once a reset-stamped base is on record, it lands.
+    /// With nothing Armed, the fresh-database test above shows a missing
+    /// previous month needs nothing.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn an_armed_leg_without_a_recorded_previous_base_defers_the_reset(pool: sqlx::PgPool) {
+        let tenant_id = uuid::Uuid::from_u128(0x13207);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let mut daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let pending = watch_month_boundary_pending(&mut daemon);
+        save_armed(&daemon).await;
+        let previous = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
+        let boundary = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 1).single().unwrap();
+
+        let missing = daemon.poll_month_boundary(boundary).await.unwrap_err();
+        assert!(matches!(missing, DaemonError::MonthBoundaryDeferred { .. }), "{missing:?}");
+
+        sqlx::query(
+            "INSERT INTO monthly_state (year, month, capital_base, created_at) \
+             VALUES ($1, $2, 9000, $3)",
+        )
+        .bind(previous.year() as i16)
+        .bind(previous.month() as i16)
+        .bind(previous)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let unstamped = daemon.poll_month_boundary(boundary).await.unwrap_err();
+        assert!(matches!(unstamped, DaemonError::MonthBoundaryDeferred { .. }), "{unstamped:?}");
+        assert_eq!(month_reset_events(&pool, tenant_id).await, 0);
+        assert_eq!(month_row(&pool, boundary).await, None);
+        assert_eq!(pending.get(), 1.0);
+
+        sqlx::query(
+            "UPDATE monthly_state SET boundary_reset_at = created_at \
+             WHERE year = $1 AND month = $2",
+        )
+        .bind(previous.year() as i16)
+        .bind(previous.month() as i16)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(daemon.poll_month_boundary(boundary).await.unwrap());
+
+        assert_eq!(month_row(&pool, boundary).await, Some((dec!(9910), Some(boundary))));
         assert_eq!(pending.get(), 0.0);
     }
 

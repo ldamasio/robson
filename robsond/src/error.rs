@@ -114,6 +114,11 @@ pub enum DaemonError {
     #[error("Admissions closed: {reason}")]
     AdmissionsClosed { reason: String },
 
+    /// The month-boundary reset waits: a basis it needs is not on record
+    /// (ADR-0024 §6). Nothing was appended; the next poll retries.
+    #[error("Month boundary reset deferred: {reason}")]
+    MonthBoundaryDeferred { reason: String },
+
     /// MonthlyHalt is active — all new entries blocked (v3 policy).
     ///
     /// Returned when `arm_position`, `handle_signal`, or `approve_query` is

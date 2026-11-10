@@ -590,6 +590,37 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(self.configured_capital())
     }
 
+    /// The capital base a month's reset recorded, for the next boundary's
+    /// Armed reservation: `None` when the month has no row, or a row no reset
+    /// stamped, so nothing on record says what its base was. Without a
+    /// database there is no record, and the configured capital stands in.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn recorded_capital_base(
+        &self,
+        month: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<Option<Decimal>> {
+        let Some(pool) = &self.event_log_pool else {
+            return Ok(Some(self.configured_capital()));
+        };
+        let base = sqlx::query_scalar::<_, Decimal>(
+            "SELECT capital_base FROM monthly_state \
+             WHERE year = $1 AND month = $2 AND boundary_reset_at IS NOT NULL",
+        )
+        .bind(month.year() as i16)
+        .bind(month.month() as i16)
+        .fetch_optional(pool)
+        .await?;
+        Ok(base)
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    pub(crate) async fn recorded_capital_base(
+        &self,
+        _month: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<Option<Decimal>> {
+        Ok(Some(self.configured_capital()))
+    }
+
     /// Load the full persisted monthly risk state from `monthly_state`.
     ///
     /// Returns the authoritative accumulated values for:
