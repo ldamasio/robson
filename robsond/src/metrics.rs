@@ -32,6 +32,11 @@
 //! - `robsond_sse_events_total` — public SSE events sent, labelled by event
 //!   type
 //! - `robsond_sse_disconnects_total` — SSE stream terminations on `/events`
+//! - `robsond_unpermitted_mutations_total` — venue mutations without an
+//!   operation permit (ADR-0056 step 7)
+//! - `robsond_aborted_operations_total` — operations dropped before completing
+//! - `robsond_api_slot_busy_total` — API requests refused on a full slot class,
+//!   labelled by class
 
 use std::sync::LazyLock;
 
@@ -152,6 +157,57 @@ pub static JOURNAL_OPERATIONS_OVER_STATEMENT_BOUND: LazyLock<Gauge> = LazyLock::
     )
     .expect("failed to register robsond_journal_operations_over_statement_bound")
 });
+
+/// Venue mutations that reached the choke point without an operation permit
+/// while the daemon was open (ADR-0056 step 7). Each sets the journal latch;
+/// once the daemon is stopping such a mutation is refused, not counted.
+pub static UNPERMITTED_MUTATIONS: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_unpermitted_mutations_total",
+        "Venue mutations sent without an operation permit"
+    )
+    .expect("failed to register robsond_unpermitted_mutations_total")
+});
+
+/// Operations whose permit was dropped before they completed: cancelled or
+/// panicked mid-flight. Each sets the journal latch.
+pub static ABORTED_OPERATIONS: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!("robsond_aborted_operations_total", "Operations dropped before completing")
+        .expect("failed to register robsond_aborted_operations_total")
+});
+
+/// API requests answered 503 `busy` because their slot class was full, by
+/// class: `ordinary` or `protective`.
+pub static API_SLOT_BUSY: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        "robsond_api_slot_busy_total",
+        "API requests refused because their slot class was full",
+        &["class"]
+    )
+    .expect("failed to register robsond_api_slot_busy_total")
+});
+
+/// Zero series for the gate's metrics, so they export from startup.
+pub fn init_operation_gate_metrics() {
+    LazyLock::force(&UNPERMITTED_MUTATIONS);
+    LazyLock::force(&ABORTED_OPERATIONS);
+    for class in ["ordinary", "protective"] {
+        API_SLOT_BUSY.with_label_values(&[class]);
+    }
+}
+
+/// Counts what the operation gate reports.
+pub struct GateMetrics;
+
+impl robson_exec::gate::GateObserver for GateMetrics {
+    fn unpermitted_mutation(&self) {
+        UNPERMITTED_MUTATIONS.inc();
+    }
+
+    fn operation_aborted(&self, _kind: robson_exec::gate::OperationKind) {
+        ABORTED_OPERATIONS.inc();
+    }
+}
 
 /// Publish the journal's latch, retry-set depth and statement counts.
 pub fn observe_order_journal(journal: &robson_exec::order_journal::OrderJournal) {

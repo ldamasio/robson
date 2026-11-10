@@ -62,6 +62,17 @@ fn spec(id: &str, kind: IntentKind) -> IntentSpec {
     }
 }
 
+/// A venue's error in these tests: whether it is an authoritative rejection.
+/// The gate's refusal of an entry is none.
+#[derive(Debug)]
+struct Answer(bool);
+
+impl From<SendRefusal> for Answer {
+    fn from(_: SendRefusal) -> Self {
+        Self(false)
+    }
+}
+
 async fn opened(
     journal: &Arc<OrderJournal>,
     id: &str,
@@ -221,7 +232,7 @@ async fn absent_needs_every_durable_attempt_rejected_across_a_restart(pool: PgPo
     let (operation, intent) = opened(&first, "a", IntentKind::Exit).await;
     operation.scope(first.before_send(&intent, WriteClass::Bounded)).await.unwrap();
     operation
-        .scope(ledger.submit("a", |_: &()| true, async { Err::<(), ()>(()) }))
+        .scope(ledger.submit("a", |_: &Answer| true, async { Err::<(), _>(Answer(true)) }))
         .await
         .unwrap_err();
     // In memory, so unresolved, although it is rejected.
@@ -999,12 +1010,12 @@ async fn absent_and_id_reuse_hold_under_generated_sequential_schedules(pool: PgP
                                 .operation
                                 .scope(process.ledger.submit(
                                     &client,
-                                    |rejected: &bool| *rejected,
+                                    |answer: &Answer| answer.0,
                                     async {
                                         match answer {
-                                            VenueAnswer::Accepted => Ok::<(), bool>(()),
-                                            VenueAnswer::Rejected => Err(true),
-                                            VenueAnswer::Unknown => Err(false),
+                                            VenueAnswer::Accepted => Ok::<(), Answer>(()),
+                                            VenueAnswer::Rejected => Err(Answer(true)),
+                                            VenueAnswer::Unknown => Err(Answer(false)),
                                         }
                                     },
                                 ))
@@ -1103,12 +1114,12 @@ async fn run_planned_intent(
                 }
             }
             let answered = ledger
-                .submit(&id, |rejected: &bool| *rejected, async {
+                .submit(&id, |answer: &Answer| answer.0, async {
                     tokio::task::yield_now().await;
                     match answer {
                         VenueAnswerKind::Accepted => Ok(()),
-                        VenueAnswerKind::Rejected => Err(true),
-                        VenueAnswerKind::Unknown => Err(false),
+                        VenueAnswerKind::Rejected => Err(Answer(true)),
+                        VenueAnswerKind::Unknown => Err(Answer(false)),
                     }
                 })
                 .await;

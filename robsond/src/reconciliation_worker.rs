@@ -16,7 +16,8 @@ use robson_domain::{
 };
 use robson_exec::{
     cancel::CancelClass,
-    order_journal::{IntentKind, IntentSpec},
+    gate::OperationKind,
+    order_journal::{IntentKind, IntentSpec, OrderJournal},
     quantize::{self, ReductionOutcome},
     ExchangePort, ExchangePosition, ExecError, OpenOrderRecord, OrderResult, UserTradeRecord,
 };
@@ -51,6 +52,9 @@ pub struct ReconciliationWorker<E: ExchangePort + 'static, S: Store + 'static> {
     missing_observations: Arc<Mutex<HashMap<PositionId, MissingObservation>>>,
     shutdown_token: CancellationToken,
     metrics: ReconciliationMetrics,
+    /// The journal whose gate gives each scan its permit; read through the
+    /// manager when not given.
+    order_journal: Option<Arc<OrderJournal>>,
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +375,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             missing_observations: Arc::new(Mutex::new(HashMap::new())),
             shutdown_token,
             metrics: ReconciliationMetrics::global(),
+            order_journal: None,
+        }
+    }
+
+    /// Take each scan's permit from `journal`, with no manager lock.
+    pub(crate) fn with_order_journal(mut self, journal: Arc<OrderJournal>) -> Self {
+        self.order_journal = Some(journal);
+        self
+    }
+
+    async fn order_journal(&self) -> Arc<OrderJournal> {
+        match &self.order_journal {
+            Some(journal) => Arc::clone(journal),
+            None => self.position_manager.read().await.order_journal(),
         }
     }
 
@@ -406,8 +424,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
 
     /// Run one reconciliation pass, returning how many position-level
     /// reconciliation actions completed (UNTRACKED closes plus resolved local
-    /// missing positions).
+    /// missing positions). The pass runs under the reconciliation slot's
+    /// permit (ADR-0056 step 7), or under the permit its caller holds: the
+    /// startup scan is part of the startup operation.
     pub async fn scan_and_reconcile(&self) -> DaemonResult<usize> {
+        let journal = self.order_journal().await;
+        journal
+            .with_permit(OperationKind::ReconciliationScan, Box::pin(self.scan_once()))
+            .await?
+    }
+
+    async fn scan_once(&self) -> DaemonResult<usize> {
         self.metrics.scan_started(Utc::now().timestamp());
 
         let result = self.scan_and_reconcile_inner().await;
@@ -623,10 +650,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                     "Orphan insurance-stop order detected; cancelling"
                 );
 
-                let journal = self.position_manager.read().await.order_journal();
-                let operation = journal.begin_operation();
-                let class = operation
-                    .scope(journal.journaled_cancel(
+                let journal = self.order_journal().await;
+                let class = journal
+                    .within_operation(journal.journaled_cancel(
                         None,
                         &order.exchange_order_id,
                         self.exchange.cancel_stop_market_order(symbol, &order.exchange_order_id),
@@ -937,10 +963,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         // be off the grid after a lot-rule change, so it rounds on the rules held
         // and a rules rejection earns one refresh and one resubmission. Whatever
         // rounding leaves is reported by the next scan.
-        let journal = self.position_manager.read().await.order_journal();
-        let operation = journal.begin_operation();
-        let outcome = operation
-            .scope(async {
+        let journal = self.order_journal().await;
+        let outcome = journal
+            .within_operation(async {
                 let journaled = journal.open_intent(IntentSpec {
                     position_id: None,
                     kind: IntentKind::SweepClose,
@@ -1837,6 +1862,55 @@ mod tests {
                 .collect();
             assert_eq!(cancels.len(), 1, "one cancel, one intent");
             cancels.pop().unwrap()
+        }
+    }
+
+    /// One scan, one permit: its UNTRACKED close and its orphan cancel both
+    /// run under the reconciliation slot's permit. Inside the startup permit
+    /// the same scan takes none of its own (ADR-0056 step 7).
+    #[tokio::test]
+    async fn a_scan_runs_under_its_own_permit_or_the_one_it_is_reached_under() {
+        use robson_exec::{gate::OperationKind, venue::Venue};
+
+        for nested in [false, true] {
+            let OrphanSweep { worker, journal, exchange, .. } = orphan_sweep().await;
+            exchange.set_open_position(
+                Symbol::from_pair("ETHUSDT").unwrap(),
+                Side::Long,
+                Quantity::new(dec!(0.010)).unwrap(),
+                Price::new(dec!(100)).unwrap(),
+            );
+            exchange.attach_gate(Arc::clone(journal.gate()));
+            let worker = worker.with_order_journal(Arc::clone(&journal));
+            let setup = exchange.mutations().len();
+
+            let expected = if nested {
+                journal
+                    .acquire(OperationKind::Startup)
+                    .unwrap()
+                    .run(worker.scan_and_reconcile())
+                    .await
+                    .unwrap();
+                OperationKind::Startup
+            } else {
+                worker.scan_and_reconcile().await.unwrap();
+                OperationKind::ReconciliationScan
+            };
+
+            let mutations = exchange.mutations().split_off(setup);
+            let what: Vec<_> = mutations.iter().map(|m| m.what).collect();
+            assert!(what.contains(&"POST /fapi/v1/order"), "the UNTRACKED close: {what:?}");
+            assert!(what.contains(&"DELETE /fapi/v1/algoOrder"), "the orphan cancel: {what:?}");
+            for mutation in mutations {
+                assert_eq!(mutation.permit, Some(expected), "{mutation:?}");
+                let gate = mutation.gate.unwrap();
+                assert_eq!(
+                    (gate.permits, gate.internal, gate.unpermitted),
+                    (1, 1, 0),
+                    "{mutation:?}"
+                );
+            }
+            assert_eq!(journal.gate().snapshot().permits, 0);
         }
     }
 

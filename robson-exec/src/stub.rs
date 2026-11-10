@@ -5,7 +5,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
 
@@ -13,9 +13,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use robson_domain::{Candle, OrderSide, Price, Quantity, RiskConfig, Symbol};
 use rust_decimal::Decimal;
+use tokio::sync::Notify;
 
 use crate::{
     error::ExecError,
+    gate::{GateSnapshot, OperationGate, OperationKind},
+    order_journal,
     ports::{
         CandleInterval, ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord,
         MarketDataPort, OhlcvPort, OpenOrderRecord, OrderResult, PriceUpdate, SpotBalance,
@@ -59,6 +62,17 @@ pub struct StubStopOrder {
 /// Bound on each stub order history and on its submit-attempt evidence. The
 /// stub also backs the daemon's stub runtime, which can run indefinitely.
 const STUB_HISTORY_CAPACITY: usize = 4096;
+
+/// A venue mutation that passed the stub's choke point (ADR-0056 step 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StubMutation {
+    /// The request, as the real transport would send it.
+    pub what: &'static str,
+    /// The permit the calling task held.
+    pub permit: Option<OperationKind>,
+    /// The gate at that moment, when one is attached.
+    pub gate: Option<GateSnapshot>,
+}
 
 /// Insertion-ordered map of at most `capacity` entries; the oldest is dropped
 /// when full. A lookup whose record was dropped falls through to the attempt
@@ -221,6 +235,13 @@ pub struct StubExchange {
     /// Per-symbol `trading_rules` calls so tests can enforce constant-count
     /// metadata resolution instead of per-position exchange I/O.
     trading_rules_calls: RwLock<HashMap<String, u64>>,
+    /// The permit gate every mutation passes, as the real transport's
+    /// (ADR-0056 step 7). None: nothing is checked.
+    gate: OnceLock<Arc<OperationGate>>,
+    /// Mutations that passed the choke point, oldest first. Bounded.
+    mutations: Mutex<VecDeque<StubMutation>>,
+    /// The next mutation past the choke point waits for this before it acts.
+    mutation_hold: Mutex<Option<Arc<Notify>>>,
 }
 
 impl StubExchange {
@@ -287,7 +308,49 @@ impl StubExchange {
             protection_calls: RwLock::new(0),
             position_close_calls: RwLock::new(0),
             trading_rules_calls: RwLock::new(HashMap::new()),
+            gate: OnceLock::new(),
+            mutations: Mutex::new(VecDeque::new()),
+            mutation_hold: Mutex::new(None),
         }
+    }
+
+    /// The mutations that passed the choke point, oldest first.
+    pub fn mutations(&self) -> Vec<StubMutation> {
+        self.mutations.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Hold the next mutation past the choke point until the returned handle
+    /// is notified, with its permit held.
+    pub fn hold_next_mutation(&self) -> Arc<Notify> {
+        let hold = Arc::new(Notify::new());
+        *self.mutation_hold.lock().unwrap() = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// What the real transport does before every signed mutation: the gate's
+    /// choke point. A refusal sends nothing.
+    async fn mutate(&self, what: &'static str) -> Result<(), ExecError> {
+        let gate = self.gate.get();
+        if let Some(gate) = gate {
+            gate.mutation(what)
+                .map_err(|refused| ExecError::SendRefused(refused.to_string()))?;
+        }
+        {
+            let mut mutations = self.mutations.lock().unwrap();
+            if mutations.len() >= STUB_HISTORY_CAPACITY {
+                mutations.pop_front();
+            }
+            mutations.push_back(StubMutation {
+                what,
+                permit: order_journal::held_permit(),
+                gate: gate.map(|gate| gate.snapshot()),
+            });
+        }
+        let hold = self.mutation_hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            hold.notified().await;
+        }
+        Ok(())
     }
 
     /// Drop the optional funding surface: `funding()` is `None`, as on a venue
@@ -776,9 +839,10 @@ impl venue::TradingPort for StubExchange {
         if std::mem::take(&mut *self.refuse_before_send_next.write().unwrap()) {
             return Err(ExecError::Exchange("Simulated refusal before the send".to_string()));
         }
+        let attempt = self.submit_attempts.begin_send(client_order_id)?;
+        self.mutate("POST /fapi/v1/order").await?;
         *self.market_order_calls.write().unwrap() += 1;
         self.market_order_client_ids.write().unwrap().push(client_order_id.to_string());
-        let attempt = self.submit_attempts.begin(client_order_id);
 
         // Check if we should simulate a failure
         if self.should_fail() || self.should_fail_order() {
@@ -849,8 +913,9 @@ impl venue::TradingPort for StubExchange {
         stop_price: Price,
         client_order_id: &str,
     ) -> Result<PlacedStop, ExecError> {
+        let attempt = self.submit_attempts.begin_send(client_order_id)?;
+        self.mutate("POST /fapi/v1/algoOrder").await?;
         *self.protection_calls.write().unwrap() += 1;
-        let attempt = self.submit_attempts.begin(client_order_id);
         // Simulate placement failure when configured (mirrors market order path).
         if self.should_fail() || self.should_fail_order() {
             return Err(ExecError::Exchange("Simulated stop order failure".to_string()));
@@ -910,6 +975,7 @@ impl venue::TradingPort for StubExchange {
     }
 
     async fn cancel_order(&self, _symbol: &Symbol, order_id: &str) -> Result<(), ExecError> {
+        self.mutate("DELETE /fapi/v1/order").await?;
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated cancel failure".to_string()));
         }
@@ -929,6 +995,7 @@ impl venue::TradingPort for StubExchange {
         _symbol: &Symbol,
         stop: &StopRef,
     ) -> Result<StopCancelOutcome, ExecError> {
+        self.mutate("DELETE /fapi/v1/algoOrder").await?;
         *self.stop_cancel_calls.write().unwrap() += 1;
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated stop cancel failure".to_string()));
@@ -1176,7 +1243,8 @@ impl venue::FundingPort for StubExchange {
         request: SpotOrderRequest,
     ) -> Result<SpotOrder, ExecError> {
         // Never resolves as rejected: lookups do not query the spot namespace.
-        self.submit_attempts.begin(&request.client_order_id);
+        self.submit_attempts.begin_send(&request.client_order_id)?;
+        self.mutate("POST /api/v3/order").await?;
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated spot order failure".to_string()));
         }
@@ -1268,6 +1336,7 @@ impl venue::FundingPort for StubExchange {
         transfer_type: UniversalTransferType,
         client_tran_key: &str,
     ) -> Result<TransferId, ExecError> {
+        self.mutate("POST /sapi/v1/asset/transfer").await?;
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated universal transfer failure".to_string()));
         }
@@ -1322,6 +1391,8 @@ impl venue::PositionAccountPort for StubExchange {
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated futures check failure".to_string()));
         }
+        // The real adapter sets the leverage here, a signed mutation.
+        self.mutate("POST /fapi/v1/leverage").await?;
 
         let (position_mode, leverage) = {
             let settings = self.futures_settings.read().unwrap();
@@ -1385,8 +1456,9 @@ impl venue::PositionAccountPort for StubExchange {
         quantity: Quantity,
         client_order_id: &str,
     ) -> Result<OrderResult, ExecError> {
+        let attempt = self.submit_attempts.begin_send(client_order_id)?;
+        self.mutate("POST /fapi/v1/order").await?;
         *self.position_close_calls.write().unwrap() += 1;
-        let attempt = self.submit_attempts.begin(client_order_id);
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated reconciliation close failure".to_string()));
         }
@@ -1523,6 +1595,10 @@ impl venue::AccountPort for StubExchange {
 impl venue::Venue for StubExchange {
     fn attach_order_journal(&self, journal: std::sync::Arc<crate::order_journal::OrderJournal>) {
         self.submit_attempts.attach_journal(journal);
+    }
+
+    fn attach_gate(&self, gate: Arc<OperationGate>) {
+        let _ = self.gate.set(gate);
     }
 
     fn id(&self) -> &VenueId {

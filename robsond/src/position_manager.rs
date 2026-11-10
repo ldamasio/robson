@@ -38,8 +38,8 @@ use robson_engine::{
 #[cfg(feature = "postgres")]
 use robson_eventlog::{append_event, ActorType as EventlogActorType, Event as EventlogEvent};
 use robson_exec::{
-    quantize, venue::VenueId, ActionResult, ExchangePort, ExchangePosition, ExecError, Executor,
-    OhlcvPort, StubOhlcv,
+    gate::OperationKind, quantize, venue::VenueId, ActionResult, ExchangePort, ExchangePosition,
+    ExecError, Executor, OhlcvPort, StubOhlcv,
 };
 #[cfg(feature = "postgres")]
 use robson_projector::apply_event_to_projections;
@@ -2612,12 +2612,23 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // From here an order may reach the exchange: an error no longer
         // re-arms the detector, unless the executor proves nothing was sent.
         *reach = AdmissionReach::Executor;
-        let operation = self.executor.order_journal().begin_operation();
-        let executed = operation.scope(self.execute_and_persist(governed.into_actions())).await;
+        let actions = governed.into_actions();
+        let entry_client_order_id = actions.iter().find_map(|action| match action {
+            EngineAction::PlaceEntryOrder { client_order_id, .. } => Some(client_order_id.clone()),
+            _ => None,
+        });
+        // Under the permit the caller holds, which the stop below shares
+        // (ADR-0056 step 7); in an operation of its own only without one.
+        let (executed, ticket_issued) = self
+            .executor
+            .order_journal()
+            .run_admission(
+                entry_client_order_id.as_deref(),
+                Box::pin(self.execute_and_persist(actions)),
+            )
+            .await;
         // On Ok and Err alike, and whatever became of persisting the result: a
-        // ticket means this admission reached the venue's send (ADR-0056 step 7).
-        let ticket_issued = operation.entry_ticket_issued();
-        drop(operation);
+        // ticket means this admission reached the venue's send.
         if ticket_issued {
             self.clear_governed_rearm_backoff(position_id).await;
         }
@@ -2834,8 +2845,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                                     "Processing detector signal from EventBus"
                                 );
 
-                                // Call handle_signal - now we have Arc<Self>!
-                                if let Err(e) = manager.handle_signal(signal).await {
+                                // Under the main loop's slot, whose part this
+                                // plays (ADR-0056 step 7).
+                                let handled = manager
+                                    .executor
+                                    .order_journal()
+                                    .with_permit(
+                                        OperationKind::SignalListener,
+                                        manager.handle_signal(signal),
+                                    )
+                                    .await
+                                    .unwrap_or_else(|refused| Err(refused.into()));
+                                if let Err(e) = handled {
                                     error!(
                                         %position_id,
                                         %signal_id,
@@ -12566,6 +12587,105 @@ mod tests {
         );
         let events = manager.store.events().find_by_position(position.id).await.unwrap();
         assert!(events.iter().any(|event| matches!(event, Event::EntrySignalReceived { .. })));
+    }
+
+    /// An `Immediate` arm enters, and places the entry's stop, under the arm's
+    /// own permit: one ordinary slot, no second permit, every venue mutation
+    /// under it, and the entry and its stop charged to one operation
+    /// (ADR-0056 step 7).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_immediate_arm_enters_and_protects_under_its_own_permit() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        use robson_exec::venue::Venue;
+
+        let manager = create_test_manager().await;
+        let journal = manager.order_journal();
+        manager.exchange().attach_gate(Arc::clone(journal.gate()));
+        let policy =
+            EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::Automatic);
+
+        let position = journal
+            .acquire(OperationKind::Arm)
+            .unwrap()
+            .run(manager.arm_position_with_policy(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                create_test_risk_config(),
+                None,
+                Uuid::now_v7(),
+                policy,
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(position.state, PositionState::Active { .. }), "{:?}", position.state);
+        let mutations = manager.exchange().mutations();
+        let what: Vec<_> = mutations.iter().map(|m| m.what).collect();
+        assert!(what.contains(&"POST /fapi/v1/order"), "the entry: {what:?}");
+        assert!(what.contains(&"POST /fapi/v1/algoOrder"), "its stop: {what:?}");
+        for mutation in mutations {
+            assert_eq!(mutation.permit, Some(OperationKind::Arm), "{mutation:?}");
+            let gate = mutation.gate.unwrap();
+            assert_eq!((gate.permits, gate.ordinary, gate.unpermitted), (1, 1, 0), "{mutation:?}");
+        }
+        assert_eq!(journal.operation_statements_max(), 18, "entry and stop, one operation");
+        assert_eq!(journal.gate().snapshot().permits, 0);
+    }
+
+    /// Once the daemon is stopping, an entry from the main loop is refused at
+    /// its send: a typed no-send, nothing reaches the venue, and a leg with
+    /// admission evidence ends its attempt (ADR-0056 step 7, design §2.4).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_entry_refused_at_its_send_while_draining_ends_as_a_no_send() {
+        use robson_exec::venue::Venue;
+
+        let manager = create_test_manager().await;
+        let journal = manager.order_journal();
+        manager.exchange().attach_gate(Arc::clone(journal.gate()));
+        let position = manager
+            .arm_position(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(TechnicalStopDistance::from_entry_and_stop(
+                    Price::new(dec!(100)).unwrap(),
+                    Price::new(dec!(90)).unwrap(),
+                )),
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol: position.symbol.clone(),
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(86000)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        let permit = journal.acquire(OperationKind::MainLoop).unwrap();
+        journal.gate().begin_draining();
+        let refused = permit.run(manager.handle_signal(signal)).await;
+
+        assert!(
+            matches!(refused, Err(DaemonError::Exec(ExecError::SendRefused(_)))),
+            "{refused:?}"
+        );
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert!(
+            manager.exchange().mutations().iter().all(|m| m.what != "POST /fapi/v1/order"),
+            "no order went out"
+        );
+        assert_eq!(journal.gate().snapshot().sends_started, 0);
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Armed), "{:?}", leg.state);
+        assert!(
+            manager.is_entry_exhausted(position.id).await,
+            "evidence-bearing: the attempt ends"
+        );
     }
 
     /// A capital-capped immediate entry must ACTIVATE, not be denied by the

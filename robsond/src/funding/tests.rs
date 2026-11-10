@@ -319,6 +319,36 @@ async fn happy_path(pool: PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A funding poll resumes a saga under the funding slot's permit: its
+/// conversion and transfer pass the choke point with it, and no other slot is
+/// taken (ADR-0056 step 7).
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL"]
+async fn a_funding_poll_resumes_its_sagas_under_its_own_permit(pool: PgPool) -> anyhow::Result<()> {
+    use robson_exec::{gate::OperationKind, venue::Venue};
+
+    let exchange = configured_exchange();
+    let TestFundingService { service, position_manager, .. } =
+        test_service(pool, Arc::clone(&exchange), FundingConfig::default());
+    let journal = position_manager.read().await.order_journal();
+    exchange.attach_gate(Arc::clone(journal.gate()));
+    let quote = service.quote().await?;
+
+    let worker = super::worker::FundingWorker::new(service).with_order_journal(journal.clone());
+    assert_eq!(worker.resume().await?, 1);
+
+    let mutations = exchange.mutations();
+    let what: Vec<_> = mutations.iter().map(|m| m.what).collect();
+    assert_eq!(what, ["POST /api/v3/order", "POST /sapi/v1/asset/transfer"], "{quote:?}");
+    for mutation in mutations {
+        assert_eq!(mutation.permit, Some(OperationKind::FundingPoll), "{mutation:?}");
+        let gate = mutation.gate.unwrap();
+        assert_eq!((gate.permits, gate.internal, gate.unpermitted), (1, 1, 0), "{mutation:?}");
+    }
+    assert_eq!(journal.gate().snapshot().permits, 0);
+    Ok(())
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "Requires DATABASE_URL"]
 async fn inverse_pair_brl_to_usdt(pool: PgPool) -> anyhow::Result<()> {
