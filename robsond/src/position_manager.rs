@@ -9592,6 +9592,27 @@ mod tests {
         writes: &[Decimal],
         stall: sqlx::Transaction<'_, sqlx::Postgres>,
     ) {
+        wait_for_a_held_snapshot(pool).await;
+        for capital_base in writes {
+            set_month_basis(pool, *capital_base).await;
+        }
+        stall.rollback().await.unwrap();
+    }
+
+    /// Once a snapshot is held there, rewrite the month's row without its
+    /// reset stamp and let the snapshot go on.
+    #[cfg(feature = "postgres")]
+    async fn unstamp_the_reset_while_a_snapshot_waits(
+        pool: &sqlx::PgPool,
+        stall: sqlx::Transaction<'_, sqlx::Postgres>,
+    ) {
+        wait_for_a_held_snapshot(pool).await;
+        set_unreset_month_row(pool, dec!(1000)).await;
+        stall.rollback().await.unwrap();
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn wait_for_a_held_snapshot(pool: &sqlx::PgPool) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let waiting: i64 = sqlx::query_scalar(
@@ -9613,10 +9634,6 @@ mod tests {
         })
         .await
         .expect("the snapshot must reach the locked table");
-        for capital_base in writes {
-            set_month_basis(pool, *capital_base).await;
-        }
-        stall.rollback().await.unwrap();
     }
 
     /// ADR-0051 §1 over random schedules: whatever the basis goes through while
@@ -9683,6 +9700,75 @@ mod tests {
         }
 
         assert!(fired_any && spared_any, "the schedules must reach both outcomes");
+    }
+
+    /// A reset stamp that goes missing while a snapshot waits is seen where
+    /// the decision is made: the halt does not fire on the exhausted budget
+    /// the snapshot read, and the gate gets no capital.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_reset_that_goes_missing_during_the_snapshot_is_seen_at_the_decision(
+        pool: sqlx::PgPool,
+    ) {
+        set_month_basis(&pool, dec!(1000)).await;
+        let manager = create_postgres_test_manager(pool.clone());
+        let leg = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(10)).await;
+        let snapshot = manager.canonical_budget_snapshot(chrono::Utc::now()).await.unwrap();
+        assert!(!snapshot.capital_base_invalid);
+        assert!(snapshot.remaining_active <= Decimal::ZERO, "{}", snapshot.remaining_active);
+
+        let stall = stall_on_positions_current(&pool).await;
+        let (fired, ()) = tokio::join!(
+            manager.evaluate_monthly_halt(),
+            unstamp_the_reset_while_a_snapshot_waits(&pool, stall)
+        );
+
+        assert!(!fired);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+        assert!(is_still_active(&manager, &leg).await);
+
+        set_month_basis(&pool, dec!(1000)).await;
+        let stall = stall_on_positions_current(&pool).await;
+        let (context, ()) = tokio::join!(
+            manager.build_risk_context(),
+            unstamp_the_reset_while_a_snapshot_waits(&pool, stall)
+        );
+
+        assert_eq!(context.unwrap().capital, Decimal::ZERO);
+    }
+
+    /// The other way round: the reset lands while a snapshot that read the
+    /// month as pending waits. Nothing decides on that snapshot's numbers,
+    /// which no reset wrote: the halt is not evaluated and the gate gets no
+    /// capital. The next decision reads the landed basis.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_reset_that_lands_during_the_snapshot_does_not_validate_it(pool: sqlx::PgPool) {
+        let manager = create_postgres_test_manager(pool.clone());
+        let leg = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(10)).await;
+        let landing = [dec!(1000)];
+
+        let stall = stall_on_positions_current(&pool).await;
+        let (fired, ()) = tokio::join!(
+            manager.evaluate_monthly_halt(),
+            write_the_basis_while_a_snapshot_waits(&pool, &landing, stall)
+        );
+
+        assert!(!fired);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+        assert!(is_still_active(&manager, &leg).await);
+
+        sqlx::query("DELETE FROM monthly_state").execute(&pool).await.unwrap();
+        let stall = stall_on_positions_current(&pool).await;
+        let (context, ()) = tokio::join!(
+            manager.build_risk_context(),
+            write_the_basis_while_a_snapshot_waits(&pool, &landing, stall)
+        );
+
+        assert_eq!(context.unwrap().capital, Decimal::ZERO);
+        assert_eq!(manager.build_risk_context().await.unwrap().capital, dec!(1000));
     }
 
     /// Reconciliation passes, with the manager held the way the daemon holds
