@@ -23,6 +23,8 @@
 //!   or 1)
 //! - `robsond_monthly_budget_basis_last_read_timestamp_seconds` — last time
 //!   that alarm read the persisted basis
+//! - `robsond_month_boundary_pending` — the current month's reset has not
+//!   landed (0 or 1)
 //! - `robsond_budget_model_shadow_slots_delta` — dormant ADR-0051 NFS slots
 //!   minus HWM slots
 //! - `robsond_market_data_ws_failures_total` — failed WS attempts by endpoint
@@ -520,6 +522,18 @@ pub static MONTHLY_BUDGET_BASIS_LAST_READ_TIMESTAMP_SECONDS: LazyLock<Gauge> =
         .expect("failed to register robsond_monthly_budget_basis_last_read_timestamp_seconds")
     });
 
+/// The current month's `MonthBoundaryReset` has not landed: the boundary poll
+/// found none and could not append one, for instance because the wallet read
+/// failed. Set by that poll, so it rises within 60 s of 00:00 UTC and returns
+/// to 0 once the reset lands or is found. 0 from startup.
+pub static MONTH_BOUNDARY_PENDING: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_month_boundary_pending",
+        "Whether the current month's MonthBoundaryReset has not landed yet (0 or 1)"
+    )
+    .expect("failed to register robsond_month_boundary_pending")
+});
+
 /// Dormant ADR-0051 shadow comparison: net-from-start slots minus HWM slots.
 pub static BUDGET_MODEL_SHADOW_SLOTS_DELTA: LazyLock<Gauge> = LazyLock::new(|| {
     register_gauge!(
@@ -664,6 +678,13 @@ mod tests {
         let rendered = render();
         assert!(rendered.contains("robsond_monthly_budget_basis_invalid"));
         assert!(rendered.contains("robsond_monthly_budget_basis_last_read_timestamp_seconds"));
+    }
+
+    #[test]
+    fn the_month_boundary_gauge_is_exported() {
+        LazyLock::force(&MONTH_BOUNDARY_PENDING);
+
+        assert!(render().contains("robsond_month_boundary_pending "));
     }
 
     #[test]
