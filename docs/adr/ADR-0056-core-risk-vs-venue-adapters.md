@@ -900,6 +900,20 @@ applied migration missing from its embedded set, so pinning back to `sha-b06aecb
 SIGKILLed at 30 s. After the fence PR, rollback across it needs the fence PR's own condition. Not verified: SIGTERM in the live pod, PID 1 in
 the image, stop timing under a slow database, behaviour on a real venue or in the cluster.
 
+*Persistence (PR P).* Results never dropped, per-stream serialization of event persistence, stream suspension and a
+startup repair of position streams, in parts, each deployable alone in this order.
+
+*Part 1, routes and namespace.* Four domain events had no projection route: `entry_attempt_exhausted`,
+`signal_strategy_evaluated`, `entry_approval_pending` and `position_error` (never constructed). Each landed in the event log
+and then failed its apply as unhandled, which today only logs an error, but from part 2 a failed apply suspends its stream: every
+confirmed strategy signal would have suspended its leg's stream ahead of the entry, and every exhaustion and approval wait would
+have closed admissions. They now route as audit-only and change no projection table, and a restart reads `entry_attempt_exhausted`
+from the event log as before. The projector's freeze test covers every type the domain enum can be persisted under, read from the
+enum itself, so a new event with no route fails CI. An older binary returns the same `MissingHandler` on them as it does today, so
+this adds no rollback condition. The daemon also refuses to start with a `PROJECTION_STREAM_KEY` beginning with `position:` or
+`system:`: the projection worker applies the stream it polls with no stream lock, beside the position manager's own writer.
+Production uses `robson:daemon`, the default.
+
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze
 contract 1.2.0; `rbx-data` vendors its own registry copy (1.1.3) and must re-vendor before any export runs. Every rollback

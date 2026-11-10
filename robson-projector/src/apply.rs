@@ -56,6 +56,12 @@ enum ProjectionRoute {
     EntryFillProtectionFallback,
     ExecutableStopRiskResolutionFailed,
     ResidualInventoryRecorded,
+    // Domain audit events with no projection of their own (ADR-0056 step 7):
+    // the event log is what a restart reads them from.
+    EntryAttemptExhausted,
+    SignalStrategyEvaluated,
+    EntryApprovalPending,
+    PositionError,
 }
 
 fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
@@ -110,6 +116,10 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
             Some(ProjectionRoute::ExecutableStopRiskResolutionFailed)
         },
         "residual_inventory_recorded" => Some(ProjectionRoute::ResidualInventoryRecorded),
+        "entry_attempt_exhausted" => Some(ProjectionRoute::EntryAttemptExhausted),
+        "signal_strategy_evaluated" => Some(ProjectionRoute::SignalStrategyEvaluated),
+        "entry_approval_pending" => Some(ProjectionRoute::EntryApprovalPending),
+        "position_error" => Some(ProjectionRoute::PositionError),
 
         // Balance events
         "BALANCE_SAMPLED" => Some(ProjectionRoute::BalanceSampled),
@@ -228,6 +238,15 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         | Some(ProjectionRoute::ResidualInventoryRecorded) => {
             // Audit-only: no position projection mutation.
         },
+        Some(ProjectionRoute::EntryAttemptExhausted)
+        | Some(ProjectionRoute::SignalStrategyEvaluated)
+        | Some(ProjectionRoute::EntryApprovalPending)
+        | Some(ProjectionRoute::PositionError) => {
+            // Audit-only. Until these routes existed every one of them landed
+            // in the event log and then failed here as unhandled. A
+            // restart reads `entry_attempt_exhausted` back from the
+            // event log, not from a projection.
+        },
         Some(ProjectionRoute::BalanceSampled) => {
             handlers::balances::handle_balance_sampled(pool, envelope).await?
         },
@@ -277,48 +296,53 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
 
 #[cfg(test)]
 mod tests {
-    use super::projection_route;
+    use super::{projection_route, ProjectionRoute};
 
+    /// Every type a `robson_domain::Event` is persisted under, read from the
+    /// enum itself: serde names every variant when it meets an unknown tag, so
+    /// a variant added later is checked here with no change to this test.
+    fn every_domain_event_type() -> Vec<String> {
+        let unknown = serde_json::json!({ "type": "no_such_event_type" });
+        let message = serde_json::from_value::<robson_domain::Event>(unknown)
+            .expect_err("an unknown tag is refused")
+            .to_string();
+        let (_, expected) = message
+            .split_once("expected one of")
+            .unwrap_or_else(|| panic!("serde no longer lists the variants: {message}"));
+        expected.split('`').skip(1).step_by(2).map(str::to_string).collect()
+    }
+
+    /// MIG-v2.5#2 freeze test, over every domain event (ADR-0056 step 7): an
+    /// event with no route lands in the event log and then fails its apply, and
+    /// from PR P a failed apply suspends its stream.
     #[test]
-    fn runtime_emitted_domain_events_have_projection_routes() {
-        // MIG-v2.5#2 freeze test:
-        // these are the robson-domain::Event variants actually emitted by the
-        // current runtime path (robson-engine, robsond, robson-exec).
-        let runtime_event_types = [
+    fn every_domain_event_type_has_a_projection_route() {
+        let event_types = every_domain_event_type();
+        for listed in [
             "position_armed",
-            "entry_policy_resolved",
-            "position_disarmed",
-            "technical_stop_analyzed",
-            "entry_signal_received",
-            "month_boundary_reset",
-            "entry_order_placed", // legacy
-            "entry_order_requested",
-            "entry_order_accepted",
-            "entry_order_failed",
-            "entry_execution_rejected",
             "entry_filled",
-            "executable_stop_plan_drift_detected",
-            "entry_fill_protection_fallback",
-            "executable_stop_risk_resolution_failed",
-            "trailing_stop_updated",
-            "position_monitor_tick",
-            "exit_triggered",
-            "exit_order_placed",
-            "residual_inventory_recorded",
             "position_closed",
-            // ADR-0039 insurance-stop lifecycle events.
-            "insurance_stop_placed",
-            "insurance_stop_replaced",
-            "insurance_stop_cancelled",
-            "insurance_stop_failed",
-            "startup_recovery_insurance_stop_checked",
-        ];
-
-        for event_type in runtime_event_types {
+            "month_boundary_reset",
+        ] {
+            assert!(event_types.iter().any(|t| t == listed), "{listed} not in {event_types:?}");
+        }
+        for event_type in &event_types {
             assert!(
                 projection_route(event_type).is_some(),
-                "runtime-emitted event type must have a projector route: {event_type}"
+                "domain event type must have a projector route: {event_type}"
             );
+        }
+    }
+
+    #[test]
+    fn the_unprojected_domain_audit_events_have_their_own_routes() {
+        for (event_type, route) in [
+            ("entry_attempt_exhausted", ProjectionRoute::EntryAttemptExhausted),
+            ("signal_strategy_evaluated", ProjectionRoute::SignalStrategyEvaluated),
+            ("entry_approval_pending", ProjectionRoute::EntryApprovalPending),
+            ("position_error", ProjectionRoute::PositionError),
+        ] {
+            assert_eq!(projection_route(event_type), Some(route));
         }
     }
 }

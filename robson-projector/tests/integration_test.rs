@@ -145,6 +145,121 @@ async fn test_residual_inventory_is_audit_only(pool: sqlx::PgPool) -> sqlx::Resu
     Ok(())
 }
 
+/// Every projection table, as one digest per table.
+async fn projection_tables(pool: &sqlx::PgPool) -> sqlx::Result<Vec<(&'static str, String)>> {
+    let mut digests = Vec::new();
+    for table in [
+        "positions_current",
+        "orders_current",
+        "fills",
+        "monthly_state",
+        "balances_current",
+        "queries_current",
+        "risk_state_current",
+        "strategy_state_current",
+    ] {
+        let digest = sqlx::query_scalar::<_, String>(&format!(
+            "SELECT COALESCE(md5(string_agg(t::text, '|' ORDER BY t::text)), '') FROM {table} t"
+        ))
+        .fetch_one(pool)
+        .await?;
+        digests.push((table, digest));
+    }
+    Ok(digests)
+}
+
+/// ADR-0056 step 7: four domain audit events had no route, so each landed in
+/// the event log and then failed its apply. Their routes write nothing.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn test_domain_audit_events_change_no_projection_table(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let position_id = Uuid::new_v4();
+    let stream_key = format!("position:{position_id}");
+    let armed = make_envelope(
+        &stream_key,
+        "position_armed",
+        serde_json::json!({
+            "position_id": position_id,
+            "account_id": Uuid::new_v4(),
+            "symbol": {"base": "BTC", "quote": "USDT"},
+            "side": "Long",
+            "tech_stop_distance": null,
+            "stop_policy": "executable_span",
+            "timestamp": Utc::now().to_rfc3339(),
+        }),
+        1,
+    );
+    apply_event_to_projections(&pool, &armed).await.unwrap();
+    sqlx::query(
+        "INSERT INTO monthly_state (year, month, capital_base, boundary_reset_at) \
+         VALUES (2026, 11, 1000, NOW())",
+    )
+    .execute(&pool)
+    .await?;
+    let before = projection_tables(&pool).await?;
+
+    let now = Utc::now().to_rfc3339();
+    for (seq, event_type, payload) in [
+        (
+            2,
+            "signal_strategy_evaluated",
+            serde_json::json!({
+                "type": "signal_strategy_evaluated",
+                "position_id": position_id,
+                "entry_policy": "confirmed_trend",
+                "strategy_id": "sma_crossover",
+                "outcome": "signal_confirmed",
+                "side": "Long",
+                "reason": "crossed",
+                "observed_at": now,
+                "reference_price": "95000",
+                "timestamp": now,
+            }),
+        ),
+        (
+            3,
+            "entry_approval_pending",
+            serde_json::json!({
+                "type": "entry_approval_pending",
+                "position_id": position_id,
+                "signal_id": Uuid::new_v4(),
+                "timestamp": now,
+            }),
+        ),
+        (
+            4,
+            "entry_attempt_exhausted",
+            serde_json::json!({
+                "type": "entry_attempt_exhausted",
+                "position_id": position_id,
+                "signal_id": null,
+                "reason_code": "entry_not_sent",
+                "reason": "refused",
+                "timestamp": now,
+            }),
+        ),
+        (
+            5,
+            "position_error",
+            serde_json::json!({
+                "type": "position_error",
+                "position_id": position_id,
+                "error": "probe",
+                "recoverable": false,
+                "timestamp": now,
+            }),
+        ),
+    ] {
+        let envelope = make_envelope(&stream_key, event_type, payload, seq);
+        apply_event_to_projections(&pool, &envelope).await.unwrap();
+    }
+
+    assert_eq!(projection_tables(&pool).await?, before);
+    Ok(())
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn test_entry_signal_projects_executable_span_admission_payload(
