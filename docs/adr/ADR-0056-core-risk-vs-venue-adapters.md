@@ -997,6 +997,24 @@ rollback image must keep migrations 31, 32 and 33: SQLx's migrator rejects an ap
 venue or in the cluster, how often a journal write fails to land in production (each now closes admissions until a restart), and the
 repair's duration on a long suffix.
 
+*Month-boundary basis (outside the step sequence, ahead of the fence PR).* The month-boundary reset takes its basis from
+the operated wallet only. A failed wallet read, or a failed read of the previous month's base, appends no reset, and the
+60 s poll retries. The previous month's base, which prices the Armed reservation, is the one its reset recorded
+(`boundary_reset_at` set): with Armed legs and no such base the reset waits until the operator disarms them or records
+the base; with nothing Armed it needs none. Until the current month's reset lands, its basis is invalid through #300's
+path (ADR-0051 §1), additive to its numeric test: `basis_invalid = capital_base <= 0 OR the current month has no landed
+reset`, that is no row, or a row another writer (the peak refresh, a recalibration) created without `boundary_reset_at`.
+It is read in the same `load_monthly_state` query, from 00:00 UTC on and before the first poll: the canonical snapshot
+sets `capital_base_invalid` with no remaining capacity or slots, `budget_basis_is_invalid_now` sees it at the late
+revalidation, the gate gets no capital, so its denial never latches MonthlyHalt, an arm and an entry preview answer
+`AdmissionsClosed` (503), and `/status` and the current month's view (`capacity_invalid`) report it. Automatic
+budget-based MonthlyHalt is not evaluated; protection, reductions, recovery and `POST /monthly-halt` are unchanged.
+Cost: entries are denied from 00:00 UTC until the first successful poll, normally under a minute, and for as long as
+the wallet read keeps failing. `robsond_month_boundary_pending` reports a failed attempt for alerting; it never decides.
+This extends the #300 invalid-basis path for a missing reset ahead of the fence PR; F's accounting-invalid contract for
+suspended system streams builds on the same flag. F's suspended-stream contract, its month view for history and its
+release are not part of this. No migration.
+
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze
 contract 1.2.0; `rbx-data` vendors its own registry copy (1.1.3) and must re-vendor before any export runs. Every rollback
