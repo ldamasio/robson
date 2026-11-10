@@ -913,3 +913,71 @@ async fn a_client_disconnecting_mid_operation_leaves_it_to_complete(pool: PgPool
     })
     .await;
 }
+
+impl Harness {
+    /// This tenant's epochs, oldest first: marked clean, marker version.
+    async fn epochs(&self) -> Vec<(bool, Option<i16>)> {
+        sqlx::query_as(
+            "SELECT clean_stop_at IS NOT NULL, marker_version FROM process_epochs
+             WHERE tenant_id = $1 ORDER BY epoch_seq",
+        )
+        .bind(self.tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .expect("read process_epochs")
+    }
+}
+
+/// The log without its colour codes.
+fn plain(log: String) -> String {
+    let mut out = String::with_capacity(log.len());
+    let mut chars = log.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The epoch lands before any venue request: a start whose epoch the database
+/// refuses exits having sent the venue nothing at all.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_start_that_cannot_record_its_epoch_sends_the_venue_nothing(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        sqlx::query(
+            "CREATE FUNCTION refuse_epochs() RETURNS trigger AS $$
+             BEGIN RAISE EXCEPTION 'epochs refused by the test'; END $$ LANGUAGE plpgsql",
+        )
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse_epochs BEFORE INSERT ON process_epochs
+             FOR EACH ROW EXECUTE FUNCTION refuse_epochs()",
+        )
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+        let daemon = harness.daemon(None);
+        let status = daemon.wait_exit(STEP).await.expect("it refuses to start");
+        assert!(!status.success(), "{status}\n{}", daemon.log_tail());
+        assert!(
+            plain(daemon.log()).contains("epochs refused by the test"),
+            "{}",
+            daemon.log_tail()
+        );
+        assert_eq!(harness.venue.requests(), 0, "no venue request before the epoch");
+        assert!(harness.epochs().await.is_empty());
+    })
+    .await;
+}

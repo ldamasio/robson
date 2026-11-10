@@ -702,6 +702,10 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             .await
             .map_err(|error| DaemonError::Config(format!("Order journal not ready: {error}")))?;
 
+        // This process's epoch, with a strict commit before any venue request.
+        #[cfg(feature = "postgres")]
+        self.start_epoch().await?;
+
         // The startup phase holds the startup slot's permit throughout; the
         // startup scan and startup recovery run under it. Boxed: its future is
         // large.
@@ -1024,6 +1028,20 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         if let Err(e) = handled {
             error!(error = %e, "Error handling event");
         }
+    }
+
+    /// Insert this process's epoch, strictly, and record whether its start is
+    /// unclean (ADR-0056 step 7). Nothing without a database.
+    #[cfg(feature = "postgres")]
+    async fn start_epoch(&self) -> DaemonResult<Option<crate::process_epoch::Epoch>> {
+        let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id)
+        else {
+            return Ok(None);
+        };
+        let start =
+            crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION")).await?;
+        crate::process_epoch::record_start(&start);
+        Ok(Some(start.epoch))
     }
 
     async fn poll_month_boundary(&self, now: DateTime<Utc>) -> DaemonResult<bool> {

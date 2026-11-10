@@ -37,6 +37,7 @@
 //! - `robsond_aborted_operations_total` — operations dropped before completing
 //! - `robsond_api_slot_busy_total` — API requests refused on a full slot class,
 //!   labelled by class
+//! - `robsond_unclean_start` — why this process's start counts as unclean
 
 use std::sync::LazyLock;
 
@@ -185,6 +186,18 @@ pub static API_SLOT_BUSY: LazyLock<CounterVec> = LazyLock::new(|| {
         &["class"]
     )
     .expect("failed to register robsond_api_slot_busy_total")
+});
+
+/// 1 for the reason this process's start counts as unclean: `no_predecessor`,
+/// `no_marker`, or `marker_version` (every start until the fence PR writes
+/// version 2). Recorded only: nothing acts on it yet.
+pub static UNCLEAN_START: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
+        "robsond_unclean_start",
+        "Why this process's start counts as unclean (1 for the reason)",
+        &["reason"]
+    )
+    .expect("failed to register robsond_unclean_start")
 });
 
 /// Zero series for the gate's metrics, so they export from startup.

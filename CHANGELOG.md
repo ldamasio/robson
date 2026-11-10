@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Process epochs (ADR-0056 step 7, PR S, part 2)
+
+- Migration 32 adds `process_epochs`. Each start records its epoch before any venue request and refuses to start
+  when it cannot. A start after an unmarked epoch, or one marked below version 2, is logged and exported as
+  unclean (`robsond_unclean_start`); nothing acts on it before the fence ships, and until then every start is.
+
 ### Added - Operation permits and slot classes (ADR-0056 step 7, PR S, part 1)
 
 - Every operation that can change the venue runs under a permit taken before the manager lock: 16 ordinary API

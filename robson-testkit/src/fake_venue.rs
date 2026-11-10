@@ -65,6 +65,8 @@ struct Book {
     open_algos: HashMap<i64, Value>,
     next_id: i64,
     unserved: Vec<String>,
+    /// Every request received, served or not.
+    requests: u64,
     /// Market orders are read and held unanswered until released.
     hold_orders: bool,
     /// Market orders read and held so far.
@@ -128,6 +130,11 @@ impl FakeVenue {
         self.book().unserved.clone()
     }
 
+    /// Every request received so far, served or not.
+    pub fn requests(&self) -> u64 {
+        self.book().requests
+    }
+
     /// From now on, read market orders and hold them unanswered until
     /// [`FakeVenue::release_orders`]; the client's own bound may end one first,
     /// as an outcome it cannot know.
@@ -155,6 +162,7 @@ async fn serve(
     let lock = || book.lock().unwrap_or_else(|e| e.into_inner());
     let held = {
         let mut book = lock();
+        book.requests += 1;
         let held = book.hold_orders && method == Method::POST && uri.path() == "/fapi/v1/order";
         book.held += u64::from(held);
         held
