@@ -90,7 +90,11 @@ impl Harness {
         crash_point: Option<&str>,
         extra_env: &[(&str, &str)],
     ) -> DaemonProcess {
-        DaemonProcess::spawn(&DaemonSpec {
+        DaemonProcess::spawn(&self.spec(crash_point, extra_env)).expect("spawn robsond")
+    }
+
+    fn spec(&self, crash_point: Option<&str>, extra_env: &[(&str, &str)]) -> DaemonSpec {
+        DaemonSpec {
             binary: PathBuf::from(env!("CARGO_BIN_EXE_robsond")),
             work_dir: self.work_dir.clone(),
             database_url: self.database_url.clone(),
@@ -101,8 +105,7 @@ impl Harness {
             extra_env: extra_env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             removed_env: Vec::new(),
             dotenv: String::new(),
-        })
-        .expect("spawn robsond")
+        }
     }
 
     /// The journal's view of its intents of `kind`: client id, outcome,
@@ -977,6 +980,32 @@ async fn a_start_that_cannot_record_its_epoch_sends_the_venue_nothing(pool: PgPo
             daemon.log_tail()
         );
         assert_eq!(harness.venue.requests(), 0, "no venue request before the epoch");
+        assert!(harness.epochs().await.is_empty());
+    })
+    .await;
+}
+
+/// A venue that can mutate never starts without its epoch: the real binary, on
+/// USD-M with usable credentials and no `DATABASE_URL`, refuses to start
+/// before any request reaches the venue. Only the stub runs without one.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_mutating_venue_without_a_database_does_not_start(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        let daemon = DaemonProcess::spawn(&DaemonSpec {
+            removed_env: vec!["DATABASE_URL".to_string()],
+            ..harness.spec(None, &[])
+        })
+        .expect("spawn robsond");
+        let status = daemon.wait_exit(STEP).await.expect("it refuses to start");
+        assert!(!status.success(), "{status}\n{}", daemon.log_tail());
+        assert!(
+            plain(daemon.log()).contains("starts only on a process epoch"),
+            "{}",
+            daemon.log_tail()
+        );
+        assert_eq!(harness.venue.requests(), 0, "no venue request without an epoch");
         assert!(harness.epochs().await.is_empty());
     })
     .await;

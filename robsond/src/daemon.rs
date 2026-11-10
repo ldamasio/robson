@@ -207,6 +207,19 @@ async fn run_order_journal_retry(
     crate::metrics::observe_order_journal(&journal);
 }
 
+/// A venue that can mutate starts only on a process epoch (ADR-0056 step 7):
+/// without one, the fence PR's generation has no high half and a later start
+/// cannot tell how this one ended. The stub, the simulator, may start without.
+fn refuse_an_epochless_venue(venue: &robson_exec::venue::VenueId) -> DaemonResult<()> {
+    if venue.as_str() == robson_exec::stub::STUB_VENUE_ID {
+        return Ok(());
+    }
+    Err(DaemonError::Config(format!(
+        "Venue {venue} starts only on a process epoch, which needs DATABASE_URL and a build with \
+         PostgreSQL; refusing to start. Only ROBSON_VENUE=stub runs without one"
+    )))
+}
+
 impl Daemon<StubExchange, MemoryStore> {
     /// Create a new daemon with stub components (for testing/development).
     pub fn new_stub(config: Config) -> Self {
@@ -703,7 +716,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             .map_err(|error| DaemonError::Config(format!("Order journal not ready: {error}")))?;
 
         // This process's epoch, with a strict commit before any venue request.
-        #[cfg(feature = "postgres")]
+        // Only the stub starts without one.
         self.start_epoch().await?;
 
         // The startup phase holds the startup slot's permit throughout; the
@@ -1031,17 +1044,25 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     }
 
     /// Insert this process's epoch, strictly, and record whether its start is
-    /// unclean (ADR-0056 step 7). Nothing without a database.
+    /// unclean (ADR-0056 step 7). Without a database there is none, and only
+    /// the stub may start.
     #[cfg(feature = "postgres")]
     async fn start_epoch(&self) -> DaemonResult<Option<crate::process_epoch::Epoch>> {
         let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id)
         else {
+            refuse_an_epochless_venue(self.exchange.id())?;
             return Ok(None);
         };
         let start =
             crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION")).await?;
         crate::process_epoch::record_start(&start);
         Ok(Some(start.epoch))
+    }
+
+    /// A build without PostgreSQL has no epochs: only the stub may start.
+    #[cfg(not(feature = "postgres"))]
+    async fn start_epoch(&self) -> DaemonResult<()> {
+        refuse_an_epochless_venue(self.exchange.id())
     }
 
     async fn poll_month_boundary(&self, now: DateTime<Utc>) -> DaemonResult<bool> {
@@ -2418,6 +2439,39 @@ mod tests {
             let (route, route_mode) = daemon.funding_worker_route();
             assert_eq!(route_mode, mode, "{case}");
             assert_eq!(route.id().as_str(), route_id, "{case}");
+        }
+    }
+
+    /// Without a database only the stub starts: a venue that can mutate,
+    /// selected explicitly or from credentials, is refused at its epoch, which
+    /// comes before any request to it (ADR-0056 step 7).
+    #[tokio::test]
+    async fn without_a_database_only_the_stub_starts() {
+        use crate::config::{Environment::*, VenueSelection::*};
+
+        let cases = [
+            (Stub, false, false, Development, true),
+            (Unset, false, false, Production, true),
+            (Unset, true, false, Development, true),
+            (BinanceUsdm, true, true, Development, false),
+            (Unset, true, true, Development, false),
+            (Unset, true, false, Production, false),
+        ];
+        for (selection, credentials, use_testnet, environment, starts) in cases {
+            let case = format!("{selection:?} {credentials} {use_testnet} {environment:?}");
+            let daemon = daemon_from_factory(factory_config(
+                selection,
+                credentials,
+                use_testnet,
+                environment,
+            ));
+            match daemon.start_epoch().await {
+                Ok(_) => assert!(starts, "{case}: {} started", daemon.exchange.id()),
+                Err(error) => {
+                    assert!(!starts, "{case}: {error}");
+                    assert!(error.to_string().contains("process epoch"), "{case}: {error}");
+                },
+            }
         }
     }
 

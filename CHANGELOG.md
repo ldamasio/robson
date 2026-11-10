@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Migration 32 adds `process_epochs`. Each start records its epoch before any venue request and refuses to start
   when it cannot. A start after an unmarked epoch, or one marked below version 2, is logged and exported as
   unclean (`robsond_unclean_start`); nothing acts on it before the fence ships, and until then every start is.
+- Without `DATABASE_URL`, or in a build without PostgreSQL, only the stub venue starts: a venue that can trade,
+  `binance_usdm` named or selected from credentials, is refused before any request to it.
 
 ### Added - Operation permits and slot classes (ADR-0056 step 7, PR S, part 1)
 

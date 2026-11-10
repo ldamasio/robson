@@ -827,6 +827,9 @@ previous epoch and inserts this one. The start is refused when that does not lan
 when `epoch_seq` would reach 2^31, the high half of the fence PR's generation; that row is rolled back. A predecessor with no marker, or one
 older than version 2, makes the start unclean: logged, and `robsond_unclean_start{reason}` is 1 for `no_predecessor`, `no_marker` or
 `marker_version`. Only the fence PR writes version 2, so every start is unclean until then, and that is all this part does with it.
+Without a database, or in a build without PostgreSQL, there is no epoch, and only the stub starts: any other venue, `binance_usdm` whether
+named in `ROBSON_VENUE` or selected from credentials, is refused there, before any request to it. The simulator mode is
+`ROBSON_VENUE=stub`, or an unset `ROBSON_VENUE` that resolves to the stub; no checked-in workflow ran a real venue without a database.
 
 **Rollback across parts 1 and 2 is boundary B,** with the daemon stopped, and an image that keeps migrations 31 and 32: SQLx's migrator
 rejects an applied migration missing from its embedded set, so pinning back to `sha-b06aecb1` or `sha-23501535` is refused by that image's
@@ -902,7 +905,7 @@ only).
 | API slot class full (step 7, PR S) | 503 `busy` at once, nothing done; the other classes keep their slots | the caller retries | `robsond_api_slot_busy_total{class}` |
 | Venue mutation without a permit (step 7, PR S) | while open: sent, counted, latch set; while stopping: refused, nothing sent | — | `robsond_unpermitted_mutations_total`, `robsond_journal_latch` |
 | Operation dropped mid-flight: a panic, a cancelled internal future (step 7, PR S) | each intent it left open is sealed: one whose send may have started ends uncertain, one proven unsent ends not sent, both through the retry set; one with nothing to record is dropped. The permit counts as aborted and sets the latch | — | `robsond_aborted_operations_total`, `robsond_journal_latch` |
-| Database down or refusing the epoch at start (step 7, PR S) | no start, before any venue request | the pod restarts | the error in the log |
+| Database down or refusing the epoch at start, or none configured for a venue other than the stub (step 7, PR S) | no start, before any venue request | the pod restarts | the error in the log |
 | Venue REST dies | rules/costs/valuation stale → basis invalid, admission fails closed; risk reduction proceeds on the last validated rules or the persisted snapshot, with one refresh and resubmit per rejection; a leg holding neither waits for the lookup, then a decided exit goes out as given and a tick fails closed (§5) | reads from cache until TTL; protection on the venue, except a leg whose exit failed, until the heal | per-venue `eligible=false` + reasons; alert |
 | Venue feed silent | watchdog after `ROBSON_FEED_SILENCE_MAX`; REST snapshot resync; trailing advances continue on REST ticks within the request budget | bounded REST polling | silent-feed metric, event |
 | Daemon dies mid fan-out | accepted legs are protected on their venues except for a leg killed between entry fill and protection placement, which recovery protects or flattens first | startup recovery reads the durable journal and each venue's observation; completes, protects or releases per evidence | recovery events per leg |
@@ -1071,9 +1074,9 @@ Budget model for multi-venue:
   and the stale DB-gated count).
 - v14 (2026-11-10): §8, the failure modes and the Implementation Notes aligned with step 7 PR S as implemented against design note v8, in
   parts 1 and 2 of three: permits and slots, process epochs. Closes the J boundary that ended an entry's operation before its stop.
-  Codex round 1 on the three parts: REQUEST_CHANGES (1 P1, 2 P2, a vacuous required test, P3s). In part 1 since then an unpermitted
-  mutation is latched under the gate's mutex, an API operation runs in its own task, so a client's disconnect no longer cancels it, and
-  the `/panic` capacity test closes a real leg. No risk number changed.
+  Codex round 1 on the three parts: REQUEST_CHANGES (1 P1, 2 P2, a vacuous required test, P3s). Since then an unpermitted mutation is
+  latched under the gate's mutex, an API operation runs in its own task, so a client's disconnect no longer cancels it, the `/panic`
+  capacity test closes a real leg, and a venue that can trade does not start without an epoch. No risk number changed.
 - v13 (2026-11-09): §8 and the failure modes aligned with step 7 PR C as implemented against design note v8: typed cancel classification,
   uncertainty journaled and not fencing until the fence PR. No risk number changed.
 - v12 (2026-11-08): §2's finality paragraph, §8 and the failure modes aligned with step 7 PR J as implemented in three stacked PRs,
