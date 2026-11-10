@@ -32,7 +32,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::ExecError,
-    order_journal::{report_rejected, report_send_started, OrderJournal},
+    gate::OperationGate,
+    order_journal::{begin_send, report_rejected, report_send_started, OrderJournal, SendRefusal},
     ports::{
         ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord, OpenOrderRecord,
         OrderResult, SpotBalance, SpotOrder, SpotOrderRequest, Transfer, TransferId,
@@ -228,10 +229,29 @@ impl SubmitAttemptLedger {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Register one attempt, unresolved until [`SubmitAttempt::rejected`], and
-    /// report the send ticket to the journal: every send passes here last.
+    /// Start a send: the gate's send start, then one attempt registered,
+    /// unresolved until [`SubmitAttempt::rejected`]. Every send passes here
+    /// last, immediately before its request (ADR-0056 step 7).
+    ///
+    /// # Errors
+    /// The gate refused an entry because the daemon is stopping. Nothing is
+    /// registered and nothing may be sent: a proven no-send.
+    pub fn begin_send<'a>(
+        &'a self,
+        client_order_id: &'a str,
+    ) -> Result<SubmitAttempt<'a>, SendRefusal> {
+        begin_send(client_order_id)?;
+        Ok(self.register(client_order_id))
+    }
+
+    /// Register one attempt and report its ticket without the gate's refusal:
+    /// for tests of the ledger. A send goes through [`Self::begin_send`].
     pub fn begin<'a>(&'a self, client_order_id: &'a str) -> SubmitAttempt<'a> {
         report_send_started(client_order_id);
+        self.register(client_order_id)
+    }
+
+    fn register<'a>(&'a self, client_order_id: &'a str) -> SubmitAttempt<'a> {
         let mut state = self.lock();
         if !state.truncated {
             if let Some(counts) = state.attempts.get_mut(client_order_id) {
@@ -251,18 +271,23 @@ impl SubmitAttemptLedger {
         SubmitAttempt { ledger: self, client_order_id }
     }
 
-    /// Run `request` as one attempt with `client_order_id`. The attempt is on
-    /// record before `request` is first polled, so before anything can be
-    /// sent, and stays unresolved if this future is dropped at any point.
+    /// Run `request` as one attempt with `client_order_id`. The gate's send
+    /// start runs and the attempt is on record immediately before `request` is
+    /// first polled, with no await in between, so before anything can be sent;
+    /// the attempt stays unresolved if this future is dropped at any point.
     /// `is_rejection` is the venue's allow-list of authoritative rejections;
     /// any other outcome leaves the attempt unresolved.
-    pub async fn submit<T, E>(
+    ///
+    /// # Errors
+    /// `request`'s error, or the gate's refusal of an entry, which never polls
+    /// `request`.
+    pub async fn submit<T, E: From<SendRefusal>>(
         &self,
         client_order_id: &str,
         is_rejection: impl FnOnce(&E) -> bool,
         request: impl Future<Output = Result<T, E>>,
     ) -> Result<T, E> {
-        let attempt = self.begin(client_order_id);
+        let attempt = self.begin_send(client_order_id)?;
         let result = request.await;
         if let Err(error) = &result {
             if is_rejection(error) {
@@ -869,6 +894,10 @@ pub trait Venue: TradingPort + AccountPort {
     /// Give the venue's attempt ledger the durable journal. A venue without a
     /// ledger has nothing to attach.
     fn attach_order_journal(&self, _journal: Arc<OrderJournal>) {}
+    /// Give the venue's transport the permit gate (ADR-0056 step 7): every
+    /// mutation it sends passes [`OperationGate::mutation`] first. No default:
+    /// a venue says how its mutations reach the gate.
+    fn attach_gate(&self, gate: Arc<OperationGate>);
     fn position_account(&self) -> Option<&dyn PositionAccountPort>;
     fn inventory(&self) -> Option<&dyn InventoryPort>;
     fn settlement(&self) -> &dyn SettlementPort;
@@ -1055,6 +1084,10 @@ mod tests {
         }
     }
 
+    fn refused() -> ExecError {
+        ExecError::OrderRejected("refused".to_string())
+    }
+
     #[tokio::test]
     async fn submit_registers_before_the_request_is_polled() {
         let ledger = SubmitAttemptLedger::new(8);
@@ -1063,7 +1096,7 @@ mod tests {
                 unresolved: 1,
                 rejected: 0
             });
-            Err::<(), &str>("refused")
+            Err::<(), ExecError>(ExecError::OrderRejected("refused".to_string()))
         };
         let submit = ledger.submit("c1", |_| true, request);
         // Futures are lazy: built but never polled, nothing was sent.
@@ -1075,7 +1108,11 @@ mod tests {
     #[tokio::test]
     async fn dropped_submit_stays_unresolved_even_after_a_rejected_retry() {
         let ledger = SubmitAttemptLedger::new(8);
-        let stuck = ledger.submit("c1", |_: &()| true, std::future::pending::<Result<(), ()>>());
+        let stuck = ledger.submit(
+            "c1",
+            |_: &ExecError| true,
+            std::future::pending::<Result<(), ExecError>>(),
+        );
         // One poll sends the request; the elapsed timeout then drops the future.
         assert!(tokio::time::timeout(Duration::from_millis(1), stuck).await.is_err());
         assert_eq!(ledger.evidence("c1"), AttemptEvidence::Unresolved {
@@ -1084,7 +1121,7 @@ mod tests {
         });
         assert!(is_unknown(&ledger, "c1"));
 
-        let retry = ledger.submit("c1", |_| true, async { Err::<(), ()>(()) });
+        let retry = ledger.submit("c1", |_| true, async { Err::<(), _>(refused()) });
         assert!(retry.await.is_err());
         assert_eq!(ledger.evidence("c1"), AttemptEvidence::Unresolved {
             unresolved: 1,
@@ -1096,9 +1133,9 @@ mod tests {
     #[tokio::test]
     async fn submit_leaves_outcomes_outside_the_allow_list_unresolved() {
         let ledger = SubmitAttemptLedger::new(8);
-        let accepted = ledger.submit("ok", |_: &()| true, async { Ok::<(), ()>(()) });
+        let accepted = ledger.submit("ok", |_: &ExecError| true, async { Ok::<(), _>(()) });
         accepted.await.unwrap();
-        let failed = ledger.submit("failed", |_| false, async { Err::<(), ()>(()) });
+        let failed = ledger.submit("failed", |_| false, async { Err::<(), _>(refused()) });
         assert!(failed.await.is_err());
         for id in ["ok", "failed"] {
             assert_eq!(ledger.evidence(id), AttemptEvidence::Unresolved {

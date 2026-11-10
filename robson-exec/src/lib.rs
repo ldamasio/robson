@@ -42,6 +42,7 @@ mod compat;
 pub mod crash_points;
 pub mod error;
 pub mod executor;
+pub mod gate;
 pub mod intent;
 pub mod order_journal;
 pub mod ports;

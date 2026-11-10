@@ -28,8 +28,8 @@ use robson_engine::Engine;
 #[cfg(feature = "postgres")]
 use robson_eventlog::{query_events, query_stream_in_seq_order, EventEnvelope, QueryOptions};
 use robson_exec::{
-    order_journal::OrderJournal, venue::Venue, ExchangePort, Executor, IntentJournal, OhlcvPort,
-    StubExchange, StubTradeFeed, TradeFeedPort,
+    gate::OperationKind, order_journal::OrderJournal, venue::Venue, ExchangePort, Executor,
+    IntentJournal, OhlcvPort, StubExchange, StubTradeFeed, TradeFeedPort,
 };
 // Optional projection recovery for crash recovery
 #[cfg(feature = "postgres")]
@@ -119,6 +119,10 @@ pub struct Daemon<E: Venue + 'static, S: Store + 'static> {
     pg_pool: Option<Arc<sqlx::PgPool>>,
     /// Last month processed by the month-boundary poller.
     last_month_check: Arc<RwLock<(i32, u32)>>,
+    /// The executor's journal, whose gate gives every operation its permit
+    /// (ADR-0056 step 7). Held here so nothing reaches it through the manager
+    /// lock.
+    order_journal: Arc<OrderJournal>,
 }
 
 /// Parse entry_mode and approval_mode strings from DB into EntryPolicyConfig.
@@ -152,6 +156,17 @@ fn initial_month_check() -> Arc<RwLock<(i32, u32)>> {
     // first poll always runs handle_month_boundary, which consults persisted
     // MonthBoundaryReset evidence and no-ops when the reset already exists.
     Arc::new(RwLock::new((0, 0)))
+}
+
+/// Pass every venue mutation through the gate of the executor's journal
+/// (ADR-0056 step 7), and return that journal.
+fn gated<E: Venue + 'static, S: Store + 'static>(
+    venue: &Arc<E>,
+    executor: &Executor<E, S>,
+) -> Arc<OrderJournal> {
+    let journal = executor.order_journal();
+    venue.attach_gate(Arc::clone(journal.gate()));
+    journal
 }
 
 /// Give the executor the durable order journal, when there is a database for
@@ -201,6 +216,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
+        let order_journal = gated(&exchange, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
         // Execution-cost buffer parameters are operator-configured and must
@@ -255,6 +271,7 @@ impl Daemon<StubExchange, MemoryStore> {
             #[cfg(feature = "postgres")]
             pg_pool: None,
             last_month_check: initial_month_check(),
+            order_journal,
         }
     }
 
@@ -288,6 +305,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
+        let order_journal = gated(&exchange, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
         let risk_config = RiskConfig::new(capital)?
@@ -330,6 +348,7 @@ impl Daemon<StubExchange, MemoryStore> {
             #[cfg(feature = "postgres")]
             pg_pool: None,
             last_month_check: initial_month_check(),
+            order_journal,
         })
     }
 
@@ -348,6 +367,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
+        let order_journal = gated(&exchange, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder: Arc<dyn QueryRecorder> =
             if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
@@ -408,6 +428,7 @@ impl Daemon<StubExchange, MemoryStore> {
             projection_recovery,
             pg_pool,
             last_month_check: initial_month_check(),
+            order_journal,
         }
     }
 }
@@ -426,6 +447,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(Arc::clone(&venue), journal, store.clone()));
+        let order_journal = gated(&venue, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
         // Placeholder capital; will be updated from exchange in run().
@@ -482,6 +504,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             #[cfg(feature = "postgres")]
             pg_pool: None,
             last_month_check: initial_month_check(),
+            order_journal,
         }
     }
 
@@ -501,6 +524,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
         let store = Arc::new(MemoryStore::new());
         let executor = Executor::new(Arc::clone(&venue), journal, store.clone());
         let executor = Arc::new(with_durable_order_journal(executor, &venue, &pg_pool, &config));
+        let order_journal = gated(&venue, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
 
         let query_recorder: Arc<dyn QueryRecorder> =
@@ -567,6 +591,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             projection_recovery,
             pg_pool,
             last_month_check: initial_month_check(),
+            order_journal,
         }
     }
 }
@@ -575,9 +600,13 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     /// Set where older unfinished funding sagas are recovered when the venue
     /// has no funding surface.
     pub fn with_funding_recovery_route(mut self, route: Option<Arc<E>>) -> Self {
+        if let Some(route) = &route {
+            route.attach_gate(Arc::clone(self.order_journal.gate()));
+        }
         self.funding_recovery_route = route;
         self
     }
+
 
     /// The route the funding worker runs on and how it treats unfinished sagas
     /// there (ADR-0056 §3). The worker exists whatever the selected venue
@@ -662,90 +691,32 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         // Shutdown token for coordinating graceful shutdown
         let shutdown_sig = shutdown.clone();
 
+        let journal = Arc::clone(&self.order_journal);
+        crate::metrics::init_operation_gate_metrics();
+        journal.gate().set_observer(Arc::new(crate::metrics::GateMetrics));
+
         // The journal must take writes before anything can be sent: this warms
         // its pool and refuses a schema without its tables (ADR-0056 step 7).
-        self.position_manager
-            .read()
-            .await
-            .order_journal()
+        journal
             .check_ready()
             .await
             .map_err(|error| DaemonError::Config(format!("Order journal not ready: {error}")))?;
 
-        // 0. Initialize capital from exchange (best-effort)
-        self.initialize_capital().await;
-
-        // 1. Rebuild store from event log (crash recovery)
-        self.rebuild_store().await?;
-
-        // 2. Invalidate durable query approvals that cannot be rehydrated safely.
-        #[cfg(feature = "postgres")]
-        self.invalidate_restart_pending_queries().await?;
-
-        // 3. Restore active positions
-        self.restore_positions().await?;
-
-        // 3b. Re-spawn detector tasks for Armed positions (entry policy recovery).
-        // entry_policies is in-memory only; restore it from the projection so
-        // Armed positions don't silently stall after a restart.
-        #[cfg(feature = "postgres")]
-        self.restore_armed_detectors().await;
-
-        // 3a. Startup stale-active gate (fail-closed; exit code 78 on abort).
-        // Runs immediately — no grace period. Must precede the UNTRACKED scan.
-        info!("Running startup stale-active gate");
-        self.run_startup_stale_active_gate().await?;
-        info!("Startup stale-active gate: passed");
-
-        let reconciliation_interval = Duration::from_secs(self.config.reconciliation.interval_secs);
-        let missing_grace = Duration::from_secs(self.config.reconciliation.missing_grace_secs);
-        let startup_reconciliation = ReconciliationWorker::new_with_missing_grace(
-            Arc::clone(&self.exchange),
-            Arc::clone(&self.position_manager),
-            Arc::clone(&self.store),
-            Arc::clone(&self.event_bus),
-            reconciliation_interval,
-            missing_grace,
-            shutdown.clone(),
-        );
-        info!("Running startup reconciliation scan");
-        let untracked_count = startup_reconciliation.scan_and_reconcile_blocking().await?;
-        if untracked_count > 0 {
-            return Err(DaemonError::Config(format!(
-                "Startup aborted: {} UNTRACKED positions detected and closed. Review exchange account before restarting.",
-                untracked_count
-            )));
-        }
-        info!("Startup reconciliation clean (0 UNTRACKED)");
-
-        // 3b. Startup recovery: catch-up missed stop hits during downtime.
-        {
-            let pm = self.position_manager.read().await;
-            let ohlcv_port = pm.ohlcv_port();
-            match crate::startup_recovery::run_startup_recovery(&pm, &ohlcv_port).await {
-                Ok(report) => {
-                    if report.positions_closed > 0 || report.stops_updated > 0 {
-                        info!(%report, "Startup recovery applied catch-up actions");
-                    } else {
-                        info!("Startup recovery: no catch-up needed");
-                    }
-                },
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "Startup recovery failed — continuing with live ticks only. \
-                         Positions that crossed their stop during downtime will NOT be \
-                         retroactively closed."
-                    );
-                },
-            }
-        }
+        // The startup phase holds the startup slot's permit throughout; the
+        // startup scan and startup recovery run under it. Boxed: its future is
+        // large.
+        journal
+            .acquire(OperationKind::Startup)?
+            .run(Box::pin(self.start_up(&shutdown)))
+            .await?;
 
         // 4. Start API server
         let api_addr = self.start_api_server().await?;
         info!(%api_addr, "API server started");
 
         // 5. Spawn reconciliation worker (uses explicit missing_grace from config)
+        let reconciliation_interval = Duration::from_secs(self.config.reconciliation.interval_secs);
+        let missing_grace = Duration::from_secs(self.config.reconciliation.missing_grace_secs);
         let reconciliation_worker = ReconciliationWorker::new_with_missing_grace(
             Arc::clone(&self.exchange),
             Arc::clone(&self.position_manager),
@@ -754,7 +725,8 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             reconciliation_interval,
             missing_grace,
             shutdown.clone(),
-        );
+        )
+        .with_order_journal(Arc::clone(&journal));
         let reconciliation_handle = tokio::spawn(async move {
             if let Err(e) = reconciliation_worker.run().await {
                 error!(error = %e, "Reconciliation worker failed");
@@ -826,7 +798,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
 
         #[cfg(feature = "postgres")]
         let funding_handle = if let Some(service) = self.funding_worker_service() {
-            let worker = FundingWorker::new(service);
+            let worker = FundingWorker::new(service).with_order_journal(Arc::clone(&journal));
             let worker_shutdown = shutdown.clone();
             Some(tokio::spawn(async move {
                 if let Err(e) = worker.run(worker_shutdown).await {
@@ -877,10 +849,9 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         let income_ledger_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         // 7a. Keep the order journal's retry set moving (ADR-0056 step 7).
-        let order_journal = self.position_manager.read().await.order_journal();
-        crate::metrics::observe_order_journal(&order_journal);
+        crate::metrics::observe_order_journal(&journal);
         let order_journal_handle =
-            tokio::spawn(run_order_journal_retry(order_journal, shutdown.clone()));
+            tokio::spawn(run_order_journal_retry(Arc::clone(&journal), shutdown.clone()));
 
         // 8. Subscribe to event bus
         let mut event_receiver = self.event_bus.subscribe();
@@ -912,11 +883,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 // Process events from event bus
                 Some(event_result) = event_receiver.recv() => {
                     match event_result {
-                        Ok(event) => {
-                            if let Err(e) = self.handle_event(event).await {
-                                error!(error = %e, "Error handling event");
-                            }
-                        }
+                        Ok(event) => self.handle_event_permitted(&journal, event).await,
                         Err(lag_msg) => {
                             warn!(%lag_msg, "Event receiver lagged");
                         }
@@ -968,6 +935,95 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         self.shutdown().await?;
 
         Ok(())
+    }
+
+    /// The startup phase, under the startup permit: capital, recovery from the
+    /// event log, the stale-active gate, the startup scan and startup recovery.
+    async fn start_up(&self, shutdown: &tokio_util::sync::CancellationToken) -> DaemonResult<()> {
+        // 0. Initialize capital from exchange (best-effort)
+        self.initialize_capital().await;
+
+        // 1. Rebuild store from event log (crash recovery)
+        self.rebuild_store().await?;
+
+        // 2. Invalidate durable query approvals that cannot be rehydrated safely.
+        #[cfg(feature = "postgres")]
+        self.invalidate_restart_pending_queries().await?;
+
+        // 3. Restore active positions
+        self.restore_positions().await?;
+
+        // 3b. Re-spawn detector tasks for Armed positions (entry policy recovery).
+        // entry_policies is in-memory only; restore it from the projection so
+        // Armed positions don't silently stall after a restart.
+        #[cfg(feature = "postgres")]
+        self.restore_armed_detectors().await;
+
+        // 3a. Startup stale-active gate (fail-closed; exit code 78 on abort).
+        // Runs immediately — no grace period. Must precede the UNTRACKED scan.
+        info!("Running startup stale-active gate");
+        self.run_startup_stale_active_gate().await?;
+        info!("Startup stale-active gate: passed");
+
+        let reconciliation_interval = Duration::from_secs(self.config.reconciliation.interval_secs);
+        let missing_grace = Duration::from_secs(self.config.reconciliation.missing_grace_secs);
+        let startup_reconciliation = ReconciliationWorker::new_with_missing_grace(
+            Arc::clone(&self.exchange),
+            Arc::clone(&self.position_manager),
+            Arc::clone(&self.store),
+            Arc::clone(&self.event_bus),
+            reconciliation_interval,
+            missing_grace,
+            shutdown.clone(),
+        )
+        .with_order_journal(Arc::clone(&self.order_journal));
+        info!("Running startup reconciliation scan");
+        let untracked_count = startup_reconciliation.scan_and_reconcile_blocking().await?;
+        if untracked_count > 0 {
+            return Err(DaemonError::Config(format!(
+                "Startup aborted: {} UNTRACKED positions detected and closed. Review exchange account before restarting.",
+                untracked_count
+            )));
+        }
+        info!("Startup reconciliation clean (0 UNTRACKED)");
+
+        // 3b. Startup recovery: catch-up missed stop hits during downtime.
+        {
+            let pm = self.position_manager.read().await;
+            let ohlcv_port = pm.ohlcv_port();
+            match crate::startup_recovery::run_startup_recovery(&pm, &ohlcv_port).await {
+                Ok(report) => {
+                    if report.positions_closed > 0 || report.stops_updated > 0 {
+                        info!(%report, "Startup recovery applied catch-up actions");
+                    } else {
+                        info!("Startup recovery: no catch-up needed");
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Startup recovery failed — continuing with live ticks only. \
+                         Positions that crossed their stop during downtime will NOT be \
+                         retroactively closed."
+                    );
+                },
+            }
+        }
+        Ok(())
+    }
+
+    /// One main-loop event, under the main loop's permit (ADR-0056 step 7).
+    async fn handle_event_permitted(&self, journal: &Arc<OrderJournal>, event: DaemonEvent) {
+        let handled = match journal.acquire(OperationKind::MainLoop) {
+            Ok(permit) => permit.run(Box::pin(self.handle_event(event))).await,
+            Err(refusal) => {
+                warn!(%refusal, "Main loop event not handled");
+                return;
+            },
+        };
+        if let Err(e) = handled {
+            error!(error = %e, "Error handling event");
+        }
     }
 
     async fn poll_month_boundary(&self, now: DateTime<Utc>) -> DaemonResult<bool> {
@@ -1848,7 +1904,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             funding: self.config.funding.clone(),
             funding_route_mode: self.funding_worker_route().1,
             venue_feed,
-            order_journal: self.position_manager.read().await.order_journal(),
+            order_journal: Arc::clone(&self.order_journal),
         });
 
         let router = create_router(state);
@@ -3272,6 +3328,104 @@ mod tests {
     // -------------------------------------------------------------------------
     // TD-2026-05-05-001 Slice 5A — Startup stale-active gate tests
     // -------------------------------------------------------------------------
+
+    // ---- Operation permits and the stop (ADR-0056 step 7, PR S) --------
+
+    /// Every venue mutation the stub saw ran under `kind`, the one permit held,
+    /// in one internal slot.
+    fn assert_every_mutation_under(exchange: &StubExchange, kind: OperationKind) {
+        let mutations = exchange.mutations();
+        assert!(!mutations.is_empty(), "the operation reached the venue");
+        for mutation in mutations {
+            assert_eq!(mutation.permit, Some(kind), "{mutation:?}");
+            let gate = mutation.gate.expect("the daemon's stub passes the gate");
+            assert_eq!((gate.permits, gate.internal, gate.unpermitted), (1, 1, 0), "{mutation:?}");
+        }
+    }
+
+    /// One main-loop event runs under the main loop's permit, the entry it
+    /// makes and that entry's stop included; once Closing has begun, a new
+    /// event is not handled at all.
+    #[tokio::test]
+    async fn a_main_loop_event_runs_under_the_main_loop_permit() {
+        use robson_domain::{DetectorSignal, Symbol};
+        use rust_decimal_macros::dec;
+
+        let daemon = Daemon::new_stub_with_capital(Config::test(), dec!(10000)).unwrap();
+        let arm = || async {
+            daemon
+                .position_manager
+                .read()
+                .await
+                .arm_position(
+                    Symbol::from_pair("BTCUSDT").unwrap(),
+                    Side::Long,
+                    RiskConfig::new(dec!(10000)).unwrap(),
+                    Some(TechnicalStopDistance::from_entry_and_stop(
+                        Price::new(dec!(100)).unwrap(),
+                        Price::new(dec!(90)).unwrap(),
+                    )),
+                    uuid::Uuid::now_v7(),
+                )
+                .await
+                .unwrap()
+        };
+        let signal = |position: &robson_domain::Position| {
+            DaemonEvent::DetectorSignal(DetectorSignal {
+                signal_id: uuid::Uuid::now_v7(),
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: Side::Long,
+                entry_price: Price::new(dec!(95000)).unwrap(),
+                stop_loss: Price::new(dec!(86000)).unwrap(),
+                technical_stop_analysis: None,
+                timestamp: Utc::now(),
+            })
+        };
+
+        let first = arm().await;
+        daemon.handle_event_permitted(&daemon.order_journal, signal(&first)).await;
+        let what: Vec<_> = daemon.exchange.mutations().iter().map(|m| m.what).collect();
+        assert!(what.contains(&"POST /fapi/v1/order"), "the entry: {what:?}");
+        assert!(what.contains(&"POST /fapi/v1/algoOrder"), "its stop: {what:?}");
+        assert_every_mutation_under(&daemon.exchange, OperationKind::MainLoop);
+
+        let second = arm().await;
+        daemon.order_journal.gate().begin_closing();
+        let sent = daemon.exchange.mutations().len();
+        daemon.handle_event_permitted(&daemon.order_journal, signal(&second)).await;
+        assert_eq!(daemon.exchange.mutations().len(), sent);
+        let second = daemon.store.positions().find_by_id(second.id).await.unwrap().unwrap();
+        assert!(matches!(second.state, PositionState::Armed), "{:?}", second.state);
+        assert_eq!(daemon.order_journal.gate().snapshot().permits, 0);
+    }
+
+    /// The startup phase holds the startup slot's one permit, and the startup
+    /// scan's close of an untracked position runs under it, not under a
+    /// reconciliation permit of its own.
+    #[tokio::test]
+    async fn the_startup_scan_runs_under_the_startup_permit() {
+        use rust_decimal_macros::dec;
+
+        let daemon = Daemon::new_stub(Config::test());
+        let (exchange, journal) = (Arc::clone(&daemon.exchange), Arc::clone(&daemon.order_journal));
+        exchange.set_open_position(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+            Quantity::new(dec!(0.01)).unwrap(),
+            Price::new(dec!(95000)).unwrap(),
+        );
+
+        let result = daemon.run_until(tokio_util::sync::CancellationToken::new()).await;
+
+        assert!(
+            matches!(result, Err(DaemonError::Config(ref error)) if error.contains("UNTRACKED")),
+            "{result:?}"
+        );
+        assert_every_mutation_under(&exchange, OperationKind::Startup);
+        let gate = journal.gate().snapshot();
+        assert_eq!((gate.permits, gate.aborted), (0, 0));
+    }
 
     fn active_position(symbol: robson_domain::Symbol, side: Side) -> robson_domain::Position {
         use rust_decimal_macros::dec;

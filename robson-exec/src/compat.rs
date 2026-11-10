@@ -872,6 +872,7 @@ mod recorded_forwarding {
         fn id(&self) -> &VenueId {
             &self.id
         }
+        fn attach_gate(&self, _gate: std::sync::Arc<crate::gate::OperationGate>) {}
         fn position_account(&self) -> Option<&dyn PositionAccountPort> {
             Some(self)
         }

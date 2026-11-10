@@ -735,3 +735,181 @@ async fn proxy_blackhole_leaves_the_client_to_its_own_timeout(pool: PgPool) {
     })
     .await;
 }
+
+// ---- Permits, epochs and the stop (ADR-0056 step 7, PR S) -------------------
+
+/// The send start against a phase change, through the real adapter, ledger
+/// and transport to the fake venue (design §8, interleaving 3, for the stop):
+/// every entry that reached the venue was ticketed while the daemon was open,
+/// none started its send after Draining began, and every one refused is a
+/// typed no-send that left no ticket.
+#[test]
+fn every_entry_reaching_the_venue_was_ticketed_while_open() {
+    use std::sync::Arc;
+
+    use proptest::prelude::*;
+    use robson_connectors::{binance::usdm::BinanceExchangeAdapter, BinanceRestClient};
+    use robson_domain::{OrderSide, Quantity, Symbol};
+    use robson_exec::{
+        gate::OperationKind,
+        order_journal::{IntentKind, IntentSpec, OrderJournal, StubJournalBackend, WriteClass},
+        venue::{EntryOrReduce, TradingPort, Venue, VenueId},
+        ExecError,
+    };
+
+    let config = ProptestConfig { cases: 24, ..ProptestConfig::default() };
+    proptest!(config, |(delays in proptest::collection::vec(0usize..6, 1..8), flip in 0usize..8)| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let venue = FakeVenue::start().await.expect("fake venue");
+            let client = Arc::new(BinanceRestClient::with_harness_base_url(
+                venue.url(),
+                "fixture-key".to_string(),
+                "fixture-secret".to_string(),
+            ));
+            let adapter = Arc::new(BinanceExchangeAdapter::new(client));
+            let journal = Arc::new(OrderJournal::new(
+                Arc::new(StubJournalBackend::default()),
+                &VenueId::new("test:venue"),
+            ));
+            adapter.attach_order_journal(Arc::clone(&journal));
+            adapter.attach_gate(Arc::clone(journal.gate()));
+
+            let entries: Vec<_> = delays
+                .iter()
+                .enumerate()
+                .map(|(i, &delay)| {
+                    let permit = journal.acquire(OperationKind::Arm).unwrap();
+                    let (journal, adapter) = (Arc::clone(&journal), Arc::clone(&adapter));
+                    tokio::spawn(async move {
+                        permit
+                            .run(async {
+                                let id = format!("e{i}");
+                                let intent = journal.open_intent(IntentSpec {
+                                    position_id: None,
+                                    kind: IntentKind::Entry,
+                                    client_order_id: id.clone(),
+                                    cancels_order_id: None,
+                                    params: serde_json::Value::Null,
+                                });
+                                journal.before_send(&intent, WriteClass::Strict).await.unwrap();
+                                for _ in 0..delay {
+                                    tokio::task::yield_now().await;
+                                }
+                                let sent = TradingPort::place_market_order(
+                                    &*adapter,
+                                    &Symbol::from_pair(FAKE_SYMBOL).unwrap(),
+                                    OrderSide::Buy,
+                                    Quantity::new(Decimal::new(1, 1)).unwrap(),
+                                    &id,
+                                    EntryOrReduce::Entry,
+                                )
+                                .await;
+                                (sent, journal.ticket_issued(&intent))
+                            })
+                            .await
+                    })
+                })
+                .collect();
+            let flipped = {
+                let journal = Arc::clone(&journal);
+                tokio::spawn(async move {
+                    for _ in 0..flip {
+                        tokio::task::yield_now().await;
+                    }
+                    journal.gate().begin_draining();
+                    journal.gate().snapshot().sends_started
+                })
+            };
+            let started_while_open = flipped.await.unwrap();
+            let mut ticketed = 0;
+            for entry in entries {
+                let (sent, ticket) = entry.await.unwrap();
+                match sent {
+                    Ok(_) => {
+                        assert!(ticket, "a send that went out has its ticket");
+                        ticketed += 1;
+                    },
+                    Err(ExecError::SendRefused(_)) => assert!(!ticket, "a refused entry has none"),
+                    Err(other) => panic!("unexpected: {other:?}"),
+                }
+            }
+            assert_eq!(ticketed, started_while_open, "every ticket was issued while open");
+            assert_eq!(journal.gate().snapshot().sends_started, started_while_open);
+            assert_eq!(venue.counts().accepted_orders, started_while_open);
+        });
+    });
+}
+
+/// A client that disconnects while its operation is in flight does not cancel
+/// it: the API runs the operation in its own task, which owns the permit. A
+/// real TCP client sends `/panic`, its exit is held at the venue, the client
+/// closes its socket, then the venue answers: the panic completes, nothing is
+/// aborted and the latch stays clear.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_client_disconnecting_mid_operation_leaves_it_to_complete(pool: PgPool) {
+    use tokio::io::AsyncWriteExt;
+
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        let daemon = harness.daemon(None);
+        daemon.wait_ready(STEP).await.expect("daemon ready");
+        arm_immediate(daemon.api_url()).await.unwrap().expect("arm succeeds");
+        assert_ne!(harness.venue.position(FAKE_SYMBOL), Decimal::ZERO);
+
+        harness.venue.hold_orders();
+        let api = daemon.api_url();
+        let mut socket = tokio::net::TcpStream::connect(api.trim_start_matches("http://"))
+            .await
+            .expect("connect to the API");
+        socket
+            .write_all(b"POST /panic HTTP/1.1\r\nHost: robsond\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("send /panic");
+        let held = async {
+            while harness.venue.held_orders() == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(STEP, held)
+            .await
+            .expect("the exit order reaches the venue");
+        drop(socket);
+        // Long enough for the server to read the end of the stream.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        harness.venue.release_orders();
+
+        harness
+            .until("the exit lands", || async {
+                harness.intents("exit").await.iter().any(|(_, outcome, _)| outcome.is_some())
+            })
+            .await;
+        assert_eq!(harness.venue.position(FAKE_SYMBOL), Decimal::ZERO, "the leg is flat");
+        let exits = harness.intents("exit").await;
+        assert_eq!(exits.len(), 1, "{exits:?}");
+        assert!(!exits[0].2, "an answered exit, not an uncertain one: {exits:?}");
+        // The latch gauge is published once a second.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let metrics = reqwest::Client::new()
+            .get(format!("{api}/metrics"))
+            .timeout(STEP)
+            .send()
+            .await
+            .expect("metrics")
+            .text()
+            .await
+            .expect("metrics body");
+        for series in [
+            "robsond_aborted_operations_total 0",
+            "robsond_journal_latch 0",
+        ] {
+            assert!(metrics.lines().any(|line| line == series), "{series}\n{metrics}");
+        }
+    })
+    .await;
+}

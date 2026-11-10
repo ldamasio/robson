@@ -24,9 +24,19 @@
 //!
 //! **Between this PR and the fence.** Outcome classes are recorded and nothing
 //! acts on them: an uncertain intent opens no incident and closes no admission,
-//! and the latch only shows on a metric. Later PRs of step 7 add those.
+//! and the latch only shows on a metric and keeps a stop from marking itself
+//! clean. Later PRs of step 7 add the rest.
 //!
-//! The sync mutex here is a leaf and is never held across an await.
+//! **Operations and permits (PR S).** An operation is one entry of
+//! `operations_in_flight`, in a task-local scope. One taken with a permit
+//! ([`OrderJournal::acquire`]) belongs to the permit for the whole operation:
+//! an entry, its result handling and its stop are one operation, and so is
+//! everything a nested call does under it. The send ticket is issued at the
+//! send's start under the gate's rules ([`begin_send`]).
+//!
+//! The sync mutex here is a leaf and is never held across an await. The gate's
+//! mutex comes before it in the lock order, and nothing here takes the gate's
+//! while holding this one.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -49,6 +59,7 @@ use uuid::Uuid;
 use crate::{
     cancel::{classify_cancel, CancelClass},
     error::ExecError,
+    gate::{OperationGate, OperationKind, PermitRefusal, Phase, ALLOCATED_SLOTS},
     ports::StopCancelOutcome,
     quantize::Submission,
     venue::{AttemptEvidence, VenueId},
@@ -58,8 +69,12 @@ use crate::{
 pub const COMMIT_BOUND: Duration = Duration::from_millis(500);
 /// `persistence_pending`: intents with something that has not landed.
 pub const RETRY_SET_CAPACITY: usize = 1024;
-/// `operations_in_flight`.
+/// `operations_in_flight`: one entry per permit, at most [`ALLOCATED_SLOTS`],
+/// and the rest for operations without one.
 pub const OPERATIONS_CAPACITY: usize = 32;
+/// Registry entries for operations without a permit: a test, or a path the
+/// choke point counts as unpermitted.
+const UNPERMITTED_OPERATIONS: usize = OPERATIONS_CAPACITY - ALLOCATED_SLOTS as usize;
 /// Intents written by one pass of the retry loop, so a recovering database is
 /// not asked for the whole set at once.
 const RETRY_PASS_LIMIT: usize = 64;
@@ -560,8 +575,10 @@ struct JournalState {
     intents: HashMap<String, IntentMemory>,
     /// `persistence_pending`, in client ids.
     retry_set: VecDeque<String>,
-    /// `operations_in_flight`. A list is as long as its batch: a few intents.
+    /// `operations_in_flight`. A list is as long as its operation's orders.
     operations: HashMap<u64, Vec<OperationIntent>>,
+    /// Entries of `operations` held by operations without a permit.
+    unpermitted_listed: usize,
     /// Ids sent with no row and no room in the retry set: the only record
     /// that they were used (rule 3). Any other id that leaves memory either
     /// has a durable row, which the unique index holds for good, or was never
@@ -576,7 +593,9 @@ pub struct OrderJournal {
     account_scope: String,
     commit_bound: Duration,
     state: Mutex<JournalState>,
-    latch: AtomicBool,
+    /// Shared with the gate, which sets it too.
+    latch: Arc<AtomicBool>,
+    gate: Arc<OperationGate>,
     next_operation: AtomicU64,
     statements_total: AtomicU64,
     operation_statements_max: AtomicU32,
@@ -586,13 +605,15 @@ pub struct OrderJournal {
 
 impl OrderJournal {
     pub fn new(backend: Arc<dyn JournalBackend>, venue: &VenueId) -> Self {
+        let latch = Arc::new(AtomicBool::new(false));
         Self {
             backend,
             venue_id: venue.as_str().to_string(),
             account_scope: DEFAULT_ACCOUNT_SCOPE.to_string(),
             commit_bound: COMMIT_BOUND,
             state: Mutex::default(),
-            latch: AtomicBool::new(false),
+            gate: Arc::new(OperationGate::new(Arc::clone(&latch))),
+            latch,
             next_operation: AtomicU64::new(1),
             statements_total: AtomicU64::new(0),
             operation_statements_max: AtomicU32::new(0),
@@ -616,10 +637,23 @@ impl OrderJournal {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Whether a bounded send went out without its row, or history was
-    /// discarded. Stays set for the life of the process.
+    /// Whether a bounded send went out without its row, history was discarded,
+    /// a venue mutation ran without a permit or an operation was aborted.
+    /// Stays set for the life of the process.
     pub fn latch_set(&self) -> bool {
         self.latch.load(Ordering::SeqCst)
+    }
+
+    /// The permit gate, shared with the venue's transport.
+    pub fn gate(&self) -> &Arc<OperationGate> {
+        &self.gate
+    }
+
+    /// Nothing here is in flight or waiting to land: no intent in memory and
+    /// nothing in the retry set. Part of a clean stop's check.
+    pub fn is_quiescent(&self) -> bool {
+        let state = self.lock();
+        state.intents.is_empty() && state.retry_set.is_empty()
     }
 
     /// Entries waiting in `persistence_pending`.
@@ -664,22 +698,108 @@ impl OrderJournal {
         self.lock().intents.contains_key(client_order_id)
     }
 
-    /// Start an operation: its intents are listed in `operations_in_flight`
-    /// until the returned guard drops. Past the cap it runs unlisted and an
-    /// entry cannot be authorized under it; a reduction still goes out.
+    /// Start an operation without a permit: its intents are listed in
+    /// `operations_in_flight` until the returned guard drops. Past the entries
+    /// the permits leave over it runs unlisted and an entry cannot be
+    /// authorized under it; a reduction still goes out. Its venue mutations
+    /// are unpermitted at the choke point.
     pub fn begin_operation(self: &Arc<Self>) -> Operation {
         let id = self.next_operation.fetch_add(1, Ordering::Relaxed);
         let mut state = self.lock();
-        if state.operations.len() < OPERATIONS_CAPACITY {
+        let listed = state.unpermitted_listed < UNPERMITTED_OPERATIONS;
+        if listed {
+            state.unpermitted_listed += 1;
             state.operations.insert(id, Vec::new());
         } else {
-            warn!(capacity = OPERATIONS_CAPACITY, "Journal operation registry is full");
+            warn!(capacity = UNPERMITTED_OPERATIONS, "Journal operation registry is full");
         }
         Operation {
             journal: Arc::clone(self),
             id,
             statements: Arc::new(AtomicU32::new(0)),
+            permit: None,
+            listed_unpermitted: listed,
         }
+    }
+
+    /// Take a permit for an operation of `kind`, with its slot and its entry
+    /// in `operations_in_flight`, which a permit always has. Nothing is done
+    /// when it is refused.
+    ///
+    /// # Errors
+    /// The class is full, or the daemon is stopping and refuses it.
+    pub fn acquire(self: &Arc<Self>, kind: OperationKind) -> Result<Permit, PermitRefusal> {
+        self.gate.acquire(kind.class())?;
+        let id = self.next_operation.fetch_add(1, Ordering::Relaxed);
+        self.lock().operations.insert(id, Vec::new());
+        Ok(Permit {
+            operation: Some(Operation {
+                journal: Arc::clone(self),
+                id,
+                statements: Arc::new(AtomicU32::new(0)),
+                permit: Some(kind),
+                listed_unpermitted: false,
+            }),
+            kind,
+            completed: false,
+        })
+    }
+
+    /// Run `work` under the permit this task holds, or under a new one of
+    /// `kind` when it holds none. A nested operation never takes a second slot
+    /// or changes class.
+    ///
+    /// # Errors
+    /// A new permit was refused; nothing ran.
+    pub async fn with_permit<F: Future>(
+        self: &Arc<Self>,
+        kind: OperationKind,
+        work: F,
+    ) -> Result<F::Output, PermitRefusal> {
+        if in_operation() {
+            return Ok(work.await);
+        }
+        Ok(self.acquire(kind)?.run(work).await)
+    }
+
+    /// Run `work` in this task's operation, or in a new one without a permit
+    /// when the task is in none.
+    pub async fn within_operation<F: Future>(self: &Arc<Self>, work: F) -> F::Output {
+        if in_operation() {
+            return work.await;
+        }
+        self.begin_operation().scope(work).await
+    }
+
+    /// Run an admission in this task's operation, or in one of its own when
+    /// the task is in none, and say whether the entry `client_order_id`
+    /// reached its send. Read from the operation's registry, on `Ok` and `Err`
+    /// alike, before an operation of its own ends.
+    pub async fn run_admission<F: Future>(
+        self: &Arc<Self>,
+        client_order_id: Option<&str>,
+        work: F,
+    ) -> (F::Output, bool) {
+        if let Ok(id) = CURRENT_OPERATION.try_with(|current| current.id) {
+            let output = work.await;
+            return (output, self.entry_ticket_in(id, client_order_id));
+        }
+        let operation = self.begin_operation();
+        let output = operation.scope(work).await;
+        let ticket = self.entry_ticket_in(operation.id, client_order_id);
+        (output, ticket)
+    }
+
+    /// Whether operation `id` lists an entry, `client_order_id` when given,
+    /// whose send started.
+    fn entry_ticket_in(&self, id: u64, client_order_id: Option<&str>) -> bool {
+        self.lock().operations.get(&id).is_some_and(|listed| {
+            listed.iter().any(|intent| {
+                intent.kind == IntentKind::Entry
+                    && intent.ticket_issued
+                    && client_order_id.is_none_or(|wanted| intent.client_order_id == wanted)
+            })
+        })
     }
 
     /// Register an intent in memory. Nothing is written until
@@ -942,10 +1062,28 @@ impl OrderJournal {
             .is_some_and(|memory| memory.ticket_issued)
     }
 
-    fn note_send_started(&self, client_order_id: &str) {
+    /// The send start, the linearization point (design §2.6): under the gate's
+    /// mutex, with the journal's memory taken inside it, an entry is refused
+    /// unless the daemon is open and unfenced, a typed no-send; otherwise the
+    /// send is counted and its ticket issued, in one critical section with no
+    /// await. A send with no intent here (funding) is counted and has no
+    /// ticket.
+    fn begin_send(&self, client_order_id: &str) -> Result<(), SendRefusal> {
+        let mut gate = self.gate.lock();
         let mut state = self.lock();
+        let entry = state
+            .intents
+            .get(client_order_id)
+            .is_some_and(|memory| memory.row.kind == IntentKind::Entry);
+        if entry && !gate.entry_send_allowed() {
+            return Err(SendRefusal::NotSent(format!(
+                "entry refused at its send: the daemon is {}",
+                gate.phase().as_str()
+            )));
+        }
+        gate.send_started();
         let Some(memory) = state.intents.get_mut(client_order_id) else {
-            return;
+            return Ok(());
         };
         memory.ticket_issued = true;
         memory.tickets += 1;
@@ -955,6 +1093,7 @@ impl OrderJournal {
                 entry.ticket_issued = true;
             }
         }
+        Ok(())
     }
 
     fn note_rejected(&self, client_order_id: &str) {
@@ -1244,14 +1383,45 @@ struct CurrentOperation {
     journal: Arc<OrderJournal>,
     id: u64,
     statements: Arc<AtomicU32>,
+    /// Set when the operation holds a permit.
+    permit: Option<OperationKind>,
 }
 
-/// Called just before a request is sent: by the ledger, or by a test double
-/// that has none. Outside an operation, or for an id with no intent, it does
-/// nothing: funding is not journaled.
+/// Called immediately before a request is sent, with no await in between: by
+/// the ledger, or by a test double that has none. Inside an operation it is
+/// the gate's send start: an entry is refused unless the daemon is open,
+/// otherwise the ticket is issued. Outside one it does nothing: no entry can
+/// be authorized there, and the choke point sees the request.
+///
+/// # Errors
+/// An entry while the daemon is stopping: a proven no-send.
+pub fn begin_send(client_order_id: &str) -> Result<(), SendRefusal> {
+    CURRENT_OPERATION
+        .try_with(|current| current.journal.begin_send(client_order_id))
+        .unwrap_or(Ok(()))
+}
+
+/// The ticket without the gate's refusal, for a test double that only needs
+/// the ticket; [`begin_send`] is what every send goes through.
 pub fn report_send_started(client_order_id: &str) {
-    let _ =
-        CURRENT_OPERATION.try_with(|current| current.journal.note_send_started(client_order_id));
+    let _ = begin_send(client_order_id);
+}
+
+/// Whether this task holds a permit of `gate`.
+pub(crate) fn holds_permit_of(gate: &OperationGate) -> bool {
+    CURRENT_OPERATION
+        .try_with(|current| current.permit.is_some() && std::ptr::eq(&*current.journal.gate, gate))
+        .unwrap_or(false)
+}
+
+/// The kind of permit this task holds, if any.
+pub fn held_permit() -> Option<OperationKind> {
+    CURRENT_OPERATION.try_with(|current| current.permit).ok().flatten()
+}
+
+/// The phase of the gate this task's operation belongs to, if it is in one.
+pub fn current_phase() -> Option<Phase> {
+    CURRENT_OPERATION.try_with(|current| current.journal.gate.phase()).ok()
 }
 
 /// The ledger calls this on an authoritative venue rejection.
@@ -1271,6 +1441,8 @@ pub struct Operation {
     journal: Arc<OrderJournal>,
     id: u64,
     statements: Arc<AtomicU32>,
+    permit: Option<OperationKind>,
+    listed_unpermitted: bool,
 }
 
 impl Operation {
@@ -1280,6 +1452,7 @@ impl Operation {
             journal: Arc::clone(&self.journal),
             id: self.id,
             statements: Arc::clone(&self.statements),
+            permit: self.permit,
         };
         CURRENT_OPERATION.scope(current, work).await
     }
@@ -1310,6 +1483,9 @@ impl Drop for Operation {
         }
         let mut state = self.journal.lock();
         state.operations.remove(&self.id);
+        if self.listed_unpermitted {
+            state.unpermitted_listed -= 1;
+        }
         let abandoned: HashSet<String> = state
             .intents
             .iter()
@@ -1335,6 +1511,61 @@ impl Drop for Operation {
                 },
             }
         }
+    }
+}
+
+/// An operation permit (ADR-0056 step 7, PR S): a slot of its kind's class
+/// and the operation's entry in `operations_in_flight`, held in a task-local
+/// scope for the whole operation. It must be completed: dropped without
+/// completion, its future cancelled or panicked before it returned, it counts
+/// as aborted and sets the latch, whatever its rows say. An operation that
+/// returned an error has completed.
+pub struct Permit {
+    /// Taken out on drop, so the registry entry goes, with any abandoned
+    /// intent put in the retry set, before the slot is released.
+    operation: Option<Operation>,
+    kind: OperationKind,
+    completed: bool,
+}
+
+impl Permit {
+    pub fn kind(&self) -> OperationKind {
+        self.kind
+    }
+
+    /// Run `work` under this permit and complete it when `work` returns.
+    /// Dropping the returned future before then aborts the permit.
+    pub async fn run<F: Future>(mut self, work: F) -> F::Output {
+        let output = self.scope(work).await;
+        self.completed = true;
+        output
+    }
+
+    /// Run `work` under this permit, which stays held.
+    pub async fn scope<F: Future>(&self, work: F) -> F::Output {
+        match &self.operation {
+            Some(operation) => operation.scope(work).await,
+            None => work.await,
+        }
+    }
+
+    /// The operation ran to its end.
+    pub fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let Some(operation) = self.operation.take() else {
+            return;
+        };
+        let gate = Arc::clone(&operation.journal.gate);
+        if !self.completed {
+            gate.abort(self.kind);
+        }
+        drop(operation);
+        gate.release(self.kind.class());
     }
 }
 
@@ -1724,11 +1955,23 @@ mod tests {
         .await;
     }
 
+    /// Every slot taken, then every entry permits leave over: the registry
+    /// holds them all and no more.
     #[tokio::test]
     async fn the_operations_registry_is_bounded_and_refuses_only_entries_past_the_cap() {
         let (_backend, journal) = journal();
+        let kinds = std::iter::repeat_n(OperationKind::Arm, 16)
+            .chain(std::iter::repeat_n(OperationKind::Panic, 8))
+            .chain([
+                OperationKind::MainLoop,
+                OperationKind::ReconciliationScan,
+                OperationKind::FundingPoll,
+                OperationKind::Startup,
+            ]);
+        let permits: Vec<Permit> = kinds.map(|kind| journal.acquire(kind).unwrap()).collect();
+        assert_eq!(permits.len(), ALLOCATED_SLOTS as usize);
         let held: Vec<Operation> =
-            (0..OPERATIONS_CAPACITY).map(|_| journal.begin_operation()).collect();
+            (0..UNPERMITTED_OPERATIONS).map(|_| journal.begin_operation()).collect();
         assert_eq!(journal.operations_in_flight(), OPERATIONS_CAPACITY);
 
         let extra = journal.begin_operation();
@@ -1746,7 +1989,36 @@ mod tests {
             .await;
         drop(extra);
         drop(held);
+        permits.into_iter().for_each(Permit::complete);
         assert_eq!(journal.operations_in_flight(), 0);
+        assert_eq!(journal.gate().snapshot().permits, 0);
+    }
+
+    /// Operations without a permit keep to the entries the permits leave
+    /// over, with no permit held too: past them an entry is refused and a
+    /// reduction still goes out.
+    #[tokio::test]
+    async fn operations_without_a_permit_list_only_in_the_unallocated_entries() {
+        let (_backend, journal) = journal();
+        let held: Vec<Operation> =
+            (0..UNPERMITTED_OPERATIONS).map(|_| journal.begin_operation()).collect();
+        assert_eq!(journal.operations_in_flight(), UNPERMITTED_OPERATIONS);
+
+        let extra = journal.begin_operation();
+        assert_eq!(journal.operations_in_flight(), UNPERMITTED_OPERATIONS);
+        extra
+            .scope(async {
+                let entry = journal.open_intent(spec("e", IntentKind::Entry));
+                assert!(matches!(
+                    journal.before_send(&entry, WriteClass::Strict).await,
+                    Err(SendRefusal::NotSent(_))
+                ));
+            })
+            .await;
+        drop(held);
+        let listed = journal.begin_operation();
+        assert_eq!(journal.operations_in_flight(), 1, "a released entry is free again");
+        drop((extra, listed));
     }
 
     /// A future dropped mid-send: the intent ends uncertain, not forgotten.
@@ -2269,5 +2541,174 @@ mod tests {
             in_op(&journal, journal.journaled_cancel(None, "77", async { Ok(cancelled()) })).await;
         assert!(matches!(class, CancelClass::Cancelled { .. }));
         assert!(journal.latch_set());
+    }
+    // ---- Permits (PR S) --------------------------------------------------
+
+    /// A permit dropped before it completed: aborted, latched, its slot back.
+    #[tokio::test]
+    async fn a_permit_dropped_before_completing_is_aborted_and_sets_the_latch() {
+        let (_backend, journal) = journal();
+        drop(journal.acquire(OperationKind::Panic).unwrap());
+        let gate = journal.gate().snapshot();
+        assert_eq!((gate.aborted, gate.permits, gate.protective), (1, 0, 0));
+        assert!(journal.latch_set());
+        assert_eq!(journal.operations_in_flight(), 0);
+    }
+
+    /// An operation that returned, with an error or not, has completed.
+    #[tokio::test]
+    async fn a_permit_whose_work_returned_an_error_has_completed() {
+        let (_backend, journal) = journal();
+        let permit = journal.acquire(OperationKind::Arm).unwrap();
+        let failed: Result<(), &str> = permit.run(async { Err("refused") }).await;
+        assert!(failed.is_err());
+        assert_eq!(journal.gate().snapshot().aborted, 0);
+        assert!(!journal.latch_set());
+        assert_eq!(journal.gate().snapshot().permits, 0);
+    }
+
+    /// Cancelled mid-send after its attempt row landed: still aborted, and its
+    /// intent ends uncertain through the retry set.
+    #[tokio::test]
+    async fn a_permit_cancelled_after_its_row_landed_is_aborted_and_its_intent_uncertain() {
+        let (backend, journal) = journal();
+        let ledger = SubmitAttemptLedger::new(8);
+        let permit = journal.acquire(OperationKind::CancelOrClose).unwrap();
+        let work = permit.run(async {
+            let intent = journal.open_intent(spec("x", IntentKind::Exit));
+            journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
+            let _attempt = ledger.begin_send("x").unwrap();
+            std::future::pending::<()>().await;
+        });
+        assert!(tokio::time::timeout(BOUND, work).await.is_err());
+
+        let gate = journal.gate().snapshot();
+        assert_eq!((gate.aborted, gate.permits), (1, 0));
+        assert!(journal.latch_set());
+        assert_eq!(backend.row("x").unwrap().attempts.len(), 1, "its row had landed");
+        assert_eq!(journal.retry_set_depth(), 1);
+        journal.flush_pending().await;
+        let outcome = backend.row("x").unwrap().outcome.unwrap();
+        assert!(outcome.uncertain_at.is_some() && !outcome.not_sent, "{outcome:?}");
+    }
+
+    /// Nested work runs under the permit it is reached from: no second slot
+    /// and no other class, even with that class full.
+    #[tokio::test]
+    async fn nested_work_reuses_the_held_permit() {
+        let (_backend, journal) = journal();
+        let ordinary: Vec<Permit> = (0..crate::gate::ORDINARY_API_SLOTS)
+            .map(|_| journal.acquire(OperationKind::Arm).unwrap())
+            .collect();
+        let permit = journal.acquire(OperationKind::ReconcileClose).unwrap();
+        let nested = permit
+            .run(async {
+                journal
+                    .with_permit(OperationKind::Panic, async {
+                        journal
+                            .with_permit(OperationKind::Arm, async {
+                                (held_permit(), journal.gate().snapshot())
+                            })
+                            .await
+                    })
+                    .await
+            })
+            .await;
+        let (held, gate) = nested.unwrap().unwrap();
+        assert_eq!(held, Some(OperationKind::ReconcileClose));
+        assert_eq!(gate.protective, 1);
+        assert_eq!(gate.permits, crate::gate::ORDINARY_API_SLOTS + 1);
+        ordinary.into_iter().for_each(Permit::complete);
+    }
+
+    /// The send start: once the daemon is not open an entry is refused, with
+    /// no ticket and no attempt; anything else still starts and is ticketed.
+    /// The refused entry ends as a proven no-send.
+    #[tokio::test]
+    async fn the_send_start_refuses_an_entry_after_open_and_tickets_the_rest() {
+        let (backend, journal) = journal();
+        let ledger = SubmitAttemptLedger::new(8);
+        let permit = journal.acquire(OperationKind::MainLoop).unwrap();
+        permit
+            .run(async {
+                let open = journal.open_intent(spec("e-open", IntentKind::Entry));
+                journal.before_send(&open, WriteClass::Strict).await.unwrap();
+                ledger.begin_send("e-open").unwrap();
+                assert!(journal.ticket_issued(&open));
+                journal.finish_success(&open, None).await;
+
+                journal.gate().begin_draining();
+                let refused = journal.open_intent(spec("e-draining", IntentKind::Entry));
+                journal.before_send(&refused, WriteClass::Strict).await.unwrap();
+                assert!(matches!(ledger.begin_send("e-draining"), Err(SendRefusal::NotSent(_))));
+                assert!(!journal.ticket_issued(&refused));
+                assert_eq!(ledger.evidence("e-draining"), AttemptEvidence::NoRecord);
+                journal.finish_failed(&refused).await;
+
+                journal.gate().begin_closing();
+                let exit = journal.open_intent(spec("x", IntentKind::Exit));
+                journal.before_send(&exit, WriteClass::Bounded).await.unwrap();
+                ledger.begin_send("x").unwrap();
+                assert!(journal.ticket_issued(&exit));
+                journal.finish_success(&exit, None).await;
+                // A send with no intent here, a funding order, still starts.
+                ledger.begin_send("funding-1").unwrap();
+            })
+            .await;
+
+        assert_eq!(journal.gate().snapshot().sends_started, 3);
+        assert!(backend.row("e-draining").unwrap().outcome.unwrap().not_sent);
+    }
+
+    /// An entry and its stop under one permit are one operation: both are in
+    /// its registry entry, the admission reads its own entry's ticket, and the
+    /// statements are charged to the whole operation.
+    #[tokio::test]
+    async fn an_entry_and_its_stop_are_one_operation_under_a_permit() {
+        let (_backend, journal) = journal();
+        let ledger = SubmitAttemptLedger::new(8);
+        let permit = journal.acquire(OperationKind::Arm).unwrap();
+        permit
+            .run(async {
+                let ((), ticket) = journal
+                    .run_admission(Some("e"), async {
+                        let entry = journal.open_intent(spec("e", IntentKind::Entry));
+                        journal.before_send(&entry, WriteClass::Strict).await.unwrap();
+                        ledger.begin_send("e").unwrap();
+                        journal.finish_success(&entry, None).await;
+                    })
+                    .await;
+                assert!(ticket);
+                let stop = journal.open_intent(spec("ins-1", IntentKind::Protection));
+                journal.before_send(&stop, WriteClass::Bounded).await.unwrap();
+                ledger.begin_send("ins-1").unwrap();
+                journal.finish_success(&stop, None).await;
+                assert_eq!(journal.operations_in_flight(), 1);
+                let ((), other) = journal.run_admission(Some("e2"), async {}).await;
+                assert!(!other, "another entry's ticket is not this one's");
+            })
+            .await;
+        assert_eq!(journal.operation_statements_max(), 18, "entry 9 and stop 9");
+    }
+
+    /// The choke point knows a permit by its gate: one from another journal,
+    /// or an operation without one, is unpermitted here.
+    #[tokio::test]
+    async fn only_a_permit_of_this_gate_counts_at_its_choke_point() {
+        let (_mine_backend, mine) = journal();
+        let (_other_backend, other) = journal();
+        other
+            .acquire(OperationKind::Panic)
+            .unwrap()
+            .run(async {
+                mine.gate().mutation("POST /x").unwrap();
+                other.gate().mutation("POST /x").unwrap();
+            })
+            .await;
+        mine.begin_operation()
+            .scope(async { mine.gate().mutation("POST /x").unwrap() })
+            .await;
+        assert_eq!(mine.gate().snapshot().unpermitted, 2);
+        assert_eq!(other.gate().snapshot().unpermitted, 0);
     }
 }

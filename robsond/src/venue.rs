@@ -26,6 +26,7 @@ use robson_connectors::{
 };
 use robson_domain::{Exchange, OrderSide, Price, Quantity, Symbol, SymbolTradingRules};
 use robson_exec::{
+    gate::OperationGate,
     order_journal::OrderJournal,
     ports::{OpenOrderRecord, OrderResult, UserTradeRecord},
     venue::{
@@ -219,6 +220,10 @@ impl Venue for VenueRuntime {
 
     fn attach_order_journal(&self, journal: Arc<OrderJournal>) {
         forward!(self, venue => venue.attach_order_journal(journal))
+    }
+
+    fn attach_gate(&self, gate: Arc<OperationGate>) {
+        forward!(self, venue => venue.attach_gate(gate))
     }
 
     fn position_account(&self) -> Option<&dyn PositionAccountPort> {

@@ -110,6 +110,11 @@ pub enum DaemonError {
     #[error("Shutdown requested")]
     Shutdown,
 
+    /// No operation permit (ADR-0056 step 7): the class is full or the daemon
+    /// is stopping. Nothing was done.
+    #[error("Operation refused: {0}")]
+    PermitRefused(#[from] robson_exec::gate::PermitRefusal),
+
     /// A residual on an open leg blocks new admissions until that leg closes
     /// (ADR-0056 §5). A rejection of its own: the budget knows nothing of it.
     #[error(

@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol, SymbolTradingRules};
 use robson_exec::{
+    gate::OperationGate,
     order_journal::OrderJournal,
     ports::{
         ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord, IncomeType,
@@ -514,6 +515,8 @@ impl BinanceExchangeAdapter {
                 ExecError::Timeout("Binance request timed out".to_string())
             },
             BinanceRestError::InvalidParameter(msg) => ExecError::OrderRejected(msg.clone()),
+            // Nothing was sent (ADR-0056 step 7).
+            BinanceRestError::Refused(msg) => ExecError::SendRefused(msg.clone()),
             _ => ExecError::Exchange(error.to_string()),
         }
     }
@@ -1474,6 +1477,12 @@ impl Venue for BinanceExchangeAdapter {
         self.submit_attempts.attach_journal(journal);
     }
 
+    /// Every signed mutation goes through the REST client's `post_signed` or
+    /// `delete_signed`, which pass the gate.
+    fn attach_gate(&self, gate: Arc<OperationGate>) {
+        self.client.attach_gate(gate);
+    }
+
     fn id(&self) -> &VenueId {
         &self.venue_id
     }
@@ -1804,6 +1813,7 @@ mod submit_attempt_evidence {
             BinanceRestError::InvalidParameter("x".to_string()),
             BinanceRestError::SignatureError("x".to_string()),
             BinanceRestError::PositionNotFound("x".to_string()),
+            BinanceRestError::Refused("x".to_string()),
         ] {
             assert!(!is_authoritative_rejection(&error), "{error}");
         }
@@ -1968,6 +1978,69 @@ mod submit_attempt_evidence {
     fn age_refresh_failure(venue: &BinanceExchangeAdapter, by: Duration) {
         let mut failures = venue.refresh_failures();
         *failures.get_mut("BTCUSDT").unwrap() = Instant::now().checked_sub(by).unwrap();
+    }
+
+    /// The send start (ADR-0056 step 7) in the real transport path: once the
+    /// daemon is stopping, an entry is refused there, a typed no-send that
+    /// polls nothing and leaves no ticket, while a reduction under the same
+    /// permit still goes out with its ticket.
+    #[tokio::test]
+    async fn the_send_start_refuses_an_entry_once_stopping_and_nothing_reaches_the_venue() {
+        use robson_exec::{
+            gate::OperationKind,
+            order_journal::{IntentKind, IntentSpec, StubJournalBackend, WriteClass},
+        };
+
+        let (venue, _info, orders) =
+            metadata_venue(Some((200, BTC_RULES.to_string())), Some((200, FILLED.to_string())))
+                .await;
+        let journal = Arc::new(OrderJournal::new(
+            Arc::new(StubJournalBackend::default()),
+            &VenueId::new("test:venue"),
+        ));
+        venue.attach_order_journal(Arc::clone(&journal));
+        venue.attach_gate(Arc::clone(journal.gate()));
+        let spec = |id: &str, kind| IntentSpec {
+            position_id: None,
+            kind,
+            client_order_id: id.to_string(),
+            cancels_order_id: None,
+            params: serde_json::Value::Null,
+        };
+
+        let permit = journal.acquire(OperationKind::MainLoop).unwrap();
+        permit
+            .scope(async {
+                let entry = journal.open_intent(spec("e1", IntentKind::Entry));
+                journal.before_send(&entry, WriteClass::Strict).await.unwrap();
+                journal.gate().begin_draining();
+                let refused = TradingPort::place_market_order(
+                    &*venue,
+                    &btcusdt(),
+                    OrderSide::Buy,
+                    Quantity::new(dec!(0.01)).unwrap(),
+                    "e1",
+                    EntryOrReduce::Entry,
+                )
+                .await;
+                assert!(matches!(refused, Err(ExecError::SendRefused(_))), "{refused:?}");
+                assert!(!journal.ticket_issued(&entry), "a refused send has no ticket");
+                assert_eq!(venue.submit_attempts.evidence("e1"), AttemptEvidence::NoRecord);
+                assert_eq!(orders.load(Ordering::SeqCst), 0, "nothing reached the venue");
+
+                let exit = journal.open_intent(spec("x1", IntentKind::Exit));
+                journal.before_send(&exit, WriteClass::Bounded).await.unwrap();
+                reduce(&venue, "x1").await.unwrap();
+                assert!(journal.ticket_issued(&exit));
+                assert_eq!(orders.load(Ordering::SeqCst), 1);
+                journal.finish_failed(&entry).await;
+            })
+            .await;
+        permit.complete();
+
+        let gate = journal.gate().snapshot();
+        assert_eq!(gate.sends_started, 1, "only the reduction started its send");
+        assert_eq!(gate.unpermitted, 0);
     }
 
     async fn reduce(venue: &BinanceExchangeAdapter, id: &str) -> Result<OrderResult, ExecError> {
