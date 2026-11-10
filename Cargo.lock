@@ -2207,6 +2207,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "proptest",
+ "robson-domain",
  "robson-eventlog",
  "robson-testkit",
  "rust_decimal",

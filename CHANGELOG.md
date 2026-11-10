@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Four domain audit events had no projection route (ADR-0056 step 7, PR P, part 1)
+
+- `entry_attempt_exhausted`, `signal_strategy_evaluated`, `entry_approval_pending` and `position_error`
+  landed in the event log and then failed their apply as unhandled, so every exhaustion, every confirmed
+  strategy signal and every wait for an approval logged an event-log error. They now route as audit-only:
+  no projection table changes. The projector's freeze test now covers every domain event type, read from
+  the enum, so a new event without a route fails CI. An older binary returns the same error on them as
+  before, so this adds no rollback condition.
+- The daemon refuses to start with a `PROJECTION_STREAM_KEY` in the `position:` or `system:` namespace: the
+  projection worker would apply those streams beside the daemon's own writer. Production uses
+  `robson:daemon`, the default.
+
 ### Added - Two-phase stop on SIGTERM and SIGINT (ADR-0056 step 7, PR S, part 3)
 
 - SIGTERM, as well as SIGINT, now stops the daemon: as PID 1 it used to ignore SIGTERM until Kubernetes
