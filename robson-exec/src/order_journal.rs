@@ -23,9 +23,9 @@
 //! and the request goes out anyway, setting the latch if the row did not land.
 //!
 //! **Between this PR and the fence.** Outcome classes are recorded and nothing
-//! acts on them: an uncertain intent opens no incident and closes no admission,
-//! and the latch only shows on a metric and keeps a stop from marking itself
-//! clean. Later PRs of step 7 add the rest.
+//! acts on them: an uncertain intent opens no incident and closes no admission.
+//! The latch keeps a stop from marking itself clean, and from PR P it closes
+//! admissions until a restart. Later PRs of step 7 add the rest.
 //!
 //! **Operations and permits (PR S).** An operation is one entry of
 //! `operations_in_flight`, in a task-local scope. One taken with a permit
@@ -33,6 +33,12 @@
 //! an entry, its result handling and its stop are one operation, and so is
 //! everything a nested call does under it. The send ticket is issued at the
 //! send's start under the gate's rules ([`begin_send`]).
+//!
+//! **Stream suspensions (PR P).** The retry set, `persistence_pending`, also
+//! carries the record of an event-log stream that refuses appends
+//! ([`OrderJournal::record_suspension`]), which sets the latch. From PR P the
+//! latch closes admissions until a restart, at the manager's admission checks
+//! and at an entry's send.
 //!
 //! The sync mutex here is a leaf and is never held across an await. The gate's
 //! mutex comes before it in the lock order, and nothing here takes the gate's
@@ -50,7 +56,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use robson_domain::PositionId;
 use serde_json::Value;
 use tracing::{error, warn};
@@ -246,6 +252,29 @@ impl JournalBatch {
     }
 }
 
+/// An event-log stream that refuses appends (ADR-0056 step 7, PR P): a write
+/// to it failed, so nothing more is appended to it in this process. Written
+/// once through the retry set; replays converge on the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamSuspensionRow {
+    pub suspension_id: Uuid,
+    pub stream_key: String,
+    /// `position` or `system`.
+    pub stream_kind: &'static str,
+    /// The seq that did not apply. `None` when the append failed, or landed
+    /// with its seq unknown.
+    pub failed_seq: Option<i64>,
+    /// A system stream's month, as its first day.
+    pub month: Option<NaiveDate>,
+    pub error: String,
+    /// The process that suspended it.
+    pub epoch_id: Option<Uuid>,
+    pub suspended_at: DateTime<Utc>,
+}
+
+/// Statements a suspension's write is charged: `BEGIN`, the insert, `COMMIT`.
+const SUSPENSION_STATEMENTS: u32 = 3;
+
 /// Durable side of the journal.
 #[async_trait]
 pub trait JournalBackend: Send + Sync + 'static {
@@ -265,6 +294,13 @@ pub trait JournalBackend: Send + Sync + 'static {
     async fn check_ready(&self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Record a stream suspension in one transaction. An open suspension of
+    /// the same stream already on record stands, so a replay changes nothing.
+    async fn record_suspension(
+        &self,
+        suspension: &StreamSuspensionRow,
+    ) -> Result<(), CommitFailure>;
 }
 
 /// For a daemon with no database: every write succeeds and nothing is kept.
@@ -279,6 +315,10 @@ impl JournalBackend for UnpersistedBackend {
 
     async fn attempt_states(&self, _: &str, _: &str, _: &str) -> Result<Vec<bool>, String> {
         Err("no durable journal is configured".to_string())
+    }
+
+    async fn record_suspension(&self, _: &StreamSuspensionRow) -> Result<(), CommitFailure> {
+        Ok(())
     }
 }
 
@@ -317,6 +357,8 @@ pub struct StubJournalBackend {
     read_fails: AtomicBool,
     commit_delay: Mutex<Duration>,
     fail_all: Mutex<Option<JournalFault>>,
+    suspensions: Mutex<Vec<StreamSuspensionRow>>,
+    suspension_writes_fail: AtomicBool,
 }
 
 impl StubJournalBackend {
@@ -384,6 +426,30 @@ impl StubJournalBackend {
         self.commits.lock().unwrap().clone()
     }
 
+    /// Every suspension write fails, as if that table refused this role,
+    /// while intents' commits go on as scripted.
+    pub fn set_suspension_writes_fail(&self, fail: bool) {
+        self.suspension_writes_fail.store(fail, Ordering::SeqCst);
+    }
+
+    /// The stream suspensions on record, in the order they landed.
+    pub fn suspensions(&self) -> Vec<StreamSuspensionRow> {
+        self.suspensions.lock().unwrap().clone()
+    }
+
+    /// The next scripted fault, or the standing one.
+    fn next_fault(&self) -> Option<JournalFault> {
+        let scripted = self.faults.lock().unwrap().pop_front();
+        scripted.or(*self.fail_all.lock().unwrap())
+    }
+
+    fn land_suspension(&self, suspension: &StreamSuspensionRow) {
+        let mut landed = self.suspensions.lock().unwrap();
+        if !landed.iter().any(|row| row.stream_key == suspension.stream_key) {
+            landed.push(suspension.clone());
+        }
+    }
+
     fn land(&self, batch: &JournalBatch) -> Result<(), CommitFailure> {
         let mut rows = self.rows.lock().unwrap();
         let row = rows.entry(batch.intent.client_order_id.clone()).or_default();
@@ -420,9 +486,7 @@ impl JournalBackend for StubJournalBackend {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let scripted = self.faults.lock().unwrap().pop_front();
-        let fault = scripted.or(*self.fail_all.lock().unwrap());
-        match fault {
+        match self.next_fault() {
             None | Some(JournalFault::Pass) => self.land(batch),
             Some(JournalFault::Known) => Err(CommitFailure::Known("injected".to_string())),
             Some(JournalFault::AckLost) => {
@@ -446,6 +510,32 @@ impl JournalBackend for StubJournalBackend {
             .get(id)
             .map(|row| row.attempts.iter().map(|a| a.rejected_at.is_some()).collect())
             .unwrap_or_default())
+    }
+
+    async fn record_suspension(
+        &self,
+        suspension: &StreamSuspensionRow,
+    ) -> Result<(), CommitFailure> {
+        if self.suspension_writes_fail.load(Ordering::SeqCst) {
+            return Err(CommitFailure::Known("injected: suspensions refused".to_string()));
+        }
+        match self.next_fault() {
+            None | Some(JournalFault::Pass) => {
+                self.land_suspension(suspension);
+                Ok(())
+            },
+            Some(JournalFault::Known | JournalFault::IdSpent) => {
+                Err(CommitFailure::Known("injected".to_string()))
+            },
+            Some(JournalFault::AckLost) => {
+                self.land_suspension(suspension);
+                Err(CommitFailure::Uncertain("injected: ack lost".to_string()))
+            },
+            Some(JournalFault::NotLandedUncertain) => {
+                Err(CommitFailure::Uncertain("injected: not landed".to_string()))
+            },
+            Some(JournalFault::Hang) => std::future::pending().await,
+        }
     }
 }
 
@@ -575,6 +665,9 @@ struct JournalState {
     intents: HashMap<String, IntentMemory>,
     /// `persistence_pending`, in client ids.
     retry_set: VecDeque<String>,
+    /// `persistence_pending` too: stream suspensions not yet on record. The
+    /// two share [`RETRY_SET_CAPACITY`].
+    suspensions: VecDeque<StreamSuspensionRow>,
     /// `operations_in_flight`. A list is as long as its operation's orders.
     operations: HashMap<u64, Vec<OperationIntent>>,
     /// Entries of `operations` held by operations without a permit.
@@ -584,6 +677,13 @@ struct JournalState {
     /// has a durable row, which the unique index holds for good, or was never
     /// sent.
     discarded: HashSet<String>,
+}
+
+impl JournalState {
+    /// Entries in `persistence_pending`.
+    fn pending(&self) -> usize {
+        self.retry_set.len() + self.suspensions.len()
+    }
 }
 
 /// Rules, memory and registries of the order journal.
@@ -653,12 +753,32 @@ impl OrderJournal {
     /// nothing in the retry set. Part of a clean stop's check.
     pub fn is_quiescent(&self) -> bool {
         let state = self.lock();
-        state.intents.is_empty() && state.retry_set.is_empty()
+        state.intents.is_empty() && state.pending() == 0
     }
 
     /// Entries waiting in `persistence_pending`.
     pub fn retry_set_depth(&self) -> usize {
-        self.lock().retry_set.len()
+        self.lock().pending()
+    }
+
+    /// Record that an event-log stream refuses appends (ADR-0056 step 7, PR
+    /// P), through the retry set, and set the latch: from here on admissions
+    /// stay closed until a restart. No await: the retry loop writes it. With
+    /// the retry set full it is not kept, and the latch is set all the same.
+    pub fn record_suspension(&self, suspension: StreamSuspensionRow) {
+        let mut state = self.lock();
+        self.latch.store(true, Ordering::SeqCst);
+        if state.suspensions.iter().any(|row| row.stream_key == suspension.stream_key) {
+            return;
+        }
+        if state.pending() >= RETRY_SET_CAPACITY {
+            error!(
+                stream_key = %suspension.stream_key,
+                "Journal retry set is full; this stream suspension is not recorded durably"
+            );
+            return;
+        }
+        state.suspensions.push_back(suspension);
     }
 
     /// Bounded sends whose id could be kept neither in the retry set nor as a
@@ -1081,6 +1201,13 @@ impl OrderJournal {
                 gate.phase().as_str()
             )));
         }
+        // From PR P the latch closes admissions until a restart. The admission
+        // checks see it first; this is for one already past them.
+        if entry && self.latch.load(Ordering::SeqCst) {
+            return Err(SendRefusal::NotSent(
+                "entry refused at its send: the journal latch is set".to_string(),
+            ));
+        }
         gate.send_started();
         let Some(memory) = state.intents.get_mut(client_order_id) else {
             return Ok(());
@@ -1262,7 +1389,7 @@ impl OrderJournal {
         if memory.in_retry_set {
             return true;
         }
-        if state.retry_set.len() < RETRY_SET_CAPACITY {
+        if state.retry_set.len() + state.suspensions.len() < RETRY_SET_CAPACITY {
             memory.in_retry_set = true;
             state.retry_set.push_back(client_order_id.to_string());
             return true;
@@ -1293,23 +1420,26 @@ impl OrderJournal {
         }
     }
 
-    /// One pass of the retry loop. Stops at the first failure, sending that
-    /// entry to the back, so a dead database costs one bound per pass and one
-    /// bad row cannot starve the others, and stops starting commits after a
-    /// few bounds even when each succeeds slowly. Returns the entries written.
+    /// One pass of the retry loop. Stream suspensions go first, then intents.
+    /// Each part stops at its first failure, sending that entry to the back,
+    /// so a dead database costs one bound per part and pass and one bad row
+    /// cannot starve the others, of its own part or of the other one: a
+    /// suspension that keeps failing never keeps an intent's rows from being
+    /// tried. The pass stops starting commits after a few bounds even when
+    /// each succeeds slowly. Returns the entries written.
     pub async fn flush_pending(&self) -> usize {
+        let started = std::time::Instant::now();
+        let pass_bound = self.commit_bound * RETRY_PASS_COMMIT_BOUNDS;
+        let mut written = self.flush_suspensions(started, pass_bound).await;
         let batches: Vec<(String, JournalBatch)> = {
             let state = self.lock();
             state
                 .retry_set
                 .iter()
-                .take(RETRY_PASS_LIMIT)
+                .take(RETRY_PASS_LIMIT.saturating_sub(written))
                 .filter_map(|id| state.intents.get(id).map(|m| (id.clone(), m.batch())))
                 .collect()
         };
-        let mut written = 0;
-        let started = std::time::Instant::now();
-        let pass_bound = self.commit_bound * RETRY_PASS_COMMIT_BOUNDS;
         for (client_order_id, batch) in batches {
             if started.elapsed() >= pass_bound {
                 break;
@@ -1334,6 +1464,53 @@ impl OrderJournal {
                         }
                     }
                     break;
+                },
+            }
+        }
+        written
+    }
+
+    /// The suspensions part of a retry pass, first: they are few, and each one
+    /// is what tells the next start a stream needs repair. Returns the entries
+    /// written; a failure ends this part, with that entry sent to the back,
+    /// and the pass goes on to the intents.
+    async fn flush_suspensions(&self, started: std::time::Instant, pass_bound: Duration) -> usize {
+        let pending: Vec<StreamSuspensionRow> =
+            self.lock().suspensions.iter().take(RETRY_PASS_LIMIT).cloned().collect();
+        let mut written = 0;
+        for suspension in pending {
+            if started.elapsed() >= pass_bound {
+                break;
+            }
+            self.statements_total
+                .fetch_add(u64::from(SUSPENSION_STATEMENTS), Ordering::Relaxed);
+            let write = self.backend.record_suspension(&suspension);
+            let failure = match tokio::time::timeout(self.commit_bound, write).await {
+                Ok(Ok(())) => None,
+                Ok(Err(failure)) => Some(failure),
+                Err(_) => Some(CommitFailure::Uncertain("no answer within the bound".to_string())),
+            };
+            let mut state = self.lock();
+            let position = state
+                .suspensions
+                .iter()
+                .position(|row| row.suspension_id == suspension.suspension_id);
+            let Some(position) = position else {
+                continue;
+            };
+            let row = state.suspensions.remove(position);
+            match failure {
+                None => written += 1,
+                Some(failure) => {
+                    warn!(
+                        stream_key = %suspension.stream_key,
+                        ?failure,
+                        "Stream suspension not recorded yet; it will be retried"
+                    );
+                    if let Some(row) = row {
+                        state.suspensions.push_back(row);
+                    }
+                    return written;
                 },
             }
         }
@@ -2340,6 +2517,13 @@ mod tests {
             self.real.commit(batch).await
         }
 
+        async fn record_suspension(
+            &self,
+            suspension: &StreamSuspensionRow,
+        ) -> Result<(), CommitFailure> {
+            self.real.record_suspension(suspension).await
+        }
+
         async fn attempt_states(&self, v: &str, s: &str, id: &str) -> Result<Vec<bool>, String> {
             let states = self.real.attempt_states(v, s, id).await;
             if let Some(during_read) = self.during_read.lock().unwrap().take() {
@@ -2658,6 +2842,120 @@ mod tests {
 
         assert_eq!(journal.gate().snapshot().sends_started, 3);
         assert!(backend.row("e-draining").unwrap().outcome.unwrap().not_sent);
+    }
+
+    /// From PR P the latch closes admissions: an entry past the manager's
+    /// checks is refused at its send, a typed no-send with no ticket; a
+    /// reduction still goes out.
+    #[tokio::test]
+    async fn the_latch_refuses_an_entry_at_its_send_and_nothing_else() {
+        let (backend, journal) = journal();
+        let ledger = SubmitAttemptLedger::new(8);
+        let permit = journal.acquire(OperationKind::MainLoop).unwrap();
+        permit
+            .run(async {
+                journal.record_suspension(suspension("position:a"));
+                assert!(journal.latch_set());
+                let entry = journal.open_intent(spec("e-latched", IntentKind::Entry));
+                journal.before_send(&entry, WriteClass::Strict).await.unwrap();
+                let refused = ledger.begin_send("e-latched").err();
+                assert!(
+                    matches!(&refused, Some(SendRefusal::NotSent(reason)) if reason.contains("latch")),
+                    "{refused:?}"
+                );
+                assert!(!journal.ticket_issued(&entry));
+                journal.finish_failed(&entry).await;
+
+                let exit = journal.open_intent(spec("x-latched", IntentKind::Exit));
+                journal.before_send(&exit, WriteClass::Bounded).await.unwrap();
+                ledger.begin_send("x-latched").unwrap();
+                assert!(journal.ticket_issued(&exit));
+                journal.finish_success(&exit, None).await;
+            })
+            .await;
+        assert!(backend.row("e-latched").unwrap().outcome.unwrap().not_sent);
+    }
+
+    fn suspension(stream_key: &str) -> StreamSuspensionRow {
+        StreamSuspensionRow {
+            suspension_id: Uuid::now_v7(),
+            stream_key: stream_key.to_string(),
+            stream_kind: "position",
+            failed_seq: None,
+            month: None,
+            error: "injected".to_string(),
+            epoch_id: None,
+            suspended_at: Utc::now(),
+        }
+    }
+
+    /// A stream suspension goes through the retry set: the latch at once, the
+    /// row by the retry loop, retried until it lands, recorded once, and the
+    /// journal is not quiescent meanwhile.
+    #[tokio::test]
+    async fn a_stream_suspension_is_recorded_through_the_retry_set() {
+        let (backend, journal) = journal();
+        journal.record_suspension(suspension("position:a"));
+        journal.record_suspension(suspension("position:a"));
+        assert!(journal.latch_set());
+        assert_eq!(journal.retry_set_depth(), 1, "one per stream");
+        assert!(!journal.is_quiescent());
+
+        backend.push_fault(JournalFault::Known);
+        assert_eq!(journal.flush_pending().await, 0);
+        assert_eq!(journal.retry_set_depth(), 1, "kept for the next pass");
+        assert!(backend.suspensions().is_empty());
+
+        backend.push_fault(JournalFault::AckLost);
+        journal.flush_pending().await;
+        assert_eq!(journal.retry_set_depth(), 1, "an uncertain write is retried");
+        assert_eq!(journal.flush_pending().await, 1);
+        assert_eq!(journal.retry_set_depth(), 0);
+        assert!(journal.is_quiescent());
+        let recorded = backend.suspensions();
+        assert_eq!(recorded.len(), 1, "a replay converges on the first");
+        assert_eq!(recorded[0].stream_key, "position:a");
+    }
+
+    /// A suspension whose write keeps failing, while intents' commits would
+    /// land, never keeps an intent's rows from being tried: every pass still
+    /// reaches them.
+    #[tokio::test]
+    async fn a_failing_suspension_write_does_not_starve_the_intents() {
+        let (backend, journal) = journal();
+        let ledger = SubmitAttemptLedger::new(8);
+        let ((), _op) = in_op(&journal, async {
+            let intent = journal.open_intent(spec("x-pending", IntentKind::Exit));
+            journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
+            let _ = ledger.begin("x-pending");
+            backend.push_fault(JournalFault::Known);
+            journal.finish_success(&intent, None).await;
+        })
+        .await;
+        backend.set_suspension_writes_fail(true);
+        journal.record_suspension(suspension("position:refused"));
+        assert_eq!(journal.retry_set_depth(), 2);
+
+        assert_eq!(journal.flush_pending().await, 1, "the intent lands");
+        assert_eq!(journal.flush_pending().await, 0);
+        assert_eq!(journal.retry_set_depth(), 1, "the suspension waits, and only it");
+        let landed = backend.row("x-pending").unwrap().outcome.unwrap();
+        assert_eq!(landed.venue_outcome, Some(VenueOutcome::Success));
+        assert!(!journal.is_quiescent());
+
+        backend.set_suspension_writes_fail(false);
+        assert_eq!(journal.flush_pending().await, 1);
+        assert!(journal.is_quiescent());
+    }
+
+    /// A full retry set keeps no suspension, and the latch is set all the same.
+    #[tokio::test]
+    async fn a_suspension_past_a_full_retry_set_still_sets_the_latch() {
+        let (backend, journal) = journal();
+        fill_retry_set(&journal, &backend).await;
+        journal.record_suspension(suspension("position:full"));
+        assert!(journal.latch_set());
+        assert_eq!(journal.retry_set_depth(), RETRY_SET_CAPACITY);
     }
 
     /// An entry and its stop under one permit are one operation: both are in

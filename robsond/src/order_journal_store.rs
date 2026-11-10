@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use robson_exec::order_journal::{CommitFailure, JournalBackend, JournalBatch};
+use robson_exec::order_journal::{
+    CommitFailure, JournalBackend, JournalBatch, StreamSuspensionRow,
+};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{pool::PoolConnection, postgres::PgPoolOptions, Connection, PgPool, Postgres};
@@ -77,7 +79,8 @@ impl PgJournalBackend {
                 let connection = self.pool.acquire().await?;
                 let mut read = RetiringConnection { connection, finished: false };
                 sqlx::query(
-                    "SELECT 1 FROM order_intents, submit_attempts, journal_decisions LIMIT 0",
+                    "SELECT 1 FROM order_intents, submit_attempts, journal_decisions, \
+                     stream_suspensions LIMIT 0",
                 )
                 .execute(&mut *read.connection)
                 .await?;
@@ -198,6 +201,41 @@ impl JournalBackend for PgJournalBackend {
         let mut tx = write.connection.begin().await.map_err(known)?;
         self.write(batch, &mut tx).await?;
         // Sent and not answered: the row may exist.
+        tx.commit().await.map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
+        write.finished = true;
+        Ok(())
+    }
+
+    async fn record_suspension(
+        &self,
+        suspension: &StreamSuspensionRow,
+    ) -> Result<(), CommitFailure> {
+        let known = |e: sqlx::Error| CommitFailure::Known(e.to_string());
+        let connection = self.pool.acquire().await.map_err(known)?;
+        let mut write = RetiringConnection { connection, finished: false };
+        let mut tx = write.connection.begin().await.map_err(known)?;
+        // An open suspension of the stream, or this one replayed, stands.
+        sqlx::query(
+            r#"
+            INSERT INTO stream_suspensions (
+                suspension_id, tenant_id, stream_key, stream_kind, failed_seq, month, error,
+                epoch_id, suspended_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(suspension.suspension_id)
+        .bind(self.tenant_id)
+        .bind(&suspension.stream_key)
+        .bind(suspension.stream_kind)
+        .bind(suspension.failed_seq)
+        .bind(suspension.month)
+        .bind(&suspension.error)
+        .bind(suspension.epoch_id)
+        .bind(suspension.suspended_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(known)?;
         tx.commit().await.map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
         write.finished = true;
         Ok(())

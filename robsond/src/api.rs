@@ -2762,6 +2762,7 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::ApprovalDenied { .. } => StatusCode::CONFLICT,
         DaemonError::MonthlyHaltActive { .. } => StatusCode::SERVICE_UNAVAILABLE,
         DaemonError::ResidualInventoryUnresolved { .. } => StatusCode::CONFLICT,
+        DaemonError::AdmissionsClosed { .. } => StatusCode::SERVICE_UNAVAILABLE,
         DaemonError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // Exchange transport failures are upstream errors, not client errors.
         // Immediate-mode arm calls handle_signal synchronously; a connection or
@@ -2776,7 +2777,9 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         | DaemonError::Exec(robson_exec::ExecError::Timeout(_)) => StatusCode::BAD_GATEWAY,
         DaemonError::Exec(_) => StatusCode::BAD_REQUEST,
         DaemonError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        DaemonError::EventLog(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        DaemonError::EventLog(_) | DaemonError::StreamSuspended { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        },
         #[cfg(feature = "postgres")]
         DaemonError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         #[cfg(feature = "postgres")]

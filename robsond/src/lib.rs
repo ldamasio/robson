@@ -49,6 +49,7 @@ pub mod daemon;
 pub mod detector;
 pub mod error;
 pub mod event_bus;
+mod event_streams;
 pub mod funding;
 pub mod google_jwks;
 pub mod market_data;

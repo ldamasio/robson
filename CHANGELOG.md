@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed - Venue results kept, streams suspended, admissions closed on the latch (ADR-0056 step 7, PR P, part 2)
+
+- A venue result is no longer dropped when its event fails to persist: an entry that filled still gets its exchange stop,
+  and an exit still closes its leg in memory. The handlers that record a close after a venue fill (exit fill, panic close,
+  reconciled close) keep it too, and MonthlyHalt is still evaluated; `/panic` reports such a leg as closed. The entry's
+  pre-send writes stay barriers. On the tick path, and in startup recovery, one leg's event-only batch that did not persist
+  no longer stops the other legs.
+- Event persistence is serialized per stream. A failed append or projection apply suspends its stream: it takes no more
+  appends in this process, and the suspension is recorded in `stream_suspensions` (migration 33) through the journal's
+  retry set and loaded at the next start. `robsond_streams_suspended{kind}` exports both kinds at 0 from startup.
+- The journal latch now closes admissions until a restart, whatever set it, including a journal write that did not land on
+  a bounded send: arm and approval answer 503, a signal re-arms under the governed backoff, and an entry already past those
+  checks is refused at its send. Protection, exits, sweeps and the protective API continue.
+- A suspended system stream of the current month keeps admissions closed after a restart. There is no release before the
+  fence PR, and a failed month reset no longer heals itself on the next 60 s poll: it stays as it was, fail-closed.
+- Once a leg's venue work is done, a failure writing its query's audit is reported (ERROR and
+  `robsond_query_audit_failures_after_venue_work_total`) and stops nothing: the tick's and `/panic`'s other legs still run, and
+  a close or an entry keeps its outcome. A stream suspension whose write keeps failing no longer keeps the journal's other
+  pending rows from being retried.
+
 ### Fixed - Four domain audit events had no projection route (ADR-0056 step 7, PR P, part 1)
 
 - `entry_attempt_exhausted`, `signal_strategy_evaluated`, `entry_approval_pending` and `position_error`

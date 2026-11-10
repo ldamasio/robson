@@ -39,12 +39,16 @@
 //!   labelled by class
 //! - `robsond_graceful_stop_total` — stops, labelled by result
 //! - `robsond_unclean_start` — why this process's start counts as unclean
+//! - `robsond_streams_suspended` — event-log streams refusing appends, by kind
+//! - `robsond_query_audit_failures_after_venue_work_total` — query audit writes
+//!   that failed after their venue work, the outcome kept
 
 use std::sync::LazyLock;
 
 use prometheus::{
     self, register_counter, register_counter_vec, register_gauge, register_gauge_vec,
-    register_int_gauge, Counter, CounterVec, Gauge, GaugeVec, IntGauge,
+    register_int_gauge, register_int_gauge_vec, Counter, CounterVec, Gauge, GaugeVec, IntGauge,
+    IntGaugeVec,
 };
 
 /// Total completed engine cycles (each market tick processed).
@@ -98,10 +102,10 @@ pub fn init_detector_rearms_after_failure() {
     }
 }
 
-/// 1 once a bounded send went out without its journal row or journal history
-/// was discarded (ADR-0056 step 7). Stays until restart. Nothing acts on it
-/// yet: later PRs of step 7 close admissions on it. The journal gauges are
-/// defined here and published by the daemon once the journal is wired in.
+/// 1 once a bounded send went out without its journal row, journal history
+/// was discarded, an operation was aborted, a venue mutation ran without a
+/// permit or an event-log stream was suspended (ADR-0056 step 7). Stays until
+/// restart, and from PR P admissions stay closed while it is set.
 pub static JOURNAL_LATCH: LazyLock<Gauge> = LazyLock::new(|| {
     register_gauge!(
         "robsond_journal_latch",
@@ -209,9 +213,41 @@ pub static UNCLEAN_START: LazyLock<GaugeVec> = LazyLock::new(|| {
     .expect("failed to register robsond_unclean_start")
 });
 
+/// Query audit writes that failed after their venue work, the outcome kept
+/// (ADR-0056 step 7, PR P): a tick's or `/panic`'s other legs still ran.
+pub static QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_query_audit_failures_after_venue_work_total",
+        "Query audit writes that failed after their venue work; the venue outcome was kept"
+    )
+    .expect("failed to register robsond_query_audit_failures_after_venue_work_total")
+});
+
+/// Event-log streams that refuse appends, by `kind` (`position`, `system`):
+/// suspended in this process, or loaded at start and not repaired (ADR-0056
+/// step 7, PR P). A suspended system stream of the current month keeps
+/// admissions closed.
+pub static STREAMS_SUSPENDED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "robsond_streams_suspended",
+        "Event-log streams refusing appends, by kind",
+        &["kind"]
+    )
+    .expect("failed to register robsond_streams_suspended")
+});
+
+/// Publish how many streams of each kind are suspended; both kinds export,
+/// at 0 from startup.
+pub fn observe_streams_suspended(positions: usize, systems: usize) {
+    let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    STREAMS_SUSPENDED.with_label_values(&["position"]).set(count(positions));
+    STREAMS_SUSPENDED.with_label_values(&["system"]).set(count(systems));
+}
+
 /// Zero series for the gate's metrics, so they export from startup.
 pub fn init_operation_gate_metrics() {
     LazyLock::force(&UNPERMITTED_MUTATIONS);
+    LazyLock::force(&QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK);
     LazyLock::force(&ABORTED_OPERATIONS);
     for class in ["ordinary", "protective"] {
         API_SLOT_BUSY.with_label_values(&[class]);
@@ -644,6 +680,17 @@ mod tests {
             rendered.contains("robsond_journal_operations_over_statement_bound "),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn the_suspended_stream_gauge_exports_both_kinds() {
+        // Other tests' managers publish to the same gauge, so only the series
+        // are asserted here, not their values.
+        observe_streams_suspended(0, 0);
+
+        let rendered = render();
+        assert!(rendered.contains("robsond_streams_suspended{kind=\"position\"} "), "{rendered}");
+        assert!(rendered.contains("robsond_streams_suspended{kind=\"system\"} "), "{rendered}");
     }
 
     #[test]

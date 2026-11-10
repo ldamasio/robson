@@ -97,6 +97,23 @@ pub enum DaemonError {
     #[error("EventLog error: {0}")]
     EventLog(String),
 
+    /// The event's stream refuses appends: a write to it failed earlier in this
+    /// process (ADR-0056 step 7, PR P). Nothing was appended.
+    #[error(
+        "Event stream {stream_key} is suspended: {event_type} was not persisted; the stream takes \
+         no appends until a restart repairs it"
+    )]
+    StreamSuspended {
+        stream_key: String,
+        event_type: String,
+    },
+
+    /// Admissions are closed (ADR-0056 step 7, PR P): the journal latch is set,
+    /// which holds until a restart, or the current month's system stream is
+    /// suspended. Nothing was admitted.
+    #[error("Admissions closed: {reason}")]
+    AdmissionsClosed { reason: String },
+
     /// MonthlyHalt is active — all new entries blocked (v3 policy).
     ///
     /// Returned when `arm_position`, `handle_signal`, or `approve_query` is
@@ -137,6 +154,15 @@ pub enum DaemonError {
         count: usize,
         positions: Vec<StartupStaleActiveInfo>,
     },
+}
+
+impl DaemonError {
+    /// An event that did not persist: its write failed, or its stream refuses
+    /// appends (ADR-0056 step 7, PR P). What its batch did in memory and at the
+    /// venue stands.
+    pub(crate) fn is_event_not_persisted(&self) -> bool {
+        matches!(self, Self::EventLog(_) | Self::StreamSuspended { .. })
+    }
 }
 
 /// Result type for daemon operations.

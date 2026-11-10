@@ -60,6 +60,7 @@ use crate::{
     detector::DetectorTask,
     error::{DaemonError, DaemonResult},
     event_bus::{DaemonEvent, EventBus, FeedKey, MarketData},
+    event_streams::EventStreams,
     query::{
         ActorKind, CommandSource, ContextSummary, ExecutionQuery, QueryKind, QueryOutcome,
         QueryState,
@@ -229,6 +230,9 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// the position remains unresolved, so the set is bounded by the current
     /// risk-open portfolio. Read-only snapshots never touch this dedup state.
     latent_risk_warning_positions: RwLock<HashSet<PositionId>>,
+    /// The streams `persist_event_to_log` writes: their locks and which ones
+    /// refuse appends (ADR-0056 step 7, PR P).
+    event_streams: EventStreams,
     /// Optional postgres pool for persisting domain events to robson-eventlog.
     #[cfg(feature = "postgres")]
     event_log_pool: Option<PgPool>,
@@ -1018,6 +1022,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             month_peak_refreshed_at: Arc::new(Mutex::new(None)),
             shadow_slots_last: Mutex::new(None),
             latent_risk_warning_positions: RwLock::new(HashSet::new()),
+            event_streams: EventStreams::default(),
             #[cfg(feature = "postgres")]
             event_log_pool: None,
             #[cfg(feature = "postgres")]
@@ -1179,6 +1184,33 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         });
     }
 
+    /// The streams this manager writes (ADR-0056 step 7, PR P).
+    #[cfg(feature = "postgres")]
+    pub(crate) fn event_streams(&self) -> &EventStreams {
+        &self.event_streams
+    }
+
+    /// Load the stream suspensions on record that no repair cleared (ADR-0056
+    /// step 7, PR P). At start, before anything is appended. How many.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn load_stream_suspensions(&self) -> DaemonResult<usize> {
+        let (Some(pool), Some(tenant_id)) = (&self.event_log_pool, self.event_log_tenant_id) else {
+            return Ok(0);
+        };
+        let loaded = crate::event_streams::load_open_suspensions(pool, tenant_id).await?;
+        for (stream_key, suspended) in &loaded {
+            warn!(
+                %stream_key,
+                kind = suspended.stream.kind(),
+                repaired_through_seq = ?suspended.repaired_through_seq,
+                "Event stream suspended by an earlier process; it takes no appends"
+            );
+        }
+        let count = loaded.len();
+        self.event_streams.restore(loaded);
+        Ok(count)
+    }
+
     /// Configure eventlog persistence for domain events (MIG-v2.5#2).
     ///
     /// When set, every domain event emitted through the executor is also
@@ -1199,10 +1231,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Persist a single domain event to robson-eventlog and apply it to
     /// projections.
     ///
-    /// When `event_log_pool` is configured this is a **fail-fast** operation.
-    /// Any failure in append OR projection apply is returned as
-    /// `DaemonError::EventLog` so that callers propagate the error and
-    /// abort the current execution cycle.
+    /// When `event_log_pool` is configured a failure in append OR projection
+    /// apply is returned as `DaemonError::EventLog`, and the stream is
+    /// suspended (ADR-0056 step 7, PR P): it refuses every later append in this
+    /// process, `DaemonError::StreamSuspended`, so its projection lags its log
+    /// by exactly the suffix that did not apply, which a restart repairs. The
+    /// suspension is recorded through the journal's retry set and sets the
+    /// latch. A caller that already has a venue result keeps it either way.
     ///
     /// Rationale: the synchronous apply on the write path is the only active
     /// projection update mechanism for `positions_current`. Silencing failures
@@ -1210,35 +1245,82 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// knowledge, making crash recovery unreliable. (MIG-v2.5#2 design
     /// decision.)
     ///
-    /// When no pool is configured (in-memory only mode) returns `Ok(())`
-    /// immediately.
+    /// The stream's lock is held through the suspension check, the append, the
+    /// apply and the suspension, so a writer queued behind a failure sees the
+    /// suspension first. When no pool is configured (in-memory only mode) a
+    /// stream never fails, and this returns `Ok(())` unless one was suspended.
     ///
     /// Stream key pattern:
     /// - position-scoped events: `position:{position_id}`
     /// - system-scoped events: dedicated stream chosen by event type
     #[cfg(feature = "postgres")]
     async fn persist_event_to_log(&self, event: &Event) -> DaemonResult<()> {
+        let stream_key = Self::event_stream_key(event);
+        let _stream = self.event_streams.lock(&stream_key).await;
+        if self.event_streams.is_suspended(&stream_key) {
+            return Err(DaemonError::StreamSuspended {
+                stream_key,
+                event_type: event.event_type().to_string(),
+            });
+        }
         let (pool, tenant_id) = match (&self.event_log_pool, &self.event_log_tenant_id) {
             (Some(pool), Some(tid)) => (pool, *tid),
             _ => return Ok(()), // No eventlog configured — in-memory only mode
         };
+        match Self::append_and_apply(pool, tenant_id, &stream_key, event).await {
+            Ok(seq) => {
+                tracing::debug!(
+                    event_type = event.event_type(),
+                    position_id = %event.position_id(),
+                    seq,
+                    "Domain event persisted to eventlog and projection applied"
+                );
+                Ok(())
+            },
+            Err((failed_seq, message)) => {
+                if let Some(suspension) =
+                    self.event_streams.suspend(&stream_key, failed_seq, &message)
+                {
+                    error!(
+                        %stream_key,
+                        ?failed_seq,
+                        error = %message,
+                        "Event stream suspended: it takes no more appends in this process, and \
+                         admissions are closed until a restart (ADR-0056 step 7)"
+                    );
+                    self.executor.order_journal().record_suspension(suspension);
+                }
+                Err(DaemonError::EventLog(message))
+            },
+        }
+    }
 
-        let position_id = event.position_id();
-        let stream_key = Self::event_stream_key(event);
+    /// Append `event` and apply it. The seq it applied at, or the seq that did
+    /// not apply (`None` when the append failed or its seq is unknown) and why.
+    #[cfg(feature = "postgres")]
+    async fn append_and_apply(
+        pool: &PgPool,
+        tenant_id: Uuid,
+        stream_key: &str,
+        event: &Event,
+    ) -> Result<i64, (Option<i64>, String)> {
         let event_type = event.event_type().to_string();
 
         // Serialize full domain event as payload
         let payload = serde_json::to_value(event).map_err(|e| {
-            DaemonError::EventLog(format!(
-                "Failed to serialize {} for eventlog (stream {}): {}",
-                event_type, stream_key, e
-            ))
+            (
+                None,
+                format!(
+                    "Failed to serialize {} for eventlog (stream {}): {}",
+                    event_type, stream_key, e
+                ),
+            )
         })?;
 
-        let eventlog_event = EventlogEvent::new(tenant_id, &stream_key, &event_type, payload)
+        let eventlog_event = EventlogEvent::new(tenant_id, stream_key, &event_type, payload)
             .with_actor(EventlogActorType::Daemon, Some("robsond".to_string()));
 
-        let event_id = match append_event(pool, &stream_key, None, eventlog_event).await {
+        let event_id = match append_event(pool, stream_key, None, eventlog_event).await {
             Ok(id) => id,
             Err(robson_eventlog::EventLogError::IdempotentDuplicate(id)) => {
                 // Duplicate means the append already happened, but projection apply may
@@ -1253,10 +1335,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 id
             },
             Err(e) => {
-                return Err(DaemonError::EventLog(format!(
-                    "Failed to append {} to eventlog (stream {}): {}",
-                    event_type, stream_key, e
-                )));
+                return Err((
+                    None,
+                    format!(
+                        "Failed to append {} to eventlog (stream {}): {}",
+                        event_type, stream_key, e
+                    ),
+                ));
             },
         };
 
@@ -1273,26 +1358,25 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         .fetch_one(pool)
         .await
         .map_err(|e| {
-            DaemonError::EventLog(format!(
-                "Failed to fetch envelope for {} (stream {}, event_id {}): {}",
-                event_type, stream_key, event_id, e
-            ))
+            (
+                None,
+                format!(
+                    "Failed to fetch envelope for {} (stream {}, event_id {}): {}",
+                    event_type, stream_key, event_id, e
+                ),
+            )
         })?;
 
         apply_event_to_projections(pool, &envelope).await.map_err(|e| {
-            DaemonError::EventLog(format!(
-                "Failed to apply {} to projection (stream {}, seq {}): {}",
-                event_type, stream_key, envelope.seq, e
-            ))
+            (
+                Some(envelope.seq),
+                format!(
+                    "Failed to apply {} to projection (stream {}, seq {}): {}",
+                    event_type, stream_key, envelope.seq, e
+                ),
+            )
         })?;
-
-        tracing::debug!(
-            event_type = %event_type,
-            %position_id,
-            seq = envelope.seq,
-            "Domain event persisted to eventlog and projection applied"
-        );
-        Ok(())
+        Ok(envelope.seq)
     }
 
     #[cfg(not(feature = "postgres"))]
@@ -1314,10 +1398,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// - `ActionResult::EntryExecutionRejected { event, .. }` - internal
     ///   pre-placement safety/policy rejections
     ///
-    /// When `event_log_pool` is configured, persistence is **fail-fast**: any
-    /// failure in `persist_event_to_log()` (append OR projection apply) is
-    /// propagated as a `DaemonError::EventLog` and the caller must abort
-    /// the current execution cycle.
+    /// When `event_log_pool` is configured, persistence of what precedes a
+    /// venue request, and of a batch with no venue action, is **fail-fast**:
+    /// any failure in `persist_event_to_log()` (append OR projection apply, or
+    /// a suspended stream) is propagated and the caller must abort the current
+    /// execution cycle. **A venue result is never dropped** (ADR-0056 step 7,
+    /// PR P): once a batch has reached the venue, its results come back whether
+    /// or not their events persisted, so an entry still gets its stop and an
+    /// exit still closes its leg. The failure itself suspended its stream and
+    /// set the latch.
     ///
     /// This prevents silent projection drift during execution when PostgreSQL
     /// is in use. On the entry path it makes pre-exchange events a real
@@ -1668,16 +1757,24 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // recovery, and audit-only cycles: exchange side effects run before a
         // PostgreSQL outage is surfaced. In particular, a filled position
         // must still receive insurance and an exit order must still reach the
-        // exchange even when the event log is unavailable.
+        // exchange even when the event log is unavailable. A batch that went to
+        // the venue keeps its results when they fail to persist.
         if !entry_admission_barrier {
+            let reaches_venue =
+                actions.iter().any(|action| !matches!(action, EngineAction::EmitEvent(_)));
             let results = self.executor.execute(actions).await?;
-            self.persist_action_results(&results).await?;
+            if reaches_venue {
+                self.persist_venue_results(&results).await;
+            } else {
+                self.persist_action_results(&results).await?;
+            }
             return Ok(results);
         }
 
         let mut results = Vec::with_capacity(actions.len());
 
         for action in actions {
+            let places_entry = matches!(action, EngineAction::PlaceEntryOrder { .. });
             let mut action_results = self.executor.execute(vec![action]).await?;
             let result = action_results.pop().ok_or_else(|| {
                 DaemonError::Config(
@@ -1687,7 +1784,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
             // Persist before advancing to the next action. A failure here is
             // the barrier that prevents a later exchange action from running.
-            self.persist_action_result(&result).await?;
+            // The entry order's own answer, once it was sent, is a venue result:
+            // kept, so its fill still reaches `handle_entry_fill` and the stop.
+            let sent = matches!(
+                result,
+                ActionResult::OrderPlaced { .. } | ActionResult::OrderFailed { .. }
+            );
+            if places_entry && sent {
+                self.persist_venue_result(&result).await;
+            } else {
+                self.persist_action_result(&result).await?;
+            }
 
             let should_stop = matches!(
                 result,
@@ -1709,6 +1816,46 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             self.persist_action_result(result).await?;
         }
         Ok(())
+    }
+
+    /// Persist what came back from the venue, keeping it whatever happens
+    /// (ADR-0056 step 7, PR P). Each result is tried: another stream may still
+    /// take its event, while the failed one now refuses.
+    async fn persist_venue_results(&self, results: &[ActionResult]) {
+        for result in results {
+            self.persist_venue_result(result).await;
+        }
+    }
+
+    async fn persist_venue_result(&self, result: &ActionResult) {
+        if let Err(error) = self.persist_action_result(result).await {
+            error!(
+                %error,
+                "Venue result kept although its event did not persist; its stream is \
+                 suspended and admissions are closed until a restart (ADR-0056 step 7)"
+            );
+        }
+    }
+
+    /// Record the close of a leg whose fill already happened at the venue. A
+    /// close that does not persist is kept (ADR-0056 step 7, PR P): the leg is
+    /// closed in memory, the failure suspended its stream and set the latch,
+    /// and what follows a close still runs. Whether it persisted.
+    async fn record_venue_close(&self, event: Event) -> DaemonResult<bool> {
+        let position_id = event.position_id();
+        match self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.is_event_not_persisted() => {
+                error!(
+                    %position_id,
+                    %error,
+                    "Leg closed in memory; its close did not persist (stream suspended, \
+                     admissions closed until a restart, ADR-0056 step 7)"
+                );
+                Ok(false)
+            },
+            Err(error) => Err(error),
+        }
     }
 
     async fn persist_action_result(&self, result: &ActionResult) -> DaemonResult<()> {
@@ -1809,6 +1956,24 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
     async fn record_query_failure(&self, query: &ExecutionQuery) -> DaemonResult<()> {
         self.record_query_transition(query, "failed").await
+    }
+
+    /// Record a query's transition once its venue work is done or has been
+    /// given up for this leg. A failed audit write is reported, counted and
+    /// goes no further (ADR-0056 step 7, PR P): the venue outcome stands, and
+    /// what follows it, the next leg of a tick or of `/panic` included, still
+    /// runs. Records ahead of a venue request stay barriers.
+    async fn record_after_venue_work(&self, query: &ExecutionQuery, transition_cause: &str) {
+        if let Err(error) = self.record_query_transition(query, transition_cause).await {
+            crate::metrics::QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK.inc();
+            error!(
+                query_id = %query.id,
+                position_id = ?query.position_id,
+                transition_cause,
+                %error,
+                "Query audit write failed after its venue work; the outcome stands"
+            );
+        }
     }
 
     fn set_query_context_summary(query: &mut ExecutionQuery, active_positions_count: usize) {
@@ -2746,10 +2911,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
             query.fail(format!("{}", e), "acting".to_string());
-            self.record_query_failure(query).await?;
+            self.record_after_venue_work(query, "failed").await;
             return Err(DaemonError::Config(format!("Query completion error: {}", e)));
         }
-        self.record_query_transition(query, "completed").await?;
+        self.record_after_venue_work(query, "completed").await;
 
         Ok(())
     }
@@ -2792,6 +2957,31 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// A residual on any open leg blocks new admissions until that leg closes
     /// (ADR-0056 §5). A check of its own: a residual never enters the budget or
     /// latent risk, so it can neither fail the snapshot nor defer MonthlyHalt.
+    /// Admissions close for the rest of this process once the journal latch is
+    /// set, whatever set it (ADR-0056 step 7, PR P): a bounded send whose row
+    /// did not land, discarded history, an aborted operation, a mutation
+    /// without a permit, a suspended stream. They also stay closed while the
+    /// current month's system stream is suspended, loaded at start, until the
+    /// fence PR's accounting contract and release replace this. The latch is
+    /// checked again at an entry's send.
+    fn check_admissions_open(&self) -> DaemonResult<()> {
+        if self.executor.order_journal().latch_set() {
+            return Err(DaemonError::AdmissionsClosed {
+                reason: "the journal latch is set; admissions stay closed until a restart"
+                    .to_string(),
+            });
+        }
+        if let Some((year, month)) = self.event_streams.current_month_suspended() {
+            return Err(DaemonError::AdmissionsClosed {
+                reason: format!(
+                    "the event stream of {year:04}-{month:02} is suspended; admissions stay \
+                     closed while that month is current"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     async fn check_no_unresolved_residual(&self) -> DaemonResult<()> {
         let open = self.store.positions().find_active().await?;
         let Some(leg) = open.iter().find(|leg| leg.has_unresolved_residual()) else {
@@ -2968,6 +3158,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             return Err(DaemonError::MonthlyHaltActive { reason: snap.reason.unwrap_or_default() });
         }
         self.check_no_unresolved_residual().await?;
+        self.check_admissions_open()?;
 
         // Generate position ID upfront (used in event and returned to caller)
         let position_id = Uuid::now_v7();
@@ -3502,10 +3693,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Ok(_) => {
                 if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count: 1 }) {
                     query.fail(format!("{}", e), "acting".to_string());
-                    self.record_query_failure(&query).await?;
+                    self.record_after_venue_work(&query, "failed").await;
                     return Err(DaemonError::Config(format!("Query completion error: {}", e)));
                 }
-                self.record_query_transition(&query, "completed").await?;
+                self.record_after_venue_work(&query, "completed").await;
                 Ok(())
             },
             Err(e) => {
@@ -3841,6 +4032,21 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             )
             .await;
             return Err(blocked);
+        }
+        if let Err(closed) = self.check_admissions_open() {
+            let reason = closed.to_string();
+            query.fail(reason.clone(), "processing".to_string());
+            self.record_query_failure(&query).await?;
+            self.event_bus.send(DaemonEvent::EntryRejected {
+                position_id,
+                reason_code: "admissions_closed".to_string(),
+                reason,
+                terminal: false,
+                rejected_at: chrono::Utc::now(),
+            });
+            self.rearm_detector_after_governed_block(position_id, &position, "admissions closed")
+                .await;
+            return Err(closed);
         }
 
         // Cache the entry-time invalidation guard level (ADR-0042) for the fill
@@ -4185,6 +4391,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             return Err(DaemonError::MonthlyHaltActive { reason: snap.reason.unwrap_or_default() });
         }
         self.check_no_unresolved_residual().await?;
+        self.check_admissions_open()?;
 
         let mut record = {
             let mut pending_approvals = self.pending_approvals.write().await;
@@ -4711,6 +4918,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             let actions = Self::stamp_cycle_id(decision.actions, query.id);
             let results = match self.execute_and_persist(actions).await {
                 Ok(r) => r,
+                // A batch with no venue action whose event did not persist; on
+                // a suspended stream every such batch is refused. It fails this
+                // leg's query only: the other legs on this tick still trail and
+                // exit (ADR-0056 step 7, PR P).
+                Err(e) if e.is_event_not_persisted() => {
+                    error!(
+                        position_id = %position.id,
+                        error = %e,
+                        "Tick batch did not persist; continuing with the other legs"
+                    );
+                    query.fail(format!("{}", e), "acting".to_string());
+                    self.record_after_venue_work(&query, "failed").await;
+                    continue;
+                },
                 Err(e) => {
                     // #142: a reduce-only rejection with the exchange flat
                     // means the exchange-side insurance stop already closed
@@ -4749,13 +4970,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         };
                         if let Err(complete_error) = query.complete(outcome) {
                             query.fail(format!("{}", complete_error), "acting".to_string());
-                            self.record_query_failure(&query).await?;
+                            self.record_after_venue_work(&query, "failed").await;
                             return Err(DaemonError::Config(format!(
                                 "Query completion error: {}",
                                 complete_error
                             )));
                         }
-                        self.record_query_transition(&query, "completed").await?;
+                        self.record_after_venue_work(&query, "completed").await;
                         continue;
                     }
                     // The venue refused this exit: on its rules after one refresh
@@ -4836,10 +5057,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // Complete query with success
             if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
                 query.fail(format!("{}", e), "acting".to_string());
-                self.record_query_failure(&query).await?;
+                self.record_after_venue_work(&query, "failed").await;
                 return Err(DaemonError::Config(format!("Query completion error: {}", e)));
             }
-            self.record_query_transition(&query, "completed").await?;
+            self.record_after_venue_work(&query, "completed").await;
         }
 
         if let Some(error) = first_missing_rules {
@@ -4933,7 +5154,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             closure_evidence: robson_domain::ClosureEvidence::real_exit_fill(None),
             timestamp: filled_at,
         };
-        self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
+        self.record_venue_close(event).await?;
 
         // Record realized PnL in Prometheus metrics
         crate::metrics::POSITION_PNL
@@ -5129,7 +5350,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             closure_evidence: ClosureEvidence::Reconciled(input.evidence),
             timestamp: input.closed_at,
         };
-        self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
+        self.record_venue_close(event).await?;
 
         crate::metrics::POSITION_PNL
             .with_label_values(&[&input.position_id.to_string()])
@@ -5197,14 +5418,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     self.record_query_accepted(&query).await?;
 
                     match self.panic_close_position_internal(position.id, &mut query).await {
-                        Ok(_) => {
+                        Ok(persisted) => {
+                            if !persisted {
+                                error!(
+                                    position_id = %position.id,
+                                    "Panic: leg closed, its close event did not persist"
+                                );
+                            }
                             if let Err(e) =
                                 query.complete(QueryOutcome::ActionsExecuted { actions_count: 1 })
                             {
                                 query.fail(format!("{}", e), "acting".to_string());
-                                self.record_query_failure(&query).await?;
+                                self.record_after_venue_work(&query, "failed").await;
                             } else {
-                                self.record_query_transition(&query, "completed").await?;
+                                self.record_after_venue_work(&query, "completed").await;
                             }
                             closed_ids.push(position.id);
                         },
@@ -5223,7 +5450,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                                 QueryState::Denied { check, .. } => format!("denied:{}", check),
                             };
                             query.fail(format!("{}", e), phase);
-                            self.record_query_failure(&query).await?;
+                            // The other legs are still closed.
+                            self.record_after_venue_work(&query, "failed").await;
                             error!(position_id = %position.id, error = %e, "Failed to panic close");
                         },
                     }
@@ -5283,12 +5511,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// errors. The caller is responsible for failure recording. This
     /// prevents double-fail.
     ///
-    /// Emits PositionClosed event which will be applied by projection.
+    /// Emits PositionClosed event which will be applied by projection. Whether
+    /// that close persisted: the leg is closed either way.
     async fn panic_close_position_internal(
         &self,
         position_id: PositionId,
         query: &mut ExecutionQuery,
-    ) -> DaemonResult<()> {
+    ) -> DaemonResult<bool> {
         // Transition to Processing
         if let Err(e) = query.transition(QueryState::Processing) {
             return Err(DaemonError::Config(format!("Query transition error: {}", e)));
@@ -5380,7 +5609,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             timestamp: filled_at,
         };
 
-        self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
+        let persisted = self.record_venue_close(event).await?;
 
         // Send to event bus for real-time notification
         self.event_bus.send(DaemonEvent::CorePositionClosed {
@@ -5389,7 +5618,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             side: position.side,
         });
 
-        Ok(())
+        Ok(persisted)
     }
 
     /// Kill detector task for a position.
@@ -5570,6 +5799,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let engine = self.engine();
 
         for position in positions {
+            // Its projection may lag its log (ADR-0056 step 7, PR P): the leg's
+            // snapshot is invalid whatever its pricing would say.
+            if self.event_streams.position_suspended(position.id) {
+                failures.push(LatentRiskResolutionFailure {
+                    position_id: position.id,
+                    state: position.state.name().to_string(),
+                    reason: "its event stream is suspended".to_string(),
+                });
+                continue;
+            }
             if position.stop_policy == StopPolicy::LegacyUncapped {
                 if let Some(pricing) = Self::legacy_resolved_position_risk(position) {
                     total += pricing.risk;
@@ -6326,44 +6565,6 @@ mod tests {
             prev_hash: None,
             hash: None,
         }
-    }
-
-    #[cfg(feature = "postgres")]
-    #[sqlx::test(migrations = "../migrations")]
-    #[ignore = "requires DATABASE_URL"]
-    async fn eventlog_failure_during_exit_cycle_still_reaches_exchange(pool: sqlx::PgPool) {
-        let manager = create_postgres_test_manager(pool.clone());
-        pool.close().await;
-
-        let position_id = Uuid::now_v7();
-        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        let quantity = Quantity::new(dec!(0.01)).unwrap();
-        let trigger = Price::new(dec!(94000)).unwrap();
-        let actions = vec![
-            EngineAction::EmitEvent(Event::ExitTriggered {
-                position_id,
-                reason: robson_domain::ExitReason::TrailingStop,
-                trigger_price: trigger,
-                stop_price: trigger,
-                timestamp: chrono::Utc::now(),
-            }),
-            EngineAction::PlaceExitOrder {
-                position_id,
-                cycle_id: Some(Uuid::now_v7()),
-                symbol,
-                side: Side::Long.exit_action(),
-                quantity,
-                reason: robson_domain::ExitReason::TrailingStop,
-            },
-        ];
-
-        let error = manager.execute_and_persist(actions).await.unwrap_err();
-        assert!(matches!(error, DaemonError::EventLog(_)));
-        assert_eq!(
-            manager.exchange().market_order_call_count(),
-            1,
-            "exit availability must retain execute-all-then-persist semantics"
-        );
     }
 
     /// Cancel-first: the stop's cancel happened, so it must reach the event log
@@ -8510,18 +8711,19 @@ mod tests {
     /// The boundary: once the entry's actions reach the executor an order may
     /// exist, so no failure from there re-arms. Before the order: the first
     /// entry event fails to persist, which also keeps the order back
-    /// (ADR-0052). After it: the last audit write fails.
+    /// (ADR-0052). After it: the last audit write fails, which since PR P
+    /// keeps the entry's outcome and answers `Ok` (ADR-0056 step 7).
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
     async fn a_failure_once_the_executor_has_the_entry_does_not_rearm(pool: sqlx::PgPool) {
         set_month_basis(&pool, dec!(10000)).await;
         let cases = [
-            ("NEW.event_type = 'entry_signal_received'".to_string(), 0),
-            (audit_write("completed"), 1),
+            ("NEW.event_type = 'entry_signal_received'".to_string(), 0, false),
+            (audit_write("completed"), 1, true),
         ];
 
-        for (condition, orders) in cases {
+        for (condition, orders, kept) in cases {
             let manager = create_audited_postgres_test_manager(pool.clone(), 300);
             let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
 
@@ -8529,7 +8731,7 @@ mod tests {
             let result = manager.handle_signal(signal).await;
             restore_event_log_writes(&pool).await;
 
-            assert!(result.is_err(), "{condition}: {result:?}");
+            assert_eq!(result.is_ok(), kept, "{condition}: {result:?}");
             assert_eq!(manager.exchange().market_order_call_count(), orders, "{condition}");
             assert!(!manager.detectors.read().await.contains_key(&armed.id), "{condition}");
             assert_eq!(
@@ -8869,27 +9071,6 @@ mod tests {
             assert_eq!(manager.exchange().protection_call_count(), 1, "{fault:?}");
             assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), None);
         }
-    }
-
-    /// The second half of the boundary at the top: the entry reached the venue,
-    /// so the backoff resets although `execute_and_persist` returned `Err`, and
-    /// the flow does not re-arm.
-    #[cfg(feature = "postgres")]
-    #[sqlx::test(migrations = "../migrations")]
-    #[ignore = "requires DATABASE_URL"]
-    async fn a_ticketed_entry_that_returned_err_resets_the_backoff(pool: sqlx::PgPool) {
-        let manager = create_audited_postgres_test_manager(pool.clone(), 300);
-        let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
-        manager.governed_rearm_counts.write().await.insert(armed.id, 4);
-
-        fail_event_log_writes(&pool, "NEW.event_type = 'entry_order_accepted'").await;
-        let result = manager.handle_signal(signal).await;
-        restore_event_log_writes(&pool).await;
-
-        assert!(matches!(result, Err(DaemonError::EventLog(_))), "{result:?}");
-        assert_eq!(manager.exchange().market_order_call_count(), 1);
-        assert!(!manager.detectors.read().await.contains_key(&armed.id));
-        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), None);
     }
 
     /// A failed pre-send barrier is no ticket: the backoff stands, and it is
@@ -15092,4 +15273,6 @@ mod tests {
         assert_eq!(ctx.open_positions.len(), 1, "active positions must still count after restart");
         assert_eq!(ctx.open_positions[0].symbol, "BTCUSDT");
     }
+
+    mod persistence;
 }
