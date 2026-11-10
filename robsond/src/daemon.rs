@@ -16,7 +16,8 @@
 //! 5. Spawn WebSocket clients (market data)
 //! 6. Spawn projection worker (if database configured)
 //! 7. Main event loop (process events, market data)
-//! 8. Graceful shutdown on SIGINT/SIGTERM
+//! 8. Two-phase stop on SIGTERM/SIGINT (ADR-0056 step 7): drain, close, mark
+//!    the epoch clean only on a clean pass (`stop`)
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -66,6 +67,7 @@ use crate::{
     position_manager::{PositionManager, ReconcileCloseOutcome, ReconciledCloseInput},
     query_engine::{QueryRecorder, TracingQueryRecorder},
     reconciliation_worker::{gather_real_evidence, ReconciliationWorker},
+    stop::{StopMarker, StopTimings},
 };
 
 // =============================================================================
@@ -123,6 +125,8 @@ pub struct Daemon<E: Venue + 'static, S: Store + 'static> {
     /// (ADR-0056 step 7). Held here so nothing reaches it through the manager
     /// lock.
     order_journal: Arc<OrderJournal>,
+    /// Bounds of the two-phase stop.
+    stop_timings: StopTimings,
 }
 
 /// Parse entry_mode and approval_mode strings from DB into EntryPolicyConfig.
@@ -187,6 +191,45 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     executor.with_order_journal(journal)
 }
 
+/// Cancel `stop` on the first SIGTERM or SIGINT (ADR-0056 step 7). Both
+/// handlers are installed before this returns, so no later signal is lost.
+fn listen_for_stop_signals(stop: tokio_util::sync::CancellationToken) -> DaemonResult<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let install = |kind: SignalKind, name: &str| {
+        signal(kind).map_err(|error| {
+            DaemonError::Config(format!("Failed to install the {name} handler: {error}"))
+        })
+    };
+    let mut terminate = install(SignalKind::terminate(), "SIGTERM")?;
+    let mut interrupt = install(SignalKind::interrupt(), "SIGINT")?;
+    tokio::spawn(async move {
+        let received = tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+            _ = stop.cancelled() => return,
+        };
+        info!(signal = received, "Stop requested by signal");
+        stop.cancel();
+    });
+    Ok(())
+}
+
+/// Writes the clean-stop marker on this process's epoch.
+#[cfg(feature = "postgres")]
+struct EpochMarker {
+    pool: Arc<sqlx::PgPool>,
+    epoch: crate::process_epoch::Epoch,
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait::async_trait]
+impl StopMarker for EpochMarker {
+    async fn mark_clean(&self) -> Result<(), String> {
+        crate::process_epoch::mark_clean_stop(&self.pool, self.epoch).await
+    }
+}
+
 /// Keep writing what did not land, and publish the journal's gauges.
 async fn run_order_journal_retry(
     journal: Arc<OrderJournal>,
@@ -202,7 +245,7 @@ async fn run_order_journal_retry(
         journal.flush_pending().await;
         crate::metrics::observe_order_journal(&journal);
     }
-    // One last pass; the clean stop of a later PR makes this complete.
+    // One last pass; the stop's own flush makes it complete.
     journal.flush_pending().await;
     crate::metrics::observe_order_journal(&journal);
 }
@@ -285,6 +328,7 @@ impl Daemon<StubExchange, MemoryStore> {
             pg_pool: None,
             last_month_check: initial_month_check(),
             order_journal,
+            stop_timings: StopTimings::default(),
         }
     }
 
@@ -362,6 +406,7 @@ impl Daemon<StubExchange, MemoryStore> {
             pg_pool: None,
             last_month_check: initial_month_check(),
             order_journal,
+            stop_timings: StopTimings::default(),
         })
     }
 
@@ -442,6 +487,7 @@ impl Daemon<StubExchange, MemoryStore> {
             pg_pool,
             last_month_check: initial_month_check(),
             order_journal,
+            stop_timings: StopTimings::default(),
         }
     }
 }
@@ -518,6 +564,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             pg_pool: None,
             last_month_check: initial_month_check(),
             order_journal,
+            stop_timings: StopTimings::default(),
         }
     }
 
@@ -605,6 +652,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             pg_pool,
             last_month_check: initial_month_check(),
             order_journal,
+            stop_timings: StopTimings::default(),
         }
     }
 }
@@ -620,6 +668,11 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         self
     }
 
+    /// Change the stop's bounds, for tests that wait them out.
+    pub fn with_stop_timings(mut self, timings: StopTimings) -> Self {
+        self.stop_timings = timings;
+        self
+    }
 
     /// The route the funding worker runs on and how it treats unfinished sagas
     /// there (ADR-0056 §3). The worker exists whatever the selected venue
@@ -694,19 +747,25 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         self.run_until(tokio_util::sync::CancellationToken::new()).await
     }
 
-    async fn run_until(self, shutdown: tokio_util::sync::CancellationToken) -> DaemonResult<()> {
+    async fn run_until(self, stop: tokio_util::sync::CancellationToken) -> DaemonResult<()> {
         info!(
             version = env!("CARGO_PKG_VERSION"),
             environment = %self.config.environment,
             "Starting Robson daemon"
         );
 
-        // Shutdown token for coordinating graceful shutdown
-        let shutdown_sig = shutdown.clone();
+        // SIGTERM or SIGINT asks for the two-phase stop (ADR-0056 step 7). As
+        // PID 1 the daemon receives SIGTERM only once a handler is installed,
+        // so this comes first.
+        listen_for_stop_signals(stop.clone())?;
 
         let journal = Arc::clone(&self.order_journal);
         crate::metrics::init_operation_gate_metrics();
         journal.gate().set_observer(Arc::new(crate::metrics::GateMetrics));
+
+        // Cancelled when the stop enters Closing: the main loop, the workers,
+        // the detectors and the API listener.
+        let shutdown = tokio_util::sync::CancellationToken::new();
 
         // The journal must take writes before anything can be sent: this warms
         // its pool and refuses a schema without its tables (ADR-0056 step 7).
@@ -717,239 +776,51 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
 
         // This process's epoch, with a strict commit before any venue request.
         // Only the stub starts without one.
-        self.start_epoch().await?;
+        let marker = self.start_epoch().await?;
+
+        // The stop runs beside everything below from here on. It cancels the
+        // detectors through their token, never through the manager lock.
+        let stopping = {
+            let detectors = self.position_manager.read().await.detector_shutdown_token();
+            let closing = shutdown.clone();
+            let close = move || {
+                closing.cancel();
+                detectors.cancel();
+            };
+            tokio::spawn(crate::stop::stop_when_asked(
+                stop,
+                Arc::clone(&journal),
+                close,
+                marker,
+                self.stop_timings,
+            ))
+        };
 
         // The startup phase holds the startup slot's permit throughout; the
-        // startup scan and startup recovery run under it. Boxed: its future is
-        // large.
+        // startup scan and startup recovery run under it. Both halves are
+        // boxed: their futures are large.
         journal
             .acquire(OperationKind::Startup)?
             .run(Box::pin(self.start_up(&shutdown)))
             .await?;
 
-        // 4. Start API server
-        let api_addr = self.start_api_server().await?;
-        info!(%api_addr, "API server started");
-
-        // 5. Spawn reconciliation worker (uses explicit missing_grace from config)
-        let reconciliation_interval = Duration::from_secs(self.config.reconciliation.interval_secs);
-        let missing_grace = Duration::from_secs(self.config.reconciliation.missing_grace_secs);
-        let reconciliation_worker = ReconciliationWorker::new_with_missing_grace(
-            Arc::clone(&self.exchange),
-            Arc::clone(&self.position_manager),
-            Arc::clone(&self.store),
-            Arc::clone(&self.event_bus),
-            reconciliation_interval,
-            missing_grace,
-            shutdown.clone(),
-        )
-        .with_order_journal(Arc::clone(&journal));
-        let reconciliation_handle = tokio::spawn(async move {
-            if let Err(e) = reconciliation_worker.run().await {
-                error!(error = %e, "Reconciliation worker failed");
-            }
-        });
-
-        // 6. Spawn WebSocket clients (Phase 6: Market Data) plus the REST fallback
-        //    companion per symbol (ADR-0044): if the WS feed goes silent past the
-        //    watchdog while a risk-open position exists, the fallback polls the
-        //    exchange REST price into the same pipeline so the trailing engine never
-        //    starves.
-        let market_data_manager = MarketDataManager::for_venue(
-            self.event_bus.clone(),
-            shutdown.clone(),
-            self.exchange.id().clone(),
-            Arc::clone(&self.market_data),
-        );
-        let fallback_cfg = RestFallbackConfig::from_env();
-        let fallback_support: Arc<dyn FallbackSupport> = Arc::new(DaemonFallbackSupport {
-            exchange: Arc::clone(&self.exchange),
-            position_manager: Arc::clone(&self.position_manager),
-        });
-        let mut ws_handles = Vec::with_capacity(self.config.market_data.symbols.len() * 2);
-        for symbol_str in &self.config.market_data.symbols {
-            let symbol = Symbol::from_pair(symbol_str).map_err(|e| {
-                DaemonError::Config(format!("Invalid symbol {}: {}", symbol_str, e))
-            })?;
-            let health = Arc::new(FeedHealth::new());
-            let handle =
-                market_data_manager.spawn_ws_client(symbol.clone(), Arc::clone(&health))?;
-            ws_handles.push(handle);
-            let fallback_handle = market_data_manager.spawn_rest_fallback(
-                symbol,
-                health,
-                Arc::clone(&fallback_support),
-                fallback_cfg,
-            );
-            ws_handles.push(fallback_handle);
-            info!(symbol = %symbol_str, "WebSocket client + REST fallback spawned");
-        }
-
-        // 7. Spawn projection worker (if pg_pool configured)
-        #[cfg(feature = "postgres")]
-        let projection_handle = if let (Some(pool), Some(tenant_id)) =
-            (&self.pg_pool, self.config.projection.tenant_id)
-        {
-            info!(
-                stream_key = %self.config.projection.stream_key,
-                %tenant_id,
-                "Starting projection worker with shared pool"
-            );
-
-            let worker =
-                ProjectionWorker::new((**pool).clone(), self.config.projection.clone(), tenant_id);
-
-            let worker_shutdown = shutdown.clone();
-            Some(tokio::spawn(async move {
-                if let Err(e) = worker.run(worker_shutdown).await {
-                    error!(error = %e, "Projection worker failed");
-                }
-            }))
+        // A stop that reached Closing during startup starts nothing more.
+        let workers = if shutdown.is_cancelled() {
+            Vec::new()
         } else {
-            info!("No projection worker configured");
-            None
+            Box::pin(self.serve(&journal, &shutdown)).await?
         };
 
-        #[cfg(not(feature = "postgres"))]
-        let projection_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let report = stopping.await.map_err(|error| {
+            DaemonError::Config(format!("The stop task ended abnormally: {error}"))
+        })?;
 
-        #[cfg(feature = "postgres")]
-        let funding_handle = if let Some(service) = self.funding_worker_service() {
-            let worker = FundingWorker::new(service).with_order_journal(Arc::clone(&journal));
-            let worker_shutdown = shutdown.clone();
-            Some(tokio::spawn(async move {
-                if let Err(e) = worker.run(worker_shutdown).await {
-                    error!(error = %e, "Funding worker failed");
-                }
-            }))
-        } else {
-            None
-        };
-
-        #[cfg(not(feature = "postgres"))]
-        let funding_handle: Option<tokio::task::JoinHandle<()>> = None;
-
-        // 8a. Spawn the invalid-basis alarm (ADR-0051 §1 — if pg_pool configured).
-        #[cfg(feature = "postgres")]
-        let budget_basis_alarm_handle = self
-            .pg_pool
-            .as_ref()
-            .map(|pool| tokio::spawn(BudgetBasisAlarm::new(pool).run(shutdown.clone())));
-
-        #[cfg(not(feature = "postgres"))]
-        let budget_basis_alarm_handle: Option<tokio::task::JoinHandle<()>> = None;
-
-        // 8b. Spawn income ledger worker (ADR-0045 §1 — if pg_pool configured).
-        #[cfg(feature = "postgres")]
-        let income_ledger_handle = if let Some(pool) = &self.pg_pool {
-            info!("Starting income ledger worker (ADR-0045)");
-            let worker = IncomeLedgerWorker::new(
-                Arc::clone(&self.exchange),
-                Arc::clone(&self.position_manager),
-                Arc::clone(&self.store),
-                (**pool).clone(),
-                Arc::clone(&self.event_bus),
-                std::time::Duration::from_secs(60),
-                shutdown.clone(),
-            );
-            Some(tokio::spawn(async move {
-                if let Err(e) = worker.run().await {
-                    error!(error = %e, "Income ledger worker failed");
-                }
-            }))
-        } else {
-            info!("No income ledger worker configured (no pg_pool)");
-            None
-        };
-
-        #[cfg(not(feature = "postgres"))]
-        let income_ledger_handle: Option<tokio::task::JoinHandle<()>> = None;
-
-        // 7a. Keep the order journal's retry set moving (ADR-0056 step 7).
-        crate::metrics::observe_order_journal(&journal);
-        let order_journal_handle =
-            tokio::spawn(run_order_journal_retry(Arc::clone(&journal), shutdown.clone()));
-
-        // 8. Subscribe to event bus
-        let mut event_receiver = self.event_bus.subscribe();
-
-        // 9. Spawn ctrl+c handler
-        let ctrl_c_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            if let Err(_) = tokio::signal::ctrl_c().await {
-                error!("Failed to install ctrl+c handler");
-            }
-            info!("Received ctrl+c, initiating shutdown");
-            ctrl_c_shutdown.cancel();
-        });
-
-        let mut month_boundary_interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(60));
-        month_boundary_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        // 10. Main event loop
-        info!("Entering main event loop");
-        loop {
-            tokio::select! {
-                // Shutdown requested
-                _ = shutdown.cancelled() => {
-                    info!("Shutdown requested");
-                    break;
-                }
-
-                // Process events from event bus
-                Some(event_result) = event_receiver.recv() => {
-                    match event_result {
-                        Ok(event) => self.handle_event_permitted(&journal, event).await,
-                        Err(lag_msg) => {
-                            warn!(%lag_msg, "Event receiver lagged");
-                        }
-                    }
-                }
-
-                _ = month_boundary_interval.tick() => {
-                    let now = Utc::now();
-                    if let Err(e) = self.poll_month_boundary(now).await {
-                        error!(error = %e, "Month boundary check failed");
-                    }
-                }
-            }
+        // What holds no permit is given what is left of the deadline.
+        info!(count = workers.len(), "Waiting for workers to finish...");
+        for handle in workers {
+            let _ = tokio::time::timeout_at(report.deadline, handle).await;
         }
-
-        // 11. Graceful shutdown
-        shutdown_sig.cancel(); // Ensure any remaining tasks are cancelled
-
-        info!("Waiting for reconciliation worker to finish...");
-        let _ = tokio::time::timeout(Duration::from_secs(10), reconciliation_handle).await;
-
-        let _ = tokio::time::timeout(Duration::from_secs(10), order_journal_handle).await;
-
-        info!(count = ws_handles.len(), "Waiting for WebSocket clients to finish...");
-        for handle in ws_handles {
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), handle).await;
-        }
-
-        if let Some(handle) = projection_handle {
-            info!("Waiting for projection worker to finish...");
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(30), handle).await;
-        }
-
-        if let Some(handle) = funding_handle {
-            info!("Waiting for funding worker to finish...");
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
-        }
-
-        if let Some(handle) = budget_basis_alarm_handle {
-            info!("Waiting for budget basis alarm to finish...");
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
-        }
-
-        if let Some(handle) = income_ledger_handle {
-            info!("Waiting for income ledger worker to finish...");
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
-        }
-
-        self.shutdown().await?;
+        let _ = tokio::time::timeout_at(report.deadline, self.shutdown()).await;
 
         Ok(())
     }
@@ -1029,6 +900,176 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         Ok(())
     }
 
+    /// Start the API and the workers, then run the main loop until the stop
+    /// enters Closing. Returns the workers' handles.
+    async fn serve(
+        &self,
+        journal: &Arc<OrderJournal>,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) -> DaemonResult<Vec<tokio::task::JoinHandle<()>>> {
+        let mut workers = Vec::new();
+
+        // 4. Start API server
+        let api_addr = self.start_api_server_until(shutdown.clone()).await?;
+        info!(%api_addr, "API server started");
+
+        // 5. Spawn reconciliation worker (uses explicit missing_grace from config)
+        let reconciliation_interval = Duration::from_secs(self.config.reconciliation.interval_secs);
+        let missing_grace = Duration::from_secs(self.config.reconciliation.missing_grace_secs);
+        let reconciliation_worker = ReconciliationWorker::new_with_missing_grace(
+            Arc::clone(&self.exchange),
+            Arc::clone(&self.position_manager),
+            Arc::clone(&self.store),
+            Arc::clone(&self.event_bus),
+            reconciliation_interval,
+            missing_grace,
+            shutdown.clone(),
+        )
+        .with_order_journal(Arc::clone(journal));
+        workers.push(tokio::spawn(async move {
+            if let Err(e) = reconciliation_worker.run().await {
+                error!(error = %e, "Reconciliation worker failed");
+            }
+        }));
+
+        // 6. Spawn WebSocket clients (Phase 6: Market Data) plus the REST fallback
+        //    companion per symbol (ADR-0044): if the WS feed goes silent past the
+        //    watchdog while a risk-open position exists, the fallback polls the
+        //    exchange REST price into the same pipeline so the trailing engine never
+        //    starves.
+        let market_data_manager = MarketDataManager::for_venue(
+            self.event_bus.clone(),
+            shutdown.clone(),
+            self.exchange.id().clone(),
+            Arc::clone(&self.market_data),
+        );
+        let fallback_cfg = RestFallbackConfig::from_env();
+        let fallback_support: Arc<dyn FallbackSupport> = Arc::new(DaemonFallbackSupport {
+            exchange: Arc::clone(&self.exchange),
+            position_manager: Arc::clone(&self.position_manager),
+        });
+        for symbol_str in &self.config.market_data.symbols {
+            let symbol = Symbol::from_pair(symbol_str).map_err(|e| {
+                DaemonError::Config(format!("Invalid symbol {}: {}", symbol_str, e))
+            })?;
+            let health = Arc::new(FeedHealth::new());
+            let handle =
+                market_data_manager.spawn_ws_client(symbol.clone(), Arc::clone(&health))?;
+            workers.push(handle);
+            let fallback_handle = market_data_manager.spawn_rest_fallback(
+                symbol,
+                health,
+                Arc::clone(&fallback_support),
+                fallback_cfg,
+            );
+            workers.push(fallback_handle);
+            info!(symbol = %symbol_str, "WebSocket client + REST fallback spawned");
+        }
+
+        // 7. Spawn projection worker (if pg_pool configured)
+        #[cfg(feature = "postgres")]
+        if let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id) {
+            info!(
+                stream_key = %self.config.projection.stream_key,
+                %tenant_id,
+                "Starting projection worker with shared pool"
+            );
+
+            let worker =
+                ProjectionWorker::new((**pool).clone(), self.config.projection.clone(), tenant_id);
+
+            let worker_shutdown = shutdown.clone();
+            workers.push(tokio::spawn(async move {
+                if let Err(e) = worker.run(worker_shutdown).await {
+                    error!(error = %e, "Projection worker failed");
+                }
+            }));
+        } else {
+            info!("No projection worker configured");
+        }
+
+        #[cfg(feature = "postgres")]
+        if let Some(service) = self.funding_worker_service() {
+            let worker = FundingWorker::new(service).with_order_journal(Arc::clone(journal));
+            let worker_shutdown = shutdown.clone();
+            workers.push(tokio::spawn(async move {
+                if let Err(e) = worker.run(worker_shutdown).await {
+                    error!(error = %e, "Funding worker failed");
+                }
+            }));
+        }
+
+        // 8a. Spawn the invalid-basis alarm (ADR-0051 §1 — if pg_pool configured).
+        #[cfg(feature = "postgres")]
+        if let Some(pool) = &self.pg_pool {
+            workers.push(tokio::spawn(BudgetBasisAlarm::new(pool).run(shutdown.clone())));
+        }
+
+        // 8b. Spawn income ledger worker (ADR-0045 §1 — if pg_pool configured).
+        #[cfg(feature = "postgres")]
+        if let Some(pool) = &self.pg_pool {
+            info!("Starting income ledger worker (ADR-0045)");
+            let worker = IncomeLedgerWorker::new(
+                Arc::clone(&self.exchange),
+                Arc::clone(&self.position_manager),
+                Arc::clone(&self.store),
+                (**pool).clone(),
+                Arc::clone(&self.event_bus),
+                std::time::Duration::from_secs(60),
+                shutdown.clone(),
+            );
+            workers.push(tokio::spawn(async move {
+                if let Err(e) = worker.run().await {
+                    error!(error = %e, "Income ledger worker failed");
+                }
+            }));
+        } else {
+            info!("No income ledger worker configured (no pg_pool)");
+        }
+
+        // 7a. Keep the order journal's retry set moving (ADR-0056 step 7).
+        crate::metrics::observe_order_journal(journal);
+        workers.push(tokio::spawn(run_order_journal_retry(Arc::clone(journal), shutdown.clone())));
+
+        // 8. Subscribe to event bus
+        let mut event_receiver = self.event_bus.subscribe();
+
+        let mut month_boundary_interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(60));
+        month_boundary_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // 10. Main event loop, until the stop enters Closing. An event being
+        // handled finishes first: the select only chooses the next one.
+        info!("Entering main event loop");
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("Main loop closing");
+                    break;
+                }
+
+                // Process events from event bus
+                Some(event_result) = event_receiver.recv() => {
+                    match event_result {
+                        Ok(event) => self.handle_event_permitted(journal, event).await,
+                        Err(lag_msg) => {
+                            warn!(%lag_msg, "Event receiver lagged");
+                        }
+                    }
+                }
+
+                _ = month_boundary_interval.tick() => {
+                    let now = Utc::now();
+                    if let Err(e) = self.poll_month_boundary(now).await {
+                        error!(error = %e, "Month boundary check failed");
+                    }
+                }
+            }
+        }
+
+        Ok(workers)
+    }
+
     /// One main-loop event, under the main loop's permit (ADR-0056 step 7).
     async fn handle_event_permitted(&self, journal: &Arc<OrderJournal>, event: DaemonEvent) {
         let handled = match journal.acquire(OperationKind::MainLoop) {
@@ -1044,10 +1085,10 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     }
 
     /// Insert this process's epoch, strictly, and record whether its start is
-    /// unclean (ADR-0056 step 7). Without a database there is none, and only
-    /// the stub may start.
+    /// unclean (ADR-0056 step 7). The marker a clean stop writes on it.
+    /// Without a database there is none, and only the stub may start.
     #[cfg(feature = "postgres")]
-    async fn start_epoch(&self) -> DaemonResult<Option<crate::process_epoch::Epoch>> {
+    async fn start_epoch(&self) -> DaemonResult<Option<Box<dyn StopMarker>>> {
         let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id)
         else {
             refuse_an_epochless_venue(self.exchange.id())?;
@@ -1056,13 +1097,17 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         let start =
             crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION")).await?;
         crate::process_epoch::record_start(&start);
-        Ok(Some(start.epoch))
+        Ok(Some(Box::new(EpochMarker {
+            pool: Arc::clone(pool),
+            epoch: start.epoch,
+        })))
     }
 
     /// A build without PostgreSQL has no epochs: only the stub may start.
     #[cfg(not(feature = "postgres"))]
-    async fn start_epoch(&self) -> DaemonResult<()> {
-        refuse_an_epochless_venue(self.exchange.id())
+    async fn start_epoch(&self) -> DaemonResult<Option<Box<dyn StopMarker>>> {
+        refuse_an_epochless_venue(self.exchange.id())?;
+        Ok(None)
     }
 
     async fn poll_month_boundary(&self, now: DateTime<Utc>) -> DaemonResult<bool> {
@@ -1881,6 +1926,15 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     /// Public to allow integration tests to start the server and get the
     /// address.
     pub async fn start_api_server(&self) -> DaemonResult<SocketAddr> {
+        self.start_api_server_until(tokio_util::sync::CancellationToken::new()).await
+    }
+
+    /// Start the API server; it stops accepting when `shutdown` is cancelled
+    /// and lets the requests in flight finish.
+    async fn start_api_server_until(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> DaemonResult<SocketAddr> {
         let (circuit_breaker, prices) = {
             let pm = self.position_manager.read().await;
             (pm.circuit_breaker(), pm.price_cache())
@@ -1959,7 +2013,9 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
 
         // Spawn the server task
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, router).await {
+            let serving =
+                axum::serve(listener, router).with_graceful_shutdown(shutdown.cancelled_owned());
+            if let Err(e) = serving.await {
                 error!(error = %e, "API server error");
             }
         });
@@ -3497,6 +3553,65 @@ mod tests {
         assert_every_mutation_under(&exchange, OperationKind::Startup);
         let gate = journal.gate().snapshot();
         assert_eq!((gate.permits, gate.aborted), (0, 0));
+    }
+
+    /// The two-phase stop through the daemon itself: its epoch lands at
+    /// start, a clean stop marks it at version 1 and returns, and a stop after
+    /// an aborted permit leaves its epoch unmarked.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_daemon_stop_marks_its_epoch_only_when_clean(pool: sqlx::PgPool) {
+        let tenant = uuid::Uuid::now_v7();
+        for (run, abort) in [(1, false), (2, true)] {
+            let mut config = Config::test();
+            config.projection.tenant_id = Some(tenant);
+            let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())))
+                .with_stop_timings(StopTimings {
+                    drain_limit: Duration::from_secs(2),
+                    deadline: Duration::from_secs(10),
+                });
+            let journal = Arc::clone(&daemon.order_journal);
+            let stop = tokio_util::sync::CancellationToken::new();
+            let asking = {
+                let (pool, stop) = (pool.clone(), stop.clone());
+                async move {
+                    // The epoch lands before anything else is done.
+                    loop {
+                        let epochs: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM process_epochs WHERE tenant_id = $1",
+                        )
+                        .bind(tenant)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                        if epochs == run {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    if abort {
+                        drop(journal.acquire(OperationKind::Panic).unwrap());
+                    }
+                    stop.cancel();
+                }
+            };
+            let started = std::time::Instant::now();
+            let (result, ()) = tokio::join!(Box::pin(daemon.run_until(stop.clone())), asking);
+            result.unwrap();
+            assert!(started.elapsed() < Duration::from_secs(10), "run {run}");
+        }
+
+        let marks: Vec<(bool, Option<i16>)> = sqlx::query_as(
+            "SELECT clean_stop_at IS NOT NULL, marker_version FROM process_epochs
+             WHERE tenant_id = $1 ORDER BY epoch_seq",
+        )
+        .bind(tenant)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(marks, [(true, Some(1)), (false, None)]);
     }
 
     fn active_position(symbol: robson_domain::Symbol, side: Side) -> robson_domain::Position {

@@ -15,7 +15,10 @@
 
 use std::{future::Future, os::unix::process::ExitStatusExt, path::PathBuf, time::Duration};
 
-use robson_exec::crash_points::{ENTRY_AFTER_ACK, ENTRY_BEFORE_SEND, PROTECTION_BEFORE_SEND};
+use robson_exec::crash_points::{
+    ENTRY_AFTER_ACK, ENTRY_BEFORE_SEND, PROTECTION_BEFORE_SEND, STOP_AFTER_MARKER,
+    STOP_BEFORE_MARKER,
+};
 use robson_testkit::{
     daemon_process::{database_url_through, DaemonProcess, DaemonSpec},
     db_proxy::{DbProxy, ProxyMode},
@@ -1007,6 +1010,135 @@ async fn a_mutating_venue_without_a_database_does_not_start(pool: PgPool) {
         );
         assert_eq!(harness.venue.requests(), 0, "no venue request without an epoch");
         assert!(harness.epochs().await.is_empty());
+    })
+    .await;
+}
+
+/// The pod's grace period: Kubernetes SIGKILLs after it.
+const GRACE: Duration = Duration::from_secs(30);
+
+/// SIGTERM, and SIGINT on the next run, stop the real process: exit 0 well
+/// inside the grace period, its epoch marked at version 1. The second start
+/// finds that marked predecessor, which counts as unclean until the fence PR.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_signal_stops_the_real_process_clean_and_marks_its_epoch(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        for (run, signal) in ["TERM", "INT"].into_iter().enumerate() {
+            let daemon = harness.daemon(None);
+            daemon.wait_ready(STEP).await.expect("daemon ready");
+            let asked = std::time::Instant::now();
+            daemon.send_signal(signal).expect("signal");
+            let status = daemon.wait_exit(GRACE).await.expect("it stops by itself");
+            let stopped_in = asked.elapsed();
+            let log = plain(daemon.log());
+            assert!(status.success(), "{signal}: {status}\n{}", daemon.log_tail());
+            assert!(stopped_in < Duration::from_secs(25), "{signal}: {stopped_in:?}");
+            assert!(log.contains(&format!("signal=\"SIG{signal}\"")), "{log}");
+            assert!(log.contains("Stop: clean, epoch marked"), "{log}");
+            if run == 1 {
+                assert!(log.contains("counts as unclean until the fence PR"), "{log}");
+            }
+        }
+        assert_eq!(harness.epochs().await, [(true, Some(1)), (true, Some(1))]);
+        assert!(harness.venue.unserved_requests().is_empty());
+    })
+    .await;
+}
+
+/// Killed just before its marker, the epoch stays unmarked and the next start
+/// finds an unclean predecessor; killed just after it, the marker stands.
+/// Real deaths at named places, after a real SIGTERM.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn killed_around_its_marker_the_epoch_says_whether_it_was_written(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+
+        let daemon = harness.daemon(Some(STOP_BEFORE_MARKER));
+        daemon.wait_ready(STEP).await.expect("daemon ready");
+        daemon.send_signal("TERM").expect("signal");
+        daemon.wait_killed_at(STOP_BEFORE_MARKER, GRACE).await.expect("killed before");
+        assert_eq!(harness.epochs().await, [(false, None)]);
+
+        let daemon = harness.daemon(Some(STOP_AFTER_MARKER));
+        daemon.wait_ready(STEP).await.expect("daemon ready");
+        let log = plain(daemon.log());
+        assert!(log.contains("Process epoch started after an unclean stop"), "{log}");
+        assert!(log.contains("no_marker"), "{log}");
+        daemon.send_signal("TERM").expect("signal");
+        daemon.wait_killed_at(STOP_AFTER_MARKER, GRACE).await.expect("killed after");
+        assert_eq!(harness.epochs().await, [(false, None), (true, Some(1))]);
+    })
+    .await;
+}
+
+/// A stop with `/panic` in flight, its exit order held by the venue: Draining
+/// waits for the panic, refusing an ordinary request meanwhile, and the stop is
+/// clean once the order's 10 s bound ends it. The timed-out exit is uncertain
+/// and recorded, which a clean marker allows before the fence PR.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_stop_waits_for_a_panic_in_flight_and_refuses_ordinary_requests_meanwhile(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        let daemon = harness.daemon(None);
+        daemon.wait_ready(STEP).await.expect("daemon ready");
+        arm_immediate(daemon.api_url()).await.unwrap().expect("arm succeeds");
+        assert_eq!(harness.venue.counts().fills, 1);
+
+        harness.venue.hold_orders();
+        let api = daemon.api_url();
+        let panic = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{api}/panic"))
+                .timeout(STEP)
+                .send()
+                .await
+                .map(|response| response.status())
+        });
+        // The exit order reaches the venue and is held there, with the panic's
+        // permit held.
+        let held = async {
+            while harness.venue.held_orders() == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(STEP, held)
+            .await
+            .expect("the exit order reaches the venue");
+        let asked = std::time::Instant::now();
+        daemon.send_signal("TERM").expect("signal");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let refused = reqwest::Client::new()
+            .post(format!("{}/positions", daemon.api_url()))
+            .timeout(STEP)
+            .json(&json!({ "symbol": FAKE_SYMBOL, "side": "long" }))
+            .send()
+            .await
+            .expect("the listener is open while draining");
+        assert_eq!(refused.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.json::<Value>().await.unwrap()["error"], "stopping");
+
+        let status = daemon.wait_exit(GRACE).await.expect("it stops by itself");
+        let stopped_in = asked.elapsed();
+        assert!(status.success(), "{status}\n{}", daemon.log_tail());
+        assert!(panic.await.unwrap().is_ok(), "the panic got its answer");
+        assert!(
+            stopped_in > Duration::from_secs(5) && stopped_in < Duration::from_secs(25),
+            "draining waited for the panic, within the deadline: {stopped_in:?}"
+        );
+        assert!(
+            plain(daemon.log()).contains("Stop: clean, epoch marked"),
+            "{}",
+            daemon.log_tail()
+        );
+        assert_eq!(harness.epochs().await, [(true, Some(1))]);
+        let exits = harness.intents("exit").await;
+        assert_eq!(exits.len(), 1, "{exits:?}");
+        assert_eq!((exits[0].1.clone(), exits[0].2), (None, true), "uncertain, on record");
     })
     .await;
 }

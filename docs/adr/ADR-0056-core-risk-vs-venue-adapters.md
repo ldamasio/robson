@@ -780,9 +780,9 @@ exchange stop has filled is uncertain and will fence until an operator release e
 unmeasured, and nothing trades on USD-M today. Uncertain cancels block boundary B until they carry a disposition, as they did under J; a
 `gone_terminal` one no longer does. Not verified: behaviour on a real venue or in the cluster.
 
-*Stop (PR S).* Permits, process epochs and the two-phase stop, in three parts, each deployable alone in this order: the gate, the
-epochs, the stop. Parts 1 and 2 are below. What the design leaves to the fence PR stays there: nothing sets `fenced`, no generation, no
-incident, `unclean_start` is recorded and not acted on, old intents are not stamped, and the orphan sweep has no veto.
+*Stop (PR S).* Permits, the clean stop and process epochs, in three parts, each deployable alone in this order: the gate, the epochs, the
+stop. What the design leaves to the fence PR stays there: nothing sets `fenced`, no generation, no incident, `unclean_start` is recorded and not
+acted on, old intents are not stamped, the marker is version 1, and the orphan sweep has no veto.
 
 *Part 1, the gate.* `robson_exec::gate`.
 
@@ -831,9 +831,31 @@ Without a database, or in a build without PostgreSQL, there is no epoch, and onl
 named in `ROBSON_VENUE` or selected from credentials, is refused there, before any request to it. The simulator mode is
 `ROBSON_VENUE=stub`, or an unset `ROBSON_VENUE` that resolves to the stub; no checked-in workflow ran a real venue without a database.
 
-**Rollback across parts 1 and 2 is boundary B,** with the daemon stopped, and an image that keeps migrations 31 and 32: SQLx's migrator
-rejects an applied migration missing from its embedded set, so pinning back to `sha-b06aecb1` or `sha-23501535` is refused by that image's
-migration hook. `process_epochs` is additive and an older binary ignores it. Not verified: behaviour on a real venue or in the cluster.
+*Part 3, the two-phase stop.* SIGTERM or SIGINT starts the stop, with an absolute deadline of 25 s. The handlers are installed first thing in
+the daemon's run; as PID 1 the process receives SIGTERM only once one is, so during the database connection retries before it a SIGTERM is
+ignored, as today, with nothing sent.
+
+1. **Draining.** The ordinary API class answers 503 `stopping`; ticks, heals, exits, sweeps, the internal loops and the protective class
+   continue. An entry the main loop reaches meanwhile is refused at its send: a no-send, and on a leg with admission evidence the attempt
+   ends (`entry_not_sent`) and waits for the operator. Draining ends at the earlier of 12 s and the first moment no permit is held.
+2. **Closing.** Every new operation is refused. The main loop, the workers, the detectors (through their token, never the manager lock) and the
+   API listener are cancelled; requests in flight finish. The operations holding a permit run to their end, then the journal's retry set is
+   flushed, retried until the deadline. A reduction's rules refresh after a rejection is skipped while closing.
+3. **Marker.** Only when every permit was released in time, none was aborted, the latch is clear and the journal holds nothing in memory or in
+   its retry set, `clean_stop_at` and `marker_version = 1` are written on this epoch. Otherwise it stays unmarked. Then what holds no permit
+   (projection, income ledger, alarm, feeds) gets what is left of the deadline, and the process exits 0 either way.
+
+`robsond_graceful_stop_total{result}` (`clean`, `deadline`, `aborted`, `latched`, `unlanded`, `marker_failed`) is counted as the process
+exits, so a scrape may never see it; the durable record is the epoch's marker and the next start's `robsond_unclean_start`. The deadline and
+teardown fit the pod's `terminationGracePeriodSeconds` of 30 under `Recreate` with one replica. The time no daemon manages the account per
+deploy grows by Closing: near zero when idle, about 13 s after a full 12 s Draining, up to 25 s when Draining ends at once and the flush
+stalls. Exchange stops cover `Active` legs throughout. A tick exit in flight at its worst takes about 30 s, so that stop is unclean.
+
+**Rollback across PR S is boundary B,** with the daemon stopped, and an image that keeps migrations 31 and 32: SQLx's migrator rejects an
+applied migration missing from its embedded set, so pinning back to `sha-b06aecb1` or `sha-23501535` is refused by that image's migration hook.
+`process_epochs` is additive and an older binary ignores it. Rolling back part 3 alone stops the stop: SIGTERM is ignored again and the pod is
+SIGKILLed at 30 s. After the fence PR, rollback across it needs the fence PR's own condition. Not verified: SIGTERM in the live pod, PID 1 in
+the image, stop timing under a slow database, behaviour on a real venue or in the cluster.
 
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze
@@ -902,9 +924,10 @@ only).
 | Database dies | no admission, no new legs; already-installed protection remains on the exchange; inventory in an N1-a transition may remain unprotected without a duration or loss bound; no cancellation starts without a durable intent, and unfinished transitions retain liabilities and alerts and resume from that intent on recovery; intent results cannot be persisted → in-flight operations enter `Unknown`; recovery looks them up, a lookup may stay `Unknown`, and then the reservation stays held until step 7's explicit resolution path | read-only `/status` from memory; arms refused | `/readyz.database=false`; `unprotected_inventory` gauge; recovery events |
 | Journal database down or slow (step 7, PR J) | an entry's strict commit that fails is refused, no request; a leg with admission evidence ends its attempt, a legacy leg re-arms under its backoff. One that times out is uncertain, no request and no re-arm. Reductions, stops and cancels wait at most 500 ms per write and go out anyway, also with the journal's memories full | entries refused, protection and reductions continue; unlanded rows retry through a bounded set | `robsond_journal_latch`, `robsond_journal_retry_set_depth`, warnings in the logs; no fence yet |
 | Cancel outcome unknown (step 7, PR C) | an error, an indeterminate answer or an "already gone" with no final state is uncertain on the cancel's own intent; the protective action behind it proceeds | journaled only until the fence PR | `order_intents.cancel_class` and `uncertain_at`; boundary B |
+| Daemon asked to stop: SIGTERM or SIGINT (step 7, PR S) | Draining (ordinary API refused, protection continues) for at most 12 s, then Closing (everything new refused) until the operations in flight end and the journal is flushed; deadline 25 s; the epoch is marked only on a clean pass | exchange stops cover `Active` legs while no daemon runs | the epoch's `clean_stop_at`; the next start's `robsond_unclean_start`; `robsond_graceful_stop_total{result}` if scraped |
 | API slot class full (step 7, PR S) | 503 `busy` at once, nothing done; the other classes keep their slots | the caller retries | `robsond_api_slot_busy_total{class}` |
 | Venue mutation without a permit (step 7, PR S) | while open: sent, counted, latch set; while stopping: refused, nothing sent | — | `robsond_unpermitted_mutations_total`, `robsond_journal_latch` |
-| Operation dropped mid-flight: a panic, a cancelled internal future (step 7, PR S) | each intent it left open is sealed: one whose send may have started ends uncertain, one proven unsent ends not sent, both through the retry set; one with nothing to record is dropped. The permit counts as aborted and sets the latch | — | `robsond_aborted_operations_total`, `robsond_journal_latch` |
+| Operation dropped mid-flight: a panic, a cancelled internal future (step 7, PR S) | each intent it left open is sealed: one whose send may have started ends uncertain, one proven unsent ends not sent, both through the retry set; one with nothing to record is dropped. The permit counts as aborted and sets the latch, so the stop cannot mark clean | — | `robsond_aborted_operations_total`, `robsond_journal_latch` |
 | Database down or refusing the epoch at start, or none configured for a venue other than the stub (step 7, PR S) | no start, before any venue request | the pod restarts | the error in the log |
 | Venue REST dies | rules/costs/valuation stale → basis invalid, admission fails closed; risk reduction proceeds on the last validated rules or the persisted snapshot, with one refresh and resubmit per rejection; a leg holding neither waits for the lookup, then a decided exit goes out as given and a tick fails closed (§5) | reads from cache until TTL; protection on the venue, except a leg whose exit failed, until the heal | per-venue `eligible=false` + reasons; alert |
 | Venue feed silent | watchdog after `ROBSON_FEED_SILENCE_MAX`; REST snapshot resync; trailing advances continue on REST ticks within the request budget | bounded REST polling | silent-feed metric, event |
@@ -988,9 +1011,9 @@ Budget model for multi-venue:
 - Step 7: delivered in parts (§8). PR J: `robson-exec/src/{order_journal,executor,venue,stub,error}.rs`,
   `robsond/src/{order_journal_store,api,auth,daemon,metrics,position_manager,reconciliation_worker,venue}.rs`, migration 31; the
   attempt rows are read from the database rather than reloaded. PR C: `robson-exec/src/{cancel,compat,executor,order_journal,ports,stub}.rs`,
-  `robsond/src/{daemon,position_manager,reconciliation_worker}.rs`, no migration. PR S: `robson-exec/src/{gate,order_journal,venue,stub}.rs`,
-  `robson-connectors/src/binance_rest.rs` and the USD-M adapter, `robsond/src/{api,daemon,process_epoch,metrics,reconciliation_worker,
-  position_manager,venue,error}.rs` and `funding/worker.rs`, `robson-testkit`, migration 32. What follows here is the original statement of the step, with its
+  `robsond/src/{daemon,position_manager,reconciliation_worker}.rs`, no migration. PR S: `robson-exec/src/{gate,order_journal,venue,stub,quantize,
+  crash_points}.rs`, `robson-connectors/src/binance_rest.rs` and the USD-M adapter, `robsond/src/{api,daemon,stop,process_epoch,metrics,
+  reconciliation_worker,position_manager,venue,error}.rs` and `funding/worker.rs`, `robson-testkit`, migration 32. What follows here is the original statement of the step, with its
   open obligations. `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
   mapping); process-kill tests. Before any caller acts on `order_by_client_id` or `replace_protection`, this step must:
   persist each attempt durably before its request is sent and each rejection when observed, reload them on startup, treat
@@ -1073,7 +1096,7 @@ Budget model for multi-venue:
   round 1, with four P3s applied (the `/events/history` exposure above, a missing-versus-null assertion, fixture provenance
   and the stale DB-gated count).
 - v14 (2026-11-10): §8, the failure modes and the Implementation Notes aligned with step 7 PR S as implemented against design note v8, in
-  parts 1 and 2 of three: permits and slots, process epochs. Closes the J boundary that ended an entry's operation before its stop.
+  three parts: permits and slots, process epochs, the two-phase stop. Closes the J boundary that ended an entry's operation before its stop.
   Codex round 1 on the three parts: REQUEST_CHANGES (1 P1, 2 P2, a vacuous required test, P3s). Since then an unpermitted mutation is
   latched under the gate's mutex, an API operation runs in its own task, so a client's disconnect no longer cancels it, the `/panic`
   capacity test closes a real leg, and a venue that can trade does not start without an epoch. No risk number changed.

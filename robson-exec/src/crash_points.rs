@@ -33,6 +33,10 @@ crash_points! {
     ENTRY_AFTER_ACK = "entry_after_ack";
     // A protective stop's intent is committed; the request has not left.
     PROTECTION_BEFORE_SEND = "protection_before_send";
+    // A stop passed its check; the clean-stop marker is not written yet.
+    STOP_BEFORE_MARKER = "stop_before_marker";
+    // The clean-stop marker is written; the process has not exited.
+    STOP_AFTER_MARKER = "stop_after_marker";
 }
 
 /// Crash point to arm.

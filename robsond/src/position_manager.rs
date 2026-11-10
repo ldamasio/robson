@@ -1776,6 +1776,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         info!("Position manager shutdown complete ({count} detectors terminated)");
     }
 
+    /// The token that stops the detectors and the approval timers, for a stop
+    /// that must not wait on the manager lock (ADR-0056 step 7).
+    pub(crate) fn detector_shutdown_token(&self) -> CancellationToken {
+        self.shutdown_token.clone()
+    }
+
     /// Get a child cancellation token for a new detector.
     ///
     /// Child tokens are cancelled when the parent is cancelled.
