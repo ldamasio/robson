@@ -926,8 +926,13 @@ Production uses `robson:daemon`, the default.
   path such an error fails that leg's query only: the other legs on the tick still trail and exit; startup recovery likewise
   goes on through such a batch, so a suspended leg's missed stop and the legs after it are still checked. A failed journal result write
   keeps PR J's rule: the result stands, the write waits in the retry set, and only an overflow sets the latch. No reduction
-  path has a pre-send event write, so a suspension never stops a software exit, a stop placement, a heal, a trailing
-  replacement, `/panic` or a reconciled close from reaching the venue.
+  path writes a domain event through this bridge before its request, so a suspension never stops a software exit, a stop
+  placement, a heal, a trailing replacement, `/panic` or a reconciled close from reaching the venue. That holds for the
+  domain-event bridge only: an individual close and `/panic` record their query's acceptance and transitions before the
+  request, as before P, and a failure of those existing audit writes can still prevent that request. Once a leg's venue work is
+  done, or given up for that leg, its query's audit write is reported instead (ERROR,
+  `robsond_query_audit_failures_after_venue_work_total`) and stops nothing: a tick's and `/panic`'s other legs still run, a
+  close or an entry keeps its outcome, and `/panic` still reports the legs it closed.
 - **Per-stream serialization.** `persist_event_to_log`, the one production writer to `position:{id}` and
   `system:month_boundary:YYYY-MM`, holds the stream's async lock through the suspension check, the append, the projection apply
   and, on a failure, marking the stream suspended, so a writer queued behind a failure sees the suspension first. A lock entry
@@ -937,7 +942,9 @@ Production uses `robson:daemon`, the default.
   (`StreamSuspended`), so its projection lags its log by exactly the suffix that did not apply. Migration 33 adds
   `stream_suspensions` (stream key, kind, the seq that did not apply, NULL when the append itself failed or its seq is
   unknown, the month of a system stream, error, epoch; one open row per stream). The row goes through the journal's retry set,
-  which carries suspensions beside intents within its 1,024 entries, and recording it sets the latch. The next start loads the
+  which carries suspensions beside intents within its 1,024 entries, and recording it sets the latch. A retry pass writes
+  suspensions first and then intents, each part stopping at its own first failure, so a suspension whose write keeps failing
+  never keeps an intent's rows from being tried. The next start loads the
   open rows before anything is appended. Like any retry-set entry, a suspension that has not landed when its process ends, the
   database down or the stop past its final flush, is lost: the next start does not know that stream is suspended and its
   projection stays behind its log, as before P; the latch kept that stop from marking itself clean. `robsond_streams_suspended{kind}` exports `position` and `system`, at 0 from startup.
@@ -961,8 +968,10 @@ Production uses `robson:daemon`, the default.
   whose acknowledgement was lost erases a peak recorded since, and a replay guard would have to cover five writers of
   `monthly_state`, two of them not event-sourced.
 
-**Rollback across PR P is boundary B,** checked with the daemon stopped after a restart of this binary, so that the latch, which
-lives in memory, is clear, **plus no open suspension**: `SELECT COUNT(*) FROM stream_suspensions WHERE cleared_at IS NULL` must be 0.
+**Rollback across PR P is boundary B,** checked with the daemon stopped, on the final process's state: its epoch stopped clean (a
+`clean_stop_at` marker, which is written only with the latch clear and the journal quiescent; a restart clears only the initial latch,
+and startup or later bounded work can set it again, so a restart alone proves nothing about the final process), **plus no open
+suspension**: `SELECT COUNT(*) FROM stream_suspensions WHERE cleared_at IS NULL` must be 0.
 An older binary ignores the table and would append to a suspended stream past its gap, leaving an interior gap the projection never
 applies. With part 2 alone nothing clears a suspension, so one suspended stream blocks that rollback until it is resolved by hand. The
 rollback image must keep migrations 31, 32 and 33: SQLx's migrator rejects an applied migration missing from its embedded set, and

@@ -1958,6 +1958,24 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.record_query_transition(query, "failed").await
     }
 
+    /// Record a query's transition once its venue work is done or has been
+    /// given up for this leg. A failed audit write is reported, counted and
+    /// goes no further (ADR-0056 step 7, PR P): the venue outcome stands, and
+    /// what follows it, the next leg of a tick or of `/panic` included, still
+    /// runs. Records ahead of a venue request stay barriers.
+    async fn record_after_venue_work(&self, query: &ExecutionQuery, transition_cause: &str) {
+        if let Err(error) = self.record_query_transition(query, transition_cause).await {
+            crate::metrics::QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK.inc();
+            error!(
+                query_id = %query.id,
+                position_id = ?query.position_id,
+                transition_cause,
+                %error,
+                "Query audit write failed after its venue work; the outcome stands"
+            );
+        }
+    }
+
     fn set_query_context_summary(query: &mut ExecutionQuery, active_positions_count: usize) {
         query.context_summary = Some(ContextSummary { active_positions_count });
     }
@@ -2893,10 +2911,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
             query.fail(format!("{}", e), "acting".to_string());
-            self.record_query_failure(query).await?;
+            self.record_after_venue_work(query, "failed").await;
             return Err(DaemonError::Config(format!("Query completion error: {}", e)));
         }
-        self.record_query_transition(query, "completed").await?;
+        self.record_after_venue_work(query, "completed").await;
 
         Ok(())
     }
@@ -3675,10 +3693,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Ok(_) => {
                 if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count: 1 }) {
                     query.fail(format!("{}", e), "acting".to_string());
-                    self.record_query_failure(&query).await?;
+                    self.record_after_venue_work(&query, "failed").await;
                     return Err(DaemonError::Config(format!("Query completion error: {}", e)));
                 }
-                self.record_query_transition(&query, "completed").await?;
+                self.record_after_venue_work(&query, "completed").await;
                 Ok(())
             },
             Err(e) => {
@@ -4911,7 +4929,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         "Tick batch did not persist; continuing with the other legs"
                     );
                     query.fail(format!("{}", e), "acting".to_string());
-                    self.record_query_failure(&query).await?;
+                    self.record_after_venue_work(&query, "failed").await;
                     continue;
                 },
                 Err(e) => {
@@ -4952,13 +4970,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         };
                         if let Err(complete_error) = query.complete(outcome) {
                             query.fail(format!("{}", complete_error), "acting".to_string());
-                            self.record_query_failure(&query).await?;
+                            self.record_after_venue_work(&query, "failed").await;
                             return Err(DaemonError::Config(format!(
                                 "Query completion error: {}",
                                 complete_error
                             )));
                         }
-                        self.record_query_transition(&query, "completed").await?;
+                        self.record_after_venue_work(&query, "completed").await;
                         continue;
                     }
                     // The venue refused this exit: on its rules after one refresh
@@ -5039,10 +5057,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // Complete query with success
             if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
                 query.fail(format!("{}", e), "acting".to_string());
-                self.record_query_failure(&query).await?;
+                self.record_after_venue_work(&query, "failed").await;
                 return Err(DaemonError::Config(format!("Query completion error: {}", e)));
             }
-            self.record_query_transition(&query, "completed").await?;
+            self.record_after_venue_work(&query, "completed").await;
         }
 
         if let Some(error) = first_missing_rules {
@@ -5411,9 +5429,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                                 query.complete(QueryOutcome::ActionsExecuted { actions_count: 1 })
                             {
                                 query.fail(format!("{}", e), "acting".to_string());
-                                self.record_query_failure(&query).await?;
+                                self.record_after_venue_work(&query, "failed").await;
                             } else {
-                                self.record_query_transition(&query, "completed").await?;
+                                self.record_after_venue_work(&query, "completed").await;
                             }
                             closed_ids.push(position.id);
                         },
@@ -5432,7 +5450,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                                 QueryState::Denied { check, .. } => format!("denied:{}", check),
                             };
                             query.fail(format!("{}", e), phase);
-                            self.record_query_failure(&query).await?;
+                            // The other legs are still closed.
+                            self.record_after_venue_work(&query, "failed").await;
                             error!(position_id = %position.id, error = %e, "Failed to panic close");
                         },
                     }
@@ -8692,18 +8711,19 @@ mod tests {
     /// The boundary: once the entry's actions reach the executor an order may
     /// exist, so no failure from there re-arms. Before the order: the first
     /// entry event fails to persist, which also keeps the order back
-    /// (ADR-0052). After it: the last audit write fails.
+    /// (ADR-0052). After it: the last audit write fails, which since PR P
+    /// keeps the entry's outcome and answers `Ok` (ADR-0056 step 7).
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
     async fn a_failure_once_the_executor_has_the_entry_does_not_rearm(pool: sqlx::PgPool) {
         set_month_basis(&pool, dec!(10000)).await;
         let cases = [
-            ("NEW.event_type = 'entry_signal_received'".to_string(), 0),
-            (audit_write("completed"), 1),
+            ("NEW.event_type = 'entry_signal_received'".to_string(), 0, false),
+            (audit_write("completed"), 1, true),
         ];
 
-        for (condition, orders) in cases {
+        for (condition, orders, kept) in cases {
             let manager = create_audited_postgres_test_manager(pool.clone(), 300);
             let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
 
@@ -8711,7 +8731,7 @@ mod tests {
             let result = manager.handle_signal(signal).await;
             restore_event_log_writes(&pool).await;
 
-            assert!(result.is_err(), "{condition}: {result:?}");
+            assert_eq!(result.is_ok(), kept, "{condition}: {result:?}");
             assert_eq!(manager.exchange().market_order_call_count(), orders, "{condition}");
             assert!(!manager.detectors.read().await.contains_key(&armed.id), "{condition}");
             assert_eq!(

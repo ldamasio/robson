@@ -358,6 +358,7 @@ pub struct StubJournalBackend {
     commit_delay: Mutex<Duration>,
     fail_all: Mutex<Option<JournalFault>>,
     suspensions: Mutex<Vec<StreamSuspensionRow>>,
+    suspension_writes_fail: AtomicBool,
 }
 
 impl StubJournalBackend {
@@ -423,6 +424,12 @@ impl StubJournalBackend {
     /// Every batch handed to `commit`, landed or not, in order.
     pub fn commits(&self) -> Vec<JournalBatch> {
         self.commits.lock().unwrap().clone()
+    }
+
+    /// Every suspension write fails, as if that table refused this role,
+    /// while intents' commits go on as scripted.
+    pub fn set_suspension_writes_fail(&self, fail: bool) {
+        self.suspension_writes_fail.store(fail, Ordering::SeqCst);
     }
 
     /// The stream suspensions on record, in the order they landed.
@@ -509,6 +516,9 @@ impl JournalBackend for StubJournalBackend {
         &self,
         suspension: &StreamSuspensionRow,
     ) -> Result<(), CommitFailure> {
+        if self.suspension_writes_fail.load(Ordering::SeqCst) {
+            return Err(CommitFailure::Known("injected: suspensions refused".to_string()));
+        }
         match self.next_fault() {
             None | Some(JournalFault::Pass) => {
                 self.land_suspension(suspension);
@@ -1410,17 +1420,17 @@ impl OrderJournal {
         }
     }
 
-    /// One pass of the retry loop. Stops at the first failure, sending that
-    /// entry to the back, so a dead database costs one bound per pass and one
-    /// bad row cannot starve the others, and stops starting commits after a
-    /// few bounds even when each succeeds slowly. Returns the entries written.
+    /// One pass of the retry loop. Stream suspensions go first, then intents.
+    /// Each part stops at its first failure, sending that entry to the back,
+    /// so a dead database costs one bound per part and pass and one bad row
+    /// cannot starve the others, of its own part or of the other one: a
+    /// suspension that keeps failing never keeps an intent's rows from being
+    /// tried. The pass stops starting commits after a few bounds even when
+    /// each succeeds slowly. Returns the entries written.
     pub async fn flush_pending(&self) -> usize {
         let started = std::time::Instant::now();
         let pass_bound = self.commit_bound * RETRY_PASS_COMMIT_BOUNDS;
-        let (mut written, unfailed) = self.flush_suspensions(started, pass_bound).await;
-        if !unfailed {
-            return written;
-        }
+        let mut written = self.flush_suspensions(started, pass_bound).await;
         let batches: Vec<(String, JournalBatch)> = {
             let state = self.lock();
             state
@@ -1462,13 +1472,9 @@ impl OrderJournal {
 
     /// The suspensions part of a retry pass, first: they are few, and each one
     /// is what tells the next start a stream needs repair. Returns the entries
-    /// written and whether none failed; a failure ends the pass, with that
-    /// entry sent to the back.
-    async fn flush_suspensions(
-        &self,
-        started: std::time::Instant,
-        pass_bound: Duration,
-    ) -> (usize, bool) {
+    /// written; a failure ends this part, with that entry sent to the back,
+    /// and the pass goes on to the intents.
+    async fn flush_suspensions(&self, started: std::time::Instant, pass_bound: Duration) -> usize {
         let pending: Vec<StreamSuspensionRow> =
             self.lock().suspensions.iter().take(RETRY_PASS_LIMIT).cloned().collect();
         let mut written = 0;
@@ -1504,11 +1510,11 @@ impl OrderJournal {
                     if let Some(row) = row {
                         state.suspensions.push_back(row);
                     }
-                    return (written, false);
+                    return written;
                 },
             }
         }
-        (written, true)
+        written
     }
 
     /// Evidence for the finality rule, read after the venue's not-found.
@@ -2909,6 +2915,37 @@ mod tests {
         let recorded = backend.suspensions();
         assert_eq!(recorded.len(), 1, "a replay converges on the first");
         assert_eq!(recorded[0].stream_key, "position:a");
+    }
+
+    /// A suspension whose write keeps failing, while intents' commits would
+    /// land, never keeps an intent's rows from being tried: every pass still
+    /// reaches them.
+    #[tokio::test]
+    async fn a_failing_suspension_write_does_not_starve_the_intents() {
+        let (backend, journal) = journal();
+        let ledger = SubmitAttemptLedger::new(8);
+        let ((), _op) = in_op(&journal, async {
+            let intent = journal.open_intent(spec("x-pending", IntentKind::Exit));
+            journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
+            let _ = ledger.begin("x-pending");
+            backend.push_fault(JournalFault::Known);
+            journal.finish_success(&intent, None).await;
+        })
+        .await;
+        backend.set_suspension_writes_fail(true);
+        journal.record_suspension(suspension("position:refused"));
+        assert_eq!(journal.retry_set_depth(), 2);
+
+        assert_eq!(journal.flush_pending().await, 1, "the intent lands");
+        assert_eq!(journal.flush_pending().await, 0);
+        assert_eq!(journal.retry_set_depth(), 1, "the suspension waits, and only it");
+        let landed = backend.row("x-pending").unwrap().outcome.unwrap();
+        assert_eq!(landed.venue_outcome, Some(VenueOutcome::Success));
+        assert!(!journal.is_quiescent());
+
+        backend.set_suspension_writes_fail(false);
+        assert_eq!(journal.flush_pending().await, 1);
+        assert!(journal.is_quiescent());
     }
 
     /// A full retry set keeps no suspension, and the latch is set all the same.

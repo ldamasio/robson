@@ -475,44 +475,80 @@ async fn eventlog_failure_during_exit_cycle_keeps_the_result(pool: sqlx::PgPool)
     assert!(latched(&manager));
 }
 
-/// Two writers on one stream: the first fails slowly while the second waits
-/// on the stream's lock; the second sees the suspension and appends nothing.
+/// Two writers on one stream: the first is held inside its append while the
+/// second registers on the stream's lock, which the test sees before it lets
+/// the first fail. The second then sees the suspension and appends nothing.
 #[cfg(feature = "postgres")]
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn a_writer_queued_behind_a_failure_sees_the_suspension(pool: sqlx::PgPool) {
+    use sqlx::Connection;
+    const HELD: i64 = 4_242_001;
     let manager = create_postgres_test_manager(pool.clone());
     let position_id = Uuid::now_v7();
+    let stream_key = format!("position:{position_id}");
+    // The first writer's append waits on an advisory lock the test holds, then
+    // fails.
     inject_event_log_fault(
         &pool,
         "NEW.event_type = 'exit_triggered'",
-        "PERFORM pg_sleep(0.3); RAISE EXCEPTION 'injected event log failure';",
+        &format!(
+            "PERFORM pg_advisory_lock({HELD}); PERFORM pg_advisory_unlock({HELD}); \
+             RAISE EXCEPTION 'injected event log failure';"
+        ),
     )
     .await;
-    let event = |reason| Event::ExitTriggered {
+    let mut holder = sqlx::PgConnection::connect_with(&pool.connect_options()).await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(HELD)
+        .execute(&mut holder)
+        .await
+        .unwrap();
+
+    let failing = Event::ExitTriggered {
         position_id,
-        reason,
+        reason: robson_domain::ExitReason::TrailingStop,
         trigger_price: Price::new(dec!(94000)).unwrap(),
         stop_price: Price::new(dec!(94000)).unwrap(),
         timestamp: chrono::Utc::now(),
     };
-    let failing = event(robson_domain::ExitReason::TrailingStop);
-    let first = manager.persist_event_to_log(&failing);
-    let second = async {
-        // Queued on the lock while the first is inside its append.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        manager
-            .persist_event_to_log(&Event::InsuranceStopFailed {
-                position_id,
-                stop_price: Price::new(dec!(94000)).unwrap(),
-                error: "second writer".to_string(),
-                timestamp: chrono::Utc::now(),
-            })
-            .await
+    let queued = stop_failed(position_id, "second writer");
+    // Bounded, so a lock that is not taken fails this test instead of hanging it.
+    let users_reach = |users: usize| {
+        let manager = &manager;
+        let stream_key = &stream_key;
+        async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while manager.event_streams.lock_users(stream_key) < users {
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            true
+        }
     };
-    let (first, second) = tokio::join!(first, second);
+    let writers = async {
+        tokio::join!(manager.persist_event_to_log(&failing), async {
+            // The first holds the lock; once it does, the second registers.
+            users_reach(1).await;
+            manager.persist_event_to_log(&queued).await
+        })
+    };
+    let release = async {
+        let queued_first = users_reach(2).await;
+        // Both registered, the second one waiting: let the first fail.
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(HELD)
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        queued_first
+    };
+    let ((first, second), queued_first) = tokio::join!(writers, release);
     restore_event_log_writes(&pool).await;
 
+    assert!(queued_first, "the second writer was queued on the lock before the first failed");
     assert!(matches!(first, Err(DaemonError::EventLog(_))), "{first:?}");
     assert!(matches!(second, Err(DaemonError::StreamSuspended { .. })), "{second:?}");
     assert!(stream_rows(&pool, position_id).await.is_empty());
@@ -520,15 +556,130 @@ async fn a_writer_queued_behind_a_failure_sees_the_suspension(pool: sqlx::PgPool
     // Another stream is untouched.
     let other = Uuid::now_v7();
     manager
-        .persist_event_to_log(&Event::InsuranceStopFailed {
-            position_id: other,
-            stop_price: Price::new(dec!(94000)).unwrap(),
-            error: "another stream".to_string(),
-            timestamp: chrono::Utc::now(),
-        })
+        .persist_event_to_log(&stop_failed(other, "another stream"))
         .await
         .unwrap();
     assert_eq!(stream_rows(&pool, other).await.len(), 1);
+}
+
+// =============================================================================
+// Query audit after venue work: reported, never a reason to stop
+// =============================================================================
+
+/// The tick's refused batch and then its failed query audit, both on the
+/// suspended leg the tick reaches first: the healthy leg behind it still exits.
+/// The recorder is the production one, on the event log.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_failed_query_audit_on_a_refused_tick_batch_skips_no_other_leg(pool: sqlx::PgPool) {
+    fail_event_log_writes(&pool, &audit_write("failed")).await;
+    let reported = crate::metrics::QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK.get();
+    for _ in 0..64 {
+        let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+        let mut suspended =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(80), dec!(1)).await;
+        suspended.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(dec!(80)).unwrap(),
+            Price::new(dec!(60)).unwrap(),
+        ));
+        if let PositionState::Active { trailing_stop, .. } = &mut suspended.state {
+            *trailing_stop = Price::new(dec!(60)).unwrap();
+        }
+        manager.store.positions().save(&suspended).await.unwrap();
+        let (healthy, _) = active_leg_with_live_stop(&manager).await;
+        if manager.store.positions().find_active().await.unwrap()[0].id != suspended.id {
+            continue;
+        }
+        suspend_leg(&manager, suspended.id);
+        manager.exchange().set_price("BTCUSDT", dec!(90));
+
+        stop_crossing_tick(&manager, &healthy).await.unwrap();
+        restore_event_log_writes(&pool).await;
+
+        assert!(is_closed(&manager.get_position(healthy.id).await.unwrap().unwrap()));
+        assert_eq!(manager.exchange().market_order_call_count(), 1);
+        assert!(crate::metrics::QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK.get() > reported);
+        return;
+    }
+    panic!("the suspended leg never came first");
+}
+
+/// `/panic` closes a leg, then cannot record that query completed: the leg
+/// is reported closed, and the next leg is still closed.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_failed_query_audit_after_a_panic_close_keeps_the_other_legs(pool: sqlx::PgPool) {
+    let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+    let (first, _) = active_leg_with_live_stop(&manager).await;
+    let (second, _) = active_leg_with_live_stop(&manager).await;
+    fail_event_log_writes(&pool, &audit_write("completed")).await;
+
+    let closed = manager.panic_close_all().await;
+    restore_event_log_writes(&pool).await;
+
+    let mut closed = closed.unwrap();
+    closed.sort();
+    let mut both = vec![first.id, second.id];
+    both.sort();
+    assert_eq!(closed, both);
+    assert_eq!(manager.exchange().market_order_call_count(), 2);
+    for leg in [first.id, second.id] {
+        assert!(is_closed(&manager.get_position(leg).await.unwrap().unwrap()));
+    }
+}
+
+/// `/panic`'s exit fails on one leg and that failure cannot be recorded: the
+/// other leg is still closed and reported, whichever came first.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_failed_query_audit_after_a_failed_panic_leg_keeps_the_other_legs(pool: sqlx::PgPool) {
+    let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+    let (first, _) = active_leg_with_live_stop(&manager).await;
+    let (second, _) = active_leg_with_live_stop(&manager).await;
+    manager.exchange().set_order_fail_next(true);
+    fail_event_log_writes(&pool, &audit_write("failed")).await;
+
+    let closed = manager.panic_close_all().await;
+    restore_event_log_writes(&pool).await;
+
+    let closed = closed.unwrap();
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    let failed = if closed[0] == first.id {
+        second.id
+    } else {
+        first.id
+    };
+    assert!(is_closed(&manager.get_position(closed[0]).await.unwrap().unwrap()));
+    let failed = manager.get_position(failed).await.unwrap().unwrap();
+    assert!(matches!(failed.state, PositionState::Active { .. }), "{:?}", failed.state);
+}
+
+/// A single close and an entry keep their venue outcome when the query's
+/// completion cannot be recorded.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_failed_query_audit_after_a_close_or_an_entry_keeps_the_outcome(pool: sqlx::PgPool) {
+    let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+    let (leg, _) = active_leg_with_live_stop(&manager).await;
+    fail_event_log_writes(&pool, &audit_write("completed")).await;
+    let closed = manager.close_position(leg.id).await;
+    restore_event_log_writes(&pool).await;
+    assert!(closed.is_ok(), "{closed:?}");
+    assert!(is_closed(&manager.get_position(leg.id).await.unwrap().unwrap()));
+
+    let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+    let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+    fail_event_log_writes(&pool, &audit_write("completed")).await;
+    let entered = manager.handle_signal(signal).await;
+    restore_event_log_writes(&pool).await;
+    assert!(entered.is_ok(), "{entered:?}");
+    assert_eq!(manager.exchange().protection_call_count(), 1, "the stop went on");
+    let leg = manager.get_position(armed.id).await.unwrap().unwrap();
+    assert!(matches!(leg.state, PositionState::Active { .. }), "{:?}", leg.state);
 }
 
 /// A manager of `tenant_id` whose journal is the PostgreSQL one, so its

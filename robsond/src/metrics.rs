@@ -40,6 +40,8 @@
 //! - `robsond_graceful_stop_total` — stops, labelled by result
 //! - `robsond_unclean_start` — why this process's start counts as unclean
 //! - `robsond_streams_suspended` — event-log streams refusing appends, by kind
+//! - `robsond_query_audit_failures_after_venue_work_total` — query audit writes
+//!   that failed after their venue work, the outcome kept
 
 use std::sync::LazyLock;
 
@@ -211,6 +213,16 @@ pub static UNCLEAN_START: LazyLock<GaugeVec> = LazyLock::new(|| {
     .expect("failed to register robsond_unclean_start")
 });
 
+/// Query audit writes that failed after their venue work, the outcome kept
+/// (ADR-0056 step 7, PR P): a tick's or `/panic`'s other legs still ran.
+pub static QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_query_audit_failures_after_venue_work_total",
+        "Query audit writes that failed after their venue work; the venue outcome was kept"
+    )
+    .expect("failed to register robsond_query_audit_failures_after_venue_work_total")
+});
+
 /// Event-log streams that refuse appends, by `kind` (`position`, `system`):
 /// suspended in this process, or loaded at start and not repaired (ADR-0056
 /// step 7, PR P). A suspended system stream of the current month keeps
@@ -235,6 +247,7 @@ pub fn observe_streams_suspended(positions: usize, systems: usize) {
 /// Zero series for the gate's metrics, so they export from startup.
 pub fn init_operation_gate_metrics() {
     LazyLock::force(&UNPERMITTED_MUTATIONS);
+    LazyLock::force(&QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK);
     LazyLock::force(&ABORTED_OPERATIONS);
     for class in ["ordinary", "protective"] {
         API_SLOT_BUSY.with_label_values(&[class]);

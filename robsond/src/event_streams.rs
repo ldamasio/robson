@@ -150,6 +150,13 @@ impl EventStreams {
         self.lock_table().len()
     }
 
+    /// Holders and waiters of `stream_key`'s lock: a waiter counts from the
+    /// moment it registers, before it waits.
+    #[cfg(test)]
+    pub(crate) fn lock_users(&self, stream_key: &str) -> usize {
+        self.lock_table().get(stream_key).map_or(0, |entry| entry.users)
+    }
+
     /// The process epoch suspensions are recorded under.
     pub(crate) fn set_epoch(&self, epoch_id: Uuid) {
         let _ = self.epoch.set(epoch_id);

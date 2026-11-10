@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks is refused at its send. Protection, exits, sweeps and the protective API continue.
 - A suspended system stream of the current month keeps admissions closed after a restart. There is no release before the
   fence PR, and a failed month reset no longer heals itself on the next 60 s poll: it stays as it was, fail-closed.
+- Once a leg's venue work is done, a failure writing its query's audit is reported (ERROR and
+  `robsond_query_audit_failures_after_venue_work_total`) and stops nothing: the tick's and `/panic`'s other legs still run, and
+  a close or an entry keeps its outcome. A stream suspension whose write keeps failing no longer keeps the journal's other
+  pending rows from being retried.
 
 ### Fixed - Four domain audit events had no projection route (ADR-0056 step 7, PR P, part 1)
 
