@@ -10,7 +10,7 @@
 //! Step 2 only introduces the contracts; [`ExchangePort`] and [`IncomePort`]
 //! remain as a forwarding layer over them (`compat.rs`). Callers branch on
 //! [`VenueCapabilities`], never on [`VenueId`]. [`StopCancelOutcome`] here is
-//! the venue contract; the legacy two-variant outcome stays at
+//! the venue contract; its lossless mirror stays at
 //! `robson_exec::ports::StopCancelOutcome` until the legacy port is removed.
 //!
 //! [`ExchangePort`]: crate::ports::ExchangePort

@@ -1552,7 +1552,9 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
 
     /// Read back what `positions_current` does not carry (ADR-0056 §5): the
     /// leg's rules snapshot, its latest residual and the stops it displaced,
-    /// from the event log, in stream order. One query per recovered leg.
+    /// from the event log, in stream order. One query per recovered leg. The
+    /// same rows rebuild a stop heal left outstanding by the last process: an
+    /// `Active` leg whose latest stop event is a failure (ADR-0056 step 7).
     ///
     /// A query that fails aborts startup: the database is needed anyway, the
     /// pod restarts and retries, and exchange stops stay live meanwhile. A
@@ -1566,11 +1568,20 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         tenant_id: uuid::Uuid,
         position: &mut Position,
     ) -> DaemonResult<()> {
-        const LEG_EVIDENCE: [&str; 4] = [
-            "entry_signal_received",
-            "residual_inventory_recorded",
+        const STOP_FAILED: &str = "insurance_stop_failed";
+        const STOP_EVENTS: [&str; 4] = [
             "insurance_stop_placed",
             "insurance_stop_replaced",
+            "insurance_stop_cancelled",
+            STOP_FAILED,
+        ];
+        const LEG_EVIDENCE: [&str; 6] = [
+            "entry_signal_received",
+            "residual_inventory_recorded",
+            STOP_EVENTS[0],
+            STOP_EVENTS[1],
+            STOP_EVENTS[2],
+            STOP_EVENTS[3],
         ];
         let Some(pool) = &self.pg_pool else {
             return Ok(());
@@ -1587,6 +1598,12 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                     position.id
                 ))
             })?;
+        let heal_outstanding = matches!(position.state, PositionState::Active { .. })
+            && envelopes
+                .iter()
+                .rev()
+                .find(|envelope| STOP_EVENTS.contains(&envelope.event_type.as_str()))
+                .is_some_and(|envelope| envelope.event_type == STOP_FAILED);
         for envelope in envelopes {
             if let Err(error) =
                 position.restore_leg_evidence_record(&envelope.event_type, envelope.payload)
@@ -1605,6 +1622,13 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 position_id = %position.id,
                 "Residual row unreadable; admissions stay blocked until this leg closes (ADR-0056 §5)"
             );
+        }
+        if heal_outstanding {
+            self.position_manager
+                .read()
+                .await
+                .schedule_stop_heal_after_restart(position.id)
+                .await;
         }
         Ok(())
     }
@@ -2692,6 +2716,164 @@ mod tests {
         daemon.restore_leg_evidence(tenant_id, &mut reread).await.unwrap();
         assert!(reread.residual_unknown);
         assert_eq!(reread.residual_quantity, Some(dec!(0.005)));
+    }
+
+    /// ADR-0056 step 7, PR C: a stop heal the last process left outstanding is
+    /// rebuilt from the event log, on real rows, in stream order.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn restart_rebuilds_a_stop_heal_from_the_latest_stop_event(pool: sqlx::PgPool) {
+        use robson_domain::Event;
+        let tenant_id = uuid::Uuid::from_u128(0x56603);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let price = || Price::new(dec!(76000)).unwrap();
+        let failed = |position_id| Event::InsuranceStopFailed {
+            position_id,
+            stop_price: Price::zero(),
+            error: "order gateway unavailable".to_string(),
+            timestamp: Utc::now(),
+        };
+        let placed = |position_id| Event::InsuranceStopPlaced {
+            position_id,
+            order_id: "ins-2".to_string(),
+            stop_price: price(),
+            timestamp: Utc::now(),
+        };
+        let replaced = |position_id| Event::InsuranceStopReplaced {
+            position_id,
+            previous_order_id: "ins-1".to_string(),
+            order_id: "ins-2".to_string(),
+            stop_price: price(),
+            timestamp: Utc::now(),
+        };
+        let cancelled = |position_id| Event::InsuranceStopCancelled {
+            position_id,
+            order_id: "ins-1".to_string(),
+            timestamp: Utc::now(),
+        };
+        let unrelated = |position_id| Event::ResidualInventoryRecorded {
+            position_id,
+            order_kind: robson_domain::ReductionKind::Protection,
+            requested_quantity: dec!(0.105),
+            accepted_quantity: dec!(0.1),
+            residual_quantity: dec!(0.005),
+            exchange_order_id: None,
+            fill_price: None,
+            fee: None,
+            step_size: None,
+            min_qty: None,
+            timestamp: Utc::now(),
+        };
+        let active = PositionState::Active {
+            current_price: Price::new(dec!(77500)).unwrap(),
+            trailing_stop: price(),
+            favorable_extreme: Price::new(dec!(77500)).unwrap(),
+            extreme_at: Utc::now(),
+            insurance_stop_id: Some("ins-1".to_string()),
+            invalidation_guard_level: None,
+            last_emitted_stop: None,
+        };
+        let exiting = PositionState::Exiting {
+            exit_order_id: uuid::Uuid::now_v7(),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+        let id = uuid::Uuid::nil();
+        let cases: Vec<(&str, PositionState, Vec<Event>, bool)> = vec![
+            ("latest is failed", active.clone(), vec![placed(id), failed(id)], true),
+            (
+                "a later event of another kind changes nothing",
+                active.clone(),
+                vec![placed(id), failed(id), unrelated(id)],
+                true,
+            ),
+            ("failed then placed", active.clone(), vec![failed(id), placed(id)], false),
+            ("failed then replaced", active.clone(), vec![failed(id), replaced(id)], false),
+            ("failed then cancelled", active.clone(), vec![failed(id), cancelled(id)], false),
+            ("no stop event at all", active.clone(), vec![unrelated(id)], false),
+            ("not Active", exiting, vec![placed(id), failed(id)], false),
+        ];
+
+        for (name, state, events, expected) in cases {
+            let mut position = Position::new(
+                uuid::Uuid::now_v7(),
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                robson_domain::Side::Long,
+            );
+            position.quantity = robson_domain::Quantity::new(dec!(0.105)).unwrap();
+            position.state = state;
+            let stream = format!("position:{}", position.id);
+            for event in events {
+                let mut payload = serde_json::to_value(&event).unwrap();
+                payload["position_id"] = serde_json::json!(position.id);
+                let envelope =
+                    robson_eventlog::Event::new(tenant_id, &stream, event.event_type(), payload);
+                robson_eventlog::append_event(&pool, &stream, None, envelope).await.unwrap();
+            }
+
+            daemon.restore_leg_evidence(tenant_id, &mut position).await.unwrap();
+
+            let manager = daemon.position_manager.read().await;
+            assert_eq!(
+                manager.stop_heal_deadline_for_test(position.id).await.is_some(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// The whole restore path: a leg recovered from the projection with a
+    /// failure as its latest stop event comes out with its heal scheduled.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn restore_positions_schedules_the_heal_a_failed_stop_left(pool: sqlx::PgPool) {
+        let tenant_id = uuid::Uuid::from_u128(0x56604);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let mut position = Position::new(
+            uuid::Uuid::now_v7(),
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            robson_domain::Side::Long,
+        );
+        position.quantity = robson_domain::Quantity::new(dec!(0.105)).unwrap();
+        position.state = PositionState::Active {
+            current_price: Price::new(dec!(77500)).unwrap(),
+            trailing_stop: Price::new(dec!(76000)).unwrap(),
+            favorable_extreme: Price::new(dec!(77500)).unwrap(),
+            extreme_at: Utc::now(),
+            insurance_stop_id: Some("ins-1".to_string()),
+            invalidation_guard_level: None,
+            last_emitted_stop: None,
+        };
+        let id = position.id;
+        let stream = format!("position:{id}");
+        let event = robson_domain::Event::InsuranceStopFailed {
+            position_id: id,
+            stop_price: Price::zero(),
+            error: "order gateway unavailable".to_string(),
+            timestamp: Utc::now(),
+        };
+        let envelope = robson_eventlog::Event::new(
+            tenant_id,
+            &stream,
+            event.event_type(),
+            serde_json::to_value(&event).unwrap(),
+        );
+        robson_eventlog::append_event(&pool, &stream, None, envelope).await.unwrap();
+        let daemon = Daemon::new_stub_with_recovery(
+            config,
+            Some(Arc::new(OneLegProjectionRecovery(position))),
+            Some(Arc::new(pool.clone())),
+        );
+
+        daemon.restore_positions().await.unwrap();
+
+        let manager = daemon.position_manager.read().await;
+        assert!(manager.stop_heal_deadline_for_test(id).await.is_some());
+        assert_eq!(daemon.store.positions().find_active().await.unwrap().len(), 1);
     }
 
     /// The daemon itself starts the ADR-0051 §1 alarm: a zero basis on an idle

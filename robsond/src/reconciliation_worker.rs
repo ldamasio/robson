@@ -15,6 +15,7 @@ use robson_domain::{
     ReconciliationEvidence, Side, Symbol, UserTradeEvidence,
 };
 use robson_exec::{
+    cancel::CancelClass,
     order_journal::{IntentKind, IntentSpec},
     quantize::{self, ReductionOutcome},
     ExchangePort, ExchangePosition, ExecError, OpenOrderRecord, OrderResult, UserTradeRecord,
@@ -624,22 +625,27 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
 
                 let journal = self.position_manager.read().await.order_journal();
                 let operation = journal.begin_operation();
-                let cancelled = operation
+                let class = operation
                     .scope(journal.journaled_cancel(
                         None,
                         &order.exchange_order_id,
                         self.exchange.cancel_stop_market_order(symbol, &order.exchange_order_id),
                     ))
                     .await;
-                match cancelled {
-                    // An orphan stop is not attached to any tracked position, so
-                    // either outcome leaves the exchange in the desired state:
-                    // the order is gone.
-                    Ok(outcome) => {
+                match class {
+                    // An orphan stop is not attached to any tracked position, so a
+                    // definite answer leaves the exchange in the desired state.
+                    // `GoneUnresolved` does not establish that: `Open` and
+                    // `PartiallyFilled` allow a live order. Its report is a retained
+                    // legacy one, and the outcome stays uncertain in the journal
+                    // (ADR-0056 step 7).
+                    CancelClass::Cancelled { .. }
+                    | CancelClass::GoneTerminal { .. }
+                    | CancelClass::GoneUnresolved { .. } => {
                         info!(
                             symbol = %symbol.as_pair(),
                             exchange_order_id = %order.exchange_order_id,
-                            ?outcome,
+                            ?class,
                             "Orphan insurance-stop order cleared"
                         );
                         self.event_bus.send(DaemonEvent::InsuranceStopOrphanCancelled {
@@ -648,11 +654,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                             client_order_id: order.client_order_id,
                         });
                     },
-                    Err(error) => {
+                    CancelClass::Indeterminate | CancelClass::Errored(_) => {
                         warn!(
                             symbol = %symbol.as_pair(),
                             exchange_order_id = %order.exchange_order_id,
-                            error = %error,
+                            ?class,
                             "Failed to cancel orphan insurance-stop order; continuing"
                         );
                     },
@@ -1757,6 +1763,174 @@ mod tests {
             .filter(|row| row.intent.as_ref().unwrap().kind == IntentKind::SweepClose)
             .count();
         assert_eq!(closes, 2, "the sealed intent and the fresh one");
+    }
+
+    struct OrphanSweep {
+        worker: ReconciliationWorker<StubExchange, MemoryStore>,
+        backend: Arc<StubJournalBackend>,
+        journal: Arc<OrderJournal>,
+        exchange: Arc<StubExchange>,
+        events: crate::event_bus::EventReceiver,
+        orphan_id: String,
+    }
+
+    /// A journaled worker with one orphan stop to find.
+    async fn orphan_sweep() -> OrphanSweep {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol.clone(), Side::Long);
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some("CURRENT-STOP".to_string());
+        }
+        position.insurance_stop_id = Some("CURRENT-STOP".to_string());
+        store.positions().save(&position).await.unwrap();
+        let orphan = exchange
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.010)).unwrap(),
+                Price::new(dec!(99)).unwrap(),
+                "ins-orphan-1",
+            )
+            .await
+            .unwrap();
+        exchange.set_open_position(
+            symbol,
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        let events = event_bus.subscribe();
+        let (worker, backend, journal) =
+            journaled_worker_and_journal(exchange.clone(), store, event_bus);
+        OrphanSweep {
+            worker,
+            backend,
+            journal,
+            exchange,
+            events,
+            orphan_id: orphan.exchange_order_id,
+        }
+    }
+
+    impl OrphanSweep {
+        fn orphan_events(&mut self) -> usize {
+            let mut count = 0;
+            while let Some(Ok(event)) = self.events.try_recv() {
+                if let DaemonEvent::InsuranceStopOrphanCancelled { exchange_order_id, .. } = &event
+                {
+                    assert_eq!(exchange_order_id, &self.orphan_id);
+                    count += 1;
+                }
+            }
+            count
+        }
+
+        fn cancel_row(&self) -> robson_exec::order_journal::StubJournalRow {
+            let mut cancels: Vec<_> = self
+                .backend
+                .rows()
+                .into_iter()
+                .filter(|r| r.intent.as_ref().unwrap().kind == IntentKind::Cancel)
+                .collect();
+            assert_eq!(cancels.len(), 1, "one cancel, one intent");
+            cancels.pop().unwrap()
+        }
+    }
+
+    /// Each class of an orphan's cancel: a definite one and a "gone" are
+    /// reported as before, an unknown or failed cancel is only logged, and the
+    /// row says which it was.
+    #[tokio::test]
+    async fn an_orphan_cancel_is_journaled_and_reported_by_class() {
+        use robson_exec::{
+            order_journal::VenueOutcome,
+            venue::{OrderLookup, StopCancelOutcome as VenueCancel},
+        };
+        type Case = (Result<VenueCancel, ExecError>, &'static str, Option<VenueOutcome>, usize);
+        let cases: Vec<Case> = vec![
+            (
+                Ok(VenueCancel::Cancelled {
+                    filled_before_cancel: Decimal::ZERO,
+                    fills: None,
+                }),
+                "cancelled",
+                Some(VenueOutcome::Success),
+                1,
+            ),
+            (
+                Ok(VenueCancel::AlreadyGone {
+                    final_state: OrderLookup::Terminal {
+                        filled_qty: dec!(0.010),
+                        cancelled_qty: Decimal::ZERO,
+                        fills: None,
+                    },
+                }),
+                "gone_terminal",
+                Some(VenueOutcome::GoneTerminal),
+                1,
+            ),
+            (
+                Ok(VenueCancel::AlreadyGone { final_state: OrderLookup::Unknown }),
+                "gone_unresolved",
+                None,
+                1,
+            ),
+            (Ok(VenueCancel::Unknown), "indeterminate", None, 0),
+            (Err(ExecError::Timeout("no answer".to_string())), "error", None, 0),
+            (
+                Err(ExecError::OrderRejected("Unknown order sent.".to_string())),
+                "error",
+                None,
+                0,
+            ),
+        ];
+        for (outcome, label, venue_outcome, reported) in cases {
+            let mut sweep = orphan_sweep().await;
+            sweep.exchange.set_stop_cancel_outcome_next(outcome);
+
+            sweep.worker.scan_and_reconcile().await.unwrap();
+
+            assert_eq!(sweep.orphan_events(), reported, "{label}");
+            let row = sweep.cancel_row();
+            assert_eq!(
+                row.intent.unwrap().cancels_order_id.as_deref(),
+                Some(sweep.orphan_id.as_str()),
+                "{label}"
+            );
+            let outcome = row.outcome.unwrap_or_else(|| panic!("{label}: no outcome"));
+            assert_eq!(outcome.cancel_class, Some(label), "{label}");
+            assert_eq!(outcome.venue_outcome, venue_outcome, "{label}");
+            assert_eq!(outcome.uncertain_at.is_some(), venue_outcome.is_none(), "{label}");
+        }
+    }
+
+    /// An orphan cancel's journal write that never answers costs its bound and
+    /// nothing else: the request goes out and the scan carries on.
+    #[tokio::test]
+    async fn a_hung_cancel_write_never_holds_the_orphan_sweep() {
+        use robson_exec::{order_journal::JournalFault, venue::OrderLookup};
+        for write in 0..2 {
+            let mut sweep = orphan_sweep().await;
+            sweep.backend.fail_commit(write, Some(JournalFault::Hang));
+            sweep.exchange.set_stop_cancel_outcome_next(Ok(
+                robson_exec::venue::StopCancelOutcome::AlreadyGone {
+                    final_state: OrderLookup::Unknown,
+                },
+            ));
+
+            let scan = sweep.worker.scan_and_reconcile();
+            let scanned = tokio::time::timeout(Duration::from_secs(5), scan).await;
+
+            scanned.expect("the journal held the sweep").unwrap();
+            assert_eq!(sweep.orphan_events(), 1, "write {write}");
+            sweep.journal.flush_pending().await;
+            let outcome = sweep.cancel_row().outcome.expect("the outcome lands on a retry");
+            assert_eq!(outcome.cancel_class, Some("gone_unresolved"), "write {write}");
+            assert!(outcome.uncertain_at.is_some(), "write {write}");
+        }
     }
 
     /// An orphan's cancel is its own intent, naming the order it cancels.

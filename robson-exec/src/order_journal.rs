@@ -47,6 +47,7 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{
+    cancel::{classify_cancel, CancelClass},
     error::ExecError,
     ports::StopCancelOutcome,
     quantize::Submission,
@@ -188,6 +189,8 @@ pub struct AttemptRow {
 pub enum VenueOutcome {
     Success,
     Rejected,
+    /// A cancel found the order gone, with its final state from the venue.
+    GoneTerminal,
 }
 
 impl VenueOutcome {
@@ -195,6 +198,7 @@ impl VenueOutcome {
         match self {
             Self::Success => "success",
             Self::Rejected => "rejected",
+            Self::GoneTerminal => "gone_terminal",
         }
     }
 }
@@ -1035,32 +1039,27 @@ impl OrderJournal {
         })
     }
 
-    /// A cancel's result. Only an exact `Cancelled` is definite here; the
-    /// typed cancel classifier refines the rest in a later PR.
-    pub async fn finish_cancel(&self, intent: &JournaledIntent, cancelled: bool) {
-        let outcome = if cancelled {
-            OutcomeRow {
-                venue_outcome: Some(VenueOutcome::Success),
-                cancel_class: Some("cancelled"),
-                ..OutcomeRow::default()
-            }
-        } else {
-            OutcomeRow {
-                uncertain_at: Some(Utc::now()),
-                ..OutcomeRow::default()
-            }
+    /// A cancel's result, under the class [`classify_cancel`] gave it.
+    pub async fn finish_cancel(&self, intent: &JournaledIntent, class: &CancelClass) {
+        let outcome = OutcomeRow {
+            venue_outcome: class.venue_outcome(),
+            cancel_class: Some(class.label()),
+            venue_evidence: class.evidence(),
+            uncertain_at: (!class.is_definite()).then(Utc::now),
+            ..OutcomeRow::default()
         };
         self.write_outcome(intent, outcome).await;
     }
 
     /// Run `cancel` as its own intent, under a local id that never reaches the
-    /// venue. The cancel goes out whatever the journal says.
+    /// venue, and classify what it answered. The cancel goes out whatever the
+    /// journal says, and the journal's wait is bounded.
     pub async fn journaled_cancel<F>(
         &self,
         position_id: Option<PositionId>,
         order_id: &str,
         cancel: F,
-    ) -> Result<StopCancelOutcome, ExecError>
+    ) -> CancelClass
     where
         F: Future<Output = Result<StopCancelOutcome, ExecError>>,
     {
@@ -1074,10 +1073,9 @@ impl OrderJournal {
         if let Err(refusal) = self.before_send(&intent, WriteClass::Bounded).await {
             warn!(%order_id, %refusal, "Cancel goes out without a journal row");
         }
-        let result = cancel.await;
-        self.finish_cancel(&intent, matches!(result, Ok(StopCancelOutcome::Cancelled)))
-            .await;
-        result
+        let class = classify_cancel(cancel.await);
+        self.finish_cancel(&intent, &class).await;
+        class
     }
 
     /// The result's write. Never fails: the caller keeps the venue's answer
@@ -1959,11 +1957,8 @@ mod tests {
         .await;
         assert_eq!(retried.journal_statements(), 13, "one quantisation retry");
 
-        let (_, cancel) = in_op(
-            &journal,
-            journal.journaled_cancel(None, "77", async { Ok(StopCancelOutcome::Cancelled) }),
-        )
-        .await;
+        let (_, cancel) =
+            in_op(&journal, journal.journaled_cancel(None, "77", async { Ok(cancelled()) })).await;
         assert_eq!(cancel.journal_statements(), 9, "a cancel");
     }
 
@@ -2190,35 +2185,89 @@ mod tests {
         assert_eq!(ledger.final_evidence("a").await, AttemptEvidence::Unavailable);
     }
 
+    fn cancelled() -> StopCancelOutcome {
+        StopCancelOutcome::Cancelled {
+            filled_before_cancel: rust_decimal::Decimal::ZERO,
+            fills: None,
+        }
+    }
+
+    fn gone(final_state: crate::venue::OrderLookup) -> StopCancelOutcome {
+        StopCancelOutcome::AlreadyGone { final_state }
+    }
+
+    fn terminal(filled_qty: rust_decimal::Decimal) -> crate::venue::OrderLookup {
+        crate::venue::OrderLookup::Terminal {
+            filled_qty,
+            cancelled_qty: rust_decimal::Decimal::ZERO,
+            fills: None,
+        }
+    }
+
+    /// The row each cancel input leaves: the class on the row, the outcome a
+    /// definite class writes, and `uncertain_at` for every other one.
     #[tokio::test]
-    async fn only_an_exact_cancellation_is_a_definite_cancel() {
-        for (result, definite) in [
-            (Ok(StopCancelOutcome::Cancelled), true),
-            (Ok(StopCancelOutcome::AlreadyGone), false),
-            (Err(ExecError::Timeout("t".to_string())), false),
-        ] {
+    async fn a_cancel_row_carries_its_class() {
+        use crate::venue::OrderLookup;
+        let cases: Vec<(Result<StopCancelOutcome, ExecError>, &str, Option<VenueOutcome>)> = vec![
+            (Ok(cancelled()), "cancelled", Some(VenueOutcome::Success)),
+            (
+                Ok(gone(terminal(rust_decimal::Decimal::ONE))),
+                "gone_terminal",
+                Some(VenueOutcome::GoneTerminal),
+            ),
+            (Ok(gone(OrderLookup::Unknown)), "gone_unresolved", None),
+            (
+                Ok(gone(OrderLookup::Open { filled_qty: rust_decimal::Decimal::ZERO })),
+                "gone_unresolved",
+                None,
+            ),
+            (Ok(StopCancelOutcome::Indeterminate), "indeterminate", None),
+            (Err(ExecError::Timeout("t".to_string())), "error", None),
+            (Err(ExecError::OrderRejected("Unknown order sent.".to_string())), "error", None),
+        ];
+        for (result, label, venue_outcome) in cases {
             let (backend, journal) = journal();
-            let (_, _op) =
+            let (class, _op) =
                 in_op(&journal, journal.journaled_cancel(None, "77", async { result })).await;
+            assert_eq!(class.label(), label);
             let row = backend.rows().pop().unwrap();
             assert_eq!(row.intent.as_ref().unwrap().cancels_order_id.as_deref(), Some("77"));
             assert_eq!(row.attempts.len(), 1);
             let outcome = row.outcome.unwrap();
-            assert_eq!(outcome.venue_outcome.is_some(), definite);
-            assert_eq!(outcome.uncertain_at.is_some(), !definite);
+            assert_eq!(outcome.cancel_class, Some(label));
+            assert_eq!(outcome.venue_outcome, venue_outcome, "{label}");
+            assert_eq!(outcome.uncertain_at.is_some(), venue_outcome.is_none(), "{label}");
+            assert!(!outcome.not_sent, "{label}");
         }
+    }
+
+    /// A cancel that found the order gone with its final state keeps the
+    /// fills on its own intent; nothing else writes them there.
+    #[tokio::test]
+    async fn a_gone_terminal_cancel_writes_its_fills_as_evidence() {
+        let (backend, journal) = journal();
+        let (class, _op) = in_op(
+            &journal,
+            journal.journaled_cancel(None, "77", async {
+                Ok(gone(terminal(rust_decimal_macros::dec!(0.25))))
+            }),
+        )
+        .await;
+        assert_eq!(class.label(), "gone_terminal");
+        let evidence = backend.rows().pop().unwrap().outcome.unwrap().venue_evidence;
+        let evidence = evidence.expect("the terminal state is on the record");
+        assert_eq!(evidence["filled_qty"], serde_json::json!(rust_decimal_macros::dec!(0.25)));
+        assert_eq!(evidence["fills"], Value::Null);
     }
 
     #[tokio::test]
     async fn a_cancel_goes_out_when_the_journal_cannot_take_it() {
         let (backend, journal) = journal();
         backend.push_fault(JournalFault::Known);
-        let (result, _op) = in_op(
-            &journal,
-            journal.journaled_cancel(None, "77", async { Ok(StopCancelOutcome::Cancelled) }),
-        )
-        .await;
-        assert!(matches!(result, Ok(StopCancelOutcome::Cancelled)));
+        let (class, _op) =
+            in_op(&journal, journal.journaled_cancel(None, "77", async { Ok(cancelled()) })).await;
+        assert!(matches!(class, CancelClass::Cancelled { .. }));
         assert!(journal.latch_set());
     }
 }

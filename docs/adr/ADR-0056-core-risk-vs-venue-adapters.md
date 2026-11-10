@@ -707,8 +707,7 @@ the pod restarts.
   and no exit until a later tick. One fallback, no loop: if it fails or is refused, the ordinary error path applies. Exit, initial stop,
   replacement and sweep close share this through `submit_reduction`; a cancel has no resubmission, and an entry stays strict and has no
   fallback. The refused intent ends uncertain and the fresh one carries the venue's answer.
-- **Cancels.** Only an exact `Cancelled` is definite here; the typed classifier is the next PR, so until then an "already gone" cancel
-  is recorded as uncertain and changes nothing else.
+- **Cancels.** Each cancel is its own bounded intent. Their classification is the next part.
 
 Trade-off: an entry is refused rather than sent when the journal cannot record it, and a slow database adds up to 500 ms per write to
 an order's path. After an entry fill, the result write plus the stop's pre-send write can add 1 s before the stop's request; a cancel-first
@@ -718,6 +717,65 @@ replaced retry. These waits sit under existing locks: detector handling and the 
 them, so they can delay unrelated protective work. Nothing acts on uncertainty or the latch yet. `applied_at` and `uncertain_generation`
 exist but are not written. In J an entry's operation ends before its stop is placed; the permit PR widens it. Not verified: behaviour on a
 real venue or in the cluster.
+
+*Cancels (PR C).* Every production stop cancel (replacement, withdrawal, software-exit, orphan) goes through one journaled entry that
+classifies the answer with one venue-neutral, exhaustive `robson_exec::cancel::classify_cancel`. `ports::StopCancelOutcome` now mirrors
+the venue enum variant for variant, payload included (`Unknown` is `Indeterminate` there), `legacy_cancel_outcome` maps one to one and
+folds nothing into an error, and `StubExchange` can answer every variant.
+
+| Result | Class | `venue_outcome` | `cancel_class` |
+|---|---|---|---|
+| `Cancelled { .. }` | definite | `success` | `cancelled` |
+| `AlreadyGone { Terminal { .. } }` | definite | `gone_terminal` | `gone_terminal` |
+| `AlreadyGone` with `Absent`, `Open`, `PartiallyFilled` or `Unknown` | uncertain | NULL, with `uncertain_at` | `gone_unresolved` |
+| `Indeterminate` | uncertain | NULL, with `uncertain_at` | `indeterminate` |
+| any `Err` | uncertain | NULL, with `uncertain_at` | `error` |
+
+Both definite classes write the venue's fills to the cancel intent's `venue_evidence` (`filled_before_cancel` or `filled_qty`, and
+`fills`). No migration: migration 31 already created `cancel_class` and the `gone_terminal` value, so the design's 5 SQL lines were spent in J.
+
+- **No error string or broad variant can produce a definite class.** `is_unknown_order_error` is deleted. The adapter's `-2011`/`-2013` and
+  text detection only chooses between two uncertain classes. USD-M does no lookup on a cancel, so **every USD-M "already gone" is uncertain.**
+- **A cancel is its own intent.** A replacement's placement is recorded as a success before the cancel runs, and an uncertain cancel leaves it so.
+- **No in-operation resolution.** A later close of the leg, trades-only evidence included, never settles a cancel. Step 8 must supply typed terminal
+  evidence before spot activation.
+
+| Path | Definite | Uncertain |
+|---|---|---|
+| Replacement | success | placement stays a success, the double stop is tolerated and logged, as before |
+| Withdrawal | nothing logged | logged, the next stop is still withdrawn, as before |
+| Software-exit | `Cancelled`: `InsuranceStopCancelled`. `GoneTerminal`: keeps the stop id, `Skipped`, no event | `GoneUnresolved`: keeps the stop id, `Skipped`. `Indeterminate` or `Err`: `InsuranceStopFailed`, keeps the stop id. No class stops the exit behind it; a failed append or application of the `Cancelled` event does, as it did before this PR, and the failure event's append is awaited |
+| Orphan | `InsuranceStopOrphanCancelled`, as before | `GoneUnresolved`: the same report, retained from before. It does not establish that the order is gone, since `Open` and `PartiallyFilled` allow a live one, and its outcome stays uncertain in the journal. `Indeterminate` or `Err`: logged, no event, as before |
+
+**One change in emitted events.** A software-exit cancel answered by `ExecError::OrderRejected`, or by `ExecError::Exchange` with "order" in its
+text, used to read as cancelled: it emitted `InsuranceStopCancelled` and cleared the stop id. It now emits `InsuranceStopFailed` and keeps the id, as
+every other cancel error already did. **Retaining the id changes what follows it:** reverse reconciliation reads the kept stop's fill before broader trade evidence;
+restart recovery takes the branch that checks that order's fill and open state, and may keep it, where an absent id takes the placement branch; and the stale-stop retry,
+which runs if the leg is still `Active` when it comes due, because the exit behind the cancel failed, replaces the stop against the kept id, one more cancel than the plain
+re-placement of a cleared id.
+
+**A cancel that keeps failing repeats, and that is the accepted cost.** While the id stays on the leg, the software-exit cancel goes out once before each exit attempt, with its
+own journal intent and, for `Indeterminate` or `Err`, its own `InsuranceStopFailed` each time. Errors the old `is_unknown_order_error` did not match already did this, and the
+broad errors now behave the same way. Generic exit failures have no backoff, so that can be tick cadence; the exit backoffs bound it where they apply. Cancels are not rate-limited,
+because a retried cancel can be what lets the next exit through: a stop left live by a timed-out cancel can be removed on the next tick, and a reduction outranks saving a request.
+
+**A pending stop heal keeps its deadline.** An `InsuranceStopFailed` no longer changes a deadline on record, overdue included; only a leg with none gets a new 30 s. So repeated
+failures, and a batch whose bookkeeping runs after its deadline has passed, cannot keep a heal from coming due. `ProtectionNotExecutable` still overrides with its long window, and
+the heal pushes its own window before acting, so a failed heal still backs off and this does not become a heal on every tick. As a result, a failure during the long window no
+longer shortens it to 30 s.
+
+**An outstanding heal is rebuilt at a restart.** The retry window lives in memory, `InsuranceStopFailed` is audit-only, and a kept id hides the leg from missing-stop scheduling. So the
+projection-recovery path, in its existing stream query per recovered leg, schedules the heal for an `Active` leg whose latest event among `insurance_stop_placed`, `insurance_stop_replaced`,
+`insurance_stop_cancelled` and `insurance_stop_failed` is the failure, at now + 30 s, keeping any entry already there. It runs as any other heal, a `ReplaceInsuranceStop` against the kept id,
+and a successful startup-recovery placement clears it. A failed open-orders read schedules nothing, so one read failure cannot start replacing stops on healthy legs. The rebuild is conservative: a failure that is still the latest of those events schedules a replacement even when startup finds the stop healthy (an `already_protected` audit does not count), and it neither keeps elapsed backoff nor makes the replacement exactly-once, so a crash before its event is durable can repeat the replacement on the next boot, and a crash loop inside the 30 s keeps postponing it. Limits: `InsuranceStopFailed`
+is a best-effort append, so a failure event that was never written cannot be rebuilt; and the branch of `restore_positions` that finds legs already in the store does not rebuild it, which production
+cannot reach, since every daemon starts on a fresh in-memory store whose replay is empty.
+
+**Between this PR and the fence PR, uncertainty is journaled but does not fence, exactly as today:** an uncertain cancel opens no incident
+and closes no admission, and the orphan sweep has no veto. The cost the design accepts arrives with the fence, not here: on USD-M, a software-exit cancel attempted after the
+exchange stop has filled is uncertain and will fence until an operator release even if the close then succeeds. How often that happens is
+unmeasured, and nothing trades on USD-M today. Uncertain cancels block boundary B until they carry a disposition, as they did under J; a
+`gone_terminal` one no longer does. Not verified: behaviour on a real venue or in the cluster.
 
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze
@@ -785,6 +843,7 @@ only).
 |---|---|---|---|
 | Database dies | no admission, no new legs; already-installed protection remains on the exchange; inventory in an N1-a transition may remain unprotected without a duration or loss bound; no cancellation starts without a durable intent, and unfinished transitions retain liabilities and alerts and resume from that intent on recovery; intent results cannot be persisted → in-flight operations enter `Unknown`; recovery looks them up, a lookup may stay `Unknown`, and then the reservation stays held until step 7's explicit resolution path | read-only `/status` from memory; arms refused | `/readyz.database=false`; `unprotected_inventory` gauge; recovery events |
 | Journal database down or slow (step 7, PR J) | an entry's strict commit that fails is refused, no request; a leg with admission evidence ends its attempt, a legacy leg re-arms under its backoff. One that times out is uncertain, no request and no re-arm. Reductions, stops and cancels wait at most 500 ms per write and go out anyway, also with the journal's memories full | entries refused, protection and reductions continue; unlanded rows retry through a bounded set | `robsond_journal_latch`, `robsond_journal_retry_set_depth`, warnings in the logs; no fence yet |
+| Cancel outcome unknown (step 7, PR C) | an error, an indeterminate answer or an "already gone" with no final state is uncertain on the cancel's own intent; the protective action behind it proceeds | journaled only until the fence PR | `order_intents.cancel_class` and `uncertain_at`; boundary B |
 | Venue REST dies | rules/costs/valuation stale → basis invalid, admission fails closed; risk reduction proceeds on the last validated rules or the persisted snapshot, with one refresh and resubmit per rejection; a leg holding neither waits for the lookup, then a decided exit goes out as given and a tick fails closed (§5) | reads from cache until TTL; protection on the venue, except a leg whose exit failed, until the heal | per-venue `eligible=false` + reasons; alert |
 | Venue feed silent | watchdog after `ROBSON_FEED_SILENCE_MAX`; REST snapshot resync; trailing advances continue on REST ticks within the request budget | bounded REST polling | silent-feed metric, event |
 | Daemon dies mid fan-out | accepted legs are protected on their venues except for a leg killed between entry fill and protection placement, which recovery protects or flattens first | startup recovery reads the durable journal and each venue's observation; completes, protects or releases per evidence | recovery events per leg |
@@ -866,7 +925,8 @@ Budget model for multi-venue:
   contract 1.2.0; before/after fixtures.
 - Step 7: delivered in parts (§8). PR J: `robson-exec/src/{order_journal,executor,venue,stub,error}.rs`,
   `robsond/src/{order_journal_store,api,auth,daemon,metrics,position_manager,reconciliation_worker,venue}.rs`, migration 31; the
-  attempt rows are read from the database rather than reloaded. What follows here is the original statement of the step, with its
+  attempt rows are read from the database rather than reloaded. PR C: `robson-exec/src/{cancel,compat,executor,order_journal,ports,stub}.rs`,
+  `robsond/src/{daemon,position_manager,reconciliation_worker}.rs`, no migration. What follows here is the original statement of the step, with its
   open obligations. `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
   mapping); process-kill tests. Before any caller acts on `order_by_client_id` or `replace_protection`, this step must:
   persist each attempt durably before its request is sent and each rejection when observed, reload them on startup, treat
@@ -948,6 +1008,8 @@ Budget model for multi-venue:
   `validate_futures_settings` to position accounts. No risk number or operator decision changed. Codex **APPROVE** on
   round 1, with four P3s applied (the `/events/history` exposure above, a missing-versus-null assertion, fixture provenance
   and the stale DB-gated count).
+- v13 (2026-11-09): §8 and the failure modes aligned with step 7 PR C as implemented against design note v8: typed cancel classification,
+  uncertainty journaled and not fencing until the fence PR. No risk number changed.
 - v12 (2026-11-08): §2's finality paragraph, §8 and the failure modes aligned with step 7 PR J as implemented in three stacked PRs,
   against design note v8. Codex round 1 on the first draft: REQUEST_CHANGES (3 P1, 5 P2); interrupted cancels, cancelled result
   writes, the no-send recovery on `ExecutableSpan` legs, discarded ids, pool exhaustion, evidence validation, fault targeting and

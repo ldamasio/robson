@@ -2442,6 +2442,39 @@ mod submit_attempt_evidence {
         replace_with(venue, dec!(0.01), "ins-2").await
     }
 
+    /// ADR-0056 step 7: USD-M does no lookup on a cancel, so its code and text
+    /// detection only chooses between two uncertain classes. Only an accepted
+    /// cancel is definite here.
+    #[tokio::test]
+    async fn only_an_accepted_cancel_is_definite_on_usdm() {
+        let text = |message: &str| format!(r#"{{"code":-1000,"msg":"{message}"}}"#);
+        for (reply, label) in [
+            (Some((200, STOP_CANCELLED.to_string())), "cancelled"),
+            (Some((400, api_error(-2011))), "gone_unresolved"),
+            (Some((400, api_error(-2013))), "gone_unresolved"),
+            (Some((400, text("Unknown order sent."))), "gone_unresolved"),
+            (Some((400, text("Order does not exist."))), "gone_unresolved"),
+            (Some((400, text("already cancelled"))), "gone_unresolved"),
+            (Some((400, api_error(-1000))), "error"),
+            (Some((400, api_error(-2015))), "error"),
+            (Some((500, String::new())), "error"),
+        ] {
+            let (listener, venue) = bound_venue().await;
+            let answer = reply.clone();
+            serve(listener, move |request| match request {
+                "DELETE /fapi/v1/algoOrder" => answer.clone(),
+                _ => not_found(request),
+            });
+            let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+            let result =
+                robson_exec::ExchangePort::cancel_stop_market_order(&*venue, &symbol, "77").await;
+
+            let class = robson_exec::cancel::classify_cancel(result);
+            assert_eq!(class.label(), label, "{reply:?}: {class:?}");
+        }
+    }
+
     #[tokio::test]
     async fn accepted_successor_cancels_the_old_stop() {
         // Control: the cancel counter of the tests below does count.

@@ -164,6 +164,10 @@ pub struct StubExchange {
     short_fill_next: RwLock<Option<Decimal>>,
     /// The next protective stop cancel fails.
     cancel_fails_next: RwLock<bool>,
+    /// The next protective stop cancel answers this and changes nothing else.
+    stop_cancel_outcome_next: Mutex<Option<Result<StopCancelOutcome, ExecError>>>,
+    /// Requests that reached `cancel_protection`, whatever they answered.
+    stop_cancel_calls: RwLock<u64>,
     /// Runs once, right after the next protective stop is accepted: whatever
     /// happened on the leg while the placement was on its way.
     after_next_stop_accepted: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -259,6 +263,8 @@ impl StubExchange {
             reduce_only_rejections_next: RwLock::new(0),
             short_fill_next: RwLock::new(None),
             cancel_fails_next: RwLock::new(false),
+            stop_cancel_outcome_next: Mutex::new(None),
+            stop_cancel_calls: RwLock::new(0),
             after_next_stop_accepted: Mutex::new(None),
             after_next_stop_cancel: Mutex::new(None),
             after_next_open_orders_read: Mutex::new(None),
@@ -439,6 +445,17 @@ impl StubExchange {
         *self.cancel_fails_next.write().unwrap() = fails;
     }
 
+    /// Script what the next protective stop cancel answers, any variant of the
+    /// venue contract included. The stop itself stays as it is.
+    pub fn set_stop_cancel_outcome_next(&self, outcome: Result<StopCancelOutcome, ExecError>) {
+        *self.stop_cancel_outcome_next.lock().unwrap() = Some(outcome);
+    }
+
+    /// Stop cancel requests that reached the stub, whatever they answered.
+    pub fn stop_cancel_call_count(&self) -> u64 {
+        *self.stop_cancel_calls.read().unwrap()
+    }
+
     pub fn market_order_client_ids(&self) -> Vec<String> {
         self.market_order_client_ids.read().unwrap().clone()
     }
@@ -448,7 +465,8 @@ impl StubExchange {
         *self.after_next_stop_accepted.lock().unwrap() = Some(Box::new(hook));
     }
 
-    /// Run `hook` once, right after the next stop cancel takes effect.
+    /// Run `hook` once, at the next stop cancel: after it takes effect, or just
+    /// before a scripted answer returns, which changes no order state.
     pub fn set_after_next_stop_cancel(&self, hook: impl FnOnce() + Send + 'static) {
         *self.after_next_stop_cancel.lock().unwrap() = Some(Box::new(hook));
     }
@@ -911,11 +929,18 @@ impl venue::TradingPort for StubExchange {
         _symbol: &Symbol,
         stop: &StopRef,
     ) -> Result<StopCancelOutcome, ExecError> {
+        *self.stop_cancel_calls.write().unwrap() += 1;
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated stop cancel failure".to_string()));
         }
         if std::mem::take(&mut *self.cancel_fails_next.write().unwrap()) {
             return Err(ExecError::Timeout("Simulated stop cancel timeout".to_string()));
+        }
+        if let Some(outcome) = self.stop_cancel_outcome_next.lock().unwrap().take() {
+            if let Some(hook) = self.after_next_stop_cancel.lock().unwrap().take() {
+                hook();
+            }
+            return outcome;
         }
 
         let algo_id = stop.exchange_order_id.as_str();

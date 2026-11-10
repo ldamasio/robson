@@ -29,12 +29,14 @@ use robson_exec::{
         WriteClass, DEFAULT_ACCOUNT_SCOPE,
     },
     venue::{AttemptEvidence, OrderLookup, SubmitAttemptLedger, VenueFinalityRule, VenueId},
+    ExecError, StopCancelOutcome,
 };
 use robson_testkit::{
     daemon_process::database_url_through,
     db_proxy::{DbProxy, ProxyMode},
 };
 use robsond::order_journal_store::PgJournalBackend;
+use rust_decimal::Decimal;
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, Connection, PgPool};
 use uuid::Uuid;
@@ -418,6 +420,84 @@ async fn boundary_b_lists_exactly_the_outstanding_intents_with_no_disposition(po
     .await
     .unwrap();
     assert_eq!(blockers(&pool).await, vec!["unstamped"]);
+}
+
+/// A cancel's class on real SQL (ADR-0056 step 7, PR C): `gone_terminal` passes
+/// the column's check, the fills land as evidence, and boundary B lists exactly
+/// the uncertain classes.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_cancel_lands_its_class_and_evidence_on_real_sql(pool: PgPool) {
+    let journal = real_journal(&pool);
+    let gone = |final_state| Ok(StopCancelOutcome::AlreadyGone { final_state });
+    let cases: Vec<(&str, Result<StopCancelOutcome, ExecError>)> = vec![
+        (
+            "cancelled",
+            Ok(StopCancelOutcome::Cancelled {
+                filled_before_cancel: Decimal::ZERO,
+                fills: None,
+            }),
+        ),
+        (
+            "gone_terminal",
+            gone(OrderLookup::Terminal {
+                filled_qty: Decimal::new(25, 2),
+                cancelled_qty: Decimal::ZERO,
+                fills: None,
+            }),
+        ),
+        ("gone_unresolved", gone(OrderLookup::Unknown)),
+        ("indeterminate", Ok(StopCancelOutcome::Indeterminate)),
+        ("error", Err(ExecError::Timeout("no answer".to_string()))),
+    ];
+    for (order, result) in cases {
+        let operation = journal.begin_operation();
+        let class = operation.scope(journal.journaled_cancel(None, order, async { result })).await;
+        assert_eq!(class.label(), order);
+    }
+
+    let row = |order: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Option<String>, Option<String>, Option<serde_json::Value>, bool)>(
+                "SELECT venue_outcome, cancel_class, venue_evidence, uncertain_at IS NOT NULL
+                 FROM order_intents WHERE cancels_order_id = $1 AND kind = 'cancel'",
+            )
+            .bind(order)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let (outcome, class, evidence, uncertain) = row("cancelled").await;
+    assert_eq!(outcome.as_deref(), Some("success"));
+    assert_eq!(class.as_deref(), Some("cancelled"));
+    assert_eq!(evidence.unwrap()["fills"], serde_json::Value::Null);
+    assert!(!uncertain);
+
+    let (outcome, class, evidence, uncertain) = row("gone_terminal").await;
+    assert_eq!(outcome.as_deref(), Some("gone_terminal"));
+    assert_eq!(class.as_deref(), Some("gone_terminal"));
+    assert_eq!(evidence.unwrap()["filled_qty"], json!(Decimal::new(25, 2)));
+    assert!(!uncertain);
+
+    for order in ["gone_unresolved", "indeterminate", "error"] {
+        let (outcome, class, evidence, uncertain) = row(order).await;
+        assert_eq!(outcome, None, "{order}");
+        assert_eq!(class.as_deref(), Some(order));
+        assert_eq!(evidence, None, "{order}");
+        assert!(uncertain, "{order}");
+    }
+
+    let mut blocking: Vec<String> = sqlx::query_scalar(
+        "SELECT cancels_order_id FROM order_intents
+         WHERE intent_id IN (SELECT intent_id FROM order_intents_blocking_rollback)",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    blocking.sort();
+    assert_eq!(blocking, vec!["error", "gone_unresolved", "indeterminate"]);
 }
 
 /// The constraints hold the predicate even for a write that skips the
