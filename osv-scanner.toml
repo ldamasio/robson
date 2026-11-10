@@ -25,6 +25,10 @@ reason = "crypto-bigint 0.5.5 (timing variability in constant-time ops): fix is 
 id = "GHSA-qwgh-2vcv-g2f7"
 reason = "block-buffer 0.10.4 (caught panic inside a digest compress callback leaves the inline cursor corrupted, enabling OOB access afterwards): fix is 0.12.1, reachable only through digest/sha2 0.11, a semver-major across the RustCrypto tree pulled by sqlx, reqwest/rustls and jsonwebtoken. Precondition: catching a panic raised from within a hash compress callback and then reusing the same buffer. robsond never wraps hashing in catch_unwind; a panic there propagates and the task/process ends (panic = abort for the daemon's purposes), so the corrupted-buffer state is never observed. Re-evaluate when the dependency tree moves to digest 0.11. No RUSTSEC id yet, hence absent from .cargo/audit.toml. (2026-10-28)"
 
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0459"
+reason = "libsqlite3-sys 0.30.1 (bundled SQLite < 3.54.0 can return uninitialized page-cache memory when opening a crafted database with a sibling -wal file of a different page size): fix is 0.39.0, and no sqlx release accepts it — sqlx-sqlite 0.8.0 requires ^0.28.0, 0.8.1–0.8.6 require ^0.30.1 and 0.9.0 requires >=0.30.1, <0.38.0. Inclusion path: sqlx's optional sqlx-sqlite (listed by sqlx and sqlx-macros-core), which robson never enables — every crate uses sqlx with postgres only, so cargo tree -i libsqlite3-sys and -i sqlx-sqlite are empty on every target with --all-features, and no robson code opens a SQLite file. Re-evaluate when an sqlx release accepts libsqlite3-sys >= 0.39 or when any path compiles SQLite (sqlx's sqlite, sqlite-unbundled or all-databases features, or a new dependency or tool); remove this entry if sqlx drops the lockfile edge. (2026-11-09)"
+
 # --- frontend/pnpm-lock.yaml (scanned since 2026-11-03) ---
 
 [[IgnoredVulns]]
