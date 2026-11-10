@@ -153,6 +153,24 @@ impl DaemonProcess {
         });
     }
 
+    /// Send `signal` (a name such as `TERM` or `INT`) to the daemon.
+    pub fn send_signal(&self, signal: &str) -> Result<()> {
+        let pid = self.child.lock().unwrap_or_else(|e| e.into_inner()).id();
+        let status = Command::new("kill")
+            .args(["-s", signal, &pid.to_string()])
+            .status()
+            .context("run kill")?;
+        if !status.success() {
+            bail!("kill -s {signal} {pid} failed: {status}");
+        }
+        Ok(())
+    }
+
+    /// The daemon's log so far.
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+
     /// The daemon's API base URL.
     pub fn api_url(&self) -> String {
         format!("http://{}", self.api)
