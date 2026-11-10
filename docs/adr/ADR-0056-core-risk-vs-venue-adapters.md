@@ -950,7 +950,7 @@ Production uses `robson:daemon`, the default.
   projection stays behind its log, as before P; the latch kept that stop from marking itself clean. `robsond_streams_suspended{kind}` exports `position` and `system`, at 0 from startup.
   A position stream that stays suspended invalidates its leg's snapshot through the latent-failure path: while the leg is
   risk-open, the budget's remaining capacity is zero. Until part 3 nothing repairs a position stream, so after part 2 alone it
-  stays suspended across restarts.
+  stays suspended across restarts; part 3 repairs it at the next start.
 - **The latch closes admissions until a restart,** whatever set it: a bounded send whose row did not land, discarded history,
   an `IdSpent` conflict, an aborted operation, a venue mutation without a permit, a suspended stream. It is checked at the three
   admission sites beside the residual check, before any admission evidence is written (an arm and an approval answer
@@ -968,14 +968,34 @@ Production uses `robson:daemon`, the default.
   whose acknowledgement was lost erases a peak recorded since, and a replay guard would have to cover five writers of
   `monthly_state`, two of them not event-sourced.
 
+*Part 3, the startup repair of position streams.* After the suspensions on record are loaded, under the startup permit and before the
+store is rebuilt from the projection, each suspended **position** stream is repaired, holding its lock throughout, in two passes of 500
+events a page. The first validates the whole suffix past the leg's `positions_current.last_seq`, keeping only the cursor: every event
+type must apply through a handler guarded by that `last_seq` or be audit-only (`robson_projector::is_repairable_position_event`, which
+names every route). Any other type means no repair at all, not even of the events ahead of it. The second applies the suffix in seq
+order, from past the later of `last_seq` and the checkpoint an interrupted attempt left, writing `repaired_through_seq` after each
+page, and then clears the suspension (`cleared_at`), so the stream takes appends again. Any failure leaves the stream suspended, with
+`repair_error` recorded, and its leg's snapshot invalid through the latent-failure path. The monthly counters `EntryFilled` and
+`PositionClosed` add to are not guarded by `last_seq`: an event applied again whose position part had already applied adds again. They
+drive neither the budget nor the API (#298). **System streams are never repaired here**: one stays suspended, and listed in
+`stream_suspensions`, until step 8's replay-safe repair.
+
+**A deviation from design §6:** the repair's evidence is its own row in `stream_suspensions` (`repaired_through_seq` per page,
+`repair_error`, `cleared_at`), not a `journal_decisions` row, which stays untouched. That table records an operator's decision, with a
+verified or asserted identity and a note; an automatic repair has neither.
+
 **Rollback across PR P is boundary B,** checked with the daemon stopped, on the final process's state: its epoch stopped clean (a
 `clean_stop_at` marker, which is written only with the latch clear and the journal quiescent; a restart clears only the initial latch,
 and startup or later bounded work can set it again, so a restart alone proves nothing about the final process), **plus no open
 suspension**: `SELECT COUNT(*) FROM stream_suspensions WHERE cleared_at IS NULL` must be 0.
 An older binary ignores the table and would append to a suspended stream past its gap, leaving an interior gap the projection never
-applies. With part 2 alone nothing clears a suspension, so one suspended stream blocks that rollback until it is resolved by hand. The
+applies. With part 2 alone nothing clears a suspension, so one suspended stream blocks that rollback until it is resolved by hand; from
+part 3 the restart repairs a position stream when it can, and a system stream, or a position stream its repair refused, still blocks
+it. The
 rollback image must keep migrations 31, 32 and 33: SQLx's migrator rejects an applied migration missing from its embedded set, and
-`robsond db migrate` runs in the Sync hook, so pinning back to `sha-217cde03` is refused by that image's hook.
+`robsond db migrate` runs in the Sync hook, so pinning back to `sha-217cde03` is refused by that image's hook. Not verified: behaviour on a real
+venue or in the cluster, how often a journal write fails to land in production (each now closes admissions until a restart), and the
+repair's duration on a long suffix.
 
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze

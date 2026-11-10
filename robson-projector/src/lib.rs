@@ -10,5 +10,5 @@ pub mod handlers;
 
 mod types;
 
-pub use apply::apply_event_to_projections;
+pub use apply::{apply_event_to_projections, is_repairable_position_event};
 pub use error::{ProjectionError, Result};

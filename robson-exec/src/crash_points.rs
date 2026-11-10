@@ -41,6 +41,9 @@ crash_points! {
     STOP_AFTER_MARKER = "stop_after_marker";
     // The startup phase holds its permit; the startup scan has not run.
     STARTUP_BEFORE_SCAN = "startup_before_scan";
+    // A startup repair applied a page of a suspended stream and recorded its
+    // checkpoint; the next page has not started.
+    REPAIR_AFTER_PAGE = "repair_after_page";
 }
 
 /// Crash point to arm.

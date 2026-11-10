@@ -12,9 +12,9 @@
 //! projection then lags its log by exactly the suffix that did not apply. The
 //! suspension is recorded durably through the journal's retry set, which sets
 //! the latch, and is loaded back at the next start. A position stream is then
-//! repaired; a system stream stays suspended until step 8, and while its month
-//! is the current one admissions stay closed (the fence PR replaces that rule
-//! with its accounting contract and release).
+//! repaired ([`repair_position_stream`]); a system stream stays suspended until
+//! step 8, and while its month is the current one admissions stay closed (the
+//! fence PR replaces that rule with its accounting contract and release).
 //!
 //! Lock order (design §2.10): the manager lock, a stream's lock, the gate
 //! mutex, the journal's memory mutex. The two registries here are sync leaves
@@ -207,6 +207,21 @@ impl EventStreams {
         Self::publish(&suspended);
     }
 
+    /// A repaired stream takes appends again.
+    pub(crate) fn clear(&self, stream_key: &str) {
+        let mut suspended = self.suspended_table();
+        suspended.remove(stream_key);
+        Self::publish(&suspended);
+    }
+
+    /// A repair's checkpoint, kept so a later attempt in this process starts
+    /// past it.
+    pub(crate) fn note_repaired_through(&self, stream_key: &str, seq: i64) {
+        if let Some(entry) = self.suspended_table().get_mut(stream_key) {
+            entry.repaired_through_seq = Some(seq);
+        }
+    }
+
     pub(crate) fn position_suspended(&self, position_id: PositionId) -> bool {
         self.suspended_table()
             .values()
@@ -224,6 +239,18 @@ impl EventStreams {
     pub(crate) fn current_month_suspended(&self) -> Option<(i32, u32)> {
         let now = Utc::now();
         self.month_suspended(now.year(), now.month()).then(|| (now.year(), now.month()))
+    }
+
+    /// The suspended position streams, in key order.
+    pub(crate) fn suspended_positions(&self) -> Vec<(String, Suspended)> {
+        let mut streams: Vec<_> = self
+            .suspended_table()
+            .iter()
+            .filter(|(_, entry)| matches!(entry.stream, ManagedStream::Position(_)))
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect();
+        streams.sort_by(|a, b| a.0.cmp(&b.0));
+        streams
     }
 
     fn publish(suspended: &HashMap<String, Suspended>) {
@@ -259,6 +286,198 @@ pub(crate) async fn load_open_suspensions(
             }))
         })
         .collect())
+}
+
+/// Events a startup repair reads at once, in each pass (design §2.5).
+#[cfg(feature = "postgres")]
+pub(crate) const REPAIR_PAGE: i64 = 500;
+
+/// How the startup repair of one suspended position stream ended.
+#[cfg(feature = "postgres")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepairOutcome {
+    /// Its suffix applied in full; the stream takes appends again.
+    Cleared { applied: u64 },
+    /// An event type in its suffix has no guarded position handler: nothing
+    /// was applied, and it stays suspended.
+    Refused { seq: i64, event_type: String },
+    /// An apply or a read failed partway; it stays suspended, its checkpoint
+    /// where the last whole page left it.
+    Failed { error: String },
+}
+
+/// Repair one suspended position stream (ADR-0056 step 7, PR P, design §2.5),
+/// holding its lock throughout. Two passes, each 500 events a page:
+///
+/// 1. **Validate** the whole suffix past `positions_current.last_seq`, keeping
+///    only the cursor: every event type must apply through a handler guarded by
+///    the leg's `last_seq`, or be audit-only. Any other type means no repair at
+///    all.
+/// 2. **Apply** it in seq order, from past the later of that `last_seq` and the
+///    checkpoint a previous attempt left, writing `repaired_through_seq` after
+///    each page; then clear the suspension.
+///
+/// Any failure leaves the stream suspended, recorded in `repair_error`, and its
+/// leg's snapshot invalid through the latent-failure path. The monthly
+/// counters `EntryFilled` and `PositionClosed` add to are not idempotent: an
+/// event re-applied whose position part was already applied adds again. They
+/// drive neither the budget nor the API.
+#[cfg(feature = "postgres")]
+pub(crate) async fn repair_position_stream(
+    pool: &sqlx::PgPool,
+    tenant_id: Uuid,
+    streams: &EventStreams,
+    stream_key: &str,
+    suspended: &Suspended,
+) -> RepairOutcome {
+    let _stream = streams.lock(stream_key).await;
+    let outcome = match repair_under_lock(pool, tenant_id, streams, stream_key, suspended).await {
+        Ok(outcome) => outcome,
+        Err(error) => RepairOutcome::Failed { error: error.to_string() },
+    };
+    let recorded = match &outcome {
+        RepairOutcome::Cleared { .. } => {
+            sqlx::query(
+                "UPDATE stream_suspensions SET cleared_at = NOW(), repair_error = NULL \
+                 WHERE suspension_id = $1",
+            )
+            .bind(suspended.suspension_id)
+            .execute(pool)
+            .await
+        },
+        RepairOutcome::Refused { seq, event_type } => {
+            record_repair_error(
+                pool,
+                suspended.suspension_id,
+                &format!("seq {seq}: {event_type} has no guarded position handler"),
+            )
+            .await
+        },
+        RepairOutcome::Failed { error } => {
+            record_repair_error(pool, suspended.suspension_id, error).await
+        },
+    };
+    match (outcome, recorded) {
+        (RepairOutcome::Cleared { applied }, Ok(_)) => {
+            streams.clear(stream_key);
+            RepairOutcome::Cleared { applied }
+        },
+        // Applied, but not cleared on record: it stays suspended, and the next
+        // start validates and applies a suffix that is a no-op by then.
+        (RepairOutcome::Cleared { .. }, Err(error)) => RepairOutcome::Failed {
+            error: format!("clearing the suspension: {error}"),
+        },
+        (outcome, _) => outcome,
+    }
+}
+
+#[cfg(feature = "postgres")]
+async fn record_repair_error(
+    pool: &sqlx::PgPool,
+    suspension_id: Uuid,
+    error: &str,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query("UPDATE stream_suspensions SET repair_error = $2 WHERE suspension_id = $1")
+        .bind(suspension_id)
+        .bind(error)
+        .execute(pool)
+        .await
+}
+
+#[cfg(feature = "postgres")]
+async fn repair_under_lock(
+    pool: &sqlx::PgPool,
+    tenant_id: Uuid,
+    streams: &EventStreams,
+    stream_key: &str,
+    suspended: &Suspended,
+) -> Result<RepairOutcome, sqlx::Error> {
+    let ManagedStream::Position(position_id) = suspended.stream else {
+        return Ok(RepairOutcome::Refused {
+            seq: 0,
+            event_type: "a system stream".to_string(),
+        });
+    };
+    let projected = sqlx::query_scalar::<_, i64>(
+        "SELECT last_seq FROM positions_current WHERE position_id = $1",
+    )
+    .bind(position_id)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(0);
+
+    // 1. Validate, holding only the cursor.
+    let mut cursor = projected;
+    loop {
+        let page = sqlx::query_as::<_, (i64, String)>(
+            "SELECT seq, event_type FROM event_log \
+             WHERE tenant_id = $1 AND stream_key = $2 AND seq > $3 ORDER BY seq LIMIT $4",
+        )
+        .bind(tenant_id)
+        .bind(stream_key)
+        .bind(cursor)
+        .bind(REPAIR_PAGE)
+        .fetch_all(pool)
+        .await?;
+        if let Some((seq, event_type)) = page
+            .iter()
+            .find(|(_, event_type)| !robson_projector::is_repairable_position_event(event_type))
+        {
+            return Ok(RepairOutcome::Refused {
+                seq: *seq,
+                event_type: event_type.clone(),
+            });
+        }
+        match page.last() {
+            Some((seq, _)) if page.len() as i64 == REPAIR_PAGE => cursor = *seq,
+            _ => break,
+        }
+    }
+
+    // 2. Apply, past what an interrupted attempt already did.
+    let mut cursor = projected.max(suspended.repaired_through_seq.unwrap_or(0));
+    let mut applied = 0;
+    loop {
+        let page = sqlx::query_as::<_, robson_eventlog::EventEnvelope>(
+            "SELECT event_id, tenant_id, stream_key, seq, event_type, payload, \
+             payload_schema_version, occurred_at, ingested_at, idempotency_key, \
+             trace_id, causation_id, command_id, workflow_id, \
+             actor_type, actor_id, prev_hash, hash \
+             FROM event_log \
+             WHERE tenant_id = $1 AND stream_key = $2 AND seq > $3 ORDER BY seq LIMIT $4",
+        )
+        .bind(tenant_id)
+        .bind(stream_key)
+        .bind(cursor)
+        .bind(REPAIR_PAGE)
+        .fetch_all(pool)
+        .await?;
+        let Some(last) = page.last().map(|envelope| envelope.seq) else {
+            break;
+        };
+        for envelope in &page {
+            if let Err(error) = robson_projector::apply_event_to_projections(pool, envelope).await {
+                return Ok(RepairOutcome::Failed {
+                    error: format!("seq {}: {}: {error}", envelope.seq, envelope.event_type),
+                });
+            }
+            applied += 1;
+        }
+        sqlx::query(
+            "UPDATE stream_suspensions SET repaired_through_seq = $2 WHERE suspension_id = $1",
+        )
+        .bind(suspended.suspension_id)
+        .bind(last)
+        .execute(pool)
+        .await?;
+        streams.note_repaired_through(stream_key, last);
+        robson_exec::crash_point!(REPAIR_AFTER_PAGE);
+        cursor = last;
+        if (page.len() as i64) < REPAIR_PAGE {
+            break;
+        }
+    }
+    Ok(RepairOutcome::Cleared { applied })
 }
 
 #[cfg(test)]
@@ -304,6 +523,9 @@ mod tests {
         assert_eq!((row.stream_kind, row.failed_seq, row.month), ("position", Some(7), None));
         assert!(streams.position_suspended(id));
         assert!(!streams.position_suspended(Uuid::now_v7()));
+        assert_eq!(streams.suspended_positions().len(), 1);
+        streams.clear(&format!("position:{id}"));
+        assert!(!streams.position_suspended(id));
     }
 
     /// A lock entry goes when its last holder or waiter does, a waiter dropped

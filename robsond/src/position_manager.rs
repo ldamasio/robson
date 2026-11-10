@@ -1211,6 +1211,43 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(count)
     }
 
+    /// Repair the suspended position streams (ADR-0056 step 7, PR P), at start
+    /// under the startup permit, before the store is rebuilt from the
+    /// projection. A system stream is never repaired here. How many were
+    /// cleared, and how many stay suspended, their legs' snapshots invalid.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn repair_suspended_position_streams(&self) -> (usize, usize) {
+        let (Some(pool), Some(tenant_id)) = (&self.event_log_pool, self.event_log_tenant_id) else {
+            return (0, 0);
+        };
+        let (mut cleared, mut suspended) = (0, 0);
+        for (stream_key, entry) in self.event_streams.suspended_positions() {
+            match crate::event_streams::repair_position_stream(
+                pool,
+                tenant_id,
+                &self.event_streams,
+                &stream_key,
+                &entry,
+            )
+            .await
+            {
+                crate::event_streams::RepairOutcome::Cleared { applied } => {
+                    info!(%stream_key, applied, "Suspended position stream repaired and cleared");
+                    cleared += 1;
+                },
+                outcome => {
+                    error!(
+                        %stream_key,
+                        ?outcome,
+                        "Position stream stays suspended; its leg's snapshot is invalid"
+                    );
+                    suspended += 1;
+                },
+            }
+        }
+        (cleared, suspended)
+    }
+
     /// Configure eventlog persistence for domain events (MIG-v2.5#2).
     ///
     /// When set, every domain event emitted through the executor is also

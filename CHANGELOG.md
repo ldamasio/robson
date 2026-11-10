@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Startup repair of suspended position streams (ADR-0056 step 7, PR P, part 3)
+
+- At start, before the store is rebuilt, each suspended position stream is repaired: its suffix past the leg's
+  `last_seq` is validated first, 500 events a page, and any event type without a guarded position handler means no
+  repair; then it is applied in seq order, 500 a page, with `repaired_through_seq` written after each page, and the
+  suspension is cleared. A failure leaves it suspended, with `repair_error`, and the leg's snapshot invalid; a repair
+  interrupted by the process's death resumes past its checkpoint. System streams are never repaired automatically.
+
 ### Changed - Venue results kept, streams suspended, admissions closed on the latch (ADR-0056 step 7, PR P, part 2)
 
 - A venue result is no longer dropped when its event fails to persist: an entry that filled still gets its exchange stop,

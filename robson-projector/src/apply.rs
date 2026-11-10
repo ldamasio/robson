@@ -145,6 +145,68 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
     }
 }
 
+/// Whether an event of this type, on a position stream, applies through a
+/// handler guarded by the leg's `last_seq`, or is audit-only: what the startup
+/// repair of a suspended position stream may apply again (ADR-0056 step 7, PR
+/// P). Every route says, so a new one cannot be repairable by default. The
+/// monthly counters `entry_filled` and `position_closed` also add to are not
+/// guarded by `last_seq`.
+pub fn is_repairable_position_event(event_type: &str) -> bool {
+    use ProjectionRoute::*;
+    let Some(route) = projection_route(event_type) else {
+        return false;
+    };
+    match route {
+        PositionArmed
+        | EntryPolicyResolved
+        | PositionDisarmed
+        | EntrySignalReceived
+        | TechnicalStopAnalyzed
+        | EntryOrderPlaced
+        | EntryOrderRequested
+        | EntryOrderAccepted
+        | EntryOrderFailed
+        | EntryExecutionRejected
+        | EntryFilled
+        | TrailingStopUpdated
+        | FavorableExtremeAdvanced
+        | PositionMonitorTick
+        | ExitTriggered
+        | ExitOrderPlaced
+        | ExitFilled
+        | PositionClosedDomain
+        | InsuranceStopPlaced
+        | InsuranceStopReplaced
+        | InsuranceStopCancelled
+        | InsuranceStopFailed
+        | StartupRecoveryInsuranceStopChecked
+        | ExecutableStopPlanDriftDetected
+        | EntryFillProtectionFallback
+        | ExecutableStopRiskResolutionFailed
+        | ResidualInventoryRecorded
+        | EntryAttemptExhausted
+        | SignalStrategyEvaluated
+        | EntryApprovalPending
+        | PositionError => true,
+        // System, legacy and other streams' types: never on a position stream
+        // the daemon wrote.
+        MonthBoundaryReset
+        | CapitalBaseRecalibrated
+        | OrderSubmitted
+        | OrderAcked
+        | OrderRejected
+        | OrderCanceled
+        | FillReceived
+        | PositionOpened
+        | PositionClosedLegacy
+        | BalanceSampled
+        | RiskCheckFailed
+        | StrategyEnabled
+        | StrategyDisabled
+        | QueryStateChanged => false,
+    }
+}
+
 /// Apply a single event to all relevant projection tables.
 ///
 /// This is idempotent and safe for replay - handlers use UPSERT
@@ -331,6 +393,25 @@ mod tests {
                 projection_route(event_type).is_some(),
                 "domain event type must have a projector route: {event_type}"
             );
+        }
+    }
+
+    /// What a daemon writes on a position stream is repairable; a system
+    /// stream's types, legacy types and unknown ones are not.
+    #[test]
+    fn every_position_stream_event_type_is_repairable_and_nothing_else() {
+        for event_type in every_domain_event_type() {
+            let system =
+                matches!(event_type.as_str(), "month_boundary_reset" | "capital_base_recalibrated");
+            assert_eq!(super::is_repairable_position_event(&event_type), !system, "{event_type}");
+        }
+        for other in [
+            "POSITION_OPENED",
+            "ORDER_SUBMITTED",
+            "BALANCE_SAMPLED",
+            "no_such_type",
+        ] {
+            assert!(!super::is_repairable_position_event(other), "{other}");
         }
     }
 
