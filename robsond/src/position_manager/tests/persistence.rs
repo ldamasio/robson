@@ -861,6 +861,8 @@ async fn a_system_stream_suspended_by_a_lost_ack_is_not_replayed_at_the_next_sta
 
     let next = process_of(&pool, tenant_id);
     assert_eq!(next.load_stream_suspensions().await.unwrap(), 1);
+    assert_eq!(next.repair_suspended_position_streams().await, (0, 0), "positions only");
+    assert!(next.event_streams.month_suspended(now.year(), now.month()));
     let armed = next
         .arm_position(
             Symbol::from_pair("BTCUSDT").unwrap(),
@@ -1031,4 +1033,254 @@ async fn generated_writers_never_append_past_a_failure(pool: sqlx::PgPool) {
         append_failures > 0 && apply_failures > 0 && refusals > 0,
         "{append_failures} {apply_failures} {refusals}"
     );
+}
+
+// =============================================================================
+// Startup repair of suspended position streams (part 3)
+// =============================================================================
+
+/// A position stream that stays suspended invalidates its leg's snapshot
+/// through the latent-failure path: no remaining budget while it is open.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_leg_whose_stream_stays_suspended_invalidates_the_snapshot() {
+    let manager = create_test_manager().await;
+    let (position, _) = active_leg_with_live_stop(&manager).await;
+    manager.event_streams.restore([(
+        format!("position:{}", position.id),
+        crate::event_streams::Suspended {
+            suspension_id: Uuid::now_v7(),
+            stream: crate::event_streams::ManagedStream::Position(position.id),
+            repaired_through_seq: None,
+        },
+    )]);
+
+    let (snapshot, _, _, failures) = manager
+        .canonical_budget_snapshot_with_positions(chrono::Utc::now())
+        .await
+        .unwrap();
+
+    assert!(snapshot.latent_risk_invalid);
+    assert_eq!((snapshot.remaining_active, snapshot.slots_active), (Decimal::ZERO, 0));
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].position_id, position.id);
+    assert!(failures[0].reason.contains("suspended"), "{}", failures[0].reason);
+}
+
+/// A leg whose `position_armed` applied and an open suspension of its stream:
+/// with [`append_unapplied`], what a process that died with a suspended stream
+/// leaves.
+#[cfg(feature = "postgres")]
+async fn suspended_leg(pool: &sqlx::PgPool, tenant_id: Uuid) -> PositionId {
+    let position_id = Uuid::now_v7();
+    process_of(pool, tenant_id)
+        .persist_event_to_log(&Event::PositionArmed {
+            position_id,
+            account_id: Uuid::now_v7(),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            tech_stop_distance: None,
+            stop_policy: StopPolicy::ExecutableSpan,
+            stop_buffer_bps_at_arm: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    let stream_key = format!("position:{position_id}");
+    sqlx::query(
+        "INSERT INTO stream_suspensions (suspension_id, tenant_id, stream_key, stream_kind, \
+         failed_seq, error, suspended_at) VALUES ($1, $2, $3, 'position', 2, 'injected', NOW())",
+    )
+    .bind(Uuid::now_v7())
+    .bind(tenant_id)
+    .bind(&stream_key)
+    .execute(pool)
+    .await
+    .unwrap();
+    position_id
+}
+
+/// Land `suffix` on `position_id`'s stream without applying it.
+#[cfg(feature = "postgres")]
+async fn append_unapplied(
+    pool: &sqlx::PgPool,
+    tenant_id: Uuid,
+    position_id: PositionId,
+    suffix: Vec<(String, serde_json::Value)>,
+) {
+    let stream_key = format!("position:{position_id}");
+    for (event_type, payload) in suffix {
+        let event = robson_eventlog::Event::new(tenant_id, &stream_key, &event_type, payload);
+        robson_eventlog::append_event(pool, &stream_key, None, event).await.unwrap();
+    }
+}
+
+/// Trailing updates of `position_id`, one per stop, each to a stop of its own.
+#[cfg(feature = "postgres")]
+fn trailing_updates(
+    position_id: PositionId,
+    stops: std::ops::Range<i64>,
+) -> Vec<(String, serde_json::Value)> {
+    stops
+        .map(|stop| {
+            let event = Event::TrailingStopUpdated {
+                position_id,
+                previous_stop: Price::new(Decimal::from(stop)).unwrap(),
+                new_stop: Price::new(Decimal::from(stop + 1)).unwrap(),
+                trigger_price: Price::new(Decimal::from(stop + 1)).unwrap(),
+                timestamp: chrono::Utc::now(),
+            };
+            (event.event_type().to_string(), serde_json::to_value(&event).unwrap())
+        })
+        .collect()
+}
+
+/// The leg's projection and its suspension's row: `last_seq`, the trailing
+/// stop, `repaired_through_seq`, `repair_error` set, cleared.
+#[cfg(feature = "postgres")]
+async fn repair_state(
+    pool: &sqlx::PgPool,
+    position_id: PositionId,
+) -> (i64, Option<Decimal>, Option<i64>, bool, bool) {
+    let (last_seq, trailing) = sqlx::query_as::<_, (i64, Option<Decimal>)>(
+        "SELECT last_seq, trailing_stop_price FROM positions_current WHERE position_id = $1",
+    )
+    .bind(position_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let (through, errored, cleared) = sqlx::query_as::<_, (Option<i64>, bool, bool)>(
+        "SELECT repaired_through_seq, repair_error IS NOT NULL, cleared_at IS NOT NULL \
+         FROM stream_suspensions WHERE stream_key = $1",
+    )
+    .bind(format!("position:{position_id}"))
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (last_seq, trailing, through, errored, cleared)
+}
+
+/// A suffix of three pages and a little more: validated, applied in seq order
+/// with a checkpoint per page, then cleared, and the stream takes appends
+/// again.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_suspended_position_stream_is_repaired_across_pages(pool: sqlx::PgPool) {
+    let tenant_id = Uuid::now_v7();
+    let position_id = suspended_leg(&pool, tenant_id).await;
+    append_unapplied(&pool, tenant_id, position_id, trailing_updates(position_id, 1000..2100))
+        .await;
+    let process = process_of(&pool, tenant_id);
+    assert_eq!(process.load_stream_suspensions().await.unwrap(), 1);
+
+    assert_eq!(process.repair_suspended_position_streams().await, (1, 0));
+
+    assert_eq!(
+        repair_state(&pool, position_id).await,
+        (1101, Some(dec!(2100)), Some(1101), false, true)
+    );
+    assert!(!process.event_streams.position_suspended(position_id));
+    process
+        .persist_event_to_log(&stop_failed(position_id, "after the repair"))
+        .await
+        .unwrap();
+    assert_eq!(stream_rows(&pool, position_id).await.len(), 1102);
+}
+
+/// A repair interrupted on its second page keeps the first page's checkpoint
+/// and stays suspended. The next start resumes past that checkpoint and
+/// clears it. The first page is audit-only, so the checkpoint is ahead of the
+/// leg's `last_seq` and only the checkpoint says where to resume.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn an_interrupted_repair_resumes_past_its_checkpoint(pool: sqlx::PgPool) {
+    let tenant_id = Uuid::now_v7();
+    let id = suspended_leg(&pool, tenant_id).await;
+    let ticks = (0..500)
+        .map(|n| ("position_monitor_tick".to_string(), serde_json::json!({ "tick": n })))
+        .collect();
+    append_unapplied(&pool, tenant_id, id, ticks).await;
+    append_unapplied(&pool, tenant_id, id, trailing_updates(id, 1000..1200)).await;
+    // Seq 502, the second page's first event, moves the stop to 1001: its
+    // apply fails.
+    fail_projection_updates(&pool, id, "NEW.trailing_stop_price = 1001").await;
+    let first = process_of(&pool, tenant_id);
+    first.load_stream_suspensions().await.unwrap();
+    assert_eq!(first.repair_suspended_position_streams().await, (0, 1));
+    assert_eq!(repair_state(&pool, id).await, (1, None, Some(501), true, false));
+    assert!(first.event_streams.position_suspended(id));
+    let refused = first.persist_event_to_log(&stop_failed(id, "still suspended")).await;
+    assert!(matches!(refused, Err(DaemonError::StreamSuspended { .. })), "{refused:?}");
+
+    sqlx::query("DROP TRIGGER injected_projection_failure ON positions_current")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let next = process_of(&pool, tenant_id);
+    next.load_stream_suspensions().await.unwrap();
+    let (stream_key, suspended) = next.event_streams.suspended_positions().remove(0);
+    let outcome = crate::event_streams::repair_position_stream(
+        &pool,
+        tenant_id,
+        &next.event_streams,
+        &stream_key,
+        &suspended,
+    )
+    .await;
+    assert_eq!(outcome, crate::event_streams::RepairOutcome::Cleared { applied: 200 });
+    assert_eq!(repair_state(&pool, id).await, (701, Some(dec!(1200)), Some(701), false, true));
+}
+
+/// A type with no guarded position handler anywhere in the suffix means no
+/// repair at all: not even the valid events ahead of it apply.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_suffix_with_a_non_position_type_is_not_repaired(pool: sqlx::PgPool) {
+    let tenant_id = Uuid::now_v7();
+    let id = suspended_leg(&pool, tenant_id).await;
+    let mut suffix = trailing_updates(id, 1000..1003);
+    suffix.insert(2, ("month_boundary_reset".to_string(), serde_json::json!({ "probe": true })));
+    append_unapplied(&pool, tenant_id, id, suffix).await;
+    let process = process_of(&pool, tenant_id);
+    process.load_stream_suspensions().await.unwrap();
+
+    assert_eq!(process.repair_suspended_position_streams().await, (0, 1));
+
+    assert_eq!(repair_state(&pool, id).await, (1, None, None, true, false));
+    assert!(process.event_streams.position_suspended(id));
+}
+
+/// The bad type sits on the second validation page: the whole suffix is
+/// validated before anything applies, so not even the first page's valid
+/// events apply.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_non_position_type_on_a_later_page_stops_the_whole_repair(pool: sqlx::PgPool) {
+    let tenant_id = Uuid::now_v7();
+    let id = suspended_leg(&pool, tenant_id).await;
+    let mut suffix = trailing_updates(id, 1000..1600);
+    // Seq 552, on the second page of 500.
+    suffix.insert(
+        550,
+        ("capital_base_recalibrated".to_string(), serde_json::json!({ "probe": true })),
+    );
+    append_unapplied(&pool, tenant_id, id, suffix).await;
+    let process = process_of(&pool, tenant_id);
+    process.load_stream_suspensions().await.unwrap();
+
+    assert_eq!(process.repair_suspended_position_streams().await, (0, 1));
+
+    assert_eq!(repair_state(&pool, id).await, (1, None, None, true, false));
+    let error: String =
+        sqlx::query_scalar("SELECT repair_error FROM stream_suspensions WHERE stream_key = $1")
+            .bind(format!("position:{id}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(error.starts_with("seq 552: capital_base_recalibrated"), "{error}");
+    assert!(process.event_streams.position_suspended(id));
 }

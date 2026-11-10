@@ -865,14 +865,21 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         self.initialize_capital().await;
 
         // 0a. The streams earlier processes left suspended (ADR-0056 step 7):
-        // they take no appends, and a suspended system stream of this month
-        // keeps admissions closed.
+        // position streams are repaired, validated then applied in pages; what
+        // stays suspended takes no appends, and a suspended system stream of
+        // this month keeps admissions closed.
         #[cfg(feature = "postgres")]
         {
             let manager = self.position_manager.read().await;
             let loaded = manager.load_stream_suspensions().await?;
             if loaded > 0 {
-                warn!(loaded, "Event streams suspended by an earlier process");
+                let (cleared, suspended) = manager.repair_suspended_position_streams().await;
+                warn!(
+                    loaded,
+                    cleared,
+                    suspended,
+                    "Event streams suspended by an earlier process; position streams repaired"
+                );
             }
         }
 

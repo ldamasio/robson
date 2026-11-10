@@ -16,8 +16,8 @@
 use std::{future::Future, os::unix::process::ExitStatusExt, path::PathBuf, time::Duration};
 
 use robson_exec::crash_points::{
-    ENTRY_AFTER_ACK, ENTRY_BEFORE_SEND, PROTECTION_BEFORE_SEND, STALL_ENV, STARTUP_BEFORE_SCAN,
-    STOP_AFTER_MARKER, STOP_BEFORE_MARKER,
+    ENTRY_AFTER_ACK, ENTRY_BEFORE_SEND, PROTECTION_BEFORE_SEND, REPAIR_AFTER_PAGE, STALL_ENV,
+    STARTUP_BEFORE_SCAN, STOP_AFTER_MARKER, STOP_BEFORE_MARKER,
 };
 use robson_testkit::{
     daemon_process::{database_url_through, DaemonProcess, DaemonSpec},
@@ -1389,6 +1389,126 @@ async fn a_signal_during_the_database_retries_ends_the_start(pool: PgPool) {
         );
         assert_eq!(harness.venue.requests(), 0, "nothing sent");
         assert!(harness.epochs().await.is_empty(), "no epoch");
+    })
+    .await;
+}
+
+/// The leg's `last_seq` and its suspension's checkpoint and clearance.
+async fn repair_progress(pool: &PgPool, position_id: Uuid) -> (i64, Option<i64>, bool) {
+    let last_seq: i64 =
+        sqlx::query_scalar("SELECT last_seq FROM positions_current WHERE position_id = $1")
+            .bind(position_id)
+            .fetch_one(pool)
+            .await
+            .expect("read the leg");
+    let (through, cleared): (Option<i64>, bool) = sqlx::query_as(
+        "SELECT repaired_through_seq, cleared_at IS NOT NULL FROM stream_suspensions \
+         WHERE stream_key = $1",
+    )
+    .bind(format!("position:{position_id}"))
+    .fetch_one(pool)
+    .await
+    .expect("read the suspension");
+    (last_seq, through, cleared)
+}
+
+/// ADR-0056 step 7, PR P: the real process dies while repairing a suspended
+/// position stream, its first page applied and checkpointed. The next start
+/// resumes past the checkpoint, applies the rest and clears the suspension.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn killed_mid_repair_the_next_start_resumes_past_its_checkpoint(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        let position_id = Uuid::now_v7();
+        let stream_key = format!("position:{position_id}");
+        let now = chrono::Utc::now();
+        let append = |event: robson_domain::Event| {
+            let pool = harness.pool.clone();
+            let stream_key = stream_key.clone();
+            let tenant_id = harness.tenant_id;
+            async move {
+                let payload = serde_json::to_value(&event).unwrap();
+                let event = robson_eventlog::Event::new(
+                    tenant_id,
+                    &stream_key,
+                    event.event_type(),
+                    payload,
+                );
+                robson_eventlog::append_event(&pool, &stream_key, None, event).await.unwrap();
+            }
+        };
+        // A disarmed leg, applied: nothing at startup acts on it.
+        append(robson_domain::Event::PositionArmed {
+            position_id,
+            account_id: Uuid::now_v7(),
+            symbol: robson_domain::Symbol::from_pair(FAKE_SYMBOL).unwrap(),
+            side: robson_domain::Side::Long,
+            tech_stop_distance: None,
+            stop_policy: robson_domain::StopPolicy::ExecutableSpan,
+            stop_buffer_bps_at_arm: None,
+            timestamp: now,
+        })
+        .await;
+        append(robson_domain::Event::PositionDisarmed {
+            position_id,
+            reason: "harness".to_string(),
+            timestamp: now,
+        })
+        .await;
+        let applied = robson_eventlog::query_stream_in_seq_order(
+            &harness.pool,
+            harness.tenant_id,
+            &stream_key,
+            &["position_armed", "position_disarmed"],
+        )
+        .await
+        .unwrap();
+        for envelope in &applied {
+            robson_projector::apply_event_to_projections(&harness.pool, envelope)
+                .await
+                .unwrap();
+        }
+        // Two pages that landed and never applied, under an open suspension.
+        for stop in 1000..1600 {
+            let price = |value| robson_domain::Price::new(Decimal::from(value)).unwrap();
+            append(robson_domain::Event::TrailingStopUpdated {
+                position_id,
+                previous_stop: price(stop),
+                new_stop: price(stop + 1),
+                trigger_price: price(stop + 1),
+                timestamp: now,
+            })
+            .await;
+        }
+        sqlx::query(
+            "INSERT INTO stream_suspensions (suspension_id, tenant_id, stream_key, stream_kind, \
+             failed_seq, error, suspended_at) VALUES ($1, $2, $3, 'position', 3, 'harness', NOW())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(harness.tenant_id)
+        .bind(&stream_key)
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+        let daemon = harness.daemon(Some(REPAIR_AFTER_PAGE));
+        daemon
+            .wait_killed_at(REPAIR_AFTER_PAGE, STEP)
+            .await
+            .expect("killed after the first page");
+        assert_eq!(repair_progress(&harness.pool, position_id).await, (502, Some(502), false));
+        drop(daemon);
+
+        let restarted = harness.daemon(None);
+        restarted.wait_ready(STEP).await.expect("daemon ready");
+        assert_eq!(
+            repair_progress(&harness.pool, position_id).await,
+            (602, Some(602), true),
+            "{}",
+            restarted.log_tail()
+        );
+        assert_eq!(harness.venue.counts(), VenueCounts::default());
     })
     .await;
 }
