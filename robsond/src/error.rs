@@ -110,7 +110,8 @@ pub enum DaemonError {
 
     /// Admissions are closed (ADR-0056 step 7, PR P): the journal latch is set,
     /// which holds until a restart, or the current month's system stream is
-    /// suspended. Nothing was admitted.
+    /// suspended. An arm also answers this while the month's reset has not
+    /// landed. Nothing was admitted.
     #[error("Admissions closed: {reason}")]
     AdmissionsClosed { reason: String },
 

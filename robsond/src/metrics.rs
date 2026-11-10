@@ -524,8 +524,10 @@ pub static MONTHLY_BUDGET_BASIS_LAST_READ_TIMESTAMP_SECONDS: LazyLock<Gauge> =
 
 /// The current month's `MonthBoundaryReset` has not landed: the boundary poll
 /// found none and could not append one, for instance because the wallet read
-/// failed. Set by that poll, so it rises within 60 s of 00:00 UTC and returns
-/// to 0 once the reset lands or is found. 0 from startup.
+/// failed. Set when each attempt returns, so it normally rises about a minute
+/// after 00:00 UTC, later if an attempt is slow, and returns to 0 once the
+/// reset lands or is found. 0 from startup. For visibility only: admissions
+/// read the reset evidence in `monthly_state` themselves.
 pub static MONTH_BOUNDARY_PENDING: LazyLock<Gauge> = LazyLock::new(|| {
     register_gauge!(
         "robsond_month_boundary_pending",

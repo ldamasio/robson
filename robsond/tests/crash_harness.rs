@@ -75,6 +75,20 @@ impl Harness {
         let work_dir =
             PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("crash-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&work_dir).expect("work dir");
+        // This month's reset has landed, as in production between boundaries.
+        // Without it the daemon refuses entries until its first boundary poll,
+        // which races the arms below. The base is the fake venue's wallet.
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO monthly_state (year, month, capital_base, boundary_reset_at, created_at) \
+             VALUES ($1, $2, 10000, $3, $3)",
+        )
+        .bind(chrono::Datelike::year(&now) as i16)
+        .bind(chrono::Datelike::month(&now) as i16)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed this month's reset");
         Self {
             pool,
             venue,

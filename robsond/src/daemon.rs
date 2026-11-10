@@ -3416,7 +3416,7 @@ mod tests {
         .unwrap();
         assert_eq!(event_count, 1);
 
-        // Same text as load_capital_base_for_month, so same parameter types: SQLx
+        // Same parameter types as the production reads of this table: SQLx
         // caches the prepared statement per connection.
         let capital_base: Decimal = sqlx::query_scalar(
             "SELECT capital_base FROM monthly_state WHERE year = $1 AND month = $2",
@@ -3598,6 +3598,43 @@ mod tests {
 
         assert_eq!(month_row(&pool, boundary).await, Some((dec!(9910), Some(boundary))));
         assert_eq!(pending.get(), 0.0);
+    }
+
+    /// Before the first poll of a month with no landed reset, the daemon's own
+    /// manager refuses entries; the poll lands the reset and they reopen. The
+    /// guard reads `monthly_state`, not the pending gauge.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn admissions_reopen_once_the_boundary_poll_lands_the_reset(pool: sqlx::PgPool) {
+        let tenant_id = uuid::Uuid::from_u128(0x13208);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let mut daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let pending = watch_month_boundary_pending(&mut daemon);
+        daemon.exchange.set_futures_balance(dec!(8000));
+        let now = Utc::now();
+        let manager = Arc::clone(&daemon.position_manager);
+
+        let before = manager.read().await.admission_capital_base(now).await;
+        assert!(matches!(before, Err(DaemonError::AdmissionsClosed { .. })), "{before:?}");
+        assert!(
+            manager
+                .read()
+                .await
+                .canonical_budget_snapshot(now)
+                .await
+                .unwrap()
+                .capital_base_invalid
+        );
+        assert_eq!(pending.get(), 0.0, "the gauge is not what refuses");
+
+        assert!(daemon.poll_month_boundary(now).await.unwrap());
+
+        let snapshot = manager.read().await.canonical_budget_snapshot(now).await.unwrap();
+        assert!(!snapshot.capital_base_invalid);
+        assert_eq!(snapshot.capital_base, dec!(8000));
+        assert_eq!(manager.read().await.admission_capital_base(now).await.unwrap(), dec!(8000));
     }
 
     #[tokio::test]
