@@ -29,8 +29,10 @@ use robson_engine::Engine;
 #[cfg(feature = "postgres")]
 use robson_eventlog::{query_events, query_stream_in_seq_order, EventEnvelope, QueryOptions};
 use robson_exec::{
-    gate::OperationKind, order_journal::OrderJournal, venue::Venue, ExchangePort, Executor,
-    IntentJournal, OhlcvPort, StubExchange, StubTradeFeed, TradeFeedPort,
+    gate::{OperationKind, PermitRefusal},
+    order_journal::OrderJournal,
+    venue::Venue,
+    ExchangePort, Executor, IntentJournal, OhlcvPort, StubExchange, StubTradeFeed, TradeFeedPort,
 };
 // Optional projection recovery for crash recovery
 #[cfg(feature = "postgres")]
@@ -67,7 +69,7 @@ use crate::{
     position_manager::{PositionManager, ReconcileCloseOutcome, ReconciledCloseInput},
     query_engine::{QueryRecorder, TracingQueryRecorder},
     reconciliation_worker::{gather_real_evidence, ReconciliationWorker},
-    stop::{StopMarker, StopTimings},
+    stop::{StopMarker, StopReport, StopRequest, StopTimings},
 };
 
 // =============================================================================
@@ -191,28 +193,103 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     executor.with_order_journal(journal)
 }
 
-/// Cancel `stop` on the first SIGTERM or SIGINT (ADR-0056 step 7). Both
-/// handlers are installed before this returns, so no later signal is lost.
-fn listen_for_stop_signals(stop: tokio_util::sync::CancellationToken) -> DaemonResult<()> {
+/// Ask for the stop on the first SIGTERM or SIGINT (ADR-0056 step 7), its clock
+/// started at that signal, then wait out the process's hard bound.
+///
+/// Signals are received on a thread of their own, with its own small runtime:
+/// a worker of the daemon's runtime stalled in synchronous code can leave that
+/// runtime's I/O and timers unattended, and neither the stop nor the hard bound
+/// may wait on it. Asking for the stop from this thread wakes the daemon's
+/// runtime. Both handlers are installed before this returns, so no later signal
+/// is lost. Without a signal the thread ends when `stop` is asked for otherwise
+/// or the returned guard is dropped.
+async fn listen_for_stop_signals(stop: StopRequest) -> DaemonResult<StopSignals> {
+    let quit = tokio_util::sync::CancellationToken::new();
+    let (installed, installing) = tokio::sync::oneshot::channel();
+    let quitting = quit.clone();
+    std::thread::Builder::new()
+        .name("robsond-stop-signal".to_string())
+        .spawn(move || watch_stop_signals(stop, quitting, installed))
+        .map_err(|error| {
+            DaemonError::Config(format!("Failed to start the signal thread: {error}"))
+        })?;
+    match installing.await {
+        Ok(Ok(())) => Ok(StopSignals { quit }),
+        Ok(Err(error)) => Err(DaemonError::Config(format!(
+            "Failed to install the stop signal handlers: {error}"
+        ))),
+        Err(_) => Err(DaemonError::Config("The signal thread ended at its start".to_string())),
+    }
+}
+
+/// The signal thread: installs both handlers on its own runtime, says so
+/// through `installed`, then waits for a signal, the stop asked for otherwise,
+/// or `quit`. After a signal it never returns.
+fn watch_stop_signals(
+    stop: StopRequest,
+    quit: tokio_util::sync::CancellationToken,
+    installed: tokio::sync::oneshot::Sender<Result<(), String>>,
+) {
     use tokio::signal::unix::{signal, SignalKind};
 
-    let install = |kind: SignalKind, name: &str| {
-        signal(kind).map_err(|error| {
-            DaemonError::Config(format!("Failed to install the {name} handler: {error}"))
-        })
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_io().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = installed.send(Err(error.to_string()));
+            return;
+        },
     };
-    let mut terminate = install(SignalKind::terminate(), "SIGTERM")?;
-    let mut interrupt = install(SignalKind::interrupt(), "SIGINT")?;
-    tokio::spawn(async move {
-        let received = tokio::select! {
-            _ = terminate.recv() => "SIGTERM",
-            _ = interrupt.recv() => "SIGINT",
-            _ = stop.cancelled() => return,
+    let asked = stop.clone();
+    let received = runtime.block_on(async move {
+        let handlers = signal(SignalKind::terminate())
+            .and_then(|terminate| Ok((terminate, signal(SignalKind::interrupt())?)));
+        let (mut terminate, mut interrupt) = match handlers {
+            Ok(handlers) => handlers,
+            Err(error) => {
+                let _ = installed.send(Err(error.to_string()));
+                return None;
+            },
         };
-        info!(signal = received, "Stop requested by signal");
-        stop.cancel();
+        let _ = installed.send(Ok(()));
+        tokio::select! {
+            _ = terminate.recv() => Some("SIGTERM"),
+            _ = interrupt.recv() => Some("SIGINT"),
+            _ = asked.asked() => None,
+            _ = quit.cancelled() => None,
+        }
     });
-    Ok(())
+    let Some(received) = received else {
+        return;
+    };
+    let at = std::time::Instant::now();
+    crate::stop::signal_received(at);
+    stop.ask_at(tokio::time::Instant::from_std(at));
+    info!(signal = received, "Stop requested by signal");
+    crate::stop::hard_exit_after(at)
+}
+
+/// Ends the signal thread when dropped, unless a signal came first.
+struct StopSignals {
+    quit: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for StopSignals {
+    fn drop(&mut self) {
+        self.quit.cancel();
+    }
+}
+
+/// `work`, unless the stop has its result first: then that result, and `work`
+/// is dropped. A stop has a result before its deadline only when no permit is
+/// held, so this never cuts short an operation the stop is waiting for.
+async fn unless_stopped<T>(
+    work: impl std::future::Future<Output = T>,
+    stopping: &mut tokio::task::JoinHandle<StopReport>,
+) -> Result<T, Result<StopReport, tokio::task::JoinError>> {
+    tokio::select! {
+        done = work => Ok(done),
+        stopped = stopping => Err(stopped),
+    }
 }
 
 /// Writes the clean-stop marker on this process's epoch.
@@ -668,7 +745,9 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         self
     }
 
-    /// Change the stop's bounds, for tests that wait them out.
+    /// Change the stop's bounds, for tests that wait them out. Exists only in
+    /// tests and crash-points builds.
+    #[cfg(any(test, feature = "crash-points"))]
     pub fn with_stop_timings(mut self, timings: StopTimings) -> Self {
         self.stop_timings = timings;
         self
@@ -744,10 +823,10 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     ///
     /// This method blocks until shutdown is requested (SIGINT/SIGTERM).
     pub async fn run(self) -> DaemonResult<()> {
-        self.run_until(tokio_util::sync::CancellationToken::new()).await
+        self.run_until(StopRequest::default()).await
     }
 
-    async fn run_until(self, stop: tokio_util::sync::CancellationToken) -> DaemonResult<()> {
+    async fn run_until(self, stop: StopRequest) -> DaemonResult<()> {
         info!(
             version = env!("CARGO_PKG_VERSION"),
             environment = %self.config.environment,
@@ -757,7 +836,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         // SIGTERM or SIGINT asks for the two-phase stop (ADR-0056 step 7). As
         // PID 1 the daemon receives SIGTERM only once a handler is installed,
         // so this comes first.
-        listen_for_stop_signals(stop.clone())?;
+        let _signals = listen_for_stop_signals(stop.clone()).await?;
 
         let journal = Arc::clone(&self.order_journal);
         crate::metrics::init_operation_gate_metrics();
@@ -767,20 +846,21 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         // the detectors and the API listener.
         let shutdown = tokio_util::sync::CancellationToken::new();
 
-        // The journal must take writes before anything can be sent: this warms
-        // its pool and refuses a schema without its tables (ADR-0056 step 7).
-        journal
-            .check_ready()
-            .await
-            .map_err(|error| DaemonError::Config(format!("Order journal not ready: {error}")))?;
-
-        // This process's epoch, with a strict commit before any venue request.
-        // Only the stub starts without one.
-        let marker = self.start_epoch().await?;
+        // The journal's readiness and this process's epoch. A stop asked for
+        // meanwhile ends the start here: nothing has been sent, and an epoch
+        // that landed stays unmarked.
+        let marker = tokio::select! {
+            biased;
+            _ = stop.asked() => {
+                warn!("Stop requested before the start completed: nothing started, epoch left unmarked");
+                return Ok(());
+            },
+            prepared = Box::pin(self.prepare_start(&journal)) => prepared?,
+        };
 
         // The stop runs beside everything below from here on. It cancels the
         // detectors through their token, never through the manager lock.
-        let stopping = {
+        let mut stopping = {
             let detectors = self.position_manager.read().await.detector_shutdown_token();
             let closing = shutdown.clone();
             let close = move || {
@@ -797,25 +877,45 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         };
 
         // The startup phase holds the startup slot's permit throughout; the
-        // startup scan and startup recovery run under it. Both halves are
-        // boxed: their futures are large.
-        journal
-            .acquire(OperationKind::Startup)?
-            .run(Box::pin(self.start_up(&shutdown)))
-            .await?;
-
-        // A stop that reached Closing during startup starts nothing more.
-        let workers = if shutdown.is_cancelled() {
-            Vec::new()
-        } else {
-            Box::pin(self.serve(&journal, &shutdown)).await?
+        // startup scan and startup recovery run under it. Then the API, the
+        // workers and the main loop. Neither is waited for once the stop has
+        // its result. Both halves are boxed: their futures are large.
+        let mut workers = Vec::new();
+        let started = match journal.acquire(OperationKind::Startup) {
+            Ok(permit) => {
+                unless_stopped(permit.run(Box::pin(self.start_up(&shutdown))), &mut stopping).await
+            },
+            // The stop is already closing: nothing starts.
+            Err(PermitRefusal::Stopping(_)) => Ok(Ok(())),
+            Err(refusal) => return Err(refusal.into()),
         };
+        let stopped = match started {
+            Ok(started) => {
+                started?;
+                // A stop that reached Closing during startup starts nothing more.
+                if shutdown.is_cancelled() {
+                    None
+                } else {
+                    let serving = Box::pin(self.serve(&journal, &shutdown, &mut workers));
+                    match unless_stopped(serving, &mut stopping).await {
+                        Ok(served) => {
+                            served?;
+                            None
+                        },
+                        Err(stopped) => Some(stopped),
+                    }
+                }
+            },
+            Err(stopped) => Some(stopped),
+        };
+        let report = match stopped {
+            Some(stopped) => stopped,
+            None => stopping.await,
+        }
+        .map_err(|error| DaemonError::Config(format!("The stop task ended abnormally: {error}")))?;
 
-        let report = stopping.await.map_err(|error| {
-            DaemonError::Config(format!("The stop task ended abnormally: {error}"))
-        })?;
-
-        // What holds no permit is given what is left of the deadline.
+        // What holds no permit is given what is left of the deadline; the
+        // runtime's teardown gets the rest, if any.
         info!(count = workers.len(), "Waiting for workers to finish...");
         for handle in workers {
             let _ = tokio::time::timeout_at(report.deadline, handle).await;
@@ -823,6 +923,21 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         let _ = tokio::time::timeout_at(report.deadline, self.shutdown()).await;
 
         Ok(())
+    }
+
+    /// Before anything can be sent: the journal's readiness, which warms its
+    /// pool and refuses a schema without its tables, then this process's
+    /// epoch, with a strict commit (ADR-0056 step 7). Only the stub starts
+    /// without one. The marker a clean stop writes on it.
+    async fn prepare_start(
+        &self,
+        journal: &OrderJournal,
+    ) -> DaemonResult<Option<Box<dyn StopMarker>>> {
+        journal
+            .check_ready()
+            .await
+            .map_err(|error| DaemonError::Config(format!("Order journal not ready: {error}")))?;
+        self.start_epoch().await
     }
 
     /// The startup phase, under the startup permit: capital, recovery from the
@@ -866,6 +981,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         )
         .with_order_journal(Arc::clone(&self.order_journal));
         info!("Running startup reconciliation scan");
+        robson_exec::crash_point!(STARTUP_BEFORE_SCAN);
         let untracked_count = startup_reconciliation.scan_and_reconcile_blocking().await?;
         if untracked_count > 0 {
             return Err(DaemonError::Config(format!(
@@ -901,14 +1017,13 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     }
 
     /// Start the API and the workers, then run the main loop until the stop
-    /// enters Closing. Returns the workers' handles.
+    /// enters Closing. The workers' handles go to `workers` as they start.
     async fn serve(
         &self,
         journal: &Arc<OrderJournal>,
         shutdown: &tokio_util::sync::CancellationToken,
-    ) -> DaemonResult<Vec<tokio::task::JoinHandle<()>>> {
-        let mut workers = Vec::new();
-
+        workers: &mut Vec<tokio::task::JoinHandle<()>>,
+    ) -> DaemonResult<()> {
         // 4. Start API server
         let api_addr = self.start_api_server_until(shutdown.clone()).await?;
         info!(%api_addr, "API server started");
@@ -1067,7 +1182,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             }
         }
 
-        Ok(workers)
+        Ok(())
     }
 
     /// One main-loop event, under the main loop's permit (ADR-0056 step 7).
@@ -3089,7 +3204,7 @@ mod tests {
         config.projection.tenant_id = Some(uuid::Uuid::from_u128(0x13203));
         let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool)));
 
-        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown = StopRequest::default();
         let raised = async {
             let mut raised = false;
             for _ in 0..1000 {
@@ -3099,7 +3214,7 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            shutdown.cancel();
+            shutdown.ask();
             raised
         };
 
@@ -3528,6 +3643,124 @@ mod tests {
         assert_eq!(daemon.order_journal.gate().snapshot().permits, 0);
     }
 
+    /// A main-loop event that never finishes holds its permit past the stop's
+    /// deadline: the daemon does not wait for it. The stop ends unclean at the
+    /// deadline, and the daemon returns then, dropping the event, aborted.
+    #[tokio::test]
+    async fn a_stuck_main_loop_event_does_not_hold_the_daemon_past_the_stop_deadline() {
+        use robson_domain::{DetectorSignal, Symbol};
+        use rust_decimal_macros::dec;
+
+        let timings = StopTimings {
+            drain_limit: Duration::from_millis(200),
+            deadline: Duration::from_millis(600),
+        };
+        let daemon = Daemon::new_stub_with_capital(Config::test(), dec!(10000))
+            .unwrap()
+            .with_stop_timings(timings);
+        let (exchange, event_bus, journal) = (
+            Arc::clone(&daemon.exchange),
+            Arc::clone(&daemon.event_bus),
+            Arc::clone(&daemon.order_journal),
+        );
+        let venue = Arc::clone(&exchange);
+        let position = daemon
+            .position_manager
+            .read()
+            .await
+            .arm_position(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                RiskConfig::new(dec!(10000)).unwrap(),
+                Some(TechnicalStopDistance::from_entry_and_stop(
+                    Price::new(dec!(100)).unwrap(),
+                    Price::new(dec!(90)).unwrap(),
+                )),
+                uuid::Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+        let _held = exchange.hold_next_mutation();
+        let stop = StopRequest::default();
+        let asking = {
+            let stop = stop.clone();
+            async move {
+                let signal = DaemonEvent::DetectorSignal(DetectorSignal {
+                    signal_id: uuid::Uuid::now_v7(),
+                    position_id: position.id,
+                    symbol: position.symbol.clone(),
+                    side: Side::Long,
+                    entry_price: Price::new(dec!(95000)).unwrap(),
+                    stop_loss: Price::new(dec!(86000)).unwrap(),
+                    technical_stop_analysis: None,
+                    timestamp: Utc::now(),
+                });
+                // Sent until the main loop, once listening, takes it: its entry
+                // reaches the venue and is held there, with the main loop's
+                // permit. The detector listens too, and ignores it.
+                while venue.mutations().is_empty() {
+                    event_bus.send(signal.clone());
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                stop.ask();
+                tokio::time::Instant::now()
+            }
+        };
+        let running = async { tokio::join!(Box::pin(daemon.run_until(stop.clone())), asking) };
+        let (result, asked) = tokio::time::timeout(Duration::from_secs(20), running)
+            .await
+            .expect("the daemon returns once the stop has its result");
+        result.unwrap();
+        let took = asked.elapsed();
+        assert!(took >= timings.deadline && took < Duration::from_secs(3), "{took:?}");
+        assert_eq!(exchange.mutations().len(), 1, "the entry's first request was the one held");
+        assert_eq!(journal.gate().snapshot().aborted, 1, "dropped at the deadline");
+    }
+
+    /// A startup still holding its permit at the stop's deadline is not waited
+    /// for either: the stop ends unclean, and the daemon returns then, the
+    /// startup dropped, aborted.
+    #[tokio::test]
+    async fn a_stuck_startup_does_not_hold_the_daemon_past_the_stop_deadline() {
+        use rust_decimal_macros::dec;
+
+        let timings = StopTimings {
+            drain_limit: Duration::from_millis(200),
+            deadline: Duration::from_millis(600),
+        };
+        let daemon = Daemon::new_stub(Config::test()).with_stop_timings(timings);
+        let (exchange, journal) = (Arc::clone(&daemon.exchange), Arc::clone(&daemon.order_journal));
+        // An untracked position: the startup scan closes it, and the close is
+        // held at the venue, under the startup permit.
+        exchange.set_open_position(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+            Quantity::new(dec!(0.01)).unwrap(),
+            Price::new(dec!(95000)).unwrap(),
+        );
+        let _held = exchange.hold_next_mutation();
+        let stop = StopRequest::default();
+        let asking = {
+            let (stop, venue) = (stop.clone(), Arc::clone(&exchange));
+            async move {
+                while venue.mutations().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                stop.ask();
+                tokio::time::Instant::now()
+            }
+        };
+        let running = async { tokio::join!(Box::pin(daemon.run_until(stop.clone())), asking) };
+        let (result, asked) = tokio::time::timeout(Duration::from_secs(20), running)
+            .await
+            .expect("the daemon returns once the stop has its result");
+        result.unwrap();
+        let took = asked.elapsed();
+        assert!(took >= timings.deadline && took < Duration::from_secs(3), "{took:?}");
+        assert_eq!(exchange.mutations().len(), 1, "the startup's close was the one held");
+        assert_eq!(journal.gate().snapshot().aborted, 1, "dropped at the deadline");
+    }
+
     /// The startup phase holds the startup slot's one permit, and the startup
     /// scan's close of an untracked position runs under it, not under a
     /// reconciliation permit of its own.
@@ -3544,7 +3777,7 @@ mod tests {
             Price::new(dec!(95000)).unwrap(),
         );
 
-        let result = daemon.run_until(tokio_util::sync::CancellationToken::new()).await;
+        let result = daemon.run_until(StopRequest::default()).await;
 
         assert!(
             matches!(result, Err(DaemonError::Config(ref error)) if error.contains("UNTRACKED")),
@@ -3572,7 +3805,7 @@ mod tests {
                     deadline: Duration::from_secs(10),
                 });
             let journal = Arc::clone(&daemon.order_journal);
-            let stop = tokio_util::sync::CancellationToken::new();
+            let stop = StopRequest::default();
             let asking = {
                 let (pool, stop) = (pool.clone(), stop.clone());
                 async move {
@@ -3594,7 +3827,7 @@ mod tests {
                     if abort {
                         drop(journal.acquire(OperationKind::Panic).unwrap());
                     }
-                    stop.cancel();
+                    stop.ask();
                 }
             };
             let started = std::time::Instant::now();

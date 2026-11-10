@@ -68,11 +68,15 @@ fn main() -> anyhow::Result<()> {
     // production (2026-06-30, 2026-07-02) with tokio-runtime-worker stack
     // overflows that leave no backtrace. Larger stacks close that crash
     // class while the offending path is still being hunted.
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(8 * 1024 * 1024)
-        .build()?
-        .block_on(async_main())
+        .build()?;
+    let result = runtime.block_on(async_main());
+    // Teardown never outlasts the stop's deadline (ADR-0056 step 7): a task or
+    // a worker thread still running then is abandoned, not waited for.
+    runtime.shutdown_timeout(robsond::stop::teardown_bound());
+    result
 }
 
 async fn async_main() -> anyhow::Result<()> {

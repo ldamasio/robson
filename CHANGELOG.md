@@ -10,12 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added - Two-phase stop on SIGTERM and SIGINT (ADR-0056 step 7, PR S, part 3)
 
 - SIGTERM, as well as SIGINT, now stops the daemon: as PID 1 it used to ignore SIGTERM until Kubernetes
-  SIGKILLed it at the grace period. The stop drains for at most 12 s, refusing the ordinary API class with 503
-  `stopping` while protection, exits and the protective class continue, then closes: everything new is refused
-  and the operations in flight finish. Deadline 25 s, inside the pod's 30 s grace.
+  SIGKILLed it at the grace period, managing the account until then; management now stops as the stop
+  closes. The stop drains for at most 12 s, refusing the ordinary API class with 503 `stopping` while
+  protection, exits and the protective class continue, then closes: everything new is refused and the
+  operations in flight finish.
+- From the signal, the stop has its result by 25 s and the process exits by 27 s, inside the pod's 30 s grace:
+  nothing still running is waited for after the deadline, the runtime's teardown is bounded, and a thread of
+  its own exits the process with code 70 at 27 s if anything is still stuck. A signal during the start's
+  readiness check or epoch insert ends the start with nothing sent.
 - A clean stop marks the process's epoch (`clean_stop_at`, `marker_version = 1`); a deadline, an aborted
   operation, the latch or anything unlanded leaves it unmarked. An entry reached while draining is refused at
-  its send.
+  its send. A cancel-first exit cut short by the stop can leave its leg without an exchange stop until the
+  next process heals it.
 
 ### Added - Process epochs (ADR-0056 step 7, PR S, part 2)
 

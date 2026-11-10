@@ -244,6 +244,24 @@ impl DaemonProcess {
         Ok(())
     }
 
+    /// Wait until the daemon, armed to stall at `point`, has reached it, as
+    /// named by its marker file, and is still running.
+    pub async fn wait_stalled_at(&self, point: &str, within: Duration) -> Result<()> {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.try_wait()? {
+                bail!("daemon exited before stalling at {point}: {status}\n{}", self.log_tail());
+            }
+            if std::fs::read_to_string(&self.marker_path).is_ok_and(|marker| marker == point) {
+                return Ok(());
+            }
+            if started.elapsed() >= within {
+                bail!("daemon did not stall at {point} within {within:?}\n{}", self.log_tail());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// The end of the daemon's log, for failure messages.
     pub fn log_tail(&self) -> String {
         let log = std::fs::read_to_string(&self.log_path).unwrap_or_default();

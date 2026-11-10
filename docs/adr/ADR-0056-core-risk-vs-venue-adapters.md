@@ -831,9 +831,11 @@ Without a database, or in a build without PostgreSQL, there is no epoch, and onl
 named in `ROBSON_VENUE` or selected from credentials, is refused there, before any request to it. The simulator mode is
 `ROBSON_VENUE=stub`, or an unset `ROBSON_VENUE` that resolves to the stub; no checked-in workflow ran a real venue without a database.
 
-*Part 3, the two-phase stop.* SIGTERM or SIGINT starts the stop, with an absolute deadline of 25 s. The handlers are installed first thing in
-the daemon's run; as PID 1 the process receives SIGTERM only once one is, so during the database connection retries before it a SIGTERM is
-ignored, as today, with nothing sent.
+*Part 3, the two-phase stop.* SIGTERM or SIGINT starts the stop. Its clock starts at the signal: the stop has its result by 25 s after
+it and the process exits by 27 s after it, inside the pod's `terminationGracePeriodSeconds` of 30 under `Recreate` with one replica. The
+handlers are installed first thing in the daemon's run; as PID 1 the process receives SIGTERM only once one is, so during the database
+connection retries before it a SIGTERM is ignored, as today, with nothing sent. A signal during the journal's readiness check or the epoch's
+insert ends the start there: nothing has been sent, no epoch is marked, and the process exits 0.
 
 1. **Draining.** The ordinary API class answers 503 `stopping`; ticks, heals, exits, sweeps, the internal loops and the protective class
    continue. An entry the main loop reaches meanwhile is refused at its send: a no-send, and on a leg with admission evidence the attempt
@@ -842,14 +844,38 @@ ignored, as today, with nothing sent.
    API listener are cancelled; requests in flight finish. The operations holding a permit run to their end, then the journal's retry set is
    flushed, retried until the deadline. A reduction's rules refresh after a rejection is skipped while closing.
 3. **Marker.** Only when every permit was released in time, none was aborted, the latch is clear and the journal holds nothing in memory or in
-   its retry set, `clean_stop_at` and `marker_version = 1` are written on this epoch. Otherwise it stays unmarked. Then what holds no permit
-   (projection, income ledger, alarm, feeds) gets what is left of the deadline, and the process exits 0 either way.
+   its retry set, `clean_stop_at` and `marker_version = 1` are written on this epoch. Otherwise the stop does not write it. A marker write
+   that times out is a `deadline` result but cannot prove the marker stayed unwritten: the update may commit after the timeout, or have
+   committed with its answer lost. Every check came before it, so such a marker is still true of the stop.
 
-`robsond_graceful_stop_total{result}` (`clean`, `deadline`, `aborted`, `latched`, `unlanded`, `marker_failed`) is counted as the process
-exits, so a scrape may never see it; the durable record is the epoch's marker and the next start's `robsond_unclean_start`. The deadline and
-teardown fit the pod's `terminationGracePeriodSeconds` of 30 under `Recreate` with one replica. The time no daemon manages the account per
-deploy grows by Closing: near zero when idle, about 13 s after a full 12 s Draining, up to 25 s when Draining ends at once and the flush
-stalls. Exchange stops cover `Active` legs throughout. A tick exit in flight at its worst takes about 30 s, so that stop is unclean.
+**Bounds.** Once the stop has its result the daemon waits for nothing it was running. A startup phase or a main-loop event still holding its
+permit at the deadline is dropped there, aborted; what holds no permit (projection, income ledger, alarm, feeds) gets what is left of the
+deadline, and the runtime's teardown the rest, abandoning any task or thread still running. A stop has its result before the deadline only
+when no permit is held, so no operation holding one is cut short earlier. Signals are received on a thread of their own, with its own small
+runtime, not on the daemon's: a worker stalled in synchronous code can leave the daemon runtime's I/O and timers unattended, and a SIGTERM
+handled there was, in the real binary, never seen. Asking for the stop from that thread wakes the daemon's runtime again. The same thread
+then waits out 27 s from the signal: should the process still be alive, as when the thread running the daemon's start is itself stalled, it
+exits it with code 70 and an error, writing no marker. Otherwise the process exits 0 whatever the stop's result. In the real binary against
+the fake venue: an operation that never ends (a thread stalled after the venue's ack, its permit held) exits 0 at the deadline, measured
+25.04 s after the signal, with the epoch unmarked; a startup whose own thread is stalled exits 70 at the hard bound, measured 27.03 s; a
+signal while the epoch's insert waits in the database exits 0 in 54 ms with nothing sent and no epoch.
+
+**What a deploy costs.** Today PID 1 ignores SIGTERM: every deploy waits the whole 30 s grace for SIGKILL, and the old process keeps
+managing the account until it dies. From this part on, management stops as Closing begins. The time no daemon manages the account is then
+Closing, plus the teardown after the stop's result, plus the replacement's start up to its main loop. Closing alone is near zero when idle,
+about 13 s after a full 12 s Draining, and up to 25 s minus Draining when the flush stalls; an idle stop that marks at once can still spend
+what is left of the deadline on a stalled worker that holds no permit.
+
+**Protection while stopping.** Exchange stops cover the `Active` legs that have one, not every leg throughout. A cancel-first tick exit cancels
+its leg's stop before its reduction; when the reduction then fails, during the stop or because Closing skips the rules refresh after a
+rejection, the leg has no exchange stop until a later process heals it. 25 s is not an operation's bound: one cancel-first exit alone can
+make four requests of up to 10 s each (the cancel, the position-mode read, the leverage write, the market order), plus its journal and
+event writes, so an exit in flight can outlast the deadline, and that stop is unclean.
+
+**Metrics.** `robsond_graceful_stop_total{result}` (`clean`, `deadline`, `aborted`, `latched`, `unlanded`, `marker_failed`) is counted by
+the departing process as its stop ends, with its listener already closing: best effort, and a scrape may never see it. The durable record
+is the epoch's marker, which the next start reads into `robsond_unclean_start{reason}`. The fence PR's alerts must rest on that gauge's
+`no_marker`, together with target-down and restart alerts, not on scraping the departing process.
 
 **Rollback across PR S is boundary B,** with the daemon stopped, and an image that keeps migrations 31 and 32: SQLx's migrator rejects an
 applied migration missing from its embedded set, so pinning back to `sha-b06aecb1` or `sha-23501535` is refused by that image's migration hook.
@@ -924,7 +950,7 @@ only).
 | Database dies | no admission, no new legs; already-installed protection remains on the exchange; inventory in an N1-a transition may remain unprotected without a duration or loss bound; no cancellation starts without a durable intent, and unfinished transitions retain liabilities and alerts and resume from that intent on recovery; intent results cannot be persisted → in-flight operations enter `Unknown`; recovery looks them up, a lookup may stay `Unknown`, and then the reservation stays held until step 7's explicit resolution path | read-only `/status` from memory; arms refused | `/readyz.database=false`; `unprotected_inventory` gauge; recovery events |
 | Journal database down or slow (step 7, PR J) | an entry's strict commit that fails is refused, no request; a leg with admission evidence ends its attempt, a legacy leg re-arms under its backoff. One that times out is uncertain, no request and no re-arm. Reductions, stops and cancels wait at most 500 ms per write and go out anyway, also with the journal's memories full | entries refused, protection and reductions continue; unlanded rows retry through a bounded set | `robsond_journal_latch`, `robsond_journal_retry_set_depth`, warnings in the logs; no fence yet |
 | Cancel outcome unknown (step 7, PR C) | an error, an indeterminate answer or an "already gone" with no final state is uncertain on the cancel's own intent; the protective action behind it proceeds | journaled only until the fence PR | `order_intents.cancel_class` and `uncertain_at`; boundary B |
-| Daemon asked to stop: SIGTERM or SIGINT (step 7, PR S) | Draining (ordinary API refused, protection continues) for at most 12 s, then Closing (everything new refused) until the operations in flight end and the journal is flushed; deadline 25 s; the epoch is marked only on a clean pass | exchange stops cover `Active` legs while no daemon runs | the epoch's `clean_stop_at`; the next start's `robsond_unclean_start`; `robsond_graceful_stop_total{result}` if scraped |
+| Daemon asked to stop: SIGTERM or SIGINT (step 7, PR S) | Draining (ordinary API refused, protection continues) for at most 12 s, then Closing (everything new refused) until the operations in flight end and the journal is flushed; the stop's result by 25 s after the signal, the process's exit by 27 s (code 70 at that hard bound); the epoch is marked only on a clean pass. During the start's readiness check or epoch insert: no start, nothing sent | exchange stops cover the `Active` legs that keep one while no daemon runs; a cancel-first exit cut short can leave its leg without one until a later process heals it | the epoch's `clean_stop_at`; the next start's `robsond_unclean_start`; `robsond_graceful_stop_total{result}` if scraped |
 | API slot class full (step 7, PR S) | 503 `busy` at once, nothing done; the other classes keep their slots | the caller retries | `robsond_api_slot_busy_total{class}` |
 | Venue mutation without a permit (step 7, PR S) | while open: sent, counted, latch set; while stopping: refused, nothing sent | — | `robsond_unpermitted_mutations_total`, `robsond_journal_latch` |
 | Operation dropped mid-flight: a panic, a cancelled internal future (step 7, PR S) | each intent it left open is sealed: one whose send may have started ends uncertain, one proven unsent ends not sent, both through the retry set; one with nothing to record is dropped. The permit counts as aborted and sets the latch, so the stop cannot mark clean | — | `robsond_aborted_operations_total`, `robsond_journal_latch` |
@@ -1012,7 +1038,7 @@ Budget model for multi-venue:
   `robsond/src/{order_journal_store,api,auth,daemon,metrics,position_manager,reconciliation_worker,venue}.rs`, migration 31; the
   attempt rows are read from the database rather than reloaded. PR C: `robson-exec/src/{cancel,compat,executor,order_journal,ports,stub}.rs`,
   `robsond/src/{daemon,position_manager,reconciliation_worker}.rs`, no migration. PR S: `robson-exec/src/{gate,order_journal,venue,stub,quantize,
-  crash_points}.rs`, `robson-connectors/src/binance_rest.rs` and the USD-M adapter, `robsond/src/{api,daemon,stop,process_epoch,metrics,
+  crash_points}.rs`, `robson-connectors/src/binance_rest.rs` and the USD-M adapter, `robsond/src/{api,daemon,main,stop,process_epoch,metrics,
   reconciliation_worker,position_manager,venue,error}.rs` and `funding/worker.rs`, `robson-testkit`, migration 32. What follows here is the original statement of the step, with its
   open obligations. `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
   mapping); process-kill tests. Before any caller acts on `order_by_client_id` or `replace_protection`, this step must:
@@ -1097,9 +1123,11 @@ Budget model for multi-venue:
   and the stale DB-gated count).
 - v14 (2026-11-10): §8, the failure modes and the Implementation Notes aligned with step 7 PR S as implemented against design note v8, in
   three parts: permits and slots, process epochs, the two-phase stop. Closes the J boundary that ended an entry's operation before its stop.
-  Codex round 1 on the three parts: REQUEST_CHANGES (1 P1, 2 P2, a vacuous required test, P3s). Since then an unpermitted mutation is
-  latched under the gate's mutex, an API operation runs in its own task, so a client's disconnect no longer cancels it, the `/panic`
-  capacity test closes a real leg, and a venue that can trade does not start without an epoch. No risk number changed.
+  Codex round 1 on the three parts: REQUEST_CHANGES (1 P1, 2 P2, a vacuous required test, P3s). Since then the deadline bounds the
+  process from the signal, through the start, the main loop and teardown, with a hard exit at 27 s; an unpermitted mutation is latched
+  under the gate's mutex; a venue that can trade does not start without an epoch; the `/panic` capacity test closes a real leg; an API
+  operation runs in its own task, so a client's disconnect no longer cancels it; the stop's stated guarantees are narrowed to what holds.
+  No risk number changed.
 - v13 (2026-11-09): §8 and the failure modes aligned with step 7 PR C as implemented against design note v8: typed cancel classification,
   uncertainty journaled and not fencing until the fence PR. No risk number changed.
 - v12 (2026-11-08): §2's finality paragraph, §8 and the failure modes aligned with step 7 PR J as implemented in three stacked PRs,

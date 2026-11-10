@@ -1,7 +1,9 @@
 //! The two-phase stop (ADR-0056 step 7, PR S).
 //!
-//! SIGTERM or SIGINT starts it, under an absolute deadline of
-//! [`STOP_DEADLINE`], inside the 30 s Kubernetes gives the pod before SIGKILL.
+//! SIGTERM or SIGINT starts it. Its clock starts at the signal: the stop ends
+//! by [`STOP_DEADLINE`] after it, and the process exits by [`HARD_EXIT`] after
+//! it whatever is still running, inside the 30 s Kubernetes gives the pod
+//! before SIGKILL.
 //!
 //! 1. **Draining.** The ordinary API class is refused; ticks, heals, exits,
 //!    sweeps, internal loops and protective API operations continue. It ends at
@@ -14,24 +16,38 @@
 //!    clear. A deadline, an abort or a latch leaves the epoch unmarked, and the
 //!    next start sees an unclean predecessor.
 //!
+//! The daemon stops waiting for anything once the stop has its result, and the
+//! runtime's teardown gets what is left of the deadline. Signals are received
+//! on a thread of their own, outside the daemon's runtime, which then waits out
+//! [`HARD_EXIT`]: should the process still be alive then, it exits it with
+//! [`HARD_EXIT_CODE`], writing no marker.
+//!
 //! The stop never takes the manager lock and never awaits under a sync lock.
-//! When idle it takes about as long as the flush and the marker; it can come
-//! close to the deadline when Draining ends at once and the flush stalls.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use robson_exec::order_journal::OrderJournal;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Longest Draining.
 pub const DRAIN_LIMIT: Duration = Duration::from_secs(12);
 /// From the signal to the end of the stop, whatever is still running.
 pub const STOP_DEADLINE: Duration = Duration::from_secs(25);
+/// From the signal to the process's exit, whatever is still running.
+pub const HARD_EXIT: Duration = Duration::from_secs(27);
+/// The exit code at [`HARD_EXIT`] (`EX_SOFTWARE`).
+pub const HARD_EXIT_CODE: i32 = 70;
 /// Pause between flush passes that wrote nothing.
 const FLUSH_RETRY_PAUSE: Duration = Duration::from_millis(100);
+
+/// When this process received its stop signal.
+static SIGNALLED_AT: OnceLock<std::time::Instant> = OnceLock::new();
 
 /// The stop's bounds; tests shorten them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +62,73 @@ impl Default for StopTimings {
             drain_limit: DRAIN_LIMIT,
             deadline: STOP_DEADLINE,
         }
+    }
+}
+
+/// A request to stop, and when it was first made: the stop's clock starts
+/// there, not when the stop gets to run.
+#[derive(Debug, Clone, Default)]
+pub struct StopRequest {
+    token: CancellationToken,
+    asked_at: Arc<OnceLock<Instant>>,
+}
+
+impl StopRequest {
+    /// Ask for the stop at `at`; a later ask keeps the first time.
+    pub fn ask_at(&self, at: Instant) {
+        self.asked_at.get_or_init(|| at);
+        self.token.cancel();
+    }
+
+    /// Ask for the stop now.
+    pub fn ask(&self) {
+        self.ask_at(Instant::now());
+    }
+
+    pub fn is_asked(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    /// Wait for the stop to be asked for. When it was.
+    pub async fn asked(&self) -> Instant {
+        self.token.cancelled().await;
+        *self.asked_at.get_or_init(Instant::now)
+    }
+}
+
+/// A stop signal received at `at`: from here, the runtime's teardown gets what
+/// is left of the deadline.
+pub fn signal_received(at: std::time::Instant) {
+    let _ = SIGNALLED_AT.set(at);
+}
+
+/// Wait out the hard bound of a stop signal received at `at` on the calling
+/// thread, then exit the process, unclean, unless it has exited by then. Call
+/// it on a thread of its own: nothing the async runtime does can hold it back.
+pub fn hard_exit_after(at: std::time::Instant) -> ! {
+    let exit_at = at + HARD_EXIT;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= exit_at {
+            break;
+        }
+        std::thread::sleep(exit_at - now);
+    }
+    error!(
+        after_ms = HARD_EXIT.as_millis(),
+        code = HARD_EXIT_CODE,
+        "Stop: hard bound reached with the process still running; exiting unclean, epoch left \
+         unmarked"
+    );
+    std::process::exit(HARD_EXIT_CODE)
+}
+
+/// How long the runtime's teardown may take: what is left of the stop's
+/// deadline after a signal, one whole deadline without one.
+pub fn teardown_bound() -> Duration {
+    match SIGNALLED_AT.get() {
+        Some(at) => (*at + STOP_DEADLINE).saturating_duration_since(std::time::Instant::now()),
+        None => STOP_DEADLINE,
     }
 }
 
@@ -82,6 +165,7 @@ impl StopResult {
 #[derive(Debug, Clone, Copy)]
 pub struct StopReport {
     pub result: StopResult,
+    /// From the request to the end of Draining.
     pub draining: Duration,
     /// From the end of Draining to the result.
     pub closing: Duration,
@@ -95,18 +179,18 @@ pub trait StopMarker: Send + Sync {
     async fn mark_clean(&self) -> Result<(), String>;
 }
 
-/// Wait for `stop`, then run the stop. `close` cancels the loops, workers,
-/// detectors and listener as Closing begins.
+/// Wait for `stop`, then run the stop from when it was asked for. `close`
+/// cancels the loops, workers, detectors and listener as Closing begins.
 pub async fn stop_when_asked(
-    stop: CancellationToken,
+    stop: StopRequest,
     journal: Arc<OrderJournal>,
     close: impl FnOnce(),
     marker: Option<Box<dyn StopMarker>>,
     timings: StopTimings,
 ) -> StopReport {
-    stop.cancelled().await;
-    info!("Stop requested: draining");
-    let report = run_stop(&journal, close, marker.as_deref(), timings).await;
+    let asked_at = stop.asked().await;
+    info!(waited_ms = asked_at.elapsed().as_millis(), "Stop requested: draining");
+    let report = run_stop(&journal, asked_at, close, marker.as_deref(), timings).await;
     crate::metrics::GRACEFUL_STOP.with_label_values(&[report.result.label()]).inc();
     crate::metrics::observe_order_journal(&journal);
     let (draining_ms, closing_ms) = (report.draining.as_millis(), report.closing.as_millis());
@@ -122,20 +206,20 @@ pub async fn stop_when_asked(
     report
 }
 
-/// The stop itself, from the moment it is asked for.
+/// The stop itself, its clock started at `asked_at`.
 pub async fn run_stop(
     journal: &OrderJournal,
+    asked_at: Instant,
     close: impl FnOnce(),
     marker: Option<&dyn StopMarker>,
     timings: StopTimings,
 ) -> StopReport {
-    let started = Instant::now();
-    let deadline = started + timings.deadline;
+    let deadline = asked_at + timings.deadline;
     let gate = journal.gate();
 
     gate.begin_draining();
-    gate.wait_no_permits((started + timings.drain_limit).min(deadline)).await;
-    let draining = started.elapsed();
+    gate.wait_no_permits((asked_at + timings.drain_limit).min(deadline)).await;
+    let draining = asked_at.elapsed();
 
     gate.begin_closing();
     info!(draining_ms = draining.as_millis(), "Stop: closing");
@@ -144,7 +228,7 @@ pub async fn run_stop(
     StopReport {
         result,
         draining,
-        closing: started.elapsed().saturating_sub(draining),
+        closing: asked_at.elapsed().saturating_sub(draining),
         deadline,
     }
 }
@@ -185,6 +269,8 @@ async fn closing(
     };
     robson_exec::crash_point!(STOP_BEFORE_MARKER);
     let marked = match tokio::time::timeout_at(deadline, marker.mark_clean()).await {
+        // The update may still commit, or have committed with its answer
+        // lost: every check above passed, so the marker it leaves is true.
         Err(_) => StopResult::Deadline,
         Ok(Err(error)) => {
             warn!(%error, "Stop: the clean-stop marker was not written");
@@ -254,6 +340,7 @@ mod tests {
         let closed = AtomicBool::new(false);
         let report = run_stop(
             &journal,
+            Instant::now(),
             || closed.store(true, Ordering::SeqCst),
             Some(&marker),
             StopTimings::default(),
@@ -286,7 +373,8 @@ mod tests {
             })
         };
         let marker = Marker::default();
-        let report = run_stop(&journal, || {}, Some(&marker), StopTimings::default()).await;
+        let report =
+            run_stop(&journal, Instant::now(), || {}, Some(&marker), StopTimings::default()).await;
         during.await.unwrap();
         assert_eq!(report.result, StopResult::Clean);
         assert_eq!((report.draining, report.closing), (secs(5), Duration::ZERO));
@@ -321,6 +409,7 @@ mod tests {
         let marker = Marker::default();
         let report = run_stop(
             &journal,
+            Instant::now(),
             move || *at.lock().unwrap() = Some(started.elapsed()),
             Some(&marker),
             StopTimings::default(),
@@ -341,7 +430,8 @@ mod tests {
         let _stuck = journal.acquire(OperationKind::Panic).unwrap();
         let marker = Marker::default();
         let started = Instant::now();
-        let report = run_stop(&journal, || {}, Some(&marker), StopTimings::default()).await;
+        let report =
+            run_stop(&journal, Instant::now(), || {}, Some(&marker), StopTimings::default()).await;
         assert_eq!(report.result, StopResult::Deadline);
         assert_eq!((report.draining, report.closing), (DRAIN_LIMIT, STOP_DEADLINE - DRAIN_LIMIT));
         assert_eq!(started.elapsed(), STOP_DEADLINE);
@@ -354,11 +444,13 @@ mod tests {
         let (_backend, journal) = stub_journal();
         drop(journal.acquire(OperationKind::Arm).unwrap());
         let marker = Marker::default();
-        let report = run_stop(&journal, || {}, Some(&marker), StopTimings::default()).await;
+        let report =
+            run_stop(&journal, Instant::now(), || {}, Some(&marker), StopTimings::default()).await;
         assert_eq!(report.result, StopResult::Aborted);
 
         let (_backend, journal) = journal_with_latch();
-        let report = run_stop(&journal, || {}, Some(&marker), StopTimings::default()).await;
+        let report =
+            run_stop(&journal, Instant::now(), || {}, Some(&marker), StopTimings::default()).await;
         assert_eq!(report.result, StopResult::Latched);
         assert_eq!(marker.marked.load(Ordering::SeqCst), 0);
     }
@@ -405,7 +497,8 @@ mod tests {
             })
         };
         let marker = Marker::default();
-        let report = run_stop(&journal, || {}, Some(&marker), StopTimings::default()).await;
+        let report =
+            run_stop(&journal, Instant::now(), || {}, Some(&marker), StopTimings::default()).await;
         recovers.await.unwrap();
         assert_eq!(report.result, StopResult::Clean);
         assert!(report.closing >= secs(3) && report.closing < secs(4), "{report:?}");
@@ -413,7 +506,8 @@ mod tests {
 
         let (backend, journal) = stub_journal();
         unlanded_result(&backend, &journal).await;
-        let report = run_stop(&journal, || {}, Some(&marker), StopTimings::default()).await;
+        let report =
+            run_stop(&journal, Instant::now(), || {}, Some(&marker), StopTimings::default()).await;
         assert_eq!(report.result, StopResult::Deadline);
         assert_eq!(report.draining + report.closing, STOP_DEADLINE);
         assert_eq!(marker.marked.load(Ordering::SeqCst), 1, "only the first stop marked");
@@ -437,7 +531,8 @@ mod tests {
             })
             .await;
         let marker = Marker::default();
-        let report = run_stop(&journal, || {}, Some(&marker), StopTimings::default()).await;
+        let report =
+            run_stop(&journal, Instant::now(), || {}, Some(&marker), StopTimings::default()).await;
         assert_eq!(report.result, StopResult::Unlanded);
         assert_eq!(marker.marked.load(Ordering::SeqCst), 0);
         drop(operation);
@@ -448,21 +543,61 @@ mod tests {
     async fn a_marker_that_fails_or_hangs_is_not_a_clean_stop() {
         let (_backend, journal) = stub_journal();
         let failing = Marker { fails: true, ..Marker::default() };
-        let report = run_stop(&journal, || {}, Some(&failing), StopTimings::default()).await;
+        let report =
+            run_stop(&journal, Instant::now(), || {}, Some(&failing), StopTimings::default()).await;
         assert_eq!(report.result, StopResult::MarkerFailed);
 
         let (_backend, journal) = stub_journal();
         let hanging = Marker { hangs: true, ..Marker::default() };
-        let report = run_stop(&journal, || {}, Some(&hanging), StopTimings::default()).await;
+        let report =
+            run_stop(&journal, Instant::now(), || {}, Some(&hanging), StopTimings::default()).await;
         assert_eq!(report.result, StopResult::Deadline);
         assert_eq!(report.draining + report.closing, STOP_DEADLINE);
     }
 
-    /// 25 s leaves the pod's 30 s grace a margin before SIGKILL, and Draining
-    /// is the shorter part of it.
+    /// The clock starts at the request: a stop that gets to run late, as when
+    /// the signal came during startup, has only what is left of its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_stop_clock_starts_at_the_request_not_when_the_stop_runs() {
+        let (_backend, journal) = stub_journal();
+        let _stuck = journal.acquire(OperationKind::Panic).unwrap();
+        let stop = StopRequest::default();
+        stop.ask();
+        let asked_at = Instant::now();
+        tokio::time::advance(secs(10)).await;
+        stop.ask();
+        assert_eq!(stop.asked().await, asked_at, "a second ask keeps the first time");
+
+        let running = Instant::now();
+        let marker = Marker::default();
+        let report = stop_when_asked(
+            stop,
+            Arc::clone(&journal),
+            || {},
+            Some(Box::new(marker)),
+            StopTimings::default(),
+        )
+        .await;
+        assert_eq!(report.result, StopResult::Deadline);
+        assert_eq!(report.deadline, asked_at + STOP_DEADLINE);
+        assert_eq!(running.elapsed(), STOP_DEADLINE - secs(10));
+        assert_eq!((report.draining, report.closing), (DRAIN_LIMIT, STOP_DEADLINE - DRAIN_LIMIT));
+    }
+
+    /// Without a signal, teardown gets one whole deadline.
     #[test]
-    fn the_deadline_fits_inside_the_grace_period() {
-        assert_eq!((DRAIN_LIMIT, STOP_DEADLINE), (secs(12), secs(25)));
-        assert!(STOP_DEADLINE + secs(5) <= secs(30));
+    fn teardown_without_a_signal_gets_a_whole_deadline() {
+        assert!(SIGNALLED_AT.get().is_none(), "no test raises a stop signal");
+        assert_eq!(teardown_bound(), STOP_DEADLINE);
+    }
+
+    /// 25 s for the stop and 27 s for the process leave the pod's 30 s grace
+    /// a margin before SIGKILL, and Draining is the shorter part of the stop.
+    #[test]
+    fn the_deadline_and_the_hard_bound_fit_inside_the_grace_period() {
+        assert_eq!((DRAIN_LIMIT, STOP_DEADLINE, HARD_EXIT), (secs(12), secs(25), secs(27)));
+        assert!(DRAIN_LIMIT < STOP_DEADLINE && STOP_DEADLINE < HARD_EXIT);
+        assert!(HARD_EXIT + secs(3) <= secs(30));
+        assert_ne!(HARD_EXIT_CODE, 0);
     }
 }

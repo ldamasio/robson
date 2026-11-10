@@ -16,14 +16,15 @@
 use std::{future::Future, os::unix::process::ExitStatusExt, path::PathBuf, time::Duration};
 
 use robson_exec::crash_points::{
-    ENTRY_AFTER_ACK, ENTRY_BEFORE_SEND, PROTECTION_BEFORE_SEND, STOP_AFTER_MARKER,
-    STOP_BEFORE_MARKER,
+    ENTRY_AFTER_ACK, ENTRY_BEFORE_SEND, PROTECTION_BEFORE_SEND, STALL_ENV, STARTUP_BEFORE_SCAN,
+    STOP_AFTER_MARKER, STOP_BEFORE_MARKER,
 };
 use robson_testkit::{
     daemon_process::{database_url_through, DaemonProcess, DaemonSpec},
     db_proxy::{DbProxy, ProxyMode},
     fake_venue::{FakeVenue, VenueCounts, FAKE_SYMBOL},
 };
+use robsond::stop::{HARD_EXIT, HARD_EXIT_CODE, STOP_DEADLINE};
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use sqlx::{Connection, PgConnection, PgPool};
@@ -1139,6 +1140,144 @@ async fn a_stop_waits_for_a_panic_in_flight_and_refuses_ordinary_requests_meanwh
         let exits = harness.intents("exit").await;
         assert_eq!(exits.len(), 1, "{exits:?}");
         assert_eq!((exits[0].1.clone(), exits[0].2), (None, true), "uncertain, on record");
+    })
+    .await;
+}
+
+/// An operation that never ends holds the process no longer than the stop's
+/// deadline. The arm's thread stalls for good after the venue's ack, with its
+/// permit held. On SIGTERM the stop waits for it until the deadline and ends
+/// unclean; the daemon stops waiting, and the runtime's teardown abandons the
+/// stalled thread: exit 0 after the deadline and before the hard bound, the
+/// epoch unmarked.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_stuck_operation_holds_the_process_no_longer_than_the_deadline(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        let daemon = harness.daemon_with_env(Some(ENTRY_AFTER_ACK), &[(STALL_ENV, "1")]);
+        daemon.wait_ready(STEP).await.expect("daemon ready");
+        let arm = arm_immediate(daemon.api_url());
+        daemon.wait_stalled_at(ENTRY_AFTER_ACK, STEP).await.expect("the arm stalls");
+        let asked = std::time::Instant::now();
+        daemon.send_signal("TERM").expect("signal");
+
+        let status = daemon.wait_exit(GRACE).await.expect("it exits by itself");
+        let stopped_in = asked.elapsed();
+        eprintln!("a_stuck_operation_holds_the_process_no_longer_than_the_deadline: exited {stopped_in:?} after the signal, {status}");
+        assert!(status.success(), "{status}\n{}", daemon.log_tail());
+        assert!(
+            stopped_in >= STOP_DEADLINE && stopped_in < HARD_EXIT,
+            "after the deadline, before the hard bound: {stopped_in:?}\n{}",
+            daemon.log_tail()
+        );
+        let log = plain(daemon.log());
+        assert!(log.contains("Stop: not clean, epoch left unmarked"), "{}", daemon.log_tail());
+        assert!(log.contains("deadline"), "{}", daemon.log_tail());
+        assert!(!log.contains("hard bound reached"), "{}", daemon.log_tail());
+        assert_eq!(harness.epochs().await, [(false, None)]);
+        assert!(arm.await.unwrap().is_err(), "the stalled arm never answered");
+    })
+    .await;
+}
+
+/// The hard bound. The startup's own thread stalls for good, the startup
+/// permit held, so nothing the async runtime does can end the process. On
+/// SIGTERM the stop ends unclean at its deadline, and the thread started at
+/// the signal exits the process at the hard bound, non-zero, with an error.
+/// No marker.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_process_that_cannot_finish_is_ended_by_the_hard_bound(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        let daemon = harness.daemon_with_env(Some(STARTUP_BEFORE_SCAN), &[(STALL_ENV, "1")]);
+        daemon
+            .wait_stalled_at(STARTUP_BEFORE_SCAN, STEP)
+            .await
+            .expect("the startup stalls");
+        let asked = std::time::Instant::now();
+        daemon.send_signal("TERM").expect("signal");
+
+        let status = daemon.wait_exit(GRACE).await.expect("it exits by the hard bound");
+        let stopped_in = asked.elapsed();
+        eprintln!("a_process_that_cannot_finish_is_ended_by_the_hard_bound: exited {stopped_in:?} after the signal, {status}");
+        assert_eq!(status.code(), Some(HARD_EXIT_CODE), "{status}\n{}", daemon.log_tail());
+        assert!(
+            stopped_in >= HARD_EXIT && stopped_in < GRACE,
+            "at the hard bound, inside the grace: {stopped_in:?}\n{}",
+            daemon.log_tail()
+        );
+        let log = plain(daemon.log());
+        assert!(log.contains("Stop: not clean, epoch left unmarked"), "{}", daemon.log_tail());
+        assert!(log.contains("hard bound reached"), "{}", daemon.log_tail());
+        assert!(!daemon.watchdog_fired());
+        assert_eq!(harness.epochs().await, [(false, None)]);
+    })
+    .await;
+}
+
+/// A signal during the start, before anything was sent, ends the start: the
+/// epoch's insert waits in the database, SIGTERM arrives, and the process
+/// exits 0 at once, the venue sent nothing and no epoch recorded.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_signal_during_the_epoch_insert_ends_the_start_with_nothing_sent(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        sqlx::query(
+            "CREATE FUNCTION stall_epochs() RETURNS trigger AS $$
+             BEGIN PERFORM pg_sleep(30); RETURN NEW; END $$ LANGUAGE plpgsql",
+        )
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER stall_epochs BEFORE INSERT ON process_epochs
+             FOR EACH ROW EXECUTE FUNCTION stall_epochs()",
+        )
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+        let inserting = "SELECT COUNT(*)::BIGINT FROM pg_stat_activity
+             WHERE datname = current_database() AND state = 'active'
+             AND query LIKE 'INSERT INTO process_epochs%'";
+
+        let daemon = harness.daemon(None);
+        harness
+            .until("the epoch insert waits in the database", || async {
+                sqlx::query_scalar::<_, i64>(inserting).fetch_one(&harness.pool).await.unwrap() > 0
+            })
+            .await;
+        let asked = std::time::Instant::now();
+        daemon.send_signal("TERM").expect("signal");
+
+        let status = daemon.wait_exit(STEP).await.expect("it stops by itself");
+        let stopped_in = asked.elapsed();
+        eprintln!("a_signal_during_the_epoch_insert_ends_the_start_with_nothing_sent: exited {stopped_in:?} after the signal, {status}");
+        assert!(status.success(), "{status}\n{}", daemon.log_tail());
+        assert!(stopped_in < Duration::from_secs(5), "{stopped_in:?}\n{}", daemon.log_tail());
+        assert!(
+            plain(daemon.log()).contains("Stop requested before the start completed"),
+            "{}",
+            daemon.log_tail()
+        );
+        assert_eq!(harness.venue.requests(), 0, "nothing sent");
+
+        // End the insert the process left waiting; it never committed.
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+             WHERE datname = current_database() AND query LIKE 'INSERT INTO process_epochs%'",
+        )
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+        harness
+            .until("the insert has ended", || async {
+                sqlx::query_scalar::<_, i64>(inserting).fetch_one(&harness.pool).await.unwrap() == 0
+            })
+            .await;
+        assert!(harness.epochs().await.is_empty(), "no epoch recorded");
     })
     .await;
 }

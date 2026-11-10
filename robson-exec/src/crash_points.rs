@@ -2,9 +2,11 @@
 //!
 //! `crash_point!(NAME)` at a call site SIGKILLs this process when the harness
 //! armed `NAME`, so a real `robsond` dies at a named place with no unwinding
-//! and no shutdown path. The call site expands to nothing without the
-//! `crash-points` feature, and this module does not exist then. The feature is
-//! rejected at compile time in a release build; production builds use
+//! and no shutdown path. Armed with [`STALL_ENV`] as well, the thread that
+//! reaches `NAME` blocks there for good instead: an operation that never ends,
+//! whatever the async runtime does. The call site expands to nothing without
+//! the `crash-points` feature, and this module does not exist then. The feature
+//! is rejected at compile time in a release build; production builds use
 //! `--features postgres` (`Dockerfile`).
 //!
 //! To add a crash point, add one line to the table below and put
@@ -37,6 +39,8 @@ crash_points! {
     STOP_BEFORE_MARKER = "stop_before_marker";
     // The clean-stop marker is written; the process has not exited.
     STOP_AFTER_MARKER = "stop_after_marker";
+    // The startup phase holds its permit; the startup scan has not run.
+    STARTUP_BEFORE_SCAN = "startup_before_scan";
 }
 
 /// Crash point to arm.
@@ -48,12 +52,15 @@ pub const MARKER_FILE_ENV: &str = "ROBSON_CRASH_MARKER_FILE";
 pub const WATCHDOG_ENV: &str = "ROBSON_CRASH_WATCHDOG_SECS";
 /// Loopback base URL of the fake venue that replaces every Binance REST host.
 pub const VENUE_URL_ENV: &str = "ROBSON_HARNESS_VENUE_URL";
+/// Set to `1` to stall the thread at the armed point instead of killing.
+pub const STALL_ENV: &str = "ROBSON_CRASH_STALL";
 
 static ARMED: OnceLock<Option<Armed>> = OnceLock::new();
 
 struct Armed {
     point: &'static str,
     marker_file: Option<String>,
+    stall: bool,
 }
 
 /// Validate the harness environment and arm it. Call first in `main`.
@@ -64,7 +71,8 @@ pub fn arm_from_env() {
     let environment = std::env::var("ROBSON_ENV").unwrap_or_default();
     let requested = std::env::var(POINT_ENV).ok();
     let marker_file = std::env::var(MARKER_FILE_ENV).ok();
-    let armed = resolve(&environment, requested.as_deref(), marker_file)
+    let stall = std::env::var(STALL_ENV).is_ok_and(|value| value == "1");
+    let armed = resolve(&environment, requested.as_deref(), marker_file, stall)
         .unwrap_or_else(|refused| panic!("crash harness refused: {refused}"));
     let _ = ARMED.set(armed);
 
@@ -83,6 +91,7 @@ fn resolve(
     environment: &str,
     requested: Option<&str>,
     marker_file: Option<String>,
+    stall: bool,
 ) -> Result<Option<Armed>, String> {
     if matches!(environment.to_lowercase().as_str(), "production" | "prod") {
         return Err("a crash-points build must not run with ROBSON_ENV=production".to_string());
@@ -94,11 +103,11 @@ fn resolve(
         .iter()
         .find(|known| **known == requested)
         .ok_or_else(|| format!("unknown crash point {requested}; known: {ALL:?}"))?;
-    Ok(Some(Armed { point, marker_file }))
+    Ok(Some(Armed { point, marker_file, stall }))
 }
 
-/// Die here if `point` is the armed crash point. Reached through
-/// [`crash_point!`](crate::crash_point).
+/// Die here if `point` is the armed crash point, or stall here when armed to.
+/// Reached through [`crash_point!`](crate::crash_point).
 pub fn hit(point: &'static str) {
     let Some(armed) = ARMED.get_or_init(|| None) else {
         return;
@@ -110,6 +119,11 @@ pub fn hit(point: &'static str) {
         let mut file = std::fs::File::create(path).expect("crash marker file");
         file.write_all(point.as_bytes()).expect("write crash marker");
         file.sync_all().expect("sync crash marker");
+    }
+    if armed.stall {
+        loop {
+            std::thread::park();
+        }
     }
     kill_self();
 }
@@ -132,17 +146,17 @@ mod tests {
     #[test]
     fn production_is_refused_with_or_without_a_point() {
         for environment in ["production", "PROD"] {
-            assert!(resolve(environment, None, None).is_err());
-            assert!(resolve(environment, Some(ENTRY_AFTER_ACK), None).is_err());
+            assert!(resolve(environment, None, None, false).is_err());
+            assert!(resolve(environment, Some(ENTRY_AFTER_ACK), None, true).is_err());
         }
     }
 
     #[test]
     fn only_a_known_point_arms() {
-        assert!(resolve("test", Some("nonexistent"), None).is_err());
-        let armed = resolve("test", Some(ENTRY_BEFORE_SEND), None).unwrap().unwrap();
-        assert_eq!(armed.point, ENTRY_BEFORE_SEND);
-        assert!(resolve("test", None, None).unwrap().is_none());
+        assert!(resolve("test", Some("nonexistent"), None, false).is_err());
+        let armed = resolve("test", Some(ENTRY_BEFORE_SEND), None, true).unwrap().unwrap();
+        assert_eq!((armed.point, armed.stall), (ENTRY_BEFORE_SEND, true));
+        assert!(resolve("test", None, None, true).unwrap().is_none());
     }
 
     #[test]
