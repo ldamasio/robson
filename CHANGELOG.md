@@ -12,8 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Every operation that can change the venue runs under a permit taken before the manager lock: 16 ordinary API
   slots, 8 protective ones (close, `/panic`, MonthlyHalt, `/reconcile-close`) and one reserved per internal loop.
   A full class answers 503 `busy` at once with nothing done.
-- A venue mutation without a permit is counted and sets the journal latch; an operation dropped before it
-  completed, including a request whose client disconnects, does too.
+- A venue mutation without a permit is counted and sets the journal latch; so does an operation dropped
+  before it completed, such as one that panicked, which answers 500.
+- An API operation runs in its own task, which owns its permit: a client that disconnects mid-operation no
+  longer cancels it.
 - Each REST request has one 10 s bound for the send and the body together, instead of 10 s each.
 
 ### Changed - Typed classification of stop cancels (ADR-0056 step 7, PR C)

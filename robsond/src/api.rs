@@ -48,7 +48,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::warn;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -785,20 +785,34 @@ where
 /// manager lock, venue request or other mutation, and held until `work`
 /// returns. Handlers pass `work` boxed: a whole operation's future is large. A
 /// full class answers 503 `busy` and a stopping daemon 503 `stopping`, both at
-/// once and with nothing done. A client that drops the request mid-operation
-/// aborts the permit, which sets the latch.
+/// once and with nothing done.
+///
+/// The operation runs in its own task, which owns the permit; the handler only
+/// awaits its answer. A client that disconnects drops the handler, not the
+/// operation, which runs on to completion. One that panics drops its permit
+/// unfinished, so it is aborted and sets the latch, and the answer is 500.
 async fn permitted<E, S, R>(
     state: &ApiState<E, S>,
     kind: OperationKind,
-    work: impl std::future::Future<Output = R>,
+    work: impl std::future::Future<Output = R> + Send + 'static,
 ) -> Response
 where
     E: ExchangePort + 'static,
     S: Store + 'static,
-    R: IntoResponse,
+    R: IntoResponse + Send + 'static,
 {
     match state.order_journal.acquire(kind) {
-        Ok(permit) => permit.run(work).await.into_response(),
+        Ok(permit) => match tokio::spawn(permit.run(work)).await {
+            Ok(answer) => answer.into_response(),
+            Err(failed) => {
+                error!(kind = kind.as_str(), error = %failed, "API operation failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { error: "operation failed".to_string() }),
+                )
+                    .into_response()
+            },
+        },
         Err(refusal) => {
             let error = match refusal {
                 PermitRefusal::Busy(class) => {
@@ -6551,7 +6565,16 @@ mod tests {
         assert_eq!(journal.gate().snapshot().busy_protective, 4);
         full.into_iter().for_each(Permit::complete);
 
-        // Ordinary still full: the real close and /panic go through.
+        // Ordinary still full: the real close goes through, and /panic closes
+        // the other leg.
+        let other = save_active_position_for_api(
+            &position_manager,
+            "ETHUSDT",
+            Side::Long,
+            dec!(95000),
+            dec!(0.01),
+        )
+        .await;
         let response = app
             .clone()
             .oneshot(api_request("DELETE", &format!("/positions/{}", leg.id), None))
@@ -6560,8 +6583,19 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let others = robson_exec::gate::ORDINARY_API_SLOTS;
         assert_every_mutation_under_beside(&exchange, OperationKind::CancelOrClose, others);
+        let before = exchange.mutations().len();
         let response = app.clone().oneshot(api_request("POST", "/panic", None)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let panic: Vec<_> = exchange.mutations().into_iter().skip(before).collect();
+        assert!(!panic.is_empty(), "/panic reached the venue");
+        for mutation in panic {
+            assert_eq!(mutation.permit, Some(OperationKind::Panic), "{mutation:?}");
+            let gate = mutation.gate.expect("the stub passes the gate");
+            assert_eq!((gate.permits, gate.protective, gate.unpermitted), (1 + others, 1, 0));
+        }
+        let closed = position_manager.read().await.get_position(other.id).await.unwrap().unwrap();
+        assert!(matches!(closed.state, PositionState::Closed { .. }), "{:?}", closed.state);
+        assert!(position_manager.read().await.get_open_positions().await.unwrap().is_empty());
         held.into_iter().for_each(Permit::complete);
         assert_eq!(journal.gate().snapshot().permits, 0);
     }
@@ -6690,9 +6724,10 @@ mod tests {
     }
 
     /// A request dropped while its operation is in flight, as when the client
-    /// disconnects: the permit is aborted, the latch set, the slot released.
+    /// disconnects: the operation runs on in its own task, which owns the
+    /// permit, and completes. Nothing is aborted and the latch stays clear.
     #[tokio::test]
-    async fn a_request_dropped_mid_operation_aborts_its_permit() {
+    async fn a_request_dropped_mid_operation_runs_on_to_completion() {
         let (app, position_manager, exchange, journal) = gated_app().await;
         let leg = save_active_position_for_api(
             &position_manager,
@@ -6702,14 +6737,42 @@ mod tests {
             dec!(0.01),
         )
         .await;
-        let _hold = exchange.hold_next_mutation();
+        let hold = exchange.hold_next_mutation();
         let close = app.oneshot(api_request("DELETE", &format!("/positions/{}", leg.id), None));
         assert!(tokio::time::timeout(Duration::from_millis(300), close).await.is_err());
+        assert_eq!(exchange.mutations().len(), 1, "it is held at the venue");
+        assert_eq!(journal.gate().snapshot().permits, 1, "with its permit");
 
+        hold.notify_one();
+        let done = async {
+            while journal.gate().snapshot().permits > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), done)
+            .await
+            .expect("the close completes");
         let gate = journal.gate().snapshot();
+        assert_eq!((gate.aborted, gate.protective), (0, 0));
+        assert!(!journal.latch_set());
+        let closed = position_manager.read().await.get_position(leg.id).await.unwrap().unwrap();
+        assert!(matches!(closed.state, PositionState::Closed { .. }), "{:?}", closed.state);
+    }
+
+    /// An operation that panics answers 500. Its permit, dropped unfinished by
+    /// the unwind, is aborted and sets the latch, and its slot is released.
+    #[tokio::test]
+    async fn an_operation_that_panics_answers_500_and_aborts_its_permit() {
+        let (exchange, _) = WalletBalanceCacheExchange::new(dec!(1));
+        let state = wallet_cache_test_state(exchange).await;
+        fn failing() -> StatusCode {
+            panic!("the operation failed")
+        }
+        let response = permitted(&state, OperationKind::Panic, async { failing() }).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let gate = state.order_journal.gate().snapshot();
         assert_eq!((gate.aborted, gate.permits, gate.protective), (1, 0, 0));
-        assert!(journal.latch_set());
-        assert_eq!(exchange.mutations().len(), 1, "it was held at the venue");
+        assert!(state.order_journal.latch_set());
     }
 
     /// A venue mutation outside any permit is counted and latched while the

@@ -844,3 +844,72 @@ fn every_entry_reaching_the_venue_was_ticketed_while_open() {
         });
     });
 }
+
+/// A client that disconnects while its operation is in flight does not cancel
+/// it: the API runs the operation in its own task, which owns the permit. A
+/// real TCP client sends `/panic`, its exit is held at the venue, the client
+/// closes its socket, then the venue answers: the panic completes, nothing is
+/// aborted and the latch stays clear.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_client_disconnecting_mid_operation_leaves_it_to_complete(pool: PgPool) {
+    use tokio::io::AsyncWriteExt;
+
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        let daemon = harness.daemon(None);
+        daemon.wait_ready(STEP).await.expect("daemon ready");
+        arm_immediate(daemon.api_url()).await.unwrap().expect("arm succeeds");
+        assert_ne!(harness.venue.position(FAKE_SYMBOL), Decimal::ZERO);
+
+        harness.venue.hold_orders();
+        let api = daemon.api_url();
+        let mut socket = tokio::net::TcpStream::connect(api.trim_start_matches("http://"))
+            .await
+            .expect("connect to the API");
+        socket
+            .write_all(b"POST /panic HTTP/1.1\r\nHost: robsond\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("send /panic");
+        let held = async {
+            while harness.venue.held_orders() == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(STEP, held)
+            .await
+            .expect("the exit order reaches the venue");
+        drop(socket);
+        // Long enough for the server to read the end of the stream.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        harness.venue.release_orders();
+
+        harness
+            .until("the exit lands", || async {
+                harness.intents("exit").await.iter().any(|(_, outcome, _)| outcome.is_some())
+            })
+            .await;
+        assert_eq!(harness.venue.position(FAKE_SYMBOL), Decimal::ZERO, "the leg is flat");
+        let exits = harness.intents("exit").await;
+        assert_eq!(exits.len(), 1, "{exits:?}");
+        assert!(!exits[0].2, "an answered exit, not an uncertain one: {exits:?}");
+        // The latch gauge is published once a second.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let metrics = reqwest::Client::new()
+            .get(format!("{api}/metrics"))
+            .timeout(STEP)
+            .send()
+            .await
+            .expect("metrics")
+            .text()
+            .await
+            .expect("metrics body");
+        for series in [
+            "robsond_aborted_operations_total 0",
+            "robsond_journal_latch 0",
+        ] {
+            assert!(metrics.lines().any(|line| line == series), "{series}\n{metrics}");
+        }
+    })
+    .await;
+}

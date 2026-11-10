@@ -792,9 +792,10 @@ incident, and the orphan sweep has no veto.
   boundary above is closed. A nested operation runs under the permit it is reached from and never takes a second slot or another class: an
   `Immediate` arm's entry and stop, `/reconcile-close` into MonthlyHalt into `panic_close_all`, an entry's protection batch, the startup scan
   inside the startup phase, the reconciliation scan's orphan cancels and UNTRACKED closes. A permit must be completed. One dropped before
-  its work returned, a cancelled or panicked future, counts in `robsond_aborted_operations_total` and sets the latch, whatever its rows say;
-  that includes an API request whose client disconnects, since the server drops its handler. An operation that returned an error has
-  completed.
+  its work returned, a cancelled or panicked future, counts in `robsond_aborted_operations_total` and sets the latch, whatever its rows say.
+  An operation that returned an error has completed. An API operation runs in its own task, which owns the permit, and the handler only
+  awaits its answer: a client that disconnects drops the handler, which hyper does on a closed connection, and the operation runs on to
+  completion; one that panics answers 500, aborted.
 - **Slots.** One reserved slot each for the main loop (one event), a reconciliation scan, a funding poll and the startup phase; 16 for the
   ordinary API class (arm, injected signal, approval, funding execute, a spot USDT recovery that executes); 8 for the protective class (cancel
   or close, `/panic`, `POST /monthly-halt`, `/reconcile-close`), which ordinary requests never take. That is 28 of the registry's 32 entries;
@@ -816,8 +817,9 @@ incident, and the orphan sweep has no veto.
   timeout is uncertain.
 
 What part 1 changes in production: more than 16 ordinary or 8 protective API requests at once now get 503 `busy`; a client that disconnects
-mid-operation now also sets the latch; a request whose head and body together take more than 10 s now times out. The phase never leaves
-`Open` in this part.
+mid-operation no longer cancels it, where today the dropped handler takes the operation with it, possibly between an entry's fill and its
+stop or between the legs of a `/panic`; a panicking operation sets the latch; a request whose head and body together take more than 10 s
+now times out. The phase never leaves `Open` in this part.
 
 **Rollback across part 1 is boundary B,** with the daemon stopped, and an image that keeps migration 31, as for J and C: part 1 adds no
 table. Not verified: behaviour on a real venue or in the cluster.
@@ -891,7 +893,7 @@ only).
 | Cancel outcome unknown (step 7, PR C) | an error, an indeterminate answer or an "already gone" with no final state is uncertain on the cancel's own intent; the protective action behind it proceeds | journaled only until the fence PR | `order_intents.cancel_class` and `uncertain_at`; boundary B |
 | API slot class full (step 7, PR S) | 503 `busy` at once, nothing done; the other classes keep their slots | the caller retries | `robsond_api_slot_busy_total{class}` |
 | Venue mutation without a permit (step 7, PR S) | while open: sent, counted, latch set; while stopping: refused, nothing sent | — | `robsond_unpermitted_mutations_total`, `robsond_journal_latch` |
-| Operation dropped mid-flight: a cancelled request, a panic (step 7, PR S) | its intents end uncertain through the retry set; the permit counts as aborted and sets the latch | — | `robsond_aborted_operations_total`, `robsond_journal_latch` |
+| Operation dropped mid-flight: a panic, a cancelled internal future (step 7, PR S) | each intent it left open is sealed: one whose send may have started ends uncertain, one proven unsent ends not sent, both through the retry set; one with nothing to record is dropped. The permit counts as aborted and sets the latch | — | `robsond_aborted_operations_total`, `robsond_journal_latch` |
 | Venue REST dies | rules/costs/valuation stale → basis invalid, admission fails closed; risk reduction proceeds on the last validated rules or the persisted snapshot, with one refresh and resubmit per rejection; a leg holding neither waits for the lookup, then a decided exit goes out as given and a tick fails closed (§5) | reads from cache until TTL; protection on the venue, except a leg whose exit failed, until the heal | per-venue `eligible=false` + reasons; alert |
 | Venue feed silent | watchdog after `ROBSON_FEED_SILENCE_MAX`; REST snapshot resync; trailing advances continue on REST ticks within the request budget | bounded REST polling | silent-feed metric, event |
 | Daemon dies mid fan-out | accepted legs are protected on their venues except for a leg killed between entry fill and protection placement, which recovery protects or flattens first | startup recovery reads the durable journal and each venue's observation; completes, protects or releases per evidence | recovery events per leg |
@@ -976,7 +978,7 @@ Budget model for multi-venue:
   attempt rows are read from the database rather than reloaded. PR C: `robson-exec/src/{cancel,compat,executor,order_journal,ports,stub}.rs`,
   `robsond/src/{daemon,position_manager,reconciliation_worker}.rs`, no migration. PR S: `robson-exec/src/{gate,order_journal,venue,stub}.rs`,
   `robson-connectors/src/binance_rest.rs` and the USD-M adapter, `robsond/src/{api,daemon,metrics,reconciliation_worker,position_manager,
-  venue,error}.rs` and `funding/worker.rs`. What follows here is the original statement of the step, with its
+  venue,error}.rs` and `funding/worker.rs`, `robson-testkit`. What follows here is the original statement of the step, with its
   open obligations. `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
   mapping); process-kill tests. Before any caller acts on `order_by_client_id` or `replace_protection`, this step must:
   persist each attempt durably before its request is sent and each rejection when observed, reload them on startup, treat
@@ -1060,7 +1062,9 @@ Budget model for multi-venue:
   and the stale DB-gated count).
 - v14 (2026-11-10): §8, the failure modes and the Implementation Notes aligned with step 7 PR S as implemented against design note v8, in
   part 1 of three: permits and slots. Closes the J boundary that ended an entry's operation before its stop.
-  No risk number changed.
+  Codex round 1 on the three parts: REQUEST_CHANGES (1 P1, 2 P2, a vacuous required test, P3s). In this part since then an unpermitted
+  mutation is latched under the gate's mutex, an API operation runs in its own task, so a client's disconnect no longer cancels it, and
+  the `/panic` capacity test closes a real leg. No risk number changed.
 - v13 (2026-11-09): §8 and the failure modes aligned with step 7 PR C as implemented against design note v8: typed cancel classification,
   uncertainty journaled and not fencing until the fence PR. No risk number changed.
 - v12 (2026-11-08): §2's finality paragraph, §8 and the failure modes aligned with step 7 PR J as implemented in three stacked PRs,

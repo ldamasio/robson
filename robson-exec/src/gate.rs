@@ -412,8 +412,13 @@ impl OperationGate {
     /// A permit dropped without completion: whatever it was doing may have
     /// reached the venue with nothing left to record the answer.
     pub(crate) fn abort(&self, kind: OperationKind) {
-        self.lock().aborted += 1;
+        // Its slot is still held: the permit releases it only after this
+        // returns, so a stop that sees no permit already sees the latch. Set
+        // under the mutex with the count all the same.
+        let mut state = self.lock();
+        state.aborted += 1;
         self.latch.store(true, Ordering::SeqCst);
+        drop(state);
         error!(kind = kind.as_str(), "Operation dropped before completing; latch set");
         if let Some(observer) = self.observer.get() {
             observer.operation_aborted(kind);
@@ -433,9 +438,14 @@ impl OperationGate {
         if state.phase != Phase::Open {
             return Err(MutationRefused { phase: state.phase });
         }
+        // Counted and latched before the mutex that let it through is
+        // released: a stop that moves the phase after this sees the latch,
+        // however long this thread then pauses before its request.
         state.unpermitted += 1;
-        drop(state);
         self.latch.store(true, Ordering::SeqCst);
+        drop(state);
+        #[cfg(test)]
+        tests::after_an_unpermitted_pass(self);
         warn!(what, "Venue mutation without an operation permit; latch set");
         if let Some(observer) = self.observer.get() {
             observer.unpermitted_mutation();
@@ -446,7 +456,21 @@ impl OperationGate {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    thread_local! {
+        /// Run where an unpermitted mutation has been let through and its
+        /// thread could pause before its request.
+        static AFTER_AN_UNPERMITTED_PASS: Cell<Option<fn(&OperationGate)>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn after_an_unpermitted_pass(gate: &OperationGate) {
+        if let Some(hook) = AFTER_AN_UNPERMITTED_PASS.with(Cell::take) {
+            hook(gate);
+        }
+    }
 
     fn gate() -> OperationGate {
         OperationGate::new(Arc::new(AtomicBool::new(false)))
@@ -547,6 +571,28 @@ mod tests {
         gate.begin_closing();
         assert_eq!(gate.mutation("DELETE /order"), Err(MutationRefused { phase: Phase::Closing }));
         assert_eq!(gate.snapshot().unpermitted, 1, "a refused one is not sent or counted");
+    }
+
+    /// A stop that moves the phase while an unpermitted mutation, already let
+    /// through, has yet to reach its request finds the latch set and the
+    /// mutation counted: it can never mark the stop clean past it.
+    #[test]
+    fn a_stop_after_an_unpermitted_mutation_passed_sees_its_latch() {
+        thread_local! {
+            static SEEN: Cell<Option<(bool, u64)>> = const { Cell::new(None) };
+        }
+        AFTER_AN_UNPERMITTED_PASS.with(|hook| {
+            hook.set(Some(|gate| {
+                gate.begin_draining();
+                gate.begin_closing();
+                let seen = (gate.latch.load(Ordering::SeqCst), gate.snapshot().unpermitted);
+                SEEN.with(|cell| cell.set(Some(seen)));
+            }))
+        });
+        let gate = gate();
+        assert_eq!(gate.mutation("POST /order"), Ok(()));
+        assert_eq!(SEEN.with(Cell::get), Some((true, 1)), "the stop saw the latch and the count");
+        assert_eq!(gate.snapshot().unpermitted, 1);
     }
 
     #[tokio::test(start_paused = true)]
