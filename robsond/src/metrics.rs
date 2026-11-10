@@ -37,6 +37,7 @@
 //! - `robsond_aborted_operations_total` — operations dropped before completing
 //! - `robsond_api_slot_busy_total` — API requests refused on a full slot class,
 //!   labelled by class
+//! - `robsond_graceful_stop_total` — stops, labelled by result
 //! - `robsond_unclean_start` — why this process's start counts as unclean
 
 use std::sync::LazyLock;
@@ -186,6 +187,14 @@ pub static API_SLOT_BUSY: LazyLock<CounterVec> = LazyLock::new(|| {
         &["class"]
     )
     .expect("failed to register robsond_api_slot_busy_total")
+});
+
+/// Stops, by result: `clean`, or why it was not. Counted as the process exits,
+/// so a scrape may never see it; the durable record is the epoch's marker and
+/// the next start's [`UNCLEAN_START`].
+pub static GRACEFUL_STOP: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!("robsond_graceful_stop_total", "Graceful stops by result", &["result"])
+        .expect("failed to register robsond_graceful_stop_total")
 });
 
 /// 1 for the reason this process's start counts as unclean: `no_predecessor`,

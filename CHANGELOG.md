@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Two-phase stop on SIGTERM and SIGINT (ADR-0056 step 7, PR S, part 3)
+
+- SIGTERM, as well as SIGINT, now stops the daemon: as PID 1 it used to ignore SIGTERM until Kubernetes
+  SIGKILLed it at the grace period, managing the account until then; management now stops as the stop
+  closes. The stop drains for at most 12 s, refusing the ordinary API class with 503 `stopping` while
+  protection, exits and the protective class continue, then closes: everything new is refused and the
+  operations in flight finish.
+- 25 s after the signal is the stop's own, cooperative deadline: nothing still running is waited for after
+  it, and the runtime's teardown is bounded by it. A stop that is itself blocked, as by a log pipe no one
+  reads, has no result then. 27 s after the signal is the independent bound: a thread of its own exits the
+  process with `_exit(70)` whatever is stuck, writing nothing; exit code 70 is its only record. Both fit the
+  pod's 30 s grace. Signals are handled from the start of `main`: one during the start's preparation
+  (configuration, the database connection and its retries, the schema check, the journal's readiness, the
+  epoch's insert) ends the start with nothing sent, even if the database comes back. Once the startup phase
+  runs, a signal drains it like any operation, and venue requests may already have been made.
+- A clean stop marks the process's epoch (`clean_stop_at`, `marker_version = 1`); a stop that fails a check
+  (deadline, aborted operation, latch, anything unlanded) writes no marker. A marker write that times out or
+  fails is unconfirmed: its update may have committed, and the log says so. A stop that gets past its waits
+  only after the deadline starts no marker. A version-1 marker records only those checks: it stands if
+  teardown work that holds no permit later keeps the process to the hard bound.
+  An entry reached while draining is refused at its send. A cancel-first exit cut short by the stop can
+  leave its leg without an exchange stop until the next process heals it.
+
 ### Added - Process epochs (ADR-0056 step 7, PR S, part 2)
 
 - Migration 32 adds `process_epochs`. Each start records its epoch before any venue request and refuses to start

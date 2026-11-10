@@ -59,6 +59,7 @@ pub mod query_engine;
 pub mod reconciliation_worker;
 mod sse;
 pub mod startup_recovery;
+pub mod stop;
 pub mod venue;
 
 #[cfg(feature = "postgres")]
