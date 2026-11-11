@@ -134,7 +134,7 @@ pub enum SpotReadError {
     /// A well-formed answer that contradicts the request or itself.
     #[error("Inconsistent spot answer: {0}")]
     Inconsistent(String),
-    /// Rules that parsed but cannot become the domain's trading rules.
+    /// Rules that parsed but give no usable market lot.
     #[error("Unusable spot rules: {0}")]
     InvalidRules(String),
 }

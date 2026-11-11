@@ -47,8 +47,8 @@ fn without_filter(kind: &str) -> String {
     info.to_string()
 }
 
-fn invalid_rules(rules: &SpotSymbolRules) -> String {
-    match rules.trading_rules() {
+fn market_lot_error(rules: &SpotSymbolRules) -> String {
+    match rules.market_lot() {
         Err(SpotReadError::InvalidRules(why)) => why,
         other => panic!("expected InvalidRules, got {other:?}"),
     }
@@ -102,21 +102,11 @@ fn btcusdt_rules_parse_as_published() {
 
 #[test]
 fn a_zero_market_lot_minimum_or_step_adds_no_constraint() {
-    let rules = btcusdt();
-    assert_eq!(rules.market_lot().unwrap(), SpotLotFilter {
+    assert_eq!(btcusdt().market_lot().unwrap(), SpotLotFilter {
         min_qty: dec!(0.00001),
         max_qty: dec!(108.95042220),
         step_size: dec!(0.00001),
     });
-
-    let domain = rules.trading_rules().unwrap();
-    assert_eq!(domain.symbol().as_pair(), "BTCUSDT");
-    assert_eq!((domain.tick_size(), domain.min_price()), (dec!(0.01), dec!(0.01)));
-    assert_eq!(
-        (domain.step_size(), domain.min_qty(), domain.max_qty()),
-        (dec!(0.00001), dec!(0.00001), dec!(108.95042220))
-    );
-    assert_eq!(domain.min_notional(), dec!(5));
 }
 
 #[test]
@@ -149,48 +139,36 @@ fn nested_steps_take_the_coarser_and_others_are_refused() {
 
     let crossed = with_filter("MARKET_LOT_SIZE", |f| f["stepSize"] = json!("0.00002500"));
     let rules = parse_symbol_rules(&crossed, "BTCUSDT").unwrap();
-    assert!(matches!(rules.market_lot(), Err(SpotReadError::InvalidRules(_))));
-    assert!(invalid_rules(&rules).contains("do not nest"));
+    assert!(market_lot_error(&rules).contains("do not nest"));
 }
 
+/// What the lot cannot decide stays visible for 8c's projection to refuse:
+/// no step on either filter, or a zero maximum, taken as written.
 #[test]
-fn rules_with_nothing_to_quantise_on_are_refused_not_guessed() {
-    // Both steps zero: no grid at all.
+fn zero_steps_and_a_zero_maximum_are_left_as_written() {
     let no_step = with_filter("LOT_SIZE", |f| f["stepSize"] = json!("0.00000000"));
     let rules = parse_symbol_rules(&no_step, "BTCUSDT").unwrap();
     assert_eq!(rules.market_lot().unwrap().step_size, Decimal::ZERO);
-    assert!(invalid_rules(&rules).contains("step_size"));
 
-    // A disabled tick (PRICE_FILTER zero) parses and cannot serve the domain.
-    let no_tick = with_filter("PRICE_FILTER", |f| f["tickSize"] = json!("0.00000000"));
-    let rules = parse_symbol_rules(&no_tick, "BTCUSDT").unwrap();
-    assert!(invalid_rules(&rules).contains("tick_size"));
-
-    // A zero maximum is taken as written, so nothing fits.
     let no_max = with_filter("MARKET_LOT_SIZE", |f| f["maxQty"] = json!("0.00000000"));
     let rules = parse_symbol_rules(&no_max, "BTCUSDT").unwrap();
-    assert!(invalid_rules(&rules).contains("max_qty"));
+    assert_eq!(rules.market_lot().unwrap().max_qty, Decimal::ZERO);
 }
 
 #[test]
-fn optional_filters_parse_absent_and_the_domain_rules_need_theirs() {
-    for (kind, needed) in [
-        ("PRICE_FILTER", true),
-        ("LOT_SIZE", true),
-        ("NOTIONAL", true),
-        ("MARKET_LOT_SIZE", false),
-        ("MAX_NUM_ALGO_ORDERS", false),
-    ] {
-        let rules = parse_symbol_rules(&without_filter(kind), "BTCUSDT").unwrap();
-        if needed {
-            assert!(invalid_rules(&rules).contains(kind), "{kind}");
-        } else {
-            rules.trading_rules().unwrap();
-        }
-    }
+fn optional_filters_parse_absent_and_the_lot_needs_lot_size() {
+    let rules = parse_symbol_rules(&without_filter("LOT_SIZE"), "BTCUSDT").unwrap();
+    assert_eq!(rules.lot_size, None);
+    assert!(market_lot_error(&rules).contains("no LOT_SIZE"));
+
+    let rules = parse_symbol_rules(&without_filter("PRICE_FILTER"), "BTCUSDT").unwrap();
+    assert_eq!(rules.price_filter, None);
+    let rules = parse_symbol_rules(&without_filter("NOTIONAL"), "BTCUSDT").unwrap();
+    assert_eq!(rules.notional, None);
     let rules = parse_symbol_rules(&without_filter("MAX_NUM_ALGO_ORDERS"), "BTCUSDT").unwrap();
     assert_eq!(rules.max_num_algo_orders, None);
     let rules = parse_symbol_rules(&without_filter("MARKET_LOT_SIZE"), "BTCUSDT").unwrap();
+    assert_eq!(rules.market_lot_size, None);
     assert_eq!(rules.market_lot().unwrap(), rules.lot_size.clone().unwrap());
 }
 

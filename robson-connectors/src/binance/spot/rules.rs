@@ -3,11 +3,15 @@
 //! Filter semantics are Binance's, `filters.md` at `995f6eb3`: PRICE_FILTER
 //! L38, LOT_SIZE L129, NOTIONAL L184, MARKET_LOT_SIZE L229,
 //! MAX_NUM_ALGO_ORDERS L269. "All symbol filters are optional" (`rest-api.md`
-//! L986), so each is an `Option` here, and [`SpotSymbolRules::trading_rules`]
-//! refuses rules that lack one it needs. Every value is runtime metadata,
-//! never a constant (AGENTS.md invariant 9).
+//! L986), so each is an `Option` here. Every value is runtime metadata, never
+//! a constant (AGENTS.md invariant 9).
+//!
+//! The projection onto the domain's `SymbolTradingRules` belongs to 8c. It
+//! must refuse a `minPrice`/`tickSize` pair whose grid differs from Binance's:
+//! spot's price rule is `price % tickSize == 0` (filters.md L52), while the
+//! domain anchors its grid at `min_price`, so `minPrice` 0.015 with
+//! `tickSize` 0.01 would round a trigger onto a price Binance refuses.
 
-use robson_domain::{Symbol, SymbolTradingRules};
 use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
@@ -98,42 +102,6 @@ impl SpotSymbolRules {
             max_qty: lot.max_qty.min(market.max_qty),
             step_size,
         })
-    }
-
-    /// The domain's trading rules: PRICE_FILTER's tick and minimum,
-    /// [`Self::market_lot`], and NOTIONAL's minimum whether or not
-    /// `apply_min_to_market` is set (the domain checks it only at admission,
-    /// where the stricter reading only refuses). The domain's precisions,
-    /// which it never uses to round, are the assets' precisions.
-    ///
-    /// # Errors
-    /// [`SpotReadError::InvalidRules`] when a filter it needs is missing, or
-    /// a disabled (zero) tick or step leaves the domain nothing to quantise
-    /// on.
-    pub fn trading_rules(&self) -> Result<SymbolTradingRules, SpotReadError> {
-        let symbol = Symbol::new(self.base_asset.clone(), self.quote_asset.clone())
-            .map_err(|e| SpotReadError::InvalidRules(format!("{}: {e}", self.symbol)))?;
-        if symbol.as_pair() != self.symbol {
-            return Err(SpotReadError::InvalidRules(format!(
-                "{} is not {} + {}",
-                self.symbol, self.base_asset, self.quote_asset
-            )));
-        }
-        let price = self.price_filter.as_ref().ok_or_else(|| self.missing("PRICE_FILTER"))?;
-        let notional = self.notional.as_ref().ok_or_else(|| self.missing("NOTIONAL"))?;
-        let lot = self.market_lot()?;
-        SymbolTradingRules::new(
-            symbol,
-            price.tick_size,
-            price.min_price,
-            lot.step_size,
-            lot.min_qty,
-            lot.max_qty,
-            notional.min_notional,
-            self.quote_asset_precision,
-            self.base_asset_precision,
-        )
-        .map_err(|e| SpotReadError::InvalidRules(format!("{}: {e}", self.symbol)))
     }
 
     fn missing(&self, filter: &str) -> SpotReadError {
