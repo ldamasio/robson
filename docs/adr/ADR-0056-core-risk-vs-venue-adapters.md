@@ -1161,6 +1161,36 @@ every collection, memory and SQL alike: a page past every total is empty in each
 part 2's release works without it (a stale request answers the current generation). Rollback across part 3 alone: to part 2's
 image, which keeps migrations 34 and 35.
 
+*Part 4, the orphan-cancel veto.* Design §2.9. **An `ins-` order is never cancelled by the orphan sweep while an incident is open,
+the fence closed or the latch set.** The scan checks once at its start and withholds every orphan it finds then. Otherwise each
+orphan's cancel is checked again just before its journal write (`OrderJournal::journaled_orphan_cancel`, withheld with no intent
+written), and the binding check is at the transport's handoff: the cancel runs as an orphan sweep's cancel
+(`gate::orphan_sweep_cancel`, a task-local scope), and `OperationGate::mutation`, which `delete_signed` and every mutating method
+of the stub call, re-checks the veto under the gate's mutex, after the cancel's journal await. Refused there, nothing has left:
+the intent ends `not_sent`, `cancel_class = 'withheld'`, a proven no-send and no occurrence; a cancel one of whose requests had
+already passed is uncertain, as any. An occurrence after the handoff's check lets that cancel go as in flight, the same
+linearization as an entry's send. The veto covers the sweep's cancels only: ordinary protective follow-ups (replacement,
+withdrawal, the software-exit cancel) are not subject to it, and UNTRACKED closes of foreign positions continue as reductions. A
+scan that could not read the legs cancels nothing, as before; the sweep reads no journal linkage today (that is step 8's
+orphan exclusion by linkage), so that failure has nothing to veto yet.
+
+**Reporting.** Each scan replaces the report of what it withheld, kept on the journal: at most 500 orders listed (symbol, venue
+order id, client id), `total` counting every one, `truncated` past 500. `robsond_orphan_cancel_withheld_total` counts each order
+withheld by each scan, `robsond_orphan_cancel_withheld_overflow_total` those past the 500, both exported from startup. The pending
+list shows the report as `withheld_protective_orders`, paged from the same saturated offset as its other collections. **Truncating the report never narrows enforcement:** the veto applied to
+every order, listed or not.
+
+**Why, and the cost.** While something is unresolved, an `ins-` order outside coverage may be the only protection of exposure
+nothing owns; keeping it can only reduce exposure (USD-M stops are reduce-only), cancelling it can leave that exposure
+unprotected. The cost: an orphan lingers until a release and may partially reduce an `Active` leg on the same symbol and side;
+that accounting effect is fenced too, and admissions are closed meanwhile.
+
+What part 4 changes in production: while the fence is closed, including the first start of part 2's image until its release, the
+startup scan and every reconciliation scan keep orphan `ins-` orders instead of cancelling them. With P before part 4, an
+`Entering` leg's stop could still be cancelled by the sweep after a restart (P's disclosed limitation); from part 4 it is kept
+while that restart is fenced. Rollback across part 4 alone: to part 3's image, which restores the sweep's cancels during an
+incident; no condition beyond part 2's.
+
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations. Where this ADR names a persisted-state version (steps 5 and 7) it is target architecture: no step has written a
 `persisted_state_version` record, and nothing checks one. What guards the schema today is SQLx's migration validation (an

@@ -79,8 +79,8 @@ use crate::{
     cancel::{classify_cancel, CancelClass},
     error::ExecError,
     gate::{
-        GateState, Incident, IncidentReason, Occurrence, OperationGate, OperationKind,
-        PermitRefusal, Phase, ALLOCATED_SLOTS,
+        orphan_sweep_cancel, GateState, Incident, IncidentReason, Occurrence, OperationGate,
+        OperationKind, OrphanSweepCancel, PermitRefusal, Phase, ALLOCATED_SLOTS,
     },
     ports::StopCancelOutcome,
     quantize::Submission,
@@ -798,6 +798,50 @@ pub struct IntentSpec {
     pub params: Value,
 }
 
+/// What became of an orphan sweep's cancel.
+#[derive(Debug)]
+pub enum OrphanCancel {
+    /// The veto held: nothing was sent.
+    Withheld,
+    /// It went to the venue, and this is its class.
+    Sent(CancelClass),
+}
+
+/// One `ins-` order the orphan sweep withheld (design §2.9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WithheldOrder {
+    pub symbol: String,
+    pub exchange_order_id: String,
+    pub client_order_id: String,
+}
+
+/// The last scan's withheld orders: at most [`WITHHELD_REPORT_CAPACITY`]
+/// listed, `total` counting every one. A report only: the veto applied to
+/// every order, listed or not.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WithheldReport {
+    pub orders: Vec<WithheldOrder>,
+    pub total: u64,
+    pub truncated: bool,
+    pub at: Option<DateTime<Utc>>,
+}
+
+/// Withheld orders one report lists.
+pub const WITHHELD_REPORT_CAPACITY: usize = 500;
+
+impl WithheldReport {
+    /// Count `order`, and list it while there is room. Whether it was listed.
+    pub fn withhold(&mut self, order: WithheldOrder) -> bool {
+        self.total += 1;
+        if self.orders.len() < WITHHELD_REPORT_CAPACITY {
+            self.orders.push(order);
+            return true;
+        }
+        self.truncated = true;
+        false
+    }
+}
+
 /// Where a bounded send with no row was remembered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnlandedKept {
@@ -994,6 +1038,8 @@ pub struct OrderJournal {
     /// taken with no other lock held).
     flush_pass: tokio::sync::Mutex<()>,
     release_bound: Duration,
+    /// The orphan sweep's last report, a sync leaf held with no other lock.
+    withheld: Mutex<WithheldReport>,
 }
 
 impl OrderJournal {
@@ -1014,6 +1060,7 @@ impl OrderJournal {
             non_reuse_ids_lost: AtomicU64::new(0),
             flush_pass: tokio::sync::Mutex::new(()),
             release_bound: RELEASE_BOUND,
+            withheld: Mutex::default(),
         }
     }
 
@@ -1130,6 +1177,16 @@ impl OrderJournal {
             );
         }
         occurrences.iter().for_each(Occurrence::log);
+    }
+
+    /// Replace the orphan sweep's report with the last scan's.
+    pub fn replace_withheld_report(&self, report: WithheldReport) {
+        *self.withheld.lock().unwrap_or_else(|e| e.into_inner()) = report;
+    }
+
+    /// The orphan sweep's last report.
+    pub fn withheld_report(&self) -> WithheldReport {
+        self.withheld.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Bounded sends whose id could be kept neither in the retry set nor as a
@@ -1816,6 +1873,45 @@ impl OrderJournal {
         let class = classify_cancel(cancel.await);
         self.finish_cancel(&intent, &class).await;
         class
+    }
+
+    /// An orphan sweep's cancel of the `ins-` order `order_id` (design §2.9):
+    /// withheld with nothing written or sent while the veto holds, checked
+    /// once before its journal write; otherwise journaled like any cancel and
+    /// run as an orphan sweep's cancel, so the transport re-checks the veto at
+    /// its handoff, after that write. Refused there, nothing left: the intent
+    /// ends `not_sent`, class `withheld`, a proven no-send and no occurrence.
+    pub async fn journaled_orphan_cancel<F>(&self, order_id: &str, cancel: F) -> OrphanCancel
+    where
+        F: Future<Output = Result<StopCancelOutcome, ExecError>>,
+    {
+        if self.gate.orphan_cancel_vetoed() {
+            return OrphanCancel::Withheld;
+        }
+        let intent = self.open_intent(IntentSpec {
+            position_id: None,
+            kind: IntentKind::Cancel,
+            client_order_id: format!("cxl-{}", Uuid::now_v7().simple()),
+            cancels_order_id: Some(order_id.to_string()),
+            params: Value::Null,
+        });
+        if let Err(refusal) = self.before_send(&intent, WriteClass::Bounded).await {
+            warn!(%order_id, %refusal, "Orphan cancel goes on without a journal row");
+        }
+        let handoff = Arc::new(OrphanSweepCancel::default());
+        let result = orphan_sweep_cancel(Arc::clone(&handoff), cancel).await;
+        if handoff.withheld() && !handoff.passed() {
+            self.write_outcome(&intent, OutcomeRow {
+                not_sent: true,
+                cancel_class: Some("withheld"),
+                ..OutcomeRow::default()
+            })
+            .await;
+            return OrphanCancel::Withheld;
+        }
+        let class = classify_cancel(result);
+        self.finish_cancel(&intent, &class).await;
+        OrphanCancel::Sent(class)
     }
 
     /// The result's write. Never fails: the caller keeps the venue's answer
@@ -4266,5 +4362,150 @@ mod tests {
         for journal in [unlanded, conflicting, suspended, aborted, unpermitted] {
             assert!(journal.latch_set() && journal.gate().fenced());
         }
+    }
+
+    // =========================================================================
+    // PR F: the orphan-cancel veto (design §2.9)
+    // =========================================================================
+
+    async fn the_orphans_cancel(
+        gate: Arc<OperationGate>,
+        then_fence: bool,
+    ) -> Result<StopCancelOutcome, ExecError> {
+        if then_fence {
+            // Something opens an incident after the sweep's own check.
+            gate.record(IncidentReason::UncertainOutcome);
+        }
+        gate.mutation("DELETE /fapi/v1/algoOrder")
+            .map_err(|refused| ExecError::SendRefused(refused.to_string()))?;
+        Ok(cancelled())
+    }
+
+    fn cancel_rows(backend: &StubJournalBackend) -> Vec<StubJournalRow> {
+        backend
+            .rows()
+            .into_iter()
+            .filter(|row| row.intent.as_ref().unwrap().kind == IntentKind::Cancel)
+            .collect()
+    }
+
+    /// While an incident is open an orphan's cancel is withheld before its
+    /// journal write: no intent, nothing sent, no new occurrence.
+    #[tokio::test]
+    async fn an_orphan_cancel_is_withheld_while_an_incident_is_open() {
+        let (backend, journal) = journal();
+        journal.gate().record(IncidentReason::UncleanStart);
+        let generation = journal.gate().generation();
+        let ((), _op) = in_op(&journal, async {
+            let never = async { panic!("a withheld cancel is never polled") };
+            let cancelled = journal.journaled_orphan_cancel("77", never).await;
+            assert!(matches!(cancelled, OrphanCancel::Withheld), "{cancelled:?}");
+        })
+        .await;
+        journal.flush_pending().await;
+        assert!(cancel_rows(&backend).is_empty());
+        assert_eq!(journal.gate().generation(), generation, "a withheld cancel is no occurrence");
+    }
+
+    /// The binding check is at the handoff, after the journal's write: an
+    /// incident opened in between refuses the request there. Nothing left, so
+    /// the intent is a proven no-send, class `withheld`, and no uncertain
+    /// outcome is recorded for it.
+    #[tokio::test]
+    async fn the_handoff_withholds_an_orphan_cancel_the_fence_overtook() {
+        let (backend, journal) = journal();
+        let ((), _op) = in_op(&journal, async {
+            let cancel = the_orphans_cancel(Arc::clone(journal.gate()), true);
+            let cancelled = journal.journaled_orphan_cancel("77", cancel).await;
+            assert!(matches!(cancelled, OrphanCancel::Withheld), "{cancelled:?}");
+        })
+        .await;
+        journal.flush_pending().await;
+        let rows = cancel_rows(&backend);
+        assert_eq!(rows.len(), 1);
+        let outcome = rows[0].outcome.clone().unwrap();
+        assert!(outcome.not_sent && outcome.uncertain_at.is_none(), "{outcome:?}");
+        assert_eq!(outcome.cancel_class, Some("withheld"));
+        assert_eq!(
+            reasons(&journal),
+            [IncidentReason::UncertainOutcome],
+            "only the overtaking one"
+        );
+        let gate = journal.gate().snapshot();
+        assert_eq!((gate.orphan_cancels_passed, gate.orphan_cancels_withheld), (0, 1));
+    }
+
+    /// With nothing open the orphan's cancel goes out and is classified as any
+    /// cancel; a protective cancel outside the sweep is never subject to the
+    /// veto, fence or not.
+    #[tokio::test]
+    async fn only_the_sweeps_cancels_are_vetoed() {
+        let (backend, journal) = journal();
+        let ((), _op) = in_op(&journal, async {
+            let cancel = the_orphans_cancel(Arc::clone(journal.gate()), false);
+            let cancelled = journal.journaled_orphan_cancel("77", cancel).await;
+            assert!(matches!(cancelled, OrphanCancel::Sent(CancelClass::Cancelled { .. })));
+        })
+        .await;
+        journal.flush_pending().await;
+        assert_eq!(
+            cancel_rows(&backend)[0].outcome.clone().unwrap().cancel_class,
+            Some("cancelled")
+        );
+
+        journal.gate().record(IncidentReason::UncertainOutcome);
+        journal
+            .acquire(OperationKind::CancelOrClose)
+            .unwrap()
+            .run(async {
+                let class = journal
+                    .journaled_cancel(None, "78", async {
+                        journal.gate().mutation("DELETE /fapi/v1/algoOrder").unwrap();
+                        Ok(cancelled())
+                    })
+                    .await;
+                assert!(class.is_definite(), "a follow-up's cancel goes out under the fence");
+            })
+            .await;
+    }
+
+    /// A cancel one of whose requests passed the handoff may have reached the
+    /// venue: refused on a later one, it is uncertain, never `not_sent`.
+    #[tokio::test]
+    async fn an_orphan_cancel_that_passed_the_handoff_once_is_not_a_no_send() {
+        let (backend, journal) = journal();
+        let ((), _op) = in_op(&journal, async {
+            let gate = Arc::clone(journal.gate());
+            let cancel = async move {
+                gate.mutation("DELETE /fapi/v1/algoOrder").unwrap();
+                gate.record(IncidentReason::UncleanStart);
+                gate.mutation("DELETE /fapi/v1/order")
+                    .map_err(|refused| ExecError::SendRefused(refused.to_string()))?;
+                Ok(cancelled())
+            };
+            let cancelled = journal.journaled_orphan_cancel("77", cancel).await;
+            assert!(matches!(cancelled, OrphanCancel::Sent(CancelClass::Errored(_))));
+        })
+        .await;
+        journal.flush_pending().await;
+        let outcome = cancel_rows(&backend)[0].outcome.clone().unwrap();
+        assert!(!outcome.not_sent && outcome.uncertain_at.is_some(), "{outcome:?}");
+    }
+
+    /// The report lists at most 500 withheld orders and counts every one.
+    #[test]
+    fn the_withheld_report_is_capped_and_counts_past_its_cap() {
+        let mut report = WithheldReport::default();
+        for index in 0..WITHHELD_REPORT_CAPACITY + 2 {
+            let listed = report.withhold(WithheldOrder {
+                symbol: "BTCUSDT".to_string(),
+                exchange_order_id: index.to_string(),
+                client_order_id: format!("ins-{index}"),
+            });
+            assert_eq!(listed, index < WITHHELD_REPORT_CAPACITY);
+        }
+        assert_eq!(report.orders.len(), WITHHELD_REPORT_CAPACITY);
+        assert_eq!(report.total, WITHHELD_REPORT_CAPACITY as u64 + 2);
+        assert!(report.truncated);
     }
 }

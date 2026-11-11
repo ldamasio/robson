@@ -47,6 +47,10 @@
 //! - `robsond_admission_fence_closed` — the admission fence is closed, labelled
 //!   by the reason of each open incident (ADR-0056 step 7, PR F)
 //! - `robsond_recovery_incidents_open` — open incidents, by reason
+//! - `robsond_orphan_cancel_withheld_total` — orphan `ins-` cancels the veto
+//!   withheld
+//! - `robsond_orphan_cancel_withheld_overflow_total` — of those, the ones past
+//!   the report's 500 entries
 
 use std::sync::LazyLock;
 
@@ -273,6 +277,25 @@ pub static RECOVERY_INCIDENTS_OPEN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("failed to register robsond_recovery_incidents_open")
 });
 
+/// Orphan `ins-` orders the sweep's veto withheld, once per order and scan
+/// (ADR-0056 step 7, PR F, design §2.9).
+pub static ORPHAN_CANCEL_WITHHELD: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_orphan_cancel_withheld_total",
+        "Orphan insurance-stop cancels withheld while an incident is open or the latch set"
+    )
+    .expect("failed to register robsond_orphan_cancel_withheld_total")
+});
+
+/// Withheld orders past the report's 500 entries: withheld all the same.
+pub static ORPHAN_CANCEL_WITHHELD_OVERFLOW: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_orphan_cancel_withheld_overflow_total",
+        "Withheld orphan cancels past the report's capacity; the veto still applied"
+    )
+    .expect("failed to register robsond_orphan_cancel_withheld_overflow_total")
+});
+
 /// Publish the fence and the open incidents; every reason exports.
 pub fn observe_fence(journal: &robson_exec::order_journal::OrderJournal) {
     let gate = journal.gate();
@@ -299,6 +322,8 @@ pub fn init_operation_gate_metrics() {
     // Absent until a stop is first behind its plan, which an alert must not
     // read as healthy: 0 from startup, when nothing is behind yet.
     LazyLock::force(&INSURANCE_STOP_STALE_POSITIONS);
+    LazyLock::force(&ORPHAN_CANCEL_WITHHELD);
+    LazyLock::force(&ORPHAN_CANCEL_WITHHELD_OVERFLOW);
     for class in ["ordinary", "protective"] {
         API_SLOT_BUSY.with_label_values(&[class]);
     }
