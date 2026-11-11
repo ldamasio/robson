@@ -53,6 +53,16 @@
 //! intents and releases the incidents it covers, and the fence opens only if
 //! the generation did not move meanwhile.
 //!
+//! **Ownership (PR O).** A live operation owns what it registers here: the
+//! orders its intents place or cancel, until it ends
+//! ([`OrderJournal::owned_by_live_operation`]), and the inventory of a symbol
+//! and side: an entry claims its key at its send and keeps it until its
+//! operation ends; an UNTRACKED sweep claims the key before it classifies the
+//! position and keeps it through every submission of its close
+//! ([`OrderJournal::claim_sweep`]). An entry meeting a sweep's claim is refused
+//! at its send, a typed no-send; a sweep meeting an entry's claim defers. No
+//! one waits on a claim.
+//!
 //! The sync mutex here is a leaf and is never held across an await. The gate's
 //! mutex comes before it in the lock order, and nothing here takes the gate's
 //! while holding this one.
@@ -70,7 +80,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use robson_domain::PositionId;
+use robson_domain::{OrderSide, PositionId, Side, Symbol};
 use serde_json::Value;
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -916,6 +926,8 @@ struct IntentMemory {
     /// The one fresh intent that took over after that refusal.
     replaced_by: Option<JournaledIntent>,
     in_retry_set: bool,
+    /// The inventory an entry claims at its send (PR O).
+    ownership: Option<OwnershipKey>,
 }
 
 impl IntentMemory {
@@ -980,6 +992,103 @@ pub struct OperationInFlight {
     pub intents: Vec<(String, IntentKind, bool)>,
 }
 
+/// The inventory a claim is on (ADR-0056 step 7, PR O): one symbol and side
+/// of this journal's venue and account scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnershipKey {
+    symbol: String,
+    side: Side,
+}
+
+impl std::hash::Hash for OwnershipKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.symbol.hash(state);
+        matches!(self.side, Side::Long).hash(state);
+    }
+}
+
+impl OwnershipKey {
+    pub fn new(symbol: &Symbol, side: Side) -> Self {
+        Self { symbol: symbol.as_pair(), side }
+    }
+
+    /// The position an entry order opens, one-way: a buy opens a long.
+    pub fn of_entry(symbol: &Symbol, side: OrderSide) -> Self {
+        let side = match side {
+            OrderSide::Buy => Side::Long,
+            OrderSide::Sell => Side::Short,
+        };
+        Self::new(symbol, side)
+    }
+}
+
+impl fmt::Display for OwnershipKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {:?}", self.symbol, self.side)
+    }
+}
+
+/// Who holds one key now.
+#[derive(Debug, Default)]
+struct KeyClaims {
+    /// The sweep holding it: its token and its operation.
+    sweep: Option<(u64, u64)>,
+    /// The operations whose entries claimed it at their send.
+    entries: Vec<u64>,
+}
+
+impl KeyClaims {
+    fn is_empty(&self) -> bool {
+        self.sweep.is_none() && self.entries.is_empty()
+    }
+}
+
+/// An UNTRACKED sweep's claim on a key, for the whole logical close: every
+/// submission, a fresh-ID successor's included. Only
+/// [`OrderJournal::release_sweep`] or its operation's end releases it; it has
+/// no destructor, so dropping it releases nothing before the operation ends.
+#[derive(Debug)]
+#[must_use = "a sweep claim is released only by release_sweep or its operation's end"]
+pub struct SweepClaim {
+    key: OwnershipKey,
+    token: u64,
+}
+
+impl SweepClaim {
+    pub fn key(&self) -> &OwnershipKey {
+        &self.key
+    }
+}
+
+/// Why a sweep could not claim a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepClaimRefused {
+    /// A live entry claimed it: its inventory is not untracked.
+    LiveEntry,
+    /// Another sweep holds it.
+    SweepHeld,
+    /// The caller is in no operation, whose end would release the claim.
+    NoOperation,
+}
+
+impl fmt::Display for SweepClaimRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::LiveEntry => "a live entry holds this symbol and side",
+            Self::SweepHeld => "another sweep holds this symbol and side",
+            Self::NoOperation => "no operation to hold the claim",
+        })
+    }
+}
+
+/// One key's holders, for tests and inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimView {
+    pub key: OwnershipKey,
+    pub sweep: bool,
+    pub entries: usize,
+}
+
 /// One entry of `persistence_pending`, for the pending list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingEntry {
@@ -1013,6 +1122,11 @@ struct JournalState {
     /// has a durable row, which the unique index holds for good, or was never
     /// sent.
     discarded: HashSet<String>,
+    /// Who holds each key's inventory now (PR O). A key no one holds is
+    /// removed, so at most one sweep's key plus the keys of the live
+    /// operations' entries.
+    claims: HashMap<OwnershipKey, KeyClaims>,
+    next_claim_token: u64,
 }
 
 impl JournalState {
@@ -1246,6 +1360,75 @@ impl OrderJournal {
         })
     }
 
+    /// The inventory the entry `intent` opens, claimed at its send
+    /// ([`begin_send`]) and held until its operation ends (PR O).
+    pub fn own_entry_key(&self, intent: &JournaledIntent, key: OwnershipKey) {
+        let mut state = self.lock();
+        if let Some(memory) = state.intents.get_mut(&intent.client_order_id) {
+            if memory.row.intent_id == intent.intent_id {
+                memory.ownership = Some(key);
+            }
+        }
+    }
+
+    /// Claim `key` for an UNTRACKED sweep in this task's operation, before it
+    /// classifies the position (ADR-0056 step 7, PR O). Refused while a live
+    /// entry holds the key: its inventory is that entry's, and the sweep
+    /// defers it to its next scan. One gate→journal section, no waiting.
+    ///
+    /// # Errors
+    /// The key is held, or the caller is in no operation.
+    pub fn claim_sweep(&self, key: OwnershipKey) -> Result<SweepClaim, SweepClaimRefused> {
+        let operation = CURRENT_OPERATION
+            .try_with(|current| current.id)
+            .map_err(|_| SweepClaimRefused::NoOperation)?;
+        let (_gate, mut state) = self.lock_both();
+        if !state.operations.contains_key(&operation) {
+            return Err(SweepClaimRefused::NoOperation);
+        }
+        if let Some(claims) = state.claims.get(&key) {
+            if !claims.entries.is_empty() {
+                return Err(SweepClaimRefused::LiveEntry);
+            }
+            if claims.sweep.is_some() {
+                return Err(SweepClaimRefused::SweepHeld);
+            }
+        }
+        state.next_claim_token += 1;
+        let token = state.next_claim_token;
+        state.claims.entry(key.clone()).or_default().sweep = Some((token, operation));
+        Ok(SweepClaim { key, token })
+    }
+
+    /// Release a sweep's claim, once the endings of every submission of its
+    /// close are registered: an uncertain one has closed the fence by then.
+    /// Only the claim this token names goes, so an obsolete one cannot remove
+    /// a newer claim. One gate→journal section.
+    pub fn release_sweep(&self, claim: SweepClaim) {
+        let (_gate, mut state) = self.lock_both();
+        if let Some(claims) = state.claims.get_mut(&claim.key) {
+            if claims.sweep.is_some_and(|(token, _)| token == claim.token) {
+                claims.sweep = None;
+            }
+            if claims.is_empty() {
+                state.claims.remove(&claim.key);
+            }
+        }
+    }
+
+    /// Every key held now, with its holders.
+    pub fn claims_view(&self) -> Vec<ClaimView> {
+        self.lock()
+            .claims
+            .iter()
+            .map(|(key, claims)| ClaimView {
+                key: key.clone(),
+                sweep: claims.sweep.is_some(),
+                entries: claims.entries.len(),
+            })
+            .collect()
+    }
+
     /// Start an operation without a permit: its intents are listed in
     /// `operations_in_flight` until the returned guard drops. Past the entries
     /// the permits leave over it runs unlisted and an entry cannot be
@@ -1399,6 +1582,7 @@ impl OrderJournal {
             retry_refused: false,
             replaced_by: None,
             in_retry_set: false,
+            ownership: None,
         });
         handle
     }
@@ -1692,6 +1876,30 @@ impl OrderJournal {
             return Err(SendRefusal::NotSent(format!(
                 "entry refused at its send: the daemon is {why}"
             )));
+        }
+        // PR O: the entry claims the inventory it opens, in this section, with
+        // its ticket; while a sweep's close holds the key it is a no-send.
+        if entry {
+            let claim = state
+                .intents
+                .get(client_order_id)
+                .and_then(|memory| Some((memory.ownership.clone()?, memory.operation)));
+            if let Some((key, operation)) = claim {
+                if state.claims.get(&key).is_some_and(|claims| claims.sweep.is_some()) {
+                    gate.entry_refused_ownership();
+                    drop((gate, state));
+                    self.gate.observe_entry_refused_ownership();
+                    return Err(SendRefusal::NotSent(format!(
+                        "entry refused at its send: a sweep close is in flight on {key}"
+                    )));
+                }
+                if state.operations.contains_key(&operation) {
+                    let claims = state.claims.entry(key).or_default();
+                    if !claims.entries.contains(&operation) {
+                        claims.entries.push(operation);
+                    }
+                }
+            }
         }
         gate.send_started();
         let Some(memory) = state.intents.get_mut(client_order_id) else {
@@ -2419,6 +2627,16 @@ impl Drop for Operation {
         if self.listed_unpermitted {
             state.unpermitted_listed -= 1;
         }
+        // PR O: every claim of this operation goes with it, whatever its
+        // intents' memory holds, and so does a key no one holds any more.
+        let id = self.id;
+        state.claims.retain(|_, claims| {
+            claims.entries.retain(|operation| *operation != id);
+            if claims.sweep.is_some_and(|(_, operation)| operation == id) {
+                claims.sweep = None;
+            }
+            !claims.is_empty()
+        });
         let abandoned: HashSet<String> = state
             .intents
             .iter()
@@ -4575,5 +4793,130 @@ mod tests {
         drop(operation);
         assert!(!failing.owned_by_live_operation("ins-w", "W-1"));
         assert!(!failing.owned_by_live_operation("ins-other", "V-1"));
+    }
+
+    // ---- ADR-0056 step 7, PR O: claims on a symbol and side ----
+
+    fn btc_long() -> OwnershipKey {
+        OwnershipKey::new(&Symbol::from_pair("BTCUSDT").unwrap(), Side::Long)
+    }
+
+    fn eth_long() -> OwnershipKey {
+        OwnershipKey::new(&Symbol::from_pair("ETHUSDT").unwrap(), Side::Long)
+    }
+
+    fn view(key: &OwnershipKey, sweep: bool, entries: usize) -> ClaimView {
+        ClaimView { key: key.clone(), sweep, entries }
+    }
+
+    /// An entry on BTCUSDT long at its send, answered by the venue when it
+    /// left: it meets a sweep's claim, or takes its own.
+    async fn send_entry(journal: &Arc<OrderJournal>, id: &str) -> Result<(), SendRefusal> {
+        let entry = journal.open_intent(spec(id, IntentKind::Entry));
+        let btc = Symbol::from_pair("BTCUSDT").unwrap();
+        journal.own_entry_key(&entry, OwnershipKey::of_entry(&btc, OrderSide::Buy));
+        journal.before_send(&entry, WriteClass::Strict).await.unwrap();
+        let sent = begin_send(id);
+        match sent {
+            Ok(()) => journal.finish_success(&entry, None).await,
+            Err(_) => journal.finish_failed(&entry).await,
+        }
+        sent
+    }
+
+    #[tokio::test]
+    async fn an_entry_and_a_sweep_exclude_each_other_on_their_key() {
+        let (backend, journal) = journal();
+        let (k, k2) = (btc_long(), eth_long());
+
+        let (sent, entry_op) = in_op(&journal, send_entry(&journal, "e1")).await;
+        assert_eq!(sent, Ok(()));
+        assert_eq!(journal.claims_view(), vec![view(&k, false, 1)]);
+
+        let (refused, sweep_op) = in_op(&journal, async { journal.claim_sweep(k.clone()) }).await;
+        assert_eq!(refused.unwrap_err(), SweepClaimRefused::LiveEntry);
+        let other = sweep_op.scope(async { journal.claim_sweep(k2.clone()) }).await.unwrap();
+        assert_eq!(other.key(), &k2);
+
+        drop(entry_op);
+        assert_eq!(journal.claims_view(), vec![view(&k2, true, 0)], "an empty key goes");
+        let claim = sweep_op.scope(async { journal.claim_sweep(k.clone()) }).await.unwrap();
+        let again = sweep_op.scope(async { journal.claim_sweep(k.clone()) }).await;
+        assert_eq!(again.unwrap_err(), SweepClaimRefused::SweepHeld);
+
+        let ((), entry_op) = in_op(&journal, async {
+            let refused = send_entry(&journal, "e2").await;
+            assert!(
+                matches!(&refused, Err(SendRefusal::NotSent(why)) if why.contains("sweep")),
+                "{refused:?}"
+            );
+        })
+        .await;
+        assert!(backend.row("e2").unwrap().outcome.unwrap().not_sent, "a proven no-send");
+        assert!(!journal.gate().fenced());
+        assert_eq!(journal.gate().snapshot().entries_refused_ownership, 1);
+        assert!(journal.claims_view().contains(&view(&k, true, 0)), "no entry claim taken");
+
+        // Only the claim a token names goes.
+        journal.release_sweep(SweepClaim { key: k.clone(), token: claim.token + 100 });
+        assert!(journal.claims_view().contains(&view(&k, true, 0)));
+        journal.release_sweep(claim);
+        assert_eq!(journal.claims_view(), vec![view(&k2, true, 0)]);
+        let sent = entry_op.scope(send_entry(&journal, "e3")).await;
+        assert_eq!(sent, Ok(()));
+
+        // An operation's end takes every claim it holds, never released or not.
+        drop(sweep_op);
+        assert_eq!(journal.claims_view(), vec![view(&k, false, 1)]);
+        drop(entry_op);
+        assert!(journal.claims_view().is_empty());
+        assert_eq!(journal.claim_sweep(k).unwrap_err(), SweepClaimRefused::NoOperation);
+    }
+
+    /// The sweep's claim belongs to its whole close: the first submission,
+    /// the refused same-ID retry, the fresh-ID successor B with A's uncertain
+    /// ending registered before it, A's flush, completion with its unlink,
+    /// and with the retry set full too. Only `release_sweep` frees the key.
+    #[tokio::test]
+    async fn a_sweep_claim_outlives_every_ending_until_it_is_released() {
+        for saturated in [false, true] {
+            let (backend, journal) = journal();
+            if saturated {
+                backend.saturate(&journal).await;
+            }
+            let k = btc_long();
+            let held = || journal.claims_view() == vec![view(&k, true, 0)];
+            let operation = journal.begin_operation();
+            operation
+                .scope(async {
+                    let claim = journal.claim_sweep(k.clone()).unwrap();
+                    let a = journal.open_intent(spec("sweep-a", IntentKind::SweepClose));
+                    journal.authorize_reduction(&a, Submission::First, String::new).await.unwrap();
+                    begin_send("sweep-a").unwrap();
+                    backend.push_fault(JournalFault::Known);
+                    let retry =
+                        journal.authorize_reduction(&a, Submission::SameIdRetry, String::new);
+                    assert!(retry.await.is_err(), "the same-id retry is refused");
+                    let fresh = Submission::FreshIdAfterRefusedRetry {
+                        rules_rejection: "-4004".to_string(),
+                    };
+                    let b = journal
+                        .authorize_reduction(&a, fresh, || "sweep-b".to_string())
+                        .await
+                        .unwrap();
+                    assert_eq!(b, "sweep-b");
+                    assert!(journal.gate().fenced(), "A's uncertainty fenced before B");
+                    begin_send("sweep-b").unwrap();
+                    assert!(held(), "B is live");
+                    journal.flush_pending().await;
+                    assert!(held(), "A's ending flushed");
+                    journal.finish_success(&a, None).await;
+                    assert!(held(), "both endings registered, the link consumed");
+                    assert_eq!(journal.latch_set(), saturated);
+                    journal.release_sweep(claim);
+                    assert!(journal.claims_view().is_empty(), "released");
+                })
+                .await;
+        }
     }
 }
