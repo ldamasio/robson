@@ -318,6 +318,7 @@ limit."
 | Crash during month reset | Idempotent transaction restores one model/base/basis set and never charges carried downside twice. |
 | Loss outside the priced execution envelope | MonthlyHalt remains latched and a high-severity reconciliation alarm is durable. |
 | `capital_base ≤ 0` (invalid basis) | No new entries; MonthlyHalt neither latches nor closes; existing protection continues; critical alert and `/status` flag until the basis is valid. |
+| Current month's reset not landed (wallet or previous-base read failing at the boundary, or before the first poll) | The same as an invalid basis, without the critical alert: no reset is appended from any other basis and the poll retries every 60 s; `robsond_month_boundary_pending` is 1 after a failed attempt (ADR-0056 §8). |
 
 ## Consequences
 
@@ -443,8 +444,9 @@ which can still fill. Check the exchange before calling the account flat.
 **Alarm.** A dedicated worker reads `monthly_state` every minute on one connection
 of its own, under a time bound the server also enforces with `statement_timeout`, so
 it takes no connection from the daemon's pool and leaves no statement waiting. The
-persisted row is the durable record, so a restart raises the alarm again. A missing row is not invalid, since
-the snapshot falls back to the configured capital. A failed read publishes nothing,
+persisted row is the durable record, so a restart raises the alarm again. A missing row does not raise this
+alarm: a month whose reset has not landed is an invalid basis to the snapshot (ADR-0056 §8, month-boundary
+basis), and `robsond_month_boundary_pending` reports it. A failed read publishes nothing,
 and `robsond_monthly_budget_basis_last_read_timestamp_seconds` stops advancing. It
 starts at 0, so a process that never managed a read does not pass for a valid
 basis. Alert `RBXRobsondMonthlyBudgetBasisInvalid` is critical after 5 minutes and

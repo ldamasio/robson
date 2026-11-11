@@ -379,6 +379,7 @@ async fn fail_projection_updates(pool: &sqlx::PgPool, position_id: PositionId, c
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn an_entry_whose_accepted_event_did_not_land_still_gets_its_stop(pool: sqlx::PgPool) {
+    set_month_basis(&pool, dec!(10000)).await;
     let manager = create_audited_postgres_test_manager(pool.clone(), 300);
     let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
     manager.governed_rearm_counts.write().await.insert(armed.id, 4);
@@ -410,6 +411,7 @@ async fn an_entry_whose_accepted_event_did_not_apply_still_gets_its_stop(pool: s
     let backend = Arc::new(StubJournalBackend::default());
     let journal =
         Arc::new(OrderJournal::new(backend.clone(), &robson_exec::venue::VenueId::new("test:v")));
+    set_month_basis(&pool, dec!(10000)).await;
     let manager = audited_postgres_test_manager_with_journal(pool.clone(), 300, Some(journal));
     let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
 
@@ -663,6 +665,7 @@ async fn a_failed_query_audit_after_a_failed_panic_leg_keeps_the_other_legs(pool
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn a_failed_query_audit_after_a_close_or_an_entry_keeps_the_outcome(pool: sqlx::PgPool) {
+    set_month_basis(&pool, dec!(10000)).await;
     let manager = create_audited_postgres_test_manager(pool.clone(), 300);
     let (leg, _) = active_leg_with_live_stop(&manager).await;
     fail_event_log_writes(&pool, &audit_write("completed")).await;
