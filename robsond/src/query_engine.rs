@@ -894,6 +894,19 @@ mod tests {
                 .with(capture.clone());
             tracing::subscriber::with_default(subscriber, || {
                 trace_query_transition(query, "test");
+                // Callsite interest is cached process-wide. While this capture
+                // is the only live dispatcher, tracing-core registers a
+                // callsite against the registering thread's default alone, so
+                // when a parallel test reaches one of these callsites first it
+                // caches `never` and the event above is dropped (`got []`). A
+                // callsite registers once, and a rebuild from inside this
+                // scope includes the capture, so the second emission cannot
+                // lose the same race. A missing or extra event still fails the
+                // assertion below.
+                if capture.0.lock().unwrap().is_empty() {
+                    tracing::callsite::rebuild_interest_cache();
+                    trace_query_transition(query, "test");
+                }
             });
             let seen = capture.0.lock().unwrap().clone();
             assert_eq!(seen.len(), 1, "expected exactly one event, got {seen:?}");
