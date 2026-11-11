@@ -1821,7 +1821,8 @@ mod tests {
             })
             .await;
         rig.backend.set_fail_all(None);
-        assert_eq!(rig.journal.retry_set_depth(), order_journal::RETRY_SET_CAPACITY);
+        // Full, and the `unlanded_send` incident's upsert beside it (PR F).
+        assert_eq!(rig.journal.retry_set_depth(), order_journal::RETRY_SET_CAPACITY + 1);
 
         rig.exchange.set_rules_rejections_next(1);
         // Cancel: 0 and 1. Exit: 2 is its first commit.

@@ -25,11 +25,25 @@
 //! Without one it is allowed only while `Open`, and it is counted and sets the
 //! latch; from `Draining` on it is refused.
 //!
+//! **The fence (PR F, design §2.7).** The gate also holds the admission
+//! fence, the generation and the open incidents. Whatever the daemon cannot
+//! explain is recorded as an occurrence, in one critical section under this
+//! mutex at the moment it is known and before any await: the fence closes, the
+//! generation moves, the incident of its reason is opened or counted, and its
+//! durable upsert waits in `persistence_pending` (the journal's retry loop
+//! writes it). Protection never waits for that write. An entry is refused at
+//! its send while the fence is closed, and the three admission sites refuse
+//! too. Only an operator's audited release ([`OperationGate::release_through`],
+//! reached from the journal's release) opens it again, and only when nothing
+//! moved the generation meanwhile.
+//!
 //! The gate's mutex is a sync leaf, never held across an await. Lock order
 //! (design §2.10): the manager lock, a stream's lock, this gate, the journal's
-//! memory. Only the send start takes the journal's memory under the gate.
+//! memory. The journal takes its memory under the gate wherever it records an
+//! occurrence, and so does the send start.
 
 use std::{
+    collections::BTreeMap,
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -37,6 +51,7 @@ use std::{
     },
 };
 
+use chrono::{DateTime, Utc};
 use tokio::{sync::Notify, time::Instant};
 use tracing::{error, warn};
 
@@ -195,6 +210,123 @@ impl OperationKind {
     }
 }
 
+/// Why the admission fence closed: the reasons of `recovery_incidents`
+/// (design §2.7). At most one incident of each is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum IncidentReason {
+    /// The previous process did not stop clean at `marker_version` 2.
+    UncleanStart,
+    /// An intent's outcome is uncertain: it may have reached the venue.
+    UncertainOutcome,
+    /// A bounded send went out without its journal row.
+    UnlandedSend,
+    /// Journal history was discarded, or a row conflicted on retry.
+    PersistenceFailure,
+    /// A venue mutation ran without an operation permit.
+    UnpermittedMutation,
+    /// An event-log stream was suspended.
+    StreamSuspended,
+    /// An operation was dropped before it completed.
+    OperationAborted,
+    /// The generation counter of this epoch ran out.
+    GenerationExhausted,
+}
+
+impl IncidentReason {
+    pub const ALL: [Self; 8] = [
+        Self::UncleanStart,
+        Self::UncertainOutcome,
+        Self::UnlandedSend,
+        Self::PersistenceFailure,
+        Self::UnpermittedMutation,
+        Self::StreamSuspended,
+        Self::OperationAborted,
+        Self::GenerationExhausted,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UncleanStart => "unclean_start",
+            Self::UncertainOutcome => "uncertain_outcome",
+            Self::UnlandedSend => "unlanded_send",
+            Self::PersistenceFailure => "persistence_failure",
+            Self::UnpermittedMutation => "unpermitted_mutation",
+            Self::StreamSuspended => "stream_suspended",
+            Self::OperationAborted => "operation_aborted",
+            Self::GenerationExhausted => "generation_exhausted",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.as_str() == text)
+    }
+
+    /// A latch-class reason sets the journal latch, which only a restart
+    /// clears, so its release waits for the next process.
+    pub fn latches(self) -> bool {
+        !matches!(self, Self::UncleanStart | Self::UncertainOutcome)
+    }
+}
+
+/// An open incident: the occurrences of one reason since it was last released.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Incident {
+    pub reason: IncidentReason,
+    pub first_at: DateTime<Utc>,
+    pub last_at: DateTime<Utc>,
+    pub count: i64,
+    pub first_generation: i64,
+    pub last_generation: i64,
+}
+
+/// What recording one occurrence did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Occurrence {
+    pub reason: IncidentReason,
+    /// The generation it was recorded at.
+    pub generation: i64,
+    /// Whether it opened its reason's incident, rather than counting it again.
+    pub opened: bool,
+    /// Whether it took the last generation of this epoch.
+    pub exhausted: bool,
+}
+
+impl Occurrence {
+    /// Log it, outside every lock.
+    pub fn log(&self) {
+        let (reason, generation) = (self.reason.as_str(), self.generation);
+        if self.opened {
+            error!(reason, generation, "Incident opened; admissions are fenced until a release");
+        } else {
+            warn!(reason, generation, "Incident occurred again; the fence stays closed");
+        }
+        if self.exhausted {
+            error!(generation, "Generation exhausted; latch set, fenced until a restart");
+        }
+    }
+}
+
+/// The generation counter's ceiling within one epoch: `n` stays below
+/// `2^32 − 1`, and reaching it is itself an occurrence (design §2.7).
+pub const GENERATION_COUNTER_LIMIT: u32 = u32::MAX;
+
+/// What a start recorded about its epoch, for the pending list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochView {
+    pub epoch_seq: i64,
+    /// Why the start was unclean; `None` when its predecessor stopped clean.
+    pub unclean_reason: Option<&'static str>,
+}
+
+#[derive(Debug)]
+struct OpenIncident {
+    incident: Incident,
+    /// Bumped by every occurrence; the durable upsert is pending while it is
+    /// ahead of `landed`.
+    version: u64,
+    landed: u64,
+}
+
 /// Why no permit was given. Nothing was done either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermitRefusal {
@@ -215,16 +347,20 @@ impl fmt::Display for PermitRefusal {
 
 impl std::error::Error for PermitRefusal {}
 
-/// A venue mutation refused at the choke point: no permit, and the daemon is
-/// stopping. Nothing was sent.
+/// A venue mutation refused at the choke point. Nothing was sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MutationRefused {
-    pub phase: Phase,
+pub enum MutationRefused {
+    /// No permit, and the daemon is stopping.
+    Stopping(Phase),
 }
 
 impl fmt::Display for MutationRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "venue mutation without a permit refused while {}", self.phase.as_str())
+        match self {
+            Self::Stopping(phase) => {
+                write!(f, "venue mutation without a permit refused while {}", phase.as_str())
+            },
+        }
     }
 }
 
@@ -241,6 +377,11 @@ pub trait GateObserver: Send + Sync {
 pub struct GateSnapshot {
     pub phase: Phase,
     pub fenced: bool,
+    /// The current generation: `epoch_seq << 32 | n`.
+    pub generation: i64,
+    pub open_incidents: u32,
+    /// Incidents whose durable upsert has not landed.
+    pub incidents_persisting: u32,
     pub permits: u32,
     pub ordinary: u32,
     pub protective: u32,
@@ -252,11 +393,20 @@ pub struct GateSnapshot {
     pub busy_protective: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct GateState {
     phase: Phase,
-    /// The admission fence of a later PR. Nothing sets it yet.
+    /// The admission fence: closed by any occurrence, opened only by a
+    /// release that found the generation unmoved.
     fenced: bool,
+    /// The journal's latch, set with every latch-class occurrence.
+    latch: Arc<AtomicBool>,
+    /// The high half of the generation, from the process epoch.
+    epoch_seq: i64,
+    epoch: Option<EpochView>,
+    /// The low half, `n`, bumped by every occurrence.
+    counter: u32,
+    incidents: BTreeMap<IncidentReason, OpenIncident>,
     permits: u32,
     ordinary: u32,
     protective: u32,
@@ -269,6 +419,27 @@ pub(crate) struct GateState {
 }
 
 impl GateState {
+    fn new(latch: Arc<AtomicBool>) -> Self {
+        Self {
+            phase: Phase::Open,
+            fenced: false,
+            latch,
+            epoch_seq: 0,
+            epoch: None,
+            counter: 0,
+            incidents: BTreeMap::new(),
+            permits: 0,
+            ordinary: 0,
+            protective: 0,
+            internal: [false; INTERNAL_SLOTS as usize],
+            sends_started: 0,
+            aborted: 0,
+            unpermitted: 0,
+            busy_ordinary: 0,
+            busy_protective: 0,
+        }
+    }
+
     /// Whether an entry may start its send now. Anything else may in every
     /// phase.
     pub(crate) fn entry_send_allowed(&self) -> bool {
@@ -279,8 +450,106 @@ impl GateState {
         self.phase
     }
 
+    pub(crate) fn fenced(&self) -> bool {
+        self.fenced
+    }
+
     pub(crate) fn send_started(&mut self) {
         self.sends_started += 1;
+    }
+
+    /// `epoch_seq << 32 | n`, a signed value ordered numerically and
+    /// monotonic across epochs through the strict epoch insert.
+    pub(crate) fn generation(&self) -> i64 {
+        (self.epoch_seq << 32) | i64::from(self.counter)
+    }
+
+    /// Record one occurrence (design §2.7): the latch first for a
+    /// latch-class reason, then the fence, the generation and the incident,
+    /// whose upsert is now pending. The caller holds the gate's mutex from the
+    /// moment the occurrence is known and logs only after releasing it.
+    pub(crate) fn occur(&mut self, reason: IncidentReason) -> Occurrence {
+        if reason.latches() {
+            self.latch.store(true, Ordering::SeqCst);
+        }
+        self.fenced = true;
+        let exhausted = self.counter < GENERATION_COUNTER_LIMIT && {
+            self.counter += 1;
+            self.counter == GENERATION_COUNTER_LIMIT
+        };
+        let generation = self.generation();
+        let now = Utc::now();
+        let opened = self.note(reason, generation, now);
+        if exhausted {
+            // No generation is left to move: nothing can show a release that
+            // the fence stayed closed, so it stays closed until a restart.
+            self.latch.store(true, Ordering::SeqCst);
+            self.note(IncidentReason::GenerationExhausted, generation, now);
+        }
+        Occurrence { reason, generation, opened, exhausted }
+    }
+
+    /// Open `reason`'s incident or count it again. Whether it opened.
+    fn note(&mut self, reason: IncidentReason, generation: i64, at: DateTime<Utc>) -> bool {
+        match self.incidents.get_mut(&reason) {
+            Some(open) => {
+                let incident = &mut open.incident;
+                incident.last_at = incident.last_at.max(at);
+                incident.count += 1;
+                incident.last_generation = incident.last_generation.max(generation);
+                open.version += 1;
+                false
+            },
+            None => {
+                self.incidents.insert(reason, OpenIncident {
+                    incident: Incident {
+                        reason,
+                        first_at: at,
+                        last_at: at,
+                        count: 1,
+                        first_generation: generation,
+                        last_generation: generation,
+                    },
+                    version: 1,
+                    landed: 0,
+                });
+                true
+            },
+        }
+    }
+
+    /// Set `n`, for a test that needs the end of an epoch's generations.
+    #[cfg(test)]
+    pub(crate) fn set_counter(&mut self, counter: u32) {
+        self.counter = counter;
+    }
+
+    /// Incidents whose upsert has not landed: entries of
+    /// `persistence_pending`, at most one per reason.
+    pub(crate) fn incidents_persisting(&self) -> usize {
+        self.incidents.values().filter(|open| open.version > open.landed).count()
+    }
+
+    /// The upserts to write, each with the version it carries.
+    pub(crate) fn incidents_to_write(&self) -> Vec<(Incident, u64)> {
+        self.incidents
+            .values()
+            .filter(|open| open.version > open.landed)
+            .map(|open| (open.incident.clone(), open.version))
+            .collect()
+    }
+
+    /// The upsert carrying `version` of `reason`'s incident landed.
+    pub(crate) fn incident_landed(&mut self, reason: IncidentReason, version: u64) {
+        if let Some(open) = self.incidents.get_mut(&reason) {
+            open.landed = open.landed.max(version);
+        }
+    }
+
+    /// Whether the orphan sweep may not cancel an `ins-` order now (design
+    /// §2.9): an incident is open, the fence is closed or the latch is set.
+    pub(crate) fn vetoes_orphan_cancel(&self) -> bool {
+        self.fenced || !self.incidents.is_empty() || self.latch.load(Ordering::SeqCst)
     }
 }
 
@@ -303,7 +572,7 @@ impl fmt::Debug for OperationGate {
 impl OperationGate {
     pub(crate) fn new(latch: Arc<AtomicBool>) -> Self {
         Self {
-            state: Mutex::default(),
+            state: Mutex::new(GateState::new(Arc::clone(&latch))),
             latch,
             drained: Notify::new(),
             observer: OnceLock::new(),
@@ -328,6 +597,9 @@ impl OperationGate {
         GateSnapshot {
             phase: state.phase,
             fenced: state.fenced,
+            generation: state.generation(),
+            open_incidents: state.incidents.len() as u32,
+            incidents_persisting: state.incidents_persisting() as u32,
             permits: state.permits,
             ordinary: state.ordinary,
             protective: state.protective,
@@ -338,6 +610,94 @@ impl OperationGate {
             busy_ordinary: state.busy_ordinary,
             busy_protective: state.busy_protective,
         }
+    }
+
+    /// Whether the admission fence is closed.
+    pub fn fenced(&self) -> bool {
+        self.lock().fenced
+    }
+
+    /// The current generation, which a release must quote.
+    pub fn generation(&self) -> i64 {
+        self.lock().generation()
+    }
+
+    /// The open incidents as this process knows them: those loaded at start
+    /// and every occurrence since, until a release covers them.
+    pub fn open_incidents(&self) -> Vec<Incident> {
+        self.lock().incidents.values().map(|open| open.incident.clone()).collect()
+    }
+
+    /// The epoch this start recorded, if it recorded one.
+    pub fn epoch(&self) -> Option<EpochView> {
+        self.lock().epoch
+    }
+
+    /// Record an occurrence of `reason` (design §2.7), for a caller holding no
+    /// lock of this gate or the journal.
+    pub fn record(&self, reason: IncidentReason) -> Occurrence {
+        let occurrence = self.lock().occur(reason);
+        occurrence.log();
+        occurrence
+    }
+
+    /// Seed the generation and the incidents from this process's epoch,
+    /// before any venue request (design §3). `unclean` is the generation the
+    /// epoch's own transaction recorded an unclean start at, `epoch_seq << 32
+    /// | 1`; `open` is every incident on record no release covered, that one
+    /// included. Any open incident closes the fence.
+    pub fn begin_epoch(&self, view: EpochView, unclean: Option<i64>, open: Vec<Incident>) {
+        let mut state = self.lock();
+        state.epoch_seq = view.epoch_seq;
+        state.epoch = Some(view);
+        if unclean.is_some() {
+            state.counter = state.counter.max(1);
+        }
+        for incident in open {
+            match state.incidents.get_mut(&incident.reason) {
+                // Only an occurrence before the epoch was known: merge, and
+                // write the merged row.
+                Some(here) => {
+                    let mine = &mut here.incident;
+                    mine.first_at = mine.first_at.min(incident.first_at);
+                    mine.last_at = mine.last_at.max(incident.last_at);
+                    mine.first_generation = mine.first_generation.min(incident.first_generation);
+                    mine.last_generation = mine.last_generation.max(incident.last_generation);
+                    mine.count += incident.count;
+                    here.version += 1;
+                },
+                None => {
+                    state.incidents.insert(incident.reason, OpenIncident {
+                        incident,
+                        version: 1,
+                        landed: 1,
+                    });
+                },
+            }
+        }
+        if !state.incidents.is_empty() {
+            state.fenced = true;
+        }
+    }
+
+    /// After a release covering generations up to `released`: drop the
+    /// incidents it released, and open the fence only if the generation is
+    /// still `released` and the latch clear. Whether the fence is open.
+    pub(crate) fn release_through(&self, released: i64) -> bool {
+        let mut state = self.lock();
+        state.incidents.retain(|_, open| open.incident.last_generation > released);
+        if state.generation() == released
+            && state.incidents.is_empty()
+            && !self.latch.load(Ordering::SeqCst)
+        {
+            state.fenced = false;
+        }
+        !state.fenced
+    }
+
+    /// Whether the orphan sweep's cancels are withheld now (design §2.9).
+    pub fn orphan_cancel_vetoed(&self) -> bool {
+        self.lock().vetoes_orphan_cancel()
     }
 
     /// Refuse the ordinary class from now on.
@@ -417,9 +777,10 @@ impl OperationGate {
         // under the mutex with the count all the same.
         let mut state = self.lock();
         state.aborted += 1;
-        self.latch.store(true, Ordering::SeqCst);
+        let occurrence = state.occur(IncidentReason::OperationAborted);
         drop(state);
         error!(kind = kind.as_str(), "Operation dropped before completing; latch set");
+        occurrence.log();
         if let Some(observer) = self.observer.get() {
             observer.operation_aborted(kind);
         }
@@ -436,17 +797,18 @@ impl OperationGate {
         }
         let mut state = self.lock();
         if state.phase != Phase::Open {
-            return Err(MutationRefused { phase: state.phase });
+            return Err(MutationRefused::Stopping(state.phase));
         }
         // Counted and latched before the mutex that let it through is
         // released: a stop that moves the phase after this sees the latch,
         // however long this thread then pauses before its request.
         state.unpermitted += 1;
-        self.latch.store(true, Ordering::SeqCst);
+        let occurrence = state.occur(IncidentReason::UnpermittedMutation);
         drop(state);
         #[cfg(test)]
         tests::after_an_unpermitted_pass(self);
         warn!(what, "Venue mutation without an operation permit; latch set");
+        occurrence.log();
         if let Some(observer) = self.observer.get() {
             observer.unpermitted_mutation();
         }
@@ -567,9 +929,9 @@ mod tests {
         assert!(latch.load(Ordering::SeqCst));
 
         gate.begin_draining();
-        assert_eq!(gate.mutation("POST /order"), Err(MutationRefused { phase: Phase::Draining }));
+        assert_eq!(gate.mutation("POST /order"), Err(MutationRefused::Stopping(Phase::Draining)));
         gate.begin_closing();
-        assert_eq!(gate.mutation("DELETE /order"), Err(MutationRefused { phase: Phase::Closing }));
+        assert_eq!(gate.mutation("DELETE /order"), Err(MutationRefused::Stopping(Phase::Closing)));
         assert_eq!(gate.snapshot().unpermitted, 1, "a refused one is not sent or counted");
     }
 

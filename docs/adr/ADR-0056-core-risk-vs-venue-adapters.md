@@ -1040,6 +1040,84 @@ then and later. With no stream suspended nothing changes; `stream_suspensions` h
 the image before it, which keeps migrations 31 to 33, restores P's stopgap and its unsuppressed MonthlyHalt; no condition beyond
 P's (boundary B, no open suspension) is added.
 
+*Part 2, incidents, the generation, the memory-first fence, `marker_version 2` and the audited release.* `robson_exec::gate`
+holds the fence, the generation and the open incidents; the journal records into them; `recovery_incidents` is migration 34.
+
+- **Occurrences.** Whatever the daemon cannot explain is an occurrence, recorded in one critical section under the gate's mutex
+  at the moment it is known and before any await: the latch first for a latch-class reason, then the fence closes, the
+  generation moves, and the incident of its reason is opened or counted, its upsert waiting in `persistence_pending`. Protection
+  never waits for that write. Where the journal records one it takes the gate's mutex before its own memory, the order of §2.10.
+  The reasons and their sources: `uncertain_outcome`, every intent whose outcome is uncertain (a timeout, a transport error, a
+  strict commit that is itself uncertain, every uncertain cancel class, an operation dropped mid-send), stamped in the same
+  section with `uncertain_generation` and `uncertain_at`; `unlanded_send`, a bounded send whose row did not land, recorded before
+  its request leaves; `persistence_failure`, history discarded on a full retry set or a row conflicting on retry;
+  `stream_suspended`; `operation_aborted`; `unpermitted_mutation`; `unclean_start`; `generation_exhausted`. All but
+  `unclean_start` and `uncertain_outcome` set the latch, as P's latch sources already did.
+- **Generation.** `epoch_seq << 32 | n`, a signed 64-bit value, its high half from the epoch's strict insert, so it never goes
+  back across processes. Every occurrence moves `n`, a repeat of an open reason included. At `2^32 − 1` it is exhausted: the
+  latch, `generation_exhausted`, and a fence no release can open before a restart.
+- **Incidents.** One open row per reason and tenant (partial unique index), with first and last time, count and first and last
+  generation; released with the decision that released it. An upsert only grows the open row's values, so a replay, a late older
+  snapshot or a reordering converge, and against a released row it opens a new one. The retry loop writes incident upserts first
+  in each pass, then suspensions, then intents, each part stopping at its own first failure. At most one upsert per reason
+  waits, beside the 1,024 rows and suspensions and not counted against them (eight at most), so an incident is never the entry a
+  full set drops; `robsond_journal_retry_set_depth` counts them.
+- **The fence.** Closed by any occurrence; checked at the three admission sites, beside the latch (an arm and an approval answer
+  `AdmissionsClosed`, 503; a signal re-arms its detector under the governed backoff, `admissions_closed`), and at an entry's send,
+  under the gate's mutex: an entry ticketed before it closed is in flight, one reaching its send after is a typed no-send
+  (`entry_not_sent` on a leg with admission evidence). Reductions, protection, sweeps and the protective API continue.
+- **An unclean start.** The start is unclean when the predecessor of its tenant has no marker or one below version 2, or when it
+  has none (`no_predecessor`). In the epoch's own transaction, before any venue request, it stamps every intent of the tenant with
+  no outcome, not proven unsent and no stamp at `epoch_seq << 32 | 1`, setting `uncertain_at` where it was not set (intents a
+  dead process left in flight, and the uncertain ones of a binary before this part, which stamped nothing); it opens or counts
+  `unclean_start`; and it reads every incident no release covered. The daemon seeds the gate from that, and any open incident
+  closes the fence. An open incident of a reason this binary does not know refuses the start.
+- **The marker.** A clean stop writes `marker_version = 2`, and only with the fence open and no incident open, besides S's
+  conditions (`incident_open` otherwise). A quiescent epoch whose incidents were released marks clean; one that ever latched
+  cannot.
+- **Release.** `POST /recovery/release` with `{generation, note, treatment}`, `treatment` the accounting treatment of what remains
+  (`unbooked_accepted` in the core); authenticated, a verified identity recorded `verified` and the legacy token `asserted`. It
+  answers 401 without an identity and 400 without a note or a treatment; 409 `latched` while the latch is set; 409 `stale`, with
+  `current_generation`, when the quoted generation is not the current one; 409 `persisting`, with the count, while anything waits
+  in `persistence_pending`. Then one transaction on the daemon's pool, five statements with `BEGIN` and `COMMIT`: it tombstones
+  the intents of the tenant stamped at or below the generation with `uncertain_at` set, no outcome, not proven unsent and no
+  disposition (`disposition_kind = 'accepted_risk'`, the treatment, `risk_accepted_*` with the identity and the note); releases
+  the incidents whose last generation is at or below it; and appends its `journal_decisions` row (`kind = 'release'`, the
+  generation and both counts in its payload). Then, under the gate's mutex, the fence opens only if the generation is still the
+  quoted one and the latch clear; otherwise the newer incident stays open and the answer says `fence_open: false`. A transaction
+  that fails, or does not answer within 10 s, answers 503 and leaves the fence closed: it may have committed, and a retry quoting
+  the same generation then finds nothing more to do and opens it. No slot, no manager lock. **Release is risk acceptance, never
+  finality:** it sets no venue outcome and books nothing. A tombstone satisfies boundary B as a disposition does.
+- **Volume.** Repeated uncertain cancels, one intent per exit attempt while a failure lasts, are each stamped, each one entry of
+  the retry set until it lands, and all counted on the one open `uncertain_outcome` incident; one release tombstones all of them
+  in one statement, and the release refuses until each stamp has landed. With the database down they fill the retry set, and
+  its overflow is a `persistence_failure`, which latches. A disposition through `/recovery/disposition` stays per intent and is
+  not needed for what a release covers.
+- **Metrics.** `robsond_admission_fence_closed{reason}`, 1 for the reason of each open incident while the fence is closed, with
+  every reason and `unknown` exported at 0 from startup; `robsond_recovery_incidents_open{reason}`; `robsond_graceful_stop_total`
+  gains `incident_open`; `robsond_insurance_stop_stale_positions` now exports at 0 from startup, where it was absent until a stop
+  fell behind.
+
+What part 2 changes in production:
+- **The first start of this image is fenced.** Its predecessor marked version 1, so the start is unclean (`marker_version`):
+  admissions stay closed until the operator releases at the current generation (a stale one is refused with it). Every
+  uncertain intent the earlier binaries left is stamped then, and that release tombstones them.
+- After that, a deploy whose previous process stopped clean at version 2 starts unfenced; a crash, a SIGKILL, a stop past its
+  deadline or with an incident open makes the next start fenced.
+- Any uncertain venue outcome closes admissions until a release. On USD-M that includes every software-exit cancel answered
+  "already gone" (design §2.3); nothing trades on USD-M today.
+- A latch-class occurrence closes admissions as P's latch already did, and its release waits for a restart.
+
+**Rollback across part 2** is design §9's F row. Roll forward, or to an image that keeps fencing and audited release. Back to P
+only when the **final, quiesced F epoch** stopped clean at version 2 (checked with the daemon stopped: the tenant's latest
+`process_epochs` row has `clean_stop_at` and `marker_version = 2`, which the stop writes only with the latch clear, nothing
+pending or unlanded, permits drained, none aborted and no incident open), boundary B holds
+(`order_intents_blocking_rollback` empty), and no stream is suspended (`stream_suspensions` has no open row). The rollback image
+must keep migrations 31 to 34: SQLx's migrator rejects an applied migration missing from its embedded set, so pinning P's image
+is refused by its own migration hook; "an image of P" means P's code with migration 34 kept. P and S then write version 1, so
+re-deploying F starts fenced. An older binary ignores `recovery_incidents` and the stamps, which is why rolling back needs the
+final epoch's clean marker first.
+
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze
 contract 1.2.0; `rbx-data` vendors its own registry copy (1.1.3) and must re-vendor before any export runs. Every rollback
@@ -1105,8 +1183,10 @@ only).
 | Dependency / event | What happens | Degraded mode | Visibility |
 |---|---|---|---|
 | Database dies | no admission, no new legs; already-installed protection remains on the exchange; inventory in an N1-a transition may remain unprotected without a duration or loss bound; no cancellation starts without a durable intent, and unfinished transitions retain liabilities and alerts and resume from that intent on recovery; intent results cannot be persisted → in-flight operations enter `Unknown`; recovery looks them up, a lookup may stay `Unknown`, and then the reservation stays held until step 7's explicit resolution path | read-only `/status` from memory; arms refused | `/readyz.database=false`; `unprotected_inventory` gauge; recovery events |
-| Journal database down or slow (step 7, PR J) | an entry's strict commit that fails is refused, no request; a leg with admission evidence ends its attempt, a legacy leg re-arms under its backoff. One that times out is uncertain, no request and no re-arm. Reductions, stops and cancels wait at most 500 ms per write and go out anyway, also with the journal's memories full | entries refused, protection and reductions continue; unlanded rows retry through a bounded set | `robsond_journal_latch`, `robsond_journal_retry_set_depth`, warnings in the logs; no fence yet |
-| Cancel outcome unknown (step 7, PR C) | an error, an indeterminate answer or an "already gone" with no final state is uncertain on the cancel's own intent; the protective action behind it proceeds | journaled only until the fence PR | `order_intents.cancel_class` and `uncertain_at`; boundary B |
+| Journal database down or slow (step 7, PR J) | an entry's strict commit that fails is refused, no request; a leg with admission evidence ends its attempt, a legacy leg re-arms under its backoff. One that times out is uncertain, no request and no re-arm. Reductions, stops and cancels wait at most 500 ms per write and go out anyway, also with the journal's memories full | entries refused, protection and reductions continue; unlanded rows retry through a bounded set | `robsond_journal_latch`, `robsond_journal_retry_set_depth`, warnings in the logs; from PR F each such latch source is also an incident that fences admissions |
+| Cancel outcome unknown (step 7, PR C) | an error, an indeterminate answer or an "already gone" with no final state is uncertain on the cancel's own intent; the protective action behind it proceeds | journaled only until the fence PR; from PR F an incident, as below | `order_intents.cancel_class` and `uncertain_at`; boundary B |
+| Uncertain outcome, or anything else the daemon cannot explain (step 7, PR F) | recorded at once in memory, before any await: the fence closes, the generation moves, its incident opens; the incident's row follows through the retry set and protection never waits for it. An unclean predecessor does the same at the start, before any venue request | admissions closed until an operator's audited release at the current generation; exits, stops, sweeps and the protective API continue; a latch-class reason also needs a restart; the orphan sweep keeps `ins-` orders (part 4) | `robsond_admission_fence_closed{reason}`, `robsond_recovery_incidents_open{reason}`, `recovery_incidents`, `GET /recovery/pending` (part 3) |
+| Database down or slow at a release (step 7, PR F) | 503 `release_not_completed` within 10 s; the transaction may have committed | the fence stays closed; the operator retries with the same generation | the log, `journal_decisions` |
 | Daemon asked to stop: SIGTERM or SIGINT (step 7, PR S) | Draining (ordinary API refused, protection continues) for at most 12 s, then Closing (everything new refused) until the operations in flight end and the journal is flushed; the stop's result by its cooperative deadline, 25 s after the signal, unless the stop itself is blocked; the process's exit by 27 s whatever is stuck (code 70 at that independent bound); the epoch is marked only on a clean pass. During the start's preparation, from the database connection to the epoch's insert: no start, nothing sent | exchange stops cover the `Active` legs that keep one while no daemon runs; a cancel-first exit cut short can leave its leg without one until a later process heals it | the epoch's `clean_stop_at`; the next start's `robsond_unclean_start`; `robsond_graceful_stop_total{result}` if scraped |
 | API slot class full (step 7, PR S) | 503 `busy` at once, nothing done; the other classes keep their slots | the caller retries | `robsond_api_slot_busy_total{class}` |
 | Venue mutation without a permit (step 7, PR S) | while open: sent, counted, latch set; while stopping: refused, nothing sent | — | `robsond_unpermitted_mutations_total`, `robsond_journal_latch` |

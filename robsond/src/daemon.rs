@@ -238,6 +238,7 @@ async fn run_order_journal_retry(
         }
         journal.flush_pending().await;
         crate::metrics::observe_order_journal(&journal);
+        crate::metrics::observe_fence(&journal);
     }
     // One last pass; the stop's own flush makes it complete.
     journal.flush_pending().await;
@@ -415,12 +416,34 @@ impl Daemon<StubExchange, MemoryStore> {
         projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
         pg_pool: Option<Arc<sqlx::PgPool>>,
     ) -> Self {
+        Self::stub_with_recovery(config, projection_recovery, pg_pool, false)
+    }
+
+    /// The same, with the durable order journal production wires: its
+    /// incidents land, and a release is possible.
+    #[cfg(all(test, feature = "postgres"))]
+    pub fn new_stub_with_durable_journal(config: Config, pg_pool: Arc<sqlx::PgPool>) -> Self {
+        Self::stub_with_recovery(config, None, Some(pg_pool), true)
+    }
+
+    #[cfg(all(test, feature = "postgres"))]
+    fn stub_with_recovery(
+        config: Config,
+        projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
+        pg_pool: Option<Arc<sqlx::PgPool>>,
+        durable_journal: bool,
+    ) -> Self {
         use robson_domain::RiskConfig;
 
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
-        let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
+        let executor = Executor::new(Arc::clone(&exchange), journal, store.clone());
+        let executor = Arc::new(if durable_journal {
+            with_durable_order_journal(executor, &exchange, &pg_pool, &config)
+        } else {
+            executor
+        });
         let order_journal = gated(&exchange, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder: Arc<dyn QueryRecorder> =
@@ -763,6 +786,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         let journal = Arc::clone(&self.order_journal);
         crate::metrics::init_operation_gate_metrics();
         crate::metrics::observe_streams_suspended(0, 0);
+        crate::metrics::observe_fence(&journal);
         self.month_boundary_pending.set(0.0);
         journal.gate().set_observer(Arc::new(crate::metrics::GateMetrics));
 
@@ -1146,8 +1170,11 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     }
 
     /// Insert this process's epoch, strictly, and record whether its start is
-    /// unclean (ADR-0056 step 7). The marker a clean stop writes on it.
-    /// Without a database there is none, and only the stub may start.
+    /// unclean (ADR-0056 step 7). The fence is seeded from it before any venue
+    /// request: the generation's high half, the `unclean_start` occurrence,
+    /// and every incident no release covered, any of which closes it. The
+    /// marker a clean stop writes on it. Without a database there is none, and
+    /// only the stub may start.
     #[cfg(feature = "postgres")]
     async fn start_epoch(&self) -> DaemonResult<Option<Box<dyn StopMarker>>> {
         let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id)
@@ -1158,6 +1185,16 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         let start =
             crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION")).await?;
         crate::process_epoch::record_start(&start);
+        let view = robson_exec::gate::EpochView {
+            epoch_seq: start.epoch.epoch_seq,
+            unclean_reason: start.predecessor.unclean_reason(),
+        };
+        self.order_journal.gate().begin_epoch(
+            view,
+            start.unclean_generation,
+            start.open_incidents.clone(),
+        );
+        crate::metrics::observe_fence(&self.order_journal);
         self.position_manager
             .read()
             .await
@@ -4056,15 +4093,31 @@ mod tests {
         assert_eq!((gate.permits, gate.aborted), (0, 0));
     }
 
+    /// A predecessor that stopped clean at version 2, so the next start of
+    /// `tenant` is clean and opens no incident (ADR-0056 step 7, PR F).
+    #[cfg(feature = "postgres")]
+    async fn seed_clean_predecessor(pool: &sqlx::PgPool, tenant: uuid::Uuid) {
+        sqlx::query(
+            "INSERT INTO process_epochs (epoch_id, tenant_id, binary_version, clean_stop_at, \
+                 marker_version) VALUES ($1, $2, 'test-seed', NOW(), 2)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(tenant)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     /// The two-phase stop through the daemon itself: its epoch lands at
-    /// start, a clean stop marks it at version 1 and returns, and a stop after
+    /// start, a clean stop marks it at version 2 and returns, and a stop after
     /// an aborted permit leaves its epoch unmarked.
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
     async fn a_daemon_stop_marks_its_epoch_only_when_clean(pool: sqlx::PgPool) {
         let tenant = uuid::Uuid::now_v7();
-        for (run, abort) in [(1, false), (2, true)] {
+        seed_clean_predecessor(&pool, tenant).await;
+        for (run, abort) in [(2, false), (3, true)] {
             let mut config = Config::test();
             config.projection.tenant_id = Some(tenant);
             let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())))
@@ -4112,7 +4165,96 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(marks, [(true, Some(1)), (false, None)]);
+        assert_eq!(marks, [(true, Some(2)), (true, Some(2)), (false, None)]);
+    }
+
+    /// Design §8: A starts unclean and stops without a release, B is fenced
+    /// at start, releases and stops clean, C starts clean. Every start of a
+    /// tenant with no epoch on record is unclean too, and an incident open at
+    /// the stop keeps the marker off (ADR-0056 step 7, PR F).
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn an_unclean_start_is_fenced_until_a_release_and_only_then_stops_clean(
+        pool: sqlx::PgPool,
+    ) {
+        use robson_exec::order_journal::ReleaseRecord;
+
+        let tenant = uuid::Uuid::now_v7();
+        let mut fenced_at_start = Vec::new();
+        for (run, release) in [(1, false), (2, true), (3, false)] {
+            let mut config = Config::test();
+            config.projection.tenant_id = Some(tenant);
+            let daemon = Daemon::new_stub_with_durable_journal(config, Arc::new(pool.clone()))
+                .with_stop_timings(StopTimings {
+                    drain_limit: Duration::from_secs(2),
+                    deadline: Duration::from_secs(10),
+                });
+            let durable = Arc::clone(&daemon.order_journal);
+            let stop = StopRequest::default();
+            let asking = {
+                let (pool, stop, journal) = (pool.clone(), stop.clone(), Arc::clone(&durable));
+                async move {
+                    loop {
+                        let epochs: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM process_epochs WHERE tenant_id = $1",
+                        )
+                        .bind(tenant)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                        if epochs == run {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let fenced = journal.gate().fenced();
+                    if release {
+                        journal.flush_pending().await;
+                        let receipt = journal
+                            .release(ReleaseRecord {
+                                decision_id: uuid::Uuid::now_v7(),
+                                generation: journal.gate().generation(),
+                                actor: "test".to_string(),
+                                auth_kind: "verified",
+                                note: "reviewed".to_string(),
+                                treatment: "unbooked_accepted",
+                                decided_at: Utc::now(),
+                            })
+                            .await
+                            .unwrap();
+                        assert!(receipt.fence_open);
+                        assert_eq!(receipt.counts.incidents_released, 1);
+                    }
+                    stop.ask();
+                    fenced
+                }
+            };
+            let (result, fenced) = tokio::join!(Box::pin(daemon.run_until(stop.clone())), asking);
+            result.unwrap();
+            fenced_at_start.push(fenced);
+        }
+        assert_eq!(fenced_at_start, [true, true, false]);
+
+        let marks: Vec<(bool, Option<i16>)> = sqlx::query_as(
+            "SELECT clean_stop_at IS NOT NULL, marker_version FROM process_epochs
+             WHERE tenant_id = $1 ORDER BY epoch_seq",
+        )
+        .bind(tenant)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(marks, [(false, None), (true, Some(2)), (true, Some(2))]);
+        let (open, count): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*) FILTER (WHERE released_at IS NULL), MAX(count) \
+             FROM recovery_incidents WHERE tenant_id = $1",
+        )
+        .bind(tenant)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((open, count), (0, 2), "A's and B's unclean starts, one incident, released");
     }
 
     fn active_position(symbol: robson_domain::Symbol, side: Side) -> robson_domain::Position {

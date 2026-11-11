@@ -40,6 +40,19 @@
 //! latch closes admissions until a restart, at the manager's admission checks
 //! and at an entry's send.
 //!
+//! **Occurrences and release (PR F).** Every place here that learns of
+//! something it cannot explain records an occurrence on the gate (see
+//! [`crate::gate`]) in the same critical section, with the gate's mutex taken
+//! before this journal's memory: an uncertain outcome (stamped with the
+//! generation it was recorded at, `uncertain_generation`), a bounded send
+//! without its row, discarded history, a conflicting row, a suspended stream.
+//! The incident upserts wait in `persistence_pending` beside the rows and are
+//! written by the same retry loop. [`OrderJournal::release`] is the audited
+//! release: refused while the latch is set, the quoted generation is stale or
+//! anything is persisting; then one transaction tombstones the uncertain
+//! intents and releases the incidents it covers, and the fence opens only if
+//! the generation did not move meanwhile.
+//!
 //! The sync mutex here is a leaf and is never held across an await. The gate's
 //! mutex comes before it in the lock order, and nothing here takes the gate's
 //! while holding this one.
@@ -65,7 +78,10 @@ use uuid::Uuid;
 use crate::{
     cancel::{classify_cancel, CancelClass},
     error::ExecError,
-    gate::{OperationGate, OperationKind, PermitRefusal, Phase, ALLOCATED_SLOTS},
+    gate::{
+        GateState, Incident, IncidentReason, Occurrence, OperationGate, OperationKind,
+        PermitRefusal, Phase, ALLOCATED_SLOTS,
+    },
     ports::StopCancelOutcome,
     quantize::Submission,
     venue::{AttemptEvidence, VenueId},
@@ -233,6 +249,17 @@ pub struct OutcomeRow {
     pub not_sent: bool,
     pub venue_evidence: Option<Value>,
     pub uncertain_at: Option<DateTime<Utc>>,
+    /// The generation its `uncertain_outcome` occurrence was recorded at: what
+    /// a release quoting that generation or a later one tombstones.
+    pub uncertain_generation: Option<i64>,
+}
+
+impl OutcomeRow {
+    /// An uncertain outcome: the intent may have reached the venue and its
+    /// answer is unknown.
+    pub fn is_uncertain(&self) -> bool {
+        self.uncertain_at.is_some()
+    }
 }
 
 /// Everything one commit writes about one intent, in one transaction.
@@ -274,6 +301,70 @@ pub struct StreamSuspensionRow {
 
 /// Statements a suspension's write is charged: `BEGIN`, the insert, `COMMIT`.
 const SUSPENSION_STATEMENTS: u32 = 3;
+/// Statements an incident's upsert is charged: `BEGIN`, the upsert, `COMMIT`.
+const INCIDENT_STATEMENTS: u32 = 3;
+/// How long a release's transaction may take before it is reported unknown.
+pub const RELEASE_BOUND: Duration = Duration::from_secs(10);
+
+/// One audited release, as the backend writes it in one transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseRecord {
+    pub decision_id: Uuid,
+    /// The generation the operator quoted; everything at or below it is
+    /// covered.
+    pub generation: i64,
+    pub actor: String,
+    /// `verified` or `asserted`.
+    pub auth_kind: &'static str,
+    pub note: String,
+    /// The accounting treatment of what remains (`unbooked_accepted`).
+    pub treatment: &'static str,
+    pub decided_at: DateTime<Utc>,
+}
+
+/// What a release's transaction did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReleaseCounts {
+    pub intents_tombstoned: u64,
+    pub incidents_released: u64,
+}
+
+/// Why a release was refused. Nothing was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseRefusal {
+    /// The latch is set: only a restart clears it.
+    Latched,
+    /// The quoted generation is not the current one.
+    Stale { current: i64 },
+    /// Something in `persistence_pending` has not landed.
+    Persisting { pending: usize },
+    /// The transaction failed, or its answer did not come within
+    /// [`RELEASE_BOUND`]: it may have committed, and the fence stays closed.
+    Backend(String),
+}
+
+impl fmt::Display for ReleaseRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Latched => write!(f, "latched: the journal latch is set until a restart"),
+            Self::Stale { current } => write!(f, "stale: the current generation is {current}"),
+            Self::Persisting { pending } => {
+                write!(f, "persisting: {pending} entries have not landed")
+            },
+            Self::Backend(error) => write!(f, "the release did not complete: {error}"),
+        }
+    }
+}
+
+/// What an accepted release did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseReceipt {
+    pub decision_id: Uuid,
+    pub generation: i64,
+    pub counts: ReleaseCounts,
+    /// Whether the fence opened: nothing moved the generation meanwhile.
+    pub fence_open: bool,
+}
 
 /// Durable side of the journal.
 #[async_trait]
@@ -301,6 +392,17 @@ pub trait JournalBackend: Send + Sync + 'static {
         &self,
         suspension: &StreamSuspensionRow,
     ) -> Result<(), CommitFailure>;
+
+    /// Upsert the open incident of `incident.reason` in one transaction. The
+    /// values only ever grow, so a replay or a reordering changes nothing;
+    /// against a released row it opens a new one.
+    async fn upsert_incident(&self, incident: &Incident) -> Result<(), CommitFailure>;
+
+    /// The release's one transaction: tombstone the intents stamped at or
+    /// below its generation with no outcome and no tombstone, release the
+    /// incidents whose last generation is at or below it, and write the
+    /// decision.
+    async fn release(&self, release: &ReleaseRecord) -> Result<ReleaseCounts, String>;
 }
 
 /// For a daemon with no database: every write succeeds and nothing is kept.
@@ -319,6 +421,16 @@ impl JournalBackend for UnpersistedBackend {
 
     async fn record_suspension(&self, _: &StreamSuspensionRow) -> Result<(), CommitFailure> {
         Ok(())
+    }
+
+    async fn upsert_incident(&self, _: &Incident) -> Result<(), CommitFailure> {
+        Ok(())
+    }
+
+    /// A release is durable or it is nothing: with no journal it is refused,
+    /// and the fence stays closed until a restart.
+    async fn release(&self, _: &ReleaseRecord) -> Result<ReleaseCounts, String> {
+        Err("no durable journal is configured".to_string())
     }
 }
 
@@ -345,6 +457,15 @@ pub struct StubJournalRow {
     pub intent: Option<IntentRow>,
     pub attempts: Vec<AttemptRow>,
     pub outcome: Option<OutcomeRow>,
+    /// The release that tombstoned it.
+    pub tombstoned_by: Option<Uuid>,
+}
+
+/// An incident row the stub holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StubIncidentRow {
+    pub incident: Incident,
+    pub released_by: Option<Uuid>,
 }
 
 /// In-memory backend with scripted failures, applying the same upsert rules as
@@ -359,6 +480,10 @@ pub struct StubJournalBackend {
     fail_all: Mutex<Option<JournalFault>>,
     suspensions: Mutex<Vec<StreamSuspensionRow>>,
     suspension_writes_fail: AtomicBool,
+    incidents: Mutex<Vec<StubIncidentRow>>,
+    incident_writes_fail: AtomicBool,
+    releases: Mutex<Vec<ReleaseRecord>>,
+    release_fails: AtomicBool,
 }
 
 impl StubJournalBackend {
@@ -437,6 +562,26 @@ impl StubJournalBackend {
         self.suspensions.lock().unwrap().clone()
     }
 
+    /// Every incident upsert fails, while the other writes go on as scripted.
+    pub fn set_incident_writes_fail(&self, fail: bool) {
+        self.incident_writes_fail.store(fail, Ordering::SeqCst);
+    }
+
+    /// Every release's transaction fails.
+    pub fn set_release_fails(&self, fail: bool) {
+        self.release_fails.store(fail, Ordering::SeqCst);
+    }
+
+    /// The incident rows on record, open and released, oldest first.
+    pub fn incidents(&self) -> Vec<StubIncidentRow> {
+        self.incidents.lock().unwrap().clone()
+    }
+
+    /// The releases on record.
+    pub fn releases(&self) -> Vec<ReleaseRecord> {
+        self.releases.lock().unwrap().clone()
+    }
+
     /// The next scripted fault, or the standing one.
     fn next_fault(&self) -> Option<JournalFault> {
         let scripted = self.faults.lock().unwrap().pop_front();
@@ -473,6 +618,8 @@ impl StubJournalBackend {
             stored.venue_evidence =
                 stored.venue_evidence.take().or_else(|| outcome.venue_evidence.clone());
             stored.uncertain_at = stored.uncertain_at.or(outcome.uncertain_at);
+            stored.uncertain_generation =
+                stored.uncertain_generation.or(outcome.uncertain_generation);
         }
         Ok(())
     }
@@ -537,6 +684,62 @@ impl JournalBackend for StubJournalBackend {
             Some(JournalFault::Hang) => std::future::pending().await,
         }
     }
+
+    async fn upsert_incident(&self, incident: &Incident) -> Result<(), CommitFailure> {
+        if self.incident_writes_fail.load(Ordering::SeqCst) {
+            return Err(CommitFailure::Known("injected: incidents refused".to_string()));
+        }
+        let mut rows = self.incidents.lock().unwrap();
+        match rows
+            .iter_mut()
+            .find(|row| row.released_by.is_none() && row.incident.reason == incident.reason)
+        {
+            Some(row) => {
+                let open = &mut row.incident;
+                open.first_at = open.first_at.min(incident.first_at);
+                open.last_at = open.last_at.max(incident.last_at);
+                open.count = open.count.max(incident.count);
+                open.first_generation = open.first_generation.min(incident.first_generation);
+                open.last_generation = open.last_generation.max(incident.last_generation);
+            },
+            None => rows.push(StubIncidentRow {
+                incident: incident.clone(),
+                released_by: None,
+            }),
+        }
+        Ok(())
+    }
+
+    async fn release(&self, release: &ReleaseRecord) -> Result<ReleaseCounts, String> {
+        let delay = *self.commit_delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if self.release_fails.load(Ordering::SeqCst) {
+            return Err("injected: release refused".to_string());
+        }
+        let mut counts = ReleaseCounts::default();
+        for row in self.rows.lock().unwrap().values_mut() {
+            let covered = row.outcome.as_ref().is_some_and(|outcome| {
+                outcome.venue_outcome.is_none()
+                    && !outcome.not_sent
+                    && outcome.uncertain_at.is_some()
+                    && outcome.uncertain_generation.is_some_and(|g| g <= release.generation)
+            });
+            if covered && row.tombstoned_by.is_none() {
+                row.tombstoned_by = Some(release.decision_id);
+                counts.intents_tombstoned += 1;
+            }
+        }
+        for row in self.incidents.lock().unwrap().iter_mut() {
+            if row.released_by.is_none() && row.incident.last_generation <= release.generation {
+                row.released_by = Some(release.decision_id);
+                counts.incidents_released += 1;
+            }
+        }
+        self.releases.lock().unwrap().push(release.clone());
+        Ok(counts)
+    }
 }
 
 /// An order about to be journaled.
@@ -547,6 +750,16 @@ pub struct IntentSpec {
     pub client_order_id: String,
     pub cancels_order_id: Option<String>,
     pub params: Value,
+}
+
+/// Where a bounded send with no row was remembered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnlandedKept {
+    RetrySet,
+    /// Only its id, in the discarded set.
+    Discarded,
+    /// Nowhere: its non-reuse rests on the id being fresh.
+    Lost,
 }
 
 /// Handle on an intent registered with [`OrderJournal::open_intent`].
@@ -749,36 +962,53 @@ impl OrderJournal {
         &self.gate
     }
 
-    /// Nothing here is in flight or waiting to land: no intent in memory and
-    /// nothing in the retry set. Part of a clean stop's check.
-    pub fn is_quiescent(&self) -> bool {
-        let state = self.lock();
-        state.intents.is_empty() && state.pending() == 0
+    /// The gate's mutex, then this journal's memory: the lock order of every
+    /// critical section that can record an occurrence.
+    fn lock_both(&self) -> (MutexGuard<'_, GateState>, MutexGuard<'_, JournalState>) {
+        let gate = self.gate.lock();
+        (gate, self.lock())
     }
 
-    /// Entries waiting in `persistence_pending`.
+    /// Nothing here is in flight or waiting to land: no intent in memory and
+    /// nothing in `persistence_pending`, incident upserts included. Part of a
+    /// clean stop's check.
+    pub fn is_quiescent(&self) -> bool {
+        let (gate, state) = self.lock_both();
+        state.intents.is_empty() && state.pending() == 0 && gate.incidents_persisting() == 0
+    }
+
+    /// Entries waiting in `persistence_pending`: rows, suspensions and
+    /// incident upserts.
     pub fn retry_set_depth(&self) -> usize {
-        self.lock().pending()
+        let (gate, state) = self.lock_both();
+        state.pending() + gate.incidents_persisting()
     }
 
     /// Record that an event-log stream refuses appends (ADR-0056 step 7, PR
-    /// P), through the retry set, and set the latch: from here on admissions
-    /// stay closed until a restart. No await: the retry loop writes it. With
-    /// the retry set full it is not kept, and the latch is set all the same.
+    /// P), through the retry set, with its `stream_suspended` occurrence, which
+    /// sets the latch and closes the fence. No await: the retry loop writes it.
+    /// With the retry set full it is not kept: discarded history, one more
+    /// occurrence.
     pub fn record_suspension(&self, suspension: StreamSuspensionRow) {
-        let mut state = self.lock();
-        self.latch.store(true, Ordering::SeqCst);
-        if state.suspensions.iter().any(|row| row.stream_key == suspension.stream_key) {
-            return;
-        }
-        if state.pending() >= RETRY_SET_CAPACITY {
+        let (mut gate, mut state) = self.lock_both();
+        let mut occurrences = vec![gate.occur(IncidentReason::StreamSuspended)];
+        let kept = if state.suspensions.iter().any(|row| row.stream_key == suspension.stream_key) {
+            true
+        } else if state.pending() >= RETRY_SET_CAPACITY {
+            occurrences.push(gate.occur(IncidentReason::PersistenceFailure));
+            false
+        } else {
+            state.suspensions.push_back(suspension.clone());
+            true
+        };
+        drop((gate, state));
+        if !kept {
             error!(
                 stream_key = %suspension.stream_key,
                 "Journal retry set is full; this stream suspension is not recorded durably"
             );
-            return;
         }
-        state.suspensions.push_back(suspension);
+        occurrences.iter().for_each(Occurrence::log);
     }
 
     /// Bounded sends whose id could be kept neither in the retry set nor as a
@@ -1035,7 +1265,7 @@ impl OrderJournal {
         };
 
         let result = self.bounded_commit(&batch).await;
-        let mut state = self.lock();
+        let (mut gate, mut state) = self.lock_both();
         if !state.intents.contains_key(&intent.client_order_id) {
             return Err(SendRefusal::NotSent("the id's history is gone".to_string()));
         }
@@ -1052,15 +1282,29 @@ impl OrderJournal {
         // row, whatever the journal can still remember. Only an id already
         // spent stays home.
         if class == WriteClass::Bounded && first && failure != CommitFailure::IdSpent {
-            self.remember_unlanded_send(&mut state, &intent.client_order_id);
-            warn!(
-                client_order_id = %intent.client_order_id,
-                ?failure,
-                "Bounded send goes out without its journal row"
-            );
-            self.latch.store(true, Ordering::SeqCst);
+            // The occurrence before the request: the fence is closed by the
+            // time it leaves.
+            let mut occurrences = vec![gate.occur(IncidentReason::UnlandedSend)];
+            let (kept, overflow) =
+                self.remember_unlanded_send(&mut gate, &mut state, &intent.client_order_id);
+            occurrences.extend(overflow);
+            drop((gate, state));
+            let client_order_id = &intent.client_order_id;
+            match kept {
+                UnlandedKept::RetrySet => {},
+                UnlandedKept::Discarded => {
+                    error!(%client_order_id, "Journal retry set is full; keeping only this send's id");
+                },
+                UnlandedKept::Lost => error!(
+                    %client_order_id,
+                    "Journal cannot keep this send's id; non-reuse rests on freshness"
+                ),
+            }
+            warn!(%client_order_id, ?failure, "Bounded send goes out without its journal row");
+            occurrences.iter().for_each(Occurrence::log);
             return Ok(());
         }
+        drop(gate);
         let Some(memory) = state.intents.get_mut(&intent.client_order_id) else {
             return Err(SendRefusal::NotSent("the id's history is gone".to_string()));
         };
@@ -1083,19 +1327,25 @@ impl OrderJournal {
     }
 
     /// Remember a send with no row: in the retry set, or failing that as a
-    /// discarded id. With both full the id is not kept and the send still goes
-    /// out; the loss is counted and logged.
-    fn remember_unlanded_send(&self, state: &mut JournalState, client_order_id: &str) {
-        if Self::try_enqueue(state, &self.latch, client_order_id) {
-            return;
-        }
+    /// discarded id, with the overflow's `persistence_failure` occurrence.
+    /// With both full the id is not kept and the send still goes out; the
+    /// loss is counted. The caller logs.
+    fn remember_unlanded_send(
+        &self,
+        gate: &mut GateState,
+        state: &mut JournalState,
+        client_order_id: &str,
+    ) -> (UnlandedKept, Option<Occurrence>) {
+        let overflow = match Self::try_enqueue(gate, state, client_order_id) {
+            Ok(()) => return (UnlandedKept::RetrySet, None),
+            Err(overflow) => overflow,
+        };
         if state.discarded.len() < DISCARDED_CAPACITY {
-            error!(%client_order_id, "Journal retry set is full; keeping only this send's id");
             state.discarded.insert(client_order_id.to_string());
-            return;
+            return (UnlandedKept::Discarded, overflow);
         }
         self.non_reuse_ids_lost.fetch_add(1, Ordering::Relaxed);
-        error!(%client_order_id, "Journal cannot keep this send's id; non-reuse rests on freshness");
+        (UnlandedKept::Lost, overflow)
     }
 
     /// Authorize one submission of a bounded reduction and return the client id
@@ -1195,18 +1445,24 @@ impl OrderJournal {
             .intents
             .get(client_order_id)
             .is_some_and(|memory| memory.row.kind == IntentKind::Entry);
-        if entry && !gate.entry_send_allowed() {
-            return Err(SendRefusal::NotSent(format!(
-                "entry refused at its send: the daemon is {}",
-                gate.phase().as_str()
-            )));
-        }
         // From PR P the latch closes admissions until a restart. The admission
         // checks see it first; this is for one already past them.
         if entry && self.latch.load(Ordering::SeqCst) {
             return Err(SendRefusal::NotSent(
                 "entry refused at its send: the journal latch is set".to_string(),
             ));
+        }
+        // From PR F the fence: an entry ticketed before it closed is in
+        // flight; one reaching here after is a proven no-send.
+        if entry && !gate.entry_send_allowed() {
+            let why = if gate.fenced() {
+                "fenced"
+            } else {
+                gate.phase().as_str()
+            };
+            return Err(SendRefusal::NotSent(format!(
+                "entry refused at its send: the daemon is {why}"
+            )));
         }
         gate.send_started();
         let Some(memory) = state.intents.get_mut(client_order_id) else {
@@ -1346,23 +1602,37 @@ impl OrderJournal {
 
     /// The result's write. Never fails: the caller keeps the venue's answer
     /// either way. It is registered for retry before the wait, so a future
-    /// dropped mid-commit leaves it in the retry set, counted and flushed.
-    async fn write_outcome(&self, intent: &JournaledIntent, outcome: OutcomeRow) {
-        let batch = {
-            let mut state = self.lock();
+    /// dropped mid-commit leaves it in the retry set, counted and flushed. An
+    /// uncertain outcome records its `uncertain_outcome` occurrence first, in
+    /// the same critical section, and carries the generation it got: the fence
+    /// is closed before anything is awaited (design §2.2).
+    async fn write_outcome(&self, intent: &JournaledIntent, mut outcome: OutcomeRow) {
+        let (batch, occurrences) = {
+            let (mut gate, mut state) = self.lock_both();
             let Some(memory) = state.intents.get_mut(&intent.client_order_id) else {
                 return;
             };
             if memory.row.intent_id != intent.intent_id {
                 return;
             }
+            let mut occurrences = Vec::new();
+            if outcome.is_uncertain() {
+                let occurrence = gate.occur(IncidentReason::UncertainOutcome);
+                outcome.uncertain_generation = Some(occurrence.generation);
+                occurrences.push(occurrence);
+            }
             memory.sealed = true;
             memory.outcome = Some(outcome);
             memory.outcome_landed = false;
             let batch = memory.batch();
-            Self::enqueue(&mut state, &self.latch, &intent.client_order_id);
-            batch
+            let discarded = Self::enqueue(&mut gate, &mut state, &intent.client_order_id);
+            (batch, (occurrences, discarded))
         };
+        let (occurrences, discarded) = occurrences;
+        occurrences.iter().for_each(Occurrence::log);
+        if let Some(occurrence) = discarded {
+            Self::report_discarded(&intent.client_order_id, &occurrence);
+        }
         match self.bounded_commit(&batch).await {
             Ok(()) => Self::landed(&mut self.lock(), &intent.client_order_id, &batch),
             Err(failure) => warn!(
@@ -1373,33 +1643,47 @@ impl OrderJournal {
         }
     }
 
-    /// Add to `persistence_pending`, logging an overflow.
-    fn enqueue(state: &mut JournalState, latch: &AtomicBool, client_order_id: &str) {
-        if !Self::try_enqueue(state, latch, client_order_id) {
-            error!(%client_order_id, "Journal retry set is full; discarding this intent's history");
-        }
+    /// Add to `persistence_pending`. On overflow the history is discarded:
+    /// a `persistence_failure` occurrence, returned for the caller to report
+    /// with [`Self::report_discarded`] once it holds no lock.
+    fn enqueue(
+        gate: &mut GateState,
+        state: &mut JournalState,
+        client_order_id: &str,
+    ) -> Option<Occurrence> {
+        Self::try_enqueue(gate, state, client_order_id).err().flatten()
     }
 
-    /// `false` on overflow: the history is discarded, the latch is set, and an
-    /// intent that has its outcome is forgotten here.
-    fn try_enqueue(state: &mut JournalState, latch: &AtomicBool, client_order_id: &str) -> bool {
+    fn report_discarded(client_order_id: &str, occurrence: &Occurrence) {
+        error!(%client_order_id, "Journal retry set is full; discarding this intent's history");
+        occurrence.log();
+    }
+
+    /// `Err` on overflow: the history is discarded, with its
+    /// `persistence_failure` occurrence (which sets the latch), and an intent
+    /// that has its outcome is forgotten here. `Err(None)` when the intent is
+    /// not in memory at all.
+    fn try_enqueue(
+        gate: &mut GateState,
+        state: &mut JournalState,
+        client_order_id: &str,
+    ) -> Result<(), Option<Occurrence>> {
         let Some(memory) = state.intents.get_mut(client_order_id) else {
-            return false;
+            return Err(None);
         };
         if memory.in_retry_set {
-            return true;
+            return Ok(());
         }
         if state.retry_set.len() + state.suspensions.len() < RETRY_SET_CAPACITY {
             memory.in_retry_set = true;
             state.retry_set.push_back(client_order_id.to_string());
-            return true;
+            return Ok(());
         }
-        latch.store(true, Ordering::SeqCst);
         memory.sealed = true;
         if memory.outcome.is_some() {
             state.intents.remove(client_order_id);
         }
-        false
+        Err(Some(gate.occur(IncidentReason::PersistenceFailure)))
     }
 
     fn landed(state: &mut JournalState, client_order_id: &str, batch: &JournalBatch) {
@@ -1420,17 +1704,19 @@ impl OrderJournal {
         }
     }
 
-    /// One pass of the retry loop. Stream suspensions go first, then intents.
-    /// Each part stops at its first failure, sending that entry to the back,
-    /// so a dead database costs one bound per part and pass and one bad row
-    /// cannot starve the others, of its own part or of the other one: a
-    /// suspension that keeps failing never keeps an intent's rows from being
-    /// tried. The pass stops starting commits after a few bounds even when
-    /// each succeeds slowly. Returns the entries written.
+    /// One pass of the retry loop. Incident upserts go first, then stream
+    /// suspensions, then intents. Each part stops at its first failure,
+    /// sending that entry to the back, so a dead database costs one bound per
+    /// part and pass and one bad row cannot starve the others, of its own part
+    /// or of another: an upsert or a suspension that keeps failing never keeps
+    /// an intent's rows from being tried. The pass stops starting commits
+    /// after a few bounds even when each succeeds slowly. Returns the entries
+    /// written.
     pub async fn flush_pending(&self) -> usize {
         let started = std::time::Instant::now();
         let pass_bound = self.commit_bound * RETRY_PASS_COMMIT_BOUNDS;
-        let mut written = self.flush_suspensions(started, pass_bound).await;
+        let mut written = self.flush_incidents(started, pass_bound).await;
+        written += self.flush_suspensions(started, pass_bound).await;
         let batches: Vec<(String, JournalBatch)> = {
             let state = self.lock();
             state
@@ -1450,12 +1736,14 @@ impl OrderJournal {
                     written += 1;
                 },
                 Err(failure) => {
-                    let mut state = self.lock();
+                    let (mut gate, mut state) = self.lock_both();
                     if failure == CommitFailure::IdSpent {
-                        self.latch.store(true, Ordering::SeqCst);
+                        let occurrence = gate.occur(IncidentReason::PersistenceFailure);
                         state.retry_set.retain(|id| *id != client_order_id);
                         state.intents.remove(&client_order_id);
+                        drop((gate, state));
                         error!(%client_order_id, "Journal row conflicts with another intent");
+                        occurrence.log();
                     } else if let Some(position) =
                         state.retry_set.iter().position(|id| *id == client_order_id)
                     {
@@ -1464,6 +1752,42 @@ impl OrderJournal {
                         }
                     }
                     break;
+                },
+            }
+        }
+        written
+    }
+
+    /// The incidents part of a retry pass, first: at most one upsert per
+    /// reason, and each is what tells the next start the fence is closed.
+    /// Returns the upserts written; a failure ends this part.
+    async fn flush_incidents(&self, started: std::time::Instant, pass_bound: Duration) -> usize {
+        let pending = self.gate.lock().incidents_to_write();
+        let mut written = 0;
+        for (incident, version) in pending {
+            if started.elapsed() >= pass_bound {
+                break;
+            }
+            self.statements_total
+                .fetch_add(u64::from(INCIDENT_STATEMENTS), Ordering::Relaxed);
+            let upsert = self.backend.upsert_incident(&incident);
+            let failure = match tokio::time::timeout(self.commit_bound, upsert).await {
+                Ok(Ok(())) => None,
+                Ok(Err(failure)) => Some(failure),
+                Err(_) => Some(CommitFailure::Uncertain("no answer within the bound".to_string())),
+            };
+            match failure {
+                None => {
+                    self.gate.lock().incident_landed(incident.reason, version);
+                    written += 1;
+                },
+                Some(failure) => {
+                    warn!(
+                        reason = incident.reason.as_str(),
+                        ?failure,
+                        "Incident not recorded yet; it will be retried"
+                    );
+                    return written;
                 },
             }
         }
@@ -1515,6 +1839,54 @@ impl OrderJournal {
             }
         }
         written
+    }
+
+    /// The audited release (design §2.7): risk acceptance of everything up to
+    /// the generation `request.generation`, never a venue outcome and never a
+    /// booking. Refused, with nothing written, while the latch is set, when
+    /// the quoted generation is not the current one, or while anything waits
+    /// in `persistence_pending`. Then the backend's one transaction tombstones
+    /// the uncertain intents stamped at or below it and releases the incidents
+    /// whose last generation is at or below it, and the fence opens only if
+    /// the generation is still the quoted one and the latch clear. A
+    /// transaction that fails or does not answer within [`RELEASE_BOUND`]
+    /// leaves the fence closed; it may have committed, and a retry quoting the
+    /// same generation finds nothing more to do and opens it.
+    ///
+    /// # Errors
+    /// [`ReleaseRefusal`], with nothing changed here.
+    pub async fn release(&self, request: ReleaseRecord) -> Result<ReleaseReceipt, ReleaseRefusal> {
+        {
+            let (gate, state) = self.lock_both();
+            if self.latch_set() {
+                return Err(ReleaseRefusal::Latched);
+            }
+            if gate.generation() != request.generation {
+                return Err(ReleaseRefusal::Stale { current: gate.generation() });
+            }
+            let pending = state.pending() + gate.incidents_persisting();
+            if pending > 0 {
+                return Err(ReleaseRefusal::Persisting { pending });
+            }
+        }
+        let counts = match tokio::time::timeout(RELEASE_BOUND, self.backend.release(&request)).await
+        {
+            Ok(Ok(counts)) => counts,
+            Ok(Err(error)) => return Err(ReleaseRefusal::Backend(error)),
+            Err(_) => {
+                return Err(ReleaseRefusal::Backend(format!(
+                    "no answer within {} s; it may have committed",
+                    RELEASE_BOUND.as_secs()
+                )))
+            },
+        };
+        let fence_open = self.gate.release_through(request.generation);
+        Ok(ReleaseReceipt {
+            decision_id: request.decision_id,
+            generation: request.generation,
+            counts,
+            fence_open,
+        })
     }
 
     /// Evidence for the finality rule, read after the venue's not-found.
@@ -1658,7 +2030,8 @@ impl Drop for Operation {
             self.journal.operations_over_statement_bound.fetch_add(1, Ordering::Relaxed);
             warn!(statements, "Journal operation went past its reviewed statement bound");
         }
-        let mut state = self.journal.lock();
+        let (mut occurrences, mut discarded) = (Vec::new(), Vec::new());
+        let (mut gate, mut state) = self.journal.lock_both();
         state.operations.remove(&self.id);
         if self.listed_unpermitted {
             state.unpermitted_listed -= 1;
@@ -1680,13 +2053,27 @@ impl Drop for Operation {
                     if !outcome.not_sent && outcome.venue_outcome.is_none() {
                         outcome.uncertain_at.get_or_insert_with(Utc::now);
                     }
+                    if outcome.is_uncertain() {
+                        let occurrence = gate.occur(IncidentReason::UncertainOutcome);
+                        outcome.uncertain_generation = Some(occurrence.generation);
+                        occurrences.push(occurrence);
+                    }
                     memory.outcome = Some(outcome);
-                    OrderJournal::enqueue(&mut state, &self.journal.latch, &client_order_id);
+                    if let Some(occurrence) =
+                        OrderJournal::enqueue(&mut gate, &mut state, &client_order_id)
+                    {
+                        discarded.push((client_order_id, occurrence));
+                    }
                 },
                 None => {
                     state.intents.remove(&client_order_id);
                 },
             }
+        }
+        drop((gate, state));
+        occurrences.iter().for_each(Occurrence::log);
+        for (client_order_id, occurrence) in &discarded {
+            OrderJournal::report_discarded(client_order_id, occurrence);
         }
     }
 }
@@ -1846,7 +2233,9 @@ mod tests {
             .await;
             assert_eq!(result, Ok(()), "{fault:?}");
             assert!(journal.latch_set(), "{fault:?}");
-            assert_eq!(journal.retry_set_depth(), 1, "{fault:?}");
+            // The intent, and its `unlanded_send` incident's upsert (PR F).
+            assert_eq!(journal.retry_set_depth(), 2, "{fault:?}");
+            assert!(journal.gate().fenced(), "{fault:?}");
         }
     }
 
@@ -2088,7 +2477,9 @@ mod tests {
         })
         .await;
         backend.push_fault(JournalFault::Known);
-        assert_eq!(journal.flush_pending().await, 0);
+        // The `unlanded_send` incident's upsert lands first (PR F); then one
+        // failure ends the intents' part of the pass.
+        assert_eq!(journal.flush_pending().await, 1);
         assert_eq!(backend.commits().len(), 3, "one failure ends the pass");
         // `b` goes first now, so a row that never lands cannot starve the rest.
         backend.push_fault(JournalFault::Pass);
@@ -2121,7 +2512,9 @@ mod tests {
             journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
             backend.push_fault(JournalFault::Known);
             journal.finish_success(&intent, None).await;
-            assert_eq!(journal.retry_set_depth(), RETRY_SET_CAPACITY);
+            // The set is full; the overflow's `persistence_failure` incident is
+            // an upsert of its own beside it, one per reason (PR F).
+            assert_eq!(journal.retry_set_depth(), RETRY_SET_CAPACITY + 1);
             assert!(journal.latch_set(), "the overflow latches");
             assert!(!journal.is_live("over"), "the discarded history is gone");
             assert!(matches!(
@@ -2210,7 +2603,8 @@ mod tests {
         })
         .await;
         drop(op);
-        assert_eq!(journal.retry_set_depth(), 1);
+        // The intent, and its `uncertain_outcome` incident's upsert (PR F).
+        assert_eq!(journal.retry_set_depth(), 2);
         journal.flush_pending().await;
         let outcome = backend.row("a").unwrap().outcome.unwrap();
         assert!(outcome.uncertain_at.is_some());
@@ -2524,6 +2918,14 @@ mod tests {
             self.real.record_suspension(suspension).await
         }
 
+        async fn upsert_incident(&self, incident: &Incident) -> Result<(), CommitFailure> {
+            self.real.upsert_incident(incident).await
+        }
+
+        async fn release(&self, release: &ReleaseRecord) -> Result<ReleaseCounts, String> {
+            self.real.release(release).await
+        }
+
         async fn attempt_states(&self, v: &str, s: &str, id: &str) -> Result<Vec<bool>, String> {
             let states = self.real.attempt_states(v, s, id).await;
             if let Some(during_read) = self.during_read.lock().unwrap().take() {
@@ -2770,7 +3172,8 @@ mod tests {
         assert_eq!((gate.aborted, gate.permits), (1, 0));
         assert!(journal.latch_set());
         assert_eq!(backend.row("x").unwrap().attempts.len(), 1, "its row had landed");
-        assert_eq!(journal.retry_set_depth(), 1);
+        // The intent, and two incidents: the abort and the uncertain outcome.
+        assert_eq!(journal.retry_set_depth(), 3);
         journal.flush_pending().await;
         let outcome = backend.row("x").unwrap().outcome.unwrap();
         assert!(outcome.uncertain_at.is_some() && !outcome.not_sent, "{outcome:?}");
@@ -2898,13 +3301,16 @@ mod tests {
         journal.record_suspension(suspension("position:a"));
         journal.record_suspension(suspension("position:a"));
         assert!(journal.latch_set());
-        assert_eq!(journal.retry_set_depth(), 1, "one per stream");
+        // One per stream, and one `stream_suspended` incident (PR F).
+        assert_eq!(journal.retry_set_depth(), 2, "one per stream");
         assert!(!journal.is_quiescent());
 
         backend.push_fault(JournalFault::Known);
-        assert_eq!(journal.flush_pending().await, 0);
+        // The incident's upsert lands; the suspension's write fails.
+        assert_eq!(journal.flush_pending().await, 1);
         assert_eq!(journal.retry_set_depth(), 1, "kept for the next pass");
         assert!(backend.suspensions().is_empty());
+        assert_eq!(backend.incidents().len(), 1);
 
         backend.push_fault(JournalFault::AckLost);
         journal.flush_pending().await;
@@ -2934,9 +3340,11 @@ mod tests {
         .await;
         backend.set_suspension_writes_fail(true);
         journal.record_suspension(suspension("position:refused"));
-        assert_eq!(journal.retry_set_depth(), 2);
+        // The suspension, the intent and the `stream_suspended` incident.
+        assert_eq!(journal.retry_set_depth(), 3);
 
-        assert_eq!(journal.flush_pending().await, 1, "the intent lands");
+        // The intent lands, and so does the incident's upsert.
+        assert_eq!(journal.flush_pending().await, 2, "the intent lands");
         assert_eq!(journal.flush_pending().await, 0);
         assert_eq!(journal.retry_set_depth(), 1, "the suspension waits, and only it");
         let landed = backend.row("x-pending").unwrap().outcome.unwrap();
@@ -2955,7 +3363,14 @@ mod tests {
         fill_retry_set(&journal, &backend).await;
         journal.record_suspension(suspension("position:full"));
         assert!(journal.latch_set());
-        assert_eq!(journal.retry_set_depth(), RETRY_SET_CAPACITY);
+        // Full, plus the two incidents' upserts: the suspension and its
+        // discarded record (PR F).
+        assert_eq!(journal.retry_set_depth(), RETRY_SET_CAPACITY + 2);
+        let reasons: Vec<_> = journal.gate().open_incidents().iter().map(|i| i.reason).collect();
+        assert_eq!(reasons, [
+            IncidentReason::PersistenceFailure,
+            IncidentReason::StreamSuspended
+        ]);
     }
 
     /// An entry and its stop under one permit are one operation: both are in
@@ -3008,5 +3423,366 @@ mod tests {
             .await;
         assert_eq!(mine.gate().snapshot().unpermitted, 2);
         assert_eq!(other.gate().snapshot().unpermitted, 0);
+    }
+
+    // =========================================================================
+    // PR F: occurrences, the fence, the generation and the audited release
+    // =========================================================================
+
+    use crate::gate::{EpochView, Incident, IncidentReason, GENERATION_COUNTER_LIMIT};
+
+    /// An exit that was sent and has no definite answer: uncertain.
+    async fn uncertain_exit(journal: &Arc<OrderJournal>, id: &str) {
+        let ledger = SubmitAttemptLedger::new(8);
+        let ((), _op) = in_op(journal, async {
+            let intent = journal.open_intent(spec(id, IntentKind::Exit));
+            journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
+            let _ = ledger.begin(id);
+            journal.finish_failed(&intent).await;
+        })
+        .await;
+    }
+
+    fn reasons(journal: &OrderJournal) -> Vec<IncidentReason> {
+        journal.gate().open_incidents().iter().map(|incident| incident.reason).collect()
+    }
+
+    fn release_of(generation: i64) -> ReleaseRecord {
+        ReleaseRecord {
+            decision_id: Uuid::now_v7(),
+            generation,
+            actor: "operator@example.com".to_string(),
+            auth_kind: "verified",
+            note: "reviewed".to_string(),
+            treatment: "unbooked_accepted",
+            decided_at: Utc::now(),
+        }
+    }
+
+    fn epoch(journal: &OrderJournal, epoch_seq: i64) {
+        let view = EpochView { epoch_seq, unclean_reason: None };
+        journal.gate().begin_epoch(view, None, Vec::new());
+    }
+
+    /// Design §2.2: an uncertain outcome closes the fence before anything is
+    /// awaited. The outcome's write here never answers, yet after its first
+    /// poll the fence is closed, the generation moved and the intent stamped
+    /// with it, and an entry reaching its send is refused.
+    #[tokio::test]
+    async fn an_uncertain_outcome_fences_before_its_write_is_awaited() {
+        let (backend, journal) = journal();
+        epoch(&journal, 7);
+        let ledger = SubmitAttemptLedger::new(8);
+        let ((), _op) = in_op(&journal, async {
+            let intent = journal.open_intent(spec("x", IntentKind::Exit));
+            journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
+            let _ = ledger.begin("x");
+            assert!(!journal.gate().fenced());
+
+            backend.set_fail_all(Some(JournalFault::Hang));
+            let mut write = Box::pin(journal.finish_failed(&intent));
+            // One poll: the write is now waiting on its commit, and nothing
+            // before that wait yielded.
+            assert!(tokio::time::timeout(Duration::ZERO, &mut write).await.is_err());
+            assert!(journal.gate().fenced(), "the fence closed before the await");
+            assert_eq!(journal.gate().generation(), (7 << 32) | 1);
+            assert_eq!(reasons(&journal), [IncidentReason::UncertainOutcome]);
+            assert!(!journal.latch_set(), "not a latch-class reason");
+
+            let entry = journal.open_intent(spec("e", IntentKind::Entry));
+            backend.set_fail_all(None);
+            journal.before_send(&entry, WriteClass::Strict).await.unwrap();
+            let refused = ledger.begin_send("e").err();
+            assert!(
+                matches!(&refused, Some(SendRefusal::NotSent(why)) if why.contains("fenced")),
+                "{refused:?}"
+            );
+            // A reduction still goes out under the fence.
+            let exit = journal.open_intent(spec("x2", IntentKind::Exit));
+            journal.before_send(&exit, WriteClass::Bounded).await.unwrap();
+            ledger.begin_send("x2").unwrap();
+            journal.finish_success(&exit, None).await;
+            drop(write);
+        })
+        .await;
+        journal.flush_pending().await;
+        let stamped = backend.row("x").unwrap().outcome.unwrap();
+        assert_eq!(stamped.uncertain_generation, Some((7 << 32) | 1));
+        assert!(stamped.uncertain_at.is_some());
+    }
+
+    /// Every occurrence moves the generation, a repeat of an open reason
+    /// included, and is counted on its one incident; a latch-class reason sets
+    /// the latch; each incident's upsert waits in `persistence_pending` until
+    /// it lands, and one that moved while its write was out stays pending.
+    #[tokio::test]
+    async fn every_occurrence_moves_the_generation_and_counts_on_its_incident() {
+        let (backend, journal) = journal();
+        epoch(&journal, 3);
+        uncertain_exit(&journal, "a").await;
+        uncertain_exit(&journal, "b").await;
+        assert_eq!(journal.gate().generation(), (3 << 32) | 2);
+        let incidents = journal.gate().open_incidents();
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(
+            (incidents[0].count, incidents[0].first_generation, incidents[0].last_generation),
+            (2, (3 << 32) | 1, (3 << 32) | 2)
+        );
+        assert!(!journal.latch_set());
+
+        let occurrence = journal.gate().record(IncidentReason::UnpermittedMutation);
+        assert_eq!(occurrence.generation, (3 << 32) | 3);
+        assert!(occurrence.opened && journal.latch_set());
+        assert_eq!(journal.gate().snapshot().incidents_persisting, 2);
+
+        backend.set_incident_writes_fail(true);
+        journal.flush_pending().await;
+        assert_eq!(journal.gate().snapshot().incidents_persisting, 2, "not landed");
+        backend.set_incident_writes_fail(false);
+        journal.flush_pending().await;
+        assert_eq!(journal.retry_set_depth(), 0);
+        assert_eq!(backend.incidents().len(), 2);
+        let row = backend
+            .incidents()
+            .into_iter()
+            .find(|row| row.incident.reason == IncidentReason::UncertainOutcome)
+            .unwrap();
+        assert_eq!(row.incident.count, 2);
+
+        uncertain_exit(&journal, "c").await;
+        assert_eq!(journal.gate().snapshot().incidents_persisting, 1, "moved again");
+    }
+
+    /// Each latch-class source records its own reason with the latch set; the
+    /// two others close the fence with the latch clear.
+    #[test]
+    fn the_latch_class_is_every_reason_but_two() {
+        for reason in IncidentReason::ALL {
+            let (_backend, journal) = journal();
+            journal.gate().record(reason);
+            assert!(journal.gate().fenced(), "{reason:?}");
+            let latch_class =
+                !matches!(reason, IncidentReason::UncleanStart | IncidentReason::UncertainOutcome);
+            assert_eq!(journal.latch_set(), latch_class, "{reason:?}");
+            assert_eq!(IncidentReason::parse(reason.as_str()), Some(reason));
+        }
+    }
+
+    /// The last generation of an epoch is itself an occurrence: latch set,
+    /// `generation_exhausted` opened, and the generation stays where it is.
+    #[test]
+    fn running_out_of_generations_latches_and_fences_until_a_restart() {
+        let (_backend, journal) = journal();
+        epoch(&journal, 1);
+        journal.gate().lock().set_counter(GENERATION_COUNTER_LIMIT - 1);
+        let last = journal.gate().record(IncidentReason::UncertainOutcome);
+        assert!(last.exhausted);
+        assert_eq!(last.generation, (1 << 32) | i64::from(GENERATION_COUNTER_LIMIT));
+        assert!(journal.latch_set());
+        assert_eq!(reasons(&journal), [
+            IncidentReason::UncertainOutcome,
+            IncidentReason::GenerationExhausted
+        ]);
+        let after = journal.gate().record(IncidentReason::UncertainOutcome);
+        assert_eq!(after.generation, last.generation, "nothing left to move");
+        assert!(!after.exhausted);
+    }
+
+    /// A start seeds the generation from its epoch and loads the incidents no
+    /// release covered: any of them closes the fence.
+    #[test]
+    fn a_start_with_open_incidents_on_record_is_fenced() {
+        let (_backend, journal) = journal();
+        let view = EpochView {
+            epoch_seq: 9,
+            unclean_reason: Some("no_marker"),
+        };
+        let unclean = Incident {
+            reason: IncidentReason::UncleanStart,
+            first_at: Utc::now(),
+            last_at: Utc::now(),
+            count: 1,
+            first_generation: (9 << 32) | 1,
+            last_generation: (9 << 32) | 1,
+        };
+        journal.gate().begin_epoch(view, Some((9 << 32) | 1), vec![unclean]);
+        assert!(journal.gate().fenced());
+        assert_eq!(journal.gate().generation(), (9 << 32) | 1);
+        assert_eq!(journal.retry_set_depth(), 0, "loaded rows are on record already");
+        assert_eq!(journal.gate().epoch(), Some(view));
+
+        let (_backend, clean) = super::tests::journal();
+        clean
+            .gate()
+            .begin_epoch(EpochView { epoch_seq: 10, unclean_reason: None }, None, vec![]);
+        assert!(!clean.gate().fenced());
+        assert_eq!(clean.gate().generation(), 10 << 32);
+    }
+
+    /// Design §2.7: a release is refused while the latch is set, for a stale
+    /// generation and while anything persists, and writes nothing then.
+    #[tokio::test]
+    async fn a_release_is_refused_latched_stale_or_persisting() {
+        let (backend, journal) = journal();
+        epoch(&journal, 2);
+        backend.set_incident_writes_fail(true);
+        uncertain_exit(&journal, "a").await;
+        let current = journal.gate().generation();
+
+        let stale = journal.release(release_of(current - 1)).await;
+        assert_eq!(stale, Err(ReleaseRefusal::Stale { current }));
+        let persisting = journal.release(release_of(current)).await;
+        assert_eq!(persisting, Err(ReleaseRefusal::Persisting { pending: 1 }));
+
+        backend.set_incident_writes_fail(false);
+        journal.flush_pending().await;
+        journal.gate().record(IncidentReason::OperationAborted);
+        journal.flush_pending().await;
+        let latched = journal.release(release_of(journal.gate().generation())).await;
+        assert_eq!(latched, Err(ReleaseRefusal::Latched));
+        assert!(backend.releases().is_empty());
+        assert!(journal.gate().fenced());
+    }
+
+    /// An accepted release tombstones exactly the uncertain intents stamped at
+    /// or below its generation, releases the incidents it covers and, with
+    /// the generation unmoved, opens the fence. A row with a definite outcome,
+    /// one never sent and one stamped later stay as they are.
+    #[tokio::test]
+    async fn a_release_tombstones_what_it_covers_and_opens_the_fence() {
+        let (backend, journal) = journal();
+        epoch(&journal, 4);
+        uncertain_exit(&journal, "uncertain").await;
+        let ledger = SubmitAttemptLedger::new(8);
+        let ((), _op) = in_op(&journal, async {
+            let done = journal.open_intent(spec("done", IntentKind::Exit));
+            journal.before_send(&done, WriteClass::Bounded).await.unwrap();
+            let _ = ledger.begin("done");
+            journal.finish_success(&done, None).await;
+            let unsent = journal.open_intent(spec("unsent", IntentKind::Exit));
+            journal.before_send(&unsent, WriteClass::Bounded).await.unwrap();
+            journal.finish_failed(&unsent).await;
+        })
+        .await;
+        journal.flush_pending().await;
+        let quoted = journal.gate().generation();
+
+        let receipt = journal.release(release_of(quoted)).await.unwrap();
+        assert_eq!(receipt.counts.intents_tombstoned, 1);
+        assert_eq!(receipt.counts.incidents_released, 1);
+        assert!(receipt.fence_open && !journal.gate().fenced());
+        assert!(journal.gate().open_incidents().is_empty());
+        assert!(backend.row("uncertain").unwrap().tombstoned_by.is_some());
+        for untouched in ["done", "unsent"] {
+            assert!(backend.row(untouched).unwrap().tombstoned_by.is_none(), "{untouched}");
+        }
+
+        // A later uncertainty is its own: fenced again, and not covered.
+        uncertain_exit(&journal, "later").await;
+        journal.flush_pending().await;
+        assert!(journal.gate().fenced());
+        let again = journal.release(release_of(quoted)).await;
+        assert!(matches!(again, Err(ReleaseRefusal::Stale { .. })), "{again:?}");
+        assert!(backend.row("later").unwrap().tombstoned_by.is_none());
+    }
+
+    /// A release whose generation moved while its transaction ran releases
+    /// what it quoted, keeps the newer incident open and leaves the fence
+    /// closed.
+    #[tokio::test]
+    async fn a_release_overtaken_by_an_occurrence_leaves_the_fence_closed() {
+        let (backend, journal) = journal();
+        epoch(&journal, 5);
+        uncertain_exit(&journal, "a").await;
+        journal.flush_pending().await;
+        let quoted = journal.gate().generation();
+        backend.set_commit_delay(Duration::from_millis(5));
+
+        let release = journal.release(release_of(quoted));
+        let overtaking = async {
+            tokio::task::yield_now().await;
+            journal.gate().record(IncidentReason::UncertainOutcome);
+        };
+        let (receipt, ()) = tokio::join!(release, overtaking);
+        let receipt = receipt.unwrap();
+        assert!(!receipt.fence_open);
+        assert!(journal.gate().fenced());
+        let open = journal.gate().open_incidents();
+        assert_eq!(open.len(), 1);
+        assert!(open[0].last_generation > quoted);
+    }
+
+    /// A release whose transaction fails changes nothing: the fence stays
+    /// closed and the incident open. Without a durable journal there is no
+    /// release at all.
+    #[tokio::test]
+    async fn a_release_that_did_not_complete_keeps_the_fence_closed() {
+        let (backend, journal) = journal();
+        uncertain_exit(&journal, "a").await;
+        journal.flush_pending().await;
+        backend.set_release_fails(true);
+        let failed = journal.release(release_of(journal.gate().generation())).await;
+        assert!(matches!(failed, Err(ReleaseRefusal::Backend(_))), "{failed:?}");
+        assert!(journal.gate().fenced());
+        assert_eq!(reasons(&journal), [IncidentReason::UncertainOutcome]);
+
+        let unpersisted = Arc::new(OrderJournal::unpersisted());
+        unpersisted.gate().record(IncidentReason::UncleanStart);
+        unpersisted.flush_pending().await;
+        let refused = unpersisted.release(release_of(unpersisted.gate().generation())).await;
+        assert!(matches!(refused, Err(ReleaseRefusal::Backend(_))), "{refused:?}");
+        assert!(unpersisted.gate().fenced());
+    }
+
+    /// Each source of the latch records its reason: a bounded send without
+    /// its row, discarded history, a conflicting row on retry, a suspended
+    /// stream, an aborted operation and an unpermitted mutation.
+    #[tokio::test]
+    async fn each_latch_source_records_its_reason() {
+        let (backend, unlanded) = journal();
+        backend.push_fault(JournalFault::Known);
+        let ((), _op) = in_op(&unlanded, async {
+            let intent = unlanded.open_intent(spec("a", IntentKind::Exit));
+            unlanded.before_send(&intent, WriteClass::Bounded).await.unwrap();
+        })
+        .await;
+        assert_eq!(reasons(&unlanded), [IncidentReason::UnlandedSend]);
+
+        let (backend, conflicting) = journal();
+        let ((), _op) = in_op(&conflicting, async {
+            let intent = conflicting.open_intent(spec("a", IntentKind::Exit));
+            conflicting.before_send(&intent, WriteClass::Bounded).await.unwrap();
+            backend.push_fault(JournalFault::Known);
+            conflicting.finish_success(&intent, None).await;
+        })
+        .await;
+        backend.push_fault(JournalFault::IdSpent);
+        conflicting.flush_pending().await;
+        assert_eq!(reasons(&conflicting), [IncidentReason::PersistenceFailure]);
+
+        let (_backend, suspended) = journal();
+        suspended.record_suspension(StreamSuspensionRow {
+            suspension_id: Uuid::now_v7(),
+            stream_key: "position:a".to_string(),
+            stream_kind: "position",
+            failed_seq: None,
+            month: None,
+            error: "injected".to_string(),
+            epoch_id: None,
+            suspended_at: Utc::now(),
+        });
+        assert_eq!(reasons(&suspended), [IncidentReason::StreamSuspended]);
+
+        let (_backend, aborted) = journal();
+        drop(aborted.acquire(OperationKind::Panic).unwrap());
+        assert_eq!(reasons(&aborted), [IncidentReason::OperationAborted]);
+
+        let (_backend, unpermitted) = journal();
+        unpermitted.gate().mutation("POST /order").unwrap();
+        assert_eq!(reasons(&unpermitted), [IncidentReason::UnpermittedMutation]);
+
+        for journal in [unlanded, conflicting, suspended, aborted, unpermitted] {
+            assert!(journal.latch_set() && journal.gate().fenced());
+        }
     }
 }

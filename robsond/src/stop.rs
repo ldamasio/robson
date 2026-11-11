@@ -11,9 +11,10 @@
 //! 2. **Closing.** Every new operation is refused, and the main loop, the
 //!    workers, the detectors and the API listener are cancelled. The operations
 //!    already holding a permit finish, then the journal is flushed.
-//! 3. **Marker.** Only a clean pass writes the marker: every permit released in
-//!    time, none aborted, the journal holding nothing unlanded and its latch
-//!    clear. A stop that fails a check writes none, and the next start sees an
+//! 3. **Marker.** Only a clean pass writes the marker, at version 2: every
+//!    permit released in time, none aborted, the journal holding nothing
+//!    unlanded and its latch clear, and no incident open (ADR-0056 step 7, PR
+//!    F). A stop that fails a check writes none, and the next start sees an
 //!    unclean predecessor. A marker write that times out or fails is
 //!    unconfirmed: its update may have committed. A marker records those
 //!    conditions only; it stands even if teardown work that holds no permit
@@ -278,6 +279,8 @@ pub enum StopResult {
     Latched,
     /// The journal still holds something that has not landed.
     Unlanded,
+    /// An incident is open: the fence was never released.
+    IncidentOpen,
     /// The marker could not be written.
     MarkerFailed,
 }
@@ -290,6 +293,7 @@ impl StopResult {
             Self::Aborted => "aborted",
             Self::Latched => "latched",
             Self::Unlanded => "unlanded",
+            Self::IncidentOpen => "incident_open",
             Self::MarkerFailed => "marker_failed",
         }
     }
@@ -419,6 +423,12 @@ async fn closing(
     }
     if journal.latch_set() {
         return unmarked(StopResult::Latched);
+    }
+    // A quiescent epoch whose incidents were released may mark clean; one
+    // still fenced may not, so the next start is unclean and fenced again.
+    let gate = journal.gate().snapshot();
+    if gate.fenced || gate.open_incidents > 0 {
+        return unmarked(StopResult::IncidentOpen);
     }
     if !journal.is_quiescent() {
         return unmarked(StopResult::Unlanded);
@@ -621,6 +631,49 @@ mod tests {
             run_stop(&journal, Instant::now(), || {}, Some(&marker), StopTimings::default()).await;
         assert_eq!(report.result, StopResult::Latched);
         assert_eq!(marker.marked.load(Ordering::SeqCst), 0);
+    }
+
+    /// ADR-0056 step 7, PR F: an open incident leaves the epoch unmarked even
+    /// with nothing else wrong; once released at the current generation, with
+    /// its upsert landed, the same stop marks it. The incident's upsert is part
+    /// of the final flush.
+    #[tokio::test(start_paused = true)]
+    async fn an_open_incident_leaves_the_epoch_unmarked_until_released() {
+        use robson_exec::{gate::IncidentReason, order_journal::ReleaseRecord};
+
+        let (backend, journal) = stub_journal();
+        journal.gate().record(IncidentReason::UncleanStart);
+        assert!(!journal.latch_set());
+        let marker = Marker::default();
+        let report =
+            run_stop(&journal, Instant::now(), || {}, Some(&marker), StopTimings::default()).await;
+        assert_eq!(
+            (report.result, report.marker),
+            (StopResult::IncidentOpen, MarkerWrite::NotAttempted)
+        );
+        assert_eq!(report.result.label(), "incident_open");
+        assert_eq!(marker.marked.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.incidents().len(), 1, "the final flush wrote the incident");
+
+        let (_backend, journal) = stub_journal();
+        journal.gate().record(IncidentReason::UncertainOutcome);
+        journal.flush_pending().await;
+        let receipt = journal
+            .release(ReleaseRecord {
+                decision_id: uuid::Uuid::now_v7(),
+                generation: journal.gate().generation(),
+                actor: "operator".to_string(),
+                auth_kind: "verified",
+                note: "reviewed".to_string(),
+                treatment: "unbooked_accepted",
+                decided_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        assert!(receipt.fence_open);
+        let report =
+            run_stop(&journal, Instant::now(), || {}, Some(&marker), StopTimings::default()).await;
+        assert_eq!((report.result, report.marker), (StopResult::Clean, MarkerWrite::Written));
     }
 
     fn journal_with_latch() -> (Arc<StubJournalBackend>, Arc<OrderJournal>) {
