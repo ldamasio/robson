@@ -382,7 +382,8 @@ async fn a_stalled_journal_commit_times_out_at_its_bound(pool: PgPool) {
     let (operation, exit) = opened(&journal, "x", IntentKind::Exit).await;
     operation.scope(journal.before_send(&exit, WriteClass::Bounded)).await.unwrap();
     assert!(journal.latch_set());
-    assert_eq!(journal.retry_set_depth(), 1);
+    // The exit's row, and the `unlanded_send` incident's upsert (PR F).
+    assert_eq!(journal.retry_set_depth(), 2);
 }
 
 // Boundary B
@@ -837,6 +838,20 @@ impl JournalBackend for Injecting {
         suspension: &StreamSuspensionRow,
     ) -> Result<(), CommitFailure> {
         self.real.record_suspension(suspension).await
+    }
+
+    async fn upsert_incident(
+        &self,
+        incident: &robson_exec::gate::Incident,
+    ) -> Result<(), CommitFailure> {
+        self.real.upsert_incident(incident).await
+    }
+
+    async fn release(
+        &self,
+        release: &robson_exec::order_journal::ReleaseRecord,
+    ) -> Result<robson_exec::order_journal::ReleaseCounts, String> {
+        self.real.release(release).await
     }
 }
 

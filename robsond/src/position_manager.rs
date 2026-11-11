@@ -3047,12 +3047,28 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// without a permit, a suspended stream. The latch is checked again at an
     /// entry's send. A suspended system stream of the current month is not a
     /// check here: it makes the month's accounting invalid, through the
-    /// invalid-basis path (`MonthlyRiskState::basis_invalid`).
+    /// invalid-basis path (`MonthlyRiskState::basis_invalid`). From PR F they
+    /// also stay closed while the admission fence is: an incident is open,
+    /// whatever opened it, until an operator's audited release; the fence is
+    /// checked again at an entry's send.
     fn check_admissions_open(&self) -> DaemonResult<()> {
-        if self.executor.order_journal().latch_set() {
+        let journal = self.executor.order_journal();
+        if journal.latch_set() {
             return Err(DaemonError::AdmissionsClosed {
                 reason: "the journal latch is set; admissions stay closed until a restart"
                     .to_string(),
+            });
+        }
+        let gate = journal.gate();
+        if gate.fenced() {
+            let reasons: Vec<&str> =
+                gate.open_incidents().iter().map(|incident| incident.reason.as_str()).collect();
+            return Err(DaemonError::AdmissionsClosed {
+                reason: format!(
+                    "the admission fence is closed (open incidents: {}); an operator's audited \
+                     release, POST /recovery/release, reopens it",
+                    reasons.join(", ")
+                ),
             });
         }
         Ok(())

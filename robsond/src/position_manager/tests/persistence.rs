@@ -95,6 +95,85 @@ async fn the_latch_closes_admissions_at_every_door() {
     assert!(!armed.carries_admission_evidence(), "refused before any evidence");
 }
 
+/// ADR-0056 step 7, PR F: an incident closes the fence, and the fence closes
+/// admissions at each of the three doors, with the latch clear: a governed
+/// refusal before anything is written, the signal's detector re-armed under
+/// the backoff. An operator's release at the current generation reopens them.
+#[tokio::test]
+async fn the_fence_closes_admissions_at_every_door_until_a_release() {
+    use robson_exec::{
+        gate::IncidentReason,
+        order_journal::{OrderJournal, ReleaseRecord, StubJournalBackend},
+    };
+
+    let fenced = |result: Option<DaemonError>| {
+        assert!(
+            matches!(&result, Some(DaemonError::AdmissionsClosed { reason }) if reason.contains("fence")),
+            "{result:?}"
+        );
+    };
+    let journal = Arc::new(OrderJournal::new(
+        Arc::new(StubJournalBackend::default()),
+        &VenueId::new("test:venue"),
+    ));
+    let manager = create_test_manager_with_order_journal(
+        Arc::new(MemoryStore::new()),
+        Arc::new(EventBus::new(100)),
+        ApprovalPolicy::new(Decimal::from(100u32), 300),
+        Some(Arc::clone(&journal)),
+    )
+    .await;
+    let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+    let entry = Price::new(dec!(100)).unwrap();
+    let stop = Price::new(dec!(98)).unwrap();
+    let arm = || {
+        manager.arm_position(
+            symbol.clone(),
+            Side::Long,
+            create_test_risk_config(),
+            Some(TechnicalStopDistance::from_entry_and_stop(entry, stop)),
+            Uuid::now_v7(),
+        )
+    };
+    let armed = arm().await.unwrap();
+    journal.gate().record(IncidentReason::UncertainOutcome);
+    assert!(!latched(&manager), "the fence, not the latch");
+
+    fenced(arm().await.err());
+    fenced(manager.approve_query(Uuid::now_v7()).await.err());
+    let signal = || DetectorSignal {
+        signal_id: Uuid::now_v7(),
+        position_id: armed.id,
+        symbol: symbol.clone(),
+        side: Side::Long,
+        entry_price: entry,
+        stop_loss: stop,
+        technical_stop_analysis: None,
+        timestamp: chrono::Utc::now(),
+    };
+    fenced(manager.handle_signal(signal()).await.err());
+    assert_eq!(manager.exchange().market_order_call_count(), 0);
+    assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), Some(&1));
+    let still_armed = manager.get_position(armed.id).await.unwrap().unwrap();
+    assert!(!still_armed.carries_admission_evidence(), "refused before any evidence");
+
+    journal.flush_pending().await;
+    let receipt = journal
+        .release(ReleaseRecord {
+            decision_id: Uuid::now_v7(),
+            generation: journal.gate().generation(),
+            actor: "operator".to_string(),
+            auth_kind: "verified",
+            note: "reviewed".to_string(),
+            treatment: "unbooked_accepted",
+            decided_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    assert!(receipt.fence_open);
+    assert!(arm().await.is_ok(), "released: admissions open again");
+}
+
 /// Restore a suspension of `year`-`month`'s system stream, as a start loads one
 /// on record.
 fn suspend_month(manager: &PositionManager<StubExchange, MemoryStore>, year: i32, month: u32) {
@@ -796,9 +875,10 @@ async fn a_suspension_is_recorded_and_the_next_start_refuses_the_stream(pool: sq
     restore_event_log_writes(&pool).await;
     assert!(matches!(failed, Err(DaemonError::EventLog(_))), "{failed:?}");
     assert!(latched(&manager));
-    assert_eq!(manager.executor.order_journal().retry_set_depth(), 1);
+    // The suspension, and its `stream_suspended` incident's upsert (PR F).
+    assert_eq!(manager.executor.order_journal().retry_set_depth(), 2);
 
-    assert_eq!(manager.executor.order_journal().flush_pending().await, 1);
+    assert_eq!(manager.executor.order_journal().flush_pending().await, 2);
     let row = sqlx::query_as::<_, (Uuid, String, Option<i64>, bool)>(
         "SELECT tenant_id, stream_kind, failed_seq, cleared_at IS NULL FROM stream_suspensions \
          WHERE stream_key = $1",
@@ -940,7 +1020,8 @@ async fn a_system_stream_suspended_by_a_lost_ack_is_not_replayed_at_the_next_sta
     assert_eq!(rows().await, 1, "the recalibration landed");
     assert_eq!(month().await, (dec!(1000), Decimal::ZERO), "and was never applied");
     assert!(manager.event_streams.month_suspended(now.year(), now.month()));
-    assert_eq!(manager.executor.order_journal().flush_pending().await, 1);
+    // The suspension and its incident's upsert (PR F).
+    assert_eq!(manager.executor.order_journal().flush_pending().await, 2);
     // The runtime peak, written as `refresh_month_peak_net_from_snapshot` does.
     sqlx::query("UPDATE monthly_state SET month_peak_net = 50 WHERE year = $1 AND month = $2")
         .bind(now.year() as i16)

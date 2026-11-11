@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Incidents, the admission fence and its audited release (ADR-0056 step 7, PR F, part 2)
+
+- Whatever the daemon cannot explain now closes admissions until an operator releases it: an uncertain outcome of a
+  journaled order, stop or cancel (funding conversions and transfers are not journaled and stay outside), a
+  bounded send without its journal row, discarded or conflicting journal history, a suspended stream, an aborted operation,
+  a venue mutation without a permit, an unclean start. Each is recorded at once, in memory, as an incident of its reason
+  (`recovery_incidents`, migration 34; migration 35 builds its index concurrently, outside a transaction, so the deploy
+  never blocks live journal writes), counted with the generation it happened at; the database write follows and
+  protection never waits for it. Arm and approval answer 503, a signal re-arms under the governed backoff, and an entry
+  already past those checks is refused at its send. Exits, stops, sweeps and the protective API continue.
+- A start after a process that did not stop clean at the new marker version 2 is unclean: before any venue request it stamps
+  the dead process's unfinished intents uncertain and opens `unclean_start`, so it starts fenced. **The first start of this
+  image is fenced**, since every earlier process wrote version 1.
+- `POST /recovery/release` (authenticated) releases at the current generation with a note and the accounting treatment
+  (`unbooked_accepted`): one transaction tombstones the uncertain intents it covers as accepted risk and releases the
+  incidents, and the fence opens unless something new happened meanwhile. It is refused while the latch is set, for a stale
+  generation (answered with the current one) and while anything is still being written. A release is risk acceptance: it
+  books nothing and records no venue outcome.
+- A clean stop writes `marker_version = 2`, and only with no incident open, in memory or on record.
+- `robsond_admission_fence_closed{reason}` and `robsond_recovery_incidents_open{reason}` export every reason from startup;
+  `robsond_graceful_stop_total` gains `incident_open`; `robsond_insurance_stop_stale_positions` exports 0 from startup.
+
 ### Changed - A suspended system stream makes its month's accounting invalid (ADR-0056 step 7, PR F, part 1)
 
 - A month whose system stream (`system:month_boundary:YYYY-MM`) is suspended now has an invalid budget basis, on the same
