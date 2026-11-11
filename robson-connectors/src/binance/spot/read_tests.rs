@@ -172,8 +172,8 @@ async fn every_read_is_a_get_with_its_documented_weight() {
         .await
         .unwrap();
     for query in [
-        SpotTradesQuery::Order { order_id: 100234, from_id: None },
-        SpotTradesQuery::Order { order_id: 100234, from_id: Some(28457) },
+        SpotTradesQuery::Order { order_id: 100234, from_id: 0 },
+        SpotTradesQuery::Order { order_id: 100234, from_id: 28457 },
         window,
         SpotTradesQuery::Window {
             start_ms: 1_499_865_540_000,
@@ -390,23 +390,30 @@ fn history(count: u64) -> Vec<Value> {
     (1..=count).map(|id| trade(id, 9, BASE_TIME + id as i64 * 1000)).collect()
 }
 
-/// Binance's `myTrades` over `trades`: `orderId`, `fromId` (inclusive),
-/// `startTime`/`endTime`, oldest first, `limit` at most. `overlap` serves each
-/// `fromId` page from one id earlier, as a venue repeating a trade would.
+/// Binance's `myTrades` over `trades`, held in id order, as documented
+/// (rest-api.md L98-L102, L4754): filtered by `orderId`, and by
+/// `startTime`/`endTime`; then the oldest `limit` from `fromId` (inclusive) or
+/// from `startTime`, otherwise the most recent `limit`; chronological either
+/// way. `overlap` serves each `fromId` page from one id earlier, as a venue
+/// repeating a trade would.
 fn my_trades(trades: Vec<Value>, overlap: bool) -> impl Fn(&Seen) -> (u16, String) {
     move |request| {
         let number = |name: &str| request.param(name).map(|v| v.parse::<i64>().unwrap());
         let from_id = number("fromId").map(|id| if overlap { id - 1 } else { id });
         let limit = number("limit").unwrap() as usize;
-        let page: Vec<&Value> = trades
+        let matching: Vec<&Value> = trades
             .iter()
             .filter(|t| number("orderId").is_none_or(|id| t["orderId"].as_i64() == Some(id)))
             .filter(|t| from_id.is_none_or(|id| t["id"].as_i64().unwrap() >= id))
             .filter(|t| number("startTime").is_none_or(|ms| t["time"].as_i64().unwrap() >= ms))
             .filter(|t| number("endTime").is_none_or(|ms| t["time"].as_i64().unwrap() <= ms))
-            .take(limit)
             .collect();
-        (200, serde_json::to_string(&page).unwrap())
+        let page = if from_id.is_some() || number("startTime").is_some() {
+            &matching[..limit.min(matching.len())]
+        } else {
+            &matching[matching.len().saturating_sub(limit)..]
+        };
+        (200, serde_json::to_string(page).unwrap())
     }
 }
 
@@ -414,10 +421,38 @@ fn ids(read: &super::SpotTradesRead) -> Vec<u64> {
     read.trades.iter().map(|t| t.id).collect()
 }
 
+/// The stand-in answers as Binance documents: without `fromId` or a time, the
+/// most recent trades, which is what hid a scan that did not start from 0.
+#[test]
+fn without_from_id_or_a_time_the_venue_answers_the_most_recent_trades() {
+    let answer = my_trades(history(2500), false);
+    let request = |params: &[(&str, &str)]| Seen {
+        method: "GET".to_string(),
+        path: "/api/v3/myTrades".to_string(),
+        params: params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        api_key: true,
+    };
+    let first_and_last = |params: &[(&str, &str)]| {
+        let page: Vec<Value> = serde_json::from_str(&answer(&request(params)).1).unwrap();
+        (page[0]["id"].as_u64().unwrap(), page[page.len() - 1]["id"].as_u64().unwrap())
+    };
+    let order = [("symbol", "BNBBTC"), ("orderId", "9"), ("limit", "1000")];
+    assert_eq!(first_and_last(&order), (1501, 2500));
+    let from_zero = [
+        ("symbol", "BNBBTC"),
+        ("orderId", "9"),
+        ("fromId", "0"),
+        ("limit", "1000"),
+    ];
+    assert_eq!(first_and_last(&from_zero), (1, 1000));
+}
+
+/// An order with more fills than a page is read whole, oldest first: every
+/// page names `fromId`, the first 0 (rest-api.md L4754, L4763).
 #[tokio::test]
 async fn trades_by_order_page_by_from_id_until_a_short_page() {
     let (reader, seen) = venue(my_trades(history(2500), false)).await;
-    let query = SpotTradesQuery::Order { order_id: 9, from_id: None };
+    let query = SpotTradesQuery::Order { order_id: 9, from_id: 0 };
     let read = reader.trades(&symbol("BNBBTC"), query).await.unwrap();
     assert_eq!(ids(&read), (1..=2500).collect::<Vec<_>>());
     assert_eq!((read.pages, read.weight, read.next), (3, 15, None));
@@ -427,7 +462,32 @@ async fn trades_by_order_page_by_from_id_until_a_short_page() {
         .iter()
         .map(|r| r.param("fromId").map(str::to_string))
         .collect();
-    assert_eq!(from, [None, Some("1001".to_string()), Some("2001".to_string())]);
+    assert_eq!(from, [
+        Some("0".to_string()),
+        Some("1001".to_string()),
+        Some("2001".to_string())
+    ]);
+}
+
+#[tokio::test]
+async fn an_order_read_stops_at_five_pages_and_its_cursor_continues_it() {
+    // 6,000 fills of order 9, then another order's trades on the symbol.
+    let mut trades = history(6000);
+    trades.extend((6001..=6100).map(|id| trade(id, 8, BASE_TIME + id as i64 * 1000)));
+    let (reader, seen) = venue(my_trades(trades, false)).await;
+    let first = reader
+        .trades(&symbol("BNBBTC"), SpotTradesQuery::Order { order_id: 9, from_id: 0 })
+        .await
+        .unwrap();
+    assert_eq!(ids(&first), (1..=5000).collect::<Vec<_>>());
+    assert_eq!((first.pages, first.weight), (MY_TRADES_MAX_PAGES, 25));
+    assert_eq!(first.next, Some(SpotTradesQuery::Order { order_id: 9, from_id: 5001 }));
+    assert!(seen.lock().unwrap().iter().all(|r| r.param("orderId") == Some("9")));
+
+    let rest = reader.trades(&symbol("BNBBTC"), first.next.unwrap()).await.unwrap();
+    assert_eq!(ids(&rest), (5001..=6000).collect::<Vec<_>>());
+    // A full page, then an empty one: the order had no more.
+    assert_eq!((rest.pages, rest.weight, rest.next), (2, 10, None));
 }
 
 #[tokio::test]
@@ -482,7 +542,7 @@ async fn a_window_read_stops_at_the_first_trade_past_its_end() {
 #[tokio::test]
 async fn trades_read_twice_count_once() {
     let (reader, _) = venue(my_trades(history(2500), true)).await;
-    let query = SpotTradesQuery::Order { order_id: 9, from_id: None };
+    let query = SpotTradesQuery::Order { order_id: 9, from_id: 0 };
     let read = reader.trades(&symbol("BNBBTC"), query).await.unwrap();
     assert_eq!(ids(&read), (1..=2500).collect::<Vec<_>>());
     assert_eq!(read.pages, 3);
@@ -496,7 +556,7 @@ async fn one_trade_id_with_two_records_is_inconsistent() {
     trades.push(changed);
     // The second page starts at 1000 again (overlap) and finds another record.
     let (reader, _) = venue(my_trades(trades, true)).await;
-    let query = SpotTradesQuery::Order { order_id: 9, from_id: None };
+    let query = SpotTradesQuery::Order { order_id: 9, from_id: 0 };
     assert!(matches!(
         reader.trades(&symbol("BNBBTC"), query).await,
         Err(SpotReadError::Inconsistent(why)) if why.contains("trade 1000")
@@ -507,14 +567,14 @@ async fn one_trade_id_with_two_records_is_inconsistent() {
 async fn a_trade_of_another_order_or_symbol_is_inconsistent() {
     let foreign_order = serde_json::to_string(&[trade(1, 8, BASE_TIME)]).unwrap();
     let (reader, _) = answering(200, &foreign_order).await;
-    let query = SpotTradesQuery::Order { order_id: 9, from_id: None };
+    let query = SpotTradesQuery::Order { order_id: 9, from_id: 0 };
     assert!(matches!(
         reader.trades(&symbol("BNBBTC"), query).await,
         Err(SpotReadError::Inconsistent(why)) if why.contains("of order 8")
     ));
 
     let (reader, _) = answering(200, MY_TRADES).await;
-    let query = SpotTradesQuery::Order { order_id: 100234, from_id: None };
+    let query = SpotTradesQuery::Order { order_id: 100234, from_id: 0 };
     assert!(matches!(
         reader.trades(&symbol("BTCUSDT"), query).await,
         Err(SpotReadError::Inconsistent(why)) if why.contains("on BNBBTC")
@@ -524,7 +584,7 @@ async fn a_trade_of_another_order_or_symbol_is_inconsistent() {
 #[tokio::test]
 async fn no_trades_is_one_empty_page() {
     let (reader, _) = answering(200, "[]").await;
-    let query = SpotTradesQuery::Order { order_id: 9, from_id: None };
+    let query = SpotTradesQuery::Order { order_id: 9, from_id: 0 };
     let read = reader.trades(&symbol("BNBBTC"), query).await.unwrap();
     assert!(read.trades.is_empty());
     assert_eq!((read.pages, read.weight, read.next), (1, 5, None));
@@ -557,11 +617,11 @@ async fn a_window_over_24_hours_is_refused_before_anything_is_sent() {
 #[tokio::test]
 async fn a_failed_page_fails_the_read() {
     let (reader, _) = venue(|request| match request.param("fromId") {
-        None => (200, serde_json::to_string(&history(1000)).unwrap()),
-        Some(_) => (503, error_body("unknown")),
+        Some("0") => (200, serde_json::to_string(&history(1000)).unwrap()),
+        _ => (503, error_body("unknown")),
     })
     .await;
-    let query = SpotTradesQuery::Order { order_id: 9, from_id: None };
+    let query = SpotTradesQuery::Order { order_id: 9, from_id: 0 };
     assert!(matches!(
         reader.trades(&symbol("BNBBTC"), query).await,
         Err(SpotReadError::ServerError { http_status: 503, .. })

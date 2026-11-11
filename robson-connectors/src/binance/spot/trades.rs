@@ -4,13 +4,19 @@
 //! bound, and trades can lag their order. Line numbers are in `rest-api.md`
 //! at `995f6eb3`.
 //!
-//! - **By order:** `symbol + orderId`, then `symbol + orderId + fromId` (weight
-//!   5 each).
+//! - **By order:** every page is `symbol + orderId + fromId` (L4763), the first
+//!   from `fromId` 0 (weight 5 each). Without `fromId` Binance returns the most
+//!   recent trades (L4754), so an order with more fills than a page would lose
+//!   its oldest ones.
 //! - **By window:** the first page is `symbol + startTime + endTime`, which
-//!   returns the oldest trades of the window (L98-L102). `fromId` cannot be
-//!   combined with a time (L4756-L4763), so later pages are `symbol + fromId`
-//!   and stop at the first trade past `endTime` (weight 20 each). This takes
-//!   trade ids to rise with time within a symbol [R].
+//!   returns the oldest trades of the window: "With both, behaves like
+//!   `startTime`", which "returns oldest items from `startTime`" (L98-L102).
+//!   That general rule is read as unchanged by the endpoint's "Otherwise most
+//!   recent trades are returned" (L4754), which then covers a request with
+//!   neither `fromId` nor a time [NV]. `fromId` cannot be combined with a time
+//!   (L4756-L4763), so later pages are `symbol + fromId` and stop at the first
+//!   trade past `endTime` (weight 20 each). This takes trade ids to rise with
+//!   time within a symbol [R].
 //!
 //! Each page asks for [`MY_TRADES_PAGE_LIMIT`] trades and continues from the
 //! highest id it saw plus one; a short page ends the read. One read sends at
@@ -55,13 +61,14 @@ pub struct SpotTrade {
     pub is_best_match: bool,
 }
 
-/// Which trades a read asks for. `from_id` continues an earlier read.
+/// Which trades a read asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpotTradesQuery {
-    /// One order's trades.
-    Order { order_id: u64, from_id: Option<u64> },
+    /// One order's trades with ids from `from_id`: 0 for the whole order, a
+    /// cursor's value to continue.
+    Order { order_id: u64, from_id: u64 },
     /// Trades with `start_ms <= time <= end_ms`, a window of at most
-    /// [`MY_TRADES_MAX_WINDOW_MS`].
+    /// [`MY_TRADES_MAX_WINDOW_MS`]; `from_id` continues an earlier read.
     Window {
         start_ms: i64,
         end_ms: i64,
@@ -87,14 +94,12 @@ impl SpotTradesQuery {
         let symbol = ("symbol", pair.to_string());
         let limit = ("limit", MY_TRADES_PAGE_LIMIT.to_string());
         match *self {
-            Self::Order { order_id, from_id } => {
-                let mut params = vec![symbol, ("orderId", order_id.to_string())];
-                if let Some(from_id) = from_id {
-                    params.push(("fromId", from_id.to_string()));
-                }
-                params.push(limit);
-                (SpotRead::MY_TRADES_BY_ORDER, params)
-            },
+            Self::Order { order_id, from_id } => (SpotRead::MY_TRADES_BY_ORDER, vec![
+                symbol,
+                ("orderId", order_id.to_string()),
+                ("fromId", from_id.to_string()),
+                limit,
+            ]),
             Self::Window { start_ms, end_ms, from_id: None } => (SpotRead::MY_TRADES, vec![
                 symbol,
                 ("startTime", start_ms.to_string()),
@@ -109,7 +114,7 @@ impl SpotTradesQuery {
 
     fn continued_from(self, next_id: u64) -> Self {
         match self {
-            Self::Order { order_id, .. } => Self::Order { order_id, from_id: Some(next_id) },
+            Self::Order { order_id, .. } => Self::Order { order_id, from_id: next_id },
             Self::Window { start_ms, end_ms, .. } => {
                 Self::Window { start_ms, end_ms, from_id: Some(next_id) }
             },
