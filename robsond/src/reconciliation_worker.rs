@@ -796,9 +796,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     /// its leg recorded it. So an order the registration check finds
     /// unregistered was either never a live operation's, or its operation has
     /// ended and recorded what it would, in time for the fresh read; an order
-    /// the venue already lists cannot gain an owner after the check. An order
-    /// a live operation is cancelling is its own too. A failed fresh read
-    /// cancels nothing on the symbol (design §2.9).
+    /// the venue already lists cannot gain a placement owner after the check.
+    /// An order a live operation is cancelling when checked is its own too. A
+    /// cancel that starts after the check can still meet the sweep's own, whose
+    /// "already gone" answer then fences: availability only, never an `Active`
+    /// leg's stop. A failed fresh read cancels nothing on the symbol (design
+    /// §2.9).
     async fn still_orphaned(
         &self,
         symbol: &Symbol,

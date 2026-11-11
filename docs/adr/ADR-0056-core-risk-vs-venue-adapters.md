@@ -1206,20 +1206,23 @@ as an orphan, the sweep now checks, in this order:
   is owned, and so is every order on a symbol with an `Active` leg that has no stop, as in the first read. A read that fails
   cancels nothing on that symbol (design §2.9).
 
-So a stop recorded before the cancel is seen by one check or the other, and an order the venue already lists cannot gain an owner
-once its registration check has passed: the check binds before the cancel's journal write and needs nothing at the transport. An
+So a stop recorded before the cancel is seen by one check or the other, and an order the venue already lists cannot gain a
+placement owner once its registration check has passed, since no runtime path records a stop it did not place: for protection the
+check binds before the cancel's journal write and needs nothing at the transport. A cancel that starts after the check can still
+take the order as its target; the sweep does not check again, so both cancels can be sent and the second's "already gone" answer
+fences. That race costs availability only and never removes an `Active` leg's stop. An
 owned order is kept, logged and counted (`robsond_orphan_cancel_owned_total`, exported at 0 from startup), and is not reported as
 withheld; part 4's veto, its report and its handoff check run unchanged on what is left. No venue request and no query is added:
 a registration check passes over the live operations' intents once per candidate, and the fresh read is one memory read per
 symbol that still has a candidate after the first read's filters, normally none.
 
 What part 1 changes in production: nothing while the book is empty. Once stops are placed, a new leg's first stop and a
-replacement's successor survive a scan that read the legs before they were recorded, and an order a live operation is cancelling
-is not cancelled a second time. What it does not change: the registration lives in memory, so across a restart a stop the dead
+replacement's successor survive a scan that read the legs before they were recorded, and an order a live operation is already
+cancelling when the sweep checks it is not cancelled a second time. What it does not change: the registration lives in memory, so across a restart a stop the dead
 process placed and did not record is kept only while part 4's veto holds, and after a release the stop of a leg left `Entering`
 by a crash can be cancelled again (design §4), until step 8's linkage. An order whose replacement cancelled it, with that
 operation over, between the sweep's open-orders read and the check still meets the sweep's second cancel, whose "already gone"
-answer fences, as before. The first race, the UNTRACKED close against an entry, is part 2's. No migration. Rollback across part 1
+answer fences, as before, and so does one whose cancel starts after the check. The first race, the UNTRACKED close against an entry, is part 2's. No migration. Rollback across part 1
 alone: to the image before it, which restores the race; no condition beyond F's.
 
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
