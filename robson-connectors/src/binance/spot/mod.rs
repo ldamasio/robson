@@ -24,8 +24,7 @@ pub use records::{
 pub use rest::{SpotOrderRef, SpotRead, SpotReadError, SpotRestReader};
 pub use rules::{SpotLotFilter, SpotNotionalFilter, SpotPriceFilter, SpotSymbolRules};
 pub use trades::{
-    SpotTrade, SpotTradesQuery, SpotTradesRead, MY_TRADES_MAX_PAGES, MY_TRADES_MAX_WINDOW_MS,
-    MY_TRADES_PAGE_LIMIT,
+    SpotTrade, SpotTradesQuery, SpotTradesRead, MY_TRADES_MAX_PAGES, MY_TRADES_PAGE_LIMIT,
 };
 
 #[cfg(test)]

@@ -9,8 +9,7 @@
     {"read": "order_by_client_id", "request": "GET /api/v3/order?origClientOrderId=myOrder1&symbol=LTCBTC", "signed": true, "weight": 4, "doc": "rest-api.md#L4341-L4346"},
     {"read": "trades_by_order", "request": "GET /api/v3/myTrades?fromId=0&limit=1000&orderId=100234&symbol=BNBBTC", "signed": true, "weight": 5, "doc": "rest-api.md#L4728-L4736"},
     {"read": "trades_by_order_from", "request": "GET /api/v3/myTrades?fromId=28457&limit=1000&orderId=100234&symbol=BNBBTC", "signed": true, "weight": 5, "doc": "rest-api.md#L4728-L4736"},
-    {"read": "trades_window", "request": "GET /api/v3/myTrades?endTime=1499865560000&limit=1000&startTime=1499865540000&symbol=BNBBTC", "signed": true, "weight": 20, "doc": "rest-api.md#L4728-L4736"},
-    {"read": "trades_window_from", "request": "GET /api/v3/myTrades?fromId=28457&limit=1000&symbol=BNBBTC", "signed": true, "weight": 20, "doc": "rest-api.md#L4728-L4736"},
+    {"read": "trades_from_id", "request": "GET /api/v3/myTrades?fromId=28457&limit=1000&symbol=BNBBTC", "signed": true, "weight": 20, "doc": "rest-api.md#L4728-L4736"},
     {"read": "commission", "request": "GET /api/v3/account/commission?symbol=BTCUSDT", "signed": true, "weight": 20, "doc": "rest-api.md#L4954-L4959"}
   ]
 }

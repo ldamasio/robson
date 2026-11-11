@@ -4,23 +4,26 @@
 //! bound, and trades can lag their order. Line numbers are in `rest-api.md`
 //! at `995f6eb3`.
 //!
-//! - **By order:** every page is `symbol + orderId + fromId` (L4763), the first
-//!   from `fromId` 0 (weight 5 each). Without `fromId` Binance returns the most
-//!   recent trades (L4754), so an order with more fills than a page would lose
-//!   its oldest ones.
-//! - **By window:** the first page is `symbol + startTime + endTime`, which
-//!   returns the oldest trades of the window: "With both, behaves like
-//!   `startTime`", which "returns oldest items from `startTime`" (L98-L102).
-//!   That general rule is read as unchanged by the endpoint's "Otherwise most
-//!   recent trades are returned" (L4754), which then covers a request with
-//!   neither `fromId` nor a time [NV]. `fromId` cannot be combined with a time
-//!   (L4756-L4763), so later pages are `symbol + fromId` and stop at the first
-//!   trade past `endTime` (weight 20 each). This takes trade ids to rise with
-//!   time within a symbol [R].
+//! Every request names `fromId`, an inclusive lower bound on the trade id
+//! (L4754). Without it Binance returns the most recent trades, so a scan whose
+//! first page lacked it could hold only the newest of more trades than a page
+//! and end with the older ones missing.
+//! - **By order:** `symbol + orderId + fromId` (L4763), the first page from
+//!   `fromId` 0 (weight 5 each).
+//! - **From an id:** `symbol + fromId` (L4761), seeded by the caller with an
+//!   explicit lower bound, such as the trade after the last one it recorded
+//!   (weight 20 each). Any time filter is the caller's.
 //!
 //! Each page asks for [`MY_TRADES_PAGE_LIMIT`] trades and continues from the
-//! highest id it saw plus one; a short page ends the read. One read sends at
-//! most [`MY_TRADES_MAX_PAGES`] pages, then returns a cursor.
+//! highest id it saw plus one; only a short page ends the read. One read sends
+//! at most [`MY_TRADES_MAX_PAGES`] pages, then returns a cursor.
+//!
+//! There is deliberately no time-window read (`startTime`/`endTime`). The
+//! docs disagree on which trades its first page holds: the oldest of the
+//! window by the general rule (L98-L102), the most recent by this endpoint's
+//! (L4754). Under the second, a window with more trades than a page would end
+//! with its oldest trades silently missing. Adding one needs authoritative
+//! evidence of that first-page contract first.
 
 use std::collections::{btree_map::Entry, BTreeMap};
 
@@ -35,10 +38,6 @@ pub const MY_TRADES_PAGE_LIMIT: u16 = 1000;
 /// Pages one trades read sends before it returns a cursor (design note v2
 /// §3.1).
 pub const MY_TRADES_MAX_PAGES: u32 = 5;
-
-/// Longest window one read may span: "The time between `startTime` and
-/// `endTime` can't be longer than 24 hours." (L4755).
-pub const MY_TRADES_MAX_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// One account trade (L4765-L4783; `fromId` paging, L4754).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -67,28 +66,12 @@ pub enum SpotTradesQuery {
     /// One order's trades with ids from `from_id`: 0 for the whole order, a
     /// cursor's value to continue.
     Order { order_id: u64, from_id: u64 },
-    /// Trades with `start_ms <= time <= end_ms`, a window of at most
-    /// [`MY_TRADES_MAX_WINDOW_MS`]; `from_id` continues an earlier read.
-    Window {
-        start_ms: i64,
-        end_ms: i64,
-        from_id: Option<u64>,
-    },
+    /// Every trade on the symbol with an id from `from_id` on: the caller's
+    /// explicit lower bound, or a cursor's value to continue.
+    FromId { from_id: u64 },
 }
 
 impl SpotTradesQuery {
-    /// Refuse, before sending, a window Binance would refuse.
-    pub fn validate(&self) -> Result<(), SpotReadError> {
-        if let Self::Window { start_ms, end_ms, .. } = *self {
-            if start_ms < 0 || end_ms < start_ms || end_ms - start_ms > MY_TRADES_MAX_WINDOW_MS {
-                return Err(SpotReadError::InvalidQuery(format!(
-                    "trade window {start_ms}..={end_ms} ms is not within 0..=24 h"
-                )));
-            }
-        }
-        Ok(())
-    }
-
     /// The read and parameters of this query's next page.
     pub(super) fn page_request(&self, pair: &str) -> (SpotRead, Vec<(&'static str, String)>) {
         let symbol = ("symbol", pair.to_string());
@@ -100,13 +83,7 @@ impl SpotTradesQuery {
                 ("fromId", from_id.to_string()),
                 limit,
             ]),
-            Self::Window { start_ms, end_ms, from_id: None } => (SpotRead::MY_TRADES, vec![
-                symbol,
-                ("startTime", start_ms.to_string()),
-                ("endTime", end_ms.to_string()),
-                limit,
-            ]),
-            Self::Window { from_id: Some(from_id), .. } => {
+            Self::FromId { from_id } => {
                 (SpotRead::MY_TRADES, vec![symbol, ("fromId", from_id.to_string()), limit])
             },
         }
@@ -115,9 +92,7 @@ impl SpotTradesQuery {
     fn continued_from(self, next_id: u64) -> Self {
         match self {
             Self::Order { order_id, .. } => Self::Order { order_id, from_id: next_id },
-            Self::Window { start_ms, end_ms, .. } => {
-                Self::Window { start_ms, end_ms, from_id: Some(next_id) }
-            },
+            Self::FromId { .. } => Self::FromId { from_id: next_id },
         }
     }
 }
@@ -152,7 +127,7 @@ impl SpotTradeSet {
     ///
     /// A trade on another symbol or, by order, of another order is
     /// [`SpotReadError::Inconsistent`], and so is one id with two different
-    /// records. A trade outside the window is not this read's.
+    /// records.
     pub(super) fn absorb(
         &mut self,
         query: SpotTradesQuery,
@@ -160,7 +135,6 @@ impl SpotTradeSet {
     ) -> Result<Option<SpotTradesQuery>, SpotReadError> {
         let page: Vec<SpotTrade> = parse_json("trades", body)?;
         let full = page.len() >= usize::from(MY_TRADES_PAGE_LIMIT);
-        let mut past_window = false;
         let mut highest = None;
         for trade in page {
             if trade.symbol != self.pair {
@@ -170,23 +144,13 @@ impl SpotTradeSet {
                 )));
             }
             highest = highest.max(Some(trade.id));
-            match query {
-                SpotTradesQuery::Order { order_id, .. } if trade.order_id != order_id => {
+            if let SpotTradesQuery::Order { order_id, .. } = query {
+                if trade.order_id != order_id {
                     return Err(SpotReadError::Inconsistent(format!(
                         "trades of order {order_id} include trade {} of order {}",
                         trade.id, trade.order_id
                     )));
-                },
-                SpotTradesQuery::Window { start_ms, end_ms, .. } => {
-                    if trade.time > end_ms {
-                        past_window = true;
-                        continue;
-                    }
-                    if trade.time < start_ms {
-                        continue;
-                    }
-                },
-                SpotTradesQuery::Order { .. } => {},
+                }
             }
             match self.trades.entry(trade.id) {
                 Entry::Vacant(slot) => {
@@ -201,8 +165,8 @@ impl SpotTradeSet {
                 },
             }
         }
-        // A short page, or one that ran past the window, was the last.
-        if !full || past_window {
+        // Only a short page is the last: a full one may have more after it.
+        if !full {
             return Ok(None);
         }
         let Some(highest) = highest else {

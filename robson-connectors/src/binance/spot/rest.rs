@@ -125,9 +125,6 @@ pub enum SpotReadError {
     /// The request could not be signed; nothing was sent.
     #[error("Binance request not signed: {0}")]
     Signature(String),
-    /// A query this side refuses before sending anything.
-    #[error("Invalid spot read: {0}")]
-    InvalidQuery(String),
     /// A success body that is not the documented response.
     #[error("Unparseable spot answer: {0}")]
     Parse(String),
@@ -327,7 +324,6 @@ impl SpotRestReader {
         symbol: &Symbol,
         query: SpotTradesQuery,
     ) -> Result<SpotTradesRead, SpotReadError> {
-        query.validate()?;
         let pair = symbol.as_pair();
         let mut collected = SpotTradeSet::new(pair.clone());
         let mut page = query;

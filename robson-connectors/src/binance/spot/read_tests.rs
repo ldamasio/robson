@@ -19,7 +19,6 @@ use tokio::{
 
 use super::{
     SpotOrderRef, SpotRead, SpotReadError, SpotRestReader, SpotTradesQuery, MY_TRADES_MAX_PAGES,
-    MY_TRADES_MAX_WINDOW_MS,
 };
 use crate::binance_rest::BinanceRestClient;
 
@@ -154,11 +153,6 @@ async fn every_read_is_a_get_with_its_documented_weight() {
     })
     .await;
     let (btc, ltc, bnb) = (symbol("BTCUSDT"), symbol("LTCBTC"), symbol("BNBBTC"));
-    let window = SpotTradesQuery::Window {
-        start_ms: 1_499_865_540_000,
-        end_ms: 1_499_865_560_000,
-        from_id: None,
-    };
 
     let mut weights = Vec::new();
     reader.symbol_rules(&btc).await.unwrap();
@@ -174,12 +168,7 @@ async fn every_read_is_a_get_with_its_documented_weight() {
     for query in [
         SpotTradesQuery::Order { order_id: 100234, from_id: 0 },
         SpotTradesQuery::Order { order_id: 100234, from_id: 28457 },
-        window,
-        SpotTradesQuery::Window {
-            start_ms: 1_499_865_540_000,
-            end_ms: 1_499_865_560_000,
-            from_id: Some(28457),
-        },
+        SpotTradesQuery::FromId { from_id: 28457 },
     ] {
         let read = reader.trades(&bnb, query).await.unwrap();
         assert_eq!((read.pages, read.trades.len(), read.next), (1, 1, None));
@@ -205,7 +194,7 @@ async fn every_read_is_a_get_with_its_documented_weight() {
         assert_eq!(request.param("signature").is_some(), signed, "{name}: signature");
     }
     // A trades read reports the weight of the pages it sent.
-    assert_eq!(weights, [5, 5, 20, 20]);
+    assert_eq!(weights, [5, 5, 20]);
 }
 
 /// Design note v8 §3.14: one observation (account, every open order, open
@@ -391,13 +380,16 @@ fn history(count: u64) -> Vec<Value> {
 }
 
 /// Binance's `myTrades` over `trades`, held in id order, as documented
-/// (rest-api.md L98-L102, L4754): filtered by `orderId`, and by
-/// `startTime`/`endTime`; then the oldest `limit` from `fromId` (inclusive) or
-/// from `startTime`, otherwise the most recent `limit`; chronological either
-/// way. `overlap` serves each `fromId` page from one id earlier, as a venue
+/// (rest-api.md L98-L102, L4754): filtered by `orderId`, then the oldest
+/// `limit` from `fromId` (inclusive), otherwise the most recent `limit`;
+/// chronological either way. The reader sends no time, so a time here is a
+/// defect. `overlap` serves each `fromId` page from one id earlier, as a venue
 /// repeating a trade would.
 fn my_trades(trades: Vec<Value>, overlap: bool) -> impl Fn(&Seen) -> (u16, String) {
     move |request| {
+        for time in ["startTime", "endTime"] {
+            assert!(request.param(time).is_none(), "the reader sent {time}");
+        }
         let number = |name: &str| request.param(name).map(|v| v.parse::<i64>().unwrap());
         let from_id = number("fromId").map(|id| if overlap { id - 1 } else { id });
         let limit = number("limit").unwrap() as usize;
@@ -405,10 +397,8 @@ fn my_trades(trades: Vec<Value>, overlap: bool) -> impl Fn(&Seen) -> (u16, Strin
             .iter()
             .filter(|t| number("orderId").is_none_or(|id| t["orderId"].as_i64() == Some(id)))
             .filter(|t| from_id.is_none_or(|id| t["id"].as_i64().unwrap() >= id))
-            .filter(|t| number("startTime").is_none_or(|ms| t["time"].as_i64().unwrap() >= ms))
-            .filter(|t| number("endTime").is_none_or(|ms| t["time"].as_i64().unwrap() <= ms))
             .collect();
-        let page = if from_id.is_some() || number("startTime").is_some() {
+        let page = if from_id.is_some() {
             &matching[..limit.min(matching.len())]
         } else {
             &matching[matching.len().saturating_sub(limit)..]
@@ -490,53 +480,78 @@ async fn an_order_read_stops_at_five_pages_and_its_cursor_continues_it() {
     assert_eq!((rest.pages, rest.weight, rest.next), (2, 10, None));
 }
 
-#[tokio::test]
-async fn a_read_stops_at_five_pages_and_its_cursor_continues_it() {
-    let (reader, seen) = venue(my_trades(history(6000), false)).await;
-    let window = SpotTradesQuery::Window {
-        start_ms: BASE_TIME,
-        end_ms: BASE_TIME + MY_TRADES_MAX_WINDOW_MS,
-        from_id: None,
-    };
-    let first = reader.trades(&symbol("BNBBTC"), window).await.unwrap();
-    assert_eq!(first.pages, MY_TRADES_MAX_PAGES);
-    assert_eq!((first.trades.len(), first.weight), (5000, 100));
-    let Some(cursor) = first.next else {
-        panic!("a full fifth page leaves a cursor")
-    };
-    assert_eq!(cursor, SpotTradesQuery::Window {
-        start_ms: BASE_TIME,
-        end_ms: BASE_TIME + MY_TRADES_MAX_WINDOW_MS,
-        from_id: Some(5001),
-    });
-    // The first page names the window; later ones only `fromId` (L4756-L4763).
-    let requests = seen.lock().unwrap().clone();
-    assert!(requests[0].param("startTime").is_some() && requests[0].param("fromId").is_none());
-    for later in &requests[1..] {
-        assert!(later.param("startTime").is_none() && later.param("endTime").is_none());
-        assert!(later.param("fromId").is_some());
-    }
+/// Trades of two orders, alternating: ids from 1, one second apart.
+fn two_orders(count: u64) -> Vec<Value> {
+    (1..=count)
+        .map(|id| trade(id, 8 + id % 2, BASE_TIME + id as i64 * 1000))
+        .collect()
+}
 
-    let rest = reader.trades(&symbol("BNBBTC"), cursor).await.unwrap();
+/// A scan from an id reads every order's trades from the caller's seed, by
+/// `symbol + fromId` only (rest-api.md L4761).
+#[tokio::test]
+async fn a_scan_from_an_id_reads_every_order_from_its_seed() {
+    let (reader, seen) = venue(my_trades(two_orders(2500), false)).await;
+    let read = reader
+        .trades(&symbol("BNBBTC"), SpotTradesQuery::FromId { from_id: 1201 })
+        .await
+        .unwrap();
+    assert_eq!(ids(&read), (1201..=2500).collect::<Vec<_>>());
+    assert!(
+        read.trades.iter().any(|t| t.order_id == 8) && read.trades.iter().any(|t| t.order_id == 9)
+    );
+    assert_eq!((read.pages, read.weight, read.next), (2, 40, None));
+    for request in seen.lock().unwrap().iter() {
+        assert!(request.param("fromId").is_some() && request.param("orderId").is_none());
+    }
+}
+
+#[tokio::test]
+async fn a_scan_from_an_id_stops_at_five_pages_and_its_cursor_continues_it() {
+    let (reader, _) = venue(my_trades(two_orders(6000), false)).await;
+    let first = reader
+        .trades(&symbol("BNBBTC"), SpotTradesQuery::FromId { from_id: 0 })
+        .await
+        .unwrap();
+    assert_eq!(ids(&first), (1..=5000).collect::<Vec<_>>());
+    assert_eq!((first.pages, first.weight), (MY_TRADES_MAX_PAGES, 100));
+    assert_eq!(first.next, Some(SpotTradesQuery::FromId { from_id: 5001 }));
+
+    let rest = reader.trades(&symbol("BNBBTC"), first.next.unwrap()).await.unwrap();
     assert_eq!(ids(&rest), (5001..=6000).collect::<Vec<_>>());
     // A full page, then an empty one: the venue had no more.
     assert_eq!((rest.pages, rest.next), (2, None));
 }
 
+/// A first page holding only the latest trades, which is what Binance
+/// answers without `fromId` (L4754), cannot end a scan. No scan sends a
+/// request without `fromId`, and only a short page ends one: a full page,
+/// even one that ignored `fromId`, continues, and the page bound then returns
+/// a cursor instead of claiming the end.
 #[tokio::test]
-async fn a_window_read_stops_at_the_first_trade_past_its_end() {
-    let (reader, seen) = venue(my_trades(history(3000), false)).await;
-    let end_ms = BASE_TIME + 1500 * 1000;
-    let window = SpotTradesQuery::Window {
-        start_ms: BASE_TIME,
-        end_ms,
-        from_id: None,
-    };
-    let read = reader.trades(&symbol("BNBBTC"), window).await.unwrap();
-    // The first page ends at 1000; the `fromId` page runs past the window.
-    assert_eq!(ids(&read), (1..=1500).collect::<Vec<_>>());
-    assert_eq!((read.pages, read.next), (2, None));
-    assert_eq!(seen.lock().unwrap().len(), 2);
+async fn a_latest_subset_first_page_cannot_end_a_scan() {
+    let (reader, seen) = venue(my_trades(history(2500), false)).await;
+    for query in [
+        SpotTradesQuery::Order { order_id: 9, from_id: 0 },
+        SpotTradesQuery::FromId { from_id: 0 },
+    ] {
+        let read = reader.trades(&symbol("BNBBTC"), query).await.unwrap();
+        assert_eq!(ids(&read), (1..=2500).collect::<Vec<_>>(), "{query:?}");
+        assert_eq!(read.next, None, "{query:?}");
+    }
+    assert!(seen.lock().unwrap().iter().all(|r| r.param("fromId").is_some()));
+
+    // A venue answering every page with the latest 1000 of 2500.
+    let latest = serde_json::to_string(&history(2500)[1500..]).unwrap();
+    let (reader, _) = answering(200, &latest).await;
+    for query in [
+        SpotTradesQuery::Order { order_id: 9, from_id: 0 },
+        SpotTradesQuery::FromId { from_id: 0 },
+    ] {
+        let read = reader.trades(&symbol("BNBBTC"), query).await.unwrap();
+        assert_eq!(read.pages, MY_TRADES_MAX_PAGES, "{query:?}");
+        assert!(read.next.is_some(), "{query:?}: a full page never ends a scan");
+    }
 }
 
 #[tokio::test]
@@ -588,30 +603,6 @@ async fn no_trades_is_one_empty_page() {
     let read = reader.trades(&symbol("BNBBTC"), query).await.unwrap();
     assert!(read.trades.is_empty());
     assert_eq!((read.pages, read.weight, read.next), (1, 5, None));
-}
-
-#[tokio::test]
-async fn a_window_over_24_hours_is_refused_before_anything_is_sent() {
-    let (reader, seen) = answering(200, "[]").await;
-    for (start_ms, end_ms) in [
-        (BASE_TIME, BASE_TIME + MY_TRADES_MAX_WINDOW_MS + 1),
-        (BASE_TIME, BASE_TIME - 1),
-        (-1, 0),
-    ] {
-        let window = SpotTradesQuery::Window { start_ms, end_ms, from_id: None };
-        assert!(matches!(
-            reader.trades(&symbol("BNBBTC"), window).await,
-            Err(SpotReadError::InvalidQuery(_))
-        ));
-    }
-    assert!(seen.lock().unwrap().is_empty());
-
-    let day = SpotTradesQuery::Window {
-        start_ms: BASE_TIME,
-        end_ms: BASE_TIME + MY_TRADES_MAX_WINDOW_MS,
-        from_id: None,
-    };
-    reader.trades(&symbol("BNBBTC"), day).await.unwrap();
 }
 
 #[tokio::test]
