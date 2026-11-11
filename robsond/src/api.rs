@@ -260,9 +260,10 @@ pub struct MonthlyPositionsResponse {
     pub positions: Vec<PositionSummary>,
     pub occupied_slots: usize,
     pub slot_cells_total: usize,
-    /// The current month's basis cannot meter capacity (ADR-0051 §1):
-    /// `capital_base <= 0`, or its reset has not landed. Its new-entry cells
-    /// are then zero. Always false for other months.
+    /// The month's basis cannot meter capacity, and its new-entry cells are
+    /// zero: for the current month, `capital_base <= 0` or its reset has not
+    /// landed (ADR-0051 §1); for any month, current or history, its system
+    /// stream is suspended (ADR-0056 step 7), whatever a release did.
     #[serde(default)]
     pub capacity_invalid: bool,
 }
@@ -776,8 +777,9 @@ where
         .route("/funding", get(funding_list_handler::<E, S>))
         .route("/capital/refresh", post(capital_refresh_handler::<E, S>));
     #[cfg(feature = "postgres")]
-    let authenticated =
-        authenticated.route("/recovery/disposition", post(recovery_disposition_handler::<E, S>));
+    let authenticated = authenticated
+        .route("/recovery/disposition", post(recovery_disposition_handler::<E, S>))
+        .route("/recovery/release", post(recovery_release_handler::<E, S>));
     let authenticated = authenticated.layer(auth_layer).with_state(state);
 
     read_only.merge(authenticated).layer(build_cors_layer())
@@ -1063,6 +1065,135 @@ where
         Err(DispositionError::Database(error)) => {
             tracing::error!(%error, "Recording a disposition failed");
             Err(fail(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"))
+        },
+    }
+}
+
+/// `POST /recovery/release` (ADR-0056 step 7, PR F, design §2.7): the
+/// operator's audited acceptance of the risk behind every open incident and
+/// uncertain intent up to the generation quoted, which must be the current one
+/// (a stale one is refused with it).
+#[cfg(feature = "postgres")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseBody {
+    generation: i64,
+    note: String,
+    /// The accounting treatment of the remaining liabilities.
+    treatment: LiabilityTreatment,
+}
+
+/// What a release did.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReleaseResponse {
+    pub decision_id: Uuid,
+    pub generation: i64,
+    pub intents_tombstoned: u64,
+    pub incidents_released: u64,
+    /// Whether the admission fence opened. False when an occurrence moved the
+    /// generation meanwhile: the newer incident stays open, and so does the
+    /// fence.
+    pub fence_open: bool,
+}
+
+/// Why a release was refused, with what the operator needs to retry it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReleaseRefusedResponse {
+    /// `latched`, `stale`, `persisting` or `release_not_completed`.
+    pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<usize>,
+}
+
+/// Release is risk acceptance, never finality: it sets no venue outcome and
+/// books nothing. It takes no slot and no manager lock. Refused while the
+/// latch is set (a restart clears it), for a stale generation, and while
+/// anything waits to persist; then one transaction tombstones the uncertain
+/// intents at or below the generation and releases the incidents it covers,
+/// and the fence opens only if the generation did not move meanwhile.
+#[cfg(feature = "postgres")]
+async fn recovery_release_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    identity: Option<axum::Extension<OperatorIdentity>>,
+    Json(body): Json<ReleaseBody>,
+) -> Result<Json<ReleaseResponse>, (StatusCode, Json<ReleaseRefusedResponse>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    use robson_exec::order_journal::{ReleaseRecord, ReleaseRefusal};
+
+    let refused = |status: StatusCode, error: &str| {
+        (
+            status,
+            Json(ReleaseRefusedResponse {
+                error: error.to_string(),
+                current_generation: None,
+                pending: None,
+            }),
+        )
+    };
+    let Some(axum::Extension(identity)) = identity else {
+        return Err(refused(StatusCode::UNAUTHORIZED, "a verified identity is required"));
+    };
+    let note = body.note.trim();
+    if note.is_empty() {
+        return Err(refused(StatusCode::BAD_REQUEST, "a note is required"));
+    }
+    let record = ReleaseRecord {
+        decision_id: Uuid::now_v7(),
+        generation: body.generation,
+        actor: identity.subject,
+        auth_kind: identity.auth.as_str(),
+        note: note.to_string(),
+        treatment: body.treatment.as_str(),
+        decided_at: Utc::now(),
+    };
+    let (actor, auth_kind) = (record.actor.clone(), record.auth_kind);
+    let released = state.order_journal.release(record).await;
+    crate::metrics::observe_fence(&state.order_journal);
+    match released {
+        Ok(receipt) => {
+            warn!(
+                %actor,
+                auth_kind,
+                generation = receipt.generation,
+                intents_tombstoned = receipt.counts.intents_tombstoned,
+                incidents_released = receipt.counts.incidents_released,
+                fence_open = receipt.fence_open,
+                decision_id = %receipt.decision_id,
+                "Recovery release recorded: risk accepted, nothing booked"
+            );
+            Ok(Json(ReleaseResponse {
+                decision_id: receipt.decision_id,
+                generation: receipt.generation,
+                intents_tombstoned: receipt.counts.intents_tombstoned,
+                incidents_released: receipt.counts.incidents_released,
+                fence_open: receipt.fence_open,
+            }))
+        },
+        Err(ReleaseRefusal::Latched) => Err(refused(StatusCode::CONFLICT, "latched")),
+        Err(ReleaseRefusal::Stale { current }) => Err((
+            StatusCode::CONFLICT,
+            Json(ReleaseRefusedResponse {
+                error: "stale".to_string(),
+                current_generation: Some(current),
+                pending: None,
+            }),
+        )),
+        Err(ReleaseRefusal::Persisting { pending }) => Err((
+            StatusCode::CONFLICT,
+            Json(ReleaseRefusedResponse {
+                error: "persisting".to_string(),
+                current_generation: None,
+                pending: Some(pending),
+            }),
+        )),
+        Err(ReleaseRefusal::Backend(error)) => {
+            tracing::error!(%error, "Recovery release did not complete; the fence stays closed");
+            Err(refused(StatusCode::SERVICE_UNAVAILABLE, "release_not_completed"))
         },
     }
 }
@@ -1958,7 +2089,9 @@ where
         positions.iter().filter(|position| position.created_at < requested).count();
     let now = chrono::Utc::now();
     let current_month = (requested.year(), requested.month()) == (now.year(), now.month());
-    let capacity_invalid = current_month && monthly.basis_invalid();
+    // A suspended month stays untrusted after it becomes history: a later month
+    // does not make it right (ADR-0056 step 7, design §2.5).
+    let capacity_invalid = (current_month && monthly.basis_invalid()) || monthly.month_suspended;
     let base_slots_available = if capacity_invalid {
         0
     } else {
@@ -4183,6 +4316,56 @@ mod tests {
         assert_eq!(may_month.positions[2].id, btc_short.id);
     }
 
+    /// A month whose system stream is suspended reports no new-entry capacity,
+    /// and keeps reporting it once it is history: the month after it does not
+    /// make it right, and neither does a release (ADR-0056 step 7, design
+    /// §2.5). Its inherited cells still show; the month after it is unaffected.
+    #[tokio::test]
+    async fn a_suspended_month_reports_no_capacity_as_history_too() {
+        let (app, _event_bus, position_manager) = create_test_app_with_event_bus(100).await;
+        let april = month_start(2026, 4);
+        let mut inherited =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        inherited.created_at = april - chrono::Duration::days(2);
+        inherited.updated_at = april + chrono::Duration::days(3);
+        inherited.state = PositionState::Armed;
+        inherited.entry_price = Some(Price::new(dec!(100)).unwrap());
+        {
+            let manager = position_manager.write().await;
+            manager.store().positions().save(&inherited).await.unwrap();
+        }
+        let view = |month: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/positions?month={month}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let month: MonthlyPositionsResponse = serde_json::from_slice(&body).unwrap();
+                (month.capacity_invalid, month.occupied_slots, month.slot_cells_total)
+            }
+        };
+        assert_eq!(view("2026-04").await, (false, 1, 5), "trusted: four new cells");
+
+        position_manager.read().await.event_streams().restore([(
+            "system:month_boundary:2026-04".to_string(),
+            crate::event_streams::Suspended {
+                suspension_id: Uuid::now_v7(),
+                stream: crate::event_streams::ManagedStream::Month { year: 2026, month: 4 },
+                repaired_through_seq: None,
+            },
+        )]);
+        assert_eq!(view("2026-04").await, (true, 1, 1), "only the inherited cell");
+        assert!(!view("2026-05").await.0, "the next month is its own");
+    }
+
     #[tokio::test]
     async fn test_month_positions_endpoint_keeps_april_may_overlap_and_month_slots_change() {
         let (app, _event_bus, position_manager) = create_test_app_with_event_bus(100).await;
@@ -4476,6 +4659,16 @@ mod tests {
         journal: Arc<OrderJournal>,
         legacy: Option<&str>,
     ) -> Router {
+        recovery_app(pool, journal, legacy, None).await
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn recovery_app(
+        pool: sqlx::PgPool,
+        journal: Arc<OrderJournal>,
+        legacy: Option<&str>,
+        tenant_id: Option<Uuid>,
+    ) -> Router {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(
@@ -4501,7 +4694,7 @@ mod tests {
             circuit_breaker,
             wallet_balance_cache: Mutex::new(None),
             pg_pool: Some(Arc::new(pool)),
-            tenant_id: None,
+            tenant_id,
             google_auth: legacy.is_some().then(test_google_auth_config),
             legacy_api_token: legacy.map(str::to_string),
             funding: FundingConfig::default(),
@@ -6084,6 +6277,93 @@ mod tests {
         );
         let _ = build_cors_layer();
         std::env::remove_var("ROBSON_CORS_ALLOWED_ORIGINS");
+    }
+
+    // ---- ADR-0056 step 7, PR F: POST /recovery/release
+
+    /// A pool that never connects: for routes that must not reach a database.
+    #[cfg(feature = "postgres")]
+    fn unreachable_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .unwrap()
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn post_release(app: &Router, bearer: Option<&str>, body: Value) -> (StatusCode, Value) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/recovery/release")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(bearer) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    #[cfg(feature = "postgres")]
+    fn release_body(generation: i64, note: &str) -> Value {
+        json!({ "generation": generation, "note": note, "treatment": "unbooked_accepted" })
+    }
+
+    /// The release endpoint: authenticated; a note and the treatment are
+    /// mandatory; a stale generation answers 409 with the current one, a write
+    /// still persisting 409 `persisting`, a latch 409 `latched`; the current
+    /// generation releases and opens the fence. No manager lock, no slot.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn the_release_endpoint_refuses_until_it_can_release() {
+        use robson_exec::{gate::IncidentReason, order_journal::StubJournalBackend};
+
+        let backend = Arc::new(StubJournalBackend::default());
+        let journal = Arc::new(OrderJournal::new(backend.clone(), &VenueId::new("test:venue")));
+        journal.gate().record(IncidentReason::UncleanStart);
+        let app = recovery_app(unreachable_pool(), Arc::clone(&journal), Some(LEGACY), None).await;
+        let current = journal.gate().generation();
+
+        let (status, _) = post_release(&app, None, release_body(current, "x")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = post_release(&app, Some(LEGACY), release_body(current, "  ")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) =
+            post_release(&app, Some(LEGACY), json!({ "generation": current, "note": "x" })).await;
+        assert!(status.is_client_error(), "a treatment is mandatory: {status} {body}");
+
+        let (status, body) = post_release(&app, Some(LEGACY), release_body(current, "x")).await;
+        assert_eq!((status, body["error"].clone()), (StatusCode::CONFLICT, json!("persisting")));
+        journal.flush_pending().await;
+        let (status, body) = post_release(&app, Some(LEGACY), release_body(current - 1, "x")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "stale");
+        assert_eq!(body["current_generation"], current);
+        assert!(journal.gate().fenced());
+
+        let (status, body) = post_release(&app, Some(LEGACY), release_body(current, "x")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            (body["fence_open"].clone(), body["incidents_released"].clone()),
+            (json!(true), json!(1))
+        );
+        assert!(!journal.gate().fenced());
+        let recorded = &backend.releases()[0];
+        assert_eq!(
+            (recorded.actor.as_str(), recorded.auth_kind),
+            ("legacy-bearer-token", "asserted")
+        );
+
+        journal.gate().record(IncidentReason::OperationAborted);
+        journal.flush_pending().await;
+        let latest = journal.gate().generation();
+        let (status, body) = post_release(&app, Some(LEGACY), release_body(latest, "x")).await;
+        assert_eq!((status, body["error"].clone()), (StatusCode::CONFLICT, json!("latched")));
+        assert!(journal.gate().fenced());
     }
 
     // =========================================================================

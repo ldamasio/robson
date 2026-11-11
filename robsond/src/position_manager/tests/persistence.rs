@@ -41,7 +41,8 @@ fn is_closed(position: &Position) -> bool {
 }
 
 // =============================================================================
-// Admissions close on the latch, and on this month's suspended system stream
+// Admissions close on the latch; a suspended system stream invalidates its
+// month's accounting
 // =============================================================================
 
 /// Every latch source closes admissions until a restart, at each of the three
@@ -94,42 +95,174 @@ async fn the_latch_closes_admissions_at_every_door() {
     assert!(!armed.carries_admission_evidence(), "refused before any evidence");
 }
 
-/// A suspended system stream of the current month, loaded at start, keeps
-/// admissions closed with the latch clear; a past month's does not.
+/// ADR-0056 step 7, PR F: an incident closes the fence, and the fence closes
+/// admissions at each of the three doors, with the latch clear: a governed
+/// refusal before anything is written, the signal's detector re-armed under
+/// the backoff. An operator's release at the current generation reopens them.
 #[tokio::test]
-async fn a_suspended_stream_of_this_month_keeps_admissions_closed() {
+async fn the_fence_closes_admissions_at_every_door_until_a_release() {
+    use robson_exec::{
+        gate::IncidentReason,
+        order_journal::{OrderJournal, ReleaseRecord, StubJournalBackend},
+    };
+
+    let fenced = |result: Option<DaemonError>| {
+        assert!(
+            matches!(&result, Some(DaemonError::AdmissionsClosed { reason }) if reason.contains("fence")),
+            "{result:?}"
+        );
+    };
+    let journal = Arc::new(OrderJournal::new(
+        Arc::new(StubJournalBackend::default()),
+        &VenueId::new("test:venue"),
+    ));
+    let manager = create_test_manager_with_order_journal(
+        Arc::new(MemoryStore::new()),
+        Arc::new(EventBus::new(100)),
+        ApprovalPolicy::new(Decimal::from(100u32), 300),
+        Some(Arc::clone(&journal)),
+    )
+    .await;
+    let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+    let entry = Price::new(dec!(100)).unwrap();
+    let stop = Price::new(dec!(98)).unwrap();
+    let arm = || {
+        manager.arm_position(
+            symbol.clone(),
+            Side::Long,
+            create_test_risk_config(),
+            Some(TechnicalStopDistance::from_entry_and_stop(entry, stop)),
+            Uuid::now_v7(),
+        )
+    };
+    let armed = arm().await.unwrap();
+    journal.gate().record(IncidentReason::UncertainOutcome);
+    assert!(!latched(&manager), "the fence, not the latch");
+
+    fenced(arm().await.err());
+    fenced(manager.approve_query(Uuid::now_v7()).await.err());
+    let signal = || DetectorSignal {
+        signal_id: Uuid::now_v7(),
+        position_id: armed.id,
+        symbol: symbol.clone(),
+        side: Side::Long,
+        entry_price: entry,
+        stop_loss: stop,
+        technical_stop_analysis: None,
+        timestamp: chrono::Utc::now(),
+    };
+    fenced(manager.handle_signal(signal()).await.err());
+    assert_eq!(manager.exchange().market_order_call_count(), 0);
+    assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), Some(&1));
+    let still_armed = manager.get_position(armed.id).await.unwrap().unwrap();
+    assert!(!still_armed.carries_admission_evidence(), "refused before any evidence");
+
+    journal.flush_pending().await;
+    let receipt = journal
+        .release(ReleaseRecord {
+            decision_id: Uuid::now_v7(),
+            generation: journal.gate().generation(),
+            actor: "operator".to_string(),
+            auth_kind: "verified",
+            note: "reviewed".to_string(),
+            treatment: "unbooked_accepted",
+            decided_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    assert!(receipt.fence_open);
+    assert!(arm().await.is_ok(), "released: admissions open again");
+}
+
+/// Restore a suspension of `year`-`month`'s system stream, as a start loads one
+/// on record.
+fn suspend_month(manager: &PositionManager<StubExchange, MemoryStore>, year: i32, month: u32) {
+    manager.event_streams.restore([(
+        format!("system:month_boundary:{year:04}-{month:02}"),
+        crate::event_streams::Suspended {
+            suspension_id: Uuid::now_v7(),
+            stream: crate::event_streams::ManagedStream::Month { year, month },
+            repaired_through_seq: None,
+        },
+    )]);
+}
+
+/// The fence PR's accounting contract, which replaces P's stopgap (ADR-0056
+/// step 7, design §2.5): a suspended system stream of the current month makes
+/// its basis invalid through #300's path, with the latch clear. The snapshot
+/// reports no capacity, the late re-read sees it, an arm's basis is refused,
+/// a signal reaches the gate with no capital and sends nothing, and automatic
+/// MonthlyHalt is not evaluated even with realized losses past the budget; the
+/// open leg keeps running. Lifting the suspension, which only step 8's repair
+/// will do, lets the same losses halt.
+#[tokio::test]
+async fn a_suspended_system_stream_of_this_month_invalidates_its_accounting() {
+    let manager = create_test_manager().await;
+    let now = chrono::Utc::now();
+    let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+    let leg = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(1)).await;
+    let armed = manager
+        .arm_position(symbol.clone(), Side::Long, create_test_risk_config(), None, Uuid::now_v7())
+        .await
+        .unwrap();
+    save_closed_position_with_pnl(&manager, dec!(-500)).await;
+    suspend_month(&manager, now.year(), now.month());
+    assert!(!latched(&manager), "not the latch: the accounting");
+
+    let snapshot = manager.canonical_budget_snapshot(now).await.unwrap();
+    assert!(snapshot.capital_base_invalid);
+    assert_eq!(snapshot.capital_base, dec!(10000), "a positive base, still untrusted");
+    assert_eq!((snapshot.remaining_active, snapshot.slots_active), (Decimal::ZERO, 0));
+    assert!(manager.budget_basis_is_invalid_now().await.unwrap());
+    let arm = manager.admission_capital_base(now).await;
+    assert!(matches!(arm, Err(DaemonError::AdmissionsClosed { .. })), "{arm:?}");
+
+    let entry = Price::new(dec!(100)).unwrap();
+    let signal = manager
+        .handle_signal(DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: armed.id,
+            symbol: symbol.clone(),
+            side: Side::Long,
+            entry_price: entry,
+            stop_loss: Price::new(dec!(98)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: now,
+        })
+        .await;
+    assert_eq!(manager.exchange().market_order_call_count(), 0, "{signal:?}");
+
+    assert!(!manager.evaluate_monthly_halt().await);
+    assert!(!manager.circuit_breaker.blocks_new_entries().await);
+    assert!(is_still_active(&manager, &leg).await);
+
+    manager.event_streams.clear(&format!(
+        "system:month_boundary:{:04}-{:02}",
+        now.year(),
+        now.month()
+    ));
+    assert!(manager.evaluate_monthly_halt().await, "the same losses halt a trusted month");
+}
+
+/// A past month's suspension leaves this month's accounting alone, and stays
+/// on its own month: that month's basis reads invalid as history, whatever
+/// came after it (ADR-0056 step 7, design §2.5).
+#[tokio::test]
+async fn a_suspended_past_month_stays_invalid_and_leaves_this_month_alone() {
+    let manager = create_test_manager().await;
     let now = chrono::Utc::now();
     let last_month = now.with_day(1).unwrap() - chrono::Duration::days(1);
-    for (year, month, closes) in [
-        (now.year(), now.month(), true),
-        (last_month.year(), last_month.month(), false),
-    ] {
-        let manager = create_test_manager().await;
-        manager.event_streams.restore([(
-            format!("system:month_boundary:{year:04}-{month:02}"),
-            crate::event_streams::Suspended {
-                suspension_id: Uuid::now_v7(),
-                stream: crate::event_streams::ManagedStream::Month { year, month },
-                repaired_through_seq: None,
-            },
-        )]);
-        assert!(!latched(&manager));
+    suspend_month(&manager, last_month.year(), last_month.month());
 
-        let armed = manager
-            .arm_position(
-                Symbol::from_pair("BTCUSDT").unwrap(),
-                Side::Long,
-                create_test_risk_config(),
-                None,
-                Uuid::now_v7(),
-            )
-            .await;
-        assert_eq!(
-            matches!(armed, Err(DaemonError::AdmissionsClosed { .. })),
-            closes,
-            "{year}-{month}: {armed:?}"
-        );
-    }
+    let snapshot = manager.canonical_budget_snapshot(now).await.unwrap();
+    assert!(!snapshot.capital_base_invalid);
+    assert!(snapshot.slots_active > 0);
+    assert!(!manager.budget_basis_is_invalid_now().await.unwrap());
+    assert_eq!(manager.admission_capital_base(now).await.unwrap(), dec!(10000));
+
+    let history = manager.load_monthly_state(last_month).await.unwrap();
+    assert!(history.month_suspended && history.basis_invalid());
+    assert!(!manager.load_monthly_state(now).await.unwrap().basis_invalid());
 }
 
 // =============================================================================
@@ -742,9 +875,10 @@ async fn a_suspension_is_recorded_and_the_next_start_refuses_the_stream(pool: sq
     restore_event_log_writes(&pool).await;
     assert!(matches!(failed, Err(DaemonError::EventLog(_))), "{failed:?}");
     assert!(latched(&manager));
-    assert_eq!(manager.executor.order_journal().retry_set_depth(), 1);
+    // The suspension, and its `stream_suspended` incident's upsert (PR F).
+    assert_eq!(manager.executor.order_journal().retry_set_depth(), 2);
 
-    assert_eq!(manager.executor.order_journal().flush_pending().await, 1);
+    assert_eq!(manager.executor.order_journal().flush_pending().await, 2);
     let row = sqlx::query_as::<_, (Uuid, String, Option<i64>, bool)>(
         "SELECT tenant_id, stream_kind, failed_seq, cleared_at IS NULL FROM stream_suspensions \
          WHERE stream_key = $1",
@@ -791,11 +925,44 @@ async fn through_proxy(pool: &sqlx::PgPool) -> (robson_testkit::db_proxy::DbProx
     (proxy, proxied)
 }
 
+/// A governed close this month, net `net`, written as the projection writes it.
+#[cfg(feature = "postgres")]
+async fn seed_governed_close(pool: &sqlx::PgPool, tenant_id: Uuid, net: Decimal) {
+    let now = chrono::Utc::now();
+    sqlx::query(
+        r#"
+        INSERT INTO positions_current (
+            position_id, tenant_id, account_id, symbol, side,
+            entry_price, entry_quantity, entry_filled_at,
+            technical_stop_price, technical_stop_distance, current_quantity,
+            trailing_stop_price, current_price, realized_pnl, total_fees, exit_reason,
+            state, last_event_id, last_seq, created_at, updated_at, closed_at
+        ) VALUES (
+            $1, $2, $3, 'BTCUSDT', 'long',
+            100, 1, $4,
+            90, 10, 1,
+            90, 90, $5, 0, 'TrailingStop',
+            'closed', $6, 1, $4, $4, $4
+        )
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(tenant_id)
+    .bind(Uuid::now_v7())
+    .bind(now)
+    .bind(net)
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 /// A month's recalibration lands in the log and its acknowledgement is lost,
 /// so its apply never runs and the month's stream is suspended. The peak then
 /// advances at runtime. At the next start nothing replays it: the stream stays
 /// suspended, the base and the peak are what they were, and with that month
-/// current admissions stay closed (ADR-0056 step 7, design R6-2).
+/// current its accounting is invalid, so admissions stay closed (ADR-0056 step
+/// 7, design R6-2 and §2.5).
 #[cfg(feature = "postgres")]
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
@@ -853,7 +1020,8 @@ async fn a_system_stream_suspended_by_a_lost_ack_is_not_replayed_at_the_next_sta
     assert_eq!(rows().await, 1, "the recalibration landed");
     assert_eq!(month().await, (dec!(1000), Decimal::ZERO), "and was never applied");
     assert!(manager.event_streams.month_suspended(now.year(), now.month()));
-    assert_eq!(manager.executor.order_journal().flush_pending().await, 1);
+    // The suspension and its incident's upsert (PR F).
+    assert_eq!(manager.executor.order_journal().flush_pending().await, 2);
     // The runtime peak, written as `refresh_month_peak_net_from_snapshot` does.
     sqlx::query("UPDATE monthly_state SET month_peak_net = 50 WHERE year = $1 AND month = $2")
         .bind(now.year() as i16)
@@ -866,17 +1034,23 @@ async fn a_system_stream_suspended_by_a_lost_ack_is_not_replayed_at_the_next_sta
     assert_eq!(next.load_stream_suspensions().await.unwrap(), 1);
     assert_eq!(next.repair_suspended_position_streams().await, (0, 0), "positions only");
     assert!(next.event_streams.month_suspended(now.year(), now.month()));
-    let armed = next
-        .arm_position(
-            Symbol::from_pair("BTCUSDT").unwrap(),
-            Side::Long,
-            create_test_risk_config(),
-            None,
-            Uuid::now_v7(),
-        )
-        .await;
-    assert!(matches!(armed, Err(DaemonError::AdmissionsClosed { .. })), "{armed:?}");
+    // The accounting contract, after the restart and with the latch clear: the
+    // month's basis is invalid, an arm's basis is refused, and automatic
+    // MonthlyHalt is not evaluated.
     assert!(!latched(&next));
+    let arm = next.admission_capital_base(now).await;
+    assert!(matches!(arm, Err(DaemonError::AdmissionsClosed { .. })), "{arm:?}");
+    let snapshot = next.canonical_budget_snapshot(now).await.unwrap();
+    assert!(snapshot.capital_base_invalid);
+    assert_eq!(snapshot.slots_active, 0);
+    assert!(next.budget_basis_is_invalid_now().await.unwrap());
+    // A governed close that loses more than the month's budget of 40.
+    seed_governed_close(&pool, tenant_id, dec!(-100)).await;
+    assert!(!next.evaluate_monthly_halt().await, "no automatic halt on untrusted accounting");
+    assert!(!next.circuit_breaker.blocks_new_entries().await);
+    // The control: the same losses halt the month once it is trusted.
+    let control = process_of(&pool, tenant_id);
+    assert!(control.evaluate_monthly_halt().await);
     let refused = next.emit_domain_event(recalibrated(dec!(800))).await;
     assert!(matches!(refused, Err(DaemonError::StreamSuspended { .. })), "{refused:?}");
     assert_eq!(rows().await, 1);

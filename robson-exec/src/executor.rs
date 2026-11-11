@@ -1417,11 +1417,15 @@ mod tests {
     ];
 
     fn journal_rig() -> JournalRig {
+        journal_rig_with_bound(std::time::Duration::from_millis(20))
+    }
+
+    fn journal_rig_with_bound(bound: std::time::Duration) -> JournalRig {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let backend = Arc::new(StubJournalBackend::default());
         let journal = Arc::new(
             OrderJournal::new(backend.clone(), &crate::venue::VenueId::new("test:venue"))
-                .with_commit_bound(std::time::Duration::from_millis(20)),
+                .with_commit_bound(bound),
         );
         let executor = Executor::new(
             Arc::clone(&exchange),
@@ -1793,6 +1797,247 @@ mod tests {
         }
     }
 
+    /// ADR-0056 step 7, PR F, review round 1: a refused retry's original is
+    /// uncertain the moment its fresh-id replacement starts, so its incident
+    /// closes the fence before the replacement's commit or venue answer is
+    /// awaited. With the replacement's commit held mid-flight, an entry sent
+    /// through the venue's real send start is refused, and only the rejected
+    /// exit and its replacement reach the venue. For every way the same-id
+    /// retry's commit can fail, the review's own sequence (an uncertain
+    /// retry commit, which seals the original with no occurrence) included.
+    #[tokio::test]
+    async fn a_refused_retrys_original_fences_before_its_replacement_is_awaited() {
+        use crate::{
+            gate::{IncidentReason, OperationKind},
+            venue::{EntryOrReduce, TradingPort},
+        };
+
+        for fault in FAULTS {
+            let rig = journal_rig_with_bound(std::time::Duration::from_secs(5));
+            let position = rig.active_position(None).await;
+            rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+            rig.exchange.set_rules_rejections_next(1);
+            // Exit: 0 is its first commit, 1 the same-id retry's, refused; 2
+            // the replacement's, held.
+            rig.backend.fail_commit(1, Some(fault));
+            let held = rig.backend.hold_commit(2);
+
+            let exiting = rig.executor.execute(vec![exit_action(position.id, dec!(0.1))]);
+            let meanwhile = async {
+                while rig.backend.commits().len() < 3 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(rig.sent_market_orders(), 1, "{fault:?}: only the rejected one so far");
+                assert!(
+                    rig.journal.gate().fenced(),
+                    "{fault:?}: fenced while the replacement is held"
+                );
+                let reasons: Vec<_> =
+                    rig.journal.gate().open_incidents().iter().map(|i| i.reason).collect();
+                assert_eq!(reasons, [IncidentReason::UncertainOutcome], "{fault:?}");
+                let entry = rig
+                    .journal
+                    .acquire(OperationKind::Arm)
+                    .unwrap()
+                    .run(async {
+                        let entry = rig.journal.open_intent(IntentSpec {
+                            position_id: None,
+                            kind: IntentKind::Entry,
+                            client_order_id: "e-while-held".to_string(),
+                            cancels_order_id: None,
+                            params: serde_json::Value::Null,
+                        });
+                        rig.journal.before_send(&entry, WriteClass::Strict).await.unwrap();
+                        TradingPort::place_market_order(
+                            &*rig.exchange,
+                            &Symbol::from_pair(SYMBOL).unwrap(),
+                            robson_domain::OrderSide::Buy,
+                            Quantity::new(dec!(0.1)).unwrap(),
+                            "e-while-held",
+                            EntryOrReduce::Entry,
+                        )
+                        .await
+                    })
+                    .await;
+                assert!(
+                    matches!(&entry, Err(ExecError::SendRefused(why)) if why.contains("fenced")),
+                    "{fault:?}: {entry:?}"
+                );
+                held.notify_one();
+            };
+            let (results, ()) = tokio::join!(exiting, meanwhile);
+
+            let results = results.unwrap();
+            assert!(
+                results.iter().any(|r| matches!(r, ActionResult::OrderPlaced { .. })),
+                "{fault:?}: {results:?}"
+            );
+            let sent = rig.exchange.market_order_client_ids();
+            assert_eq!(sent.len(), 2, "{fault:?}: the rejected exit and its replacement: {sent:?}");
+            assert!(!sent.contains(&"e-while-held".to_string()), "{fault:?}");
+            rig.journal.flush_pending().await;
+            let (sealed, _) = exit_rows(&rig);
+            let outcome = sealed.outcome.expect("the original's ending");
+            assert!(
+                outcome.uncertain_at.is_some() && outcome.uncertain_generation.is_some(),
+                "{fault:?}"
+            );
+            assert_eq!(rig.journal.gate().open_incidents()[0].count, 1, "{fault:?}: recorded once");
+        }
+    }
+
+    /// ADR-0056 step 7, PR F, review round 2: while the replacement waits at
+    /// the venue, the retry flush lands the original's uncertain ending and its
+    /// incident, and a release at that generation opens the fence. The
+    /// original's link to its replacement survives the flush, so the
+    /// replacement's own ending is recorded at its completion, inside the
+    /// enclosing operation (a reconciliation scan's outlives the exit): an
+    /// uncertain one fences at once, and an entry is then refused at its send;
+    /// a known success is recorded with its evidence, and nothing is
+    /// classified uncertain when the operation ends.
+    #[tokio::test]
+    async fn a_replacement_link_survives_the_retry_flush_and_a_release() {
+        use crate::{
+            gate::{IncidentReason, OperationKind},
+            order_journal::ReleaseRecord,
+            venue::{EntryOrReduce, TradingPort},
+        };
+
+        let faults = [
+            JournalFault::Known,
+            JournalFault::AckLost,
+            JournalFault::NotLandedUncertain,
+        ];
+        for fault in faults {
+            for uncertain in [true, false] {
+                let ending = if uncertain { "uncertain" } else { "accepted" };
+                let case = format!("{fault:?}, the replacement {ending}");
+                let rig = journal_rig_with_bound(std::time::Duration::from_secs(5));
+                let position = rig.active_position(None).await;
+                rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+                rig.exchange.set_rules_rejections_next(1);
+                // Exit: 0 is its first commit, 1 the same-id retry's, refused;
+                // 2 the replacement's, held until the venue hold is set.
+                rig.backend.fail_commit(1, Some(fault));
+                let held = rig.backend.hold_commit(2);
+
+                let scan = rig.journal.begin_operation();
+                let exiting =
+                    scan.scope(rig.executor.execute(vec![exit_action(position.id, dec!(0.1))]));
+                let meanwhile = async {
+                    while rig.backend.commits().len() < 3 {
+                        tokio::task::yield_now().await;
+                    }
+                    // The replacement goes on to the venue and waits there.
+                    let at_venue = rig.exchange.hold_next_mutation();
+                    held.notify_one();
+                    while rig.exchange.mutations().len() < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                    rig.journal.flush_pending().await;
+                    assert_eq!(rig.journal.retry_set_depth(), 0, "{case}: the original landed");
+                    let generation = rig.journal.gate().generation();
+                    let receipt = rig
+                        .journal
+                        .release(ReleaseRecord {
+                            decision_id: Uuid::now_v7(),
+                            generation,
+                            actor: "operator@example.com".to_string(),
+                            auth_kind: "verified",
+                            note: "reviewed".to_string(),
+                            treatment: "unbooked_accepted",
+                            decided_at: chrono::Utc::now(),
+                        })
+                        .await
+                        .unwrap();
+                    assert!(receipt.fence_open, "{case}");
+                    if uncertain {
+                        rig.exchange.set_order_fail_next(true);
+                    }
+                    at_venue.notify_one();
+                    generation
+                };
+                let (results, released) = tokio::join!(exiting, meanwhile);
+                assert_eq!(
+                    rig.exchange.market_order_client_ids().len(),
+                    2,
+                    "{case}: the rejected exit and its replacement"
+                );
+
+                // The exit is over; the operation that ran it is not.
+                if uncertain {
+                    assert!(rig.journal.gate().fenced(), "{case}: fenced at once: {results:?}");
+                    let incidents = rig.journal.gate().open_incidents();
+                    assert_eq!(incidents.len(), 1, "{case}");
+                    assert_eq!(incidents[0].reason, IncidentReason::UncertainOutcome, "{case}");
+                    assert!(incidents[0].first_generation > released, "{case}");
+                    let entry = rig
+                        .journal
+                        .acquire(OperationKind::Arm)
+                        .unwrap()
+                        .run(async {
+                            let entry = rig.journal.open_intent(IntentSpec {
+                                position_id: None,
+                                kind: IntentKind::Entry,
+                                client_order_id: "e-after".to_string(),
+                                cancels_order_id: None,
+                                params: serde_json::Value::Null,
+                            });
+                            rig.journal.before_send(&entry, WriteClass::Strict).await.unwrap();
+                            TradingPort::place_market_order(
+                                &*rig.exchange,
+                                &Symbol::from_pair(SYMBOL).unwrap(),
+                                robson_domain::OrderSide::Buy,
+                                Quantity::new(dec!(0.1)).unwrap(),
+                                "e-after",
+                                EntryOrReduce::Entry,
+                            )
+                            .await
+                        })
+                        .await;
+                    assert!(
+                        matches!(&entry, Err(ExecError::SendRefused(why)) if why.contains("fenced")),
+                        "{case}: {entry:?}"
+                    );
+                } else {
+                    let results = results.unwrap();
+                    assert!(
+                        results.iter().any(|r| matches!(r, ActionResult::OrderPlaced { .. })),
+                        "{case}: {results:?}"
+                    );
+                    assert!(!rig.journal.gate().fenced(), "{case}");
+                    assert!(rig.journal.gate().open_incidents().is_empty(), "{case}");
+                }
+                rig.journal.flush_pending().await;
+                let (_, fresh) = exit_rows(&rig);
+                let fresh = fresh.expect("the replacement is on record").outcome;
+                let fresh = fresh.expect("the replacement's ending is on record");
+                if uncertain {
+                    assert!(fresh.uncertain_generation.is_some_and(|g| g > released), "{case}");
+                } else {
+                    assert_eq!(
+                        fresh.venue_outcome,
+                        Some(crate::order_journal::VenueOutcome::Success),
+                        "{case}"
+                    );
+                    assert!(fresh.venue_evidence.is_some(), "{case}: its evidence");
+                    assert!(fresh.uncertain_at.is_none(), "{case}");
+                }
+                assert!(rig.journal.is_quiescent(), "{case}: the link consumed at completion");
+
+                drop(scan);
+                assert_eq!(rig.journal.gate().fenced(), uncertain, "{case}: after the operation");
+                assert_eq!(
+                    rig.journal.gate().open_incidents().len(),
+                    usize::from(uncertain),
+                    "{case}: nothing more at the operation's end"
+                );
+                rig.journal.flush_pending().await;
+                assert!(rig.journal.is_quiescent(), "{case}: the link consumed, memory empty");
+            }
+        }
+    }
+
     /// Retry set full, discarded set with room: the exit's first commit fails,
     /// so its id can only be kept as discarded, and the same-id retry is
     /// refused on that. The fresh-id exit still reaches the venue in the
@@ -1821,7 +2066,8 @@ mod tests {
             })
             .await;
         rig.backend.set_fail_all(None);
-        assert_eq!(rig.journal.retry_set_depth(), order_journal::RETRY_SET_CAPACITY);
+        // Full, and the `unlanded_send` incident's upsert beside it (PR F).
+        assert_eq!(rig.journal.retry_set_depth(), order_journal::RETRY_SET_CAPACITY + 1);
 
         rig.exchange.set_rules_rejections_next(1);
         // Cancel: 0 and 1. Exit: 2 is its first commit.

@@ -32,6 +32,10 @@ use uuid::Uuid;
 
 /// Hard limit for one daemon process; the watchdogs enforce it.
 const DAEMON_DEADLINE: Duration = Duration::from_secs(90);
+/// The legacy bearer token of an operated daemon: harness only.
+const OPERATOR_TOKEN: &str = "harness-only-token";
+/// `binary_version` of the clean predecessor every harness starts after.
+const SEED_EPOCH: &str = "harness-seed";
 /// Time a step may take before the test fails with the daemon's log.
 const STEP: Duration = Duration::from_secs(60);
 
@@ -68,6 +72,7 @@ impl Harness {
             .expect("the test database host has an address");
         let proxy = DbProxy::start(upstream).await.expect("database proxy");
         let database = options.get_database().expect("sqlx::test names its database");
+        let tenant_id = Uuid::now_v7();
         let base_url =
             std::env::var("DATABASE_URL").expect("the environment supplies DATABASE_URL");
         let database_url =
@@ -89,14 +94,88 @@ impl Harness {
         .execute(&pool)
         .await
         .expect("seed this month's reset");
+        // A predecessor that stopped clean at the fence's marker, as in
+        // production between deploys: the first start is clean and unfenced.
+        // A test of an unclean start puts its own epoch after it.
+        sqlx::query(
+            "INSERT INTO process_epochs (epoch_id, tenant_id, binary_version, clean_stop_at, \
+                 marker_version) VALUES ($1, $2, $3, NOW(), 2)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant_id)
+        .bind(SEED_EPOCH)
+        .execute(&pool)
+        .await
+        .expect("seed a clean predecessor");
         Self {
             pool,
             venue,
             proxy,
             database_url,
-            tenant_id: Uuid::now_v7(),
+            tenant_id,
             work_dir,
         }
+    }
+
+    /// A daemon with the harness's operator token, which `/recovery/*` needs.
+    fn operated(&self, crash_point: Option<&str>) -> DaemonProcess {
+        self.daemon_with_env(crash_point, &[("ROBSON_LEGACY_API_TOKEN", OPERATOR_TOKEN)])
+    }
+
+    /// Ask an operated daemon for a release at `generation`.
+    async fn post_release(&self, daemon: &DaemonProcess, generation: i64) -> (u16, Value) {
+        let response = reqwest::Client::new()
+            .post(format!("{}/recovery/release", daemon.api_url()))
+            .bearer_auth(OPERATOR_TOKEN)
+            .timeout(STEP)
+            .json(&json!({
+                "generation": generation,
+                "note": "harness",
+                "treatment": "unbooked_accepted",
+            }))
+            .send()
+            .await
+            .expect("the release answers");
+        let status = response.status().as_u16();
+        (status, response.json().await.expect("json"))
+    }
+
+    /// The current generation, as a release quoting a stale one answers it.
+    async fn generation(&self, daemon: &DaemonProcess) -> i64 {
+        let (status, body) = self.post_release(daemon, -1).await;
+        assert_eq!((status, body["error"].clone()), (409, json!("stale")), "{body}");
+        body["current_generation"].as_i64().expect("the current generation")
+    }
+
+    /// Release an operated daemon at its current generation, once nothing
+    /// persists: the operator's audited release (ADR-0056 step 7, PR F).
+    async fn release(&self, daemon: &DaemonProcess) -> Value {
+        for _ in 0..50 {
+            let generation = self.generation(daemon).await;
+            let (status, body) = self.post_release(daemon, generation).await;
+            if status == 200 {
+                return body;
+            }
+            assert_eq!(body["error"], "persisting", "{status}: {body}\n{}", daemon.log_tail());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the release kept answering persisting\n{}", daemon.log_tail());
+    }
+
+    /// `robsond_admission_fence_closed{reason}` as the daemon exports it.
+    async fn fence_closed_by(&self, daemon: &DaemonProcess, reason: &str) -> bool {
+        let metrics = reqwest::Client::new()
+            .get(format!("{}/metrics", daemon.api_url()))
+            .timeout(STEP)
+            .send()
+            .await
+            .expect("the metrics answer")
+            .text()
+            .await
+            .expect("text");
+        let series = format!("robsond_admission_fence_closed{{reason=\"{reason}\"}} ");
+        let line = metrics.lines().find(|line| line.starts_with(&series));
+        line.expect("the fence exports every reason").ends_with(" 1")
     }
 
     fn daemon(&self, crash_point: Option<&str>) -> DaemonProcess {
@@ -183,6 +262,7 @@ fn arm_immediate(api_url: String) -> tokio::task::JoinHandle<Result<Value, Strin
     tokio::spawn(async move {
         let response = reqwest::Client::new()
             .post(format!("{api_url}/positions"))
+            .bearer_auth(OPERATOR_TOKEN)
             .timeout(STEP)
             .json(&json!({
                 "symbol": FAKE_SYMBOL,
@@ -261,7 +341,15 @@ async fn killed_after_the_venue_acked_the_fill_exists_only_on_the_venue(pool: Pg
             cancels: 0
         });
         assert!(harness.venue.position(FAKE_SYMBOL) > Decimal::ZERO);
-        assert_eq!(harness.intents("entry").await, intents, "a restart invents no outcome");
+        // A restart invents no outcome. From the fence PR its start is unclean:
+        // before the gate it stamped the dead process's intent uncertain at its
+        // own generation and opened `unclean_start`, so admissions are fenced
+        // until a release, whichever start next gets past the gate.
+        let after = harness.intents("entry").await;
+        assert_eq!((after[0].0.clone(), after[0].1.clone()), (intents[0].0.clone(), None));
+        assert!(after[0].2, "stamped uncertain by the unclean start");
+        assert_eq!(harness.open_incidents().await, ["unclean_start"]);
+        assert_eq!(harness.blockers().await, 1, "a stamp is not a disposition");
     })
     .await;
 }
@@ -440,7 +528,12 @@ async fn killed_with_a_committed_stop_intent_the_row_outlives_the_process(pool: 
             "{orders:?}\n{}",
             restarted.log_tail()
         );
-        assert_eq!(harness.intents("protection").await, stops, "no outcome is invented");
+        // No outcome is invented: the unclean restart stamps the dead stop
+        // uncertain, and fences admissions (PR F).
+        let after = harness.intents("protection").await;
+        assert_eq!((after[0].0.clone(), after[0].1.clone()), (stops[0].0.clone(), None));
+        assert!(after[0].2, "stamped uncertain by the unclean start");
+        assert!(harness.open_incidents().await.contains(&"unclean_start".to_string()));
     })
     .await;
 }
@@ -759,11 +852,12 @@ async fn proxy_blackhole_leaves_the_client_to_its_own_timeout(pool: PgPool) {
 
 // ---- Permits, epochs and the stop (ADR-0056 step 7, PR S) -------------------
 
-/// The send start against a phase change, through the real adapter, ledger
-/// and transport to the fake venue (design §8, interleaving 3, for the stop):
-/// every entry that reached the venue was ticketed while the daemon was open,
-/// none started its send after Draining began, and every one refused is a
-/// typed no-send that left no ticket.
+/// The send start against a phase change or the fence closing, through the
+/// real adapter, ledger and transport to the fake venue (design §8,
+/// interleaving 3, for the stop and for the fence PR): every entry that reached
+/// the venue was ticketed while the daemon was open and unfenced, none started
+/// its send after Draining began or an occurrence closed the fence, and every
+/// one refused is a typed no-send that left no ticket.
 #[test]
 fn every_entry_reaching_the_venue_was_ticketed_while_open() {
     use std::sync::Arc;
@@ -772,14 +866,18 @@ fn every_entry_reaching_the_venue_was_ticketed_while_open() {
     use robson_connectors::{binance::usdm::BinanceExchangeAdapter, BinanceRestClient};
     use robson_domain::{OrderSide, Quantity, Symbol};
     use robson_exec::{
-        gate::OperationKind,
+        gate::{IncidentReason, OperationKind},
         order_journal::{IntentKind, IntentSpec, OrderJournal, StubJournalBackend, WriteClass},
         venue::{EntryOrReduce, TradingPort, Venue, VenueId},
         ExecError,
     };
 
-    let config = ProptestConfig { cases: 24, ..ProptestConfig::default() };
-    proptest!(config, |(delays in proptest::collection::vec(0usize..6, 1..8), flip in 0usize..8)| {
+    let config = ProptestConfig { cases: 32, ..ProptestConfig::default() };
+    proptest!(config, |(
+        delays in proptest::collection::vec(0usize..6, 1..8),
+        flip in 0usize..8,
+        fence in proptest::bool::ANY,
+    )| {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -842,7 +940,12 @@ fn every_entry_reaching_the_venue_was_ticketed_while_open() {
                     for _ in 0..flip {
                         tokio::task::yield_now().await;
                     }
-                    journal.gate().begin_draining();
+                    if fence {
+                        // An uncertain outcome elsewhere: the fence closes.
+                        journal.gate().record(IncidentReason::UncertainOutcome);
+                    } else {
+                        journal.gate().begin_draining();
+                    }
                     journal.gate().snapshot().sends_started
                 })
             };
@@ -936,13 +1039,26 @@ async fn a_client_disconnecting_mid_operation_leaves_it_to_complete(pool: PgPool
 }
 
 impl Harness {
+    /// This tenant's open incidents, by reason.
+    async fn open_incidents(&self) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT reason FROM recovery_incidents WHERE tenant_id = $1 AND released_at IS NULL \
+             ORDER BY reason",
+        )
+        .bind(self.tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .expect("read recovery_incidents")
+    }
+
     /// This tenant's epochs, oldest first: marked clean, marker version.
     async fn epochs(&self) -> Vec<(bool, Option<i16>)> {
         sqlx::query_as(
             "SELECT clean_stop_at IS NOT NULL, marker_version FROM process_epochs
-             WHERE tenant_id = $1 ORDER BY epoch_seq",
+             WHERE tenant_id = $1 AND binary_version <> $2 ORDER BY epoch_seq",
         )
         .bind(self.tenant_id)
+        .bind(SEED_EPOCH)
         .fetch_all(&self.pool)
         .await
         .expect("read process_epochs")
@@ -1052,19 +1168,21 @@ async fn a_signal_stops_the_real_process_clean_and_marks_its_epoch(pool: PgPool)
             assert!(stopped_in < Duration::from_secs(25), "{signal}: {stopped_in:?}");
             assert!(log.contains(&format!("cause=\"SIG{signal}\"")), "{log}");
             assert!(log.contains("Stop: clean, epoch marked"), "{log}");
-            if run == 1 {
-                assert!(log.contains("counts as unclean until the fence PR"), "{log}");
-            }
+            // Each start follows a version 2 marker: the seeded one, then the
+            // first run's.
+            assert!(log.contains("predecessor stopped clean"), "run {run}: {log}");
         }
-        assert_eq!(harness.epochs().await, [(true, Some(1)), (true, Some(1))]);
+        assert_eq!(harness.epochs().await, [(true, Some(2)), (true, Some(2))]);
+        assert!(harness.open_incidents().await.is_empty());
         assert!(harness.venue.unserved_requests().is_empty());
     })
     .await;
 }
 
 /// Killed just before its marker, the epoch stays unmarked and the next start
-/// finds an unclean predecessor; killed just after it, the marker stands.
-/// Real deaths at named places, after a real SIGTERM.
+/// finds an unclean predecessor, which fences it: no marker until a release.
+/// Released, and killed just after its marker, the marker stands. Real deaths
+/// at named places, after a real SIGTERM.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn killed_around_its_marker_the_epoch_says_whether_it_was_written(pool: PgPool) {
@@ -1077,22 +1195,87 @@ async fn killed_around_its_marker_the_epoch_says_whether_it_was_written(pool: Pg
         daemon.wait_killed_at(STOP_BEFORE_MARKER, GRACE).await.expect("killed before");
         assert_eq!(harness.epochs().await, [(false, None)]);
 
-        let daemon = harness.daemon(Some(STOP_AFTER_MARKER));
+        let daemon = harness.operated(Some(STOP_AFTER_MARKER));
         daemon.wait_ready(STEP).await.expect("daemon ready");
         let log = plain(daemon.log());
         assert!(log.contains("Process epoch started after an unclean stop"), "{log}");
         assert!(log.contains("no_marker"), "{log}");
+        assert!(harness.fence_closed_by(&daemon, "unclean_start").await);
+        assert_eq!(harness.release(&daemon).await["fence_open"], true);
         daemon.send_signal("TERM").expect("signal");
         daemon.wait_killed_at(STOP_AFTER_MARKER, GRACE).await.expect("killed after");
-        assert_eq!(harness.epochs().await, [(false, None), (true, Some(1))]);
+        assert_eq!(harness.epochs().await, [(false, None), (true, Some(2))]);
+    })
+    .await;
+}
+
+/// Design §8: A dies (SIGKILL at a named place), B starts unclean and fenced,
+/// the operator releases it through the real endpoints and B stops clean at
+/// version 2, C starts clean and unfenced. Admissions are refused at the arm
+/// while fenced and accepted after the release; a stale generation is refused
+/// with the current one.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn an_unclean_start_is_fenced_until_an_audited_release_then_stops_clean(pool: PgPool) {
+    within(DAEMON_TEST_LIMIT, async move {
+        let harness = Harness::start(pool).await;
+        let a = harness.daemon(Some(STARTUP_BEFORE_SCAN));
+        a.wait_killed_at(STARTUP_BEFORE_SCAN, STEP).await.expect("A killed");
+
+        let b = harness.operated(None);
+        b.wait_ready(STEP).await.expect("B ready");
+        assert!(plain(b.log()).contains("no_marker"), "{}", b.log_tail());
+        assert!(harness.fence_closed_by(&b, "unclean_start").await);
+        assert_eq!(harness.open_incidents().await, ["unclean_start"]);
+        let generation = harness.generation(&b).await;
+        assert_eq!(generation & 0xffff_ffff, 1, "the unclean start's own occurrence");
+        let refused = arm_immediate(b.api_url()).await.unwrap().expect_err("fenced");
+        assert!(refused.contains("503") && refused.contains("fence"), "{refused}");
+
+        let (status, stale) = harness.post_release(&b, generation - 1).await;
+        assert_eq!(status, 409);
+        assert_eq!(
+            (stale["error"].clone(), stale["current_generation"].clone()),
+            (json!("stale"), json!(generation))
+        );
+        let released = harness.release(&b).await;
+        assert_eq!(released["fence_open"], true, "{released}");
+        assert_eq!(released["incidents_released"], 1, "{released}");
+        assert!(!harness.fence_closed_by(&b, "unclean_start").await);
+        arm_immediate(b.api_url())
+            .await
+            .unwrap()
+            .expect("the arm goes through once released");
+        let (actor, auth, kind): (String, String, String) = sqlx::query_as(
+            "SELECT actor, auth_kind, kind FROM journal_decisions WHERE kind = 'release'",
+        )
+        .fetch_one(&harness.pool)
+        .await
+        .expect("the release's decision");
+        assert_eq!(
+            (actor.as_str(), auth.as_str(), kind.as_str()),
+            ("legacy-bearer-token", "asserted", "release")
+        );
+
+        b.send_signal("TERM").expect("signal");
+        assert!(b.wait_exit(GRACE).await.expect("B stops").success(), "{}", b.log_tail());
+        assert!(plain(b.log()).contains("Stop: clean, epoch marked"), "{}", b.log_tail());
+
+        let c = harness.operated(None);
+        c.wait_ready(STEP).await.expect("C ready");
+        assert!(plain(c.log()).contains("predecessor stopped clean"), "{}", c.log_tail());
+        assert!(!harness.fence_closed_by(&c, "unclean_start").await);
+        assert_eq!(harness.epochs().await, [(false, None), (true, Some(2)), (false, None)]);
+        assert!(harness.open_incidents().await.is_empty());
     })
     .await;
 }
 
 /// A stop with `/panic` in flight, its exit order held by the venue: Draining
-/// waits for the panic, refusing an ordinary request meanwhile, and the stop is
-/// clean once the order's 10 s bound ends it. The timed-out exit is uncertain
-/// and recorded, which a clean marker allows before the fence PR.
+/// waits for the panic, refusing an ordinary request meanwhile, and the stop
+/// ends once the order's 10 s bound ends it. The timed-out exit is uncertain
+/// and recorded, and from the fence PR it is an incident: the stop writes no
+/// marker, and the next start is fenced.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn a_stop_waits_for_a_panic_in_flight_and_refuses_ordinary_requests_meanwhile(pool: PgPool) {
@@ -1145,15 +1328,14 @@ async fn a_stop_waits_for_a_panic_in_flight_and_refuses_ordinary_requests_meanwh
             stopped_in > Duration::from_secs(5) && stopped_in < Duration::from_secs(25),
             "draining waited for the panic, within the deadline: {stopped_in:?}"
         );
-        assert!(
-            plain(daemon.log()).contains("Stop: clean, epoch marked"),
-            "{}",
-            daemon.log_tail()
-        );
-        assert_eq!(harness.epochs().await, [(true, Some(1))]);
+        let log = plain(daemon.log());
+        assert!(log.contains("result=\"incident_open\""), "{}", daemon.log_tail());
+        assert!(log.contains("Stop: not clean, no marker written"), "{}", daemon.log_tail());
+        assert_eq!(harness.epochs().await, [(false, None)]);
         let exits = harness.intents("exit").await;
         assert_eq!(exits.len(), 1, "{exits:?}");
         assert_eq!((exits[0].1.clone(), exits[0].2), (None, true), "uncertain, on record");
+        assert_eq!(harness.open_incidents().await, ["uncertain_outcome"]);
     })
     .await;
 }

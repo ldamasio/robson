@@ -416,14 +416,21 @@ pub(crate) struct MonthlyRiskState {
     /// reset, has none. Without a database there is no reset to look for,
     /// and this is true.
     pub boundary_reset_landed: bool,
+    /// The month's system stream is suspended (ADR-0056 step 7, design §2.5):
+    /// a reset or recalibration of it may have landed in the log and not in
+    /// `monthly_state`, so nothing read here can be trusted to meter it. Read
+    /// from the suspensions held in memory, no query, whether the month is
+    /// current or history, and whatever a release did.
+    pub month_suspended: bool,
 }
 
 impl MonthlyRiskState {
-    /// The basis cannot meter the month (ADR-0051 §1): `capital_base <= 0`,
+    /// The basis cannot meter the month (ADR-0051 §1): `capital_base <= 0`;
     /// or the month's reset has not landed, so the base read is configured
-    /// capital or a value no reset wrote, not the operated wallet's.
+    /// capital or a value no reset wrote, not the operated wallet's; or the
+    /// month's system stream is suspended (ADR-0056 step 7).
     pub(crate) fn basis_invalid(&self) -> bool {
-        self.capital_base <= Decimal::ZERO || !self.boundary_reset_landed
+        self.capital_base <= Decimal::ZERO || !self.boundary_reset_landed || self.month_suspended
     }
 }
 
@@ -577,13 +584,24 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
     /// The basis an arm sizes with: the month's persisted `capital_base`. A
     /// month whose reset has not landed refuses the arm, since that basis did
-    /// not come from the operated wallet. A basis <= 0 is returned as it is,
-    /// for `with_capital` to refuse (ADR-0051 §1).
+    /// not come from the operated wallet, and so does a month whose system
+    /// stream is suspended (ADR-0056 step 7). A basis <= 0 is returned as it
+    /// is, for `with_capital` to refuse (ADR-0051 §1).
     pub(crate) async fn admission_capital_base(
         &self,
         now: chrono::DateTime<chrono::Utc>,
     ) -> DaemonResult<Decimal> {
         let monthly = self.load_monthly_state(now).await?;
+        if monthly.month_suspended {
+            return Err(DaemonError::AdmissionsClosed {
+                reason: format!(
+                    "the {:04}-{:02} system stream is suspended, so its accounting cannot meter \
+                     entries; they stay closed while that month is current",
+                    now.year(),
+                    now.month()
+                ),
+            });
+        }
         if !monthly.boundary_reset_landed {
             return Err(DaemonError::AdmissionsClosed {
                 reason: format!(
@@ -684,6 +702,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 trades_opened,
                 budget_model,
                 boundary_reset_landed,
+                month_suspended: self.event_streams.month_suspended(now.year(), now.month()),
             });
         }
 
@@ -727,6 +746,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             trades_opened: 0,
             budget_model: inherited_model,
             boundary_reset_landed: false,
+            month_suspended: self.event_streams.month_suspended(now.year(), now.month()),
         })
     }
 
@@ -794,6 +814,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             trades_opened: monthly_closed.len() as i32,
             budget_model,
             boundary_reset_landed: true,
+            month_suspended: self.event_streams.month_suspended(now.year(), now.month()),
         })
     }
 
@@ -1206,7 +1227,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     /// The streams this manager writes (ADR-0056 step 7, PR P).
-    #[cfg(feature = "postgres")]
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     pub(crate) fn event_streams(&self) -> &EventStreams {
         &self.event_streams
     }
@@ -3023,22 +3044,30 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Admissions close for the rest of this process once the journal latch is
     /// set, whatever set it (ADR-0056 step 7, PR P): a bounded send whose row
     /// did not land, discarded history, an aborted operation, a mutation
-    /// without a permit, a suspended stream. They also stay closed while the
-    /// current month's system stream is suspended, loaded at start, until the
-    /// fence PR's accounting contract and release replace this. The latch is
+    /// without a permit, a suspended stream. The latch is checked again at an
+    /// entry's send. A suspended system stream of the current month is not a
+    /// check here: it makes the month's accounting invalid, through the
+    /// invalid-basis path (`MonthlyRiskState::basis_invalid`). From PR F they
+    /// also stay closed while the admission fence is: an incident is open,
+    /// whatever opened it, until an operator's audited release; the fence is
     /// checked again at an entry's send.
     fn check_admissions_open(&self) -> DaemonResult<()> {
-        if self.executor.order_journal().latch_set() {
+        let journal = self.executor.order_journal();
+        if journal.latch_set() {
             return Err(DaemonError::AdmissionsClosed {
                 reason: "the journal latch is set; admissions stay closed until a restart"
                     .to_string(),
             });
         }
-        if let Some((year, month)) = self.event_streams.current_month_suspended() {
+        let gate = journal.gate();
+        if gate.fenced() {
+            let reasons: Vec<&str> =
+                gate.open_incidents().iter().map(|incident| incident.reason.as_str()).collect();
             return Err(DaemonError::AdmissionsClosed {
                 reason: format!(
-                    "the event stream of {year:04}-{month:02} is suspended; admissions stay \
-                     closed while that month is current"
+                    "the admission fence is closed (open incidents: {}); an operator's audited \
+                     release, POST /recovery/release, reopens it",
+                    reasons.join(", ")
                 ),
             });
         }
@@ -3525,7 +3554,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             error!(
                 capital_base = %snapshot.capital_base,
                 risk_open_positions = local_risk_open.len(),
-                "MonthlyHalt not evaluated: the monthly budget basis is invalid, capital_base <= 0 or the month's reset not landed (ADR-0051 §1); open positions are kept"
+                "MonthlyHalt not evaluated: the monthly budget basis is invalid, capital_base <= 0, the month's reset not landed (ADR-0051 §1) or its system stream suspended (ADR-0056 step 7); open positions are kept"
             );
             return false;
         }
@@ -6037,9 +6066,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 month = now.month(),
                 "Monthly budget snapshot is invalid: the month's reset has not landed, so its basis is not the operated wallet's; new entries denied, open positions kept"
             );
+        } else if monthly.month_suspended {
+            error!(
+                capital_base = %monthly.capital_base,
+                year = now.year(),
+                month = now.month(),
+                "Monthly budget snapshot is invalid: the month's system stream is suspended, so its accounting is untrusted (ADR-0056 step 7); new entries denied, automatic MonthlyHalt not evaluated, open positions kept"
+            );
         }
-        // A base no reset wrote meters nothing, so it reports no capacity.
-        let capacity_unknown = latent_risk_invalid || !monthly.boundary_reset_landed;
+        // A base no reset wrote, or a month whose stream is suspended, meters
+        // nothing, so it reports no capacity.
+        let capacity_unknown =
+            latent_risk_invalid || !monthly.boundary_reset_landed || monthly.month_suspended;
         let budget_amount = self.trading_policy.monthly_budget(monthly.capital_base);
 
         let consumed_hwm = (month_peak_net - month_equity_net).max(Decimal::ZERO);

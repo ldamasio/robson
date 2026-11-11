@@ -44,6 +44,9 @@
 //! - `robsond_streams_suspended` — event-log streams refusing appends, by kind
 //! - `robsond_query_audit_failures_after_venue_work_total` — query audit writes
 //!   that failed after their venue work, the outcome kept
+//! - `robsond_admission_fence_closed` — the admission fence is closed, labelled
+//!   by the reason of each open incident (ADR-0056 step 7, PR F)
+//! - `robsond_recovery_incidents_open` — open incidents, by reason
 
 use std::sync::LazyLock;
 
@@ -204,8 +207,9 @@ pub static GRACEFUL_STOP: LazyLock<CounterVec> = LazyLock::new(|| {
 });
 
 /// 1 for the reason this process's start counts as unclean: `no_predecessor`,
-/// `no_marker`, or `marker_version` (every start until the fence PR writes
-/// version 2). Recorded only: nothing acts on it yet.
+/// `no_marker`, or `marker_version` (a predecessor that marked below version
+/// 2, which binaries before the fence PR write). From PR F an unclean start
+/// opens `unclean_start` and starts fenced.
 pub static UNCLEAN_START: LazyLock<GaugeVec> = LazyLock::new(|| {
     register_gauge_vec!(
         "robsond_unclean_start",
@@ -227,8 +231,8 @@ pub static QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK: LazyLock<Counter> = LazyLock::
 
 /// Event-log streams that refuse appends, by `kind` (`position`, `system`):
 /// suspended in this process, or loaded at start and not repaired (ADR-0056
-/// step 7, PR P). A suspended system stream of the current month keeps
-/// admissions closed.
+/// step 7, PR P). A suspended system stream makes its month's accounting
+/// invalid, current or history (PR F).
 pub static STREAMS_SUSPENDED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "robsond_streams_suspended",
@@ -246,11 +250,55 @@ pub fn observe_streams_suspended(positions: usize, systems: usize) {
     STREAMS_SUSPENDED.with_label_values(&["system"]).set(count(systems));
 }
 
+/// 1 for each reason the admission fence is closed by: the reason of an open
+/// incident, or `unknown` for a fence closed with none on record here (ADR-0056
+/// step 7, PR F). Every label exports from startup, at 0 while the fence is
+/// open, so an absent series means a missing daemon, not an open fence.
+pub static ADMISSION_FENCE_CLOSED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "robsond_admission_fence_closed",
+        "The admission fence is closed, by the reason of each open incident",
+        &["reason"]
+    )
+    .expect("failed to register robsond_admission_fence_closed")
+});
+
+/// Open incidents, by reason: 0 or 1, one open incident per reason at most.
+pub static RECOVERY_INCIDENTS_OPEN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "robsond_recovery_incidents_open",
+        "Open recovery incidents, by reason",
+        &["reason"]
+    )
+    .expect("failed to register robsond_recovery_incidents_open")
+});
+
+/// Publish the fence and the open incidents; every reason exports.
+pub fn observe_fence(journal: &robson_exec::order_journal::OrderJournal) {
+    let gate = journal.gate();
+    let fenced = gate.fenced();
+    let open = gate.open_incidents();
+    for reason in robson_exec::gate::IncidentReason::ALL {
+        let is_open = open.iter().any(|incident| incident.reason == reason);
+        let label = reason.as_str();
+        RECOVERY_INCIDENTS_OPEN.with_label_values(&[label]).set(i64::from(is_open));
+        ADMISSION_FENCE_CLOSED
+            .with_label_values(&[label])
+            .set(i64::from(fenced && is_open));
+    }
+    ADMISSION_FENCE_CLOSED
+        .with_label_values(&["unknown"])
+        .set(i64::from(fenced && open.is_empty()));
+}
+
 /// Zero series for the gate's metrics, so they export from startup.
 pub fn init_operation_gate_metrics() {
     LazyLock::force(&UNPERMITTED_MUTATIONS);
     LazyLock::force(&QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK);
     LazyLock::force(&ABORTED_OPERATIONS);
+    // Absent until a stop is first behind its plan, which an alert must not
+    // read as healthy: 0 from startup, when nothing is behind yet.
+    LazyLock::force(&INSURANCE_STOP_STALE_POSITIONS);
     for class in ["ordinary", "protective"] {
         API_SLOT_BUSY.with_label_values(&[class]);
     }
@@ -703,6 +751,28 @@ mod tests {
             rendered.contains("robsond_journal_operations_over_statement_bound "),
             "{rendered}"
         );
+    }
+
+    /// The fence's gauges export every reason from the first observation, so
+    /// an alert on absence means a missing daemon (ADR-0056 step 7, PR F); and
+    /// the stale-stop gauge exports from startup.
+    #[test]
+    fn the_fence_gauges_export_every_reason() {
+        init_operation_gate_metrics();
+        observe_fence(&robson_exec::order_journal::OrderJournal::unpersisted());
+
+        let rendered = render();
+        for reason in robson_exec::gate::IncidentReason::ALL {
+            let label = format!("{{reason=\"{}\"}}", reason.as_str());
+            for metric in [
+                "robsond_admission_fence_closed",
+                "robsond_recovery_incidents_open",
+            ] {
+                assert!(rendered.contains(&format!("{metric}{label}")), "{metric}{label}");
+            }
+        }
+        assert!(rendered.contains("robsond_admission_fence_closed{reason=\"unknown\"}"));
+        assert!(rendered.contains("robsond_insurance_stop_stale_positions "), "{rendered}");
     }
 
     #[test]
