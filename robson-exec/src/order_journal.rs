@@ -959,6 +959,9 @@ struct OperationIntent {
     client_order_id: String,
     kind: IntentKind,
     ticket_issued: bool,
+    /// The venue order a cancel targets. Kept here, for the operation's whole
+    /// life, because the intent's own memory can be collected before it ends.
+    cancels_order_id: Option<String>,
 }
 
 /// One entry of `operations_in_flight`.
@@ -1226,6 +1229,23 @@ impl OrderJournal {
         self.lock().intents.contains_key(client_order_id)
     }
 
+    /// Whether a live operation owns the venue order `exchange_order_id`, whose
+    /// client id is `client_order_id` (ADR-0056 step 7, PR O): one of its
+    /// intents is that order, or cancels it. Read from `operations_in_flight`,
+    /// which lists an intent from [`Self::open_intent`], before its request,
+    /// until its operation ends, whatever became of the intent's own memory: a
+    /// stop stays listed until after its leg recorded it, and an order a live
+    /// operation is cancelling stays its own. Memory only, so it answers when
+    /// persistence failed. One sync section, with no other lock taken.
+    pub fn owned_by_live_operation(&self, client_order_id: &str, exchange_order_id: &str) -> bool {
+        self.lock().operations.values().any(|operation| {
+            operation.intents.iter().any(|intent| {
+                intent.client_order_id == client_order_id
+                    || intent.cancels_order_id.as_deref() == Some(exchange_order_id)
+            })
+        })
+    }
+
     /// Start an operation without a permit: its intents are listed in
     /// `operations_in_flight` until the returned guard drops. Past the entries
     /// the permits leave over it runs unlisted and an entry cannot be
@@ -1352,6 +1372,7 @@ impl OrderJournal {
                 client_order_id: spec.client_order_id.clone(),
                 kind: spec.kind,
                 ticket_issued: false,
+                cancels_order_id: spec.cancels_order_id.clone(),
             });
         }
         let row = IntentRow {
@@ -4507,5 +4528,52 @@ mod tests {
         assert_eq!(report.orders.len(), WITHHELD_REPORT_CAPACITY);
         assert_eq!(report.total, WITHHELD_REPORT_CAPACITY as u64 + 2);
         assert!(report.truncated);
+    }
+
+    /// ADR-0056 step 7, PR O: an operation owns the orders it placed and the
+    /// orders it cancels until it ends, after the intents' own memory has gone
+    /// and whatever became of their persistence.
+    #[tokio::test]
+    async fn a_live_operation_owns_its_orders_until_it_ends() {
+        async fn place_and_cancel(journal: &Arc<OrderJournal>) {
+            let stop = journal.open_intent(spec("ins-w", IntentKind::Protection));
+            let _ = journal.before_send(&stop, WriteClass::Bounded).await;
+            journal.finish_success(&stop, None).await;
+            let cancel = journal.open_intent(IntentSpec {
+                cancels_order_id: Some("V-1".to_string()),
+                ..spec("cxl-v", IntentKind::Cancel)
+            });
+            let _ = journal.before_send(&cancel, WriteClass::Bounded).await;
+            let cancelled = CancelClass::Cancelled {
+                filled_before_cancel: rust_decimal::Decimal::ZERO,
+                fills: None,
+            };
+            journal.finish_cancel(&cancel, &cancelled).await;
+        }
+
+        // Landed: both intents leave memory, the operation still owns both.
+        let (backend, landed) = journal();
+        let ((), operation) = in_op(&landed, place_and_cancel(&landed)).await;
+        assert!(backend.row("ins-w").unwrap().outcome.is_some(), "it landed");
+        assert!(!landed.is_live("ins-w") && !landed.is_live("cxl-v"), "their memory is gone");
+        assert!(landed.owned_by_live_operation("ins-w", "W-1"), "the stop it placed");
+        assert!(landed.owned_by_live_operation("ins-other", "V-1"), "the order it cancels");
+        assert!(!landed.owned_by_live_operation("ins-other", "OTHER-1"));
+        drop(operation);
+        assert!(!landed.owned_by_live_operation("ins-w", "W-1"));
+        assert!(!landed.owned_by_live_operation("ins-other", "V-1"));
+
+        // Every commit failing, the retry set full and the history discarded.
+        let (backend, failing) = journal();
+        backend.saturate(&failing).await;
+        let ((), operation) = in_op(&failing, place_and_cancel(&failing)).await;
+        assert!(failing.latch_set());
+        assert!(!failing.is_live("ins-w") && !failing.is_live("cxl-v"), "discarded");
+        assert!(backend.row("ins-w").is_none() && backend.row("cxl-v").is_none());
+        assert!(failing.owned_by_live_operation("ins-w", "W-1"));
+        assert!(failing.owned_by_live_operation("ins-other", "V-1"));
+        drop(operation);
+        assert!(!failing.owned_by_live_operation("ins-w", "W-1"));
+        assert!(!failing.owned_by_live_operation("ins-other", "V-1"));
     }
 }

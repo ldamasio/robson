@@ -51,6 +51,9 @@
 //!   withheld
 //! - `robsond_orphan_cancel_withheld_overflow_total` — of those, the ones past
 //!   the report's 500 entries
+//! - `robsond_orphan_cancel_owned_total` — `ins-` orders outside the scan's
+//!   covered set that the sweep left alone because a live operation or a leg
+//!   owns them (ADR-0056 step 7, PR O)
 
 use std::sync::LazyLock;
 
@@ -296,6 +299,18 @@ pub static ORPHAN_CANCEL_WITHHELD_OVERFLOW: LazyLock<Counter> = LazyLock::new(||
     .expect("failed to register robsond_orphan_cancel_withheld_overflow_total")
 });
 
+/// `ins-` orders outside the scan's covered set that the orphan sweep did not
+/// cancel because ownership revalidation found them owned: registered to a
+/// live operation, or recorded on a leg since the scan read the legs
+/// (ADR-0056 step 7, PR O). Once per order and scan.
+pub static ORPHAN_CANCEL_OWNED: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_orphan_cancel_owned_total",
+        "Insurance-stop orders outside the covered set that the sweep kept because they are owned"
+    )
+    .expect("failed to register robsond_orphan_cancel_owned_total")
+});
+
 /// Publish the fence and the open incidents; every reason exports.
 pub fn observe_fence(journal: &robson_exec::order_journal::OrderJournal) {
     let gate = journal.gate();
@@ -324,6 +339,7 @@ pub fn init_operation_gate_metrics() {
     LazyLock::force(&INSURANCE_STOP_STALE_POSITIONS);
     LazyLock::force(&ORPHAN_CANCEL_WITHHELD);
     LazyLock::force(&ORPHAN_CANCEL_WITHHELD_OVERFLOW);
+    LazyLock::force(&ORPHAN_CANCEL_OWNED);
     for class in ["ordinary", "protective"] {
         API_SLOT_BUSY.with_label_values(&[class]);
     }
@@ -780,7 +796,7 @@ mod tests {
 
     /// The fence's gauges export every reason from the first observation, so
     /// an alert on absence means a missing daemon (ADR-0056 step 7, PR F); and
-    /// the stale-stop gauge exports from startup.
+    /// the stale-stop gauge and the owned-orphan counter export from startup.
     #[test]
     fn the_fence_gauges_export_every_reason() {
         init_operation_gate_metrics();
@@ -798,6 +814,7 @@ mod tests {
         }
         assert!(rendered.contains("robsond_admission_fence_closed{reason=\"unknown\"}"));
         assert!(rendered.contains("robsond_insurance_stop_stale_positions "), "{rendered}");
+        assert!(rendered.contains("robsond_orphan_cancel_owned_total "), "{rendered}");
     }
 
     #[test]

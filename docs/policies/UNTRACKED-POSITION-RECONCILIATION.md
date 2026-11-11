@@ -3,7 +3,7 @@
 **Status**: Active
 **Effective Date**: 2026-04-18
 **Owner**: Risk Engineering / robsond Runtime
-**Version**: 1.5
+**Version**: 1.6
 **Companion ADR**: [ADR-0022 — Robson-Authored Position Invariant](../adr/ADR-0022-robson-authored-position-invariant.md)
 
 ---
@@ -458,6 +458,12 @@ The runtime MUST enforce I1/I2 with at least the following mechanisms:
    robsond-authored protective orders. Cancel errors are tolerated (logged, scan
    continues); each cancellation emits an `InsuranceStopOrphanCancelled` audit
    event. See [ADR-0039](../adr/ADR-0039-exchange-side-insurance-stop.md).
+   Since ADR-0056 step 7 (PR O, part 1) the sweep revalidates ownership before it
+   cancels, because it reads the legs before the open orders: an order a live
+   operation placed or is cancelling, or one a leg has recorded since, is kept
+   and counted in `robsond_orphan_cancel_owned_total`, not cancelled. While an
+   incident is open, the fence closed or the latch set, the sweep cancels no
+   orphan at all (ADR-0056 step 7, PR F).
 
 ---
 
@@ -607,6 +613,7 @@ Do not run this command against the current runtime; the endpoint does not exist
 | 1.3 | 2026-07-02 | Added orphan insurance-order sweep to Enforcement (ADR-0039). | Claude (glm-5.2) |
 | 1.4 | 2026-09-27 | Retired legacy PositionMonitor runtime wiring; documented current Futures `(symbol, side)` matching and the durable I2 audit gap. | Codex |
 | 1.5 | 2026-09-27 | Removed legacy PositionMonitor application artifacts; retained applied migrations and the infrastructure flag only for rollback safety. | Codex |
+| 1.6 | 2026-11-11 | The orphan insurance-order sweep revalidates ownership before it cancels, and withholds while anything is unresolved (ADR-0056 step 7, PRs O and F). | Claude Opus 5.5 |
 
 ---
 

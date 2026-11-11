@@ -458,7 +458,8 @@ The domain stop resolver's adverse tick rounding is reused; ADR-0052's persisted
   and `ReduceOnlyRejected` have a 30 s window. **Known corner:** a persistent untyped refusal while price stays past the stop submits
   at tick cadence and alternates heal and cancel, about 2 stop events per 30 s, until the operator acts.
 - **A stop gone from the venue.** A stop can stop being live on a leg the venue still holds: a rounded stop fills and leaves a remainder
-  with no crossing tick, a stop executes part and expires, the operator cancels it, or the sweep cancels a successor not yet recorded.
+  with no crossing tick, a stop executes part and expires, the operator cancels it, or, before step 7's PR O, the sweep cancelled a successor not yet
+  recorded.
   The leg stays `Active`, so nothing closes it, and a recorded id would keep the heal from noticing. The orphan sweep already reads the
   open protective orders of every symbol with an `Active` leg, so no request is added: on a successful read, a leg the venue holds whose
   recorded stop is not among them, and whose id is unchanged on a re-read, is scheduled for the heal, with a warning and the stale gauge.
@@ -1191,6 +1192,39 @@ startup scan and every reconciliation scan keep orphan `ins-` orders instead of 
 while that restart is fenced. Rollback across part 4 alone: to part 3's image, which restores the sweep's cancels during an
 incident; no condition beyond part 2's.
 
+*Ownership races (PR O), part 1: the orphan sweep revalidates ownership.* The second race of the Implementation Notes: the sweep
+read the legs, built its covered set, and only then read each symbol's open orders, so a stop accepted in between (a new leg's
+first stop, a replacement's successor) was outside the set and was cancelled, whether its leg had recorded it by then or not, and
+the leg could hold a cancelled stop until a later scan scheduled the heal. Before it treats an `ins-` order outside the covered set
+as an orphan, the sweep now checks, in this order:
+
+- **Registration first.** A live operation that lists the order, by client id, or is cancelling it, by venue id, owns it
+  (`OrderJournal::owned_by_live_operation`, over `operations_in_flight`). An operation lists an intent from before its request
+  until it ends, which for a stop is after its leg recorded it, in memory, whatever became of the intent's own history or of its
+  persistence; a cancel's target is now kept there too.
+- **Then one fresh read of the legs** for the symbol, after every registration check on it. An order recorded on an `Active` leg
+  is owned, and so is every order on a symbol with an `Active` leg that has no stop, as in the first read. A read that fails
+  cancels nothing on that symbol (design §2.9).
+
+So a stop recorded before the cancel is seen by one check or the other, and an order the venue already lists cannot gain a
+placement owner once its registration check has passed, since no runtime path records a stop it did not place: for protection the
+check binds before the cancel's journal write and needs nothing at the transport. A cancel that starts after the check can still
+take the order as its target; the sweep does not check again, so both cancels can be sent and the second's "already gone" answer
+fences. That race costs availability only and never removes an `Active` leg's stop. An
+owned order is kept, logged and counted (`robsond_orphan_cancel_owned_total`, exported at 0 from startup), and is not reported as
+withheld; part 4's veto, its report and its handoff check run unchanged on what is left. No venue request and no query is added:
+a registration check passes over the live operations' intents once per candidate, and the fresh read is one memory read per
+symbol that still has a candidate after the first read's filters, normally none.
+
+What part 1 changes in production: nothing while the book is empty. Once stops are placed, a new leg's first stop and a
+replacement's successor survive a scan that read the legs before they were recorded, and an order a live operation is already
+cancelling when the sweep checks it is not cancelled a second time. What it does not change: the registration lives in memory, so across a restart a stop the dead
+process placed and did not record is kept only while part 4's veto holds, and after a release the stop of a leg left `Entering`
+by a crash can be cancelled again (design §4), until step 8's linkage. An order whose replacement cancelled it, with that
+operation over, between the sweep's open-orders read and the check still meets the sweep's second cancel, whose "already gone"
+answer fences, as before, and so does one whose cancel starts after the check. The first race, the UNTRACKED close against an entry, is part 2's. No migration. Rollback across part 1
+alone: to the image before it, which restores the race; no condition beyond F's.
+
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations. Where this ADR names a persisted-state version (steps 5 and 7) it is target architecture: no step has written a
 `persisted_state_version` record, and nothing checks one. What guards the schema today is SQLx's migration validation (an
@@ -1353,7 +1387,8 @@ Budget model for multi-venue:
   attempt rows are read from the database rather than reloaded. PR C: `robson-exec/src/{cancel,compat,executor,order_journal,ports,stub}.rs`,
   `robsond/src/{daemon,position_manager,reconciliation_worker}.rs`, no migration. PR S: `robson-exec/src/{gate,order_journal,venue,stub,quantize,
   crash_points}.rs`, `robson-connectors/src/binance_rest.rs` and the USD-M adapter, `robsond/src/{api,daemon,main,stop,process_epoch,metrics,
-  reconciliation_worker,position_manager,venue,error}.rs` (with `libc` for the hard bound's `_exit`) and `funding/worker.rs`, `robson-testkit`, migration 32. What follows here is the original statement of the step, with its
+  reconciliation_worker,position_manager,venue,error}.rs` (with `libc` for the hard bound's `_exit`) and `funding/worker.rs`, `robson-testkit`, migration 32. PR O, part 1: `robson-exec/src/{order_journal,stub}.rs`,
+  `robsond/src/{reconciliation_worker,metrics}.rs`, no migration. What follows here is the original statement of the step, with its
   open obligations. `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
   mapping); process-kill tests. Before any caller acts on `order_by_client_id` or `replace_protection`, this step must:
   persist each attempt durably before its request is sent and each rejection when observed, reload them on startup, treat
@@ -1368,7 +1403,9 @@ Budget model for multi-venue:
   the orphan sweep, working from a stale covered set, cancels a stop accepted after that set was read, recorded or not, including an initial
   stop on a new leg, so the leg can record a cancelled stop until the next sweep schedules the heal (§5). This step must revalidate ownership
   in coordination with cancellation and test a stop recorded before the cancel. Step 6's wider sweep adds some exposure to the second, and its
-  refresh and resubmit lengthen the first's window.
+  refresh and resubmit lengthen the first's window. PR O, part 1, closes the second race in the sweep itself (registration first, then a
+  fresh read of the legs, then the cancel) with that test (§8); §2.2's per-leg transition coordination stays with step 8's spot
+  arbitration. The first race is part 2's.
 - Step 8: `robson-connectors/src/binance/spot/*`; conformance suite; `ROBSON_VENUE=binance_spot`; executor's
   `validate_futures_settings` gated to position accounts (§4). It must also, before activation: replace the same-id resubmit, since
   spot has no reduce-only bound (§5); decide what a fill short of the leg and a remainder mean on a balance account, because step 6's
