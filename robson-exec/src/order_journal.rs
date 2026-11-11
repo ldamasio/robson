@@ -920,7 +920,10 @@ struct OperationIntent {
 #[derive(Debug, Default)]
 struct JournalState {
     /// Intents in flight or with something unlanded. Removed once finished
-    /// and landed, so at most the retry set plus the orders running now.
+    /// and landed, so at most the retry set plus the orders running now. A
+    /// refused retry's original stays while it names its replacement, until
+    /// its completion or its operation's end consumes the link
+    /// ([`OrderJournal::unlink`]): an order running now too.
     intents: HashMap<String, IntentMemory>,
     /// `persistence_pending`, in client ids.
     retry_set: VecDeque<String>,
@@ -1443,10 +1446,13 @@ impl OrderJournal {
             let Some(memory) = state.intents.get(&intent.client_order_id) else {
                 return Err(SendRefusal::NotSent("the id's history is gone".to_string()));
             };
+            // Once only: a link is consumed only by the original's completion
+            // or its operation's end, and an ended original has its outcome.
             if memory.row.intent_id != intent.intent_id
                 || !memory.retry_refused
                 || memory.tickets != 1
                 || memory.replaced_by.is_some()
+                || memory.outcome.is_some()
             {
                 return Err(SendRefusal::NotSent("this retry cannot be replaced".to_string()));
             }
@@ -1586,16 +1592,51 @@ impl OrderJournal {
             ..OutcomeRow::default()
         })
         .await;
+        if replacement.is_some() {
+            self.unlink_replacement(intent);
+        }
     }
 
     /// The order ended without a venue acceptance: `Rejected` if every attempt
     /// was authoritatively refused, marked not sent if no request left,
     /// otherwise uncertain.
     pub async fn finish_failed(&self, intent: &JournaledIntent) {
-        if let Some(fresh) = self.replacement_of(intent) {
-            self.finish_failed_own(&fresh).await;
+        let replacement = self.replacement_of(intent);
+        if let Some(fresh) = &replacement {
+            self.finish_failed_own(fresh).await;
         }
         self.finish_failed_own(intent).await;
+        if replacement.is_some() {
+            self.unlink_replacement(intent);
+        }
+    }
+
+    /// Completion consumed a refused retry's link to its replacement: the
+    /// original no longer names it, and goes now unless something of it still
+    /// waits to land (then [`Self::landed`] collects it).
+    fn unlink_replacement(&self, original: &JournaledIntent) {
+        let mut state = self.lock();
+        if state
+            .intents
+            .get(&original.client_order_id)
+            .is_some_and(|memory| memory.row.intent_id == original.intent_id)
+        {
+            Self::unlink(&mut state, &original.client_order_id);
+        }
+    }
+
+    /// Drop the link an original holds and collect it once nothing of it waits
+    /// in the retry set: its ending landed, or overflowed and was discarded.
+    fn unlink(state: &mut JournalState, client_order_id: &str) {
+        let Some(memory) = state.intents.get_mut(client_order_id) else {
+            return;
+        };
+        if memory.replaced_by.take().is_none() {
+            return;
+        }
+        if memory.outcome.is_some() && !memory.in_retry_set {
+            state.intents.remove(client_order_id);
+        }
     }
 
     async fn finish_failed_own(&self, intent: &JournaledIntent) {
@@ -1608,8 +1649,10 @@ impl OrderJournal {
                 return;
             }
             memory.sealed = true;
-            // Settled already (a refused retry's original): only its write.
+            // Settled already (a refused retry's original): only its write,
+            // and none once it has landed.
             match &memory.outcome {
+                Some(_) if !memory.has_unlanded() => return,
                 Some(_) => Err(memory.batch()),
                 None => Ok(Self::failed_outcome(memory)),
             }
@@ -1749,12 +1792,11 @@ impl OrderJournal {
                     "Journal result write failed; it will be retried"
                 );
                 // Unless the retry set had no room for it: then its history
-                // goes now, as an overflow's does.
+                // goes now, as an overflow's does, or with its link.
                 let mut state = self.lock();
-                let unkept = state
-                    .intents
-                    .get(&intent.client_order_id)
-                    .is_some_and(|memory| memory.outcome.is_some() && !memory.in_retry_set);
+                let unkept = state.intents.get(&intent.client_order_id).is_some_and(|memory| {
+                    memory.outcome.is_some() && !memory.in_retry_set && memory.replaced_by.is_none()
+                });
                 if unkept {
                     state.intents.remove(&intent.client_order_id);
                 }
@@ -1799,8 +1841,8 @@ impl OrderJournal {
             return Ok(());
         }
         memory.sealed = true;
-        // A refused retry's original keeps its memory until its replacement
-        // ends: it names the replacement.
+        // A refused retry's original keeps its memory while it names its
+        // replacement: unlinking collects it.
         if memory.outcome.is_some() && memory.replaced_by.is_none() {
             state.intents.remove(client_order_id);
         }
@@ -1813,7 +1855,9 @@ impl OrderJournal {
         };
         memory.mark_landed(batch);
         if !memory.has_unlanded() {
-            let finished = memory.outcome.is_some();
+            // A refused retry's original that still names its replacement
+            // stays: its completion reads the link. Unlinking collects it.
+            let finished = memory.outcome.is_some() && memory.replaced_by.is_none();
             let queued = memory.in_retry_set;
             memory.in_retry_set = false;
             if queued {
@@ -1865,7 +1909,16 @@ impl OrderJournal {
                     if failure == CommitFailure::IdSpent {
                         let occurrence = gate.occur(IncidentReason::PersistenceFailure);
                         state.retry_set.retain(|id| *id != client_order_id);
-                        state.intents.remove(&client_order_id);
+                        match state.intents.get_mut(&client_order_id) {
+                            // Its link stays for its completion; unlinking
+                            // collects it.
+                            Some(memory) if memory.replaced_by.is_some() => {
+                                memory.in_retry_set = false;
+                            },
+                            _ => {
+                                state.intents.remove(&client_order_id);
+                            },
+                        }
                         drop((gate, state));
                         error!(%client_order_id, "Journal row conflicts with another intent");
                         occurrence.log();
@@ -2194,6 +2247,18 @@ impl Drop for Operation {
                     state.intents.remove(&client_order_id);
                 },
             }
+        }
+        // Links no completion consumed (cancelled or unwound before it): each
+        // original goes now unless its ending still waits in the retry set,
+        // an overflowed one too, so nothing stays without an owner.
+        let linked: Vec<String> = state
+            .intents
+            .iter()
+            .filter(|(_, memory)| memory.operation == self.id && memory.replaced_by.is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for client_order_id in linked {
+            OrderJournal::unlink(&mut state, &client_order_id);
         }
         drop((gate, state));
         occurrences.iter().for_each(Occurrence::log);
@@ -2973,7 +3038,17 @@ mod tests {
             assert!(journal.before_send(&intent, WriteClass::Bounded).await.is_err());
 
             let _ = ledger.begin("b");
+            // The original's ending fails to land at completion: it stays in
+            // memory, in the retry set and unlinked, and is still not
+            // replaceable.
+            backend.push_fault(JournalFault::Known);
             journal.finish_success(&intent, None).await;
+            assert!(journal.lock().intents["a"].replaced_by.is_none(), "the link is consumed");
+            let after = journal
+                .replace_refused_retry(&intent, "d".to_string(), "rules".to_string())
+                .await;
+            assert!(after.is_err(), "none after its completion either: {after:?}");
+            journal.flush_pending().await;
         })
         .await;
         let sealed = backend.row("a").unwrap();
@@ -3012,6 +3087,104 @@ mod tests {
             assert!(out_twice.is_err(), "{out_twice:?}");
         })
         .await;
+    }
+
+    /// Memory entries with no owner: neither waiting in the retry set nor
+    /// held by a live operation.
+    fn unowned(journal: &OrderJournal) -> Vec<String> {
+        let state = journal.lock();
+        let mut ids: Vec<String> = state
+            .intents
+            .iter()
+            .filter(|(_, memory)| {
+                !memory.in_retry_set && !state.operations.contains_key(&memory.operation)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Review round 2: a fallback whose operation is cancelled while the
+    /// replacement waits at the venue, before its completion consumes the
+    /// link. With the retry set full the original's uncertain ending
+    /// overflowed, so it has an outcome and no retry-set entry, and only its
+    /// link kept it; with room, its ending landed. Either way the operation's
+    /// end consumes the link and collects it, the abandoned replacement is
+    /// recorded as uncertain like any other, nothing is left without an
+    /// owner, and once the retry set drains, memory is empty.
+    #[tokio::test]
+    async fn a_cancelled_fallback_leaves_nothing_unowned() {
+        for full in [true, false] {
+            let (backend, journal) = journal();
+            let ledger = SubmitAttemptLedger::new(8);
+            if full {
+                backend.set_fail_all(Some(JournalFault::Known));
+                let ((), filling) = in_op(&journal, async {
+                    for index in 0..RETRY_SET_CAPACITY {
+                        let intent = journal
+                            .open_intent(spec(&format!("filling-{index}"), IntentKind::Exit));
+                        journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
+                    }
+                })
+                .await;
+                drop(filling);
+                backend.set_fail_all(None);
+                assert_eq!(journal.lock().retry_set.len(), RETRY_SET_CAPACITY);
+            }
+
+            let operation = journal.begin_operation();
+            let reduction = operation.scope(async {
+                let intent = journal.open_intent(spec("a", IntentKind::Exit));
+                journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
+                let _ = ledger.begin("a");
+                backend.push_fault(JournalFault::NotLandedUncertain);
+                journal.before_send(&intent, WriteClass::Bounded).await.unwrap_err();
+                journal
+                    .replace_refused_retry(&intent, "b".to_string(), "rules".to_string())
+                    .await
+                    .unwrap();
+                let _ = ledger.begin("b");
+                if !full {
+                    journal.flush_pending().await;
+                    assert!(backend.row("a").unwrap().outcome.is_some(), "its ending landed");
+                }
+                // At the venue, never answering: cancelled from outside.
+                std::future::pending::<()>().await;
+            });
+            let cancelled = tokio::time::timeout(Duration::from_millis(50), reduction).await;
+            assert!(cancelled.is_err());
+            {
+                let state = journal.lock();
+                let original = &state.intents["a"];
+                assert!(original.replaced_by.is_some() && original.outcome.is_some());
+                assert!(!original.in_retry_set, "full {full}: overflowed or landed");
+            }
+            drop(operation);
+
+            {
+                let state = journal.lock();
+                assert!(!state.intents.contains_key("a"), "full {full}: the original is collected");
+                if full {
+                    assert!(!state.intents.contains_key("b"), "the replacement overflowed too");
+                } else {
+                    let fresh = &state.intents["b"];
+                    assert!(fresh.outcome.as_ref().is_some_and(OutcomeRow::is_uncertain));
+                    assert!(fresh.in_retry_set);
+                }
+                let expected = if full { RETRY_SET_CAPACITY } else { 1 };
+                assert_eq!(state.intents.len(), expected, "full {full}: within the bound");
+            }
+            assert_eq!(unowned(&journal), Vec::<String>::new(), "full {full}");
+            for _ in 0..RETRY_SET_CAPACITY {
+                if journal.retry_set_depth() == 0 {
+                    break;
+                }
+                journal.flush_pending().await;
+            }
+            assert!(journal.lock().intents.is_empty(), "full {full}: memory returns to empty");
+            assert_eq!(journal.retry_set_depth(), 0, "full {full}");
+        }
     }
 
     // Rule 4 ------------------------------------------------------------------

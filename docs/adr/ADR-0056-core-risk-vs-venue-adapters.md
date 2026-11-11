@@ -1056,7 +1056,10 @@ with no incident, and neither kind is ever evidence a release relies on.
   The reasons and their sources: `uncertain_outcome`, every journaled intent whose outcome is uncertain (a timeout, a transport
   error, a strict commit that is itself uncertain, every uncertain cancel class, an operation dropped mid-send, and the original
   of a refused retry, registered as its fresh-id replacement starts, before the replacement's commit or answer is awaited),
-  stamped in the same section with `uncertain_generation` and `uncertain_at`; `unlanded_send`, a bounded send whose row did not land, recorded before
+  stamped in the same section with `uncertain_generation` and `uncertain_at`. That original keeps its link to the replacement,
+  and its memory, until its completion records the replacement's own ending (a success with its evidence, or an uncertain
+  ending that fences at once) or its operation ends; its ending landing or overflowing does not drop it, so a release of its
+  incident in between cannot leave the replacement's ending unrecorded. `unlanded_send`, a bounded send whose row did not land, recorded before
   its request leaves; `persistence_failure`, history discarded on a full retry set or a row conflicting on retry;
   `stream_suspended`; `operation_aborted`; `unpermitted_mutation`; `unclean_start`; `generation_exhausted`. All but
   `unclean_start` and `uncertain_outcome` set the latch, as P's latch sources already did.
@@ -1140,10 +1143,14 @@ re-deploying F starts fenced. An older binary ignores `recovery_incidents` and t
 final epoch's clean marker first.
 
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
-migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze
-contract 1.2.0; `rbx-data` vendors its own registry copy (1.1.3) and must re-vendor before any export runs. Every rollback
-names its transitive dependency prefix: a step is reverted only
-together with every later merged step that imports it, and only at a persisted-state version its binary can read.
+migrations. Where this ADR names a persisted-state version (steps 5 and 7) it is target architecture: no step has written a
+`persisted_state_version` record, and nothing checks one. What guards the schema today is SQLx's migration validation (an
+image refuses an applied migration it does not embed, so its migration hook fails) and the journal's readiness probe (an
+image refuses to start without the tables it uses). Step 6 adds one optional event field and one event type, registered in
+bronze contract 1.2.0; `rbx-data` vendors its own registry copy (1.1.3) and must re-vendor before any export runs. Every
+rollback names its transitive dependency prefix: a step is reverted only together with every later merged step that
+imports it, and only to a binary that can read the state on record: today, one that embeds every applied migration and
+meets its step's rollback condition.
 
 ### 9. Not decided here
 
