@@ -197,6 +197,13 @@ impl BinanceRestClient {
         }
     }
 
+    /// Whether this client was built for the testnet, where the path rule
+    /// sends `/api/v3/` to the spot testnet host. The spot klines refuse such
+    /// a client (ADR-0056 step 8b; the spot testnet is out of scope).
+    pub(crate) fn is_testnet(&self) -> bool {
+        self.testnet
+    }
+
     fn spot_base_url(&self) -> &str {
         if self.testnet {
             BINANCE_SPOT_TESTNET_API_URL
@@ -205,7 +212,10 @@ impl BinanceRestClient {
         }
     }
 
-    fn endpoint_base_url(&self, endpoint: &str) -> &str {
+    /// The host the path rule picks: `/fapi/` to the futures host, anything
+    /// else to the spot host (crate-visible for the spot klines' host test,
+    /// ADR-0056 step 8b).
+    pub(crate) fn endpoint_base_url(&self, endpoint: &str) -> &str {
         #[cfg(any(test, feature = "crash-points"))]
         if let Some(local) = &self.local_base_url {
             return local;
@@ -996,7 +1006,7 @@ pub(crate) struct RestAnswer {
 impl RestAnswer {
     /// The body of a success. Any other status is an error: `ApiError` when
     /// the body is Binance's JSON error, `RequestFailed` otherwise.
-    fn into_body(self) -> Result<String, BinanceRestError> {
+    pub(crate) fn into_body(self) -> Result<String, BinanceRestError> {
         let RestAnswer { status, body } = self;
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
@@ -1449,7 +1459,9 @@ pub(crate) fn parse_futures_balance(body: &str) -> Result<BinanceFuturesBalance,
     })
 }
 
-fn parse_futures_klines(body: &str) -> Result<Vec<BinanceKline>, BinanceRestError> {
+/// Parse a klines response. Spot's layout is the same at the indices read
+/// here (ADR-0056 step 8b), so the spot klines use it too.
+pub(crate) fn parse_futures_klines(body: &str) -> Result<Vec<BinanceKline>, BinanceRestError> {
     let rows: Vec<Vec<Value>> =
         serde_json::from_str(body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
 
