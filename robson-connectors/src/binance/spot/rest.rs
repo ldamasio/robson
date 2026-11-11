@@ -59,6 +59,9 @@ impl SpotRead {
     pub const MY_TRADES_BY_ORDER: Self = Self::signed("/api/v3/myTrades", 5);
     /// `GET /api/v3/account/commission`, weight 20 (F17; L4954-L4959).
     pub const COMMISSION: Self = Self::signed("/api/v3/account/commission", 20);
+    /// `GET /api/v3/klines`, weight 2, public (F25; L1273-L1281). Sent by
+    /// `BinanceSpotOhlcv` (8b), not by this reader.
+    pub const KLINES: Self = Self::public("/api/v3/klines", 2);
 
     const fn public(path: &'static str, weight: u32) -> Self {
         Self { path, weight, signed: false }

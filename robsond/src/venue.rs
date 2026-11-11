@@ -532,10 +532,11 @@ mod tests {
         assert!(error.contains("ROBSON_VENUE=stub"), "{error}");
     }
 
-    /// ADR-0056 step 8a merges inert (SD12): `binance_spot` is refused before
-    /// the factory, and no selection the factory takes, with any credentials
-    /// in any environment, builds a spot venue or route. The connector side
-    /// checks that nothing outside it names the spot read side
+    /// ADR-0056 steps 8a and 8b merge inert (SD12): `binance_spot` is refused
+    /// before the factory, and no selection the factory takes, with any
+    /// credentials in any environment, builds a spot venue or route, or a feed
+    /// on any base but USD-M's and the stub's. The connector side checks that
+    /// nothing outside it names the spot read side, feed or klines
     /// (`inertness_tests.rs`).
     #[test]
     fn no_selection_builds_a_spot_venue() {
@@ -573,6 +574,17 @@ mod tests {
                                 "{case}"
                             );
                             assert!(venue.inventory().is_none(), "{case}");
+                        }
+                        for endpoint in parts.market_data.endpoints() {
+                            assert!(
+                                [
+                                    MAINNET_MARKET_WS_ENDPOINT,
+                                    TESTNET_MARKET_WS_ENDPOINT,
+                                    robson_exec::stub::STUB_FEED_ENDPOINT,
+                                ]
+                                .contains(&endpoint.as_str()),
+                                "{case}: a feed on {endpoint}"
+                            );
                         }
                     }
                 }

@@ -5,6 +5,7 @@
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::{
     records::{parse_account, parse_commission, parse_order, parse_order_list_count, parse_orders},
@@ -424,9 +425,15 @@ fn a_trade_parses_as_documented() {
     }]);
 }
 
-/// Every fixture says where it came from and when it was read.
+/// Every fixture says where it came from and when it was read: 8a's on
+/// 2026-11-10, 8b's on 2026-11-11. A live one is a public request, kept
+/// unmodified: its bytes have the sha256 recorded.
 #[test]
 fn every_fixture_states_its_source_and_access_date() {
+    let live = [
+        "https://api.binance.com/api/v3/exchangeInfo?symbol=BTCUSDT",
+        "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=3",
+    ];
     let sources = value(SOURCES);
     let listed = sources["fixtures"].as_object().unwrap();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/binance/spot/testdata");
@@ -445,10 +452,16 @@ fn every_fixture_states_its_source_and_access_date() {
             url.starts_with(
                 "https://github.com/binance/binance-spot-api-docs/blob/\
                  995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/"
-            ) || url == "https://api.binance.com/api/v3/exchangeInfo?symbol=BTCUSDT",
+            ) || live.contains(&url),
             "{name}: {url}"
         );
-        assert_eq!(source["accessed"], "2026-11-10", "{name}");
-        assert!(!source["how"].as_str().unwrap().is_empty(), "{name}");
+        let accessed = source["accessed"].as_str().unwrap();
+        assert!(["2026-11-10", "2026-11-11"].contains(&accessed), "{name}: {accessed}");
+        let how = source["how"].as_str().unwrap();
+        assert!(!how.is_empty(), "{name}");
+        if live.contains(&url) {
+            let digest = hex::encode(Sha256::digest(std::fs::read(dir.join(name)).unwrap()));
+            assert!(how.contains(&format!("sha256 {digest}")), "{name}: {digest}");
+        }
     }
 }
