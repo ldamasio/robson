@@ -1581,34 +1581,49 @@ impl OrderJournal {
     /// The venue accepted the order. After a replacement the acceptance is the
     /// fresh intent's, and the refused one ends on its own attempts.
     pub async fn finish_success(&self, intent: &JournaledIntent, evidence: Option<Value>) {
-        let replacement = self.replacement_of(intent);
-        if replacement.is_some() {
-            self.finish_failed_own(intent).await;
-        }
-        let accepted = replacement.as_ref().unwrap_or(intent);
-        self.write_outcome(accepted, OutcomeRow {
+        let success = OutcomeRow {
             venue_outcome: Some(VenueOutcome::Success),
             venue_evidence: evidence,
             ..OutcomeRow::default()
-        })
-        .await;
-        if replacement.is_some() {
-            self.unlink_replacement(intent);
+        };
+        let Some(fresh) = self.replacement_of(intent) else {
+            self.write_outcome(intent, success).await;
+            return;
+        };
+        // Both endings are registered before either write is awaited: a
+        // completion cancelled during a write leaves the known acceptance, with
+        // its evidence, in the retry set, not an unfinished replacement for
+        // the operation's end to take for uncertain.
+        let accepted = self.register_outcome(&fresh, success);
+        let refused = self.register_failed_own(intent);
+        if let Some(batch) = refused {
+            self.commit_outcome(intent, &batch).await;
         }
+        if let Some(batch) = accepted {
+            self.commit_outcome(&fresh, &batch).await;
+        }
+        self.unlink_replacement(intent);
     }
 
     /// The order ended without a venue acceptance: `Rejected` if every attempt
     /// was authoritatively refused, marked not sent if no request left,
     /// otherwise uncertain.
     pub async fn finish_failed(&self, intent: &JournaledIntent) {
-        let replacement = self.replacement_of(intent);
-        if let Some(fresh) = &replacement {
-            self.finish_failed_own(fresh).await;
+        let Some(fresh) = self.replacement_of(intent) else {
+            self.finish_failed_own(intent).await;
+            return;
+        };
+        // As for a success: both endings registered, the replacement's first,
+        // before either write is awaited.
+        let replaced = self.register_failed_own(&fresh);
+        let refused = self.register_failed_own(intent);
+        if let Some(batch) = replaced {
+            self.commit_outcome(&fresh, &batch).await;
         }
-        self.finish_failed_own(intent).await;
-        if replacement.is_some() {
-            self.unlink_replacement(intent);
+        if let Some(batch) = refused {
+            self.commit_outcome(intent, &batch).await;
         }
+        self.unlink_replacement(intent);
     }
 
     /// Completion consumed a refused retry's link to its replacement: the
@@ -1640,28 +1655,36 @@ impl OrderJournal {
     }
 
     async fn finish_failed_own(&self, intent: &JournaledIntent) {
+        if let Some(batch) = self.register_failed_own(intent) {
+            self.commit_outcome(intent, &batch).await;
+        }
+    }
+
+    /// The synchronous half of [`Self::finish_failed_own`]: seal the intent
+    /// and register its failed ending, unless it has one. The batch still to
+    /// write, or `None` when nothing is (no request left, or it has landed).
+    fn register_failed_own(&self, intent: &JournaledIntent) -> Option<JournalBatch> {
         let ending = {
             let mut state = self.lock();
-            let Some(memory) = state.intents.get_mut(&intent.client_order_id) else {
-                return;
-            };
+            let memory = state.intents.get_mut(&intent.client_order_id)?;
             if memory.row.intent_id != intent.intent_id {
-                return;
+                return None;
             }
             memory.sealed = true;
             // Settled already (a refused retry's original): only its write,
             // and none once it has landed.
             match &memory.outcome {
-                Some(_) if !memory.has_unlanded() => return,
+                Some(_) if !memory.has_unlanded() => return None,
                 Some(_) => Err(memory.batch()),
                 None => Ok(Self::failed_outcome(memory)),
             }
         };
         match ending {
-            Err(registered) => self.commit_outcome(intent, &registered).await,
-            Ok(Some(outcome)) => self.write_outcome(intent, outcome).await,
+            Err(registered) => Some(registered),
+            Ok(Some(outcome)) => self.register_outcome(intent, outcome),
             Ok(None) => {
                 self.lock().intents.remove(&intent.client_order_id);
+                None
             },
         }
     }
@@ -3185,6 +3208,67 @@ mod tests {
             assert!(journal.lock().intents.is_empty(), "full {full}: memory returns to empty");
             assert_eq!(journal.retry_set_depth(), 0, "full {full}");
         }
+    }
+
+    /// Review round 3: the replacement is accepted while the original's
+    /// uncertain ending, registered at the fallback, has not landed. Its
+    /// completion is cancelled while that ending's write is held, and the
+    /// operation ends. The acceptance was registered before anything was
+    /// awaited, so draining writes the replacement's success with its
+    /// evidence: no uncertainty for it, no new occurrence, the fence as it
+    /// was.
+    #[tokio::test]
+    async fn a_replacement_accepted_keeps_its_success_when_completion_is_cancelled() {
+        let (backend, journal) = journal();
+        let ledger = SubmitAttemptLedger::new(8);
+        let evidence = json!({"orderId": 7, "status": "FILLED"});
+        let operation = journal.begin_operation();
+        let intent = operation
+            .scope(async {
+                let intent = journal.open_intent(spec("a", IntentKind::Exit));
+                journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
+                let _ = ledger.begin("a");
+                backend.push_fault(JournalFault::NotLandedUncertain);
+                journal.before_send(&intent, WriteClass::Bounded).await.unwrap_err();
+                journal
+                    .replace_refused_retry(&intent, "b".to_string(), "rules".to_string())
+                    .await
+                    .unwrap();
+                let _ = ledger.begin("b");
+                intent
+            })
+            .await;
+        assert!(journal.lock().intents["a"].has_unlanded(), "the original's ending is unflushed");
+        let before = (journal.gate().fenced(), journal.gate().generation(), reasons(&journal));
+        assert!(before.0, "fenced by the original");
+        let counted = journal.gate().open_incidents()[0].count;
+
+        let held = backend.hold_commit(backend.commits().len());
+        let completion = operation.scope(journal.finish_success(&intent, Some(evidence.clone())));
+        let cancelled = tokio::time::timeout(Duration::from_millis(20), completion).await;
+        assert!(cancelled.is_err(), "cancelled with its first write held");
+        drop(operation);
+        held.notify_one();
+
+        let after = (journal.gate().fenced(), journal.gate().generation(), reasons(&journal));
+        assert_eq!(after, before, "no new occurrence, the fence as it was");
+        assert_eq!(journal.gate().open_incidents()[0].count, counted);
+        for _ in 0..8 {
+            if journal.retry_set_depth() == 0 {
+                break;
+            }
+            journal.flush_pending().await;
+        }
+        assert_eq!(journal.retry_set_depth(), 0);
+        let fresh = backend.row("b").unwrap().outcome.expect("the acceptance is on record");
+        assert_eq!(fresh.venue_outcome, Some(VenueOutcome::Success));
+        assert_eq!(fresh.venue_evidence, Some(evidence));
+        assert!(fresh.uncertain_at.is_none() && fresh.uncertain_generation.is_none());
+        let original = backend.row("a").unwrap().outcome.expect("the original's ending");
+        assert!(original.uncertain_at.is_some());
+        assert_eq!(journal.gate().generation(), before.1, "draining added nothing");
+        assert!(journal.lock().intents.is_empty(), "the link went with the operation");
+        assert_eq!(unowned(&journal), Vec::<String>::new());
     }
 
     // Rule 4 ------------------------------------------------------------------
