@@ -1,0 +1,9 @@
+{
+  "no_such_order": "{\"code\":-2013,\"msg\":\"Order does not exist.\"}",
+  "order_archived": "{\"code\":-2026,\"msg\":\"Order was canceled or expired with no executed qty over 90 days ago and has been archived.\"}",
+  "backend_timeout": "{\"code\":-1007,\"msg\":\"Timeout waiting for response from backend server. Send status unknown; execution status unknown.\"}",
+  "unknown": "{\"code\":-1000,\"msg\":\"An unknown error occurred while processing the request.\"}",
+  "bad_symbol": "{\"code\":-1121,\"msg\":\"Invalid symbol.\"}",
+  "too_many_requests": "{\"code\":-1003,\"msg\":\"Too much request weight used; current limit is 6000 request weight per 1 MINUTE. Please use WebSocket Streams for live updates to avoid polling the API.\"}",
+  "html_page": "<html><body><h1>Service unavailable</h1></body></html>"
+}

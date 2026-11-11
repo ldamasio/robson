@@ -1,6 +1,7 @@
 //! Binance venue adapters (ADR-0056 §3).
 
 mod endpoints;
+pub mod spot;
 pub mod usdm;
 mod wire;
 

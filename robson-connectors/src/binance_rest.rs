@@ -20,7 +20,7 @@ use std::{
 };
 
 use chrono::Utc;
-use reqwest::{Client, RequestBuilder};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use robson_domain::{Price, Quantity, Side};
 use robson_exec::{gate::OperationGate, order_journal::SendRefusal};
 use rust_decimal::Decimal;
@@ -246,8 +246,8 @@ impl BinanceRestClient {
 
     /// Send one request and read its body under one bound for both
     /// (ADR-0056 step 7, D19). A timeout is uncertain: the request may have
-    /// reached the venue.
-    async fn exchange(&self, request: RequestBuilder) -> Result<String, BinanceRestError> {
+    /// reached the venue. Every HTTP status is an answer here.
+    async fn answer(&self, request: RequestBuilder) -> Result<RestAnswer, BinanceRestError> {
         let answered = async {
             let response = request
                 .send()
@@ -256,24 +256,16 @@ impl BinanceRestClient {
             let status = response.status();
             let body =
                 response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
-            Ok::<_, BinanceRestError>((status, body))
+            Ok::<_, BinanceRestError>(RestAnswer { status, body })
         };
-        let (status, body) = timeout(self.request_timeout, answered)
+        timeout(self.request_timeout, answered)
             .await
-            .map_err(|_| BinanceRestError::Timeout)??;
+            .map_err(|_| BinanceRestError::Timeout)?
+    }
 
-        if !status.is_success() {
-            if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
-                return Err(BinanceRestError::ApiError {
-                    code: err.code,
-                    msg: err.msg,
-                    http_status: status.as_u16(),
-                });
-            }
-            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
-        }
-
-        Ok(body)
+    /// [`Self::answer`], with every non-success status an error.
+    async fn exchange(&self, request: RequestBuilder) -> Result<String, BinanceRestError> {
+        self.answer(request).await?.into_body()
     }
 
     /// The choke point (ADR-0056 step 7): every signed mutation passes the
@@ -293,6 +285,17 @@ impl BinanceRestClient {
         endpoint: &str,
         params: Vec<(&str, String)>,
     ) -> Result<String, BinanceRestError> {
+        self.get_public_answer(endpoint, params).await?.into_body()
+    }
+
+    /// A public GET whose answer comes back whatever its HTTP status, for a
+    /// caller that types the venue's errors itself (the spot read side,
+    /// ADR-0056 step 8a).
+    pub(crate) async fn get_public_answer(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<RestAnswer, BinanceRestError> {
         let url = if params.is_empty() {
             format!("{}{}", self.endpoint_base_url(endpoint), endpoint)
         } else {
@@ -301,7 +304,7 @@ impl BinanceRestClient {
             format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query)
         };
 
-        self.exchange(self.client.get(&url)).await
+        self.answer(self.client.get(&url)).await
     }
 
     /// Send a GET request to a signed endpoint.
@@ -310,10 +313,21 @@ impl BinanceRestClient {
         endpoint: &str,
         params: Vec<(&str, String)>,
     ) -> Result<String, BinanceRestError> {
+        self.get_signed_answer(endpoint, params).await?.into_body()
+    }
+
+    /// A signed GET whose answer comes back whatever its HTTP status, for a
+    /// caller that types the venue's errors itself (the spot read side,
+    /// ADR-0056 step 8a). A read: it does not pass the mutation gate.
+    pub(crate) async fn get_signed_answer(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<RestAnswer, BinanceRestError> {
         let query = self.build_signed_query(params)?;
         let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
 
-        self.exchange(self.client.get(&url).header("X-MBX-APIKEY", &self.api_key)).await
+        self.answer(self.client.get(&url).header("X-MBX-APIKEY", &self.api_key)).await
     }
 
     /// Send a POST request to a signed endpoint: a venue mutation.
@@ -973,6 +987,32 @@ impl BinanceRestClient {
 // Binance Types (from API responses)
 // =============================================================================
 
+/// One answer from the venue, of any HTTP status.
+pub(crate) struct RestAnswer {
+    pub(crate) status: StatusCode,
+    pub(crate) body: String,
+}
+
+impl RestAnswer {
+    /// The body of a success. Any other status is an error: `ApiError` when
+    /// the body is Binance's JSON error, `RequestFailed` otherwise.
+    fn into_body(self) -> Result<String, BinanceRestError> {
+        let RestAnswer { status, body } = self;
+        if !status.is_success() {
+            if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
+                return Err(BinanceRestError::ApiError {
+                    code: err.code,
+                    msg: err.msg,
+                    http_status: status.as_u16(),
+                });
+            }
+            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
+        }
+
+        Ok(body)
+    }
+}
+
 /// Binance error response.
 #[derive(Debug, Deserialize)]
 struct BinanceErrorResponse {
@@ -1595,6 +1635,27 @@ mod tests {
         let (url, _) = slow_venue(bound / 5, bound / 5).await;
         let client = BinanceRestClient::with_local_base_url(url).with_request_timeout(bound);
         assert_eq!(client.get_public("/fapi/v1/ping", vec![]).await.unwrap(), "{}");
+    }
+
+    /// ADR-0056 step 8a split the bounded send from the error mapping; a
+    /// non-success answer maps as it did before.
+    #[test]
+    fn a_non_success_answer_maps_as_before() {
+        let answer = |status: StatusCode, body: &str| RestAnswer { status, body: body.to_string() };
+        assert_eq!(answer(StatusCode::OK, "{}").into_body().unwrap(), "{}");
+        let api =
+            answer(StatusCode::BAD_REQUEST, r#"{"code":-2013,"msg":"Order does not exist."}"#);
+        assert!(matches!(
+            api.into_body(),
+            Err(BinanceRestError::ApiError { code: -2013, http_status: 400, msg })
+                if msg == "Order does not exist."
+        ));
+        match answer(StatusCode::BAD_GATEWAY, "<html></html>").into_body() {
+            Err(BinanceRestError::RequestFailed(msg)) => {
+                assert_eq!(msg, "HTTP 502 Bad Gateway: <html></html>")
+            },
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
     }
 
     /// The choke point (ADR-0056 step 7) without a permit: counted and latched
