@@ -13224,6 +13224,155 @@ mod tests {
         );
     }
 
+    // ---- ADR-0056 step 7, PR O: an entry meets a sweep's claim ----
+
+    /// A sweep's claim on BTCUSDT long, held by an operation of its own, as a
+    /// scan holds it around an UNTRACKED close.
+    async fn a_sweep_holds_btc_long(
+        journal: &Arc<robson_exec::order_journal::OrderJournal>,
+    ) -> (robson_exec::order_journal::Permit, robson_exec::order_journal::SweepClaim) {
+        use robson_exec::order_journal::OwnershipKey;
+        let permit = journal.acquire(OperationKind::ReconciliationScan).unwrap();
+        let key = OwnershipKey::new(&Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        let claim = permit.scope(async { journal.claim_sweep(key) }).await.unwrap();
+        (permit, claim)
+    }
+
+    /// Every route of an entry reaches its send and meets the sweep's claim
+    /// there: a typed no-send, nothing at the venue. A signal on a leg with
+    /// admission evidence ends its attempt (D15).
+    #[tokio::test]
+    async fn a_signal_on_a_production_policy_leg_under_a_sweep_claim_ends_its_attempt() {
+        let (manager, _backend) = journaled_manager().await;
+        let journal = manager.order_journal();
+        let (armed, signal) = production_policy_position_and_signal(&manager).await;
+        let (sweep, claim) = a_sweep_holds_btc_long(&journal).await;
+
+        let result = manager.handle_signal(signal).await;
+
+        assert!(
+            matches!(result, Err(DaemonError::Exec(ExecError::SendRefused(ref why))) if why.contains("sweep")),
+            "{result:?}"
+        );
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert!(manager.is_entry_exhausted(armed.id).await);
+        assert_eq!(journal.gate().snapshot().entries_refused_ownership, 1);
+        journal.release_sweep(claim);
+        sweep.complete();
+        assert!(journal.claims_view().is_empty());
+    }
+
+    /// A legacy leg re-arms under the governed backoff; its re-entry, once the
+    /// sweep is done, takes its own claim at its send and fills.
+    #[tokio::test]
+    async fn a_legacy_leg_refused_under_a_sweep_claim_re_arms_and_enters_after() {
+        let (manager, _backend) = journaled_manager().await;
+        let journal = manager.order_journal();
+        let (armed, signal) = armed_with_backoff(&manager, 2).await;
+        let (sweep, claim) = a_sweep_holds_btc_long(&journal).await;
+
+        let result = manager.handle_signal(signal.clone()).await;
+
+        assert!(
+            matches!(result, Err(DaemonError::Exec(ExecError::SendRefused(_)))),
+            "{result:?}"
+        );
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert!(manager.detectors.read().await.contains_key(&armed.id), "re-armed");
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), Some(&3));
+        journal.release_sweep(claim);
+        sweep.complete();
+
+        if let Some(rearmed) = manager.detectors.write().await.remove(&armed.id) {
+            rearmed.abort();
+        }
+        manager
+            .handle_signal(DetectorSignal { signal_id: Uuid::now_v7(), ..signal })
+            .await
+            .expect("the key is free: the re-entry admits");
+        assert_eq!(manager.exchange().market_order_call_count(), 1);
+        assert!(journal.claims_view().is_empty(), "its claim went with its operation");
+    }
+
+    /// An approval resumes an entry: it too meets the claim at its send.
+    #[tokio::test]
+    async fn an_approval_under_a_sweep_claim_sends_nothing() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        let manager = create_test_manager().await;
+        let journal = manager.order_journal();
+        let position = manager
+            .arm_position_with_policy(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(TechnicalStopDistance::from_entry_and_stop(
+                    Price::new(dec!(100)).unwrap(),
+                    Price::new(dec!(90)).unwrap(),
+                )),
+                Uuid::now_v7(),
+                EntryPolicyConfig::new(
+                    EntryPolicy::ConfirmedTrend,
+                    DomainApprovalPolicy::HumanConfirmation,
+                ),
+            )
+            .await
+            .unwrap();
+        manager
+            .handle_signal(DetectorSignal {
+                signal_id: Uuid::now_v7(),
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: Side::Long,
+                entry_price: Price::new(dec!(95000)).unwrap(),
+                stop_loss: Price::new(dec!(85500)).unwrap(),
+                technical_stop_analysis: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let query_id = *manager.pending_approvals.read().await.keys().next().unwrap();
+        let (sweep, claim) = a_sweep_holds_btc_long(&journal).await;
+
+        let result = manager.approve_query(query_id).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert_eq!(journal.gate().snapshot().entries_refused_ownership, 1);
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Armed), "{:?}", leg.state);
+        journal.release_sweep(claim);
+        sweep.complete();
+    }
+
+    /// An `Immediate` arm enters synchronously: under the claim, its entry
+    /// is refused at its send and nothing reaches the venue.
+    #[tokio::test]
+    async fn an_immediate_arm_under_a_sweep_claim_sends_nothing() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        let manager = create_test_manager().await;
+        let journal = manager.order_journal();
+        let (sweep, claim) = a_sweep_holds_btc_long(&journal).await;
+
+        let _ = journal
+            .acquire(OperationKind::Arm)
+            .unwrap()
+            .run(manager.arm_position_with_policy(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                create_test_risk_config(),
+                None,
+                Uuid::now_v7(),
+                EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::Automatic),
+            ))
+            .await;
+
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert_eq!(journal.gate().snapshot().entries_refused_ownership, 1);
+        journal.release_sweep(claim);
+        sweep.complete();
+        assert!(journal.claims_view().is_empty());
+    }
+
     /// A capital-capped immediate entry must ACTIVATE, not be denied by the
     /// risk gate's qty × entry round-trip (2026-07-04 prod incident: the
     /// Decimal round-trip exceeded capital by ~1e-22 and the gate rejected

@@ -419,9 +419,11 @@ The domain stop resolver's adverse tick rounding is reused; ADR-0052's persisted
 - **How long a remainder sits.** The worker closes it under ADR-0022 with no grace period, normally on its next scan
   (`ROBSON_RECONCILIATION_INTERVAL_SECS`, default 60 s), and it has no stop until then. **There is no upper bound**: a failed positions
   read skips the pass for as long as it fails, passes are serial and a slow request delays them, a venue refusal or a remainder below
-  the lot retries every scan until the operator clears it, and downtime extends it. Nothing blocks a new entry meanwhile: a new
+  the lot retries every scan until the operator clears it, and downtime extends it. Nothing blocks a new entry meanwhile, except
+  while a sweep's close of that symbol and side is in flight (step 7, PR O, part 2: the entry is then refused at its send): a new
   `Entering`, `Active` or `Exiting` leg on the same symbol and side makes the remainder count as tracked (§2.3's symbol/side gap), so it
-  is not swept until that leg closes. A failed UNTRACKED close no longer ends the rest of the scan.
+  is not swept until that leg closes, and so does a live entry's claim until its leg is recorded. A failed UNTRACKED close no longer
+  ends the rest of the scan.
 - **Evidence of a short exit.** An exit fill short of the leg always writes `residual_inventory_recorded` first, on the tick, close
   and panic paths, because `ExitOrderPlaced` carries the requested quantity and this is the only durable record of what filled.
 - **A triggered stop counts as filled only with terminal, complete evidence.** `NEW`, `PARTIALLY_FILLED` and unknown statuses are not
@@ -1225,6 +1227,41 @@ operation over, between the sweep's open-orders read and the check still meets t
 answer fences, as before, and so does one whose cancel starts after the check. The first race, the UNTRACKED close against an entry, is part 2's. No migration. Rollback across part 1
 alone: to the image before it, which restores the race; no condition beyond F's.
 
+*Ownership races (PR O), part 2: the UNTRACKED close against an entry.* The first race of the Implementation Notes: the worker read
+the venue's positions, classified one as UNTRACKED because no `Entering`, `Active` or `Exiting` leg tracked its symbol and side,
+and closed the quantity it read, coordinated with nothing. So it could sell a live entry's fill while its leg was still `Armed`
+(between the venue's fill and `EntryOrderAccepted`, which follows the entry's journal result write), or close a quantity read
+before a new entry on that key filled. The journal now holds claims on a symbol and side of its venue and account scope, in its
+memory, changed under the gate's mutex then the journal's with no await, and nothing ever waits for one:
+
+- **An entry claims its key at its send**, in `begin_send`, in the same critical section as the fence check and its ticket, and
+  holds it until its operation ends (`Operation::drop`), whatever its intents' memory holds. In production every entry runs under
+  an outer permit (the main loop, an arm, a signal, an approval) that also covers its fill, its stop and their persistence; an
+  operation of its own covers only the order, and then the leg is `Entering`, which tracks the inventory already. While a sweep's
+  claim holds the key, the entry is refused at its send: a typed no-send, nothing sent, counted by
+  `robsond_entry_refused_ownership_total` (operator decision 2026-11-11: refuse at the send only; no admission-site check). A leg
+  with admission evidence ends its attempt (`entry_not_sent`), a legacy leg re-arms under the governed backoff.
+- **The sweep claims the key before it classifies the position**, then reads `is_tracked` inside the claim, and holds it through
+  every submission of the close: the first, the refresh, the same-ID retry and the fresh-ID successor that a refused retry opens.
+  The claim names no intent, so no intent's settlement, flush, overflow, unlink or collection releases it. It is released, only
+  when its token matches, after `finish_success` or `finish_failed` returns, which have registered every submission's ending by
+  then, so an uncertain one has closed the fence before the key is free; a release reopening the fence while the successor is
+  still in flight finds the key still claimed. A scan cancelled or panicked mid-close leaves its claim to its operation's end,
+  after its permit's abort has latched. While a live entry holds the key the sweep defers the position to its next scan, counted
+  by `robsond_untracked_close_deferred_total` and logged. Both counters export at 0 from startup.
+
+Across a restart the claims are gone and nothing durable replaces them: F's fence (PR F, part 2) covers what outlives the process (an
+entry's strict row lands before its send, a close's bounded row lands or latches before its request, any uncertain ending fences
+at once, and the next start of a dead process is unclean and fenced until an audited release). After a release, an old request
+completing late is the risk the release accepted; a live successor of the sweep's close is not, and stays claimed. The scan makes
+no further venue request: the `is_tracked` read moves inside the claim, and a sweep that claims costs two gate→journal sections.
+
+What part 2 changes in production: nothing while the book is empty and every USD-M order is refused (`-2015`). Once entries fill,
+a live entry's fill is never closed as UNTRACKED, a real remainder on a key a live entry holds waits for the next scan, and an
+entry that meets a sweep's close of its key is refused at its send. Spot's base-asset inventory, shared across symbols, and the
+resolver's adoption of a managed leg whatever delayed metadata says are step 8's. No migration. Rollback across part 2 alone: to
+part 1's image, which restores the race; no condition beyond F's.
+
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations. Where this ADR names a persisted-state version (steps 5 and 7) it is target architecture: no step has written a
 `persisted_state_version` record, and nothing checks one. What guards the schema today is SQLx's migration validation (an
@@ -1388,7 +1425,8 @@ Budget model for multi-venue:
   `robsond/src/{daemon,position_manager,reconciliation_worker}.rs`, no migration. PR S: `robson-exec/src/{gate,order_journal,venue,stub,quantize,
   crash_points}.rs`, `robson-connectors/src/binance_rest.rs` and the USD-M adapter, `robsond/src/{api,daemon,main,stop,process_epoch,metrics,
   reconciliation_worker,position_manager,venue,error}.rs` (with `libc` for the hard bound's `_exit`) and `funding/worker.rs`, `robson-testkit`, migration 32. PR O, part 1: `robson-exec/src/{order_journal,stub}.rs`,
-  `robsond/src/{reconciliation_worker,metrics}.rs`, no migration. What follows here is the original statement of the step, with its
+  `robsond/src/{reconciliation_worker,metrics}.rs`, no migration. PR O, part 2: `robson-exec/src/{order_journal,gate,executor,stub}.rs`,
+  `robsond/src/{reconciliation_worker,metrics,position_manager}.rs`, no migration. What follows here is the original statement of the step, with its
   open obligations. `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
   mapping); process-kill tests. Before any caller acts on `order_by_client_id` or `replace_protection`, this step must:
   persist each attempt durably before its request is sent and each rejection when observed, reload them on startup, treat
@@ -1405,7 +1443,9 @@ Budget model for multi-venue:
   in coordination with cancellation and test a stop recorded before the cancel. Step 6's wider sweep adds some exposure to the second, and its
   refresh and resubmit lengthen the first's window. PR O, part 1, closes the second race in the sweep itself (registration first, then a
   fresh read of the legs, then the cancel) with that test (§8); §2.2's per-leg transition coordination stays with step 8's spot
-  arbitration. The first race is part 2's.
+  arbitration. PR O, part 2, closes the first race with claims on a symbol and side held in the journal's memory: an entry claims its
+  key at its send until its operation ends, the sweep claims it before it classifies and through every submission of its close, and
+  each refuses what the other holds (§8).
 - Step 8: `robson-connectors/src/binance/spot/*`; conformance suite; `ROBSON_VENUE=binance_spot`; executor's
   `validate_futures_settings` gated to position accounts (§4). It must also, before activation: replace the same-id resubmit, since
   spot has no reduce-only bound (§5); decide what a fill short of the leg and a remainder mean on a balance account, because step 6's

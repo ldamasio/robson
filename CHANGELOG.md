@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - The UNTRACKED close no longer sells a live entry's fill (ADR-0056 step 7, PR O, part 2)
+
+- The reconciliation worker classified a position as UNTRACKED when no `Entering`, `Active` or `Exiting` leg tracked its symbol
+  and side, so it could close a live entry's fill before its leg was recorded, or a quantity read before a new entry filled. Now an
+  entry claims its symbol and side at its send until its operation ends, and the worker claims it before it classifies the
+  position and through every submission of its close. A position a live entry holds is deferred to the next scan
+  (`robsond_untracked_close_deferred_total`); an entry that reaches its send while a close of its key is in flight is refused
+  there, a typed no-send (`robsond_entry_refused_ownership_total`): a leg with admission evidence ends its attempt, a legacy leg
+  re-arms. No venue request or query is added.
+
 ### Fixed - The orphan sweep no longer cancels a stop it read too early (ADR-0056 step 7, PR O, part 1)
 
 - The reconciliation sweep reads the legs before each symbol's open orders, so a stop accepted in between (a new leg's first

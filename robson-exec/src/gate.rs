@@ -417,6 +417,9 @@ impl std::error::Error for MutationRefused {}
 pub trait GateObserver: Send + Sync {
     fn unpermitted_mutation(&self);
     fn operation_aborted(&self, kind: OperationKind);
+    /// An entry refused at its send because a sweep's close held its key
+    /// (ADR-0056 step 7, PR O).
+    fn entry_refused_ownership(&self) {}
 }
 
 /// The gate's counters at one instant.
@@ -442,6 +445,8 @@ pub struct GateSnapshot {
     pub orphan_cancels_passed: u64,
     /// Those the veto refused there.
     pub orphan_cancels_withheld: u64,
+    /// Entries refused at their send while a sweep's close held their key.
+    pub entries_refused_ownership: u64,
 }
 
 #[derive(Debug)]
@@ -469,6 +474,7 @@ pub(crate) struct GateState {
     busy_protective: u64,
     orphan_cancels_passed: u64,
     orphan_cancels_withheld: u64,
+    entries_refused_ownership: u64,
 }
 
 impl GateState {
@@ -492,6 +498,7 @@ impl GateState {
             busy_protective: 0,
             orphan_cancels_passed: 0,
             orphan_cancels_withheld: 0,
+            entries_refused_ownership: 0,
         }
     }
 
@@ -511,6 +518,10 @@ impl GateState {
 
     pub(crate) fn send_started(&mut self) {
         self.sends_started += 1;
+    }
+
+    pub(crate) fn entry_refused_ownership(&mut self) {
+        self.entries_refused_ownership += 1;
     }
 
     /// `epoch_seq << 32 | n`, a signed value ordered numerically and
@@ -666,6 +677,7 @@ impl OperationGate {
             busy_protective: state.busy_protective,
             orphan_cancels_passed: state.orphan_cancels_passed,
             orphan_cancels_withheld: state.orphan_cancels_withheld,
+            entries_refused_ownership: state.entries_refused_ownership,
         }
     }
 
@@ -750,6 +762,13 @@ impl OperationGate {
             state.fenced = false;
         }
         !state.fenced
+    }
+
+    /// Tell the observer of an entry refused for its key; with no gate lock.
+    pub(crate) fn observe_entry_refused_ownership(&self) {
+        if let Some(observer) = self.observer.get() {
+            observer.entry_refused_ownership();
+        }
     }
 
     /// Whether the orphan sweep's cancels are withheld now (design §2.9).

@@ -18,7 +18,8 @@ use robson_exec::{
     cancel::CancelClass,
     gate::OperationKind,
     order_journal::{
-        IntentKind, IntentSpec, OrderJournal, OrphanCancel, WithheldOrder, WithheldReport,
+        IntentKind, IntentSpec, OrderJournal, OrphanCancel, OwnershipKey, WithheldOrder,
+        WithheldReport,
     },
     quantize::{self, ReductionOutcome},
     ExchangePort, ExchangePosition, ExecError, OpenOrderRecord, OrderResult, UserTradeRecord,
@@ -60,6 +61,9 @@ pub struct ReconciliationWorker<E: ExchangePort + 'static, S: Store + 'static> {
     /// Where a test stops the orphan sweep right after its fresh leg read.
     #[cfg(test)]
     fresh_read_pause: std::sync::Mutex<Option<Arc<TestPause>>>,
+    /// Where a test stops the UNTRACKED pass right after its claim attempt.
+    #[cfg(test)]
+    sweep_claim_pause: std::sync::Mutex<Option<Arc<TestPause>>>,
 }
 
 /// A test's stop at one point of a scan: the scan says it got there, then
@@ -392,6 +396,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             order_journal: None,
             #[cfg(test)]
             fresh_read_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            sweep_claim_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -419,6 +425,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     fn pause_after_next_fresh_read(&self) -> Arc<TestPause> {
         let pause = Arc::new(TestPause::default());
         *self.fresh_read_pause.lock().unwrap() = Some(Arc::clone(&pause));
+        pause
+    }
+
+    /// Stop the next UNTRACKED pass right after its claim attempt, before it
+    /// classifies the position.
+    #[cfg(test)]
+    fn pause_after_next_sweep_claim(&self) -> Arc<TestPause> {
+        let pause = Arc::new(TestPause::default());
+        *self.sweep_claim_pause.lock().unwrap() = Some(Arc::clone(&pause));
         pause
     }
 
@@ -482,13 +497,47 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         // say) must not stop the rest of the pass, scan after scan. The scan still
         // fails at the end, so it stays visible.
         let mut first_untracked_failure = None;
+        let journal = self.order_journal().await;
 
         for exchange_position in &exchange_positions {
-            if self.is_tracked(&exchange_position).await? {
+            // ADR-0056 step 7, PR O: the key first, then the classification
+            // inside it, held through every submission of the close. A live
+            // entry's key is deferred to the next scan: until its operation
+            // ends its fill is not untracked, and afterwards its leg tracks it.
+            let key = OwnershipKey::new(&exchange_position.symbol, exchange_position.side);
+            let claim = journal.claim_sweep(key);
+            #[cfg(test)]
+            self.pause_after_sweep_claim().await;
+            let claim = match claim {
+                Ok(claim) => claim,
+                Err(refused) => {
+                    crate::metrics::UNTRACKED_CLOSE_DEFERRED.inc();
+                    warn!(
+                        symbol = %exchange_position.symbol.as_pair(),
+                        side = ?exchange_position.side,
+                        %refused,
+                        "UNTRACKED close deferred to the next scan"
+                    );
+                    continue;
+                },
+            };
+            let tracked = match self.is_tracked(exchange_position).await {
+                Ok(tracked) => tracked,
+                Err(error) => {
+                    journal.release_sweep(claim);
+                    return Err(error);
+                },
+            };
+            if tracked {
+                journal.release_sweep(claim);
                 continue;
             }
 
-            match self.handle_untracked_position(exchange_position.clone()).await {
+            let closed = self.handle_untracked_position(exchange_position.clone()).await;
+            // Every submission's ending is registered by now: an uncertain one
+            // has closed the fence before the key is free again.
+            journal.release_sweep(claim);
+            match closed {
                 Ok(()) => reconciled += 1,
                 Err(error) => {
                     first_untracked_failure.get_or_insert(error);
@@ -872,6 +921,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     #[cfg(test)]
     async fn pause_after_fresh_read(&self) {
         let pause = self.fresh_read_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_after_sweep_claim(&self) {
+        let pause = self.sweep_claim_pause.lock().unwrap().take();
         if let Some(pause) = pause {
             pause.reached.notify_one();
             pause.resume.notified().await;
@@ -2769,6 +2827,561 @@ mod tests {
         assert!(crate::metrics::ORPHAN_CANCEL_OWNED.get() >= owned + 1.0);
         held.hold.notify_one();
         held.task.await.unwrap().unwrap();
+    }
+
+    // ---- ADR-0056 step 7, PR O, part 2: the sweep against an entry ----
+
+    /// A venue that keeps inventory from its orders, a journaled worker, and
+    /// an executor sharing the worker's store, venue and journal, every
+    /// mutation passing the gate's choke point. No leg on any key yet.
+    struct SweepRig {
+        worker: Arc<ReconciliationWorker<StubExchange, MemoryStore>>,
+        backend: Arc<StubJournalBackend>,
+        journal: Arc<OrderJournal>,
+        exchange: Arc<StubExchange>,
+        store: Arc<MemoryStore>,
+        executor: Arc<Executor<StubExchange, MemoryStore>>,
+    }
+
+    fn btc() -> Symbol {
+        Symbol::from_pair("BTCUSDT").unwrap()
+    }
+
+    fn sweep_rig(commit_bound: Duration) -> SweepRig {
+        use robson_exec::venue::Venue;
+
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        exchange.set_tracks_inventory(true);
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(64));
+        let backend = Arc::new(StubJournalBackend::default());
+        let journal = Arc::new(
+            OrderJournal::new(backend.clone(), &robson_exec::venue::VenueId::new("test:venue"))
+                .with_commit_bound(commit_bound),
+        );
+        let manager = create_journaled_position_manager(
+            exchange.clone(),
+            store.clone(),
+            event_bus.clone(),
+            Some(journal.clone()),
+        );
+        let worker = ReconciliationWorker::new_with_missing_grace(
+            exchange.clone(),
+            manager,
+            store.clone(),
+            event_bus,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            CancellationToken::new(),
+        )
+        .with_order_journal(Arc::clone(&journal));
+        exchange.attach_gate(Arc::clone(journal.gate()));
+        let executor = Arc::new(
+            Executor::new(exchange.clone(), Arc::new(IntentJournal::new()), store.clone())
+                .with_order_journal(Arc::clone(&journal)),
+        );
+        SweepRig {
+            worker: Arc::new(worker),
+            backend,
+            journal,
+            exchange,
+            store,
+            executor,
+        }
+    }
+
+    impl SweepRig {
+        /// A remainder no leg owns, on `symbol` long.
+        fn seed_remainder(&self, symbol: &Symbol) {
+            self.exchange.set_open_position(
+                symbol.clone(),
+                Side::Long,
+                Quantity::new(dec!(0.010)).unwrap(),
+                Price::new(dec!(100)).unwrap(),
+            );
+        }
+
+        fn held(&self, symbol: &Symbol) -> Decimal {
+            self.exchange.held_quantity(symbol, Side::Long)
+        }
+
+        async fn armed_leg(&self, symbol: &Symbol) -> Position {
+            let mut leg = Position::new(Uuid::now_v7(), symbol.clone(), Side::Long);
+            leg.tech_stop_distance =
+                Some(robson_domain::TechnicalStopDistance::from_entry_and_stop(
+                    Price::new(dec!(100)).unwrap(),
+                    Price::new(dec!(95)).unwrap(),
+                ));
+            leg.state = PositionState::Armed;
+            self.store.positions().save(&leg).await.unwrap();
+            leg
+        }
+
+        async fn state_of(&self, leg: &Position) -> PositionState {
+            self.store.positions().find_by_id(leg.id).await.unwrap().unwrap().state
+        }
+
+        /// An entry of 0.010 for `leg` through the executor, under a permit.
+        fn entry(
+            &self,
+            leg: &Position,
+        ) -> tokio::task::JoinHandle<Result<Vec<robson_exec::ActionResult>, ExecError>> {
+            self.entry_after(leg, 0)
+        }
+
+        /// The same, starting after `yields` yields.
+        fn entry_after(
+            &self,
+            leg: &Position,
+            yields: usize,
+        ) -> tokio::task::JoinHandle<Result<Vec<robson_exec::ActionResult>, ExecError>> {
+            use robson_engine::EngineAction;
+            use robson_exec::gate::OperationKind;
+
+            let action = EngineAction::PlaceEntryOrder {
+                position_id: leg.id,
+                cycle_id: Some(Uuid::now_v7()),
+                symbol: leg.symbol.clone(),
+                side: OrderSide::Buy,
+                quantity: Quantity::new(dec!(0.010)).unwrap(),
+                order_id: Uuid::now_v7(),
+                client_order_id: Uuid::now_v7().to_string(),
+                expected_price: Price::new(dec!(100)).unwrap(),
+                signal_id: Uuid::now_v7(),
+            };
+            let permit = self.journal.acquire(OperationKind::Signal).unwrap();
+            let executor = Arc::clone(&self.executor);
+            tokio::spawn(async move {
+                for _ in 0..yields {
+                    tokio::task::yield_now().await;
+                }
+                permit.run(executor.execute(vec![action])).await
+            })
+        }
+
+        /// Run an entry to its end: whether it reached the venue.
+        async fn entered(&self, leg: &Position) -> bool {
+            let results = self.entry(leg).await.unwrap().unwrap();
+            match &results[0] {
+                robson_exec::ActionResult::OrderPlaced { .. } => true,
+                robson_exec::ActionResult::EntryNotSent { reason, .. } => {
+                    assert!(
+                        reason.contains("sweep")
+                            || reason.contains("fenced")
+                            || reason.contains("latch"),
+                        "{reason}"
+                    );
+                    false
+                },
+                other => panic!("unexpected entry result {other:?}"),
+            }
+        }
+
+        fn scan(&self) -> tokio::task::JoinHandle<DaemonResult<usize>> {
+            let worker = Arc::clone(&self.worker);
+            tokio::spawn(async move { worker.scan_and_reconcile().await })
+        }
+
+        fn claims(&self) -> Vec<robson_exec::order_journal::ClaimView> {
+            self.journal.claims_view()
+        }
+
+        fn sweep_claims(&self) -> usize {
+            self.claims().iter().filter(|claim| claim.sweep).count()
+        }
+
+        fn entry_claims(&self) -> usize {
+            self.claims().iter().map(|claim| claim.entries).sum()
+        }
+    }
+
+    /// Window A: the venue holds a live entry's fill while its leg is still
+    /// `Armed` (its result write is in flight). The scan finds the entry's
+    /// claim on the key and defers; nothing is closed. Once the operation
+    /// ends, its leg tracks the inventory and the next scan leaves it.
+    #[tokio::test]
+    async fn a_live_entrys_fill_is_never_closed_as_untracked() {
+        let rig = sweep_rig(Duration::from_secs(30));
+        let leg = rig.armed_leg(&btc()).await;
+        let result_write = rig.backend.hold_commit(1);
+        let entry = rig.entry(&leg);
+        let exchange = Arc::clone(&rig.exchange);
+        wait_until(|| exchange.held_quantity(&btc(), Side::Long) == dec!(0.010)).await;
+        assert!(matches!(rig.state_of(&leg).await, PositionState::Armed));
+        assert_eq!((rig.entry_claims(), rig.sweep_claims()), (1, 0));
+        assert!(!rig.journal.gate().fenced());
+        let deferred = crate::metrics::UNTRACKED_CLOSE_DEFERRED.get();
+
+        rig.worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(rig.exchange.position_close_call_count(), 0, "nothing closed");
+        assert_eq!(rig.held(&btc()), dec!(0.010));
+        assert!(crate::metrics::UNTRACKED_CLOSE_DEFERRED.get() >= deferred + 1.0);
+        result_write.notify_one();
+        entry.await.unwrap().unwrap();
+        assert!(matches!(rig.state_of(&leg).await, PositionState::Entering { .. }));
+        assert!(rig.claims().is_empty(), "the entry's claim went with its operation");
+        rig.worker.scan_and_reconcile().await.unwrap();
+        assert_eq!(rig.exchange.position_close_call_count(), 0, "tracked now");
+        assert_eq!(rig.held(&btc()), dec!(0.010));
+    }
+
+    /// The claim comes before the classification. Paused between the two,
+    /// the live entry finishes: its leg is `Entering`, its claim gone. A scan
+    /// that classified first would have read the leg `Armed`, then taken the
+    /// free key and sold the fill; this one met the entry's claim and defers.
+    #[tokio::test]
+    async fn the_key_is_claimed_before_the_position_is_classified() {
+        let rig = sweep_rig(Duration::from_secs(30));
+        let leg = rig.armed_leg(&btc()).await;
+        let result_write = rig.backend.hold_commit(1);
+        let entry = rig.entry(&leg);
+        let exchange = Arc::clone(&rig.exchange);
+        wait_until(|| exchange.held_quantity(&btc(), Side::Long) == dec!(0.010)).await;
+        let pause = rig.worker.pause_after_next_sweep_claim();
+
+        let scan = rig.scan();
+        reached(&pause.reached).await;
+        result_write.notify_one();
+        entry.await.unwrap().unwrap();
+        assert!(rig.claims().is_empty());
+        pause.resume.notify_one();
+        scan.await.unwrap().unwrap();
+
+        assert_eq!(rig.exchange.position_close_call_count(), 0, "the fill was not sold");
+        assert_eq!(rig.held(&btc()), dec!(0.010));
+    }
+
+    /// Window B: the sweep's close of a real remainder is at the transport.
+    /// An entry on that key is refused at its send, a proven no-send with no
+    /// ticket and no order, and counted; an entry on another key passes; once
+    /// the close is done, an entry on the key passes too.
+    #[tokio::test]
+    async fn an_entry_on_a_key_a_sweep_is_closing_is_refused_at_its_send() {
+        let rig = sweep_rig(Duration::from_secs(30));
+        rig.seed_remainder(&btc());
+        let close = rig.exchange.hold_next_mutation();
+        let scan = rig.scan();
+        let exchange = Arc::clone(&rig.exchange);
+        wait_until(|| exchange.mutations().iter().any(|m| m.what == "POST /fapi/v1/order")).await;
+        assert_eq!(rig.sweep_claims(), 1);
+
+        let leg = rig.armed_leg(&btc()).await;
+        assert!(!rig.entered(&leg).await, "refused at its send");
+        assert_eq!(rig.exchange.market_order_call_count(), 0, "no order left");
+        assert!(matches!(rig.state_of(&leg).await, PositionState::Armed));
+        assert_eq!(rig.journal.gate().snapshot().entries_refused_ownership, 1);
+        assert!(!rig.journal.gate().fenced(), "a proven no-send fences nothing");
+        let eth = Symbol::from_pair("ETHUSDT").unwrap();
+        let other = rig.armed_leg(&eth).await;
+        assert!(rig.entered(&other).await, "another key is free");
+        assert_eq!(rig.held(&eth), dec!(0.010));
+
+        close.notify_one();
+        assert_eq!(scan.await.unwrap().unwrap(), 1, "the remainder closed");
+        assert_eq!(rig.held(&btc()), Decimal::ZERO);
+        assert!(rig.claims().is_empty());
+        let again = rig.armed_leg(&btc()).await;
+        assert!(rig.entered(&again).await, "the key is free again");
+        assert_eq!(rig.held(&btc()), dec!(0.010));
+    }
+
+    /// The claim belongs to the whole close (P1). A's first send is
+    /// rules-rejected and its same-ID retry refused by the journal, so A
+    /// settles uncertain and the fresh-ID successor B opens; B is held at its
+    /// pre-send write. A's ending and incident are flushed and an audited
+    /// release reopens the fence, with B still live: an entry on the key is
+    /// refused by the claim alone (fence open, latch clear, nothing aborted).
+    #[tokio::test]
+    async fn the_sweep_claim_holds_through_a_fresh_id_successor_past_a_release() {
+        use robson_exec::order_journal::{JournalFault, ReleaseRecord};
+
+        let rig = sweep_rig(Duration::from_secs(30));
+        rig.seed_remainder(&btc());
+        rig.exchange.set_trading_rules(
+            robson_domain::SymbolTradingRules::new(
+                btc(),
+                dec!(0.1),
+                dec!(0),
+                dec!(0.001),
+                dec!(0.001),
+                dec!(120),
+                dec!(0),
+                2,
+                3,
+            )
+            .unwrap(),
+        );
+        rig.exchange.set_rules_rejections_next(1);
+        rig.backend.fail_commit(1, Some(JournalFault::Known));
+        let successor = rig.backend.hold_commit(2);
+        let scan = rig.scan();
+        let backend = Arc::clone(&rig.backend);
+        wait_until(|| backend.commits().len() == 3).await;
+        assert!(rig.journal.gate().fenced(), "A settled uncertain before B");
+
+        rig.journal.flush_pending().await;
+        let receipt = rig
+            .journal
+            .release(ReleaseRecord {
+                decision_id: Uuid::now_v7(),
+                generation: rig.journal.gate().generation(),
+                actor: "operator".to_string(),
+                auth_kind: "verified",
+                note: "reviewed".to_string(),
+                treatment: "unbooked_accepted",
+                decided_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        assert!(receipt.fence_open);
+        let gate = rig.journal.gate().snapshot();
+        assert!(!gate.fenced && !rig.journal.latch_set() && gate.aborted == 0);
+        assert_eq!(rig.sweep_claims(), 1, "B is live, and the key still the sweep's");
+
+        let leg = rig.armed_leg(&btc()).await;
+        assert!(!rig.entered(&leg).await, "refused by the claim alone");
+        assert_eq!(rig.journal.gate().snapshot().entries_refused_ownership, 1);
+
+        successor.notify_one();
+        scan.await.unwrap().unwrap();
+        assert_eq!(rig.held(&btc()), Decimal::ZERO, "B closed the remainder");
+        assert!(rig.claims().is_empty());
+        assert!(rig.entered(&leg).await, "the key is free again");
+    }
+
+    /// Every way a sweep's pass ends frees its key, the key leaves the table,
+    /// and a healthy end leaves entries free: a tracked position, a close that
+    /// sent nothing (below the lot, no outcome batch). After a scan cancelled
+    /// mid-close or a retry set that overflowed, the process is latched until
+    /// a restart: the table is empty all the same, and admissions stay fenced.
+    #[tokio::test]
+    async fn every_end_of_a_sweep_frees_its_key() {
+        // A tracked position: claimed, then released untouched.
+        let rig = sweep_rig(Duration::from_secs(30));
+        let leg = rig.armed_leg(&btc()).await;
+        assert!(rig.entered(&leg).await);
+        rig.worker.scan_and_reconcile().await.unwrap();
+        assert!(rig.claims().is_empty());
+        assert_eq!(rig.exchange.position_close_call_count(), 0);
+        assert!(rig.entered(&rig.armed_leg(&btc()).await).await);
+
+        // A close the journal refused before it left (its id spent): nothing
+        // sent, no outcome batch, the scan fails.
+        let rig = sweep_rig(Duration::from_secs(30));
+        rig.seed_remainder(&btc());
+        rig.backend.push_fault(robson_exec::order_journal::JournalFault::IdSpent);
+        assert!(rig.worker.scan_and_reconcile().await.is_err());
+        assert_eq!(rig.exchange.position_close_call_count(), 0, "nothing left");
+        assert!(rig.claims().is_empty());
+        assert!(!rig.journal.gate().fenced());
+        assert!(rig.entered(&rig.armed_leg(&btc()).await).await);
+
+        // A close the venue refused for good: the position was gone by then.
+        let rig = sweep_rig(Duration::from_secs(30));
+        rig.seed_remainder(&btc());
+        let exchange = Arc::clone(&rig.exchange);
+        rig.exchange.set_after_next_positions_read(move || {
+            exchange.clear_open_position(&btc(), Side::Long)
+        });
+        assert!(rig.worker.scan_and_reconcile().await.is_err());
+        assert_eq!(rig.exchange.position_close_call_count(), 1);
+        assert!(rig.claims().is_empty());
+        assert!(!rig.journal.gate().fenced(), "a definite rejection");
+        assert!(rig.entered(&rig.armed_leg(&btc()).await).await);
+
+        // The retry set overflowed: latched.
+        let rig = sweep_rig(Duration::from_secs(30));
+        rig.seed_remainder(&btc());
+        rig.backend.saturate(&rig.journal).await;
+        rig.worker.scan_and_reconcile().await.unwrap();
+        assert_eq!(rig.held(&btc()), Decimal::ZERO, "the close went out regardless");
+        assert!(rig.claims().is_empty());
+        assert!(rig.journal.latch_set() && rig.journal.gate().fenced());
+        rig.backend.set_fail_all(None);
+        assert!(!rig.entered(&rig.armed_leg(&btc()).await).await, "fenced, not claimed");
+
+        // A scan cancelled with its close at the transport: the operation's
+        // end clears the claim, after the permit's abort latched.
+        let rig = sweep_rig(Duration::from_secs(30));
+        rig.seed_remainder(&btc());
+        let _close = rig.exchange.hold_next_mutation();
+        let scan = rig.scan();
+        let exchange = Arc::clone(&rig.exchange);
+        wait_until(|| exchange.mutations().iter().any(|m| m.what == "POST /fapi/v1/order")).await;
+        assert_eq!(rig.sweep_claims(), 1);
+        scan.abort();
+        assert!(scan.await.unwrap_err().is_cancelled());
+        assert!(rig.claims().is_empty());
+        assert!(rig.journal.latch_set() && rig.journal.gate().snapshot().aborted == 1);
+        assert!(!rig.entered(&rig.armed_leg(&btc()).await).await, "fenced, not claimed");
+    }
+
+    /// Codex's timeout scenario: the journal blackholed, so the close's row
+    /// never lands and the latch and fence close before its request; the
+    /// close itself fails with no answer, uncertain. Both are recorded before
+    /// the key is released: an entry on it then meets the fence, and a
+    /// release is refused while latched.
+    #[tokio::test]
+    async fn a_timed_out_close_fences_before_its_key_is_free() {
+        use robson_exec::order_journal::{JournalFault, ReleaseRecord, ReleaseRefusal};
+
+        let rig = sweep_rig(Duration::from_millis(20));
+        rig.seed_remainder(&btc());
+        rig.backend.set_fail_all(Some(JournalFault::Hang));
+        let exchange = Arc::clone(&rig.exchange);
+        rig.exchange.set_after_next_positions_read(move || exchange.set_fail_next(true));
+
+        let _ = rig.worker.scan_and_reconcile().await;
+
+        assert_eq!(rig.exchange.position_close_call_count(), 1, "the close went out");
+        assert!(rig.claims().is_empty());
+        assert!(rig.journal.latch_set() && rig.journal.gate().fenced());
+        // The database is back; the process stays latched until a restart.
+        rig.backend.set_fail_all(None);
+        assert!(!rig.entered(&rig.armed_leg(&btc()).await).await, "fenced");
+        let refused = rig
+            .journal
+            .release(ReleaseRecord {
+                decision_id: Uuid::now_v7(),
+                generation: rig.journal.gate().generation(),
+                actor: "operator".to_string(),
+                auth_kind: "verified",
+                note: "reviewed".to_string(),
+                treatment: "unbooked_accepted",
+                decided_at: Utc::now(),
+            })
+            .await;
+        assert!(matches!(refused, Err(ReleaseRefusal::Latched)), "{refused:?}");
+    }
+
+    /// The step7b handoff. Live: an entry whose result write is held across
+    /// the scan, a stand-in for a late `applied_at`, is never swept (above).
+    /// Abandoned: an entry whose operation ended with its leg still `Armed`,
+    /// here dropped mid-write, is no one's: under the fence its abort
+    /// raised, the next scan closes its fill, as design §4 says.
+    #[tokio::test]
+    async fn an_abandoned_entrys_fill_is_swept_under_the_fence() {
+        let rig = sweep_rig(Duration::from_secs(30));
+        let leg = rig.armed_leg(&btc()).await;
+        let _result_write = rig.backend.hold_commit(1);
+        let entry = rig.entry(&leg);
+        let exchange = Arc::clone(&rig.exchange);
+        wait_until(|| exchange.held_quantity(&btc(), Side::Long) == dec!(0.010)).await;
+        entry.abort();
+        assert!(entry.await.unwrap_err().is_cancelled());
+        assert!(matches!(rig.state_of(&leg).await, PositionState::Armed));
+        assert!(rig.claims().is_empty() && rig.journal.gate().fenced());
+
+        rig.worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(rig.exchange.position_close_call_count(), 1);
+        assert_eq!(rig.held(&btc()), Decimal::ZERO, "abandoned inventory is swept");
+    }
+
+    /// Design §8, generated interleavings 5: live entries against the sweep
+    /// under the ownership claims, on two keys with and without a remainder
+    /// no leg owns. Both directions hold at every dispatch, read from the
+    /// venue's choke point: no close while an entry holds the key, and no
+    /// entry while a sweep does. And, independently of the claims, the venue
+    /// still holds every unit a tracked leg entered.
+    #[test]
+    fn the_sweep_never_sells_a_live_entrys_inventory() {
+        use proptest::{
+            strategy::{Strategy, ValueTree},
+            test_runner::TestRunner,
+        };
+        use robson_exec::stub::StubDispatchKind;
+
+        let strategy = (
+            proptest::collection::vec((0usize..2, 0usize..8), 1..5),
+            (proptest::bool::ANY, proptest::bool::ANY),
+            0usize..8,
+            1usize..3,
+        );
+        let mut runner = TestRunner::default();
+        for _ in 0..48 {
+            let (entries, remainders, scan_delay, scans) =
+                strategy.new_tree(&mut runner).unwrap().current();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let rig = sweep_rig(Duration::from_secs(30));
+                rig.backend.set_commit_delay(Duration::from_micros(300));
+                let keys = [btc(), Symbol::from_pair("ETHUSDT").unwrap()];
+                for (key, seeded) in keys.iter().zip([remainders.0, remainders.1]) {
+                    if seeded {
+                        rig.seed_remainder(key);
+                    }
+                }
+                let violations = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let (journal, seen) = (Arc::clone(&rig.journal), Arc::clone(&violations));
+                rig.exchange.set_dispatch_observer(Arc::new(
+                    move |kind: StubDispatchKind, symbol: &Symbol, _side: Side| {
+                        let held = journal
+                            .claims_view()
+                            .into_iter()
+                            .find(|claim| claim.key == OwnershipKey::new(symbol, Side::Long));
+                        let (sweep, entries) = held.map_or((false, 0), |c| (c.sweep, c.entries));
+                        match kind {
+                            StubDispatchKind::Close if entries > 0 || !sweep => {
+                                seen.lock()
+                                    .unwrap()
+                                    .push(format!("close of {symbol:?}: {entries}"));
+                            },
+                            StubDispatchKind::Entry if sweep => {
+                                seen.lock()
+                                    .unwrap()
+                                    .push(format!("entry on {symbol:?} under a sweep"));
+                            },
+                            _ => {},
+                        }
+                    },
+                ));
+                let mut legs = Vec::new();
+                for (key, _) in &entries {
+                    legs.push(rig.armed_leg(&keys[*key]).await);
+                }
+                let tasks: Vec<_> = legs
+                    .iter()
+                    .zip(&entries)
+                    .map(|(leg, (_, yields))| rig.entry_after(leg, *yields))
+                    .collect();
+                let worker = Arc::clone(&rig.worker);
+                let scanning = tokio::spawn(async move {
+                    for _ in 0..scan_delay {
+                        tokio::task::yield_now().await;
+                    }
+                    for _ in 0..scans {
+                        let _ = worker.scan_and_reconcile().await;
+                    }
+                });
+                for task in tasks {
+                    let _ = task.await.unwrap();
+                }
+                scanning.await.unwrap();
+
+                let violations = violations.lock().unwrap().clone();
+                assert!(violations.is_empty(), "{violations:?} {entries:?} {remainders:?}");
+                for key in &keys {
+                    let mut tracked = Decimal::ZERO;
+                    for leg in legs.iter().filter(|leg| leg.symbol == *key) {
+                        if matches!(rig.state_of(leg).await, PositionState::Entering { .. }) {
+                            tracked += dec!(0.010);
+                        }
+                    }
+                    assert!(
+                        rig.held(key) >= tracked,
+                        "{key:?}: held {} < tracked {tracked} ({entries:?} {remainders:?})",
+                        rig.held(key)
+                    );
+                }
+                assert!(rig.claims().is_empty());
+            });
+        }
     }
 
     /// Design §8, generated interleavings 4: orphan cancels against an

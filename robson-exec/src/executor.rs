@@ -26,7 +26,8 @@ use crate::{
     error::{ExecError, ExecResult},
     intent::{Intent, IntentAction, IntentJournal, IntentResult},
     order_journal::{
-        self, IntentKind, IntentSpec, JournaledIntent, OrderJournal, SendRefusal, WriteClass,
+        self, IntentKind, IntentSpec, JournaledIntent, OrderJournal, OwnershipKey, SendRefusal,
+        WriteClass,
     },
     ports::{ExchangePort, OrderResult},
     quantize::{self, ReductionOutcome},
@@ -412,6 +413,10 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                 "signal_id": signal_id,
             }),
         });
+        // The inventory it opens: claimed at its send, with its ticket, and
+        // held until its operation ends (ADR-0056 step 7, PR O).
+        self.order_journal
+            .own_entry_key(&journaled, OwnershipKey::of_entry(&symbol, side));
         if let Err(refusal) = self.order_journal.before_send(&journaled, WriteClass::Strict).await {
             warn!(%position_id, %signal_id, %refusal, "Entry not sent");
             self.order_journal.finish_failed(&journaled).await;

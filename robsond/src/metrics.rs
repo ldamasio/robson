@@ -54,6 +54,10 @@
 //! - `robsond_orphan_cancel_owned_total` — `ins-` orders outside the scan's
 //!   covered set that the sweep left alone because a live operation or a leg
 //!   owns them (ADR-0056 step 7, PR O)
+//! - `robsond_untracked_close_deferred_total` — UNTRACKED closes deferred to
+//!   the next scan because a live entry held their symbol and side (PR O)
+//! - `robsond_entry_refused_ownership_total` — entries refused at their send
+//!   because a sweep's close held their symbol and side (PR O)
 
 use std::sync::LazyLock;
 
@@ -311,6 +315,27 @@ pub static ORPHAN_CANCEL_OWNED: LazyLock<Counter> = LazyLock::new(|| {
     .expect("failed to register robsond_orphan_cancel_owned_total")
 });
 
+/// UNTRACKED closes the sweep deferred to its next scan because a live entry
+/// held their symbol and side (ADR-0056 step 7, PR O). Once per position and
+/// scan.
+pub static UNTRACKED_CLOSE_DEFERRED: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_untracked_close_deferred_total",
+        "UNTRACKED closes deferred because a live entry held their symbol and side"
+    )
+    .expect("failed to register robsond_untracked_close_deferred_total")
+});
+
+/// Entries refused at their send, a typed no-send, because a sweep's close
+/// held their symbol and side (ADR-0056 step 7, PR O).
+pub static ENTRY_REFUSED_OWNERSHIP: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_entry_refused_ownership_total",
+        "Entries refused at their send because a sweep close held their symbol and side"
+    )
+    .expect("failed to register robsond_entry_refused_ownership_total")
+});
+
 /// Publish the fence and the open incidents; every reason exports.
 pub fn observe_fence(journal: &robson_exec::order_journal::OrderJournal) {
     let gate = journal.gate();
@@ -340,6 +365,8 @@ pub fn init_operation_gate_metrics() {
     LazyLock::force(&ORPHAN_CANCEL_WITHHELD);
     LazyLock::force(&ORPHAN_CANCEL_WITHHELD_OVERFLOW);
     LazyLock::force(&ORPHAN_CANCEL_OWNED);
+    LazyLock::force(&UNTRACKED_CLOSE_DEFERRED);
+    LazyLock::force(&ENTRY_REFUSED_OWNERSHIP);
     for class in ["ordinary", "protective"] {
         API_SLOT_BUSY.with_label_values(&[class]);
     }
@@ -355,6 +382,10 @@ impl robson_exec::gate::GateObserver for GateMetrics {
 
     fn operation_aborted(&self, _kind: robson_exec::gate::OperationKind) {
         ABORTED_OPERATIONS.inc();
+    }
+
+    fn entry_refused_ownership(&self) {
+        ENTRY_REFUSED_OWNERSHIP.inc();
     }
 }
 
@@ -796,7 +827,7 @@ mod tests {
 
     /// The fence's gauges export every reason from the first observation, so
     /// an alert on absence means a missing daemon (ADR-0056 step 7, PR F); and
-    /// the stale-stop gauge and the owned-orphan counter export from startup.
+    /// the stale-stop gauge and the ownership counters export from startup.
     #[test]
     fn the_fence_gauges_export_every_reason() {
         init_operation_gate_metrics();
@@ -815,6 +846,8 @@ mod tests {
         assert!(rendered.contains("robsond_admission_fence_closed{reason=\"unknown\"}"));
         assert!(rendered.contains("robsond_insurance_stop_stale_positions "), "{rendered}");
         assert!(rendered.contains("robsond_orphan_cancel_owned_total "), "{rendered}");
+        assert!(rendered.contains("robsond_untracked_close_deferred_total "), "{rendered}");
+        assert!(rendered.contains("robsond_entry_refused_ownership_total "), "{rendered}");
     }
 
     #[test]

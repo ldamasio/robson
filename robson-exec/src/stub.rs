@@ -245,7 +245,25 @@ pub struct StubExchange {
     /// The next open-orders read, its answer fixed, waits for this before it
     /// returns.
     open_orders_hold: Mutex<Option<Arc<Notify>>>,
+    /// Opt-in: an entry's fill adds to the simulated position and a market
+    /// reduction takes from it, as a close always does.
+    tracks_inventory: RwLock<bool>,
+    /// Told of every market order and close that passed the choke point.
+    dispatch_observer: Mutex<Option<DispatchObserver>>,
 }
+
+/// What reached the choke point: an entry, a market reduction or a close, on
+/// one symbol and position side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StubDispatchKind {
+    Entry,
+    Reduce,
+    Close,
+}
+
+/// A test's view of each order the stub dispatches, as it leaves.
+pub type DispatchObserver =
+    Arc<dyn Fn(StubDispatchKind, &Symbol, robson_domain::Side) + Send + Sync>;
 
 impl StubExchange {
     /// Create a new stub exchange with default price and balance.
@@ -315,6 +333,8 @@ impl StubExchange {
             mutations: Mutex::new(VecDeque::new()),
             mutation_hold: Mutex::new(None),
             open_orders_hold: Mutex::new(None),
+            tracks_inventory: RwLock::new(false),
+            dispatch_observer: Mutex::new(None),
         }
     }
 
@@ -329,6 +349,60 @@ impl StubExchange {
         let hold = Arc::new(Notify::new());
         *self.mutation_hold.lock().unwrap() = Some(Arc::clone(&hold));
         hold
+    }
+
+    /// Keep the simulated positions from the orders: an entry's fill adds to
+    /// its symbol and side, a market reduction takes from it.
+    pub fn set_tracks_inventory(&self, tracks: bool) {
+        *self.tracks_inventory.write().unwrap() = tracks;
+    }
+
+    /// The quantity held on `symbol` and `side`, zero when flat.
+    pub fn held_quantity(&self, symbol: &Symbol, side: robson_domain::Side) -> Decimal {
+        self.open_positions
+            .read()
+            .unwrap()
+            .get(&Self::position_key(symbol, side))
+            .map_or(Decimal::ZERO, |position| position.quantity.as_decimal())
+    }
+
+    /// Call `observer` with each market order and close past the choke point.
+    pub fn set_dispatch_observer(&self, observer: DispatchObserver) {
+        *self.dispatch_observer.lock().unwrap() = Some(observer);
+    }
+
+    fn observe_dispatch(&self, kind: StubDispatchKind, symbol: &Symbol, side: robson_domain::Side) {
+        let observer = self.dispatch_observer.lock().unwrap().clone();
+        if let Some(observer) = observer {
+            observer(kind, symbol, side);
+        }
+    }
+
+    /// Apply a market order's fill to the simulated position, when tracked.
+    fn track_fill(
+        &self,
+        symbol: &Symbol,
+        side: robson_domain::Side,
+        delta: Decimal,
+        price: Decimal,
+    ) {
+        if !*self.tracks_inventory.read().unwrap() {
+            return;
+        }
+        let key = Self::position_key(symbol, side);
+        let mut positions = self.open_positions.write().unwrap();
+        let held = positions.get(&key).map_or(Decimal::ZERO, |p| p.quantity.as_decimal());
+        let now = (held + delta).max(Decimal::ZERO);
+        if now.is_zero() {
+            positions.remove(&key);
+        } else {
+            positions.insert(key, ExchangePosition {
+                symbol: symbol.clone(),
+                side,
+                quantity: Quantity::new(now).unwrap(),
+                entry_price: Price::new(price).unwrap(),
+            });
+        }
     }
 
     /// Hold the next open-orders read, once its answer is fixed, until the
@@ -844,7 +918,7 @@ impl venue::TradingPort for StubExchange {
     async fn place_market_order(
         &self,
         symbol: &Symbol,
-        _side: OrderSide,
+        side: OrderSide,
         quantity: Quantity,
         client_order_id: &str,
         intent: EntryOrReduce,
@@ -854,6 +928,17 @@ impl venue::TradingPort for StubExchange {
         }
         let attempt = self.submit_attempts.begin_send(client_order_id)?;
         self.mutate("POST /fapi/v1/order").await?;
+        // One-way: a buy entry opens a long, a sell reduction reduces it.
+        let position_side = match (side, intent.is_reduce()) {
+            (OrderSide::Buy, false) | (OrderSide::Sell, true) => robson_domain::Side::Long,
+            (OrderSide::Sell, false) | (OrderSide::Buy, true) => robson_domain::Side::Short,
+        };
+        let kind = if intent.is_reduce() {
+            StubDispatchKind::Reduce
+        } else {
+            StubDispatchKind::Entry
+        };
+        self.observe_dispatch(kind, symbol, position_side);
         *self.market_order_calls.write().unwrap() += 1;
         self.market_order_client_ids.write().unwrap().push(client_order_id.to_string());
 
@@ -911,6 +996,12 @@ impl venue::TradingPort for StubExchange {
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
         };
+        let delta = if intent.is_reduce() {
+            -quantity.as_decimal()
+        } else {
+            quantity.as_decimal()
+        };
+        self.track_fill(symbol, position_side, delta, price);
         self.client_orders
             .write()
             .unwrap()
@@ -1475,6 +1566,7 @@ impl venue::PositionAccountPort for StubExchange {
     ) -> Result<OrderResult, ExecError> {
         let attempt = self.submit_attempts.begin_send(client_order_id)?;
         self.mutate("POST /fapi/v1/order").await?;
+        self.observe_dispatch(StubDispatchKind::Close, symbol, side);
         *self.position_close_calls.write().unwrap() += 1;
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated reconciliation close failure".to_string()));
