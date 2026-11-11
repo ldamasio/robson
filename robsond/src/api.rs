@@ -779,7 +779,8 @@ where
     #[cfg(feature = "postgres")]
     let authenticated = authenticated
         .route("/recovery/disposition", post(recovery_disposition_handler::<E, S>))
-        .route("/recovery/release", post(recovery_release_handler::<E, S>));
+        .route("/recovery/release", post(recovery_release_handler::<E, S>))
+        .route("/recovery/pending", get(recovery_pending_handler::<E, S>));
     let authenticated = authenticated.layer(auth_layer).with_state(state);
 
     read_only.merge(authenticated).layer(build_cors_layer())
@@ -1076,7 +1077,7 @@ where
 /// `POST /recovery/release` (ADR-0056 step 7, PR F, design §2.7): the
 /// operator's audited acceptance of the risk behind every open incident and
 /// uncertain intent up to the generation quoted, which must be the current one
-/// (a stale one is refused with it).
+/// (`GET /recovery/pending` shows it).
 #[cfg(feature = "postgres")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1200,6 +1201,339 @@ where
             Err(refused(StatusCode::SERVICE_UNAVAILABLE, "release_not_completed"))
         },
     }
+}
+
+/// Items of one page of the pending list.
+pub const PENDING_PAGE_SIZE: usize = 100;
+
+/// One page of a pending collection, with its total.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingPage<T> {
+    pub total: u64,
+    pub items: Vec<T>,
+}
+
+impl<T> PendingPage<T> {
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    fn of(all: Vec<T>, page: usize) -> Self {
+        let total = all.len() as u64;
+        let items = all.into_iter().skip(page * PENDING_PAGE_SIZE).take(PENDING_PAGE_SIZE);
+        Self { total, items: items.collect() }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingIncident {
+    pub reason: String,
+    pub first_at: chrono::DateTime<Utc>,
+    pub last_at: chrono::DateTime<Utc>,
+    pub count: i64,
+    pub first_generation: i64,
+    pub last_generation: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingIntent {
+    pub intent_id: Uuid,
+    pub client_order_id: String,
+    pub kind: String,
+    pub position_id: Option<Uuid>,
+    pub cancels_order_id: Option<String>,
+    pub uncertain_at: Option<chrono::DateTime<Utc>>,
+    pub uncertain_generation: i64,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingOperation {
+    /// The permit's kind; `None` for an operation without one.
+    pub permit: Option<String>,
+    pub intents: Vec<PendingOperationIntent>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingOperationIntent {
+    pub client_order_id: String,
+    pub kind: String,
+    pub send_started: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingWrite {
+    /// `intent`, `suspension` or `incident`.
+    pub kind: String,
+    /// The client id, the stream key or the incident's reason.
+    pub key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingStream {
+    pub stream_key: String,
+    pub stream_kind: String,
+    pub failed_seq: Option<i64>,
+    pub repaired_through_seq: Option<i64>,
+    pub month: Option<NaiveDate>,
+    pub error: String,
+    pub repair_error: Option<String>,
+    pub suspended_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingLeg {
+    pub position_id: Uuid,
+    pub symbol: String,
+    pub side: String,
+    pub state: String,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingEpoch {
+    pub epoch_seq: i64,
+    /// Why this start was unclean; absent when it was clean.
+    pub unclean_reason: Option<String>,
+}
+
+/// `GET /recovery/pending` (design §2.8): what is unresolved and what a
+/// release would cover. Each collection is one page of at most 100 with its
+/// total; `?page=` selects the same page of each.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingResponse {
+    /// The current generation: the one a release must quote.
+    pub generation: i64,
+    pub fenced: bool,
+    pub latch: bool,
+    pub aborted_operations: u64,
+    pub unpermitted_mutations: u64,
+    pub epoch: Option<PendingEpoch>,
+    pub page: usize,
+    pub incidents: PendingPage<PendingIncident>,
+    /// Stamped, with no outcome and no tombstone: what a release quoting
+    /// their generation or a later one tombstones.
+    pub uncertain_intents: PendingPage<PendingIntent>,
+    /// From `operations_in_flight`: never released.
+    pub in_flight: PendingPage<PendingOperation>,
+    /// From `persistence_pending`: a release answers `persisting` while any.
+    pub persisting: PendingPage<PendingWrite>,
+    pub suspended_streams: PendingPage<PendingStream>,
+    /// Legs now `entering` or `exiting`.
+    pub legs_in_flight: PendingPage<PendingLeg>,
+}
+
+#[cfg(feature = "postgres")]
+#[derive(Debug, Deserialize)]
+struct PendingQuery {
+    page: Option<usize>,
+}
+
+/// The pending list: memory (the gate, `operations_in_flight`,
+/// `persistence_pending`) and six SQL queries, a count and a page for each of
+/// three durable collections. No venue request, no manager lock.
+#[cfg(feature = "postgres")]
+async fn recovery_pending_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Query(query): Query<PendingQuery>,
+) -> Result<Json<PendingResponse>, (StatusCode, Json<ErrorResponse>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let fail = |status: StatusCode, message: &str| {
+        (status, Json(ErrorResponse { error: message.to_string() }))
+    };
+    let (Some(pool), Some(tenant_id)) = (&state.pg_pool, state.tenant_id) else {
+        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "no database is configured"));
+    };
+    let page = query.page.unwrap_or(0);
+    let offset = i64::try_from(page.saturating_mul(PENDING_PAGE_SIZE)).unwrap_or(i64::MAX);
+    let limit = PENDING_PAGE_SIZE as i64;
+    let journal = &state.order_journal;
+    let gate = journal.gate().snapshot();
+
+    let incidents = journal
+        .gate()
+        .open_incidents()
+        .into_iter()
+        .map(|incident| PendingIncident {
+            reason: incident.reason.as_str().to_string(),
+            first_at: incident.first_at,
+            last_at: incident.last_at,
+            count: incident.count,
+            first_generation: incident.first_generation,
+            last_generation: incident.last_generation,
+        })
+        .collect();
+    let in_flight = journal
+        .operations_in_flight_view()
+        .into_iter()
+        .map(|operation| PendingOperation {
+            permit: operation.permit.map(|kind| kind.as_str().to_string()),
+            intents: operation
+                .intents
+                .into_iter()
+                .map(|(client_order_id, kind, send_started)| PendingOperationIntent {
+                    client_order_id,
+                    kind: kind.as_str().to_string(),
+                    send_started,
+                })
+                .collect(),
+        })
+        .collect();
+    let persisting = journal
+        .pending_entries()
+        .into_iter()
+        .map(|entry| {
+            use robson_exec::order_journal::PendingEntry;
+            let (kind, key) = match entry {
+                PendingEntry::Intent(id) => ("intent", id),
+                PendingEntry::Suspension(key) => ("suspension", key),
+                PendingEntry::Incident(reason) => ("incident", reason.as_str().to_string()),
+            };
+            PendingWrite { kind: kind.to_string(), key }
+        })
+        .collect();
+
+    let unavailable = |error: sqlx::Error| {
+        tracing::error!(%error, "Reading the pending list failed");
+        fail(StatusCode::SERVICE_UNAVAILABLE, "database unavailable")
+    };
+    const UNCERTAIN: &str = "FROM order_intents WHERE tenant_id = $1 \
+        AND uncertain_generation IS NOT NULL AND venue_outcome IS NULL AND NOT not_sent \
+        AND disposition_kind IS NULL";
+    let uncertain_total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) {UNCERTAIN}"))
+        .bind(tenant_id)
+        .fetch_one(pool.as_ref())
+        .await
+        .map_err(unavailable)?;
+    type IntentRow = (
+        Uuid,
+        String,
+        String,
+        Option<Uuid>,
+        Option<String>,
+        Option<chrono::DateTime<Utc>>,
+        i64,
+        chrono::DateTime<Utc>,
+    );
+    let uncertain: Vec<IntentRow> = sqlx::query_as(&format!(
+        "SELECT intent_id, client_order_id, kind, position_id, cancels_order_id, uncertain_at, \
+         uncertain_generation, created_at {UNCERTAIN} \
+         ORDER BY uncertain_generation, created_at LIMIT $2 OFFSET $3"
+    ))
+    .bind(tenant_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool.as_ref())
+    .await
+    .map_err(unavailable)?;
+
+    const SUSPENDED: &str = "FROM stream_suspensions WHERE tenant_id = $1 AND cleared_at IS NULL";
+    let suspended_total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) {SUSPENDED}"))
+        .bind(tenant_id)
+        .fetch_one(pool.as_ref())
+        .await
+        .map_err(unavailable)?;
+    type StreamRow = (
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<NaiveDate>,
+        String,
+        Option<String>,
+        chrono::DateTime<Utc>,
+    );
+    let suspended: Vec<StreamRow> = sqlx::query_as(&format!(
+        "SELECT stream_key, stream_kind, failed_seq, repaired_through_seq, month, error, \
+         repair_error, suspended_at {SUSPENDED} ORDER BY suspended_at LIMIT $2 OFFSET $3"
+    ))
+    .bind(tenant_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool.as_ref())
+    .await
+    .map_err(unavailable)?;
+
+    const LEGS: &str = "FROM positions_current WHERE tenant_id = $1 \
+        AND state IN ('entering', 'exiting')";
+    let legs_total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) {LEGS}"))
+        .bind(tenant_id)
+        .fetch_one(pool.as_ref())
+        .await
+        .map_err(unavailable)?;
+    let legs: Vec<(Uuid, String, String, String, chrono::DateTime<Utc>)> =
+        sqlx::query_as(&format!(
+            "SELECT position_id, symbol, side, state, updated_at {LEGS} \
+             ORDER BY updated_at LIMIT $2 OFFSET $3"
+        ))
+        .bind(tenant_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool.as_ref())
+        .await
+        .map_err(unavailable)?;
+
+    let total = |count: i64| u64::try_from(count).unwrap_or(0);
+    Ok(Json(PendingResponse {
+        generation: gate.generation,
+        fenced: gate.fenced,
+        latch: journal.latch_set(),
+        aborted_operations: gate.aborted,
+        unpermitted_mutations: gate.unpermitted,
+        epoch: journal.gate().epoch().map(|epoch| PendingEpoch {
+            epoch_seq: epoch.epoch_seq,
+            unclean_reason: epoch.unclean_reason.map(str::to_string),
+        }),
+        page,
+        incidents: PendingPage::of(incidents, page),
+        uncertain_intents: PendingPage {
+            total: total(uncertain_total),
+            items: uncertain
+                .into_iter()
+                .map(|row| PendingIntent {
+                    intent_id: row.0,
+                    client_order_id: row.1,
+                    kind: row.2,
+                    position_id: row.3,
+                    cancels_order_id: row.4,
+                    uncertain_at: row.5,
+                    uncertain_generation: row.6,
+                    created_at: row.7,
+                })
+                .collect(),
+        },
+        in_flight: PendingPage::of(in_flight, page),
+        persisting: PendingPage::of(persisting, page),
+        suspended_streams: PendingPage {
+            total: total(suspended_total),
+            items: suspended
+                .into_iter()
+                .map(|row| PendingStream {
+                    stream_key: row.0,
+                    stream_kind: row.1,
+                    failed_seq: row.2,
+                    repaired_through_seq: row.3,
+                    month: row.4,
+                    error: row.5,
+                    repair_error: row.6,
+                    suspended_at: row.7,
+                })
+                .collect(),
+        },
+        legs_in_flight: PendingPage {
+            total: total(legs_total),
+            items: legs
+                .into_iter()
+                .map(|(position_id, symbol, side, state, updated_at)| PendingLeg {
+                    position_id,
+                    symbol,
+                    side,
+                    state,
+                    updated_at,
+                })
+                .collect(),
+        },
+    }))
 }
 
 async fn metrics_handler() -> impl IntoResponse {
@@ -6279,7 +6613,7 @@ mod tests {
         std::env::remove_var("ROBSON_CORS_ALLOWED_ORIGINS");
     }
 
-    // ---- ADR-0056 step 7, PR F: POST /recovery/release
+    // ---- ADR-0056 step 7, PR F: POST /recovery/release, GET /recovery/pending
 
     /// A pool that never connects: for routes that must not reach a database.
     #[cfg(feature = "postgres")]
@@ -6364,6 +6698,142 @@ mod tests {
         let (status, body) = post_release(&app, Some(LEGACY), release_body(latest, "x")).await;
         assert_eq!((status, body["error"].clone()), (StatusCode::CONFLICT, json!("latched")));
         assert!(journal.gate().fenced());
+    }
+
+    /// Design §2.8: the pending list shows the current generation, the open
+    /// incidents, the uncertain intents a release would tombstone, what is in
+    /// flight and persisting, the suspended streams, the legs entering or
+    /// exiting and the epoch; each paged at 100 with its total. Authenticated.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn the_pending_list_shows_what_a_release_would_cover(pool: sqlx::PgPool) {
+        use robson_exec::{
+            gate::{EpochView, IncidentReason},
+            order_journal::{IntentKind, IntentSpec, WriteClass},
+        };
+
+        let tenant = Uuid::now_v7();
+        let backend = crate::order_journal_store::PgJournalBackend::new(&pool, tenant);
+        let journal = Arc::new(OrderJournal::new(Arc::new(backend), &VenueId::new("test:venue")));
+        journal.gate().begin_epoch(
+            EpochView {
+                epoch_seq: 3,
+                unclean_reason: Some("no_marker"),
+            },
+            None,
+            Vec::new(),
+        );
+        // 101 uncertain intents: two pages.
+        let ledger = robson_exec::venue::SubmitAttemptLedger::new(256);
+        let operation = journal.begin_operation();
+        operation
+            .scope(async {
+                for index in 0..101 {
+                    let id = format!("x{index:03}");
+                    let intent = journal.open_intent(IntentSpec {
+                        position_id: None,
+                        kind: IntentKind::Exit,
+                        client_order_id: id.clone(),
+                        cancels_order_id: None,
+                        params: json!({}),
+                    });
+                    journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
+                    let _ = ledger.begin(&id);
+                    journal.finish_failed(&intent).await;
+                }
+                // One in flight: committed, not finished.
+                let open = journal.open_intent(IntentSpec {
+                    position_id: None,
+                    kind: IntentKind::Exit,
+                    client_order_id: "in-flight".to_string(),
+                    cancels_order_id: None,
+                    params: json!({}),
+                });
+                journal.before_send(&open, WriteClass::Bounded).await.unwrap();
+            })
+            .await;
+        // A suspended stream and a leg entering, on record.
+        sqlx::query(
+            "INSERT INTO stream_suspensions (suspension_id, tenant_id, stream_key, stream_kind, \
+                 month, error, suspended_at) \
+             VALUES ($1, $2, 'system:month_boundary:2026-10', 'system', '2026-10-01', 'x', NOW())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO positions_current (position_id, tenant_id, account_id, symbol, side, \
+                 current_quantity, state, last_event_id, last_seq, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'BTCUSDT', 'long', 1, 'entering', $4, 1, NOW(), NOW())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant)
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .unwrap();
+        journal.gate().record(IncidentReason::UnlandedSend);
+
+        let app =
+            recovery_app(pool.clone(), Arc::clone(&journal), Some(LEGACY), Some(tenant)).await;
+        let get = |page: u32| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/recovery/pending?page={page}"))
+                            .header(header::AUTHORIZATION, format!("Bearer {LEGACY}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                serde_json::from_slice::<PendingResponse>(&bytes).unwrap()
+            }
+        };
+        let pending = get(0).await;
+        assert_eq!(pending.generation, journal.gate().generation());
+        assert_eq!(pending.generation, (3 << 32) | 102);
+        assert!(pending.fenced && pending.latch);
+        assert_eq!(pending.epoch.as_ref().unwrap().unclean_reason.as_deref(), Some("no_marker"));
+        let reasons: Vec<_> = pending.incidents.items.iter().map(|i| i.reason.as_str()).collect();
+        assert_eq!(reasons, ["uncertain_outcome", "unlanded_send"]);
+        assert_eq!(pending.incidents.items[0].count, 101);
+        assert_eq!(
+            (pending.uncertain_intents.total, pending.uncertain_intents.items.len()),
+            (101, 100)
+        );
+        assert_eq!(pending.uncertain_intents.items[0].uncertain_generation, (3 << 32) | 1);
+        assert_eq!(pending.in_flight.total, 1);
+        let listed = &pending.in_flight.items[0].intents;
+        assert!(listed.iter().any(|i| i.client_order_id == "in-flight" && !i.send_started));
+        assert_eq!(pending.persisting.total, 2, "both incidents' upserts");
+        assert_eq!(pending.suspended_streams.total, 1);
+        assert_eq!(pending.suspended_streams.items[0].month, NaiveDate::from_ymd_opt(2026, 10, 1));
+        assert_eq!(pending.legs_in_flight.total, 1);
+        assert_eq!(pending.legs_in_flight.items[0].state, "entering");
+
+        let second = get(1).await;
+        assert_eq!(
+            (second.uncertain_intents.total, second.uncertain_intents.items.len()),
+            (101, 1)
+        );
+        assert_eq!(second.uncertain_intents.items[0].client_order_id, "x100");
+        drop(operation);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(Request::builder().uri("/recovery/pending").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
     }
 
     // =========================================================================
