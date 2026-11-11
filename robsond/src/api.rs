@@ -1215,9 +1215,11 @@ pub struct PendingPage<T> {
 
 impl<T> PendingPage<T> {
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
-    fn of(all: Vec<T>, page: usize) -> Self {
+    /// The page starting at `offset`, the one offset every collection of a
+    /// request shares.
+    fn of(all: Vec<T>, offset: usize) -> Self {
         let total = all.len() as u64;
-        let items = all.into_iter().skip(page * PENDING_PAGE_SIZE).take(PENDING_PAGE_SIZE);
+        let items = all.into_iter().skip(offset).take(PENDING_PAGE_SIZE);
         Self { total, items: items.collect() }
     }
 }
@@ -1328,10 +1330,14 @@ struct PendingQuery {
 
 /// The pending list: memory (the gate, `operations_in_flight`,
 /// `persistence_pending`) and six SQL queries, a count and a page for each of
-/// three durable collections. No venue request, no manager lock.
+/// three durable collections. No venue request, no manager lock. It requires
+/// an identity itself, as release and disposition do: with neither Google
+/// auth nor the legacy token configured the router lets a request through
+/// unauthenticated, and this answers 401 then.
 #[cfg(feature = "postgres")]
 async fn recovery_pending_handler<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
+    identity: Option<axum::Extension<OperatorIdentity>>,
     Query(query): Query<PendingQuery>,
 ) -> Result<Json<PendingResponse>, (StatusCode, Json<ErrorResponse>)>
 where
@@ -1341,11 +1347,17 @@ where
     let fail = |status: StatusCode, message: &str| {
         (status, Json(ErrorResponse { error: message.to_string() }))
     };
+    if identity.is_none() {
+        return Err(fail(StatusCode::UNAUTHORIZED, "a verified identity is required"));
+    }
     let (Some(pool), Some(tenant_id)) = (&state.pg_pool, state.tenant_id) else {
         return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "no database is configured"));
     };
     let page = query.page.unwrap_or(0);
-    let offset = i64::try_from(page.saturating_mul(PENDING_PAGE_SIZE)).unwrap_or(i64::MAX);
+    // One offset for every collection, saturated once: a page past every total
+    // is empty in each, memory and SQL alike, and never overflows.
+    let offset = page.saturating_mul(PENDING_PAGE_SIZE);
+    let sql_offset = i64::try_from(offset).unwrap_or(i64::MAX);
     let limit = PENDING_PAGE_SIZE as i64;
     let journal = &state.order_journal;
     let gate = journal.gate().snapshot();
@@ -1422,7 +1434,7 @@ where
     ))
     .bind(tenant_id)
     .bind(limit)
-    .bind(offset)
+    .bind(sql_offset)
     .fetch_all(pool.as_ref())
     .await
     .map_err(unavailable)?;
@@ -1449,7 +1461,7 @@ where
     ))
     .bind(tenant_id)
     .bind(limit)
-    .bind(offset)
+    .bind(sql_offset)
     .fetch_all(pool.as_ref())
     .await
     .map_err(unavailable)?;
@@ -1468,7 +1480,7 @@ where
         ))
         .bind(tenant_id)
         .bind(limit)
-        .bind(offset)
+        .bind(sql_offset)
         .fetch_all(pool.as_ref())
         .await
         .map_err(unavailable)?;
@@ -1485,7 +1497,7 @@ where
             unclean_reason: epoch.unclean_reason.map(str::to_string),
         }),
         page,
-        incidents: PendingPage::of(incidents, page),
+        incidents: PendingPage::of(incidents, offset),
         uncertain_intents: PendingPage {
             total: total(uncertain_total),
             items: uncertain
@@ -1502,8 +1514,8 @@ where
                 })
                 .collect(),
         },
-        in_flight: PendingPage::of(in_flight, page),
-        persisting: PendingPage::of(persisting, page),
+        in_flight: PendingPage::of(in_flight, offset),
+        persisting: PendingPage::of(persisting, offset),
         suspended_streams: PendingPage {
             total: total(suspended_total),
             items: suspended
@@ -6780,7 +6792,7 @@ mod tests {
 
         let app =
             recovery_app(pool.clone(), Arc::clone(&journal), Some(LEGACY), Some(tenant)).await;
-        let get = |page: u32| {
+        let get = |page: u64| {
             let app = app.clone();
             async move {
                 let response = app
@@ -6826,6 +6838,17 @@ mod tests {
             (101, 1)
         );
         assert_eq!(second.uncertain_intents.items[0].client_order_id, "x100");
+        // Review round 1: a page past every total, as far as the query takes
+        // it, is empty in every collection, memory and SQL alike, with the
+        // totals kept; it never overflows.
+        let past = get(u64::MAX).await;
+        assert_eq!(past.page, usize::MAX);
+        assert_eq!(past.uncertain_intents.total, 101);
+        assert_eq!(past.incidents.total, 2);
+        assert_eq!(past.in_flight.total, 1);
+        assert!(past.uncertain_intents.items.is_empty());
+        assert!(past.incidents.items.is_empty() && past.in_flight.items.is_empty());
+        assert!(past.persisting.items.is_empty() && past.legs_in_flight.items.is_empty());
         drop(operation);
 
         let unauthenticated = app
@@ -6834,6 +6857,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Review round 1: the pending list requires an identity itself. With
+    /// neither Google auth nor the legacy token configured the router lets a
+    /// request through unauthenticated, and the list answers 401, as release
+    /// and disposition do.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn the_pending_list_requires_an_identity_even_with_auth_unconfigured() {
+        let journal = Arc::new(OrderJournal::unpersisted());
+        let app = recovery_app(unreachable_pool(), journal, None, Some(Uuid::now_v7())).await;
+        let response = app
+            .oneshot(Request::builder().uri("/recovery/pending").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// One offset, saturated, for every memory collection: past the end is
+    /// empty, never an overflow.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn a_pending_page_past_its_end_is_empty() {
+        let page = PendingPage::of(vec![1, 2, 3], usize::MAX);
+        assert_eq!((page.total, page.items.len()), (3, 0));
+        let page = PendingPage::of((0..250).collect::<Vec<_>>(), 200);
+        assert_eq!((page.total, page.items), (250, (200..250).collect::<Vec<_>>()));
     }
 
     // =========================================================================

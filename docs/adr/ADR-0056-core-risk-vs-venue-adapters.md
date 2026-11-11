@@ -1155,8 +1155,11 @@ and whether each send started, which a release never covers; what is **persistin
 suspensions and incident upserts), for which a release answers `persisting`; the open **stream suspensions**, with their
 checkpoints and repair errors; and the legs now `entering` or `exiting`. The fence, the incidents, the operations and the
 persisting entries are read from memory; the other three collections are a count and a page each, six SQL queries per call. No
-venue request, no slot, no manager lock. It is a view only: it changes nothing, and part 2's release works without it (a stale
-request answers the current generation). Rollback across part 3 alone: to part 2's image, which keeps migration 34.
+venue request, no slot, no manager lock. It requires an identity itself, as release and disposition do, so it answers 401 even
+where neither Google auth nor the legacy token is configured. `page` is turned into one offset, saturated once and shared by
+every collection, memory and SQL alike: a page past every total is empty in each. It is a view only: it changes nothing, and
+part 2's release works without it (a stale request answers the current generation). Rollback across part 3 alone: to part 2's
+image, which keeps migrations 34 and 35.
 
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations. Where this ADR names a persisted-state version (steps 5 and 7) it is target architecture: no step has written a
