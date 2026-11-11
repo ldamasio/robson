@@ -260,9 +260,10 @@ pub struct MonthlyPositionsResponse {
     pub positions: Vec<PositionSummary>,
     pub occupied_slots: usize,
     pub slot_cells_total: usize,
-    /// The current month's basis cannot meter capacity (ADR-0051 §1):
-    /// `capital_base <= 0`, or its reset has not landed. Its new-entry cells
-    /// are then zero. Always false for other months.
+    /// The month's basis cannot meter capacity, and its new-entry cells are
+    /// zero: for the current month, `capital_base <= 0` or its reset has not
+    /// landed (ADR-0051 §1); for any month, current or history, its system
+    /// stream is suspended (ADR-0056 step 7), whatever a release did.
     #[serde(default)]
     pub capacity_invalid: bool,
 }
@@ -1958,7 +1959,9 @@ where
         positions.iter().filter(|position| position.created_at < requested).count();
     let now = chrono::Utc::now();
     let current_month = (requested.year(), requested.month()) == (now.year(), now.month());
-    let capacity_invalid = current_month && monthly.basis_invalid();
+    // A suspended month stays untrusted after it becomes history: a later month
+    // does not make it right (ADR-0056 step 7, design §2.5).
+    let capacity_invalid = (current_month && monthly.basis_invalid()) || monthly.month_suspended;
     let base_slots_available = if capacity_invalid {
         0
     } else {
@@ -4181,6 +4184,56 @@ mod tests {
         assert_eq!(may_month.positions[0].id, ada_armed.id);
         assert_eq!(may_month.positions[1].id, btc_long.id);
         assert_eq!(may_month.positions[2].id, btc_short.id);
+    }
+
+    /// A month whose system stream is suspended reports no new-entry capacity,
+    /// and keeps reporting it once it is history: the month after it does not
+    /// make it right, and neither does a release (ADR-0056 step 7, design
+    /// §2.5). Its inherited cells still show; the month after it is unaffected.
+    #[tokio::test]
+    async fn a_suspended_month_reports_no_capacity_as_history_too() {
+        let (app, _event_bus, position_manager) = create_test_app_with_event_bus(100).await;
+        let april = month_start(2026, 4);
+        let mut inherited =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        inherited.created_at = april - chrono::Duration::days(2);
+        inherited.updated_at = april + chrono::Duration::days(3);
+        inherited.state = PositionState::Armed;
+        inherited.entry_price = Some(Price::new(dec!(100)).unwrap());
+        {
+            let manager = position_manager.write().await;
+            manager.store().positions().save(&inherited).await.unwrap();
+        }
+        let view = |month: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/positions?month={month}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let month: MonthlyPositionsResponse = serde_json::from_slice(&body).unwrap();
+                (month.capacity_invalid, month.occupied_slots, month.slot_cells_total)
+            }
+        };
+        assert_eq!(view("2026-04").await, (false, 1, 5), "trusted: four new cells");
+
+        position_manager.read().await.event_streams().restore([(
+            "system:month_boundary:2026-04".to_string(),
+            crate::event_streams::Suspended {
+                suspension_id: Uuid::now_v7(),
+                stream: crate::event_streams::ManagedStream::Month { year: 2026, month: 4 },
+                repaired_through_seq: None,
+            },
+        )]);
+        assert_eq!(view("2026-04").await, (true, 1, 1), "only the inherited cell");
+        assert!(!view("2026-05").await.0, "the next month is its own");
     }
 
     #[tokio::test]

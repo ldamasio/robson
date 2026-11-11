@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed - A suspended system stream makes its month's accounting invalid (ADR-0056 step 7, PR F, part 1)
+
+- A month whose system stream (`system:month_boundary:YYYY-MM`) is suspended now has an invalid budget basis, on the same
+  path as `capital_base <= 0` and a reset that has not landed: no capacity in the snapshot or `/status`, no automatic
+  MonthlyHalt whatever the realized losses, arm and entry preview answer 503, and a signal or an approval is denied by the
+  gate with no capital. This replaces P's stopgap, which refused the same admissions while that month was current but left
+  automatic MonthlyHalt running on the untrusted base.
+- `GET /positions?month=` reports `capacity_invalid`, with no new-entry cells, for a suspended month after it becomes history
+  too. Nothing a later month or a release does clears it; only step 8's system repair will.
+
 ### Added - Startup repair of suspended position streams (ADR-0056 step 7, PR P, part 3)
 
 - At start, before the store is rebuilt, each suspended position stream is repaired: its suffix past the leg's
