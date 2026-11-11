@@ -55,10 +55,20 @@
       "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L89-L96",
       "accessed": "2026-11-11",
       "how": "The documented serverShutdown event on a raw stream, comments removed"
+    },
+    "klines.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1319-L1337",
+      "accessed": "2026-11-11",
+      "how": "The documented response of GET /api/v3/klines, comments removed"
+    },
+    "klines_btcusdt_1m.json": {
+      "source": "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=3",
+      "accessed": "2026-11-11",
+      "how": "The public, unauthenticated response fetched at 2026-11-11T22:28:55Z, unmodified (sha256 b9c9e4c956ef8fe32f4761984d6432b5f3b04c1d7d54bf49157ddf30e4b71b63): three 1-minute klines, oldest first. Format: https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1273-L1337"
     }
   },
   "facts": {
-    "about": "Venue facts the spot trade feed (ADR-0056 step 8b) relies on, read 2026-11-11 at the same commit",
+    "about": "Venue facts the spot trade feed and klines (ADR-0056 step 8b) rely on, read 2026-11-11 at the same commit",
     "stream_base": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L41: wss://stream.binance.com:9443, or port 443",
     "raw_stream_path": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L42-L47: a raw stream at /ws/<streamName>; a combined stream at /stream?streams=... wraps each event as {stream, data}",
     "lowercase_symbols": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L48",
@@ -66,6 +76,12 @@
     "agg_trade_payload": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L279-L293",
     "connection_lifetime": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L49-L50: one connection is valid for 24 hours",
     "server_shutdown": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L51-L53, #L85-L110: a serverShutdown event precedes a disconnection",
-    "ping_pong": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L54-L59: a ping every 20 seconds; no pong within a minute disconnects; the pong copies the ping's payload"
+    "ping_pong": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L54-L59: a ping every 20 seconds; no pong within a minute disconnects; the pong copies the ping's payload",
+    "klines_request": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1273-L1292: GET /api/v3/klines, weight 2; symbol and interval mandatory; limit default 500, maximum 1000",
+    "klines_security": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L263-L268, #L280-L282: no security type, so NONE, public and unsigned",
+    "kline_intervals": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1298-L1307",
+    "klines_most_recent": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1311, #L98-L99: without startTime or endTime, the most recent klines, in chronological order",
+    "klines_response": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1319-L1337",
+    "rest_base": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L87-L88: https://api.binance.com"
   }
 }

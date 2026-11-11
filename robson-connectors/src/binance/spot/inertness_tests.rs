@@ -3,11 +3,11 @@
 //! Grep-based, over the workspace's Rust sources as they are on disk:
 //! - nothing outside `binance/spot/` reaches this module, names a type it
 //!   defines or names a spot endpoint, so no production path, factory included,
-//!   can construct its reader or feed;
+//!   can construct its reader, feed or klines;
 //! - 8a's readers import no `robson_exec` contract and implement no port. 8b's
-//!   feed imports exactly the existing items of the port it implements
-//!   (`TradeFeedPort`) and nothing else, so no spot source uses anything 8c or
-//!   a later step introduces there;
+//!   feed and klines import exactly the existing items of the port each
+//!   implements (`TradeFeedPort`, `OhlcvPort`) and nothing else, so no spot
+//!   source uses anything 8c or a later step introduces there;
 //! - they send no mutation, read no configuration and name no testnet host.
 //!
 //! `robsond`'s venue tests check the other half: the factory still refuses
@@ -120,9 +120,9 @@ fn spot_type_names() -> Vec<String> {
 }
 
 /// Whether `text` names a spot endpoint: the spot stream host (not the
-/// futures `fstream` one).
+/// futures `fstream` one) or the spot klines path.
 fn names_spot_endpoint(text: &str) -> bool {
-    has_word(text, "stream.binance.com")
+    has_word(text, "stream.binance.com") || text.contains("/api/v3/klines")
 }
 
 /// `text` without its comments: prose may name the contracts.
@@ -135,8 +135,10 @@ fn code_only(text: &str) -> String {
 
 /// The `robson_exec` items each 8b adapter takes: the existing port it
 /// implements, with that port's own types. No other spot file takes any.
-const PORT_ITEMS: [(&str, &[&str]); 1] =
-    [("market_data.rs", &["TradeFeedMessage", "TradeFeedPort", "TradeStream"])];
+const PORT_ITEMS: [(&str, &[&str]); 2] = [
+    ("market_data.rs", &["TradeFeedMessage", "TradeFeedPort", "TradeStream"]),
+    ("ohlcv.rs", &["CandleInterval", "ExecError", "OhlcvPort"]),
+];
 
 /// Contracts a spot file may name only when its allow-list holds them.
 const CONTRACTS: [&str; 15] = [
@@ -229,12 +231,15 @@ fn the_matchers_find_what_they_look_for() {
     for spot_endpoint in [
         "wss://stream.binance.com:9443",
         "wss://stream.binance.com:443/ws/btcusdt@aggTrade",
+        "https://api.binance.com/api/v3/klines?symbol=BTCUSDT",
+        "SpotRead::public(\"/api/v3/klines\", 2)",
     ] {
         assert!(names_spot_endpoint(spot_endpoint), "{spot_endpoint}");
     }
     for elsewhere in [
         "wss://fstream.binance.com/market",
         "wss://stream.binancefuture.com",
+        "/fapi/v1/klines",
         "/api/v3/exchangeInfo",
     ] {
         assert!(!names_spot_endpoint(elsewhere), "{elsewhere}");
@@ -243,6 +248,7 @@ fn the_matchers_find_what_they_look_for() {
     let names = spot_type_names();
     for expected in [
         "BinanceSpotTradeFeed",
+        "BinanceSpotOhlcv",
         "SPOT_MARKET_WS_ENDPOINT",
         "SpotRestReader",
         "SpotRead",
@@ -304,7 +310,9 @@ fn the_port_allow_list_admits_only_each_adapter_s_own_items() {
     let feed =
         "use robson_exec::{\n    TradeFeedMessage,\n    TradeFeedPort,\n    TradeStream,\n};"
             .to_string();
+    let ohlcv = "use robson_exec::{CandleInterval, ExecError, OhlcvPort};".to_string();
     assert_eq!(port_contract_violations("market_data.rs", &feed), Vec::<String>::new());
+    assert_eq!(port_contract_violations("ohlcv.rs", &ohlcv), Vec::<String>::new());
     assert_eq!(port_contract_violations("rest.rs", "use crate::x;"), Vec::<String>::new());
 
     let mut crossing = vec![
@@ -314,7 +322,7 @@ fn the_port_allow_list_admits_only_each_adapter_s_own_items() {
         ("rest.rs", feed.clone()),
         ("mod.rs", "pub use robson_exec::{OhlcvPort};".to_string()),
         ("trades.rs", "fn f(_: &dyn OhlcvPort) {}".to_string()),
-        // The adapter its own items, exactly.
+        // Each adapter its own items, exactly.
         ("market_data.rs", String::new()),
         ("market_data.rs", "use robson_exec::{TradeFeedPort, TradeStream};".to_string()),
         (
@@ -332,12 +340,21 @@ fn the_port_allow_list_admits_only_each_adapter_s_own_items() {
             "market_data.rs",
             format!("{feed}\nfn f(_: robson_exec::gate::OperationGate) {{}}"),
         ),
+        ("market_data.rs", ohlcv.clone()),
+        ("ohlcv.rs", feed.clone()),
+        ("ohlcv.rs", String::new()),
+        (
+            "ohlcv.rs",
+            "use robson_exec::{CandleInterval, ExecError, OhlcvPort, OrderResult};".to_string(),
+        ),
+        (
+            "ohlcv.rs",
+            "use robson_exec::{CandleInterval, ExecError, OhlcvPort, venue::Mark};".to_string(),
+        ),
+        ("ohlcv.rs", "use robson_exec::*;".to_string()),
     ];
-    // No contract outside the allow-list, by whatever path.
-    for contract in [
-        "ExecError",
-        "OhlcvPort",
-        "CandleInterval",
+    // No contract outside the file's allow-list, by whatever path.
+    let others = [
         "OrderResult",
         "OrderLookup",
         "Venue",
@@ -347,8 +364,12 @@ fn the_port_allow_list_admits_only_each_adapter_s_own_items() {
         "SettlementPort",
         "FundingPort",
         "MarketDataPort",
-    ] {
+    ];
+    for contract in others.iter().chain(&["ExecError", "OhlcvPort", "CandleInterval"]) {
         crossing.push(("market_data.rs", format!("{feed}\nfn f(_: &dyn {contract}) {{}}")));
+    }
+    for contract in others.iter().chain(&["TradeFeedPort", "TradeStream", "TradeFeedMessage"]) {
+        crossing.push(("ohlcv.rs", format!("{ohlcv}\nfn f(_: &dyn {contract}) {{}}")));
     }
     for (file, code) in crossing {
         assert!(!port_contract_violations(file, &code).is_empty(), "{file} admits {code}");
@@ -356,8 +377,8 @@ fn the_port_allow_list_admits_only_each_adapter_s_own_items() {
 }
 
 /// SD12 point 1: 8a's readers take nothing from `robson_exec`, where the
-/// port contracts and 8c's additions live, and 8b's feed takes only the
-/// existing port it implements. No spot source uses a later contract.
+/// port contracts and 8c's additions live, and 8b's feed and klines take only
+/// the existing port each implements. No spot source uses a later contract.
 #[test]
 fn the_spot_module_uses_no_port_contract_beyond_8b_s_ports() {
     let sources = spot_production_sources();
@@ -371,10 +392,11 @@ fn the_spot_module_uses_no_port_contract_beyond_8b_s_ports() {
     }
 }
 
-/// 8b's feed reads public market data only, through its `aggTrade`
+/// 8b's adapters read public market data only: the klines through the
+/// shared client's unsigned GET, the feed through its `aggTrade`
 /// subscription. No spot source names a testnet or futures host.
 #[test]
-fn the_feed_reads_public_market_data_only() {
+fn the_feed_and_the_klines_read_public_market_data_only() {
     let sources = spot_production_sources();
     let code = |file: &str| {
         let (_, text) = sources
@@ -383,6 +405,11 @@ fn the_feed_reads_public_market_data_only() {
             .unwrap_or_else(|| panic!("{file} not found"));
         code_only(text)
     };
+    let ohlcv = code("ohlcv.rs");
+    assert!(ohlcv.contains("get_public_answer"));
+    for signed in ["get_signed", "build_signed_query", "api_key"] {
+        assert!(!ohlcv.contains(signed), "ohlcv.rs contains {signed}");
+    }
     let feed = code("market_data.rs");
     assert!(feed.contains("subscribe_agg_trade"));
     for other in [
@@ -404,7 +431,7 @@ fn the_feed_reads_public_market_data_only() {
 #[test]
 fn the_spot_module_sends_no_mutation_and_reads_no_configuration() {
     let sources = spot_production_sources();
-    assert!(sources.len() >= 6, "{} production sources", sources.len());
+    assert!(sources.len() >= 7, "{} production sources", sources.len());
     for (path, text) in sources {
         for mutation in [
             "post_signed",
