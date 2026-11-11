@@ -1060,7 +1060,9 @@ with no incident, and neither kind is ever evidence a release relies on.
   and its memory, until its completion records the replacement's own ending (a success with its evidence, or an uncertain
   ending that fences at once) or its operation ends; its ending landing or overflowing does not drop it, so a release of its
   incident in between cannot leave the replacement's ending unrecorded. Completion registers both endings before it awaits
-  either write, so a completion cancelled mid-write leaves a known acceptance in the retry set, never taken for uncertain. `unlanded_send`, a bounded send whose row did not land, recorded before
+  either write, so a completion cancelled mid-write leaves a known acceptance in the retry set, never taken for uncertain,
+  subject to the retry set's overflow policy: an ending that overflows a full set, which early registration can reach before
+  a write frees a slot, is discarded and latches a `persistence_failure`. `unlanded_send`, a bounded send whose row did not land, recorded before
   its request leaves; `persistence_failure`, history discarded on a full retry set or a row conflicting on retry;
   `stream_suspended`; `operation_aborted`; `unpermitted_mutation`; `unclean_start`; `generation_exhausted`. All but
   `unclean_start` and `uncertain_outcome` set the latch, as P's latch sources already did.
