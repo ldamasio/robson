@@ -411,6 +411,20 @@ pub(crate) struct MonthlyRiskState {
     pub month_peak_net: Decimal,
     pub trades_opened: i32,
     pub budget_model: MonthlyBudgetModel,
+    /// The month's row carries `boundary_reset_at`: its `MonthBoundaryReset`
+    /// landed. A missing row, or one another writer created before the
+    /// reset, has none. Without a database there is no reset to look for,
+    /// and this is true.
+    pub boundary_reset_landed: bool,
+}
+
+impl MonthlyRiskState {
+    /// The basis cannot meter the month (ADR-0051 §1): `capital_base <= 0`,
+    /// or the month's reset has not landed, so the base read is configured
+    /// capital or a value no reset wrote, not the operated wallet's.
+    pub(crate) fn basis_invalid(&self) -> bool {
+        self.capital_base <= Decimal::ZERO || !self.boundary_reset_landed
+    }
 }
 
 /// Freshness bound for `/status` reads of the tick-path price cache. Matches
@@ -550,32 +564,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .sum()
     }
 
-    /// Compute current equity per ADR-0024 §6:
-    ///
-    /// ```text
-    /// current_equity = initial_capital + all_time_realized_pnl + unrealized_pnl
-    /// ```
-    ///
-    /// Where:
-    /// - `initial_capital`: operator's declared starting capital from config
-    /// - `all_time_realized_pnl`: Σ(realized_pnl − fees_paid) for every closed
-    ///   position since the system started
-    /// - `unrealized_pnl`: mark-to-market PnL of Active positions
-    pub(crate) async fn compute_current_equity(&self) -> DaemonResult<Decimal> {
-        let initial_capital = self.configured_capital();
-
-        // All-time realized PnL (net of fees)
-        let all_closed = self.store.positions().find_all_closed().await?;
-        let all_time_realized: Decimal =
-            all_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
-
-        // Unrealized PnL of open Active positions at live marks
-        let active = self.store.positions().find_risk_open().await?;
-        let unrealized = self.unrealized_pnl_marked(&active).await;
-
-        Ok(initial_capital + all_time_realized + unrealized)
-    }
-
     #[cfg(feature = "postgres")]
     fn event_stream_key(event: &Event) -> String {
         match event {
@@ -587,33 +575,57 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
     }
 
-    #[cfg(feature = "postgres")]
-    pub(crate) async fn load_capital_base_for_month(
+    /// The basis an arm sizes with: the month's persisted `capital_base`. A
+    /// month whose reset has not landed refuses the arm, since that basis did
+    /// not come from the operated wallet. A basis <= 0 is returned as it is,
+    /// for `with_capital` to refuse (ADR-0051 §1).
+    pub(crate) async fn admission_capital_base(
         &self,
         now: chrono::DateTime<chrono::Utc>,
     ) -> DaemonResult<Decimal> {
-        let configured_capital = self.configured_capital();
-        let Some(pool) = &self.event_log_pool else {
-            return Ok(configured_capital);
-        };
+        let monthly = self.load_monthly_state(now).await?;
+        if !monthly.boundary_reset_landed {
+            return Err(DaemonError::AdmissionsClosed {
+                reason: format!(
+                    "the {:04}-{:02} month-boundary reset has not landed; entries wait for a \
+                     basis from the operated wallet",
+                    now.year(),
+                    now.month()
+                ),
+            });
+        }
+        Ok(monthly.capital_base)
+    }
 
-        let row = sqlx::query_as::<_, (Decimal,)>(
-            "SELECT capital_base FROM monthly_state WHERE year = $1 AND month = $2",
+    /// The capital base a month's reset recorded, for the next boundary's
+    /// Armed reservation: `None` when the month has no row, or a row no reset
+    /// stamped, so nothing on record says what its base was. Without a
+    /// database there is no record, and the configured capital stands in.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn recorded_capital_base(
+        &self,
+        month: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<Option<Decimal>> {
+        let Some(pool) = &self.event_log_pool else {
+            return Ok(Some(self.configured_capital()));
+        };
+        let base = sqlx::query_scalar::<_, Decimal>(
+            "SELECT capital_base FROM monthly_state \
+             WHERE year = $1 AND month = $2 AND boundary_reset_at IS NOT NULL",
         )
-        .bind(now.year())
-        .bind(now.month() as i16)
+        .bind(month.year() as i16)
+        .bind(month.month() as i16)
         .fetch_optional(pool)
         .await?;
-
-        Ok(row.map(|(capital_base,)| capital_base).unwrap_or(configured_capital))
+        Ok(base)
     }
 
     #[cfg(not(feature = "postgres"))]
-    pub(crate) async fn load_capital_base_for_month(
+    pub(crate) async fn recorded_capital_base(
         &self,
-        _now: chrono::DateTime<chrono::Utc>,
-    ) -> DaemonResult<Decimal> {
-        Ok(self.configured_capital())
+        _month: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<Option<Decimal>> {
+        Ok(Some(self.configured_capital()))
     }
 
     /// Load the full persisted monthly risk state from `monthly_state`.
@@ -640,16 +652,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         };
 
         let configured_capital = self.configured_capital();
-        let row = sqlx::query_as::<_, (Decimal, Decimal, Decimal, i32, String)>(
-            "SELECT capital_base, realized_loss, month_peak_net, trades_opened, monthly_budget_model FROM monthly_state WHERE year = $1 AND month = $2",
+        let row = sqlx::query_as::<_, (Decimal, Decimal, Decimal, i32, String, bool)>(
+            "SELECT capital_base, realized_loss, month_peak_net, trades_opened, monthly_budget_model, boundary_reset_at IS NOT NULL FROM monthly_state WHERE year = $1 AND month = $2",
         )
         .bind(now.year())
         .bind(now.month() as i16)
         .fetch_optional(pool)
         .await?;
 
-        if let Some((capital_base, realized_loss, month_peak_net, trades_opened, stored_model)) =
-            row
+        if let Some((
+            capital_base,
+            realized_loss,
+            month_peak_net,
+            trades_opened,
+            stored_model,
+            boundary_reset_landed,
+        )) = row
         {
             let budget_model = MonthlyBudgetModel::from_persisted(&stored_model);
             if stored_model != budget_model.as_str() {
@@ -665,6 +683,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 month_peak_net,
                 trades_opened,
                 budget_model,
+                boundary_reset_landed,
             });
         }
 
@@ -707,6 +726,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             month_peak_net: Decimal::ZERO,
             trades_opened: 0,
             budget_model: inherited_model,
+            boundary_reset_landed: false,
         })
     }
 
@@ -773,6 +793,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             month_peak_net: realized_peak.max(cached_peak),
             trades_opened: monthly_closed.len() as i32,
             budget_model,
+            boundary_reset_landed: true,
         })
     }
 
@@ -2204,11 +2225,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let monthly_unrealized_pnl = budget.month_equity_net - budget.governed_realized_net;
 
         // The gate decides next, on this value: it must see a basis that went
-        // invalid during the snapshot.
-        let capital = Self::capital_for_the_gate(
-            budget.capital_base,
-            self.budget_basis_is_invalid_now().await,
-        );
+        // invalid during the snapshot, and no capital for one that was invalid
+        // in it, such as a base no reset wrote. With no capital the gate
+        // denies, and never as an exhausted budget.
+        let snapshot_capital = if budget.capital_base_invalid {
+            Decimal::ZERO
+        } else {
+            budget.capital_base
+        };
+        let capital =
+            Self::capital_for_the_gate(snapshot_capital, self.budget_basis_is_invalid_now().await);
 
         Ok(RiskContext::with_month_equity(
             capital,
@@ -2302,7 +2328,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         side: Side,
     ) -> DaemonResult<EntryPreviewJob<E>> {
         let now = chrono::Utc::now();
-        let capital = self.load_capital_base_for_month(now).await?;
+        let capital = self.admission_capital_base(now).await?;
         let risk_config = self
             .risk_config_snapshot()
             .with_capital(capital)
@@ -3457,7 +3483,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// ADR-0051 budget snapshot.
     ///
     /// Trigger condition: `remaining_budget <= 0` on a valid basis. With
-    /// `capital_base <= 0` nothing fires (ADR-0051 §1).
+    /// `capital_base <= 0`, or before the month's reset has landed, nothing
+    /// fires (ADR-0051 §1).
     /// where:
     ///   remaining_budget = (capital_base × max_monthly_drawdown_pct) −
     /// consumed − latent_risk
@@ -3498,7 +3525,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             error!(
                 capital_base = %snapshot.capital_base,
                 risk_open_positions = local_risk_open.len(),
-                "MonthlyHalt not evaluated: the monthly budget basis is invalid (ADR-0051 §1); open positions are kept"
+                "MonthlyHalt not evaluated: the monthly budget basis is invalid, capital_base <= 0 or the month's reset not landed (ADR-0051 §1); open positions are kept"
             );
             return false;
         }
@@ -3570,7 +3597,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// longer stand.
     async fn budget_basis_is_invalid_now(&self) -> DaemonResult<bool> {
         let monthly = self.load_monthly_state(chrono::Utc::now()).await?;
-        Ok(monthly.capital_base <= Decimal::ZERO)
+        Ok(monthly.basis_invalid())
     }
 
     /// A re-read that fails is a governed denial like any other, which re-arms
@@ -5995,15 +6022,24 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             self.resolve_latent_risk_for_positions(&local_risk_open, &rules_by_symbol);
         let latent_risk_invalid = !latent_risk_failures.is_empty();
 
-        let capital_base_invalid = monthly.capital_base <= Decimal::ZERO;
-        if capital_base_invalid {
+        let capital_base_invalid = monthly.basis_invalid();
+        if monthly.capital_base <= Decimal::ZERO {
             error!(
                 capital_base = %monthly.capital_base,
                 year = now.year(),
                 month = now.month(),
                 "ADR-0051 §1: monthly budget snapshot is invalid because capital_base <= 0; new entries denied, open positions kept"
             );
+        } else if !monthly.boundary_reset_landed {
+            warn!(
+                capital_base = %monthly.capital_base,
+                year = now.year(),
+                month = now.month(),
+                "Monthly budget snapshot is invalid: the month's reset has not landed, so its basis is not the operated wallet's; new entries denied, open positions kept"
+            );
         }
+        // A base no reset wrote meters nothing, so it reports no capacity.
+        let capacity_unknown = latent_risk_invalid || !monthly.boundary_reset_landed;
         let budget_amount = self.trading_policy.monthly_budget(monthly.capital_base);
 
         let consumed_hwm = (month_peak_net - month_equity_net).max(Decimal::ZERO);
@@ -6012,13 +6048,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             MonthlyBudgetModel::HwmV1 => consumed_hwm,
             MonthlyBudgetModel::NetFromStartNonExpandingV1 => consumed_nfs,
         };
-        let remaining_hwm = if latent_risk_invalid {
+        let remaining_hwm = if capacity_unknown {
             Decimal::ZERO
         } else {
             self.trading_policy
                 .remaining_budget(monthly.capital_base, consumed_hwm, latent_risk)
         };
-        let remaining_nfs = if latent_risk_invalid {
+        let remaining_nfs = if capacity_unknown {
             Decimal::ZERO
         } else {
             self.trading_policy
@@ -6028,13 +6064,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             MonthlyBudgetModel::HwmV1 => remaining_hwm,
             MonthlyBudgetModel::NetFromStartNonExpandingV1 => remaining_nfs,
         };
-        let slots_hwm = if latent_risk_invalid {
+        let slots_hwm = if capacity_unknown {
             0
         } else {
             self.trading_policy
                 .slots_available(monthly.capital_base, consumed_hwm, latent_risk)
         };
-        let slots_nfs = if latent_risk_invalid {
+        let slots_nfs = if capacity_unknown {
             0
         } else {
             self.trading_policy
@@ -8254,6 +8290,8 @@ mod tests {
         assert!(manager.circuit_breaker.blocks_new_entries().await);
     }
 
+    /// The current month's row as its landed reset leaves it, with this
+    /// basis.
     #[cfg(feature = "postgres")]
     async fn set_month_basis(pool: &sqlx::PgPool, capital_base: Decimal) {
         let now = chrono::Utc::now();
@@ -8261,10 +8299,12 @@ mod tests {
             r#"
             INSERT INTO monthly_state (
                 year, month, capital_base, month_peak_net,
-                monthly_budget_model, created_at
+                monthly_budget_model, boundary_reset_at, created_at
             )
-            VALUES ($1, $2, $3, 0, 'net_from_start_non_expanding_v1', $4)
-            ON CONFLICT (year, month) DO UPDATE SET capital_base = EXCLUDED.capital_base
+            VALUES ($1, $2, $3, 0, 'net_from_start_non_expanding_v1', $4, $4)
+            ON CONFLICT (year, month) DO UPDATE SET
+                capital_base = EXCLUDED.capital_base,
+                boundary_reset_at = EXCLUDED.boundary_reset_at
             "#,
         )
         .bind(now.year() as i16)
@@ -8375,6 +8415,144 @@ mod tests {
 
         assert!(matches!(result, Err(DaemonError::ApprovalDenied { .. })), "{result:?}");
         assert_denied_and_book_kept(&manager, &armed, &leg).await;
+    }
+
+    /// The current month's row as a writer other than the reset leaves it: a
+    /// base, no `boundary_reset_at`.
+    #[cfg(feature = "postgres")]
+    async fn set_unreset_month_row(pool: &sqlx::PgPool, capital_base: Decimal) {
+        let now = chrono::Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO monthly_state (year, month, capital_base, month_peak_net, created_at)
+            VALUES ($1, $2, $3, 50, $4)
+            ON CONFLICT (year, month) DO UPDATE SET
+                capital_base = EXCLUDED.capital_base,
+                boundary_reset_at = NULL
+            "#,
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .bind(capital_base)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Every admission check refuses the month's basis.
+    #[cfg(feature = "postgres")]
+    async fn assert_basis_refused(manager: &Arc<PositionManager<StubExchange, MemoryStore>>) {
+        let now = chrono::Utc::now();
+        let snapshot = manager.canonical_budget_snapshot(now).await.unwrap();
+        assert!(snapshot.capital_base_invalid);
+        assert_eq!(snapshot.slots_active, 0);
+        assert_eq!(snapshot.remaining_active, Decimal::ZERO);
+        assert!(manager.budget_basis_is_invalid_now().await.unwrap());
+        let arm = manager.admission_capital_base(now).await;
+        assert!(matches!(arm, Err(DaemonError::AdmissionsClosed { .. })), "{arm:?}");
+        let preview = manager
+            .prepare_entry_preview(Symbol::from_pair("BTCUSDT").unwrap(), Side::Long)
+            .await
+            .err();
+        assert!(matches!(preview, Some(DaemonError::AdmissionsClosed { .. })), "{preview:?}");
+    }
+
+    /// Until the month's reset lands, its basis is configured capital, not the
+    /// operated wallet's: the snapshot, the late revalidation, an arm, a
+    /// preview and a signal all refuse it. A row the peak writer created reads
+    /// the same. Once the reset stamps the row, admissions reopen, and an
+    /// approval answered after the stamp went missing is denied.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn admissions_wait_for_the_month_reset_to_land(pool: sqlx::PgPool) {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+
+        let manager = create_postgres_test_manager(pool.clone());
+        let leg = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let (armed, signal) = armed_position_and_signal(&manager).await;
+
+        assert_basis_refused(&manager).await;
+        manager.handle_signal(signal.clone()).await.unwrap();
+        assert_denied_and_book_kept(&manager, &armed, &leg).await;
+
+        set_unreset_month_row(&pool, dec!(10000)).await;
+        assert_basis_refused(&manager).await;
+
+        set_month_basis(&pool, dec!(10000)).await;
+        let now = chrono::Utc::now();
+        let snapshot = manager.canonical_budget_snapshot(now).await.unwrap();
+        assert!(!snapshot.capital_base_invalid);
+        assert!(snapshot.slots_active > 0);
+        assert!(!manager.budget_basis_is_invalid_now().await.unwrap());
+        assert_eq!(manager.admission_capital_base(now).await.unwrap(), dec!(10000));
+        manager.entry_policies.write().await.insert(
+            armed.id,
+            EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::HumanConfirmation),
+        );
+        manager.handle_signal(signal_again(&signal)).await.unwrap();
+        let query_id = {
+            let pending = manager.pending_approvals.read().await;
+            *pending.keys().next().expect("the gate admits once the reset landed")
+        };
+
+        set_unreset_month_row(&pool, dec!(10000)).await;
+        let result = manager.approve_query(query_id).await;
+
+        assert!(matches!(result, Err(DaemonError::ApprovalDenied { .. })), "{result:?}");
+        assert_denied_and_book_kept(&manager, &armed, &leg).await;
+    }
+
+    /// The worst pending window: the startup wallet read failed, leaving the
+    /// placeholder capital of 1, the boundary keeps deferring, and carried legs
+    /// reserve far more than 4% of 1. A realized loss and a signal neither
+    /// latch MonthlyHalt nor close anything; the legs keep their stops.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_pending_reset_on_placeholder_capital_neither_halts_nor_closes(pool: sqlx::PgPool) {
+        let manager = create_postgres_test_manager(pool.clone());
+        manager.update_engine_capital(dec!(1));
+        let leg = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let other = save_active_position(&manager, "SOLUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let now = chrono::Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO positions_current (
+                position_id, tenant_id, account_id, symbol, side,
+                entry_price, entry_quantity, entry_filled_at,
+                technical_stop_price, technical_stop_distance, current_quantity,
+                trailing_stop_price, current_price, realized_pnl, total_fees, exit_reason,
+                state, last_event_id, last_seq, created_at, updated_at, closed_at
+            ) VALUES (
+                $1, $2, $3, 'BTCUSDT', 'long',
+                100, 1, $4,
+                90, 10, 1,
+                90, 90, -90, 10, 'TrailingStop',
+                'closed', $5, 1, $4, $4, $4
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(manager.event_log_tenant_id.unwrap())
+        .bind(Uuid::now_v7())
+        .bind(now)
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let snapshot = manager.canonical_budget_snapshot(now).await.unwrap();
+        assert_eq!(snapshot.capital_base, dec!(1));
+        assert_eq!(snapshot.governed_realized_net, dec!(-100), "the loss is seen");
+
+        assert!(!manager.evaluate_monthly_halt().await);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+        let (armed, signal) = armed_position_and_signal(&manager).await;
+        manager.handle_signal(signal).await.unwrap();
+
+        assert_denied_and_book_kept(&manager, &armed, &leg).await;
+        assert!(is_still_active(&manager, &other).await);
     }
 
     /// The production query recorder on the same database as the event log, so
@@ -8956,6 +9134,7 @@ mod tests {
             backend.clone(),
             &robson_exec::venue::VenueId::new("test:venue"),
         ));
+        set_month_basis(&pool, dec!(10000)).await;
         let manager = audited_postgres_test_manager_with_journal(pool.clone(), 300, Some(journal));
         let (armed, signal) = production_policy_position_and_signal(&manager).await;
         backend.push_fault(JournalFault::Known);
@@ -8977,6 +9156,7 @@ mod tests {
     async fn a_failure_before_the_executor_leaves_no_evidence_and_the_rearm_recovers(
         pool: sqlx::PgPool,
     ) {
+        set_month_basis(&pool, dec!(10000)).await;
         let manager = create_audited_postgres_test_manager(pool.clone(), 300);
         let (armed, signal) = production_policy_position_and_signal(&manager).await;
 
@@ -9116,6 +9296,7 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
     async fn a_failed_pre_send_barrier_keeps_the_backoff_and_sends_nothing(pool: sqlx::PgPool) {
+        set_month_basis(&pool, dec!(10000)).await;
         for event in ["entry_signal_received", "entry_order_requested"] {
             let manager = create_audited_postgres_test_manager(pool.clone(), 300);
             let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
@@ -9411,6 +9592,27 @@ mod tests {
         writes: &[Decimal],
         stall: sqlx::Transaction<'_, sqlx::Postgres>,
     ) {
+        wait_for_a_held_snapshot(pool).await;
+        for capital_base in writes {
+            set_month_basis(pool, *capital_base).await;
+        }
+        stall.rollback().await.unwrap();
+    }
+
+    /// Once a snapshot is held there, rewrite the month's row without its
+    /// reset stamp and let the snapshot go on.
+    #[cfg(feature = "postgres")]
+    async fn unstamp_the_reset_while_a_snapshot_waits(
+        pool: &sqlx::PgPool,
+        stall: sqlx::Transaction<'_, sqlx::Postgres>,
+    ) {
+        wait_for_a_held_snapshot(pool).await;
+        set_unreset_month_row(pool, dec!(1000)).await;
+        stall.rollback().await.unwrap();
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn wait_for_a_held_snapshot(pool: &sqlx::PgPool) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let waiting: i64 = sqlx::query_scalar(
@@ -9432,10 +9634,6 @@ mod tests {
         })
         .await
         .expect("the snapshot must reach the locked table");
-        for capital_base in writes {
-            set_month_basis(pool, *capital_base).await;
-        }
-        stall.rollback().await.unwrap();
     }
 
     /// ADR-0051 §1 over random schedules: whatever the basis goes through while
@@ -9502,6 +9700,75 @@ mod tests {
         }
 
         assert!(fired_any && spared_any, "the schedules must reach both outcomes");
+    }
+
+    /// A reset stamp that goes missing while a snapshot waits is seen where
+    /// the decision is made: the halt does not fire on the exhausted budget
+    /// the snapshot read, and the gate gets no capital.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_reset_that_goes_missing_during_the_snapshot_is_seen_at_the_decision(
+        pool: sqlx::PgPool,
+    ) {
+        set_month_basis(&pool, dec!(1000)).await;
+        let manager = create_postgres_test_manager(pool.clone());
+        let leg = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(10)).await;
+        let snapshot = manager.canonical_budget_snapshot(chrono::Utc::now()).await.unwrap();
+        assert!(!snapshot.capital_base_invalid);
+        assert!(snapshot.remaining_active <= Decimal::ZERO, "{}", snapshot.remaining_active);
+
+        let stall = stall_on_positions_current(&pool).await;
+        let (fired, ()) = tokio::join!(
+            manager.evaluate_monthly_halt(),
+            unstamp_the_reset_while_a_snapshot_waits(&pool, stall)
+        );
+
+        assert!(!fired);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+        assert!(is_still_active(&manager, &leg).await);
+
+        set_month_basis(&pool, dec!(1000)).await;
+        let stall = stall_on_positions_current(&pool).await;
+        let (context, ()) = tokio::join!(
+            manager.build_risk_context(),
+            unstamp_the_reset_while_a_snapshot_waits(&pool, stall)
+        );
+
+        assert_eq!(context.unwrap().capital, Decimal::ZERO);
+    }
+
+    /// The other way round: the reset lands while a snapshot that read the
+    /// month as pending waits. Nothing decides on that snapshot's numbers,
+    /// which no reset wrote: the halt is not evaluated and the gate gets no
+    /// capital. The next decision reads the landed basis.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_reset_that_lands_during_the_snapshot_does_not_validate_it(pool: sqlx::PgPool) {
+        let manager = create_postgres_test_manager(pool.clone());
+        let leg = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(10)).await;
+        let landing = [dec!(1000)];
+
+        let stall = stall_on_positions_current(&pool).await;
+        let (fired, ()) = tokio::join!(
+            manager.evaluate_monthly_halt(),
+            write_the_basis_while_a_snapshot_waits(&pool, &landing, stall)
+        );
+
+        assert!(!fired);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+        assert!(is_still_active(&manager, &leg).await);
+
+        sqlx::query("DELETE FROM monthly_state").execute(&pool).await.unwrap();
+        let stall = stall_on_positions_current(&pool).await;
+        let (context, ()) = tokio::join!(
+            manager.build_risk_context(),
+            write_the_basis_while_a_snapshot_waits(&pool, &landing, stall)
+        );
+
+        assert_eq!(context.unwrap().capital, Decimal::ZERO);
+        assert_eq!(manager.build_risk_context().await.unwrap().capital, dec!(1000));
     }
 
     /// Reconciliation passes, with the manager held the way the daemon holds
@@ -13484,7 +13751,7 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
-    async fn test_losing_close_before_first_boundary_poll_keeps_a_valid_base(pool: sqlx::PgPool) {
+    async fn test_losing_close_before_first_boundary_poll_writes_no_zero_base(pool: sqlx::PgPool) {
         let manager = create_postgres_test_manager(pool.clone());
         let now = chrono::Utc::now();
 
@@ -13504,8 +13771,10 @@ mod tests {
         );
         apply_event_to_projections(&pool, &envelope).await.unwrap();
 
+        // No row, so no zero: the base is the configured capital, and invalid
+        // only because the month's reset has not landed.
         let snapshot = manager.canonical_budget_snapshot(now).await.unwrap();
-        assert!(!snapshot.capital_base_invalid);
+        assert!(snapshot.capital_base_invalid);
         assert_eq!(snapshot.capital_base, dec!(10000));
         assert!(!manager.evaluate_monthly_halt().await);
         assert!(!manager.circuit_breaker().blocks_new_entries().await);

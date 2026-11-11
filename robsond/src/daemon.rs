@@ -123,6 +123,9 @@ pub struct Daemon<E: Venue + 'static, S: Store + 'static> {
     pg_pool: Option<Arc<sqlx::PgPool>>,
     /// Last month processed by the month-boundary poller.
     last_month_check: Arc<RwLock<(i32, u32)>>,
+    /// `robsond_month_boundary_pending`, which that poller sets. A field so a
+    /// test can watch its own.
+    month_boundary_pending: prometheus::Gauge,
     /// The executor's journal, whose gate gives every operation its permit
     /// (ADR-0056 step 7). Held here so nothing reaches it through the manager
     /// lock.
@@ -318,6 +321,7 @@ impl Daemon<StubExchange, MemoryStore> {
             #[cfg(feature = "postgres")]
             pg_pool: None,
             last_month_check: initial_month_check(),
+            month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             stop_timings: StopTimings::default(),
         }
@@ -396,6 +400,7 @@ impl Daemon<StubExchange, MemoryStore> {
             #[cfg(feature = "postgres")]
             pg_pool: None,
             last_month_check: initial_month_check(),
+            month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             stop_timings: StopTimings::default(),
         })
@@ -477,6 +482,7 @@ impl Daemon<StubExchange, MemoryStore> {
             projection_recovery,
             pg_pool,
             last_month_check: initial_month_check(),
+            month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             stop_timings: StopTimings::default(),
         }
@@ -554,6 +560,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             #[cfg(feature = "postgres")]
             pg_pool: None,
             last_month_check: initial_month_check(),
+            month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             stop_timings: StopTimings::default(),
         }
@@ -642,6 +649,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             projection_recovery,
             pg_pool,
             last_month_check: initial_month_check(),
+            month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             stop_timings: StopTimings::default(),
         }
@@ -755,6 +763,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         let journal = Arc::clone(&self.order_journal);
         crate::metrics::init_operation_gate_metrics();
         crate::metrics::observe_streams_suspended(0, 0);
+        self.month_boundary_pending.set(0.0);
         journal.gate().set_observer(Arc::new(crate::metrics::GateMetrics));
 
         // Cancelled when the stop enters Closing: the main loop, the workers,
@@ -1181,7 +1190,11 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             "Month boundary detected, processing reset"
         );
 
-        self.handle_month_boundary(now).await?;
+        // Pending until this month's reset lands or is found. A failure leaves
+        // last_month_check behind, so the next poll retries.
+        let handled = self.handle_month_boundary(now).await;
+        self.month_boundary_pending.set(if handled.is_ok() { 0.0 } else { 1.0 });
+        handled?;
 
         let mut last_month_check = self.last_month_check.write().await;
         *last_month_check = current_month;
@@ -1235,32 +1248,66 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 .expect("midnight must be valid"),
             chrono::Utc,
         );
-        let prev_capital = {
-            let manager = self.position_manager.read().await;
-            manager.load_capital_base_for_month(prev_month).await.unwrap_or(Decimal::ZERO)
-        };
         let all_open_positions = self.store.positions().find_active().await?;
         let armed_count = all_open_positions
             .iter()
             .filter(|p| matches!(p.state, PositionState::Armed))
             .count() as u32;
-        let armed_risk = prev_capital * Decimal::new(1, 2) * Decimal::from(armed_count);
+        // Only the base the previous month's reset recorded. A failed read
+        // appends no reset: counting Armed risk as zero would overstate the
+        // basis for the whole month. The next poll retries.
+        let prev_capital = {
+            let manager = self.position_manager.read().await;
+            manager.recorded_capital_base(prev_month).await
+        };
+        let prev_capital = prev_capital.inspect_err(|e| {
+            error!(
+                error = %e,
+                year = now.year(),
+                month = now.month(),
+                "Month boundary reset deferred: the previous month's capital base could not be \
+                 read; no reset appended, retrying at the next poll"
+            );
+        })?;
+        let armed_risk = match prev_capital {
+            Some(prev_capital) => prev_capital * Decimal::new(1, 2) * Decimal::from(armed_count),
+            // Bootstrap: with nothing Armed the previous base reserves nothing.
+            None if armed_count == 0 => Decimal::ZERO,
+            None => {
+                let reason = format!(
+                    "{armed_count} Armed position(s) need the previous month's capital base for \
+                     their reservation, and no reset recorded one; disarm them or record that \
+                     base"
+                );
+                error!(
+                    year = now.year(),
+                    month = now.month(),
+                    armed_count,
+                    "Month boundary reset deferred: {reason}; no reset appended, retrying at the \
+                     next poll"
+                );
+                return Err(DaemonError::MonthBoundaryDeferred { reason });
+            },
+        };
         let carried_risk = carried_risk_committed + armed_risk;
 
         // current_equity per ADR-0024 §6: wallet balance from the exchange.
         // The capital_base is pessimistic: it subtracts carried_risk (worst case
         // loss from inherited positions) from current_equity. This guarantees
-        // every month starts with 4 available slots.
+        // every month starts with 4 available slots. Only the operated wallet
+        // sets the basis: a failed read appends no reset, and the next poll
+        // retries until the venue answers.
         let current_equity = match self.exchange.get_futures_balance().await {
             Ok(balance) => balance.wallet_balance,
             Err(e) => {
-                warn!(
+                error!(
                     error = %e,
-                    "Failed to query exchange balance for month boundary — \
-                     falling back to local equity estimate"
+                    year = now.year(),
+                    month = now.month(),
+                    "Month boundary reset deferred: the wallet balance could not be read; no \
+                     reset appended, retrying at the next poll"
                 );
-                let manager = self.position_manager.read().await;
-                manager.compute_current_equity().await?
+                return Err(e.into());
             },
         };
         let capital_base = (current_equity - carried_risk).max(rust_decimal::Decimal::ZERO);
@@ -2766,6 +2813,77 @@ mod tests {
         assert!(!daemon.poll_month_boundary(now).await.unwrap());
     }
 
+    /// The `MonthBoundaryReset` events in the daemon's store: base, carried
+    /// risk, month, year.
+    async fn month_resets(
+        daemon: &Daemon<StubExchange, MemoryStore>,
+    ) -> Vec<(Decimal, Decimal, u32, i32)> {
+        let events = daemon.store.events().get_all_events().await.unwrap();
+        events
+            .iter()
+            .filter_map(|event| match event {
+                robson_domain::Event::MonthBoundaryReset {
+                    capital_base,
+                    carried_positions_risk,
+                    month,
+                    year,
+                    ..
+                } => Some((*capital_base, *carried_positions_risk, *month, *year)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A gauge of the test's own in place of the shared one.
+    fn watch_month_boundary_pending(
+        daemon: &mut Daemon<StubExchange, MemoryStore>,
+    ) -> prometheus::Gauge {
+        let pending = prometheus::Gauge::new("test_month_boundary_pending", "test").unwrap();
+        daemon.month_boundary_pending = pending.clone();
+        pending
+    }
+
+    /// ADR-0024 §6: only the operated wallet sets the basis. A boundary whose
+    /// wallet read fails appends no reset, with no local estimate in its place;
+    /// the month stays pending and the next poll appends the wallet's basis.
+    /// The configured capital (10,000) differs from the wallet (8,000), so a
+    /// fallback to it would show.
+    #[tokio::test]
+    async fn a_failed_wallet_read_appends_no_reset_and_the_next_poll_retries() {
+        let mut daemon = Daemon::new_stub(Config::test());
+        let pending = watch_month_boundary_pending(&mut daemon);
+        daemon.exchange.set_futures_balance(dec!(8000));
+        let boundary = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
+
+        daemon.exchange.set_fail_next(true);
+        let error = daemon.poll_month_boundary(boundary).await.unwrap_err();
+
+        assert!(matches!(error, DaemonError::Exec(_)), "{error:?}");
+        assert!(month_resets(&daemon).await.is_empty());
+        assert_eq!(pending.get(), 1.0);
+
+        let retry = boundary + chrono::Duration::seconds(60);
+        assert!(daemon.poll_month_boundary(retry).await.unwrap());
+
+        assert_eq!(month_resets(&daemon).await, vec![(dec!(8000), dec!(0), 5, 2026)]);
+        assert_eq!(pending.get(), 0.0);
+        assert!(!daemon.poll_month_boundary(retry).await.unwrap());
+    }
+
+    /// The pending gauge exports 0 from startup, before any poll.
+    #[tokio::test]
+    async fn the_month_boundary_gauge_starts_at_zero() {
+        let mut daemon = Daemon::new_stub(Config::test());
+        let pending = watch_month_boundary_pending(&mut daemon);
+        pending.set(1.0);
+        let stop = StopRequest::default();
+        stop.ask();
+
+        daemon.run_until(stop).await.unwrap();
+
+        assert_eq!(pending.get(), 0.0);
+    }
+
     /// ADR-0056 §5: a restart reads the leg evidence back from `event_log`,
     /// since `positions_current` has no column for it (§8: no migration in
     /// step 6). In stream order: timestamps here run against the stream to
@@ -3298,7 +3416,7 @@ mod tests {
         .unwrap();
         assert_eq!(event_count, 1);
 
-        // Same text as load_capital_base_for_month, so same parameter types: SQLx
+        // Same parameter types as the production reads of this table: SQLx
         // caches the prepared statement per connection.
         let capital_base: Decimal = sqlx::query_scalar(
             "SELECT capital_base FROM monthly_state WHERE year = $1 AND month = $2",
@@ -3309,6 +3427,214 @@ mod tests {
         .await
         .unwrap();
         assert!(capital_base > Decimal::ZERO, "capital_base = {capital_base}");
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn month_reset_events(pool: &sqlx::PgPool, tenant_id: uuid::Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_log WHERE tenant_id = $1 AND event_type = 'month_boundary_reset'",
+        )
+        .bind(tenant_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The month's row as the reset leaves it: base and reset time. Text of its
+    /// own, so no production statement is cached with other parameter types.
+    #[cfg(feature = "postgres")]
+    async fn month_row(
+        pool: &sqlx::PgPool,
+        at: chrono::DateTime<Utc>,
+    ) -> Option<(Decimal, Option<chrono::DateTime<Utc>>)> {
+        sqlx::query_as(
+            "SELECT capital_base, boundary_reset_at FROM monthly_state \
+             WHERE year = $1 AND month = $2 /* test */",
+        )
+        .bind(at.year() as i16)
+        .bind(at.month() as i16)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// On PostgreSQL: a boundary whose wallet read fails leaves nothing in
+    /// `event_log` or `monthly_state`, so the month is not marked as reset, and
+    /// the next poll persists the wallet's basis.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_failed_wallet_read_at_the_boundary_persists_no_reset(pool: sqlx::PgPool) {
+        let tenant_id = uuid::Uuid::from_u128(0x13205);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let mut daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let pending = watch_month_boundary_pending(&mut daemon);
+        daemon.exchange.set_futures_balance(dec!(8000));
+        let boundary = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
+
+        daemon.exchange.set_fail_next(true);
+        let error = daemon.poll_month_boundary(boundary).await.unwrap_err();
+
+        assert!(matches!(error, DaemonError::Exec(_)), "{error:?}");
+        assert_eq!(month_reset_events(&pool, tenant_id).await, 0);
+        assert_eq!(month_row(&pool, boundary).await, None);
+        assert_eq!(pending.get(), 1.0);
+
+        let retry = boundary + chrono::Duration::seconds(60);
+        assert!(daemon.poll_month_boundary(retry).await.unwrap());
+
+        assert_eq!(month_reset_events(&pool, tenant_id).await, 1);
+        assert_eq!(month_row(&pool, boundary).await, Some((dec!(8000), Some(retry))));
+        assert_eq!(pending.get(), 0.0);
+    }
+
+    /// An Armed leg in the in-memory book, to be reserved at the boundary.
+    #[cfg(feature = "postgres")]
+    async fn save_armed(daemon: &Daemon<StubExchange, MemoryStore>) {
+        let mut armed =
+            Position::new(uuid::Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        armed.state = PositionState::Armed;
+        daemon.store.positions().save(&armed).await.unwrap();
+    }
+
+    /// The previous month's base cannot be read (a NaN, which no `Decimal`
+    /// holds), so Armed risk is unknown: the boundary appends no reset rather
+    /// than count it as zero. Once the row reads, the next poll appends it,
+    /// reserving 1% of that recorded base (9,000), not of the configured
+    /// capital (10,000), for the Armed leg.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_failed_previous_month_read_at_the_boundary_persists_no_reset(pool: sqlx::PgPool) {
+        let previous = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
+        sqlx::query(
+            "INSERT INTO monthly_state (year, month, capital_base, boundary_reset_at, created_at) \
+             VALUES ($1, $2, 'NaN', $3, $3)",
+        )
+        .bind(previous.year() as i16)
+        .bind(previous.month() as i16)
+        .bind(previous)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let tenant_id = uuid::Uuid::from_u128(0x13206);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let mut daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let pending = watch_month_boundary_pending(&mut daemon);
+        save_armed(&daemon).await;
+        let boundary = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 1).single().unwrap();
+
+        let error = daemon.poll_month_boundary(boundary).await.unwrap_err();
+
+        assert!(matches!(error, DaemonError::Database(_)), "{error:?}");
+        assert_eq!(month_reset_events(&pool, tenant_id).await, 0);
+        assert_eq!(month_row(&pool, boundary).await, None);
+        assert_eq!(pending.get(), 1.0);
+
+        sqlx::query("UPDATE monthly_state SET capital_base = 9000 WHERE year = $1 AND month = $2")
+            .bind(previous.year() as i16)
+            .bind(previous.month() as i16)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retry = boundary + chrono::Duration::seconds(60);
+        assert!(daemon.poll_month_boundary(retry).await.unwrap());
+
+        assert_eq!(month_reset_events(&pool, tenant_id).await, 1);
+        assert_eq!(month_row(&pool, boundary).await, Some((dec!(9910), Some(retry))));
+        assert_eq!(month_resets(&daemon).await, vec![(dec!(9910), dec!(90), 6, 2026)]);
+        assert_eq!(pending.get(), 0.0);
+    }
+
+    /// With an Armed leg, a previous month with no recorded base, no row or a
+    /// row no reset stamped, defers the reset instead of reserving 1% of the
+    /// configured capital. Once a reset-stamped base is on record, it lands.
+    /// With nothing Armed, the fresh-database test above shows a missing
+    /// previous month needs nothing.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn an_armed_leg_without_a_recorded_previous_base_defers_the_reset(pool: sqlx::PgPool) {
+        let tenant_id = uuid::Uuid::from_u128(0x13207);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let mut daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let pending = watch_month_boundary_pending(&mut daemon);
+        save_armed(&daemon).await;
+        let previous = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
+        let boundary = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 1).single().unwrap();
+
+        let missing = daemon.poll_month_boundary(boundary).await.unwrap_err();
+        assert!(matches!(missing, DaemonError::MonthBoundaryDeferred { .. }), "{missing:?}");
+
+        sqlx::query(
+            "INSERT INTO monthly_state (year, month, capital_base, created_at) \
+             VALUES ($1, $2, 9000, $3)",
+        )
+        .bind(previous.year() as i16)
+        .bind(previous.month() as i16)
+        .bind(previous)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let unstamped = daemon.poll_month_boundary(boundary).await.unwrap_err();
+        assert!(matches!(unstamped, DaemonError::MonthBoundaryDeferred { .. }), "{unstamped:?}");
+        assert_eq!(month_reset_events(&pool, tenant_id).await, 0);
+        assert_eq!(month_row(&pool, boundary).await, None);
+        assert_eq!(pending.get(), 1.0);
+
+        sqlx::query(
+            "UPDATE monthly_state SET boundary_reset_at = created_at \
+             WHERE year = $1 AND month = $2",
+        )
+        .bind(previous.year() as i16)
+        .bind(previous.month() as i16)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(daemon.poll_month_boundary(boundary).await.unwrap());
+
+        assert_eq!(month_row(&pool, boundary).await, Some((dec!(9910), Some(boundary))));
+        assert_eq!(pending.get(), 0.0);
+    }
+
+    /// Before the first poll of a month with no landed reset, the daemon's own
+    /// manager refuses entries; the poll lands the reset and they reopen. The
+    /// guard reads `monthly_state`, not the pending gauge.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn admissions_reopen_once_the_boundary_poll_lands_the_reset(pool: sqlx::PgPool) {
+        let tenant_id = uuid::Uuid::from_u128(0x13208);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let mut daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let pending = watch_month_boundary_pending(&mut daemon);
+        daemon.exchange.set_futures_balance(dec!(8000));
+        let now = Utc::now();
+        let manager = Arc::clone(&daemon.position_manager);
+
+        let before = manager.read().await.admission_capital_base(now).await;
+        assert!(matches!(before, Err(DaemonError::AdmissionsClosed { .. })), "{before:?}");
+        assert!(
+            manager
+                .read()
+                .await
+                .canonical_budget_snapshot(now)
+                .await
+                .unwrap()
+                .capital_base_invalid
+        );
+        assert_eq!(pending.get(), 0.0, "the gauge is not what refuses");
+
+        assert!(daemon.poll_month_boundary(now).await.unwrap());
+
+        let snapshot = manager.read().await.canonical_budget_snapshot(now).await.unwrap();
+        assert!(!snapshot.capital_base_invalid);
+        assert_eq!(snapshot.capital_base, dec!(8000));
+        assert_eq!(manager.read().await.admission_capital_base(now).await.unwrap(), dec!(8000));
     }
 
     #[tokio::test]

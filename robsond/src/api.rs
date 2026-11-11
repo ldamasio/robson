@@ -240,7 +240,8 @@ pub struct StatusResponse {
     /// Starting capital basis for the current month.
     pub capital_base: Decimal,
     /// Whether the persisted monthly budget basis is invalid under ADR-0051
-    /// §1 (`capital_base <= 0`).
+    /// §1 (`capital_base <= 0`, or the month's reset has not landed), or its
+    /// latent risk unresolved.
     pub monthly_budget_basis_invalid: bool,
     /// Current futures wallet balance reported by the exchange.
     pub wallet_balance: Decimal,
@@ -259,6 +260,11 @@ pub struct MonthlyPositionsResponse {
     pub positions: Vec<PositionSummary>,
     pub occupied_slots: usize,
     pub slot_cells_total: usize,
+    /// The current month's basis cannot meter capacity (ADR-0051 §1):
+    /// `capital_base <= 0`, or its reset has not landed. Its new-entry cells
+    /// are then zero. Always false for other months.
+    #[serde(default)]
+    pub capacity_invalid: bool,
 }
 
 /// Durable audit events for one UTC calendar day, newest first.
@@ -1950,11 +1956,15 @@ where
     let occupied_slots = positions.len();
     let inherited_slots =
         positions.iter().filter(|position| position.created_at < requested).count();
-    let base_slots_available = TradingPolicy::default().slots_available(
-        monthly.capital_base,
-        realized_loss,
-        Decimal::ZERO,
-    ) as usize;
+    let now = chrono::Utc::now();
+    let current_month = (requested.year(), requested.month()) == (now.year(), now.month());
+    let capacity_invalid = current_month && monthly.basis_invalid();
+    let base_slots_available = if capacity_invalid {
+        0
+    } else {
+        TradingPolicy::default().slots_available(monthly.capital_base, realized_loss, Decimal::ZERO)
+            as usize
+    };
     let slot_cells_total = base_slots_available.saturating_add(inherited_slots);
 
     Ok(Json(MonthlyPositionsResponse {
@@ -1962,6 +1972,7 @@ where
         positions,
         occupied_slots,
         slot_cells_total,
+        capacity_invalid,
     }))
 }
 
@@ -2067,17 +2078,21 @@ where
     //
     // The caller never supplies capital. Position sizing is derived:
     //   position_size = (capital_base × 1%) / technical_stop_distance
+    //
+    // A month whose reset has not landed answers 503: its basis did not come
+    // from the operated wallet.
     let capital = {
         let manager = state.position_manager.read().await;
-        manager.load_capital_base_for_month(chrono::Utc::now()).await
+        manager.admission_capital_base(chrono::Utc::now()).await
     };
-    let capital = capital.map_err(|e| {
-        (
+    let capital = capital.map_err(|e| match e {
+        DaemonError::AdmissionsClosed { .. } => to_error_response(e),
+        e => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: format!("Failed to load capital base: {}", e),
             }),
-        )
+        ),
     })?;
     // Rebuild from the engine snapshot so the operator-configured
     // execution-cost parameters survive the capital swap (ADR-0039).
@@ -3973,6 +3988,120 @@ mod tests {
 
         seed_close(month_start(2027, 4)).await;
         assert_eq!(view().await, (2, 2), "close exactly at the month's start");
+    }
+
+    /// Until the current month's reset lands, `/status` and that month's view
+    /// report the basis invalid with no new-entry capacity, and an arm answers
+    /// 503 with nothing armed. A row the peak writer created reads the same.
+    /// Once the reset stamps the row, both report capacity and the arm goes
+    /// through.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_month_without_a_landed_reset_reports_no_capacity(pool: sqlx::PgPool) {
+        let tenant_id = Uuid::now_v7();
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        let store = Arc::new(MemoryStore::new());
+        let executor = Arc::new(Executor::new(
+            Arc::clone(&exchange),
+            Arc::new(IntentJournal::new()),
+            store.clone(),
+        ));
+        let event_bus = Arc::new(crate::event_bus::EventBus::new(100));
+        let manager = PositionManager::new(
+            Engine::new(RiskConfig::new(dec!(10000)).unwrap()),
+            executor,
+            store.clone(),
+            Arc::clone(&event_bus),
+            Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
+        )
+        .with_event_log(pool.clone(), tenant_id);
+        let circuit_breaker = manager.circuit_breaker();
+        let order_journal = manager.order_journal();
+        let app = create_router(Arc::new(ApiState {
+            exchange,
+            position_manager: Arc::new(RwLock::new(manager)),
+            event_bus,
+            circuit_breaker,
+            wallet_balance_cache: Mutex::new(None),
+            pg_pool: Some(Arc::new(pool.clone())),
+            tenant_id: Some(tenant_id),
+            google_auth: None,
+            legacy_api_token: None,
+            funding: FundingConfig::default(),
+            funding_route_mode: FundingRouteMode::Selected,
+            venue_feed: VenueFeedView::default(),
+            order_journal,
+        }));
+        let now = chrono::Utc::now();
+        let this_month = format!("{:04}-{:02}", now.year(), now.month());
+        let capacity = || async {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri("/status").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let status: StatusResponse = serde_json::from_slice(&body).unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/positions?month={this_month}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let month: MonthlyPositionsResponse = serde_json::from_slice(&body).unwrap();
+            (
+                status.monthly_budget_basis_invalid,
+                status.new_slots_available,
+                month.capacity_invalid,
+                month.slot_cells_total,
+            )
+        };
+        let arm = || async {
+            let body = serde_json::json!({ "symbol": "BTCUSDT", "side": "long" });
+            app.clone()
+                .oneshot(api_request("POST", "/positions", Some(body)))
+                .await
+                .unwrap()
+                .status()
+        };
+
+        assert_eq!(capacity().await, (true, 0, true, 0), "no row");
+        assert_eq!(arm().await, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(store.positions().find_active().await.unwrap().is_empty());
+
+        sqlx::query(
+            "INSERT INTO monthly_state (year, month, capital_base, month_peak_net, created_at) \
+             VALUES ($1, $2, 10000, 0, $3)",
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(capacity().await, (true, 0, true, 0), "a row no reset stamped");
+        assert_eq!(arm().await, StatusCode::SERVICE_UNAVAILABLE);
+
+        sqlx::query(
+            "UPDATE monthly_state SET boundary_reset_at = $3 WHERE year = $1 AND month = $2",
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(capacity().await, (false, 4, false, 4), "the reset landed");
+        assert_eq!(arm().await, StatusCode::CREATED);
     }
 
     #[tokio::test]
