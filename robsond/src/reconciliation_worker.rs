@@ -57,6 +57,18 @@ pub struct ReconciliationWorker<E: ExchangePort + 'static, S: Store + 'static> {
     /// The journal whose gate gives each scan its permit; read through the
     /// manager when not given.
     order_journal: Option<Arc<OrderJournal>>,
+    /// Where a test stops the orphan sweep right after its fresh leg read.
+    #[cfg(test)]
+    fresh_read_pause: std::sync::Mutex<Option<Arc<TestPause>>>,
+}
+
+/// A test's stop at one point of a scan: the scan says it got there, then
+/// waits to be let go.
+#[cfg(test)]
+#[derive(Default)]
+struct TestPause {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 #[derive(Debug, Clone)]
@@ -378,6 +390,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             shutdown_token,
             metrics: ReconciliationMetrics::global(),
             order_journal: None,
+            #[cfg(test)]
+            fresh_read_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -398,6 +412,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     fn with_metrics(mut self, metrics: ReconciliationMetrics) -> Self {
         self.metrics = metrics;
         self
+    }
+
+    /// Stop the next orphan sweep right after its fresh leg read.
+    #[cfg(test)]
+    fn pause_after_next_fresh_read(&self) -> Arc<TestPause> {
+        let pause = Arc::new(TestPause::default());
+        *self.fresh_read_pause.lock().unwrap() = Some(Arc::clone(&pause));
+        pause
     }
 
     /// Run the periodic reconciliation loop until shutdown.
@@ -571,6 +593,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     /// read the legs cancels nothing, as before. What is withheld is reported:
     /// at most 500 orders listed, the rest counted, and each scan replaces the
     /// report; listing never narrows the veto.
+    ///
+    /// **Ownership (ADR-0056 step 7, PR O).** The covered set is read before
+    /// the open orders, so an order outside it is revalidated before it is
+    /// treated as an orphan: an order a live operation placed or is cancelling
+    /// is owned, and so is one a leg has recorded since, by a fresh read of the
+    /// legs after every registration check. Owned orders are counted and kept,
+    /// neither cancelled nor reported as withheld.
     async fn sweep_orphan_insurance_orders(&self, exchange_positions: &[ExchangePosition]) {
         let journal = self.order_journal().await;
         let vetoed = journal.gate().orphan_cancel_vetoed();
@@ -660,6 +689,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             )
             .await;
 
+            let mut candidates = Vec::new();
             for order in open_orders {
                 if !Self::is_orphan_insurance_order(&order) {
                     continue;
@@ -678,7 +708,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                     );
                     continue;
                 }
+                candidates.push(order);
+            }
+            if candidates.is_empty() {
+                continue;
+            }
 
+            for order in self.still_orphaned(symbol, candidates, journal).await {
                 let mut withhold = |order: &OpenOrderRecord| {
                     crate::metrics::ORPHAN_CANCEL_WITHHELD.inc();
                     let listed = withheld.withhold(WithheldOrder {
@@ -746,6 +782,96 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                     },
                 }
             }
+        }
+    }
+
+    /// Of `candidates`, the `ins-` orders on `symbol` that no one owns now, in
+    /// the order (ADR-0056 step 7, PR O): registration first, then one fresh
+    /// read of the legs, then the caller's cancels.
+    ///
+    /// The covered set was read before the open orders, so a stop accepted
+    /// since, a new leg's first stop or a replacement's successor, is outside
+    /// it, recorded by now or not. A stop is registered, in the journal's
+    /// memory, from before its request until its operation ends, which is after
+    /// its leg recorded it. So an order the registration check finds
+    /// unregistered was either never a live operation's, or its operation has
+    /// ended and recorded what it would, in time for the fresh read; an order
+    /// the venue already lists cannot gain an owner after the check. An order
+    /// a live operation is cancelling is its own too. A failed fresh read
+    /// cancels nothing on the symbol (design §2.9).
+    async fn still_orphaned(
+        &self,
+        symbol: &Symbol,
+        candidates: Vec<OpenOrderRecord>,
+        journal: &OrderJournal,
+    ) -> Vec<OpenOrderRecord> {
+        // 1. Every candidate's registration, before the read.
+        let (owned, unregistered): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|order| {
+            journal.owned_by_live_operation(&order.client_order_id, &order.exchange_order_id)
+        });
+        for order in &owned {
+            Self::keep_owned(symbol, order, "a live operation placed or is cancelling it");
+        }
+        // 2. One fresh read of the legs, after every registration check.
+        let legs = match self.store.positions().find_active().await {
+            Ok(legs) => legs,
+            Err(error) => {
+                warn!(
+                    symbol = %symbol.as_pair(),
+                    error = %error,
+                    "Orphan insurance-order sweep: failed to re-read the legs; cancelling nothing \
+                     on this symbol"
+                );
+                return Vec::new();
+            },
+        };
+        #[cfg(test)]
+        self.pause_after_fresh_read().await;
+        let mut recorded = HashSet::new();
+        let mut unprotected = false;
+        for leg in legs.iter().filter(|leg| leg.symbol == *symbol) {
+            if let PositionState::Active { insurance_stop_id, .. } = &leg.state {
+                match insurance_stop_id.as_ref().or(leg.insurance_stop_id.as_ref()) {
+                    Some(id) => {
+                        recorded.insert(id.clone());
+                    },
+                    None => unprotected = true,
+                }
+            }
+        }
+        unregistered
+            .into_iter()
+            .filter(|order| {
+                let owned = unprotected || recorded.contains(&order.exchange_order_id);
+                if owned {
+                    Self::keep_owned(
+                        symbol,
+                        order,
+                        "a leg has recorded it, or lacks a stop, since",
+                    );
+                }
+                !owned
+            })
+            .collect()
+    }
+
+    fn keep_owned(symbol: &Symbol, order: &OpenOrderRecord, why: &str) {
+        crate::metrics::ORPHAN_CANCEL_OWNED.inc();
+        info!(
+            symbol = %symbol.as_pair(),
+            exchange_order_id = %order.exchange_order_id,
+            client_order_id = %order.client_order_id,
+            why,
+            "Insurance-stop order outside the scan's covered set is owned; not cancelled"
+        );
+    }
+
+    #[cfg(test)]
+    async fn pause_after_fresh_read(&self) {
+        let pause = self.fresh_read_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
         }
     }
 
@@ -2237,6 +2363,409 @@ mod tests {
         let outcome = row.outcome.unwrap();
         assert!(outcome.not_sent);
         assert_eq!(outcome.cancel_class, Some("withheld"));
+    }
+
+    // ---- ADR-0056 step 7, PR O: the orphan sweep revalidates ownership ----
+
+    /// A leg with its recorded stop V on the venue, a journaled worker, and an
+    /// executor sharing the worker's store, venue and journal, every mutation
+    /// passing the gate's choke point as in production. V stays recorded until
+    /// a replacement records its successor, so the symbol is never one with an
+    /// unprotected leg, which the sweep would skip anyway.
+    struct OwnershipRig {
+        worker: Arc<ReconciliationWorker<StubExchange, MemoryStore>>,
+        backend: Arc<StubJournalBackend>,
+        journal: Arc<OrderJournal>,
+        exchange: Arc<StubExchange>,
+        store: Arc<MemoryStore>,
+        executor: Arc<Executor<StubExchange, MemoryStore>>,
+        leg: Position,
+        symbol: Symbol,
+        v: String,
+    }
+
+    /// A replacement of V by W under the main loop's permit, stopped at its
+    /// predecessor's cancel: W accepted and its outcome landed, W not yet
+    /// recorded on the leg, its operation live.
+    struct HeldReplacement {
+        hold: Arc<tokio::sync::Notify>,
+        task: tokio::task::JoinHandle<Result<Vec<robson_exec::ActionResult>, ExecError>>,
+        w: String,
+        w_client: String,
+    }
+
+    /// Wait for the scan to reach a pause; a scan that never does fails the
+    /// test instead of hanging it.
+    async fn reached(point: &tokio::sync::Notify) {
+        tokio::time::timeout(Duration::from_secs(5), point.notified())
+            .await
+            .expect("the scan never reached its pause");
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the condition never held");
+    }
+
+    async fn ownership_rig() -> OwnershipRig {
+        use robson_exec::venue::Venue;
+
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let v = exchange
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.010)).unwrap(),
+                Price::new(dec!(99)).unwrap(),
+                "ins-v",
+            )
+            .await
+            .unwrap()
+            .exchange_order_id;
+        let mut leg = tracked_active_position(symbol.clone(), Side::Long);
+        if let PositionState::Active { insurance_stop_id, .. } = &mut leg.state {
+            *insurance_stop_id = Some(v.clone());
+        }
+        leg.insurance_stop_id = Some(v.clone());
+        store.positions().save(&leg).await.unwrap();
+        exchange.set_open_position(
+            symbol.clone(),
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        let (worker, backend, journal) =
+            journaled_worker_and_journal(exchange.clone(), store.clone(), event_bus);
+        exchange.attach_gate(Arc::clone(journal.gate()));
+        let worker = Arc::new(worker.with_order_journal(Arc::clone(&journal)));
+        let executor = Arc::new(
+            Executor::new(exchange.clone(), Arc::new(IntentJournal::new()), store.clone())
+                .with_order_journal(Arc::clone(&journal)),
+        );
+        OwnershipRig {
+            worker,
+            backend,
+            journal,
+            exchange,
+            store,
+            executor,
+            leg,
+            symbol,
+            v,
+        }
+    }
+
+    impl OwnershipRig {
+        async fn recorded_stop(&self) -> Option<String> {
+            let leg = self.store.positions().find_by_id(self.leg.id).await.unwrap().unwrap();
+            leg.insurance_stop_id
+        }
+
+        fn scan(&self) -> tokio::task::JoinHandle<DaemonResult<usize>> {
+            let worker = Arc::clone(&self.worker);
+            tokio::spawn(async move { worker.scan_and_reconcile().await })
+        }
+
+        /// An `ins-` order on the venue that no operation of this process
+        /// registered, placed under a permit as any mutation must be: one
+        /// without would latch, and the veto would mask every check.
+        async fn place_unregistered(&self, client_order_id: &'static str) -> String {
+            use robson_exec::gate::OperationKind;
+
+            let permit = self.journal.acquire(OperationKind::Panic).unwrap();
+            let order = permit
+                .run(self.exchange.place_stop_market_order(
+                    &self.symbol,
+                    OrderSide::Sell,
+                    Quantity::new(dec!(0.010)).unwrap(),
+                    Price::new(dec!(98)).unwrap(),
+                    client_order_id,
+                ))
+                .await
+                .unwrap()
+                .exchange_order_id;
+            assert!(!self.journal.owned_by_live_operation(client_order_id, &order));
+            assert!(!self.journal.gate().orphan_cancel_vetoed(), "nothing latched or fenced");
+            order
+        }
+
+        fn cancels_of(&self, order_id: &str) -> usize {
+            self.backend
+                .rows()
+                .into_iter()
+                .filter(|row| {
+                    row.intent.as_ref().unwrap().cancels_order_id.as_deref() == Some(order_id)
+                })
+                .count()
+        }
+
+        async fn replacement_held_at_its_cancel(&self) -> HeldReplacement {
+            use robson_engine::EngineAction;
+            use robson_exec::gate::OperationKind;
+
+            let hold = Arc::new(std::sync::Mutex::new(None));
+            let (exchange, slot) = (Arc::clone(&self.exchange), Arc::clone(&hold));
+            self.exchange.set_after_next_stop_accepted(move || {
+                *slot.lock().unwrap() = Some(exchange.hold_next_mutation());
+            });
+            let action = EngineAction::ReplaceInsuranceStop {
+                position_id: self.leg.id,
+                symbol: self.symbol.clone(),
+                side: OrderSide::Sell,
+                quantity: self.leg.quantity,
+                previous_order_id: self.v.clone(),
+                new_stop_price: Price::new(dec!(99.5)).unwrap(),
+            };
+            let permit = self.journal.acquire(OperationKind::MainLoop).unwrap();
+            let executor = Arc::clone(&self.executor);
+            let task =
+                tokio::spawn(async move { permit.run(executor.execute(vec![action])).await });
+            let exchange = Arc::clone(&self.exchange);
+            wait_until(|| {
+                exchange.mutations().iter().any(|m| m.what == "DELETE /fapi/v1/algoOrder")
+            })
+            .await;
+            let hold = hold.lock().unwrap().take().expect("the predecessor's cancel is held");
+            let w = self
+                .exchange
+                .get_open_orders(&self.symbol)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|order| order.exchange_order_id != self.v)
+                .expect("W is on the venue");
+            assert_eq!(self.recorded_stop().await, Some(self.v.clone()), "W is not recorded");
+            HeldReplacement {
+                hold,
+                task,
+                w: w.exchange_order_id,
+                w_client: w.client_order_id,
+            }
+        }
+    }
+
+    /// A stop recorded before the cancel is not cancelled (ADR-0056 step 7,
+    /// Implementation Notes). The sweep reads the legs (V covered), then the
+    /// open orders, which list V and the successor W. While that answer is on
+    /// its way the replacement completes: V cancelled, W recorded, its
+    /// operation over, so nothing registers W any more. The fresh read of the
+    /// legs sees W recorded, and the sweep leaves it.
+    #[tokio::test]
+    async fn a_stop_recorded_before_the_cancel_is_not_cancelled() {
+        let rig = ownership_rig().await;
+        let held = rig.replacement_held_at_its_cancel().await;
+        let answered = Arc::new(tokio::sync::Notify::new());
+        let signal = Arc::clone(&answered);
+        rig.exchange.set_after_next_open_orders_read(move || signal.notify_one());
+        let read = rig.exchange.hold_next_open_orders_read();
+
+        let scan = rig.scan();
+        reached(&answered).await;
+        held.hold.notify_one();
+        held.task.await.unwrap().unwrap();
+        assert_eq!(rig.recorded_stop().await, Some(held.w.clone()), "W recorded");
+        assert!(!rig.journal.owned_by_live_operation(&held.w_client, &held.w));
+        assert!(!rig.journal.gate().orphan_cancel_vetoed());
+        read.notify_one();
+        scan.await.unwrap().unwrap();
+
+        assert!(rig.exchange.has_stop_order(&held.w), "W stays on the venue");
+        assert_eq!(rig.exchange.stop_cancel_call_count(), 1, "only the replacement cancelled V");
+        assert_eq!(rig.cancels_of(&held.w), 0, "no cancel intent for W");
+        assert_eq!(rig.journal.withheld_report().total, 0);
+    }
+
+    /// The registration alone: W accepted, its outcome landed and its intent's
+    /// memory collected, not yet recorded on the leg, which still records V,
+    /// the fence open. The operation placing W still lists it, so the sweep
+    /// leaves it; once the replacement records W, it is covered.
+    #[tokio::test]
+    async fn a_stop_its_operation_still_owns_is_not_cancelled() {
+        let rig = ownership_rig().await;
+        let held = rig.replacement_held_at_its_cancel().await;
+        assert!(rig.backend.row(&held.w_client).unwrap().outcome.is_some(), "W's outcome landed");
+        assert!(!rig.journal.is_live(&held.w_client), "W's intent memory is gone");
+        assert!(!rig.journal.gate().orphan_cancel_vetoed());
+        let owned = crate::metrics::ORPHAN_CANCEL_OWNED.get();
+
+        rig.worker.scan_and_reconcile().await.unwrap();
+
+        assert!(rig.exchange.has_stop_order(&held.w), "W stays on the venue");
+        assert_eq!(rig.exchange.stop_cancel_call_count(), 0, "the sweep cancelled nothing");
+        assert_eq!(rig.cancels_of(&held.w), 0);
+        assert_eq!(rig.journal.withheld_report().total, 0, "owned, not withheld");
+        assert!(crate::metrics::ORPHAN_CANCEL_OWNED.get() >= owned + 1.0);
+
+        held.hold.notify_one();
+        held.task.await.unwrap().unwrap();
+        assert_eq!(rig.recorded_stop().await, Some(held.w.clone()));
+        rig.worker.scan_and_reconcile().await.unwrap();
+        assert!(rig.exchange.has_stop_order(&held.w), "recorded, so covered");
+        assert_eq!(rig.exchange.stop_cancel_call_count(), 1, "only V, by the replacement");
+    }
+
+    /// Across the boundary between the two checks: W is registered when the
+    /// registration check runs; right after the fresh read, before the sweep
+    /// acts on it, the replacement records W and its operation ends. W was
+    /// owned at the check, and the sweep leaves it. Read the legs first and
+    /// the registrations second, and this order is lost.
+    #[tokio::test]
+    async fn an_owner_ending_after_the_registration_check_still_owns_its_stop() {
+        let rig = ownership_rig().await;
+        let held = rig.replacement_held_at_its_cancel().await;
+        assert!(!rig.journal.gate().orphan_cancel_vetoed());
+        let pause = rig.worker.pause_after_next_fresh_read();
+
+        let scan = rig.scan();
+        reached(&pause.reached).await;
+        held.hold.notify_one();
+        held.task.await.unwrap().unwrap();
+        assert!(!rig.journal.owned_by_live_operation(&held.w_client, &held.w));
+        pause.resume.notify_one();
+        scan.await.unwrap().unwrap();
+
+        assert!(rig.exchange.has_stop_order(&held.w), "W stays on the venue");
+        assert_eq!(rig.exchange.stop_cancel_call_count(), 1, "only the replacement cancelled V");
+        assert_eq!(rig.cancels_of(&held.w), 0);
+    }
+
+    /// An order a live operation is cancelling is its own: a stray `ins-`
+    /// order X, placed by no operation of this process, recorded by no leg,
+    /// with a live operation's cancel of it held at the transport. Only that
+    /// cancel's target registers it, and the venue sees one cancel.
+    #[tokio::test]
+    async fn an_order_a_live_operation_is_cancelling_is_left_to_it() {
+        use robson_exec::gate::OperationKind;
+
+        let rig = ownership_rig().await;
+        let x = rig.place_unregistered("ins-x").await;
+        let hold = rig.exchange.hold_next_mutation();
+        let permit = rig.journal.acquire(OperationKind::CancelOrClose).unwrap();
+        let (journal, exchange, symbol, target, leg) = (
+            Arc::clone(&rig.journal),
+            Arc::clone(&rig.exchange),
+            rig.symbol.clone(),
+            x.clone(),
+            rig.leg.id,
+        );
+        let cancel = tokio::spawn(async move {
+            permit
+                .run(async {
+                    let request = exchange.cancel_stop_market_order(&symbol, &target);
+                    journal.journaled_cancel(Some(leg), &target, request).await
+                })
+                .await
+        });
+        let exchange = Arc::clone(&rig.exchange);
+        wait_until(|| exchange.mutations().iter().any(|m| m.what == "DELETE /fapi/v1/algoOrder"))
+            .await;
+        assert!(!rig.journal.owned_by_live_operation("ins-x", "not-x"), "no placement of X");
+        assert!(rig.journal.owned_by_live_operation("not-ins-x", &x), "a live cancel of X");
+        assert!(!rig.journal.gate().orphan_cancel_vetoed());
+
+        rig.worker.scan_and_reconcile().await.unwrap();
+        assert_eq!(rig.exchange.stop_cancel_call_count(), 0, "the sweep left X");
+        hold.notify_one();
+        let class = cancel.await.unwrap();
+        assert!(class.is_definite(), "{class:?}");
+
+        assert_eq!(rig.exchange.stop_cancel_call_count(), 1, "one cancel reached the venue");
+        assert_eq!(rig.cancels_of(&x), 1, "and one cancel intent");
+        assert!(!rig.exchange.has_stop_order(&x));
+    }
+
+    /// Two candidates on one symbol, each registered by a live operation that
+    /// is replacing the stop of its own leg. Every registration check comes
+    /// before the one fresh read: right after that read, each leg records its
+    /// successor and both operations end, and the sweep still leaves both.
+    /// Whichever candidate came second, a read hoisted before its check would
+    /// see it unrecorded and then miss its registration.
+    #[tokio::test]
+    async fn every_registration_check_precedes_the_one_fresh_read() {
+        use robson_exec::gate::OperationKind;
+
+        let rig = ownership_rig().await;
+        // A second leg on the symbol, with its own recorded stop.
+        let mut other = tracked_active_position(rig.symbol.clone(), Side::Long);
+        let other_stop = rig.place_unregistered("ins-vb").await;
+        if let PositionState::Active { insurance_stop_id, .. } = &mut other.state {
+            *insurance_stop_id = Some(other_stop.clone());
+        }
+        other.insurance_stop_id = Some(other_stop);
+        rig.store.positions().save(&other).await.unwrap();
+        let mut successors = Vec::new();
+        for (client, kind, leg) in [
+            ("ins-w1", OperationKind::Arm, rig.leg.clone()),
+            ("ins-w2", OperationKind::Signal, other.clone()),
+        ] {
+            let order = rig.place_unregistered(client).await;
+            let permit = rig.journal.acquire(kind).unwrap();
+            permit
+                .scope(async {
+                    rig.journal.open_intent(IntentSpec {
+                        position_id: Some(leg.id),
+                        kind: IntentKind::Protection,
+                        client_order_id: client.to_string(),
+                        cancels_order_id: None,
+                        params: serde_json::Value::Null,
+                    })
+                })
+                .await;
+            successors.push((client, order, permit, leg));
+        }
+        assert!(!rig.journal.gate().orphan_cancel_vetoed());
+        let pause = rig.worker.pause_after_next_fresh_read();
+
+        let scan = rig.scan();
+        reached(&pause.reached).await;
+        let mut kept = Vec::new();
+        for (client, order, permit, mut leg) in successors {
+            if let PositionState::Active { insurance_stop_id, .. } = &mut leg.state {
+                *insurance_stop_id = Some(order.clone());
+            }
+            leg.insurance_stop_id = Some(order.clone());
+            rig.store.positions().save(&leg).await.unwrap();
+            permit.complete();
+            assert!(!rig.journal.owned_by_live_operation(client, &order));
+            kept.push(order);
+        }
+        pause.resume.notify_one();
+        scan.await.unwrap().unwrap();
+
+        assert_eq!(rig.exchange.stop_cancel_call_count(), 0, "neither W1 nor W2 cancelled");
+        assert!(kept.iter().all(|order| rig.exchange.has_stop_order(order)));
+    }
+
+    /// With the journal failing, the stop's registration still lives in
+    /// memory. The latch holds the veto, so nothing would be cancelled either
+    /// way; what the registration decides is that W is owned, counted as such
+    /// and not reported as a withheld orphan.
+    #[tokio::test]
+    async fn a_stop_registered_while_the_journal_fails_is_owned_not_withheld() {
+        use robson_exec::order_journal::JournalFault;
+
+        let rig = ownership_rig().await;
+        rig.backend.set_fail_all(Some(JournalFault::Known));
+        let held = rig.replacement_held_at_its_cancel().await;
+        assert!(rig.journal.latch_set() && rig.journal.gate().orphan_cancel_vetoed());
+        assert!(rig.backend.row(&held.w_client).is_none(), "nothing of W landed");
+        let owned = crate::metrics::ORPHAN_CANCEL_OWNED.get();
+
+        rig.worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(rig.exchange.stop_cancel_call_count(), 0);
+        assert_eq!(rig.journal.withheld_report().total, 0, "owned, not a withheld orphan");
+        assert!(crate::metrics::ORPHAN_CANCEL_OWNED.get() >= owned + 1.0);
+        held.hold.notify_one();
+        held.task.await.unwrap().unwrap();
     }
 
     /// Design §8, generated interleavings 4: orphan cancels against an

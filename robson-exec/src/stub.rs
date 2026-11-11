@@ -242,6 +242,9 @@ pub struct StubExchange {
     mutations: Mutex<VecDeque<StubMutation>>,
     /// The next mutation past the choke point waits for this before it acts.
     mutation_hold: Mutex<Option<Arc<Notify>>>,
+    /// The next open-orders read, its answer fixed, waits for this before it
+    /// returns.
+    open_orders_hold: Mutex<Option<Arc<Notify>>>,
 }
 
 impl StubExchange {
@@ -311,6 +314,7 @@ impl StubExchange {
             gate: OnceLock::new(),
             mutations: Mutex::new(VecDeque::new()),
             mutation_hold: Mutex::new(None),
+            open_orders_hold: Mutex::new(None),
         }
     }
 
@@ -324,6 +328,15 @@ impl StubExchange {
     pub fn hold_next_mutation(&self) -> Arc<Notify> {
         let hold = Arc::new(Notify::new());
         *self.mutation_hold.lock().unwrap() = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// Hold the next open-orders read, once its answer is fixed, until the
+    /// returned handle is notified: what a slow venue answer looks like to a
+    /// caller that acts on it afterwards.
+    pub fn hold_next_open_orders_read(&self) -> Arc<Notify> {
+        let hold = Arc::new(Notify::new());
+        *self.open_orders_hold.lock().unwrap() = Some(Arc::clone(&hold));
         hold
     }
 
@@ -1131,6 +1144,10 @@ impl venue::TradingPort for StubExchange {
 
         if let Some(hook) = self.after_next_open_orders_read.lock().unwrap().take() {
             hook();
+        }
+        let hold = self.open_orders_hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            hold.notified().await;
         }
         Ok(orders)
     }

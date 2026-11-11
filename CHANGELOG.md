@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - The orphan sweep no longer cancels a stop it read too early (ADR-0056 step 7, PR O, part 1)
+
+- The reconciliation sweep reads the legs before each symbol's open orders, so a stop accepted in between (a new leg's first
+  stop, a replacement's successor) used to look like an orphan and was cancelled, recorded or not. Before cancelling, the sweep
+  now checks whether a live operation placed that order or is cancelling it, then reads the legs again: an owned order is kept
+  and counted in `robsond_orphan_cancel_owned_total`, and is not reported as withheld. No venue request or query is added.
+
 ### Changed - The orphan sweep keeps protective orders while anything is unresolved (ADR-0056 step 7, PR F, part 4)
 
 - While an incident is open, the fence closed or the latch set, the reconciliation sweep no longer cancels orphan `ins-`
