@@ -917,6 +917,33 @@ struct OperationIntent {
     ticket_issued: bool,
 }
 
+/// One entry of `operations_in_flight`.
+#[derive(Debug, Default)]
+struct OperationEntry {
+    /// `None` for an operation without a permit.
+    permit: Option<OperationKind>,
+    intents: Vec<OperationIntent>,
+}
+
+/// One operation in flight, for the pending list: never released.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationInFlight {
+    pub permit: Option<OperationKind>,
+    /// Its intents: client id, kind, whether a send started.
+    pub intents: Vec<(String, IntentKind, bool)>,
+}
+
+/// One entry of `persistence_pending`, for the pending list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingEntry {
+    /// An intent's rows or outcome, by client id.
+    Intent(String),
+    /// A stream suspension, by stream key.
+    Suspension(String),
+    /// An incident's upsert.
+    Incident(IncidentReason),
+}
+
 #[derive(Debug, Default)]
 struct JournalState {
     /// Intents in flight or with something unlanded. Removed once finished
@@ -931,7 +958,7 @@ struct JournalState {
     /// two share [`RETRY_SET_CAPACITY`].
     suspensions: VecDeque<StreamSuspensionRow>,
     /// `operations_in_flight`. A list is as long as its operation's orders.
-    operations: HashMap<u64, Vec<OperationIntent>>,
+    operations: HashMap<u64, OperationEntry>,
     /// Entries of `operations` held by operations without a permit.
     unpermitted_listed: usize,
     /// Ids sent with no row and no room in the retry set: the only record
@@ -1045,6 +1072,39 @@ impl OrderJournal {
         state.pending() + gate.incidents_persisting()
     }
 
+    /// What `persistence_pending` holds, for the pending list.
+    pub fn pending_entries(&self) -> Vec<PendingEntry> {
+        let (gate, state) = self.lock_both();
+        let incidents = gate.incidents_to_write().into_iter();
+        let mut entries: Vec<PendingEntry> =
+            incidents.map(|(incident, _)| PendingEntry::Incident(incident.reason)).collect();
+        entries.extend(
+            state.suspensions.iter().map(|s| PendingEntry::Suspension(s.stream_key.clone())),
+        );
+        entries.extend(state.retry_set.iter().cloned().map(PendingEntry::Intent));
+        entries
+    }
+
+    /// The operations in flight, for the pending list.
+    pub fn operations_in_flight_view(&self) -> Vec<OperationInFlight> {
+        let state = self.lock();
+        let mut ids: Vec<&u64> = state.operations.keys().collect();
+        ids.sort();
+        ids.into_iter()
+            .map(|id| {
+                let entry = &state.operations[id];
+                OperationInFlight {
+                    permit: entry.permit,
+                    intents: entry
+                        .intents
+                        .iter()
+                        .map(|i| (i.client_order_id.clone(), i.kind, i.ticket_issued))
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
     /// Record that an event-log stream refuses appends (ADR-0056 step 7, PR
     /// P), through the retry set, with its `stream_suspended` occurrence, which
     /// sets the latch and closes the fence. No await: the retry loop writes it.
@@ -1120,7 +1180,7 @@ impl OrderJournal {
         let listed = state.unpermitted_listed < UNPERMITTED_OPERATIONS;
         if listed {
             state.unpermitted_listed += 1;
-            state.operations.insert(id, Vec::new());
+            state.operations.insert(id, OperationEntry::default());
         } else {
             warn!(capacity = UNPERMITTED_OPERATIONS, "Journal operation registry is full");
         }
@@ -1142,7 +1202,9 @@ impl OrderJournal {
     pub fn acquire(self: &Arc<Self>, kind: OperationKind) -> Result<Permit, PermitRefusal> {
         self.gate.acquire(kind.class())?;
         let id = self.next_operation.fetch_add(1, Ordering::Relaxed);
-        self.lock().operations.insert(id, Vec::new());
+        self.lock()
+            .operations
+            .insert(id, OperationEntry { permit: Some(kind), intents: Vec::new() });
         Ok(Permit {
             operation: Some(Operation {
                 journal: Arc::clone(self),
@@ -1205,7 +1267,7 @@ impl OrderJournal {
     /// whose send started.
     fn entry_ticket_in(&self, id: u64, client_order_id: Option<&str>) -> bool {
         self.lock().operations.get(&id).is_some_and(|listed| {
-            listed.iter().any(|intent| {
+            listed.intents.iter().any(|intent| {
                 intent.kind == IntentKind::Entry
                     && intent.ticket_issued
                     && client_order_id.is_none_or(|wanted| intent.client_order_id == wanted)
@@ -1229,7 +1291,7 @@ impl OrderJournal {
             return handle;
         }
         if let Some(listed) = state.operations.get_mut(&operation) {
-            listed.push(OperationIntent {
+            listed.intents.push(OperationIntent {
                 client_order_id: spec.client_order_id.clone(),
                 kind: spec.kind,
                 ticket_issued: false,
@@ -1561,7 +1623,9 @@ impl OrderJournal {
         memory.tickets += 1;
         let operation = memory.operation;
         if let Some(listed) = state.operations.get_mut(&operation) {
-            if let Some(entry) = listed.iter_mut().find(|e| e.client_order_id == client_order_id) {
+            if let Some(entry) =
+                listed.intents.iter_mut().find(|e| e.client_order_id == client_order_id)
+            {
                 entry.ticket_issued = true;
             }
         }
@@ -2217,6 +2281,7 @@ impl Operation {
     pub fn entry_ticket_issued(&self) -> bool {
         self.journal.lock().operations.get(&self.id).is_some_and(|listed| {
             listed
+                .intents
                 .iter()
                 .any(|intent| intent.kind == IntentKind::Entry && intent.ticket_issued)
         })

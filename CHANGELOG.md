@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - The pending list (ADR-0056 step 7, PR F, part 3)
+
+- `GET /recovery/pending` (authenticated) shows the current generation a release must quote, the fence and the latch, the
+  epoch, the open incidents, the uncertain intents a release would tombstone, the operations in flight, what is still being
+  written, the suspended streams and the legs entering or exiting, each paged at 100 with its total. It reads memory and
+  six SQL queries, makes no venue request and changes nothing.
+
 ### Added - Incidents, the admission fence and its audited release (ADR-0056 step 7, PR F, part 2)
 
 - Whatever the daemon cannot explain now closes admissions until an operator releases it: an uncertain outcome of a
