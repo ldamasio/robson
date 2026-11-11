@@ -17,7 +17,9 @@ use robson_domain::{
 use robson_exec::{
     cancel::CancelClass,
     gate::OperationKind,
-    order_journal::{IntentKind, IntentSpec, OrderJournal},
+    order_journal::{
+        IntentKind, IntentSpec, OrderJournal, OrphanCancel, WithheldOrder, WithheldReport,
+    },
     quantize::{self, ReductionOutcome},
     ExchangePort, ExchangePosition, ExecError, OpenOrderRecord, OrderResult, UserTradeRecord,
 };
@@ -559,7 +561,41 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     /// Every step is best-effort: exchange query errors, cancel errors, and
     /// store read errors are logged and the scan continues. This method never
     /// returns an error and never aborts `scan_and_reconcile`.
+    ///
+    /// **The veto (ADR-0056 step 7, PR F, design §2.9).** While an incident is
+    /// open, the fence closed or the latch set, no orphan is cancelled: an
+    /// `ins-` order outside coverage may be the only protection of exposure
+    /// nothing owns, and keeping it can only reduce exposure. The scan checks
+    /// once at its start and each cancel is checked again before its journal
+    /// write and, binding, at the transport's handoff. A scan that could not
+    /// read the legs cancels nothing, as before. What is withheld is reported:
+    /// at most 500 orders listed, the rest counted, and each scan replaces the
+    /// report; listing never narrows the veto.
     async fn sweep_orphan_insurance_orders(&self, exchange_positions: &[ExchangePosition]) {
+        let journal = self.order_journal().await;
+        let vetoed = journal.gate().orphan_cancel_vetoed();
+        let mut withheld = WithheldReport::default();
+        self.sweep_orphans_with(exchange_positions, &journal, vetoed, &mut withheld)
+            .await;
+        if withheld.total > 0 {
+            warn!(
+                withheld = withheld.total,
+                listed = withheld.orders.len(),
+                "Orphan insurance-stop orders withheld: an incident is open, the fence closed or \
+                 the latch set; kept until a release"
+            );
+        }
+        withheld.at = Some(Utc::now());
+        journal.replace_withheld_report(withheld);
+    }
+
+    async fn sweep_orphans_with(
+        &self,
+        exchange_positions: &[ExchangePosition],
+        journal: &Arc<OrderJournal>,
+        vetoed: bool,
+        withheld: &mut WithheldReport,
+    ) {
         let active_positions = match self.store.positions().find_active().await {
             Ok(positions) => positions,
             Err(error) => {
@@ -643,6 +679,21 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                     continue;
                 }
 
+                let mut withhold = |order: &OpenOrderRecord| {
+                    crate::metrics::ORPHAN_CANCEL_WITHHELD.inc();
+                    let listed = withheld.withhold(WithheldOrder {
+                        symbol: symbol.as_pair(),
+                        exchange_order_id: order.exchange_order_id.clone(),
+                        client_order_id: order.client_order_id.clone(),
+                    });
+                    if !listed {
+                        crate::metrics::ORPHAN_CANCEL_WITHHELD_OVERFLOW.inc();
+                    }
+                };
+                if vetoed {
+                    withhold(&order);
+                    continue;
+                }
                 warn!(
                     symbol = %symbol.as_pair(),
                     exchange_order_id = %order.exchange_order_id,
@@ -650,14 +701,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                     "Orphan insurance-stop order detected; cancelling"
                 );
 
-                let journal = self.order_journal().await;
-                let class = journal
-                    .within_operation(journal.journaled_cancel(
-                        None,
+                let cancelled = journal
+                    .within_operation(journal.journaled_orphan_cancel(
                         &order.exchange_order_id,
                         self.exchange.cancel_stop_market_order(symbol, &order.exchange_order_id),
                     ))
                     .await;
+                let class = match cancelled {
+                    OrphanCancel::Sent(class) => class,
+                    OrphanCancel::Withheld => {
+                        withhold(&order);
+                        continue;
+                    },
+                };
                 match class {
                     // An orphan stop is not attached to any tracked position, so a
                     // definite answer leaves the exchange in the desired state.
@@ -2004,6 +2060,271 @@ mod tests {
             let outcome = sweep.cancel_row().outcome.expect("the outcome lands on a retry");
             assert_eq!(outcome.cancel_class, Some("gone_unresolved"), "write {write}");
             assert!(outcome.uncertain_at.is_some(), "write {write}");
+        }
+    }
+
+    /// ADR-0056 step 7, PR F, design §2.9: while an incident is open the
+    /// sweep cancels no orphan. It stays on the venue, no cancel intent is
+    /// written, and the scan's report lists it and counts it. Released, the
+    /// next scan cancels it and its report is empty.
+    #[tokio::test]
+    async fn while_an_incident_is_open_the_sweep_withholds_the_orphan() {
+        use robson_exec::{gate::IncidentReason, order_journal::ReleaseRecord, venue::Venue};
+
+        let OrphanSweep {
+            worker,
+            backend,
+            journal,
+            exchange,
+            mut events,
+            orphan_id,
+        } = orphan_sweep().await;
+        exchange.attach_gate(Arc::clone(journal.gate()));
+        let worker = worker.with_order_journal(Arc::clone(&journal));
+        journal.gate().record(IncidentReason::UncertainOutcome);
+        let counted = crate::metrics::ORPHAN_CANCEL_WITHHELD.get();
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(exchange.stop_cancel_call_count(), 0, "nothing reached the venue");
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let open = exchange.get_open_orders(&symbol).await.unwrap();
+        assert!(open.iter().any(|order| order.exchange_order_id == orphan_id), "kept");
+        assert!(backend.rows().is_empty(), "no cancel intent");
+        assert!(events.try_recv().is_none());
+        let report = journal.withheld_report();
+        assert_eq!((report.total, report.truncated), (1, false));
+        assert_eq!(report.orders[0].exchange_order_id, orphan_id);
+        assert_eq!(report.orders[0].client_order_id, "ins-orphan-1");
+        assert!(report.at.is_some());
+        assert!(crate::metrics::ORPHAN_CANCEL_WITHHELD.get() >= counted + 1.0);
+
+        journal.flush_pending().await;
+        let receipt = journal
+            .release(ReleaseRecord {
+                decision_id: Uuid::now_v7(),
+                generation: journal.gate().generation(),
+                actor: "operator".to_string(),
+                auth_kind: "verified",
+                note: "reviewed".to_string(),
+                treatment: "unbooked_accepted",
+                decided_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        assert!(receipt.fence_open);
+        worker.scan_and_reconcile().await.unwrap();
+        assert_eq!(exchange.stop_cancel_call_count(), 1, "released: the orphan is cancelled");
+        assert_eq!(journal.withheld_report().total, 0, "each scan replaces the report");
+    }
+
+    /// The scan checks once at its start: an incident open then withholds
+    /// every orphan that scan finds, even when a release lands while it runs
+    /// (here, between its open-orders read and the cancel). The next scan
+    /// cancels it.
+    #[tokio::test]
+    async fn a_scan_that_started_fenced_withholds_its_orphans_to_its_end() {
+        use robson_exec::{gate::IncidentReason, order_journal::ReleaseRecord, venue::Venue};
+
+        let OrphanSweep { worker, journal, exchange, orphan_id, .. } = orphan_sweep().await;
+        exchange.attach_gate(Arc::clone(journal.gate()));
+        let worker = worker.with_order_journal(Arc::clone(&journal));
+        journal.gate().record(IncidentReason::UncleanStart);
+        journal.flush_pending().await;
+        let releasing = Arc::clone(&journal);
+        exchange.set_after_next_open_orders_read(move || {
+            let release = ReleaseRecord {
+                decision_id: Uuid::now_v7(),
+                generation: releasing.gate().generation(),
+                actor: "operator".to_string(),
+                auth_kind: "verified",
+                note: "reviewed".to_string(),
+                treatment: "unbooked_accepted",
+                decided_at: Utc::now(),
+            };
+            let receipt = std::thread::spawn(move || {
+                let runtime =
+                    tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+                runtime.block_on(releasing.release(release))
+            })
+            .join()
+            .unwrap()
+            .unwrap();
+            assert!(receipt.fence_open, "released mid-scan");
+        });
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert!(!journal.gate().fenced());
+        assert_eq!(exchange.stop_cancel_call_count(), 0, "withheld for the whole scan");
+        assert_eq!(journal.withheld_report().orders[0].exchange_order_id, orphan_id);
+        worker.scan_and_reconcile().await.unwrap();
+        assert_eq!(exchange.stop_cancel_call_count(), 1, "the next scan cancels it");
+    }
+
+    /// The report lists at most 500 withheld orders; the rest are counted,
+    /// and withheld all the same: listing never narrows the veto.
+    #[tokio::test]
+    async fn a_withheld_report_past_its_cap_withholds_every_orphan() {
+        use robson_exec::{
+            gate::IncidentReason, order_journal::WITHHELD_REPORT_CAPACITY, venue::Venue,
+        };
+
+        let OrphanSweep { worker, journal, exchange, .. } = orphan_sweep().await;
+        exchange.attach_gate(Arc::clone(journal.gate()));
+        let worker = worker.with_order_journal(Arc::clone(&journal));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        for index in 0..WITHHELD_REPORT_CAPACITY + 1 {
+            exchange
+                .place_stop_market_order(
+                    &symbol,
+                    OrderSide::Sell,
+                    Quantity::new(dec!(0.010)).unwrap(),
+                    Price::new(dec!(99)).unwrap(),
+                    &format!("ins-extra-{index}"),
+                )
+                .await
+                .unwrap();
+        }
+        let orphans = WITHHELD_REPORT_CAPACITY as u64 + 2;
+        journal.gate().record(IncidentReason::UnlandedSend);
+        let overflow = crate::metrics::ORPHAN_CANCEL_WITHHELD_OVERFLOW.get();
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        let report = journal.withheld_report();
+        assert_eq!(report.total, orphans);
+        assert_eq!(report.orders.len(), WITHHELD_REPORT_CAPACITY);
+        assert!(report.truncated);
+        assert_eq!(exchange.stop_cancel_call_count(), 0, "not one was cancelled");
+        assert_eq!(exchange.get_open_orders(&symbol).await.unwrap().len() as u64, orphans);
+        assert!(crate::metrics::ORPHAN_CANCEL_WITHHELD_OVERFLOW.get() >= overflow + 2.0);
+    }
+
+    /// The binding check is at the handoff, after the cancel's journal write:
+    /// a write that did not land latches and closes the fence before the
+    /// request, so the transport refuses it. Nothing reaches the venue, the
+    /// orphan is reported withheld, and its intent is a proven no-send.
+    #[tokio::test]
+    async fn a_cancel_whose_journal_write_did_not_land_is_withheld_at_its_handoff() {
+        use robson_exec::{order_journal::JournalFault, venue::Venue};
+
+        let OrphanSweep {
+            worker,
+            backend,
+            journal,
+            exchange,
+            orphan_id,
+            ..
+        } = orphan_sweep().await;
+        exchange.attach_gate(Arc::clone(journal.gate()));
+        let worker = worker.with_order_journal(Arc::clone(&journal));
+        backend.push_fault(JournalFault::Known);
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert!(journal.latch_set());
+        assert_eq!(exchange.stop_cancel_call_count(), 0);
+        let report = journal.withheld_report();
+        assert_eq!(report.orders[0].exchange_order_id, orphan_id);
+        assert_eq!(journal.gate().snapshot().orphan_cancels_withheld, 1);
+        journal.flush_pending().await;
+        let row = backend
+            .rows()
+            .into_iter()
+            .find(|row| row.intent.as_ref().unwrap().kind == IntentKind::Cancel)
+            .unwrap();
+        let outcome = row.outcome.unwrap();
+        assert!(outcome.not_sent);
+        assert_eq!(outcome.cancel_class, Some("withheld"));
+    }
+
+    /// Design §8, generated interleavings 4: orphan cancels against an
+    /// incident opening, through the journal and the stub's choke point. No
+    /// orphan cancel reaches the transport after the veto holds: the cancels
+    /// the venue saw are exactly those that passed their handoff before the
+    /// incident, every other one is withheld, and each withheld one left a
+    /// proven no-send or no intent at all.
+    #[test]
+    fn no_orphan_cancel_reaches_the_transport_after_the_veto_holds() {
+        use proptest::{
+            strategy::{Strategy, ValueTree},
+            test_runner::TestRunner,
+        };
+        use robson_exec::{
+            gate::{IncidentReason, OperationKind},
+            order_journal::OrphanCancel,
+            venue::Venue,
+        };
+
+        let strategy = (proptest::collection::vec(0usize..6, 1..8), 0usize..10);
+        let mut runner = TestRunner::default();
+        for _ in 0..48 {
+            let (delays, flip) = strategy.new_tree(&mut runner).unwrap().current();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let exchange = Arc::new(StubExchange::new(dec!(100)));
+                let backend = Arc::new(StubJournalBackend::default());
+                let journal = Arc::new(OrderJournal::new(
+                    backend.clone(),
+                    &robson_exec::venue::VenueId::new("test:venue"),
+                ));
+                exchange.attach_gate(Arc::clone(journal.gate()));
+                let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+                let cancels: Vec<_> = delays
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &delay)| {
+                        let permit = journal.acquire(OperationKind::Panic).unwrap();
+                        let (journal, exchange, symbol) =
+                            (Arc::clone(&journal), Arc::clone(&exchange), symbol.clone());
+                        tokio::spawn(async move {
+                            permit
+                                .run(async {
+                                    for _ in 0..delay {
+                                        tokio::task::yield_now().await;
+                                    }
+                                    let id = format!("{index}");
+                                    let cancel = exchange.cancel_stop_market_order(&symbol, &id);
+                                    journal.journaled_orphan_cancel(&id, cancel).await
+                                })
+                                .await
+                        })
+                    })
+                    .collect();
+                let opening = {
+                    let journal = Arc::clone(&journal);
+                    tokio::spawn(async move {
+                        for _ in 0..flip {
+                            tokio::task::yield_now().await;
+                        }
+                        journal.gate().record(IncidentReason::UncertainOutcome);
+                        journal.gate().snapshot().orphan_cancels_passed
+                    })
+                };
+                let passed_before = opening.await.unwrap();
+                let mut sent = 0;
+                for cancel in cancels {
+                    match cancel.await.unwrap() {
+                        OrphanCancel::Sent(_) => sent += 1,
+                        OrphanCancel::Withheld => {},
+                    }
+                }
+                assert_eq!(sent, passed_before, "{delays:?} {flip}");
+                assert_eq!(exchange.stop_cancel_call_count(), passed_before);
+                assert_eq!(journal.gate().snapshot().orphan_cancels_passed, passed_before);
+                journal.flush_pending().await;
+                for row in backend.rows() {
+                    let outcome = row.outcome.unwrap();
+                    if outcome.cancel_class == Some("withheld") {
+                        assert!(outcome.not_sent && outcome.uncertain_at.is_none());
+                    }
+                }
+            });
         }
     }
 

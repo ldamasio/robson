@@ -1320,6 +1320,28 @@ pub struct PendingResponse {
     pub suspended_streams: PendingPage<PendingStream>,
     /// Legs now `entering` or `exiting`.
     pub legs_in_flight: PendingPage<PendingLeg>,
+    /// The orphan sweep's last report of the `ins-` orders it withheld
+    /// (design §2.9).
+    pub withheld_protective_orders: PendingWithheld,
+}
+
+/// The orphan sweep's last report: at most 500 orders listed, `total`
+/// counting every one withheld, `truncated` when some are not listed. The veto
+/// applied to every one.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingWithheld {
+    pub total: u64,
+    pub truncated: bool,
+    /// When the last scan reported; absent before the first.
+    pub at: Option<chrono::DateTime<Utc>>,
+    pub items: Vec<PendingWithheldOrder>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingWithheldOrder {
+    pub symbol: String,
+    pub exchange_order_id: String,
+    pub client_order_id: String,
 }
 
 #[cfg(feature = "postgres")]
@@ -1486,6 +1508,23 @@ where
         .map_err(unavailable)?;
 
     let total = |count: i64| u64::try_from(count).unwrap_or(0);
+    let report = journal.withheld_report();
+    let withheld_protective_orders = PendingWithheld {
+        total: report.total,
+        truncated: report.truncated,
+        at: report.at,
+        items: report
+            .orders
+            .into_iter()
+            .skip(page * PENDING_PAGE_SIZE)
+            .take(PENDING_PAGE_SIZE)
+            .map(|order| PendingWithheldOrder {
+                symbol: order.symbol,
+                exchange_order_id: order.exchange_order_id,
+                client_order_id: order.client_order_id,
+            })
+            .collect(),
+    };
     Ok(Json(PendingResponse {
         generation: gate.generation,
         fenced: gate.fenced,
@@ -1545,6 +1584,7 @@ where
                 })
                 .collect(),
         },
+        withheld_protective_orders,
     }))
 }
 
@@ -6789,6 +6829,16 @@ mod tests {
         .await
         .unwrap();
         journal.gate().record(IncidentReason::UnlandedSend);
+        // The orphan sweep's last report (part 4).
+        let mut report = robson_exec::order_journal::WithheldReport::default();
+        for index in 0..2 {
+            report.withhold(robson_exec::order_journal::WithheldOrder {
+                symbol: "BTCUSDT".to_string(),
+                exchange_order_id: format!("{index}"),
+                client_order_id: format!("ins-{index}"),
+            });
+        }
+        journal.replace_withheld_report(report);
 
         let app =
             recovery_app(pool.clone(), Arc::clone(&journal), Some(LEGACY), Some(tenant)).await;
@@ -6831,6 +6881,9 @@ mod tests {
         assert_eq!(pending.suspended_streams.items[0].month, NaiveDate::from_ymd_opt(2026, 10, 1));
         assert_eq!(pending.legs_in_flight.total, 1);
         assert_eq!(pending.legs_in_flight.items[0].state, "entering");
+        let withheld = &pending.withheld_protective_orders;
+        assert_eq!((withheld.total, withheld.truncated, withheld.items.len()), (2, false, 2));
+        assert_eq!(withheld.items[1].client_order_id, "ins-1");
 
         let second = get(1).await;
         assert_eq!(

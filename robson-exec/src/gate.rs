@@ -37,6 +37,14 @@
 //! reached from the journal's release) opens it again, and only when nothing
 //! moved the generation meanwhile.
 //!
+//! **The orphan-cancel veto (PR F, design §2.9).** An `ins-` order is never
+//! cancelled by the orphan sweep while an incident is open, the fence closed
+//! or the latch set. The sweep checks before each cancel's journal write, and
+//! the binding check is here, at the transport's handoff: a mutation made in an
+//! orphan sweep's cancel ([`orphan_sweep_cancel`]) re-checks under this mutex,
+//! after the cancel's journal await, and is refused, nothing sent, while the
+//! veto holds. Ordinary protective follow-ups are not subject to it.
+//!
 //! The gate's mutex is a sync leaf, never held across an await. Lock order
 //! (design §2.10): the manager lock, a stream's lock, this gate, the journal's
 //! memory. The journal takes its memory under the gate wherever it records an
@@ -45,6 +53,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
+    future::Future,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, MutexGuard, OnceLock,
@@ -352,6 +361,8 @@ impl std::error::Error for PermitRefusal {}
 pub enum MutationRefused {
     /// No permit, and the daemon is stopping.
     Stopping(Phase),
+    /// An orphan sweep's cancel while the veto holds (design §2.9).
+    OrphanCancelWithheld,
 }
 
 impl fmt::Display for MutationRefused {
@@ -360,8 +371,44 @@ impl fmt::Display for MutationRefused {
             Self::Stopping(phase) => {
                 write!(f, "venue mutation without a permit refused while {}", phase.as_str())
             },
+            Self::OrphanCancelWithheld => write!(
+                f,
+                "orphan-sweep cancel withheld: an incident is open, the fence closed or the latch set"
+            ),
         }
     }
+}
+
+/// One orphan sweep's cancel, as its transport handoff saw it.
+#[derive(Debug, Default)]
+pub struct OrphanSweepCancel {
+    withheld: AtomicBool,
+    passed: AtomicBool,
+}
+
+impl OrphanSweepCancel {
+    /// Whether the handoff refused a mutation under the veto.
+    pub fn withheld(&self) -> bool {
+        self.withheld.load(Ordering::SeqCst)
+    }
+
+    /// Whether a mutation of it passed the handoff: it may have left.
+    pub fn passed(&self) -> bool {
+        self.passed.load(Ordering::SeqCst)
+    }
+}
+
+tokio::task_local! {
+    static ORPHAN_SWEEP_CANCEL: Arc<OrphanSweepCancel>;
+}
+
+/// Run `cancel` as one orphan sweep's cancel: every venue mutation it makes is
+/// re-checked against the veto at the choke point (design §2.9).
+pub async fn orphan_sweep_cancel<F: Future>(
+    context: Arc<OrphanSweepCancel>,
+    cancel: F,
+) -> F::Output {
+    ORPHAN_SWEEP_CANCEL.scope(context, cancel).await
 }
 
 impl std::error::Error for MutationRefused {}
@@ -391,6 +438,10 @@ pub struct GateSnapshot {
     pub unpermitted: u64,
     pub busy_ordinary: u64,
     pub busy_protective: u64,
+    /// Orphan-sweep cancels that passed the veto at their handoff.
+    pub orphan_cancels_passed: u64,
+    /// Those the veto refused there.
+    pub orphan_cancels_withheld: u64,
 }
 
 #[derive(Debug)]
@@ -416,6 +467,8 @@ pub(crate) struct GateState {
     unpermitted: u64,
     busy_ordinary: u64,
     busy_protective: u64,
+    orphan_cancels_passed: u64,
+    orphan_cancels_withheld: u64,
 }
 
 impl GateState {
@@ -437,6 +490,8 @@ impl GateState {
             unpermitted: 0,
             busy_ordinary: 0,
             busy_protective: 0,
+            orphan_cancels_passed: 0,
+            orphan_cancels_withheld: 0,
         }
     }
 
@@ -609,6 +664,8 @@ impl OperationGate {
             unpermitted: state.unpermitted,
             busy_ordinary: state.busy_ordinary,
             busy_protective: state.busy_protective,
+            orphan_cancels_passed: state.orphan_cancels_passed,
+            orphan_cancels_withheld: state.orphan_cancels_withheld,
         }
     }
 
@@ -792,6 +849,21 @@ impl OperationGate {
     /// # Errors
     /// Without a permit of this gate, once the daemon is stopping.
     pub fn mutation(&self, what: &str) -> Result<(), MutationRefused> {
+        // The orphan-cancel veto's binding check (design §2.9), under the mutex
+        // every occurrence takes: one that closes the fence after this lets
+        // this cancel go as in flight, one before it refuses it.
+        if let Ok(context) = ORPHAN_SWEEP_CANCEL.try_with(Arc::clone) {
+            let mut state = self.lock();
+            if state.vetoes_orphan_cancel() {
+                state.orphan_cancels_withheld += 1;
+                context.withheld.store(true, Ordering::SeqCst);
+                drop(state);
+                warn!(what, "Orphan-sweep cancel withheld at its handoff; nothing sent");
+                return Err(MutationRefused::OrphanCancelWithheld);
+            }
+            state.orphan_cancels_passed += 1;
+            context.passed.store(true, Ordering::SeqCst);
+        }
         if order_journal::holds_permit_of(self) {
             return Ok(());
         }
