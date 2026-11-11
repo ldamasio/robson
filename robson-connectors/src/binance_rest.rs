@@ -14,11 +14,15 @@
 //! - `signature` query parameter (HMAC SHA256 of query string)
 //! - `timestamp` query parameter
 
-use std::time::Duration;
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use chrono::Utc;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder, StatusCode};
 use robson_domain::{Price, Quantity, Side};
+use robson_exec::{gate::OperationGate, order_journal::SendRefusal};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
@@ -38,8 +42,9 @@ const BINANCE_FUTURES_TESTNET_API_URL: &str = "https://testnet.binancefuture.com
 const BINANCE_SPOT_API_URL: &str = "https://api.binance.com";
 const BINANCE_SPOT_TESTNET_API_URL: &str = "https://testnet.binance.vision";
 
-/// Request timeout in seconds
-const REQUEST_TIMEOUT_SECS: u64 = 10;
+/// One bound per request, sending and reading the body alike (ADR-0056 step 7,
+/// D19). It replaced a bound on each, which let one request take 20 s.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 // =============================================================================
 // Errors
@@ -70,9 +75,15 @@ pub enum BinanceRestError {
     #[error("Failed to parse response: {0}")]
     ParseError(String),
 
-    /// Request timed out
+    /// Request timed out. Uncertain: it may have reached the venue.
     #[error("Request timed out")]
     Timeout,
+
+    /// Refused before anything was sent (ADR-0056 step 7): a mutation without
+    /// an operation permit while the daemon is stopping, or an entry the gate
+    /// refused at its send.
+    #[error("Refused before sending: {0}")]
+    Refused(String),
 
     /// Invalid parameter
     #[error("Invalid parameter: {0}")]
@@ -81,6 +92,12 @@ pub enum BinanceRestError {
     /// Position not found
     #[error("Position not found for symbol: {0}")]
     PositionNotFound(String),
+}
+
+impl From<SendRefusal> for BinanceRestError {
+    fn from(refusal: SendRefusal) -> Self {
+        Self::Refused(refusal.to_string())
+    }
 }
 
 // =============================================================================
@@ -97,8 +114,11 @@ pub struct BinanceRestClient {
     api_secret: String,
     /// Use testnet
     testnet: bool,
+    /// The permit gate every signed mutation passes; none checks nothing.
+    gate: OnceLock<Arc<OperationGate>>,
+    request_timeout: Duration,
     /// Test seam: serve every endpoint from a local listener.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "crash-points"))]
     local_base_url: Option<String>,
 }
 
@@ -110,7 +130,9 @@ impl BinanceRestClient {
             api_key,
             api_secret,
             testnet: false,
-            #[cfg(test)]
+            gate: OnceLock::new(),
+            request_timeout: REQUEST_TIMEOUT,
+            #[cfg(any(test, feature = "crash-points"))]
             local_base_url: None,
         }
     }
@@ -122,9 +144,24 @@ impl BinanceRestClient {
             api_key,
             api_secret,
             testnet: true,
-            #[cfg(test)]
+            gate: OnceLock::new(),
+            request_timeout: REQUEST_TIMEOUT,
+            #[cfg(any(test, feature = "crash-points"))]
             local_base_url: None,
         }
+    }
+
+    /// Pass every signed mutation through `gate` from now on (ADR-0056 step
+    /// 7). The first gate stays.
+    pub fn attach_gate(&self, gate: Arc<OperationGate>) {
+        let _ = self.gate.set(gate);
+    }
+
+    /// Shorten the per-request bound, for tests that wait it out.
+    #[cfg(test)]
+    pub(crate) fn with_request_timeout(mut self, bound: Duration) -> Self {
+        self.request_timeout = bound;
+        self
     }
 
     /// Client whose every request goes to a local test listener.
@@ -133,6 +170,21 @@ impl BinanceRestClient {
         Self {
             local_base_url: Some(base_url),
             ..Self::new("key".to_string(), "secret".to_string())
+        }
+    }
+
+    /// Crash harness: every request goes to the fake venue at `base_url`.
+    /// Exists only with the `crash-points` feature.
+    ///
+    /// # Panics
+    /// Unless `base_url` is an `http://<loopback>:<port>` origin.
+    #[cfg(feature = "crash-points")]
+    pub fn with_harness_base_url(base_url: String, api_key: String, api_secret: String) -> Self {
+        let origin = harness_origin(&base_url)
+            .unwrap_or_else(|refused| panic!("crash harness venue refused: {refused}"));
+        Self {
+            local_base_url: Some(origin),
+            ..Self::new(api_key, api_secret)
         }
     }
 
@@ -154,7 +206,7 @@ impl BinanceRestClient {
     }
 
     fn endpoint_base_url(&self, endpoint: &str) -> &str {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "crash-points"))]
         if let Some(local) = &self.local_base_url {
             return local;
         }
@@ -192,12 +244,58 @@ impl BinanceRestClient {
         Ok(format!("{}&signature={}", query_string, signature))
     }
 
+    /// Send one request and read its body under one bound for both
+    /// (ADR-0056 step 7, D19). A timeout is uncertain: the request may have
+    /// reached the venue. Every HTTP status is an answer here.
+    async fn answer(&self, request: RequestBuilder) -> Result<RestAnswer, BinanceRestError> {
+        let answered = async {
+            let response = request
+                .send()
+                .await
+                .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
+            let status = response.status();
+            let body =
+                response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+            Ok::<_, BinanceRestError>(RestAnswer { status, body })
+        };
+        timeout(self.request_timeout, answered)
+            .await
+            .map_err(|_| BinanceRestError::Timeout)?
+    }
+
+    /// [`Self::answer`], with every non-success status an error.
+    async fn exchange(&self, request: RequestBuilder) -> Result<String, BinanceRestError> {
+        self.answer(request).await?.into_body()
+    }
+
+    /// The choke point (ADR-0056 step 7): every signed mutation passes the
+    /// gate before anything is built or sent.
+    fn pass_gate(&self, method: &str, endpoint: &str) -> Result<(), BinanceRestError> {
+        match self.gate.get() {
+            Some(gate) => gate
+                .mutation(&format!("{method} {endpoint}"))
+                .map_err(|refused| BinanceRestError::Refused(refused.to_string())),
+            None => Ok(()),
+        }
+    }
+
     /// Send a GET request to a public endpoint.
     async fn get_public(
         &self,
         endpoint: &str,
         params: Vec<(&str, String)>,
     ) -> Result<String, BinanceRestError> {
+        self.get_public_answer(endpoint, params).await?.into_body()
+    }
+
+    /// A public GET whose answer comes back whatever its HTTP status, for a
+    /// caller that types the venue's errors itself (the spot read side,
+    /// ADR-0056 step 8a).
+    pub(crate) async fn get_public_answer(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<RestAnswer, BinanceRestError> {
         let url = if params.is_empty() {
             format!("{}{}", self.endpoint_base_url(endpoint), endpoint)
         } else {
@@ -206,30 +304,7 @@ impl BinanceRestClient {
             format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query)
         };
 
-        let response =
-            timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), self.client.get(&url).send())
-                .await
-                .map_err(|_| BinanceRestError::Timeout)?
-                .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
-
-        let status = response.status();
-        let body = timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), response.text())
-            .await
-            .map_err(|_| BinanceRestError::Timeout)?
-            .map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
-
-        if !status.is_success() {
-            if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
-                return Err(BinanceRestError::ApiError {
-                    code: err.code,
-                    msg: err.msg,
-                    http_status: status.as_u16(),
-                });
-            }
-            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
-        }
-
-        Ok(body)
+        self.answer(self.client.get(&url)).await
     }
 
     /// Send a GET request to a signed endpoint.
@@ -238,109 +313,49 @@ impl BinanceRestClient {
         endpoint: &str,
         params: Vec<(&str, String)>,
     ) -> Result<String, BinanceRestError> {
+        self.get_signed_answer(endpoint, params).await?.into_body()
+    }
+
+    /// A signed GET whose answer comes back whatever its HTTP status, for a
+    /// caller that types the venue's errors itself (the spot read side,
+    /// ADR-0056 step 8a). A read: it does not pass the mutation gate.
+    pub(crate) async fn get_signed_answer(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<RestAnswer, BinanceRestError> {
         let query = self.build_signed_query(params)?;
         let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
 
-        let response = timeout(
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
-            self.client.get(&url).header("X-MBX-APIKEY", &self.api_key).send(),
-        )
-        .await
-        .map_err(|_| BinanceRestError::Timeout)?
-        .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
-
-        let status = response.status();
-        let body = timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), response.text())
-            .await
-            .map_err(|_| BinanceRestError::Timeout)?
-            .map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
-
-        if !status.is_success() {
-            if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
-                return Err(BinanceRestError::ApiError {
-                    code: err.code,
-                    msg: err.msg,
-                    http_status: status.as_u16(),
-                });
-            }
-            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
-        }
-
-        Ok(body)
+        self.answer(self.client.get(&url).header("X-MBX-APIKEY", &self.api_key)).await
     }
 
-    /// Send a POST request to a signed endpoint.
+    /// Send a POST request to a signed endpoint: a venue mutation.
     async fn post_signed(
         &self,
         endpoint: &str,
         params: Vec<(&str, String)>,
     ) -> Result<String, BinanceRestError> {
+        self.pass_gate("POST", endpoint)?;
         let query = self.build_signed_query(params)?;
         let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
 
-        let response = timeout(
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
-            self.client.post(&url).header("X-MBX-APIKEY", &self.api_key).send(),
-        )
-        .await
-        .map_err(|_| BinanceRestError::Timeout)?
-        .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
-
-        let status = response.status();
-        let body = timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), response.text())
+        self.exchange(self.client.post(&url).header("X-MBX-APIKEY", &self.api_key))
             .await
-            .map_err(|_| BinanceRestError::Timeout)?
-            .map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
-
-        if !status.is_success() {
-            if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
-                return Err(BinanceRestError::ApiError {
-                    code: err.code,
-                    msg: err.msg,
-                    http_status: status.as_u16(),
-                });
-            }
-            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
-        }
-
-        Ok(body)
     }
 
-    /// Send a DELETE request to a signed endpoint.
+    /// Send a DELETE request to a signed endpoint: a venue mutation.
     async fn delete_signed(
         &self,
         endpoint: &str,
         params: Vec<(&str, String)>,
     ) -> Result<String, BinanceRestError> {
+        self.pass_gate("DELETE", endpoint)?;
         let query = self.build_signed_query(params)?;
         let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
 
-        let response = timeout(
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
-            self.client.delete(&url).header("X-MBX-APIKEY", &self.api_key).send(),
-        )
-        .await
-        .map_err(|_| BinanceRestError::Timeout)?
-        .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
-
-        let status = response.status();
-        let body = timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), response.text())
+        self.exchange(self.client.delete(&url).header("X-MBX-APIKEY", &self.api_key))
             .await
-            .map_err(|_| BinanceRestError::Timeout)?
-            .map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
-
-        if !status.is_success() {
-            if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
-                return Err(BinanceRestError::ApiError {
-                    code: err.code,
-                    msg: err.msg,
-                    http_status: status.as_u16(),
-                });
-            }
-            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
-        }
-
-        Ok(body)
     }
 
     // =========================================================================
@@ -972,6 +987,32 @@ impl BinanceRestClient {
 // Binance Types (from API responses)
 // =============================================================================
 
+/// One answer from the venue, of any HTTP status.
+pub(crate) struct RestAnswer {
+    pub(crate) status: StatusCode,
+    pub(crate) body: String,
+}
+
+impl RestAnswer {
+    /// The body of a success. Any other status is an error: `ApiError` when
+    /// the body is Binance's JSON error, `RequestFailed` otherwise.
+    fn into_body(self) -> Result<String, BinanceRestError> {
+        let RestAnswer { status, body } = self;
+        if !status.is_success() {
+            if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
+                return Err(BinanceRestError::ApiError {
+                    code: err.code,
+                    msg: err.msg,
+                    http_status: status.as_u16(),
+                });
+            }
+            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
+        }
+
+        Ok(body)
+    }
+}
+
 /// Binance error response.
 #[derive(Debug, Deserialize)]
 struct BinanceErrorResponse {
@@ -1496,11 +1537,179 @@ fn parse_field_error(
 // Tests
 // =============================================================================
 
+/// The origin of a crash-harness venue URL, parsed and checked here so that a
+/// lookalike such as `http://127.0.0.1:80@evil.example` cannot leave loopback.
+/// The port must be explicit, and credentials, paths and queries are refused.
+#[cfg(any(test, feature = "crash-points"))]
+fn harness_origin(base_url: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(base_url).map_err(|error| format!("{base_url}: {error}"))?;
+    let host = url.host_str().unwrap_or_default();
+    let loopback = host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    let bare_origin = url.path() == "/" && url.query().is_none() && url.fragment().is_none();
+    let no_credentials = url.username().is_empty() && url.password().is_none();
+    if url.scheme() != "http"
+        || !loopback
+        || url.port().is_none()
+        || !bare_origin
+        || !no_credentials
+    {
+        return Err(format!("{base_url} is not an http://<loopback>:<port> origin"));
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use robson_exec::{gate::OperationKind, order_journal::OrderJournal};
     use rust_decimal_macros::dec;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     use super::*;
+
+    /// A venue that answers every request `{}` with 200, its head after
+    /// `head_after` and its body `body_after` later, and counts the requests.
+    async fn slow_venue(head_after: Duration, body_after: Duration) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let counted = Arc::clone(&counted);
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(head_after).await;
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                Content-Length: 2\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(body_after).await;
+                    let _ = stream.write_all(b"{}").await;
+                });
+            }
+        });
+        (url, requests)
+    }
+
+    #[test]
+    fn one_request_is_bounded_at_ten_seconds() {
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(10));
+    }
+
+    /// D19: one bound from the send to the last byte of the body. A request
+    /// whose head and body each arrive inside the bound, but not both, is a
+    /// timeout, which callers treat as uncertain.
+    #[tokio::test]
+    async fn one_bound_covers_the_send_and_the_body() {
+        let bound = Duration::from_millis(400);
+        let (url, requests) = slow_venue(bound * 3 / 5, bound * 3 / 5).await;
+        let client = BinanceRestClient::with_local_base_url(url).with_request_timeout(bound);
+        let started = std::time::Instant::now();
+        let answered = client.get_public("/fapi/v1/ping", vec![]).await;
+        assert!(matches!(answered, Err(BinanceRestError::Timeout)), "{answered:?}");
+        assert!(
+            started.elapsed() < bound * 6 / 5,
+            "it ends at the bound: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let (url, _) = slow_venue(bound / 5, bound / 5).await;
+        let client = BinanceRestClient::with_local_base_url(url).with_request_timeout(bound);
+        assert_eq!(client.get_public("/fapi/v1/ping", vec![]).await.unwrap(), "{}");
+    }
+
+    /// ADR-0056 step 8a split the bounded send from the error mapping; a
+    /// non-success answer maps as it did before.
+    #[test]
+    fn a_non_success_answer_maps_as_before() {
+        let answer = |status: StatusCode, body: &str| RestAnswer { status, body: body.to_string() };
+        assert_eq!(answer(StatusCode::OK, "{}").into_body().unwrap(), "{}");
+        let api =
+            answer(StatusCode::BAD_REQUEST, r#"{"code":-2013,"msg":"Order does not exist."}"#);
+        assert!(matches!(
+            api.into_body(),
+            Err(BinanceRestError::ApiError { code: -2013, http_status: 400, msg })
+                if msg == "Order does not exist."
+        ));
+        match answer(StatusCode::BAD_GATEWAY, "<html></html>").into_body() {
+            Err(BinanceRestError::RequestFailed(msg)) => {
+                assert_eq!(msg, "HTTP 502 Bad Gateway: <html></html>")
+            },
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+    }
+
+    /// The choke point (ADR-0056 step 7) without a permit: counted and latched
+    /// while open, refused before anything is sent once stopping. A read is
+    /// not a mutation.
+    #[tokio::test]
+    async fn a_mutation_without_a_permit_is_counted_while_open_and_refused_once_stopping() {
+        let (url, requests) = slow_venue(Duration::ZERO, Duration::ZERO).await;
+        let client = BinanceRestClient::with_local_base_url(url);
+        let journal = Arc::new(OrderJournal::unpersisted());
+        client.attach_gate(Arc::clone(journal.gate()));
+
+        client.set_leverage("BTCUSDT", 1).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.gate().snapshot().unpermitted, 1);
+        assert!(journal.latch_set());
+        client.get_position_mode().await.unwrap();
+        assert_eq!(journal.gate().snapshot().unpermitted, 1);
+
+        journal.gate().begin_draining();
+        let refused = client.set_leverage("BTCUSDT", 1).await;
+        assert!(matches!(refused, Err(BinanceRestError::Refused(_))), "{refused:?}");
+        journal.gate().begin_closing();
+        let refused = client.cancel_algo_order(7).await;
+        assert!(matches!(refused, Err(BinanceRestError::Refused(_))), "{refused:?}");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "nothing refused reached the venue");
+        assert_eq!(journal.gate().snapshot().unpermitted, 1);
+    }
+
+    /// With a permit a mutation goes out in every phase, uncounted.
+    #[tokio::test]
+    async fn a_mutation_under_a_permit_goes_out_in_every_phase() {
+        let (url, requests) = slow_venue(Duration::ZERO, Duration::ZERO).await;
+        let client = BinanceRestClient::with_local_base_url(url);
+        let journal = Arc::new(OrderJournal::unpersisted());
+        client.attach_gate(Arc::clone(journal.gate()));
+
+        let permit = journal.acquire(OperationKind::Panic).unwrap();
+        permit
+            .scope(async {
+                client.set_leverage("BTCUSDT", 1).await.unwrap();
+                journal.gate().begin_draining();
+                client.set_leverage("BTCUSDT", 1).await.unwrap();
+                journal.gate().begin_closing();
+                client.set_leverage("BTCUSDT", 1).await.unwrap();
+            })
+            .await;
+        permit.complete();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(journal.gate().snapshot().unpermitted, 0);
+        assert!(!journal.latch_set());
+    }
 
     #[test]
     fn test_algo_cancel_response_accepts_string_and_numeric_code() {
@@ -1594,6 +1803,35 @@ mod tests {
         assert_eq!(klines[0].volume, dec!(148976.11427815));
         assert_eq!(klines[0].close_time_ms, 1_499_644_799_999);
         assert_eq!(klines[0].trades, 308);
+    }
+
+    #[test]
+    fn the_harness_venue_url_must_be_a_loopback_origin() {
+        for accepted in [
+            "http://127.0.0.1:41000",
+            "http://localhost:41000",
+            "http://[::1]:41000",
+        ] {
+            assert_eq!(harness_origin(accepted).as_deref(), Ok(accepted));
+        }
+        for refused in [
+            // `127.0.0.1:80` is user information; the host is evil.example.
+            "http://127.0.0.1:80@evil.example",
+            // Not a port at all.
+            "http://localhost:80.evil",
+            "http://127.0.0.1:41000@evil.example:41000",
+            "http://user:secret@127.0.0.1:41000",
+            "https://127.0.0.1:41000",
+            "http://evil.example:41000",
+            "http://localhost.evil:41000",
+            "http://127.0.0.1.evil.example:41000",
+            "http://127.0.0.1",
+            "http://127.0.0.1:41000/fapi",
+            "http://127.0.0.1:41000?a=1",
+            "not a url",
+        ] {
+            assert!(harness_origin(refused).is_err(), "{refused} must be refused");
+        }
     }
 
     #[tokio::test]

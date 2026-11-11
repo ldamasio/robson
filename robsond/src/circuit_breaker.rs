@@ -26,6 +26,9 @@
 //! - **MonthlyHalt closes positions.** When the 4% monthly drawdown limit is
 //!   reached, all open positions are closed immediately using the existing exit
 //!   logic (without re-entering `entry_flow_lock`).
+//! - **An invalid budget basis is not a MonthlyHalt.** `capital_base <= 0` says
+//!   nothing about the budget (ADR-0051 §1): admission denies it and this state
+//!   stays as it is.
 //! - **No automatic reset.** MonthlyHalt persists until next calendar month or
 //!   explicit operator acknowledgment. There is no `/monthly-halt/reset`
 //!   endpoint — unblocking the month without policy evidence is not permitted.

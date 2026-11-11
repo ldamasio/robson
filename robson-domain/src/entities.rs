@@ -108,6 +108,31 @@ pub struct Position {
     /// Exchange tick size used for admission-time adverse quantization.
     #[serde(default)]
     pub tick_size_at_admission: Option<rust_decimal::Decimal>,
+    /// Validated trading rules this leg was admitted with (ADR-0056 §5),
+    /// first-write-wins from `entry_signal_received`. Not a `positions_current`
+    /// column: a restart reads it back from the event log (no migration in
+    /// step 6). Never used to recompute the persisted executable span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_snapshot: Option<crate::trading_rules::SymbolTradingRules>,
+    /// The latest residual standing on this open leg (ADR-0056 §5): a stop
+    /// short of it or below the lot, or an exit with nothing executable.
+    /// Only closing the leg resolves it; an accepted stop does not. Blocks
+    /// new admissions and never enters the budget or latent risk. Not a
+    /// `positions_current` column: a restart reads it back from the event
+    /// log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residual_quantity: Option<rust_decimal::Decimal>,
+    /// A restart could not read a residual row of this open leg. Blocks new
+    /// admissions the same way, until the leg closes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub residual_unknown: bool,
+    /// The stops this leg's recorded stop displaced, newest first, at most
+    /// [`Self::SUPERSEDED_STOPS_KEPT`] (ADR-0056 §5). A stop can trigger as it
+    /// is displaced and fill afterwards, and the fill is still this leg's. Not
+    /// a `positions_current` column: a restart reads it back from the event
+    /// log.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded_stop_ids: Vec<String>,
 
     // Audit
     pub created_at: DateTime<Utc>,
@@ -116,6 +141,18 @@ pub struct Position {
 }
 
 impl Position {
+    /// Whether this leg holds ADR-0052 admission evidence: an earlier admission
+    /// got far enough to write its immutable ruler, so no second admission may
+    /// derive another.
+    pub fn carries_admission_evidence(&self) -> bool {
+        self.stop_policy == StopPolicy::ExecutableSpan
+            && (self.stop_plan_entry_reference.is_some()
+                || self.initial_executable_stop.is_some()
+                || self.executable_span.is_some()
+                || self.cap_basis_distance.is_some()
+                || self.tick_size_at_admission.is_some())
+    }
+
     /// Create a new armed position with the legacy stop policy.
     ///
     /// This constructor never selects a new-position policy: it always
@@ -159,9 +196,116 @@ impl Position {
             executable_span: None,
             cap_basis_distance: None,
             tick_size_at_admission: None,
+            rules_snapshot: None,
+            residual_quantity: None,
+            residual_unknown: false,
+            superseded_stop_ids: Vec::new(),
             created_at: now,
             updated_at: now,
             closed_at: None,
+        }
+    }
+
+    /// How many superseded stops a leg keeps as fill evidence.
+    pub const SUPERSEDED_STOPS_KEPT: usize = 3;
+
+    /// The stop on record for this leg.
+    pub fn recorded_stop_id(&self) -> Option<&str> {
+        match &self.state {
+            PositionState::Active { insurance_stop_id, .. } => {
+                insurance_stop_id.as_deref().or(self.insurance_stop_id.as_deref())
+            },
+            _ => self.insurance_stop_id.as_deref(),
+        }
+    }
+
+    /// Keep a stop this leg has had as fill evidence, newest first. The stop on
+    /// record is not one of them, and comes out if it was.
+    pub fn record_superseded_stop(&mut self, stop_id: &str) {
+        self.superseded_stop_ids.retain(|id| id != stop_id);
+        if self.recorded_stop_id() != Some(stop_id) {
+            self.superseded_stop_ids.insert(0, stop_id.to_string());
+        }
+        self.superseded_stop_ids.truncate(Self::SUPERSEDED_STOPS_KEPT);
+    }
+
+    /// Whether this leg holds a residual, known or unreadable, that blocks new
+    /// admissions (ADR-0056 §5).
+    pub fn has_unresolved_residual(&self) -> bool {
+        self.residual_quantity.is_some() || self.residual_unknown
+    }
+
+    /// Restore the leg evidence only the event log carries (ADR-0056 §5) after
+    /// a restart from `positions_current`, with the semantics of replay: given
+    /// events in stream order, the first rules snapshot wins, the latest
+    /// standing residual stands, and each stop the stream shows, other than the
+    /// one on record, is kept as evidence. Other events are ignored.
+    pub fn restore_leg_evidence<'a>(
+        &mut self,
+        events: impl IntoIterator<Item = &'a crate::events::Event>,
+    ) {
+        use crate::events::Event;
+        for event in events {
+            if let Event::EntrySignalReceived { rules_snapshot: Some(rules), .. } = event {
+                if self.rules_snapshot.is_none() {
+                    self.rules_snapshot = Some(rules.clone());
+                }
+            }
+            if let Some(residual) = event.standing_residual() {
+                self.residual_quantity = Some(residual);
+            }
+            match event {
+                Event::InsuranceStopPlaced { order_id, .. } => {
+                    self.record_superseded_stop(order_id);
+                },
+                Event::InsuranceStopReplaced { previous_order_id, order_id, .. } => {
+                    self.record_superseded_stop(previous_order_id);
+                    self.record_superseded_stop(order_id);
+                },
+                _ => {},
+            }
+        }
+    }
+
+    /// [`Self::restore_leg_evidence`] for one record as the event log holds it.
+    /// A record counts only if its payload is the event its type says, for
+    /// this leg. Any other record comes back as the error, for the caller
+    /// to log. A rules row then counts as no snapshot; a residual row on an
+    /// open leg blocks admissions until the leg closes.
+    pub fn restore_leg_evidence_record(
+        &mut self,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
+        let event = serde_json::from_value::<crate::events::Event>(payload)
+            .map_err(|error| error.to_string())
+            .and_then(|event| {
+                if event.event_type() != event_type {
+                    return Err(format!("payload is a {}", event.event_type()));
+                }
+                if event.position_id() != self.id {
+                    return Err(format!("payload is for position {}", event.position_id()));
+                }
+                Ok(event)
+            });
+        match event {
+            Ok(event) => {
+                self.restore_leg_evidence([&event]);
+                Ok(())
+            },
+            Err(error) => {
+                if event_type == "residual_inventory_recorded"
+                    && matches!(
+                        self.state,
+                        PositionState::Entering { .. }
+                            | PositionState::Active { .. }
+                            | PositionState::Exiting { .. }
+                    )
+                {
+                    self.residual_unknown = true;
+                }
+                Err(error)
+            },
         }
     }
 

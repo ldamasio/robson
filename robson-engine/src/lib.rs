@@ -511,13 +511,7 @@ impl Engine {
         // Armed position means an earlier admission partially completed and
         // must be recovered explicitly; deriving a second ruler would make S
         // mutable across retries or metadata refreshes.
-        if position.stop_policy == StopPolicy::ExecutableSpan
-            && (position.stop_plan_entry_reference.is_some()
-                || position.initial_executable_stop.is_some()
-                || position.executable_span.is_some()
-                || position.cap_basis_distance.is_some()
-                || position.tick_size_at_admission.is_some())
-        {
+        if position.carries_admission_evidence() {
             return Err(EngineError::DomainError(
                 robson_domain::DomainError::AdmissionEvidenceAlreadyPresent(
                     "ExecutableSpan position already contains immutable admission evidence"
@@ -579,6 +573,12 @@ impl Engine {
                     plan.tick_size,
                 ),
             };
+        // The rules that priced this admission, persisted with the leg for
+        // risk reduction (ADR-0056 §5). Legacy positions derive without rules.
+        let rules_snapshot = match plan.policy {
+            StopPolicy::LegacyUncapped => None,
+            StopPolicy::ExecutableSpan => rules.cloned(),
+        };
 
         debug!(
             position_id = %position.id,
@@ -606,6 +606,7 @@ impl Engine {
                 executable_span,
                 cap_basis_distance,
                 tick_size,
+                rules_snapshot,
                 timestamp: Utc::now(),
             }),
             // Emit governed intent (pre-exchange, cycle_id stamped by GovernedAction)

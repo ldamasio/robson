@@ -26,6 +26,8 @@ use robson_connectors::{
 };
 use robson_domain::{Exchange, OrderSide, Price, Quantity, Symbol, SymbolTradingRules};
 use robson_exec::{
+    gate::OperationGate,
+    order_journal::OrderJournal,
     ports::{OpenOrderRecord, OrderResult, UserTradeRecord},
     venue::{
         AccountPort, Cash, EntryOrReduce, ExecutionCostEnvelope, FundingPort, InventoryPort, Mark,
@@ -75,6 +77,25 @@ impl TradingPort for VenueRuntime {
         symbol: &Symbol,
     ) -> Result<SymbolTradingRules, ExecError> {
         forward!(self, venue => venue.trading_rules_preview(symbol).await)
+    }
+
+    async fn trading_rules_fresh(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        forward!(self, venue => venue.trading_rules_fresh(symbol).await)
+    }
+
+    fn last_validated_rules(&self, symbol: &Symbol) -> Option<SymbolTradingRules> {
+        forward!(self, venue => venue.last_validated_rules(symbol))
+    }
+
+    fn rules_refresh_due(&self, symbol: &Symbol) -> bool {
+        forward!(self, venue => venue.rules_refresh_due(symbol))
+    }
+
+    async fn refresh_trading_rules(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        forward!(self, venue => venue.refresh_trading_rules(symbol).await)
     }
 
     async fn place_market_order(
@@ -197,6 +218,14 @@ impl Venue for VenueRuntime {
         forward!(self, venue => venue.id())
     }
 
+    fn attach_order_journal(&self, journal: Arc<OrderJournal>) {
+        forward!(self, venue => venue.attach_order_journal(journal))
+    }
+
+    fn attach_gate(&self, gate: Arc<OperationGate>) {
+        forward!(self, venue => venue.attach_gate(gate))
+    }
+
     fn position_account(&self) -> Option<&dyn PositionAccountPort> {
         forward!(self, venue => venue.position_account())
     }
@@ -310,6 +339,12 @@ fn usdm_credential(config: &Config) -> Option<Exchange> {
 fn usdm_client(config: &Config, credential: Exchange) -> Option<Arc<BinanceRestClient>> {
     let api_key = config.binance.api_key.clone()?;
     let api_secret = config.binance.api_secret.clone()?;
+    #[cfg(feature = "crash-points")]
+    if let Ok(base_url) = std::env::var(robson_exec::crash_points::VENUE_URL_ENV) {
+        return Some(Arc::new(BinanceRestClient::with_harness_base_url(
+            base_url, api_key, api_secret,
+        )));
+    }
     Some(Arc::new(match credential {
         Exchange::Binance => BinanceRestClient::new(api_key, api_secret),
         Exchange::BinanceTestnet => BinanceRestClient::testnet(api_key, api_secret),
@@ -381,7 +416,7 @@ mod tests {
     use robson_connectors::binance::usdm::{
         MAINNET_MARKET_WS_ENDPOINT, TESTNET_MARKET_WS_ENDPOINT,
     };
-    use robson_exec::venue::capability_mismatches;
+    use robson_exec::venue::{capability_mismatches, AccountKind, MarketKind};
 
     use super::*;
 
@@ -497,6 +532,56 @@ mod tests {
         assert!(error.contains("ROBSON_VENUE=stub"), "{error}");
     }
 
+    /// ADR-0056 step 8a merges inert (SD12): `binance_spot` is refused before
+    /// the factory, and no selection the factory takes, with any credentials
+    /// in any environment, builds a spot venue or route. The connector side
+    /// checks that nothing outside it names the spot read side
+    /// (`inertness_tests.rs`).
+    #[test]
+    fn no_selection_builds_a_spot_venue() {
+        let refused = VenueSelection::parse(Some("binance_spot")).unwrap_err().to_string();
+        assert!(refused.contains("ROBSON_VENUE=binance_spot"), "{refused}");
+
+        use Environment::{Development, Production, Test};
+        for selection in [
+            VenueSelection::Unset,
+            VenueSelection::BinanceUsdm,
+            VenueSelection::Stub,
+        ] {
+            // A new selection fails to compile here, so this test is revisited.
+            match selection {
+                VenueSelection::Unset | VenueSelection::BinanceUsdm | VenueSelection::Stub => {},
+            }
+            let mut built = 0;
+            for credentials in [false, true] {
+                for use_testnet in [false, true] {
+                    for environment in [Test, Development, Production] {
+                        let config = config(selection, credentials, use_testnet, environment);
+                        let Ok(parts) = VenueFactory::build(&config) else {
+                            continue;
+                        };
+                        built += 1;
+                        let case =
+                            format!("{selection:?} {credentials} {use_testnet} {environment:?}");
+                        for venue in std::iter::once(&parts.venue).chain(&parts.funding_recovery) {
+                            assert_ne!(venue.id().as_str(), "binance:spot", "{case}");
+                            let capabilities = venue.capabilities();
+                            assert_ne!(capabilities.market_kind, MarketKind::Spot, "{case}");
+                            assert_ne!(
+                                capabilities.account_kind,
+                                AccountKind::BalanceAccount,
+                                "{case}"
+                            );
+                            assert!(venue.inventory().is_none(), "{case}");
+                        }
+                    }
+                }
+            }
+            // Not vacuous: every selection builds a venue somewhere.
+            assert!(built > 0, "{selection:?} built nothing");
+        }
+    }
+
     #[test]
     fn every_factory_stub_has_no_funding_surface() {
         for (selection, credentials) in [
@@ -535,11 +620,22 @@ mod tests {
             )
             .unwrap(),
         );
+        stub.set_rules_refresh_due(true);
         let runtime = VenueRuntime::Stub(Box::new(stub));
         assert_eq!(runtime.id().as_str(), "stub");
         assert_eq!(runtime.price(&symbol).await.unwrap().as_decimal(), dec!(95000));
         assert!(runtime.trading_rules(&symbol).await.is_ok());
         assert!(runtime.trading_rules_preview(&symbol).await.is_ok());
+        // ADR-0056 §5: each default differs from what the stub answers here.
+        assert!(runtime.last_validated_rules(&symbol).is_some());
+        assert!(runtime.rules_refresh_due(&symbol));
+        assert!(runtime.refresh_trading_rules(&symbol).await.is_ok());
+        let VenueRuntime::Stub(held) = &runtime else {
+            panic!("the runtime holds the stub");
+        };
+        assert_eq!(held.rules_refresh_call_count(), 1);
+        held.set_fresh_rules_unavailable(true);
+        assert!(runtime.trading_rules_fresh(&symbol).await.is_err());
         assert!(capability_mismatches(&runtime).is_empty());
 
         let without_funding =

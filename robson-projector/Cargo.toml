@@ -22,4 +22,6 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 robson-testkit = { path = "../robson-testkit" }
+robson-domain = { path = "../robson-domain" }
 rust_decimal_macros = { workspace = true }
+proptest = "1"

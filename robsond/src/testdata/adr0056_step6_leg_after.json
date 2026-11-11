@@ -1,0 +1,35 @@
+{
+  "clean_exit": {
+    "outcome": {
+      "events": [
+        "insurance_stop_cancelled",
+        "exit_order_placed",
+        "exit_triggered",
+        "position_closed"
+      ],
+      "state": "closed",
+      "stop_live": false
+    }
+  },
+  "exit_fill_below_leg_quantity": {
+    "outcome": {
+      "events": [
+        "residual_inventory_recorded",
+        "exit_order_placed",
+        "position_closed"
+      ],
+      "state": "closed",
+      "stop_live": true
+    },
+    "why": "Closes as before, with what the order filled now on the record: residual_inventory_recorded is the only durable record of the filled quantity on this path. The old row reached the fill by hand through the handler; this one goes through the executor."
+  },
+  "exit_order_fails": {
+    "outcome": {
+      "events": [
+        "insurance_stop_cancelled"
+      ],
+      "state": "active",
+      "stop_live": false
+    }
+  }
+}

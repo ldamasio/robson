@@ -5,6 +5,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Test harness only (ADR-0056 step 7): `compile_error!` under a release build.
+crash-points = ["dep:libc"]
+
 [dependencies]
 robson-domain = { path = "../robson-domain" }
 robson-engine = { path = "../robson-engine" }
@@ -18,8 +23,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 rust_decimal = { workspace = true }
 chrono = { workspace = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 rust_decimal_macros = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

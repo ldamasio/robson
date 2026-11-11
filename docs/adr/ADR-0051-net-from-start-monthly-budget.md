@@ -31,7 +31,9 @@ after the four orphaned income items were acknowledged; October and earlier
 rows keep `hwm_v1`. Execution record in the runbook. Still pending: §5.5
 cleanup (peak code and `month_peak_net` column), the §3 settlement
 completeness, #242 (persisted withheld basis increases) and the matcher
-gaps on #232.
+gaps on #232. **Update (2026-11-07):** §1 and §2 amended by the operator: an
+invalid basis no longer latches MonthlyHalt or closes positions. See "Amendment
+2026-11-07".
 **Deciders**: RBX Systems (operator + architecture, with adversarial design
 review by a secondary model)
 **Supersedes**: [ADR-0046](ADR-0046-monthly-high-water-mark-budget.md)
@@ -133,8 +135,11 @@ conservatively downward using runtime exchange metadata.
 
 `latent_risk` and every risk charge MUST be non-negative. If
 `capital_base ≤ 0`, the snapshot is invalid: `slots_available = 0`, admission
-fails closed, MonthlyHalt latches, and the `risk_unit` division is not
-evaluated. A high-severity accounting alarm is raised.
+fails closed, and the `risk_unit` division is not evaluated. An invalid basis
+says nothing about the budget, so it never counts as `remaining_budget ≤ 0`
+for §2: MonthlyHalt neither latches nor closes on it, and open positions stay
+protected and managed, as §3 requires for any other accounting failure. A
+high-severity accounting alarm is raised. See "Amendment 2026-11-07".
 
 `remaining_budget` remains signed for admission and halt. Only slot reporting
 clamps it to zero. Therefore, when
@@ -181,8 +186,9 @@ transitions atomically replace the basis of that same reservation; no
 transition may leave an interval where the risk appears in both
 representations or in neither.
 
-MonthlyHalt triggers when `remaining_budget ≤ 0`. It latches, blocks new
-entries, and closes risk-bearing positions. The −4% guarantee applies within
+MonthlyHalt triggers when `remaining_budget ≤ 0` on a valid basis (§1). It
+latches, blocks new entries, and closes risk-bearing positions. The −4%
+guarantee applies within
 the execution cost and gap envelope used by planned-risk and latent-risk
 pricing (ADR-0039); a breach outside that envelope keeps MonthlyHalt latched
 and raises a high-severity, durable reconciliation alarm.
@@ -303,7 +309,7 @@ limit."
 
 | Failure | Required behavior |
 | --- | --- |
-| Postgres/projection unavailable | No new entries; no incomplete in-memory production fallback; existing protection continues; durable visible alarm. |
+| Postgres/projection unavailable | No new entries; no incomplete in-memory production fallback; existing protection continues; durable visible alarm; an admission that fails before the executor keeps its Armed position's detector under backoff, and the position resumes when the database returns. A failure from the executor on leaves it without one until reconciliation, a restart or the operator resolves it (Amendment 2026-11-07, Recovery). |
 | Income endpoint unavailable or stale | Settlement reservations remain; new entries fail closed after the freshness bound; retry with backoff. |
 | Exchange position inventory unavailable | Use the full durable local risk-bearing set conservatively; do not omit positions; deny new entries and expose staleness. |
 | Concurrent admissions/accounting updates | Serialized reservation or versioned compare-and-swap; loser retries from a new snapshot. |
@@ -311,6 +317,8 @@ limit."
 | Close evidence incomplete | Reservation remains until complete evidence atomically replaces it. |
 | Crash during month reset | Idempotent transaction restores one model/base/basis set and never charges carried downside twice. |
 | Loss outside the priced execution envelope | MonthlyHalt remains latched and a high-severity reconciliation alarm is durable. |
+| `capital_base ≤ 0` (invalid basis) | No new entries; MonthlyHalt neither latches nor closes; existing protection continues; critical alert and `/status` flag until the basis is valid. |
+| Current month's reset not landed (wallet or previous-base read failing at the boundary, or before the first poll) | The same as an invalid basis, without the critical alert: no reset is appended from any other basis and the poll retries every 60 s; `robsond_month_boundary_pending` is 1 after a failed attempt (ADR-0056 §8). |
 
 ## Consequences
 
@@ -364,6 +372,193 @@ since 2026-10-24. The switch itself was one guarded
 `UPDATE` (`UPDATE 1`), no restart, and the first `/status` snapshot
 reported the new model with the HWM outputs withheld.
 
+## Amendment 2026-11-07: an invalid basis does not liquidate
+
+**Status**: DECIDED by the operator, 2026-11-07. Implemented in `robsond`
+together with this text. The alert rules below land separately in
+`rbxrobotica/rbx-infra`.
+
+**Why this was reopened.** As first written, §1 latched MonthlyHalt on an invalid
+basis and §2 closes risk-bearing positions once latched. The ADR-0056 step 6
+review flagged the false liquidation. Reading the source at `2804c329` showed
+what that text had not weighed:
+
+- A basis of zero can exist with no fault in the account. The projector's
+  auxiliary `monthly_state` upserts (`handle_entry_filled_monthly`,
+  `handle_position_closed_monthly`) insert `capital_base = 0` when the month row
+  is missing, and that row is visible until `MonthBoundaryReset` overwrites it.
+  The boundary is polled every 60 s; the 2026-11-01 reset ran at 00:00:49. A
+  losing close in that window would close every other leg at market, then the
+  reset would correct the basis and clear the latch, leaving a flat book with no
+  visible cause. This is from reading the code; no such event is on record. The
+  boundary and both recalibration paths can also write zero through their
+  `.max(0)` clamp. PR #298 then closed the window above, since the counters now
+  only update an existing row; those three paths remain, and the decision stands
+  on them and on the reasons below.
+- Only a close reached the halt. A signal or an approval was refused earlier, on
+  margin, so the "denies and halt-latches" in the test invariants was only half
+  true, and no test pinned it.
+- Every other accounting failure in this ADR keeps positions open (§3 and the
+  failure-mode table). In code, unresolved latent risk defers the halt unless
+  realized losses alone exhaust a valid budget, which is a known amount and not a
+  failure to know one.
+
+**Decision.** On `capital_base ≤ 0`:
+
+```
+capital_base ≤ 0
+  ├─ arm, signal, approval  → denied; `RiskCheck::MonthlyDrawdown` needs a positive basis
+  ├─ a position closes      → evaluate_monthly_halt logs and returns; no latch, no close
+  ├─ every 60 s, own worker → robsond_monthly_budget_basis_invalid = 1 → critical alert
+  └─ POST /monthly-halt     → the operator can still latch and close, best effort
+```
+
+**What holds without the close.** The floor proof in §1 is `N − L − A` over
+reservations made at admission. It never uses the close, so liquidating adds
+nothing to it, and open positions keep their stops and reservations. It is a proof
+against the basis those reservations were made on and under the premises of §§1–3,
+not a new guarantee for an unknown basis:
+
+- If the row is corrected to a lower basis, risk admitted earlier can exceed the
+  new budget ($100 admitted on 10,000 against a budget of $40 on 1,000), as with
+  any reduction §1 permits.
+- Known exceptions to those premises stand and are not changed here: `Exiting`
+  positions are outside `find_risk_open`, and governed net reads close P&L and fees
+  without the settlement completeness of §3.
+- Basis reads are not versioned against a concurrent write: the serialized snapshot
+  of §2 remains follow-up required. A snapshot's reads can take seconds when trading
+  rules must be fetched, so the halt and admission each re-read the basis at their
+  decision point. A write after that read is after the decision: a halt or an entry
+  decided on a valid basis a moment earlier stands. A re-read that fails defers the
+  halt and denies the entry. If that denial's audit write fails too, the signal or
+  approval returns an error and the position re-arms like any admission that fails
+  before the executor (see Recovery). Either way it enters nothing.
+
+Admission stays closed without the latch: the gate, `can_admit`, `slots_available`
+and `with_capital` each refuse the basis, and they survive a restart, which the
+in-memory latch does not.
+
+`POST /monthly-halt` remains best effort: `panic_close_all` skips `Entering` orders,
+which can still fill. Check the exchange before calling the account flat.
+
+**Alarm.** A dedicated worker reads `monthly_state` every minute on one connection
+of its own, under a time bound the server also enforces with `statement_timeout`, so
+it takes no connection from the daemon's pool and leaves no statement waiting. The
+persisted row is the durable record, so a restart raises the alarm again. A missing row does not raise this
+alarm: a month whose reset has not landed is an invalid basis to the snapshot (ADR-0056 §8, month-boundary
+basis), and `robsond_month_boundary_pending` reports it. A failed read publishes nothing,
+and `robsond_monthly_budget_basis_last_read_timestamp_seconds` stops advancing. It
+starts at 0, so a process that never managed a read does not pass for a valid
+basis. Alert `RBXRobsondMonthlyBudgetBasisInvalid` is critical after 5 minutes and
+`RBXRobsondMonthlyBudgetBasisUnread` covers the blind case.
+`/status.monthly_budget_basis_invalid` and an error log per read complete it. A
+zero shorter than the alert's window, such as the projector's, leaves at most the
+log lines of whichever reader saw it, and possibly nothing: a row overwritten
+between reads keeps no history.
+
+**Recovery.** The next `MonthBoundaryReset` writes a new basis, or the operator
+corrects the row with evidence. Admission reads the basis on every attempt, so
+entries resume with no restart and no reset. A position already Armed re-arms
+after a denied signal or approval and may then enter through the normal gate. The
+exception is a signal on an `Immediate` position, which is cancelled as on any
+margin refusal.
+
+A database failure during admission needs no restart either. Detectors are
+single-shot, so an admission that returned an error used to leave its position Armed
+with no detector until a restart, or a disarm and arm. Now any error before the
+executor re-arms the detector under the governed backoff: in a signal, in an approval
+the flow has taken from the queue, and in the expiry task when it cannot record an
+expiry. The backoff starts at 5 s and doubles to 15 minutes, and resets once an
+admission reaches the executor or the approval queue. During an outage each fire
+costs one failed write and a longer wait. Once the database is back the position
+resumes within one backoff period, then waits for its entry condition. Every retry is
+a full admission: its query audit writes before the order (`accepted`, `processing`,
+`risk_checked`, `acting`, and `authorized` after an approval) must succeed, so no
+order goes out without them. The `EntryApprovalPending` domain event stays best
+effort, as before. Not re-armed: a failure from the executor on, where an order may
+exist or the admission is half written (ADR-0052). Reconciliation, a restart or a
+disarm and arm resolves it, and until then a position still Armed has no detector.
+Nor a signal that MonthlyHalt drops, or a position that is no longer Armed, waits for
+approval, or needs an operator re-arm. A refusal that ends an `Immediate` arm still
+ends it when its own record fails. Each re-arm happens under `entry_flow_lock` on the
+position as it stands then, the expiry task's included, so a disarm cannot leave a
+stray detector. MonthlyHalt stops every running detector as it latches, before the
+disarms that fail at their first write when the database is down, and a re-arm checks
+for the halt under the lock that stop takes, so no re-armed detector outlives a halt.
+An arm already past its own halt check is not covered by this.
+`robsond_detector_rearms_after_failure_total{flow}` counts the re-arms, a record the
+event log cannot keep while the database is down.
+
+The re-armed detector is the one the position had before it fired, as after a
+restart. In a strategy mode it reads candles on each matching market tick, as any
+Armed position's detector does, so the backoff bounds admissions, not those reads.
+
+What this leaves on the table: errors are not sorted by cause, so a fault before the
+executor that never clears retries every 15 minutes, with an error log and a count
+each time, instead of going quiet. An `Immediate` position re-arms as on a governed
+denial, so it can enter when the database returns rather than when it was armed.
+Disarm it to prevent that.
+
+Rollout and rollback of this recovery: no schema or event-format change. After the
+deploy, `/metrics` exports the counter at 0 for `signal`, `approval` and
+`approval_expiry`. Before merging, record the running `sha-*` tag from the
+`rbx-infra` pin as the rollback target; it already includes PR #300. Rolling back to
+it only brings back the lost detectors: an admission that fails before the executor
+again leaves its position without one until a restart, or a disarm and arm.
+
+| Option | On an invalid basis | Gain | Cost | Decision |
+| --- | --- | --- | --- | --- |
+| Keep §1 as written | Latch and close on the next close | No code | A false zero liquidates a healthy book and hides the cause | Rejected |
+| Deny and alarm, no latch, no close | Entries denied, positions kept | Heals when the basis is corrected; one rule for every accounting failure | Needs its own worker, metrics and alerts | **Accepted** |
+| Latch without closing | Latch, positions kept | Reuses the MonthlyHalt alert | "Already halted" would skip a real exhaustion after the row is corrected; no reset endpoint, so a correction waits for a restart or the boundary; the halt and alert text say positions closed | Rejected |
+
+**Trade-offs: what this leaves on the table.**
+
+- An account that really is empty with legs open is no longer flattened
+  automatically. The legs run to their stops and the operator is alerted.
+- While the basis is invalid, exhaustion cannot be measured. Once it is valid
+  again, the halt is next evaluated on the next close, or the next admission
+  attempt that reaches the monthly check (duplicate and margin refusals come
+  first), not when the row changes, like any other basis change today (§1's
+  "immediately re-evaluating" is not implemented for any of them). Under the premises
+  and exceptions above, the reservations still bound the month, within the envelope
+  of §2.
+- A corrupted small positive basis still closes through the ordinary
+  `remaining_budget ≤ 0` path. §1 permits a reduced basis, so telling the two
+  apart needs a plausibility check against the wallet, which is not part of this
+  change.
+- The dashboard shows its own banner for `capital_base ≤ 0` in place of "budget
+  exhausted", unless MonthlyHalt is latched, and arming fails with "Capital base
+  invalid", but only while someone is looking. The alert is what reaches an absent
+  operator.
+
+**Rollout and rollback.** This covers the invalid-basis change, PR #300; the
+detector recovery under Recovery has its own. A `robsond` merge promotes
+automatically, so the alerts go first: merge the `rbx-infra` rules and confirm
+Prometheus has loaded them before merging this change. A rule with no series stays
+silent. After the deploy, confirm `/metrics` exports the gauge at 0 with the
+last-read timestamp advancing. There is no schema or event-format change. The
+worker opens one more database connection.
+
+The rollback target is the image running before this deploy: record its `sha-*` tag
+from the `rbx-infra` pin before merging, confirm it is in the registry
+(`docs/runbooks/ci-cd-image-tagging.md`), and confirm it is running and includes
+PR #298 (`sha-aee83b1b` or later). #298 added migration 30, and once that is applied
+the sync's migration hook refuses an image without it, which leaves the daemon on
+this one. To go back past #298, roll forward instead: revert on `main` and keep the
+migration file, as that runbook says. Either way, undoing this change restores the
+automatic liquidation on an invalid basis, so first confirm the basis is valid or the
+exchange book is flat, in-flight entries included. Afterwards, check the pod's health
+and `/status`.
+
+**Failure modes.** Database down: admission fails closed at its first audit write
+or at the snapshot, the halt is not evaluated, the gauge keeps its last value, and a
+signal that fires in that window re-arms its detector under a growing backoff until a
+retry gets through (see Recovery). Daemon down: the row
+persists and the alarm returns on the first tick after restart. Exchange down:
+the rule reads no exchange data; exchange-side stops are unaffected. Alertmanager
+or Prometheus down: the `/status` flag and logs remain.
+
 ## Supersession boundaries
 
 This ADR supersedes ADR-0046's high-water-mark anchor, peak persistence,
@@ -386,7 +581,7 @@ drift, and fail-closed requirements remain in force.
 ADR-0043 remains authoritative for actual-planned-risk admission, the
 full-cap guaranteed-minimum meaning of slots, the ability to admit a smaller
 trade while slots are zero, and the `remaining_budget ≤ 0` MonthlyHalt
-threshold.
+threshold on a valid basis (§1).
 
 ADR-0045 remains authoritative for typed income evidence, item-level
 reconciliation, raw drift attribution, and the prohibition on absorbing
@@ -443,7 +638,7 @@ closed. Exit and protective-stop management continue.
   admission/status/slots/halt read byte-equivalent snapshots; restart
   reproduces the same snapshot; month reset idempotent, carried risk charged
   exactly once; out-of-band drift never enters governed net;
-  `capital_base ≤ 0` never divides and always denies and halt-latches;
+  `capital_base ≤ 0` never divides, always denies, and never latches or closes;
   `0 < remaining_budget < risk_unit` reports zero slots but may admit a
   smaller priced trade; exact final-budget reservation exercises the
   `remaining = 0` halt behavior; conservative Decimal/quantization boundary

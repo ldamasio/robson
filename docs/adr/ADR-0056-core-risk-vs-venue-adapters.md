@@ -10,7 +10,8 @@ enforcement claim do **not** hold on balance accounts during a protection transi
 those two *guarantees* are qualified.
 **Preserves**: ADR-0021 (level selection), ADR-0022 (unauthored inventory on the operated account is closed, account-wide; no
 exception), ADR-0050 (valid-level selection, no-valid-stop semantics, executable risk costing), ADR-0051 (net-from-start
-monthly budget, atomic reservation, cost-priced boundary downside), ADR-0049 (event payloads do not change)
+monthly budget, atomic reservation, cost-priced boundary downside), ADR-0049 (the event log stays an audit trail; existing
+payloads do not change, except step 6's optional `rules_snapshot` and its new audit-only `residual_inventory_recorded`, §5)
 **Related**: issue #154, TD-2026-05-05-001, docs/policies/UNTRACKED-POSITION-RECONCILIATION.md, 2026-10-30 security assessment
 
 ---
@@ -106,7 +107,8 @@ release as a **forwarding compatibility layer** (same method names, implemented 
 
 ```text
 TradingPort                      required
-  trading_rules / trading_rules_preview                      (issue #154 contracts unchanged)
+  trading_rules / trading_rules_preview                      (issue #154 contracts, qualified by step 6: §5)
+  trading_rules_fresh / last_validated_rules / rules_refresh_due / refresh_trading_rules     (step 6: §5)
   place_market_order(symbol, side, qty, client_id, intent: EntryOrReduce) -> OrderResult
   place_protection(symbol, close_side, qty, trigger, client_id) -> PlacedStop { stop: StopRef, acceptance: OrderResult }
   cancel_protection(symbol, StopRef) -> StopCancelOutcome
@@ -191,9 +193,10 @@ look like a fresh record. What counts as an authoritative rejection is per venue
 Binance documents as execution-status-unknown. This reads the codes' documented meanings; Binance gives no explicit
 finality guarantee, and the HTTP condition is an inference that fails safe to `Unknown`.
 
-The evidence is in memory until step 7 persists it. An attempt by an earlier or another process leaves no record, so a
-rejected retry with the same client id would read as all-rejected. Until step 7, no caller may act on `Absent` for a
-client id that another process may have submitted.
+The adapter's ledger is in memory and speaks for one process. With the order journal attached (step 7, §8) the finality
+rule reads the durable attempt rows and the journal's memory instead: at least one row, all rejected, nothing unlanded in
+memory, then the venue's not-found. A send with no row reads `Unknown` for ever, and so does a failed read. A daemon with
+no database has no journal and keeps the in-memory limitation, and no production path acts on `Absent` yet.
 
 **2.1 Protection kind.** An eligible venue must provide exchange-resident protection that triggers **market** execution at
 the resolved executable trigger: `ProtectionKind::MarketOnTrigger`. Binance USDⓈ-M: conditional `STOP_MARKET`. Binance
@@ -243,6 +246,16 @@ unexecutable residuals stay visibly unresolved. Reusing a
 `Unknown`. A `Terminal` outcome releases only the liabilities
 proven extinguished: filled inventory and unsettled costs stay charged until settlement evidence arrives.
 
+**Exit order on position accounts (step 6).** `binance:usdm` keeps the order it runs in production. The tick's exit cancels the
+protective stop, then submits the market exit (the 2026-07-02 ADR-0039 implementation guide). `DELETE` and `/panic` submit only
+the exit and never cancel: a failed one keeps the stop, and a successful one leaves it live until the next sweep. So §5's "protection is retained until the successor is accepted" holds for
+stop replacement, which is place-then-cancel, and **not** for the tick's market exit, and this qualifies ADR-0039 and ADR-0052's
+availability language for that window. Nothing has shown that Binance accepts a reduce-only market exit beside an open reduce-only
+stop, and an exit-first design with a cancel-then-resubmit fallback was tried and withdrawn (Review trail, v11). The cost: a tick
+exit that fails leaves the leg with no exchange stop until the heal re-places it, and §5 states that window. On this venue the
+remainder is not computed from the stop's final state as above: the reduce-only bound caps the order and its fill closes the leg
+(§5). Balance accounts also cancel first, for their own reason: the stop locks the inventory the exit sells.
+
 **2.3 Reconciliation is never optional.** The reconciliation worker, startup recovery, the live-risk filter, orphan-stop
 recognition and `/status` sync consume an `AccountObservation` produced by the venue: `Positions(snapshot)` for position
 accounts, `Inventory(account_observation)` for balance accounts, in both cases **account-wide** (every symbol, every
@@ -252,6 +265,17 @@ A residual that cannot be executed (below the lot or notional minimum) is a visi
 evidence, priced conservatively at the venue mark, never declared closed. A discrepancy between governed inventory and
 Robson's leg quantity blocks new legs on that venue and surfaces in `/status`. The existing gap (matching by symbol/side
 rather than order-level authorship) stays a follow-up.
+
+**What step 6 delivers on `binance:usdm`, narrower than the above.** A fill for a leg's exit or stop closes the leg, as it did
+before this step, and what the venue still holds is unauthored inventory, closed under ADR-0022 on the next scan. So on this venue
+a leg can be declared closed with a remainder on the account; the remainder itself is never declared closed, and one below the
+lot fails every scan visibly until the operator clears it. There is no operator API. ADR-0022's definition of authored inventory
+rests on entry traceability and this remainder is traceable, so this is an extension of the sweep, recorded in the UNTRACKED policy's
+implementation boundary. A residual on a leg that stays open (a rounded
+stop, a stop below the lot, an exit that is not executable) is durable evidence and blocks new admissions, but it is **not priced at
+the mark in this step**: neither the budget nor latent risk reads it. It surfaces as `residual_quantity` on the position summary and
+as the admission refusal, not in the `/status` slots, and `/positions?month=` under PostgreSQL reads the projection and omits it. Pricing it, and what a remainder means on a balance account, are step 8
+obligations (Implementation Notes).
 
 **2.4 Capital quantities.** `AccountPort`/`PositionAccountPort` expose **wallet balance and unrealized P&L
 separately** (the connector's `wallet_balance` mapping is left as is; a new field is added). The core derives once:
@@ -302,7 +326,7 @@ commission.
   `Selected` (as before), `Recovery` (the selected venue has no funding; finishes started sagas on the implied route,
   expires unstarted quotes, never touches the selected venue's capital) and `Blocked` (the route's credentials are
   unusable; writes nothing, liabilities retained). Evidence for `Blocked` is `blocked_reason` on the funding views and the
-  gauge `robsond_funding_sagas_blocked`. **Owner of durable per-saga routing and per-route workers: step 7**, whose legacy
+  gauge `robsond_funding_sagas_blocked`. **Owner of durable per-saga routing and per-route workers: step 8** (moved from step 7 on 2026-11-08), whose legacy
   mapping must also account for sagas a simulator created earlier on the same database.
 - **Simulated venues.** A factory-built stub has no funding surface, so it can neither create nor execute a persisted saga.
 - **Conversion exclusion.** Excluding governed inventory and reserving conversion quantities is not delivered. It is
@@ -310,8 +334,9 @@ commission.
   wallet: `current_spot_usdt()` transfers all free spot USDT, which there is quote cash. **Owner: step 8, before
   activation**, covering recovery work too; refusing recovery while spot is selected is the acceptable alternative.
 - **`eligible`.** `/readyz.venue` computes only valuation freshness today and reports `rules`, `costs` and
-  `account_observation` freshness as untracked reasons, so it reads `false`. **Owner: the steps producing that evidence, and
-  step 8 activation requires all of it.**
+  `account_observation` freshness as untracked reasons, so it reads `false`. Step 6 adds `rules_refresh_due`, which can
+  supply the rules input; `/readyz` does not read it yet. **Owner: the steps producing that evidence, and step 8 activation
+  requires all of it.**
 - **Reconnect resync and feed properties.** Today a reconnect takes no snapshot; REST polling starts only after the
   watchdog's 90 s of silence with a risk-open position, and subscriptions follow the configured symbols rather than the
   active `(venue, symbol)` set. Step 8 inherits this behaviour. **Owner: a separate reviewed change, before a second
@@ -357,6 +382,115 @@ step and validates min, max and alignment; they differ. Step 6 replaces the help
   minimum is recorded as residual inventory, never declared closed. Today's fallback quantity path
   (`binance_exchange.rs:391`) is replaced by this rule, not removed silently.
 The domain stop resolver's adverse tick rounding is reused; ADR-0052's persisted span is never recomputed.
+
+**What step 6 delivers, and where it reads this section narrowly:**
+- **Snapshot.** Taken at admission (the entry signal), not at arm, and under `ExecutableSpan` only: `LegacyUncapped`
+  admissions need fresh metadata but persist none. It is an optional `rules_snapshot` on `entry_signal_received`, read back
+  from `event_log` at restart as the first non-null one by stream sequence. No migration.
+- **Source order for risk reduction.** Last validated cache, then the snapshot. The cache goes first because it is never older
+  than the snapshot taken from it. Holding either never waits: a refresh past the TTL goes on the side, one in flight per
+  symbol.
+- **The one exception to "never waits".** A leg holding neither, which after this step means one admitted before it or one whose
+  snapshot could not be read, does the rules lookup on whatever path it is on, including the tick, as before this step. The lookup
+  and the rejection refresh are each bounded end to end at 15 s. If the lookup fails, a decided exit (close, panic, recovery, or a
+  tick that already had rules) goes out with the quantity as given. A tick cannot decide without rules, because the `ExecutableSpan`
+  trigger derives from them: that leg fails closed for that tick, the other legs are processed, and the tick returns the first error.
+  After an attempted fetch that did not succeed, a symbol with nothing cached retries after 30 s instead of 5 minutes, counted from
+  the attempt's start even if the bound dropped it, so such a leg cannot evaluate its software stop for up to 30 s after the venue
+  recovers (§10 states the request cost).
+- **Not executable under held rules.** Those rules may be stale, so the order is submitted raw and the venue decides. Only a
+  venue refusal confirmed by rules that also say so ends as not executable.
+- **Maximum.** Not checked locally on risk reduction, so stale rules cannot stop an order reaching the venue; a venue refusal
+  is a rules rejection like any other.
+- **Rules rejection on USDⓈ-M.** HTTP 400 with `-1111`, `-4004`, `-4005`, `-4013`, `-4014`, `-4023` or `-4164`. This is a
+  reading of Binance's error table, not a guarantee, and only `-1111` has repository evidence (2026-07-04). It is separate
+  from the step 2 finality list: a rejected attempt stays unresolved in the ledger. It takes at most one `exchangeInfo`,
+  skipped within 30 s of the last refresh, and one resubmit under the same client id; the reduce-only flag bounds what a
+  misreading can do. A second rejection returns to the caller, and the leg retries after 30 s.
+- **A fill closes its leg, and a remainder is unauthored inventory.** An exit fill, or a stop fill the daemon reaches through an
+  exit, startup recovery, reverse reconciliation or the tick's overtaken path, closes the leg whatever quantity it executed, and no venue
+  read decides it. A stop fill reached by none of these leaves the leg `Active` (see "A stop gone from the venue"). For a market exit this rests on a reading with no venue evidence: a `FILLED` reduce-only
+  order short of its request means the venue capped it because the position was smaller, or rounding after a lot rule rose, leaving
+  under one lot. `PARTIALLY_FILLED` and `EXPIRED` on a market reduce return the error they returned before this step, and the exit
+  retries. A stop is different: one that executes part and then expires or is cancelled counts as terminal, and startup recovery and
+  `/reconcile-close` (on operator evidence) can close a leg on it while the venue still holds most of the leg; that remainder is not
+  dust and goes to the sweep at market. The worker, the startup gate and the tick's overtaken path do not close on it while the venue
+  shows the position.
+- **How long a remainder sits.** The worker closes it under ADR-0022 with no grace period, normally on its next scan
+  (`ROBSON_RECONCILIATION_INTERVAL_SECS`, default 60 s), and it has no stop until then. **There is no upper bound**: a failed positions
+  read skips the pass for as long as it fails, passes are serial and a slow request delays them, a venue refusal or a remainder below
+  the lot retries every scan until the operator clears it, and downtime extends it. Nothing blocks a new entry meanwhile: a new
+  `Entering`, `Active` or `Exiting` leg on the same symbol and side makes the remainder count as tracked (§2.3's symbol/side gap), so it
+  is not swept until that leg closes. A failed UNTRACKED close no longer ends the rest of the scan.
+- **Evidence of a short exit.** An exit fill short of the leg always writes `residual_inventory_recorded` first, on the tick, close
+  and panic paths, because `ExitOrderPlaced` carries the requested quantity and this is the only durable record of what filled.
+- **A triggered stop counts as filled only with terminal, complete evidence.** `NEW`, `PARTIALLY_FILLED` and unknown statuses are not
+  fills, and a terminal order's summed trades must equal its cumulative executed quantity; otherwise the caller retries on a later
+  pass. This also tightens startup recovery, the tick's overtaken path and the worker's missing-position path. There is no bound if
+  they never match: the lookup reads one page of 1000 trades, so an order beyond it, or past the venue's trade history, stays unresolved
+  on a flat venue where the previous code accepted the partial evidence, until user-trade evidence or `/reconcile-close` resolves it.
+  **Remaining gap:** an order not found (`-2013`) still falls through to its trades, which cannot prove it terminal or complete.
+- **What a close books.** Every close books the leg's recorded quantity at the last order's fill, and that order's fee. This is an
+  estimate when a leg closes through more than one order: the earlier fill is priced at the later fill's price and its fee is not
+  counted. It is kept over pricing only what the last order executed, which would drop the earlier quantity from the month's net and
+  understate a loss. If the recorded quantity really was larger than the venue held, the difference is booked at the last fill too,
+  as the exit and panic paths did before this step. Only reverse reconciliation prices a fill above the leg at what filled, and its
+  evidence keeps the real filled quantity. Per-fill accounting is a step 8 obligation.
+- **Residual on an open leg.** `residual_inventory_recorded` is audit-only: the projector ignores it, and its `fill_price` and `fee`
+  are evidence nobody reads yet. On a leg that stays open (a rounded stop, a stop below the lot, an exit that is not executable) the
+  latest residual stands and only closing the leg resolves it: an accepted stop does not clear it, even one covering the whole leg. An
+  unchanged value writes nothing. A stop below the lot minimum retries every 5 minutes and writes durable events once.
+- **Admission block.** A residual on any open leg refuses new admissions through its own check and reason (409). It never fails
+  the budget snapshot and is no input to the budget, latent risk or MonthlyHalt. It does not cover a remainder after a close.
+- **MonthlyHalt.** With latent risk unresolved, the halt fires only on a valid capital base with realized losses alone exhausting the
+  budget (`min(consumed_active, consumed_nfs)`). Below that it defers as before this step. An invalid base never fires it, with latent
+  risk resolved or not (ADR-0051 §1, amended 2026-11-07, after this step).
+- **Stop healing.** Any `Active` leg with no stop on record is re-placed through the existing heal path, whichever caller or error
+  left it so. The first attempt waits the 30 s window and needs a tick, so the exposure after a failed tick exit is at least 30 s and
+  has no upper bound without ticks on the symbol. A leg with nothing held and a failed lookup waits for metadata; a leg below the lot
+  retries every 5 minutes; a leg suspected closed on the venue is not healed, rechecked when a heal comes due. After placement, and again after a replacement cancels its
+  predecessor, a leg no longer `Active` gets nothing recorded and the new stop is withdrawn, best-effort. A window remains between the
+  last check and applying the event; a stop that survives it is an orphan for the next sweep and, until then, could reduce a new entry
+  on that symbol and side if it triggers. The sweep also visits the symbols of legs closed in the last 24 h by `closed_at`, so such a stop,
+  or the one a successful `DELETE` or `/panic` leaves, normally goes within a scan. It does not on a flat symbol with no open leg when
+  `get_open_orders` keeps failing past those 24 h, when the close is backdated past them (`closed_at` is the fill's time, so a restart
+  can reconcile an old fill), or for a leg in `Error`. Untyped exit failures retry at tick cadence as before this step; only `RulesRejected`
+  and `ReduceOnlyRejected` have a 30 s window. **Known corner:** a persistent untyped refusal while price stays past the stop submits
+  at tick cadence and alternates heal and cancel, about 2 stop events per 30 s, until the operator acts.
+- **A stop gone from the venue.** A stop can stop being live on a leg the venue still holds: a rounded stop fills and leaves a remainder
+  with no crossing tick, a stop executes part and expires, the operator cancels it, or the sweep cancels a successor not yet recorded.
+  The leg stays `Active`, so nothing closes it, and a recorded id would keep the heal from noticing. The orphan sweep already reads the
+  open protective orders of every symbol with an `Active` leg, so no request is added: on a successful read, a leg the venue holds whose
+  recorded stop is not among them, and whose id is unchanged on a re-read, is scheduled for the heal, with a warning and the stale gauge.
+  Exposure lasts up to one scan, plus the 30 s window, plus the next tick, and with no feed nothing is re-placed. Not verified on a venue:
+  that a reduce-only stop larger than what is held is accepted (if refused, `InsuranceStopFailed` repeats every 30 s and only the software
+  stop protects the leg), and that the read returns every live conditional stop (if it hid one, the cost is one replacement per leg per
+  scan, which stacks only if a predecessor's cancel also fails). The scan's two reads are not atomic, so a stop filling between them
+  schedules a heal on a leg about to be flat; the venue may refuse the new stop, and then it retries every 30 s until the leg closes. A
+  worker lookup that closed the leg on the dead stop was built and withdrawn (Review trail, v11).
+- **A superseded stop stays evidence of a whole fill.** A leg remembers its last 3 displaced stop ids, restored at restart from the stream
+  it already reads, because a stop can fill after being displaced, by this heal, by startup recovery or by a trailing advance. The
+  missing-position worker and the startup gate try the recorded id, then those; a displaced stop counts only if it filled the leg's whole
+  quantity, and it keeps its `ins-` authorship, so the close is `InsuranceStop` and counts in the budget. An older partial is ignored, so it
+  cannot finalize a later close at its own price and month, and the path falls through to user trades. That costs up to 3 ids × 3 requests,
+  only when the recorded id has no fill. The tick's overtaken path looks up the recorded stop only, so it costs per mark what it did before
+  this step. Three further displacements before the fill push an id off the list and the close falls to user trades, outside the budget; a
+  failed append of the event loses the id at restart (step 7). A fill that left the leg open stays out of the month's net until the leg
+  closes and the whole leg is booked at the later fill.
+- **Restart.** An event-log query error aborts startup with a retryable exit; exchange stops stay live meanwhile. A residual row that
+  cannot be read, or is not the variant its type says for this leg, sets `residual_unknown`, which blocks admissions the same way until
+  the leg closes; such a rules row counts as no snapshot. A residual going A→B→A without an order id hits event-log idempotency, so a
+  restart shows B instead of A; both block.
+- **The old fallback.** The path cited above now lives in `usdm/exchange.rs` and is gone, together with its 2-decimal
+  trigger rounding. With no cache, no snapshot and `exchangeInfo` down, a legacy trigger whose 2-decimal result happened to
+  be tick-aligned is no longer placed and retries at 30 s. New `ExecutableSpan` legs cannot reach this.
+- **Accepted limit: a real partial is not in the month's net while the leg stays open**, and the close only approximates it, as above.
+  The income ledger is a conditional safety net: a `REALIZED_PNL` or `COMMISSION` row matches when exactly one position on the symbol
+  has `entry_filled_at` or `closed_at` within 120 s of it, so a partial near the entry or the close raises nothing. Otherwise it stays
+  unmatched, alarms after the grace period and makes `transfer_explains_delta` return `None`, which stops transfer-confirmed
+  `capital_base` recalibration for that window; acknowledging the row does not lift that (ADR-0045 §2). Trading is unaffected.
+- **Crash between a fill and its events, or a failed durable append** (reasoned, not tested; **owner: step 7**). A residual's admission
+  block can be lost at restart. The leg keeps its recorded quantity and stays managed.
 
 ### 6. Long-only readiness
 
@@ -469,12 +603,422 @@ account exists.
 | 3 | `VenueFactory`, `with_venue`, `TradeFeedPort` and the WS wiring relocation, feed injection with `(VenueId, Symbol)` keys, additive `/readyz.venue`, funding route modes (§3 lists what is staged) | preserving for execution with `ROBSON_VENUE` unset and usable credentials; additive for readiness consumers; stub paths lose their funding surface | revert alone |
 | 4 | Rust naming and endpoint cleanup with stable event, `Position` and credential encodings; fixtures | preserving | revert alone |
 | 5 | Accounting: governed equity derived once; month-boundary basis uses ADR-0051 §3 cost-priced downside; **migration** for persisted carried bases with compatible settlement attribution and replay handling; atomic reset | **changing** (basis, persisted state version) | once new accounting state is written, rollback needs demonstrated reader/writer compatibility of the older binary with that state, or a verified book free of risk-bearing and unsettled liabilities; keeping `capital_base` alone is insufficient |
-| 6 | Quantisation and metadata rules (§5) with before/after fixtures per order kind | **changing** | revert alone only with a verified empty book (the old helper is incompatible with spot lots) |
+| 6 | Quantisation and metadata rules (§5) with before/after fixtures per order kind | **changing** | revert alone only with a verified empty book (the old helper is incompatible with spot lots) **and no `residual_inventory_recorded` row in `event_log`**, since an older binary's projector returns `MissingHandler` on it and its event enum cannot read it; the additive `rules_snapshot` needs no such condition |
 | 7 | Durable intent journal in the store (migration): intents and results persisted in order relative to reservations, stable venue-scoped client ids, durable attempt evidence (§2), explicit unresolved states, transition intents (§2.2); **durable venue/account routing on every risk-bearing and unsettled leg**, with the legacy mapping of every existing position to `binance:usdm`; process-kill tests at every external-call/persistence boundary | preserving (adds evidence and identity) | revert alone with an empty book; after step 8 only together with step 8 |
 | 8 | Spot venue acceptance behind `ROBSON_VENUE=binance_spot`: `InventoryPort`, protection protocol per N1, settlement from fills, conformance suite green; the long-only entry gate is a separate ADR | new venue | disabling a venue stops new admissions on it but **keeps managing its open and unsettled legs** through the step-7 routing; a binary rollback requires a verified empty book on that venue |
 
+**Step 7 is delivered in parts, and this is what is implemented so far (operational rollout pending).** Step 7's scope is
+the venue-independent core; routing, booking and everything else that needs the spot design moved to step 8 by operator
+decision on 2026-11-08 (`Fence and manual recovery`, `Core now`). The parts land in the order harness, journal, cancels,
+stop, persistence, fence, ownership races. The row above is the original statement.
+
+*Harness (PR H).* Named crash points, a fake venue, a database proxy, CI step. No production behaviour.
+
+*Order journal, part 1 (store and rules).* Migration 31 adds `order_intents` (one row per logical order, unique per venue,
+account scope and client id), `submit_attempts` and `journal_decisions`, and the view `order_intents_blocking_rollback`.
+`robson_exec::order_journal` holds the rules and `robsond::order_journal_store` the PostgreSQL side.
+
+- **Attempt rules.** An attempt goes `started → rejected` and nothing else, and an upsert lets `rejected` absorb `started`, so
+  replays and lost acknowledgements converge. A further attempt on a client id commits together with every earlier attempt on
+  it, including attempts known only in memory; a failed or uncertain commit refuses that send, and the id is closed for the
+  rest of the process. A later process cannot use a client id that landed. An id whose row never landed and whose process
+  died cannot be detected as used: that case rests on ids never being minted twice.
+- **Write classes.** Strict: the intent and first attempt commit before the request, waiting at most 500 ms. A known failure is
+  a proven no-send; a timeout or a commit with no answer is uncertain and no request goes out. Bounded: the commit is tried for
+  at most 500 ms on the journal's own pool of 2 connections and the request goes out anyway, setting the latch if the row did
+  not land. A client id already spent is refused on either class. **"Known failure" means the `COMMIT` was never sent**, since a
+  transaction that never sent it cannot be durable: a statement error before it is known, which is broader than "before the
+  statement was sent"; every timeout stays uncertain.
+- **Results and retry.** A result write never fails its caller. It is registered in the retry set before the wait, so a future
+  dropped mid-commit stays there, counted on the gauge and flushed; the set holds at most 1,024 intents, and one retry pass stops
+  starting commits after 2 s, so it holds its loop for at most 2.5 s. Overflow discards that intent's history and sets the latch.
+- **Discarded ids stay refused while they can be kept.** An id that leaves memory either has a durable row, which the unique index
+  holds for good, or was never sent, except one sent with no row and no room in the retry set. Those go to a set of at most 4,096 ids
+  (about 400 KB) kept for the life of the process, and are refused through any handle. **A full journal never stops a bounded first
+  send.** With both full the send goes out and its id is not kept, so its non-reuse rests on the id being fresh, the same reliance as
+  a process that died with no row. Every bounded path mints a fresh id per intent. The loss is logged at ERROR and counted, and the
+  count only grows until restart.
+- **Cancellation of a read or a write.** A connection whose read or write did not finish is closed, not returned to the pool, so a
+  dropped future cannot leave the two connections waiting on replies that will never come. An interrupted cancel intent is uncertain, never
+  `not_sent`: `not_sent` needs a ticket as proof, and a cancel has none.
+- **Query bounds (guardrails §1.1).** Every write is one explicit transaction ending in a simple-query `COMMIT`; nothing commits
+  implicitly. Reviewed bounds per handled operation, `BEGIN` and `COMMIT` included: an order 9 (13 with one quantisation retry, 22 with a
+  refused retry replaced by a fresh intent), a cancel 9, a stop placement with its predecessor's cancel 31, a cancel-first exit 31, a
+  placement that withdraws both stops 40.
+  They are above the guardrails' default review threshold of 15 on purpose: the writes are small and each pair is one order's
+  durability. Each operation's count is kept and the bound (40) is checked when it ends. These are charged counts: a commit is charged
+  what it plans to run, so one that fails before sending anything is charged in full. They are not a measure of executed SQL.
+  From PR S an operation is a permit's whole span: an entry and its initial stop are one operation, 18. An operation over several legs
+  (one main-loop event on a symbol with several legs, a reconciliation scan, `/panic`, the startup phase) is charged the sum of its orders,
+  so it can pass 40; the over-bound counter then counts it too, which marks a loop of venue work for review rather than an error.
+
+**Rollback across this schema is boundary B:** with the daemon stopped, `SELECT * FROM order_intents_blocking_rollback` must be
+empty. It lists every intent with no definite outcome that is not proven unsent and has no disposition. Read on a running process
+it is a snapshot, not an authorization. An older binary ignores the new tables, which is why ignoring them needs this check first.
+
+**A rollback image must keep migration 31.** SQLx's migrator rejects an applied migration missing from its embedded set
+(`VersionMissing`), and `robsond db migrate` runs in the deployment's Sync hook. So once migration 31 is applied, pinning straight back to
+`sha-179898cf` is rejected by that image's migration hook. Rollback means an image that keeps migration 31, or a compatible
+migration-job image.
+
+Part 1 changes nothing at runtime: nothing calls the journal yet.
+
+*Order journal, part 2 (disposition and metrics).* **`POST /recovery/disposition`** (authenticated; a verified Google identity is
+recorded as `verified`, the legacy token as `asserted`) records, per outstanding intent, `terminal_evidence` or `accepted_risk`,
+plus the accounting treatment of what remains (`unbooked_accepted` in the core). It writes no venue outcome and no event, books
+nothing and affects no admission. Terminal evidence names the order (for a cancellation, the venue reference of the order it cancelled, never its local `cxl-` id, which
+never reached the venue), states a terminal status consistent with its filled quantity,
+which cannot be negative or more than the order asked for, gives its source and a past observation time, and **attaches the venue's
+own record of the order**. Without a record, what the operator has is an assertion, and the disposition to make is `accepted_risk`.
+The endpoint does not check the record against the venue: it is what the named operator attached. So an observation that the account
+is empty never satisfies B. A disposition is not a venue outcome and does not discharge liabilities; the recorded treatment does.
+Each request appends to `journal_decisions` and the latest stands, so a retry after a lost acknowledgement adds a second decision
+and changes nothing else.
+
+Metrics, defined here and published from part 3 on: `robsond_journal_latch`, `robsond_journal_retry_set_depth`,
+`robsond_journal_non_reuse_ids_lost`, `robsond_journal_statements` (charged, not executed),
+`robsond_journal_operation_statements_max`, `robsond_journal_operations_over_statement_bound`.
+`robsond_journal_non_reuse_ids_lost` is process-local, resets on restart, and counts sends authorized without their id being kept, not
+a verified inventory of orders with no row.
+
+*Order journal, part 3 (wiring).* Every order path writes through the journal: entry (strict); exit, protective stop, replacement,
+withdrawal, software-exit and orphan cancels, and the UNTRACKED sweep close (bounded). Funding conversions are not journaled and are
+never evidence for `Absent`. The daemon checks the journal at startup, which also warms its pool: it refuses to start when the journal's
+tables are missing or when the whole check, probes and retries included, has not finished within 10 s, and a stalled probe's connection is
+closed. On a slow database this is new: a boot that used to carry on now exits with an error if the journal cannot answer in that time, and
+the pod restarts.
+
+- **Outcome classes are recorded only.** An intent ends as a success, a rejection (every attempt authoritatively refused), not sent,
+  or uncertain. **Between this PR and the fence PR, uncertainty is journaled but does not fence, exactly as today:** no incident
+  opens, no admission closes, and the latch shows only on its metric. A failed result write never discards a venue result and never
+  prevents protection. Event persistence after a venue result can still abort the flow as before; PR P (below) ends that.
+- **Tickets and the re-arm backoff.** The attempt ledger reports a send ticket just before a request leaves. The backoff reset moved
+  from before the executor to after it, on `Ok` and `Err` alike, and only when the entry holds a ticket. An adapter refusing locally
+  before the send is therefore a proven no-send too.
+- **A proven no-send (design D15, amended).** ADR-0052 makes admission evidence on an `Armed` leg something to recover explicitly, and
+  the engine refuses a second admission against it, so a re-arm could never admit. On a leg with evidence (`ExecutableSpan`, the
+  production default) the attempt ends at once through `mark_entry_exhausted`, reason `entry_not_sent`, audited and with no re-arm;
+  the evidence is neither cleared nor re-admitted against, and the operator re-arms. On a leg with none (legacy policy) the detector
+  goes back under the governed backoff. A refusal by the account's futures settings is the same case: its safety event stands and a leg with
+  evidence ends the same way, while a legacy leg keeps today's behaviour there, with no exhaustion and no re-arm. If the exhaustion cannot be
+  appended, this process still holds the record and re-arms nothing, but that is a same-process statement: a restart can restore the detector,
+  and the engine's evidence check then rejects the next signal and makes it terminal. Across a restart what holds is that no second admission
+  happens. An uncertain commit is not a no-send: no re-arm and no reset.
+- **A refused resubmission does not wait.** A rules rejection earns one resubmission under the same id, and the completeness rule can
+  refuse it. The refused id stays closed, and when the first submission ended in that rules rejection and only that first request left, the
+  refreshed order goes out once under a fresh id in the same call, as a bounded first attempt, so a cancel-first exit is not left with no stop
+  and no exit until a later tick. One fallback, no loop: if it fails or is refused, the ordinary error path applies. Exit, initial stop,
+  replacement and sweep close share this through `submit_reduction`; a cancel has no resubmission, and an entry stays strict and has no
+  fallback. The refused intent ends uncertain and the fresh one carries the venue's answer.
+- **Cancels.** Each cancel is its own bounded intent. Their classification is the next part.
+
+Trade-off: an entry is refused rather than sent when the journal cannot record it, and a slow database adds up to 500 ms per write to
+an order's path. After an entry fill, the result write plus the stop's pre-send write can add 1 s before the stop's request; a cancel-first
+exit likewise. "Does not wait" above means no later tick or backoff, not zero journal waiting: the fallback adds another bounded pre-send write and
+another outcome write, so up to 2 s of journal waits can pass after the cancel acknowledgement before the fresh request, and 2.5 s in total for a
+replaced retry. These waits sit under existing locks: detector handling and the API's close and panic hold the manager write lock across
+them, so they can delay unrelated protective work. Nothing acts on uncertainty or the latch yet (from PR P the latch closes admissions). `applied_at` and `uncertain_generation`
+exist but are not written. In J an entry's operation ended before its stop was placed; PR S makes them one operation. Not verified: behaviour on a
+real venue or in the cluster.
+
+*Cancels (PR C).* Every production stop cancel (replacement, withdrawal, software-exit, orphan) goes through one journaled entry that
+classifies the answer with one venue-neutral, exhaustive `robson_exec::cancel::classify_cancel`. `ports::StopCancelOutcome` now mirrors
+the venue enum variant for variant, payload included (`Unknown` is `Indeterminate` there), `legacy_cancel_outcome` maps one to one and
+folds nothing into an error, and `StubExchange` can answer every variant.
+
+| Result | Class | `venue_outcome` | `cancel_class` |
+|---|---|---|---|
+| `Cancelled { .. }` | definite | `success` | `cancelled` |
+| `AlreadyGone { Terminal { .. } }` | definite | `gone_terminal` | `gone_terminal` |
+| `AlreadyGone` with `Absent`, `Open`, `PartiallyFilled` or `Unknown` | uncertain | NULL, with `uncertain_at` | `gone_unresolved` |
+| `Indeterminate` | uncertain | NULL, with `uncertain_at` | `indeterminate` |
+| any `Err` | uncertain | NULL, with `uncertain_at` | `error` |
+
+Both definite classes write the venue's fills to the cancel intent's `venue_evidence` (`filled_before_cancel` or `filled_qty`, and
+`fills`). No migration: migration 31 already created `cancel_class` and the `gone_terminal` value, so the design's 5 SQL lines were spent in J.
+
+- **No error string or broad variant can produce a definite class.** `is_unknown_order_error` is deleted. The adapter's `-2011`/`-2013` and
+  text detection only chooses between two uncertain classes. USD-M does no lookup on a cancel, so **every USD-M "already gone" is uncertain.**
+- **A cancel is its own intent.** A replacement's placement is recorded as a success before the cancel runs, and an uncertain cancel leaves it so.
+- **No in-operation resolution.** A later close of the leg, trades-only evidence included, never settles a cancel. Step 8 must supply typed terminal
+  evidence before spot activation.
+
+| Path | Definite | Uncertain |
+|---|---|---|
+| Replacement | success | placement stays a success, the double stop is tolerated and logged, as before |
+| Withdrawal | nothing logged | logged, the next stop is still withdrawn, as before |
+| Software-exit | `Cancelled`: `InsuranceStopCancelled`. `GoneTerminal`: keeps the stop id, `Skipped`, no event | `GoneUnresolved`: keeps the stop id, `Skipped`. `Indeterminate` or `Err`: `InsuranceStopFailed`, keeps the stop id. No class stops the exit behind it; a failed append or application of the `Cancelled` event does, as it did before this PR, and the failure event's append is awaited |
+| Orphan | `InsuranceStopOrphanCancelled`, as before | `GoneUnresolved`: the same report, retained from before. It does not establish that the order is gone, since `Open` and `PartiallyFilled` allow a live one, and its outcome stays uncertain in the journal. `Indeterminate` or `Err`: logged, no event, as before |
+
+**One change in emitted events.** A software-exit cancel answered by `ExecError::OrderRejected`, or by `ExecError::Exchange` with "order" in its
+text, used to read as cancelled: it emitted `InsuranceStopCancelled` and cleared the stop id. It now emits `InsuranceStopFailed` and keeps the id, as
+every other cancel error already did. **Retaining the id changes what follows it:** reverse reconciliation reads the kept stop's fill before broader trade evidence;
+restart recovery takes the branch that checks that order's fill and open state, and may keep it, where an absent id takes the placement branch; and the stale-stop retry,
+which runs if the leg is still `Active` when it comes due, because the exit behind the cancel failed, replaces the stop against the kept id, one more cancel than the plain
+re-placement of a cleared id.
+
+**A cancel that keeps failing repeats, and that is the accepted cost.** While the id stays on the leg, the software-exit cancel goes out once before each exit attempt, with its
+own journal intent and, for `Indeterminate` or `Err`, its own `InsuranceStopFailed` each time. Errors the old `is_unknown_order_error` did not match already did this, and the
+broad errors now behave the same way. Generic exit failures have no backoff, so that can be tick cadence; the exit backoffs bound it where they apply. Cancels are not rate-limited,
+because a retried cancel can be what lets the next exit through: a stop left live by a timed-out cancel can be removed on the next tick, and a reduction outranks saving a request.
+
+**A pending stop heal keeps its deadline.** An `InsuranceStopFailed` no longer changes a deadline on record, overdue included; only a leg with none gets a new 30 s. So repeated
+failures, and a batch whose bookkeeping runs after its deadline has passed, cannot keep a heal from coming due. `ProtectionNotExecutable` still overrides with its long window, and
+the heal pushes its own window before acting, so a failed heal still backs off and this does not become a heal on every tick. As a result, a failure during the long window no
+longer shortens it to 30 s.
+
+**An outstanding heal is rebuilt at a restart.** The retry window lives in memory, `InsuranceStopFailed` is audit-only, and a kept id hides the leg from missing-stop scheduling. So the
+projection-recovery path, in its existing stream query per recovered leg, schedules the heal for an `Active` leg whose latest event among `insurance_stop_placed`, `insurance_stop_replaced`,
+`insurance_stop_cancelled` and `insurance_stop_failed` is the failure, at now + 30 s, keeping any entry already there. It runs as any other heal, a `ReplaceInsuranceStop` against the kept id,
+and a successful startup-recovery placement clears it. A failed open-orders read schedules nothing, so one read failure cannot start replacing stops on healthy legs. The rebuild is conservative: a failure that is still the latest of those events schedules a replacement even when startup finds the stop healthy (an `already_protected` audit does not count), and it neither keeps elapsed backoff nor makes the replacement exactly-once, so a crash before its event is durable can repeat the replacement on the next boot, and a crash loop inside the 30 s keeps postponing it. Limits: `InsuranceStopFailed`
+is a best-effort append, so a failure event that was never written cannot be rebuilt; and the branch of `restore_positions` that finds legs already in the store does not rebuild it, which production
+cannot reach, since every daemon starts on a fresh in-memory store whose replay is empty.
+
+**Between this PR and the fence PR, uncertainty is journaled but does not fence, exactly as today:** an uncertain cancel opens no incident
+and closes no admission, and the orphan sweep has no veto. The cost the design accepts arrives with the fence, not here: on USD-M, a software-exit cancel attempted after the
+exchange stop has filled is uncertain and will fence until an operator release even if the close then succeeds. How often that happens is
+unmeasured, and nothing trades on USD-M today. Uncertain cancels block boundary B until they carry a disposition, as they did under J; a
+`gone_terminal` one no longer does. Not verified: behaviour on a real venue or in the cluster.
+
+*Stop (PR S).* Permits, the clean stop and process epochs, in three parts, each deployable alone in this order: the gate, the epochs, the
+stop. What the design leaves to the fence PR stays there: nothing sets `fenced`, no generation, no incident, `unclean_start` is recorded and not
+acted on, old intents are not stamped, the marker is version 1, and the orphan sweep has no veto.
+
+*Part 1, the gate.* `robson_exec::gate`.
+
+- **Operation permits.** Every operation that can mutate the venue runs under a permit taken at its entry, before any venue request and
+  before the manager lock, held in a task-local scope for the whole operation, its result handling and protective follow-ups included. The
+  permit is the operation's entry in `operations_in_flight`, J's registry, so an entry and its initial stop are now one operation and the J
+  boundary above is closed. A nested operation runs under the permit it is reached from and never takes a second slot or another class: an
+  `Immediate` arm's entry and stop, `/reconcile-close` into MonthlyHalt into `panic_close_all`, an entry's protection batch, the startup scan
+  inside the startup phase, the reconciliation scan's orphan cancels and UNTRACKED closes. A permit must be completed. One dropped before
+  its work returned, a cancelled or panicked future, counts in `robsond_aborted_operations_total` and sets the latch, whatever its rows say.
+  An operation that returned an error has completed. An API operation runs in its own task, which owns the permit, and the handler only
+  awaits its answer: a client that disconnects drops the handler, which hyper does on a closed connection, and the operation runs on to
+  completion; one that panics answers 500, aborted.
+- **Slots.** One reserved slot each for the main loop (one event), a reconciliation scan, a funding poll and the startup phase; 16 for the
+  ordinary API class (arm, injected signal, approval, funding execute, a spot USDT recovery that executes); 8 for the protective class (cancel
+  or close, `/panic`, `POST /monthly-halt`, `/reconcile-close`), which ordinary requests never take. That is 28 of the registry's 32 entries;
+  the other 4 take operations without a permit, which in production only a path the choke point counts can be. A full class answers 503
+  `busy` at once with nothing done, counted in `robsond_api_slot_busy_total{class}`. Slots guarantee allocation, not latency: holders still
+  queue on the manager lock. The route table is `OperationKind::class`. Routes with no venue mutation take no slot: `/funding/quote`,
+  `/capital/refresh`, `/entry/preview`, income acknowledgement, `/recovery/disposition` and a recovery dry run.
+- **Choke point.** `BinanceRestClient::post_signed` and `delete_signed`, and every mutating method of `StubExchange`, call
+  `OperationGate::mutation` before anything is built or sent. With a permit of that gate it passes in every phase. Without one it passes only
+  while the daemon is open, counted in `robsond_unpermitted_mutations_total` and setting the latch; once the daemon is stopping it is refused
+  and nothing is sent. `Venue::attach_gate` has no default, so every venue says how its mutations reach the gate; the daemon attaches it to
+  the selected venue and to the funding recovery route.
+- **Send start.** `SubmitAttemptLedger::submit`, and the stub, run `begin_send` immediately before the request is first polled, with no
+  await between. Under the gate's mutex, with the journal's memory taken inside it (the lock order is the manager lock, a stream's lock, the
+  gate, the journal's memory), an entry is refused unless the daemon is open and unfenced: a typed no-send that registers no attempt and
+  leaves no ticket. Anything else is counted in `sends_started` and gets its ticket. This is J's ticket, now issued under the gate: one
+  ticket, not two.
+- **One bound per request (D19).** Each REST request has one 10 s bound for the send and the body together, where it had 10 s for each. A
+  timeout is uncertain.
+
+What part 1 changes in production: more than 16 ordinary or 8 protective API requests at once now get 503 `busy`; a client that disconnects
+mid-operation no longer cancels it, where today the dropped handler takes the operation with it, possibly between an entry's fill and its
+stop or between the legs of a `/panic`; a panicking operation sets the latch; a request whose head and body together take more than 10 s
+now times out. The phase never leaves `Open` in this part.
+
+*Part 2, epochs.* Migration 32 adds `process_epochs`, with the design's columns plus the tenant: a predecessor is the latest epoch of the same
+tenant. At start, after the journal's readiness check and before any venue request, the capital read included, one transaction reads the
+previous epoch and inserts this one. The start is refused when that does not land within 10 s, as with a database down at start today, or
+when `epoch_seq` would reach 2^31, the high half of the fence PR's generation; that row is rolled back. A predecessor with no marker, or one
+older than version 2, makes the start unclean: logged, and `robsond_unclean_start{reason}` is 1 for `no_predecessor`, `no_marker` or
+`marker_version`. Only the fence PR writes version 2, so every start is unclean until then, and that is all this part does with it.
+Without a database, or in a build without PostgreSQL, there is no epoch, and only the stub starts: any other venue, `binance_usdm` whether
+named in `ROBSON_VENUE` or selected from credentials, is refused there, before any request to it. The simulator mode is
+`ROBSON_VENUE=stub`, or an unset `ROBSON_VENUE` that resolves to the stub; no checked-in workflow ran a real venue without a database.
+
+*Part 3, the two-phase stop.* SIGTERM or SIGINT starts the stop. Its clock starts at the signal. 25 s after it is the stop's own,
+cooperative deadline: the stop has its result by then unless the stop itself is blocked, as when every log write waits on a pipe no one
+reads, and then there is no result at 25 s. 27 s after it is the process's independent bound: whatever else is stuck, the stop included,
+the process exits then, inside the pod's `terminationGracePeriodSeconds` of 30 under `Recreate` with one replica. The handlers are
+installed first thing in `main`, before configuration and the database connection; as PID 1 the process receives SIGTERM only once one is,
+so only its first instructions run with SIGTERM ignored. A signal during the start's preparation, before any venue work (configuration,
+the database connection with its retries and backoff, the schema check, the journal's readiness check, the epoch's insert), ends the start
+there: nothing has been sent, no marker is written, and the process exits 0 once it reaches its cancellation point, even if the
+database comes back after the signal. That exit 0 is the cooperative outcome: preparation stuck where it cannot reach that point (a
+blocked log write, say) ends at the hard bound with 70, and an ordinary start-up error keeps its own exit code. Once the
+startup phase runs under its permit, a signal drains it like any other operation: venue requests may already have been made, and more may
+follow under that permit until it ends or the deadline drops it. The `db` commands keep the default handling.
+
+1. **Draining.** The ordinary API class answers 503 `stopping`; ticks, heals, exits, sweeps, the internal loops and the protective class
+   continue. An entry the main loop reaches meanwhile is refused at its send: a no-send, and on a leg with admission evidence the attempt
+   ends (`entry_not_sent`) and waits for the operator. Draining ends at the earlier of 12 s and the first moment no permit is held.
+2. **Closing.** Every new operation is refused. The main loop, the workers, the detectors (through their token, never the manager lock) and the
+   API listener are cancelled; requests in flight finish. The operations holding a permit run to their end, then the journal's retry set is
+   flushed, retried until the deadline. A reduction's rules refresh after a rejection is skipped while closing.
+3. **Marker.** Only when every permit was released in time, none was aborted, the latch is clear and the journal holds nothing in memory or in
+   its retry set, `clean_stop_at` and `marker_version = 1` are written on this epoch. Otherwise the stop does not write it. A marker write
+   that times out (a `deadline` result) or fails (`marker_failed`) cannot prove the marker stayed unwritten: the update may commit after the
+   timeout, or have committed with its answer lost, and the log calls the write unconfirmed. Every check came before it, so such a marker is
+   still true of the stop. A version-1 marker records those checks and nothing else: it stands if teardown work that holds no permit later
+   keeps the process to its hard bound, and it is not the fence PR's incident clearance.
+
+**Bounds.** Once the stop has its result the daemon waits for nothing it was running. A startup phase or a main-loop event still holding its
+permit at the deadline is dropped there, aborted; what holds no permit (projection, income ledger, alarm, feeds) gets what is left of the
+deadline, and the runtime's teardown the rest, abandoning any task or thread still running. A stop has its result before the deadline only
+when no permit is held, so no operation holding one is cut short earlier, and a stop that gets past its waits only after the deadline, as
+when its own task was held past it, starts neither the final flush nor the marker. Signals are received on a thread of their own, with its
+own small runtime, not on the daemon's: a worker stalled in synchronous code can leave the daemon runtime's I/O and timers unattended, and
+a SIGTERM handled there was, in the real binary, never seen. On a signal that thread first starts the hard bound's thread, then asks for
+the stop, which wakes the daemon's runtime; neither thread logs, writes to stdio or takes an application lock, and the daemon's runtime
+logs the request when it takes it up. Should no thread start for the bound, the signal thread is the bound itself and hands the request to
+a thread of its own, or makes it first, which takes only the token's and the runtime's internal locks, never held across I/O or a log. At
+27 s after the signal, should the process still be alive, as when the thread running the daemon's start is stalled or every log write
+blocks on a pipe no one reads, the hard bound calls `_exit(70)` and does nothing else: no log, no notice, no stdio, and `_exit` skips all
+exit-time cleanup, stdio flushes and atexit handlers alike. Exit code 70 in the pod's last state is the only record of the hard bound. It
+writes no marker; one a clean stop wrote earlier stands. Otherwise the process exits 0 whatever the stop's result. In the real binary
+against the fake venue: an operation that never ends (a thread stalled after the venue's ack, its permit held) exits 0 at the deadline,
+measured 25.04 s after the signal, with the epoch unmarked; a startup whose own thread is stalled exits 70 at the hard bound, measured
+27.03 s; with stdout and stderr on a full pipe no one reads, it exits 70 at the hard bound, measured 27.03 s, the stop blocked at its first
+log line, no stop result and no marker; a signal while the epoch's insert waits in the database exits 0 in 54 ms with nothing sent and no
+epoch; one during the database connection retries, the database back right after it, exits 0 in 54 ms with nothing sent and no epoch.
+
+**What a deploy costs.** Today PID 1 ignores SIGTERM: every deploy waits the whole 30 s grace for SIGKILL, and the old process keeps
+managing the account until it dies. From this part on, management stops as Closing begins. The time no daemon manages the account is then
+Closing, plus the teardown after the stop's result, plus the replacement's start up to its main loop. Closing alone is near zero when idle,
+about 13 s after a full 12 s Draining, and up to 25 s minus Draining when the flush stalls; an idle stop that marks at once can still spend
+what is left of the deadline on a stalled worker that holds no permit.
+
+**Protection while stopping.** Exchange stops cover the `Active` legs that have one, not every leg throughout. A cancel-first tick exit cancels
+its leg's stop before its reduction; when the reduction then fails, during the stop or because Closing skips the rules refresh after a
+rejection, the leg has no exchange stop until a later process heals it. 25 s is not an operation's bound: one cancel-first exit alone can
+make four requests of up to 10 s each (the cancel, the position-mode read, the leverage write, the market order), plus its journal and
+event writes, so an exit in flight can outlast the deadline, and that stop is unclean.
+
+**Metrics.** `robsond_graceful_stop_total{result}` (`clean`, `deadline`, `aborted`, `latched`, `unlanded`, `marker_failed`) is counted by
+the departing process as its stop ends, with its listener already closing: best effort, and a scrape may never see it. The durable record
+is the epoch's marker, which the next start reads into `robsond_unclean_start{reason}`. The fence PR's alerts must rest on that gauge's
+`no_marker`, together with target-down and restart alerts, not on scraping the departing process.
+
+**Rollback across PR S is boundary B,** with the daemon stopped, and an image that keeps migrations 31 and 32: SQLx's migrator rejects an
+applied migration missing from its embedded set, so pinning back to `sha-b06aecb1` or `sha-23501535` is refused by that image's migration hook.
+`process_epochs` is additive and an older binary ignores it. Rolling back part 3 alone stops the stop: SIGTERM is ignored again and the pod is
+SIGKILLed at 30 s. After the fence PR, rollback across it needs the fence PR's own condition. Not verified: SIGTERM in the live pod, PID 1 in
+the image, stop timing under a slow database, behaviour on a real venue or in the cluster.
+
+*Persistence (PR P).* Results never dropped, per-stream serialization of event persistence, stream suspension and a
+startup repair of position streams, in parts, each deployable alone in this order.
+
+*Part 1, routes and namespace.* Four domain events had no projection route: `entry_attempt_exhausted`,
+`signal_strategy_evaluated`, `entry_approval_pending` and `position_error` (never constructed). Each landed in the event log
+and then failed its apply as unhandled, which today only logs an error, but from part 2 a failed apply suspends its stream: every
+confirmed strategy signal would have suspended its leg's stream ahead of the entry, and every exhaustion and approval wait would
+have closed admissions. They now route as audit-only and change no projection table, and a restart reads `entry_attempt_exhausted`
+from the event log as before. The projector's freeze test covers every type the domain enum can be persisted under, read from the
+enum itself, so a new event with no route fails CI. An older binary returns the same `MissingHandler` on them as it does today, so
+this adds no rollback condition. The daemon also refuses to start with a `PROJECTION_STREAM_KEY` beginning with `position:` or
+`system:`: the projection worker applies the stream it polls with no stream lock, beside the position manager's own writer.
+Production uses `robson:daemon`, the default.
+
+*Part 2, results kept, serialization, suspension.*
+
+- **A venue result is never dropped.** `execute_and_persist` keeps the results of a batch that reached the venue when their
+  events fail to persist, so an entry still reaches `handle_entry_fill` and its stop is placed, and an exit still reaches
+  `handle_exit_fill`, so its leg closes in memory and any remainder is untracked and swept as today. The same holds where a close
+  is recorded after a venue fill: `handle_exit_fill`, the panic close and `reconcile_close` keep the close, log it at ERROR and go
+  on, `evaluate_monthly_halt()` included, and `/panic` reports such a leg as closed. The failure itself suspends the stream and
+  sets the latch. Unchanged: the entry's pre-send barriers (`EntrySignalReceived`, `EntryOrderRequested`, and the event of a
+  futures-settings refusal, which sent nothing), and a batch with no venue action, whose failure is still an error. On the tick
+  path such an error fails that leg's query only: the other legs on the tick still trail and exit; startup recovery likewise
+  goes on through such a batch, so a suspended leg's missed stop and the legs after it are still checked. A failed journal result write
+  keeps PR J's rule: the result stands, the write waits in the retry set, and only an overflow sets the latch. No reduction
+  path writes a domain event through this bridge before its request, so a suspension never stops a software exit, a stop
+  placement, a heal, a trailing replacement, `/panic` or a reconciled close from reaching the venue. That holds for the
+  domain-event bridge only: an individual close and `/panic` record their query's acceptance and transitions before the
+  request, as before P, and a failure of those existing audit writes can still prevent that request. Once a leg's venue work is
+  done, or given up for that leg, its query's audit write is reported instead (ERROR,
+  `robsond_query_audit_failures_after_venue_work_total`) and stops nothing: a tick's and `/panic`'s other legs still run, a
+  close or an entry keeps its outcome, and `/panic` still reports the legs it closed.
+- **Per-stream serialization.** `persist_event_to_log`, the one production writer to `position:{id}` and
+  `system:month_boundary:YYYY-MM`, holds the stream's async lock through the suspension check, the append, the projection apply
+  and, on a failure, marking the stream suspended, so a writer queued behind a failure sees the suspension first. A lock entry
+  lives while it is held or awaited. Lock order: the manager lock, a stream's lock, the gate mutex, the journal's memory mutex;
+  the two stream registries are sync leaves, never held across an await or while another lock is taken.
+- **Suspension.** Any failed append or apply suspends its stream: it refuses every later append in this process
+  (`StreamSuspended`), so its projection lags its log by exactly the suffix that did not apply. Migration 33 adds
+  `stream_suspensions` (stream key, kind, the seq that did not apply, NULL when the append itself failed or its seq is
+  unknown, the month of a system stream, error, epoch; one open row per stream). The row goes through the journal's retry set,
+  which carries suspensions beside intents within its 1,024 entries, and recording it sets the latch. A retry pass writes
+  suspensions first and then intents, each part stopping at its own first failure, so a suspension whose write keeps failing
+  never keeps an intent's rows from being tried. The next start loads the
+  open rows before anything is appended. Like any retry-set entry, a suspension that has not landed when its process ends, the
+  database down or the stop past its final flush, is lost: the next start does not know that stream is suspended and its
+  projection stays behind its log, as before P; the latch kept that stop from marking itself clean. `robsond_streams_suspended{kind}` exports `position` and `system`, at 0 from startup.
+  A position stream that stays suspended invalidates its leg's snapshot through the latent-failure path: while the leg is
+  risk-open, the budget's remaining capacity is zero. Until part 3 nothing repairs a position stream, so after part 2 alone it
+  stays suspended across restarts; part 3 repairs it at the next start.
+- **The latch closes admissions until a restart,** whatever set it: a bounded send whose row did not land, discarded history,
+  an `IdSpent` conflict, an aborted operation, a venue mutation without a permit, a suspended stream. It is checked at the three
+  admission sites beside the residual check, before any admission evidence is written (an arm and an approval answer
+  `AdmissionsClosed`, 503; a signal re-arms its detector under the governed backoff, `admissions_closed`), and again at an
+  entry's send in `begin_send`, a typed no-send for an admission already past its check. **Production effect: a journal blip on
+  any bounded send now closes admissions until the pod restarts.** Protection, exits, sweeps and the protective API continue.
+- **A suspended system stream of the current month keeps admissions closed after a restart**, through the same admission checks.
+  This is P's stopgap for the window before the fence PR, which replaces it with the exact accounting-invalid contract and its
+  release. In P there is no release, so admissions stay closed while that month is current, until the fence PR ships. P does not
+  suppress automatic MonthlyHalt on that month and does not mark its month view invalid; both are the fence PR's. Legs open
+  before the restart stay managed. "No suspended system stream" is therefore a deploy check. **It replaces a self-heal:** today a
+  month reset whose write failed is retried by the next boundary poll, within 60 s, and that retry appends a fresh reset (or, if
+  deduplicated, applies the landed one again) and heals the month. From P the stream is suspended, the retry is refused on every
+  poll and the month stays as it was: fail-closed. Accepted, per the design's R6-2: replaying a reset whose apply landed and
+  whose acknowledgement was lost erases a peak recorded since, and a replay guard would have to cover five writers of
+  `monthly_state`, two of them not event-sourced.
+
+*Part 3, the startup repair of position streams.* After the suspensions on record are loaded, under the startup permit and before the
+store is rebuilt from the projection, each suspended **position** stream is repaired, holding its lock throughout, in two passes of 500
+events a page. The first validates the whole suffix past the leg's `positions_current.last_seq`, keeping only the cursor: every event
+type must apply through a handler guarded by that `last_seq` or be audit-only (`robson_projector::is_repairable_position_event`, which
+names every route). Any other type means no repair at all, not even of the events ahead of it. The second applies the suffix in seq
+order, from past the later of `last_seq` and the checkpoint an interrupted attempt left, writing `repaired_through_seq` after each
+page, and then clears the suspension (`cleared_at`), so the stream takes appends again. Any failure leaves the stream suspended, with
+`repair_error` recorded, and its leg's snapshot invalid through the latent-failure path. The monthly counters `EntryFilled` and
+`PositionClosed` add to are not guarded by `last_seq`: an event applied again whose position part had already applied adds again. They
+drive neither the budget nor the API (#298). **System streams are never repaired here**: one stays suspended, and listed in
+`stream_suspensions`, until step 8's replay-safe repair.
+
+**A deviation from design §6:** the repair's evidence is its own row in `stream_suspensions` (`repaired_through_seq` per page,
+`repair_error`, `cleared_at`), not a `journal_decisions` row, which stays untouched. That table records an operator's decision, with a
+verified or asserted identity and a note; an automatic repair has neither.
+
+**Rollback across PR P is boundary B,** checked with the daemon stopped, on the final process's state: its epoch stopped clean (a
+`clean_stop_at` marker, which is written only with the latch clear and the journal quiescent; a restart clears only the initial latch,
+and startup or later bounded work can set it again, so a restart alone proves nothing about the final process), **plus no open
+suspension**: `SELECT COUNT(*) FROM stream_suspensions WHERE cleared_at IS NULL` must be 0.
+An older binary ignores the table and would append to a suspended stream past its gap, leaving an interior gap the projection never
+applies. With part 2 alone nothing clears a suspension, so one suspended stream blocks that rollback until it is resolved by hand; from
+part 3 the restart repairs a position stream when it can, and a system stream, or a position stream its repair refused, still blocks
+it. The
+rollback image must keep migrations 31, 32 and 33: SQLx's migrator rejects an applied migration missing from its embedded set, and
+`robsond db migrate` runs in the Sync hook, so pinning back to `sha-217cde03` is refused by that image's hook. Not verified: behaviour on a real
+venue or in the cluster, how often a journal write fails to land in production (each now closes admissions until a restart), and the
+repair's duration on a long suffix.
+
+*Month-boundary basis (outside the step sequence, ahead of the fence PR).* The month-boundary reset takes its basis from
+the operated wallet only. A failed wallet read, or a failed read of the previous month's base, appends no reset, and the
+60 s poll retries. The previous month's base, which prices the Armed reservation, is the one its reset recorded
+(`boundary_reset_at` set): with Armed legs and no such base the reset waits until the operator disarms them or records
+the base; with nothing Armed it needs none. Until the current month's reset lands, its basis is invalid through #300's
+path (ADR-0051 §1), additive to its numeric test: `basis_invalid = capital_base <= 0 OR the current month has no landed
+reset`, that is no row, or a row another writer (the peak refresh, a recalibration) created without `boundary_reset_at`.
+It is read in the same `load_monthly_state` query, from 00:00 UTC on and before the first poll: the canonical snapshot
+sets `capital_base_invalid` with no remaining capacity or slots, `budget_basis_is_invalid_now` sees it at the late
+revalidation, the gate gets no capital, so its denial never latches MonthlyHalt, an arm and an entry preview answer
+`AdmissionsClosed` (503), and `/status` and the current month's view (`capacity_invalid`) report it. Automatic
+budget-based MonthlyHalt is not evaluated; protection, reductions, recovery and `POST /monthly-halt` are unchanged.
+Cost: entries are denied from 00:00 UTC until the first successful poll, normally under a minute, and for as long as
+the wallet read keeps failing. `robsond_month_boundary_pending` reports a failed attempt for alerting; it never decides.
+This extends the #300 invalid-basis path for a missing reset ahead of the fence PR; F's accounting-invalid contract for
+suspended system streams builds on the same flag. F's suspended-stream contract, its month view for history and its
+release are not part of this. No migration.
+
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
-migrations and persisted-state versions. Every rollback names its transitive dependency prefix: a step is reverted only
+migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze
+contract 1.2.0; `rbx-data` vendors its own registry copy (1.1.3) and must re-vendor before any export runs. Every rollback
+names its transitive dependency prefix: a step is reverted only
 together with every later merged step that imports it, and only at a persisted-state version its binary can read.
 
 ### 9. Not decided here
@@ -506,7 +1050,13 @@ only).
   account observation ≤ 6 per minute; order lookups ≤ pending intents per minute; no REST call on a market tick. An
   aggregate weighted-request budget across venues and symbols respects each exchange's shared limits; protective
   operations (re-protect, flatten, reconciliation of an `Unknown`) have priority and an explicit emergency budget over
-  the steady-state ceilings, recorded per incident. Degraded mode (feed silent) keeps the same ceilings.
+  the steady-state ceilings, recorded per incident. Degraded mode (feed silent) keeps the same ceilings. Step 6 bounds
+  its own requests (§5) by construction and tests, but apart from the counter below delivers no `/metrics` instrumentation and no
+  aggregate or protective-priority budget, so it does not establish this criterion. During an outage a symbol with nothing cached costs up to
+  2 `exchangeInfo` per minute, above the rules ceiling here for those symbols only. The wider sweep (§5) adds 1 open-orders request per
+  symbol with a leg closed in the last 24 h and nothing else to visit it, plus one store read (two in the first 24 h of a month), counted
+  by `robsond_reconciliation_closed_symbol_visits_total`, a logical total: the guardrail's measure per handled operation and its
+  threshold alert are not met. **Owner of both: before step 8 activation.**
 - **Concurrency and memory bounds**: financial admission depends **only** on the monetary constraints of §7 (slots
   report guaranteed full-cap opportunities, `policy.rs:253`, and never cap legs or admissions). Execution is bounded by
   worker concurrency (one in-flight transition per leg, `ROBSON_EXEC_WORKERS` proposed 4) and bounded queues; recovery
@@ -530,15 +1080,25 @@ only).
 | Dependency / event | What happens | Degraded mode | Visibility |
 |---|---|---|---|
 | Database dies | no admission, no new legs; already-installed protection remains on the exchange; inventory in an N1-a transition may remain unprotected without a duration or loss bound; no cancellation starts without a durable intent, and unfinished transitions retain liabilities and alerts and resume from that intent on recovery; intent results cannot be persisted → in-flight operations enter `Unknown`; recovery looks them up, a lookup may stay `Unknown`, and then the reservation stays held until step 7's explicit resolution path | read-only `/status` from memory; arms refused | `/readyz.database=false`; `unprotected_inventory` gauge; recovery events |
-| Venue REST dies | rules/costs/valuation stale → basis invalid, admission fails closed; risk reduction proceeds on the persisted rules snapshot with retries | reads from cache until TTL; protection on the venue | per-venue `eligible=false` + reasons; alert |
+| Journal database down or slow (step 7, PR J) | an entry's strict commit that fails is refused, no request; a leg with admission evidence ends its attempt, a legacy leg re-arms under its backoff. One that times out is uncertain, no request and no re-arm. Reductions, stops and cancels wait at most 500 ms per write and go out anyway, also with the journal's memories full | entries refused, protection and reductions continue; unlanded rows retry through a bounded set | `robsond_journal_latch`, `robsond_journal_retry_set_depth`, warnings in the logs; no fence yet |
+| Cancel outcome unknown (step 7, PR C) | an error, an indeterminate answer or an "already gone" with no final state is uncertain on the cancel's own intent; the protective action behind it proceeds | journaled only until the fence PR | `order_intents.cancel_class` and `uncertain_at`; boundary B |
+| Daemon asked to stop: SIGTERM or SIGINT (step 7, PR S) | Draining (ordinary API refused, protection continues) for at most 12 s, then Closing (everything new refused) until the operations in flight end and the journal is flushed; the stop's result by its cooperative deadline, 25 s after the signal, unless the stop itself is blocked; the process's exit by 27 s whatever is stuck (code 70 at that independent bound); the epoch is marked only on a clean pass. During the start's preparation, from the database connection to the epoch's insert: no start, nothing sent | exchange stops cover the `Active` legs that keep one while no daemon runs; a cancel-first exit cut short can leave its leg without one until a later process heals it | the epoch's `clean_stop_at`; the next start's `robsond_unclean_start`; `robsond_graceful_stop_total{result}` if scraped |
+| API slot class full (step 7, PR S) | 503 `busy` at once, nothing done; the other classes keep their slots | the caller retries | `robsond_api_slot_busy_total{class}` |
+| Venue mutation without a permit (step 7, PR S) | while open: sent, counted, latch set; while stopping: refused, nothing sent | — | `robsond_unpermitted_mutations_total`, `robsond_journal_latch` |
+| Operation dropped mid-flight: a panic, a cancelled internal future (step 7, PR S) | each intent it left open is sealed: one whose send may have started ends uncertain, one proven unsent ends not sent, both through the retry set; one with nothing to record is dropped. The permit counts as aborted and sets the latch, so the stop cannot mark clean | — | `robsond_aborted_operations_total`, `robsond_journal_latch` |
+| Database down or refusing the epoch at start, or none configured for a venue other than the stub (step 7, PR S) | no start, before any venue request | the pod restarts | the error in the log |
+| Venue REST dies | rules/costs/valuation stale → basis invalid, admission fails closed; risk reduction proceeds on the last validated rules or the persisted snapshot, with one refresh and resubmit per rejection; a leg holding neither waits for the lookup, then a decided exit goes out as given and a tick fails closed (§5) | reads from cache until TTL; protection on the venue, except a leg whose exit failed, until the heal | per-venue `eligible=false` + reasons; alert |
 | Venue feed silent | watchdog after `ROBSON_FEED_SILENCE_MAX`; REST snapshot resync; trailing advances continue on REST ticks within the request budget | bounded REST polling | silent-feed metric, event |
 | Daemon dies mid fan-out | accepted legs are protected on their venues except for a leg killed between entry fill and protection placement, which recovery protects or flattens first | startup recovery reads the durable journal and each venue's observation; completes, protects or releases per evidence | recovery events per leg |
 | Daemon dies, venue unreachable or placement rejected inside a balance-account transition (N1-a) | the leg is unprotected for the whole interval, with no maximum duration; loss can exceed the priced envelope and every cap | retry, flatten, then re-protect-or-flatten as the first recovery action; admission on the venue blocked | `unprotected_inventory` gauge and alert while nonzero; transition event with duration; recovery event |
 | Daemon dies mid replacement (position account) | old stop still live (place-then-cancel) | recovery heals from `open_protective_orders` | recovery event |
 | Unknown order outcome (timeout) | reservation held; `order_by_client_id` before any retry; `Unknown` keeps the leg pending, possibly indefinitely (time does not resolve it) | no blind retry | event, `/status` pending count |
-| Stale fees / rules / valuation | admission fails closed; risk reduction unaffected (persisted snapshot) | — | `/status` per-venue staleness |
+| Stale fees / rules / valuation | admission fails closed; risk reduction does not wait while it holds rules (§5) | — | `/status` per-venue staleness |
+| Tick exit fails (position account) | the stop was cancelled first, so the leg has no exchange stop until the heal: at least 30 s, longer without ticks or held rules (§5); the software stop keeps evaluating | heal re-places the stop | `robsond_insurance_stop_stale_positions` gauge |
+| Fill leaves a remainder on the account (position account) | the leg closes; the remainder is unauthored, without a stop, until a scan closes it, normally the next, with no upper bound (§5) | a remainder below the lot fails each scan until the operator clears it | UNTRACKED warning and rogue-position event each scan; `residual_inventory_recorded` for a short market exit only |
+| Event log unreadable at restart | query error: startup aborts with a retryable exit, exchange stops stay live | unreadable or mismatched residual row: admissions blocked until the leg closes (§5) | warning or error in the logs, no durable event |
 | Incomplete settlement | commission/pnl missing → month accounting flagged invalid, new legs blocked (ADR-0051) | — | `unmatched_income_count`, event |
-| Unauthored inventory or position on an execution account | closed (ADR-0022); new legs blocked until the account is clean | — | `/status` per-venue discrepancy, event |
+| Unauthored inventory or position on an execution account | closed (ADR-0022); new legs blocked until the account is clean, a block `binance:usdm` does not have yet (§5) | — | `/status` per-venue discrepancy, event |
 
 ## Consequences
 
@@ -547,7 +1107,8 @@ only).
   are written down per venue.
 - Negative / trade-offs: eight refactor PRs with no operator-visible feature before step 8; optional ports add branching;
   the consolidated basis needs every venue reachable and valued at month start; spot inventory accounting is new surface;
-  N1-a accepts an unprotected interval without a guaranteed maximum duration that position accounts do not have, and
+  N1-a accepts an unprotected interval without a guaranteed maximum duration, which position accounts did not have before step 6 (§5:
+  a failed tick exit, a remainder and a stop gone from the venue can each go unprotected with no upper bound), and
   qualifies the ADR-0039 and ADR-0052 guarantees on balance accounts. A leg whose order outcome stays `Unknown` holds its
   global and per-venue admission capacity indefinitely: elapsed time, a restart or a month rollover does not release the
   reservation, only evidence or step 7's explicit resolution path does. During Fase S, a book that cannot be verified as
@@ -600,17 +1161,39 @@ Budget model for multi-venue:
   `robsond/src/{config,event_bus,position_manager,sse}.rs`, `robson-projector/src/types.rs`, golden fixtures.
 - Step 5: `robsond/src/daemon.rs` (boundary), `robson-domain` (carried basis), migration for persisted carried bases
   and settlement attribution, persisted-state version bump.
-- Step 6: `robson-exec/src/quantize.rs`, `robsond/src/position_manager.rs`, usdm adapter; before/after fixtures.
-- Step 7: `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
+- Step 6: `robson-exec/src/{quantize,executor,error,ports,venue,compat,stub}.rs`, `robson-engine/src/lib.rs`,
+  `robson-domain/src/{entities,events,trading_rules}.rs`, `robson-store/src/memory.rs`, `robson-eventlog`, `robson-projector`,
+  `robson-store/src/postgres.rs` (a close exactly at month start belongs to that month),
+  `robsond/src/{position_manager,daemon,api,error,metrics,reconciliation_worker,startup_recovery,venue}.rs`, usdm adapter; bronze
+  contract 1.2.0; before/after fixtures.
+- Step 7: delivered in parts (§8). PR J: `robson-exec/src/{order_journal,executor,venue,stub,error}.rs`,
+  `robsond/src/{order_journal_store,api,auth,daemon,metrics,position_manager,reconciliation_worker,venue}.rs`, migration 31; the
+  attempt rows are read from the database rather than reloaded. PR C: `robson-exec/src/{cancel,compat,executor,order_journal,ports,stub}.rs`,
+  `robsond/src/{daemon,position_manager,reconciliation_worker}.rs`, no migration. PR S: `robson-exec/src/{gate,order_journal,venue,stub,quantize,
+  crash_points}.rs`, `robson-connectors/src/binance_rest.rs` and the USD-M adapter, `robsond/src/{api,daemon,main,stop,process_epoch,metrics,
+  reconciliation_worker,position_manager,venue,error}.rs` (with `libc` for the hard bound's `_exit`) and `funding/worker.rs`, `robson-testkit`, migration 32. What follows here is the original statement of the step, with its
+  open obligations. `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
   mapping); process-kill tests. Before any caller acts on `order_by_client_id` or `replace_protection`, this step must:
   persist each attempt durably before its request is sent and each rejection when observed, reload them on startup, treat
   an attempt without a persisted rejection as unresolved, and keep the truncated state across restarts. It must also give
   the permanently `Unknown` cases an explicit resolution path that never infers absence from time, including an attempt
   whose outcome never becomes known and a successor refused locally before anything was sent (`NoRecord` →
   `Unknown{new: None}`, old stop still live, nothing for a lookup to find); until resolved, the leg stays pending with its
-  reservation held and visible.
+  reservation held and visible. Step 6 removed that local refusal from USDⓈ-M `place_protection`; the rule stands for any
+  venue that keeps one. This step also owns a crash between a fill and its events, a failed durable append of a
+  residual event (§5), and two ownership races that exist before step 6 and need the per-leg transition coordination of §2.2: the worker
+  classifies a remainder as UNTRACKED, a new entry on that symbol and side fills, and the worker reduces inventory the new leg owns; and
+  the orphan sweep, working from a stale covered set, cancels a stop accepted after that set was read, recorded or not, including an initial
+  stop on a new leg, so the leg can record a cancelled stop until the next sweep schedules the heal (§5). This step must revalidate ownership
+  in coordination with cancellation and test a stop recorded before the cancel. Step 6's wider sweep adds some exposure to the second, and its
+  refresh and resubmit lengthen the first's window.
 - Step 8: `robson-connectors/src/binance/spot/*`; conformance suite; `ROBSON_VENUE=binance_spot`; executor's
-  `validate_futures_settings` gated to position accounts (§4).
+  `validate_futures_settings` gated to position accounts (§4). It must also, before activation: replace the same-id resubmit, since
+  spot has no reduce-only bound (§5); decide what a fill short of the leg and a remainder mean on a balance account, because step 6's
+  answer on position accounts relies on a reduce-only bound and on ADR-0022 closing the rest; price a residual at the mark (§2.3);
+  account per fill, so that a partial counts in the month's net and a close stops booking the whole leg at its last fill (§5); and
+  design for dust. A fee charged in the base asset can leave inventory below the lot; how often has not been measured. Review trail
+  v11 records the two USDⓈ-M designs withdrawn in step 6 and why.
 - Evidence: `docs/evidence/2026-11-04-binance-exchangeinfo-btcusdt.md` (retained in this PR): timestamped verbatim
   extracts with source URLs and SHA-256 of the raw responses; spot `orderTypes` includes `STOP_LOSS`, `LOT_SIZE` step
   0.00001, `NOTIONAL` min 5 USDT (applyMinToMarket, avgPriceMins 5); futures `LOT_SIZE` step 0.001, `MIN_NOTIONAL` 50
@@ -670,3 +1253,38 @@ Budget model for multi-venue:
   `validate_futures_settings` to position accounts. No risk number or operator decision changed. Codex **APPROVE** on
   round 1, with four P3s applied (the `/events/history` exposure above, a missing-versus-null assertion, fixture provenance
   and the stale DB-gated count).
+- v14 (2026-11-10): §8, the failure modes and the Implementation Notes aligned with step 7 PR S as implemented against design note v8, in
+  three parts: permits and slots, process epochs, the two-phase stop. Closes the J boundary that ended an entry's operation before its stop.
+  Codex round 1 on the three parts: REQUEST_CHANGES (1 P1, 2 P2, a vacuous required test, P3s). Since then the deadline bounds the
+  process from the signal, through the start, the main loop and teardown, with a hard exit at 27 s; an unpermitted mutation is latched
+  under the gate's mutex; a venue that can trade does not start without an epoch; the `/panic` capacity test closes a real leg; an API
+  operation runs in its own task, so a client's disconnect no longer cancels it; the stop's stated guarantees are narrowed to what holds.
+  Codex round 2: S1 and S2 APPROVE; S3 REQUEST_CHANGES (1 P1, 1 P2, 1 P3). Since then the hard bound does not wait on logging or stdio,
+  signals are handled from the start of `main`, and a marker write that timed out or failed is called unconfirmed. Codex round 3 on S3:
+  REQUEST_CHANGES (1 P1, 1 P2, 1 P3). Since then the hard bound only calls `_exit(70)`, with no notice; a stop past its deadline starts
+  neither the flush nor the marker; 25 s is the cooperative deadline and 27 s the independent bound. No risk number changed.
+- v13 (2026-11-09): §8 and the failure modes aligned with step 7 PR C as implemented against design note v8: typed cancel classification,
+  uncertainty journaled and not fencing until the fence PR. No risk number changed.
+- v12 (2026-11-08): §2's finality paragraph, §8 and the failure modes aligned with step 7 PR J as implemented in three stacked PRs,
+  against design note v8. Codex round 1 on the first draft: REQUEST_CHANGES (3 P1, 5 P2); interrupted cancels, cancelled result
+  writes, the no-send recovery on `ExecutableSpan` legs, discarded ids, pool exhaustion, evidence validation, fault targeting and
+  query bounds fixed. Round 4: PR 3 REQUEST_CHANGES (1 P2, 1 P3); a retry refused on a discarded id takes the same fallback. Round 3: PR 3 REQUEST_CHANGES (1 P2); a resubmission the journal refuses now goes out once under a fresh id. Round 2: REQUEST_CHANGES (1 P1, 5 P2, P3s); a full journal no longer refuses a bounded first send, reads and the startup
+  probe retire their connections, a cancellation's evidence names the cancelled order, and typed no-sends and returned futures-settings rejections reach the amended policy, while the retained pre-send barriers and other error returns do not. States that uncertainty is journaled and does not fence until the fence PR, and boundary B as a view. No risk
+  number changed.
+- v11 (2026-11-07): the header, §2, §2.2, §2.3, §3, §5, §8, §10, the failure modes and the Implementation Notes aligned with
+  step 6 as implemented on `refactor/venue-step6-quantize`. Codex rejected two wider USDⓈ-M designs. Rounds 1 and 2: exit-first with
+  a cancel-then-resubmit fallback, a partial exit reducing the leg's quantity with P&L accumulated while open, and inventory with no
+  live stop charged at the mark (7 P1 + 4 P2, then 10 P1 + 2 P2). Round 3: a leg kept `Active` after a short fill and closed only on
+  a flat venue read (7 P1 + 3 P2; five in that lifecycle, one not fixable on today's port, because a position read carries no evidence
+  that it follows the fill). Round 4 on the current rule: 5 P1 + 3 P2 on stop evidence, the withdrawal race and request accounting,
+  applied except for two ownership races staged to step 7, and an invalid base's halt, which stayed as ADR-0051 §1 then decided (since amended, 2026-11-07). Round 5:
+  1 P1 + 2 P2 + 2 P3, mostly on a worker lookup that closed a leg on its dead stop, whose coverage check could not be tied to the stop;
+  the lookup was withdrawn. Round 6: 1 P1 + 2 P3, rejecting a dead recorded stop as a stated limit; the sweep now re-places a recorded stop
+  gone from the venue. Round 7: 1 P1 + 2 P3, a replaced stop's later fill leaving the budget; displaced stops now stay evidence. Round 8:
+  2 P1 + 2 P3 on that evidence; it now covers every displacement and counts only a whole fill. Round 9: **APPROVE**, with two P3 on
+  documentation applied after the verdict, with no new round. **Operator decisions (2026-11-06 and 2026-11-07): narrow the step twice**, since the operator cannot trade
+  that venue and spot needs a different model. So this version moves three promises: §2.3's residual priced at the mark goes to step 8;
+  "never declared closed" no longer covers a leg with a remainder on a position account, only the remainder; and §5's retained
+  protection does not cover the tick's market exit, which stays cancel-first. Per-fill accounting also goes to step 8. No risk constant
+  changed. MonthlyHalt changed in one direction: realized losses exhausting the budget on a valid base now fire it with latent risk
+  unresolved.

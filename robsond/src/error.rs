@@ -97,6 +97,29 @@ pub enum DaemonError {
     #[error("EventLog error: {0}")]
     EventLog(String),
 
+    /// The event's stream refuses appends: a write to it failed earlier in this
+    /// process (ADR-0056 step 7, PR P). Nothing was appended.
+    #[error(
+        "Event stream {stream_key} is suspended: {event_type} was not persisted; the stream takes \
+         no appends until a restart repairs it"
+    )]
+    StreamSuspended {
+        stream_key: String,
+        event_type: String,
+    },
+
+    /// Admissions are closed (ADR-0056 step 7, PR P): the journal latch is set,
+    /// which holds until a restart, or the current month's system stream is
+    /// suspended. An arm also answers this while the month's reset has not
+    /// landed. Nothing was admitted.
+    #[error("Admissions closed: {reason}")]
+    AdmissionsClosed { reason: String },
+
+    /// The month-boundary reset waits: a basis it needs is not on record
+    /// (ADR-0024 §6). Nothing was appended; the next poll retries.
+    #[error("Month boundary reset deferred: {reason}")]
+    MonthBoundaryDeferred { reason: String },
+
     /// MonthlyHalt is active — all new entries blocked (v3 policy).
     ///
     /// Returned when `arm_position`, `handle_signal`, or `approve_query` is
@@ -109,6 +132,19 @@ pub enum DaemonError {
     /// Shutdown requested
     #[error("Shutdown requested")]
     Shutdown,
+
+    /// No operation permit (ADR-0056 step 7): the class is full or the daemon
+    /// is stopping. Nothing was done.
+    #[error("Operation refused: {0}")]
+    PermitRefused(#[from] robson_exec::gate::PermitRefusal),
+
+    /// A residual on an open leg blocks new admissions until that leg closes
+    /// (ADR-0056 §5). A rejection of its own: the budget knows nothing of it.
+    #[error(
+        "Admission blocked: position {position_id} holds unresolved residual inventory \
+         ({residual}); it resolves when that leg closes"
+    )]
+    ResidualInventoryUnresolved { position_id: Uuid, residual: String },
 
     /// One or more Robson-Active positions are absent from the exchange at
     /// startup.
@@ -124,6 +160,15 @@ pub enum DaemonError {
         count: usize,
         positions: Vec<StartupStaleActiveInfo>,
     },
+}
+
+impl DaemonError {
+    /// An event that did not persist: its write failed, or its stream refuses
+    /// appends (ADR-0056 step 7, PR P). What its batch did in memory and at the
+    /// venue stands.
+    pub(crate) fn is_event_not_persisted(&self) -> bool {
+        matches!(self, Self::EventLog(_) | Self::StreamSuspended { .. })
+    }
 }
 
 /// Result type for daemon operations.

@@ -7,6 +7,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Startup repair of suspended position streams (ADR-0056 step 7, PR P, part 3)
+
+- At start, before the store is rebuilt, each suspended position stream is repaired: its suffix past the leg's
+  `last_seq` is validated first, 500 events a page, and any event type without a guarded position handler means no
+  repair; then it is applied in seq order, 500 a page, with `repaired_through_seq` written after each page, and the
+  suspension is cleared. A failure leaves it suspended, with `repair_error`, and the leg's snapshot invalid; a repair
+  interrupted by the process's death resumes past its checkpoint. System streams are never repaired automatically.
+
+### Changed - Venue results kept, streams suspended, admissions closed on the latch (ADR-0056 step 7, PR P, part 2)
+
+- A venue result is no longer dropped when its event fails to persist: an entry that filled still gets its exchange stop,
+  and an exit still closes its leg in memory. The handlers that record a close after a venue fill (exit fill, panic close,
+  reconciled close) keep it too, and MonthlyHalt is still evaluated; `/panic` reports such a leg as closed. The entry's
+  pre-send writes stay barriers. On the tick path, and in startup recovery, one leg's event-only batch that did not persist
+  no longer stops the other legs.
+- Event persistence is serialized per stream. A failed append or projection apply suspends its stream: it takes no more
+  appends in this process, and the suspension is recorded in `stream_suspensions` (migration 33) through the journal's
+  retry set and loaded at the next start. `robsond_streams_suspended{kind}` exports both kinds at 0 from startup.
+- The journal latch now closes admissions until a restart, whatever set it, including a journal write that did not land on
+  a bounded send: arm and approval answer 503, a signal re-arms under the governed backoff, and an entry already past those
+  checks is refused at its send. Protection, exits, sweeps and the protective API continue.
+- A suspended system stream of the current month keeps admissions closed after a restart. There is no release before the
+  fence PR, and a failed month reset no longer heals itself on the next 60 s poll: it stays as it was, fail-closed.
+- Once a leg's venue work is done, a failure writing its query's audit is reported (ERROR and
+  `robsond_query_audit_failures_after_venue_work_total`) and stops nothing: the tick's and `/panic`'s other legs still run, and
+  a close or an entry keeps its outcome. A stream suspension whose write keeps failing no longer keeps the journal's other
+  pending rows from being retried.
+
+### Fixed - Four domain audit events had no projection route (ADR-0056 step 7, PR P, part 1)
+
+- `entry_attempt_exhausted`, `signal_strategy_evaluated`, `entry_approval_pending` and `position_error`
+  landed in the event log and then failed their apply as unhandled, so every exhaustion, every confirmed
+  strategy signal and every wait for an approval logged an event-log error. They now route as audit-only:
+  no projection table changes. The projector's freeze test now covers every domain event type, read from
+  the enum, so a new event without a route fails CI. An older binary returns the same error on them as
+  before, so this adds no rollback condition.
+- The daemon refuses to start with a `PROJECTION_STREAM_KEY` in the `position:` or `system:` namespace: the
+  projection worker would apply those streams beside the daemon's own writer. Production uses
+  `robson:daemon`, the default.
+
+### Added - Two-phase stop on SIGTERM and SIGINT (ADR-0056 step 7, PR S, part 3)
+
+- SIGTERM, as well as SIGINT, now stops the daemon: as PID 1 it used to ignore SIGTERM until Kubernetes
+  SIGKILLed it at the grace period, managing the account until then; management now stops as the stop
+  closes. The stop drains for at most 12 s, refusing the ordinary API class with 503 `stopping` while
+  protection, exits and the protective class continue, then closes: everything new is refused and the
+  operations in flight finish.
+- 25 s after the signal is the stop's own, cooperative deadline: nothing still running is waited for after
+  it, and the runtime's teardown is bounded by it. A stop that is itself blocked, as by a log pipe no one
+  reads, has no result then. 27 s after the signal is the independent bound: a thread of its own exits the
+  process with `_exit(70)` whatever is stuck, writing nothing; exit code 70 is its only record. Both fit the
+  pod's 30 s grace. Signals are handled from the start of `main`: one during the start's preparation
+  (configuration, the database connection and its retries, the schema check, the journal's readiness, the
+  epoch's insert) ends the start with nothing sent, even if the database comes back. Once the startup phase
+  runs, a signal drains it like any operation, and venue requests may already have been made.
+- A clean stop marks the process's epoch (`clean_stop_at`, `marker_version = 1`); a stop that fails a check
+  (deadline, aborted operation, latch, anything unlanded) writes no marker. A marker write that times out or
+  fails is unconfirmed: its update may have committed, and the log says so. A stop that gets past its waits
+  only after the deadline starts no marker. A version-1 marker records only those checks: it stands if
+  teardown work that holds no permit later keeps the process to the hard bound.
+  An entry reached while draining is refused at its send. A cancel-first exit cut short by the stop can
+  leave its leg without an exchange stop until the next process heals it.
+
+### Added - Process epochs (ADR-0056 step 7, PR S, part 2)
+
+- Migration 32 adds `process_epochs`. Each start records its epoch before any venue request and refuses to start
+  when it cannot. A start after an unmarked epoch, or one marked below version 2, is logged and exported as
+  unclean (`robsond_unclean_start`); nothing acts on it before the fence ships, and until then every start is.
+- Without `DATABASE_URL`, or in a build without PostgreSQL, only the stub venue starts: a venue that can trade,
+  `binance_usdm` named or selected from credentials, is refused before any request to it.
+
+### Added - Operation permits and slot classes (ADR-0056 step 7, PR S, part 1)
+
+- Every operation that can change the venue runs under a permit taken before the manager lock: 16 ordinary API
+  slots, 8 protective ones (close, `/panic`, MonthlyHalt, `/reconcile-close`) and one reserved per internal loop.
+  A full class answers 503 `busy` at once with nothing done.
+- A venue mutation without a permit is counted and sets the journal latch; so does an operation dropped
+  before it completed, such as one that panicked, which answers 500.
+- An API operation runs in its own task, which owns its permit: a client that disconnects mid-operation no
+  longer cancels it.
+- Each REST request has one 10 s bound for the send and the body together, instead of 10 s each.
+
+### Changed - Typed classification of stop cancels (ADR-0056 step 7, PR C)
+
+- Every production stop cancel is classified the same way, with its class on its own journal intent. Only a
+  typed `Cancelled` or an "already gone" with a final state is definite; no error type or message can be.
+- A software-exit cancel answered by a broad order error now emits `InsuranceStopFailed` and keeps the stop
+  id, instead of being read as cancelled. Uncertainty is journaled and does not close admissions until the
+  fence ships.
+- That cancel is not rate-limited: while the id stays on the leg it repeats once per exit attempt, with its
+  own journal intent and failure event, because a retried cancel can be what lets the next exit through.
+- An `InsuranceStopFailed` no longer changes a stop heal's deadline on record, overdue included; only a leg
+  with none gets a new window. A heal left outstanding by the last process is rebuilt from the event log at
+  startup.
+
+### Added - Every order written to the journal (ADR-0056 step 7, PR J, part 3)
+
+- An entry does not go out without its row. Reductions, protective stops and cancels try for 500 ms and go
+  out anyway, setting `robsond_journal_latch` if the row did not land.
+- Outcomes are recorded only: uncertainty is journaled and does not close admissions until the fence ships.
+- The governed re-arm backoff now resets only after an entry reached the venue's send, on success and failure
+  alike. A proven no-send on an `ExecutableSpan` leg ends the attempt (`entry_not_sent`); a legacy leg re-arms.
+
+### Added - Disposition endpoint and journal metrics (ADR-0056 step 7, PR J, part 2)
+
+- `POST /recovery/disposition` records an operator's terminal evidence or accepted risk for an outstanding
+  intent, with the verified identity. It never sets a venue outcome.
+
+### Added - Order journal storage and rules (ADR-0056 step 7, PR J, part 1)
+
+- Migration 31 adds the order journal's tables and the rollback view
+  `order_intents_blocking_rollback`. Nothing calls the journal yet.
+
+### Fixed - A month row no longer gets a zero capital base without account evidence
+
+- The entry and close counters inserted `capital_base = 0` when the month's row
+  was missing, so a fill or a losing close before the first boundary poll of a
+  month left a zero base visible until the reset overwrote it. A close in that
+  window evaluated MonthlyHalt against it. They now only update an existing row:
+  a missing row keeps falling back to configured capital, and the reset already
+  zeroes both counters.
+- `GET /positions?month=` now charges closes from `positions_current`, the source
+  `/status` and the budget already use, instead of the `realized_loss` counter,
+  which misses closes from before the month's row and reset. A past month's
+  `slot_cells_total` can differ where the two sources disagreed, for example on
+  a losing close that is not governed. A close stamped exactly at a month's
+  start now counts in that month, for the budget as well.
+- On a fresh database, migrations 11 and 21 left a current-month row with a zero
+  base and `boundary_reset_at` set, so the month's reset was skipped and arm
+  stayed blocked. Migration 30 removes such a row when it records nothing and
+  has no event on the month's boundary stream. Production's current row has a
+  real base, so it does not match.
+
 ### Added - Model-aware monthly budget gauge and ADR-0051 activation runbook
 
 - On 2026-10-15 a net +83.50 USDT October with an empty book showed 2 of 4

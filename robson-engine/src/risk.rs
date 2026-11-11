@@ -508,7 +508,9 @@ impl RiskGate {
         let latent_risk = context.latent_risk_sum();
         let remaining = self.policy.remaining_budget(capital_base, budget_consumed, latent_risk);
 
-        if remaining <= Decimal::ZERO {
+        // ADR-0051 §1: an invalid basis is denied below by `can_admit`, but it is
+        // not an exhausted budget, and this check is what latches MonthlyHalt.
+        if capital_base > Decimal::ZERO && remaining <= Decimal::ZERO {
             debug!(
                 capital_base = %capital_base,
                 budget_consumed = %budget_consumed,
@@ -829,6 +831,87 @@ mod tests {
             matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }),
             "exactly 4.00% monthly loss must be blocked"
         );
+    }
+
+    proptest::proptest! {
+        /// ADR-0051 §1: a basis that is not positive is never admitted and never
+        /// reads as the denial that latches MonthlyHalt.
+        #[test]
+        fn an_invalid_basis_is_always_denied_and_never_reads_as_monthly_drawdown(
+            capital in proptest::prop_oneof![proptest::strategy::Just(0i64), -1000i64..0],
+            consumed in 0i64..2000,
+            margin in proptest::prop_oneof![proptest::strategy::Just(0i64), 1i64..2000],
+            planned_risk in 0i64..200,
+        ) {
+            let context = context_with_consumed(Decimal::from(capital), Decimal::from(consumed));
+            let mut proposed = sample_proposed();
+            proposed.initial_margin = Decimal::from(margin);
+            proposed.planned_risk = Decimal::from(planned_risk);
+
+            let verdict = RiskGate::new().evaluate(&proposed, &context);
+
+            proptest::prop_assert!(
+                !matches!(verdict, RiskVerdict::Approved | RiskVerdict::Rejected {
+                    check: RiskCheck::MonthlyDrawdown,
+                    ..
+                }),
+                "{:?}",
+                verdict
+            );
+        }
+
+        /// On a valid basis the threshold is what it was: exhausted is
+        /// MonthlyDrawdown, and nothing else is.
+        #[test]
+        fn a_valid_basis_reads_as_monthly_drawdown_exactly_when_exhausted(
+            capital in 1i64..100_000,
+            consumed in 0i64..10_000,
+        ) {
+            let (capital, consumed) = (Decimal::from(capital), Decimal::from(consumed));
+            let mut proposed = sample_proposed();
+            proposed.initial_margin = Decimal::ZERO;
+
+            let verdict = RiskGate::new().evaluate(&proposed, &context_with_consumed(capital, consumed));
+
+            let exhausted = TradingPolicy::default().remaining_budget(capital, consumed, Decimal::ZERO)
+                <= Decimal::ZERO;
+            proptest::prop_assert_eq!(
+                matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }),
+                exhausted
+            );
+        }
+    }
+
+    #[test]
+    fn test_invalid_basis_is_denied_without_reading_as_monthly_drawdown() {
+        // ADR-0051 §1: MonthlyDrawdown is the denial that latches MonthlyHalt and
+        // closes positions, so a basis of zero must never produce it.
+        let gate = RiskGate::new();
+        for capital in [Decimal::ZERO, dec!(-1)] {
+            let context = context_with_consumed(capital, dec!(500));
+
+            let verdict = gate.evaluate(&sample_proposed(), &context);
+            assert!(
+                matches!(verdict, RiskVerdict::Rejected {
+                    check: RiskCheck::InsufficientMargin,
+                    ..
+                }),
+                "{verdict:?}"
+            );
+
+            // Margin of zero: the margin check refuses nothing at a basis of zero.
+            let mut no_margin = sample_proposed();
+            no_margin.initial_margin = Decimal::ZERO;
+            let verdict = gate.evaluate(&no_margin, &context);
+            assert!(
+                !matches!(
+                    verdict,
+                    RiskVerdict::Approved
+                        | RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }
+                ),
+                "{verdict:?}"
+            );
+        }
     }
 
     #[test]

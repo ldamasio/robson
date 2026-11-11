@@ -41,21 +41,18 @@ fn funding<V: Venue + ?Sized>(venue: &V) -> Result<&dyn FundingPort, ExecError> 
         .ok_or_else(|| ExecError::Config(format!("venue {} has no funding surface", venue.id())))
 }
 
-/// Map the venue cancel outcome onto the legacy two-variant outcome.
-///
-/// `Unknown` has no legacy variant; it becomes `ExecError::Timeout`, which
-/// the executor's unknown-order classification does not match, so an
-/// indeterminate cancel is never recorded as a cancellation. No adapter
-/// returns `Unknown` in this step (request failures are still `Err`).
-pub(crate) fn legacy_cancel_outcome(
-    outcome: StopCancelOutcome,
-) -> Result<ports::StopCancelOutcome, ExecError> {
+/// Map the venue cancel outcome onto the legacy port's, one to one and with
+/// its payload. Nothing folds into an error: reading an outcome is
+/// [`crate::cancel::classify_cancel`]'s job (ADR-0056 step 7).
+pub(crate) fn legacy_cancel_outcome(outcome: StopCancelOutcome) -> ports::StopCancelOutcome {
     match outcome {
-        StopCancelOutcome::Cancelled { .. } => Ok(ports::StopCancelOutcome::Cancelled),
-        StopCancelOutcome::AlreadyGone { .. } => Ok(ports::StopCancelOutcome::AlreadyGone),
-        StopCancelOutcome::Unknown => Err(ExecError::Timeout(
-            "protective stop cancel outcome is indeterminate".to_string(),
-        )),
+        StopCancelOutcome::Cancelled { filled_before_cancel, fills } => {
+            ports::StopCancelOutcome::Cancelled { filled_before_cancel, fills }
+        },
+        StopCancelOutcome::AlreadyGone { final_state } => {
+            ports::StopCancelOutcome::AlreadyGone { final_state }
+        },
+        StopCancelOutcome::Unknown => ports::StopCancelOutcome::Indeterminate,
     }
 }
 
@@ -80,6 +77,25 @@ impl<V: Venue> ExchangePort for V {
         symbol: &Symbol,
     ) -> Result<SymbolTradingRules, ExecError> {
         TradingPort::trading_rules_preview(self, symbol).await
+    }
+
+    async fn trading_rules_fresh(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        TradingPort::trading_rules_fresh(self, symbol).await
+    }
+
+    fn last_validated_rules(&self, symbol: &Symbol) -> Option<SymbolTradingRules> {
+        TradingPort::last_validated_rules(self, symbol)
+    }
+
+    fn rules_refresh_due(&self, symbol: &Symbol) -> bool {
+        TradingPort::rules_refresh_due(self, symbol)
+    }
+
+    async fn refresh_trading_rules(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        TradingPort::refresh_trading_rules(self, symbol).await
     }
 
     async fn place_market_order(
@@ -119,7 +135,9 @@ impl<V: Venue> ExchangePort for V {
         symbol: &Symbol,
         algo_id: &str,
     ) -> Result<ports::StopCancelOutcome, ExecError> {
-        legacy_cancel_outcome(self.cancel_protection(symbol, &StopRef::new(algo_id)).await?)
+        self.cancel_protection(symbol, &StopRef::new(algo_id))
+            .await
+            .map(legacy_cancel_outcome)
     }
 
     async fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<(), ExecError> {
@@ -253,7 +271,7 @@ mod tests {
         venue::{
             self, AccountKind, AccountPort, FundingPort, MarketKind, OrderLookup,
             PositionAccountPort, ProtectionKind, ReplaceOutcome, ReplacementProtocol,
-            SettlementPort, StopParams,
+            SettlementPort, StopParams, VenueFinalityRule,
         },
     };
 
@@ -324,14 +342,15 @@ mod tests {
         assert_eq!((a.fill_price, a.filled_quantity), (trigger, Quantity::zero()));
 
         let id = a.exchange_order_id.as_str();
-        assert_eq!(
+        assert!(matches!(
             legacy.cancel_stop_market_order(&sym, id).await.unwrap(),
-            ports::StopCancelOutcome::Cancelled
-        );
-        assert_eq!(
+            ports::StopCancelOutcome::Cancelled { filled_before_cancel, fills: None }
+                if filled_before_cancel.is_zero()
+        ));
+        assert!(matches!(
             legacy.cancel_stop_market_order(&sym, id).await.unwrap(),
-            ports::StopCancelOutcome::AlreadyGone
-        );
+            ports::StopCancelOutcome::AlreadyGone { final_state: OrderLookup::Unknown }
+        ));
         assert!(matches!(
             direct.cancel_protection(&sym, &StopRef::new(id)).await.unwrap(),
             StopCancelOutcome::Cancelled { filled_before_cancel, .. } if filled_before_cancel.is_zero()
@@ -342,11 +361,72 @@ mod tests {
         ));
     }
 
+    /// The way back, written here only to compare both sides: a variant or a
+    /// payload lost on the way out shows up as a difference.
+    fn venue_outcome_of(legacy: ports::StopCancelOutcome) -> StopCancelOutcome {
+        match legacy {
+            ports::StopCancelOutcome::Cancelled { filled_before_cancel, fills } => {
+                StopCancelOutcome::Cancelled { filled_before_cancel, fills }
+            },
+            ports::StopCancelOutcome::AlreadyGone { final_state } => {
+                StopCancelOutcome::AlreadyGone { final_state }
+            },
+            ports::StopCancelOutcome::Indeterminate => StopCancelOutcome::Unknown,
+        }
+    }
+
     #[test]
-    fn indeterminate_cancel_is_never_a_legacy_success() {
+    fn the_legacy_outcome_round_trips_without_losing_anything() {
+        let fill = OrderResult {
+            exchange_order_id: "77".to_string(),
+            client_order_id: "ins-1".to_string(),
+            fill_price: Price::new(dec!(90)).unwrap(),
+            filled_quantity: Quantity::new(dec!(0.1)).unwrap(),
+            fee: dec!(0.01),
+            fee_asset: "USDT".to_string(),
+            filled_at: Utc::now(),
+        };
+        let gone = |final_state| StopCancelOutcome::AlreadyGone { final_state };
+        for outcome in [
+            StopCancelOutcome::Cancelled {
+                filled_before_cancel: dec!(0.02),
+                fills: Some(fill.clone()),
+            },
+            StopCancelOutcome::Cancelled {
+                filled_before_cancel: dec!(0),
+                fills: None,
+            },
+            gone(OrderLookup::Terminal {
+                filled_qty: dec!(0.1),
+                cancelled_qty: dec!(0.03),
+                fills: Some(fill),
+            }),
+            gone(OrderLookup::Terminal {
+                filled_qty: dec!(0),
+                cancelled_qty: dec!(0.1),
+                fills: None,
+            }),
+            gone(OrderLookup::Absent {
+                finality: VenueFinalityRule::EveryAttemptRejected,
+            }),
+            gone(OrderLookup::Open { filled_qty: dec!(0.01) }),
+            gone(OrderLookup::PartiallyFilled { filled_qty: dec!(0.02) }),
+            gone(OrderLookup::Unknown),
+            StopCancelOutcome::Unknown,
+        ] {
+            let before = format!("{outcome:?}");
+            let after = venue_outcome_of(legacy_cancel_outcome(outcome));
+            assert_eq!(format!("{after:?}"), before);
+        }
+    }
+
+    /// `Unknown` used to fold into `ExecError::Timeout` here, so no reader
+    /// could tell it from a request that failed.
+    #[test]
+    fn indeterminate_cancel_stays_a_typed_outcome() {
         assert!(matches!(
             legacy_cancel_outcome(StopCancelOutcome::Unknown),
-            Err(ExecError::Timeout(_))
+            ports::StopCancelOutcome::Indeterminate
         ));
     }
 
@@ -792,6 +872,7 @@ mod recorded_forwarding {
         fn id(&self) -> &VenueId {
             &self.id
         }
+        fn attach_gate(&self, _gate: std::sync::Arc<crate::gate::OperationGate>) {}
         fn position_account(&self) -> Option<&dyn PositionAccountPort> {
             Some(self)
         }
@@ -834,7 +915,9 @@ mod recorded_forwarding {
         assert_eq!(accepted.exchange_order_id, "p");
         let outcome = v.cancel_stop_market_order(&s, "77").await.unwrap();
         one("cancel_protection BTCUSDT 77");
-        assert_eq!(outcome, ports::StopCancelOutcome::AlreadyGone);
+        assert!(matches!(outcome, ports::StopCancelOutcome::AlreadyGone {
+            final_state: OrderLookup::Unknown
+        }));
         ExchangePort::cancel_order(&v, &s, "5").await.unwrap();
         one("cancel_order BTCUSDT 5");
         v.get_open_orders(&s).await.unwrap();

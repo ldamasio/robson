@@ -14,7 +14,13 @@ use robson_domain::{
     Event, OrderFillEvidence, Position, PositionId, PositionState, Price, Quantity,
     ReconciliationEvidence, Side, Symbol, UserTradeEvidence,
 };
-use robson_exec::{ExchangePort, ExchangePosition, OpenOrderRecord, OrderResult, UserTradeRecord};
+use robson_exec::{
+    cancel::CancelClass,
+    gate::OperationKind,
+    order_journal::{IntentKind, IntentSpec, OrderJournal},
+    quantize::{self, ReductionOutcome},
+    ExchangePort, ExchangePosition, ExecError, OpenOrderRecord, OrderResult, UserTradeRecord,
+};
 use robson_store::Store;
 use rust_decimal::Decimal;
 use tokio::{
@@ -32,6 +38,9 @@ use crate::{
     position_manager::{PositionManager, ReconcileCloseOutcome, ReconciledCloseInput},
 };
 
+/// How long after a leg closes the orphan sweep keeps visiting its symbol.
+const CLOSED_LEG_SWEEP_WINDOW_HOURS: i64 = 24;
+
 /// Background worker that reconciles exchange state with Robson state.
 pub struct ReconciliationWorker<E: ExchangePort + 'static, S: Store + 'static> {
     exchange: Arc<E>,
@@ -43,6 +52,9 @@ pub struct ReconciliationWorker<E: ExchangePort + 'static, S: Store + 'static> {
     missing_observations: Arc<Mutex<HashMap<PositionId, MissingObservation>>>,
     shutdown_token: CancellationToken,
     metrics: ReconciliationMetrics,
+    /// The journal whose gate gives each scan its permit; read through the
+    /// manager when not given.
+    order_journal: Option<Arc<OrderJournal>>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,11 +83,52 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
-    if let Some(input) = gather_order_fill_evidence(exchange, store, position).await? {
+    if let Some(input) = gather_stop_fill_evidence(exchange, store, position).await? {
         return Ok(Some(input));
     }
 
     gather_user_trade_evidence::<E>(exchange, position, expected_quantity, observed_at_floor).await
+}
+
+/// The recorded stop's fill, or failing that a fill of the whole leg by a stop
+/// it displaced. A stop displaced while it was executing still fills as this
+/// leg's stop, and its `ins-` authorship is what keeps the close in the
+/// governed month net. A displaced stop's partial does not count: it can be
+/// older than the close still waiting for its evidence, and would finalize that
+/// at its own price and month.
+///
+/// For the scan's paths, which act on a leg the venue does not show. Only when
+/// the recorded stop has no fill does it ask further: at most three more stops,
+/// of up to three requests each. The tick reads the recorded stop alone.
+pub(crate) async fn gather_stop_fill_evidence<E, S>(
+    exchange: &Arc<E>,
+    store: &Arc<S>,
+    position: &Position,
+) -> DaemonResult<Option<ReconciledCloseInput>>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    if let Some(input) = gather_order_fill_evidence(exchange, store, position).await? {
+        return Ok(Some(input));
+    }
+
+    for order_id in &position.superseded_stop_ids {
+        let Some(result) = exchange.get_stop_order_fill(&position.symbol, order_id).await? else {
+            continue;
+        };
+        if result.filled_quantity == position.quantity {
+            return Ok(Some(input_from_order_result(position.id, result)));
+        }
+        warn!(
+            position_id = %position.id,
+            %order_id,
+            filled = %result.filled_quantity.as_decimal(),
+            "A displaced stop filled part of the leg; that does not close it"
+        );
+    }
+
+    Ok(None)
 }
 
 pub(crate) async fn gather_order_fill_evidence<E, S>(
@@ -322,6 +375,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             missing_observations: Arc::new(Mutex::new(HashMap::new())),
             shutdown_token,
             metrics: ReconciliationMetrics::global(),
+            order_journal: None,
+        }
+    }
+
+    /// Take each scan's permit from `journal`, with no manager lock.
+    pub(crate) fn with_order_journal(mut self, journal: Arc<OrderJournal>) -> Self {
+        self.order_journal = Some(journal);
+        self
+    }
+
+    async fn order_journal(&self) -> Arc<OrderJournal> {
+        match &self.order_journal {
+            Some(journal) => Arc::clone(journal),
+            None => self.position_manager.read().await.order_journal(),
         }
     }
 
@@ -357,8 +424,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
 
     /// Run one reconciliation pass, returning how many position-level
     /// reconciliation actions completed (UNTRACKED closes plus resolved local
-    /// missing positions).
+    /// missing positions). The pass runs under the reconciliation slot's
+    /// permit (ADR-0056 step 7), or under the permit its caller holds: the
+    /// startup scan is part of the startup operation.
     pub async fn scan_and_reconcile(&self) -> DaemonResult<usize> {
+        let journal = self.order_journal().await;
+        journal
+            .with_permit(OperationKind::ReconciliationScan, Box::pin(self.scan_once()))
+            .await?
+    }
+
+    async fn scan_once(&self) -> DaemonResult<usize> {
         self.metrics.scan_started(Utc::now().timestamp());
 
         let result = self.scan_and_reconcile_inner().await;
@@ -378,14 +454,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     async fn scan_and_reconcile_inner(&self) -> DaemonResult<usize> {
         let exchange_positions = self.exchange.get_all_open_positions().await?;
         let mut reconciled = 0usize;
+        // One inventory that cannot be closed (a remainder below the lot minimum,
+        // say) must not stop the rest of the pass, scan after scan. The scan still
+        // fails at the end, so it stays visible.
+        let mut first_untracked_failure = None;
 
         for exchange_position in &exchange_positions {
             if self.is_tracked(&exchange_position).await? {
                 continue;
             }
 
-            self.handle_untracked_position(exchange_position.clone()).await?;
-            reconciled += 1;
+            match self.handle_untracked_position(exchange_position.clone()).await {
+                Ok(()) => reconciled += 1,
+                Err(error) => {
+                    first_untracked_failure.get_or_insert(error);
+                },
+            }
         }
 
         reconciled += self.reconcile_local_missing_positions(&exchange_positions).await?;
@@ -395,6 +479,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         // and never aborts the scan (invariant: insurance-stop maintenance
         // failures must not break reconciliation).
         self.sweep_orphan_insurance_orders(&exchange_positions).await;
+
+        if let Some(error) = first_untracked_failure {
+            return Err(error);
+        }
 
         if reconciled > 0 {
             self.recalibrate_capital_base_after_manual_drift(reconciled).await?;
@@ -465,6 +553,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     /// position that has since been reconciled away. It is cancelled so it
     /// cannot interfere with future entries on the same symbol.
     ///
+    /// The same read shows the opposite case, with no further request: an
+    /// `Active` leg the venue still holds whose recorded stop is not open.
+    ///
     /// Every step is best-effort: exchange query errors, cancel errors, and
     /// store read errors are logged and the scan continues. This method never
     /// returns an error and never aborts `scan_and_reconcile`.
@@ -506,6 +597,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                 }
             }
         }
+        for symbol in self.recently_closed_symbols(Utc::now()).await {
+            if symbols.insert(symbol) {
+                self.metrics.closed_symbol_visit();
+            }
+        }
 
         for symbol in &symbols {
             let open_orders = match self.exchange.get_open_orders(symbol).await {
@@ -519,6 +615,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                     continue;
                 },
             };
+
+            self.schedule_heal_of_dead_stops(
+                symbol,
+                &active_positions,
+                exchange_positions,
+                &open_orders,
+            )
+            .await;
 
             for order in open_orders {
                 if !Self::is_orphan_insurance_order(&order) {
@@ -546,16 +650,28 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                     "Orphan insurance-stop order detected; cancelling"
                 );
 
-                match self.exchange.cancel_stop_market_order(symbol, &order.exchange_order_id).await
-                {
-                    // An orphan stop is not attached to any tracked position, so
-                    // either outcome leaves the exchange in the desired state:
-                    // the order is gone.
-                    Ok(outcome) => {
+                let journal = self.order_journal().await;
+                let class = journal
+                    .within_operation(journal.journaled_cancel(
+                        None,
+                        &order.exchange_order_id,
+                        self.exchange.cancel_stop_market_order(symbol, &order.exchange_order_id),
+                    ))
+                    .await;
+                match class {
+                    // An orphan stop is not attached to any tracked position, so a
+                    // definite answer leaves the exchange in the desired state.
+                    // `GoneUnresolved` does not establish that: `Open` and
+                    // `PartiallyFilled` allow a live order. Its report is a retained
+                    // legacy one, and the outcome stays uncertain in the journal
+                    // (ADR-0056 step 7).
+                    CancelClass::Cancelled { .. }
+                    | CancelClass::GoneTerminal { .. }
+                    | CancelClass::GoneUnresolved { .. } => {
                         info!(
                             symbol = %symbol.as_pair(),
                             exchange_order_id = %order.exchange_order_id,
-                            ?outcome,
+                            ?class,
                             "Orphan insurance-stop order cleared"
                         );
                         self.event_bus.send(DaemonEvent::InsuranceStopOrphanCancelled {
@@ -564,17 +680,82 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                             client_order_id: order.client_order_id,
                         });
                     },
-                    Err(error) => {
+                    CancelClass::Indeterminate | CancelClass::Errored(_) => {
                         warn!(
                             symbol = %symbol.as_pair(),
                             exchange_order_id = %order.exchange_order_id,
-                            error = %error,
+                            ?class,
                             "Failed to cancel orphan insurance-stop order; continuing"
                         );
                     },
                 }
             }
         }
+    }
+
+    /// Ask for a heal for each `Active` leg on `symbol` that the venue holds
+    /// and whose recorded stop is not among `open_orders`, from a read that
+    /// succeeded. A leg the venue does not hold is not one: that is an
+    /// ordinary stop fill on its way to the missing-position path, which
+    /// needs the id it has on record.
+    async fn schedule_heal_of_dead_stops(
+        &self,
+        symbol: &Symbol,
+        active_positions: &[Position],
+        exchange_positions: &[ExchangePosition],
+        open_orders: &[OpenOrderRecord],
+    ) {
+        for position in active_positions.iter().filter(|leg| leg.symbol == *symbol) {
+            let PositionState::Active { insurance_stop_id, .. } = &position.state else {
+                continue;
+            };
+            let Some(recorded) = insurance_stop_id.as_ref().or(position.insurance_stop_id.as_ref())
+            else {
+                continue;
+            };
+            let open = open_orders.iter().any(|order| order.exchange_order_id == *recorded);
+            let held = exchange_positions
+                .iter()
+                .any(|held| held.symbol == *symbol && held.side == position.side);
+            if held && !open {
+                let manager = self.position_manager.read().await;
+                manager.schedule_stop_heal_if_dead(position.id, recorded).await;
+            }
+        }
+    }
+
+    /// Symbols of the legs closed in the last 24 h. A stop that outlives its
+    /// leg can sit on a symbol with no position and no open leg, where
+    /// nothing else brings the sweep. One read of the month's closes, two
+    /// when the window crosses into the month before. A failed read only
+    /// narrows this pass.
+    async fn recently_closed_symbols(&self, now: DateTime<Utc>) -> HashSet<Symbol> {
+        let since = now - chrono::Duration::hours(CLOSED_LEG_SWEEP_WINDOW_HOURS);
+        let mut months = vec![now];
+        if (since.year(), since.month()) != (now.year(), now.month()) {
+            months.push(since);
+        }
+
+        let manager = self.position_manager.read().await;
+        let mut symbols = HashSet::new();
+        for month in months {
+            match manager.closed_positions_in_month(month).await {
+                Ok(closed) => symbols.extend(
+                    closed
+                        .into_iter()
+                        .filter(|leg| leg.closed_at.is_some_and(|at| at >= since))
+                        .map(|leg| leg.symbol),
+                ),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Orphan insurance-order sweep: failed to read closed legs; \
+                         skipping their symbols"
+                    );
+                },
+            }
+        }
+        symbols
     }
 
     /// True for an open order that is a robsond-authored insurance stop
@@ -778,16 +959,73 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         });
 
         let client_order_id = Uuid::now_v7().to_string();
-        match self
-            .exchange
-            .close_position_market(
-                &exchange_position.symbol,
-                exchange_position.side,
-                exchange_position.quantity,
-                &client_order_id,
-            )
-            .await
-        {
+        // The same rule as any reduction (ADR-0056 §5): a reported quantity can
+        // be off the grid after a lot-rule change, so it rounds on the rules held
+        // and a rules rejection earns one refresh and one resubmission. Whatever
+        // rounding leaves is reported by the next scan.
+        let journal = self.order_journal().await;
+        let outcome = journal
+            .within_operation(async {
+                let journaled = journal.open_intent(IntentSpec {
+                    position_id: None,
+                    kind: IntentKind::SweepClose,
+                    client_order_id: client_order_id.clone(),
+                    cancels_order_id: None,
+                    params: serde_json::json!({
+                        "symbol": exchange_position.symbol.as_pair(),
+                        "side": exchange_position.side,
+                        "quantity": exchange_position.quantity.as_decimal(),
+                    }),
+                });
+                let outcome = quantize::submit_reduction(
+                    &*self.exchange,
+                    &exchange_position.symbol,
+                    exchange_position.quantity,
+                    None,
+                    quantize::METADATA_WAIT_BOUND,
+                    |quantity, _rules, submission| {
+                        let (journal, journaled, position) =
+                            (&journal, &journaled, &exchange_position);
+                        async move {
+                            let client_order_id = journal
+                                .authorize_reduction(journaled, submission, || {
+                                    Uuid::now_v7().to_string()
+                                })
+                                .await?;
+                            self.exchange
+                                .close_position_market(
+                                    &position.symbol,
+                                    position.side,
+                                    quantity,
+                                    &client_order_id,
+                                )
+                                .await
+                        }
+                    },
+                )
+                .await
+                .and_then(|outcome| match outcome {
+                    ReductionOutcome::Submitted { accepted, .. } => Ok(accepted),
+                    ReductionOutcome::NotExecutable { residual, .. } => {
+                        Err(ExecError::OrderRejected(format!(
+                            "{residual} rounds below the lot minimum; nothing can be submitted"
+                        )))
+                    },
+                });
+                match &outcome {
+                    Ok(order) => {
+                        let evidence = serde_json::json!({
+                            "exchange_order_id": order.exchange_order_id,
+                            "filled_quantity": order.filled_quantity.as_decimal(),
+                        });
+                        journal.finish_success(&journaled, Some(evidence)).await;
+                    },
+                    Err(_) => journal.finish_failed(&journaled).await,
+                }
+                outcome
+            })
+            .await;
+        match outcome {
             Ok(order) => {
                 info!(
                     symbol = %exchange_position.symbol.as_pair(),
@@ -1067,7 +1305,10 @@ mod tests {
         Symbol, TradingPolicy,
     };
     use robson_engine::Engine;
-    use robson_exec::{Executor, IntentJournal, OrderResult, StubExchange, UserTradeRecord};
+    use robson_exec::{
+        order_journal::{OrderJournal, StubJournalBackend},
+        Executor, IntentJournal, OrderResult, StubExchange, UserTradeRecord,
+    };
     use robson_store::{MemoryStore, Store};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -1077,13 +1318,68 @@ mod tests {
     use super::*;
     use crate::query_engine::TracingQueryRecorder;
 
+    /// A worker whose manager writes to a scripted journal.
+    fn journaled_worker(
+        exchange: Arc<StubExchange>,
+        store: Arc<MemoryStore>,
+        event_bus: Arc<EventBus>,
+    ) -> (ReconciliationWorker<StubExchange, MemoryStore>, Arc<StubJournalBackend>) {
+        let (worker, backend, _) = journaled_worker_and_journal(exchange, store, event_bus);
+        (worker, backend)
+    }
+
+    fn journaled_worker_and_journal(
+        exchange: Arc<StubExchange>,
+        store: Arc<MemoryStore>,
+        event_bus: Arc<EventBus>,
+    ) -> (
+        ReconciliationWorker<StubExchange, MemoryStore>,
+        Arc<StubJournalBackend>,
+        Arc<OrderJournal>,
+    ) {
+        let backend = Arc::new(StubJournalBackend::default());
+        let journal = Arc::new(OrderJournal::new(
+            backend.clone(),
+            &robson_exec::venue::VenueId::new("test:venue"),
+        ));
+        let position_manager = create_journaled_position_manager(
+            exchange.clone(),
+            store.clone(),
+            event_bus.clone(),
+            Some(journal.clone()),
+        );
+        let worker = ReconciliationWorker::new_with_missing_grace(
+            exchange,
+            position_manager,
+            store,
+            event_bus,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            CancellationToken::new(),
+        );
+        (worker, backend, journal)
+    }
+
     fn create_position_manager(
         exchange: Arc<StubExchange>,
         store: Arc<MemoryStore>,
         event_bus: Arc<EventBus>,
     ) -> Arc<RwLock<PositionManager<StubExchange, MemoryStore>>> {
+        create_journaled_position_manager(exchange, store, event_bus, None)
+    }
+
+    fn create_journaled_position_manager(
+        exchange: Arc<StubExchange>,
+        store: Arc<MemoryStore>,
+        event_bus: Arc<EventBus>,
+        order_journal: Option<Arc<OrderJournal>>,
+    ) -> Arc<RwLock<PositionManager<StubExchange, MemoryStore>>> {
         let journal = Arc::new(IntentJournal::new());
-        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let executor = Executor::new(exchange, journal, store.clone());
+        let executor = Arc::new(match order_journal {
+            Some(order_journal) => executor.with_order_journal(order_journal),
+            None => executor,
+        });
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
 
@@ -1403,6 +1699,358 @@ mod tests {
 
         let second = receiver.recv().await.unwrap().unwrap();
         assert!(matches!(second, DaemonEvent::SafetyExitExecuted { .. }));
+    }
+
+    /// ADR-0056 step 7: an UNTRACKED close is a reduction like any other, with
+    /// its own intent and its result on it.
+    #[tokio::test]
+    async fn an_untracked_close_is_journaled_as_a_sweep_close() {
+        use robson_exec::order_journal::{IntentKind, VenueOutcome};
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        exchange.set_open_position(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        let (worker, backend) = journaled_worker(exchange, store, event_bus);
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        let row = backend.rows().pop().expect("a row");
+        assert_eq!(row.intent.unwrap().kind, IntentKind::SweepClose);
+        assert_eq!(row.attempts.len(), 1);
+        assert_eq!(row.outcome.unwrap().venue_outcome, Some(VenueOutcome::Success));
+    }
+
+    /// A sweep close is a reduction: it goes out with the journal's memories
+    /// full and its writes failing.
+    #[tokio::test]
+    async fn a_saturated_failing_journal_stops_no_sweep_close() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        exchange.set_open_position(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        let (worker, backend, journal) =
+            journaled_worker_and_journal(exchange.clone(), store, event_bus);
+        backend.saturate(&journal).await;
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(exchange.open_positions_len(), 0, "the close reached the venue");
+        assert!(journal.non_reuse_ids_lost() > 0);
+    }
+
+    /// A sweep close has the same resubmission and the same fallback.
+    #[tokio::test]
+    async fn a_refused_sweep_retry_closes_under_a_fresh_id() {
+        use robson_exec::order_journal::{IntentKind, JournalFault};
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        exchange.set_open_position(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        exchange.set_trading_rules(
+            robson_domain::SymbolTradingRules::new(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                dec!(0.1),
+                dec!(0),
+                dec!(0.001),
+                dec!(0.001),
+                dec!(120),
+                dec!(0),
+                2,
+                3,
+            )
+            .unwrap(),
+        );
+        exchange.set_rules_rejections_next(1);
+        let (worker, backend) = journaled_worker(exchange.clone(), store, event_bus);
+        backend.fail_commit(1, Some(JournalFault::Known));
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(exchange.open_positions_len(), 0, "the fresh close reached the venue");
+        let closes = backend
+            .rows()
+            .into_iter()
+            .filter(|row| row.intent.as_ref().unwrap().kind == IntentKind::SweepClose)
+            .count();
+        assert_eq!(closes, 2, "the sealed intent and the fresh one");
+    }
+
+    struct OrphanSweep {
+        worker: ReconciliationWorker<StubExchange, MemoryStore>,
+        backend: Arc<StubJournalBackend>,
+        journal: Arc<OrderJournal>,
+        exchange: Arc<StubExchange>,
+        events: crate::event_bus::EventReceiver,
+        orphan_id: String,
+    }
+
+    /// A journaled worker with one orphan stop to find.
+    async fn orphan_sweep() -> OrphanSweep {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol.clone(), Side::Long);
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some("CURRENT-STOP".to_string());
+        }
+        position.insurance_stop_id = Some("CURRENT-STOP".to_string());
+        store.positions().save(&position).await.unwrap();
+        let orphan = exchange
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.010)).unwrap(),
+                Price::new(dec!(99)).unwrap(),
+                "ins-orphan-1",
+            )
+            .await
+            .unwrap();
+        exchange.set_open_position(
+            symbol,
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        let events = event_bus.subscribe();
+        let (worker, backend, journal) =
+            journaled_worker_and_journal(exchange.clone(), store, event_bus);
+        OrphanSweep {
+            worker,
+            backend,
+            journal,
+            exchange,
+            events,
+            orphan_id: orphan.exchange_order_id,
+        }
+    }
+
+    impl OrphanSweep {
+        fn orphan_events(&mut self) -> usize {
+            let mut count = 0;
+            while let Some(Ok(event)) = self.events.try_recv() {
+                if let DaemonEvent::InsuranceStopOrphanCancelled { exchange_order_id, .. } = &event
+                {
+                    assert_eq!(exchange_order_id, &self.orphan_id);
+                    count += 1;
+                }
+            }
+            count
+        }
+
+        fn cancel_row(&self) -> robson_exec::order_journal::StubJournalRow {
+            let mut cancels: Vec<_> = self
+                .backend
+                .rows()
+                .into_iter()
+                .filter(|r| r.intent.as_ref().unwrap().kind == IntentKind::Cancel)
+                .collect();
+            assert_eq!(cancels.len(), 1, "one cancel, one intent");
+            cancels.pop().unwrap()
+        }
+    }
+
+    /// One scan, one permit: its UNTRACKED close and its orphan cancel both
+    /// run under the reconciliation slot's permit. Inside the startup permit
+    /// the same scan takes none of its own (ADR-0056 step 7).
+    #[tokio::test]
+    async fn a_scan_runs_under_its_own_permit_or_the_one_it_is_reached_under() {
+        use robson_exec::{gate::OperationKind, venue::Venue};
+
+        for nested in [false, true] {
+            let OrphanSweep { worker, journal, exchange, .. } = orphan_sweep().await;
+            exchange.set_open_position(
+                Symbol::from_pair("ETHUSDT").unwrap(),
+                Side::Long,
+                Quantity::new(dec!(0.010)).unwrap(),
+                Price::new(dec!(100)).unwrap(),
+            );
+            exchange.attach_gate(Arc::clone(journal.gate()));
+            let worker = worker.with_order_journal(Arc::clone(&journal));
+            let setup = exchange.mutations().len();
+
+            let expected = if nested {
+                journal
+                    .acquire(OperationKind::Startup)
+                    .unwrap()
+                    .run(worker.scan_and_reconcile())
+                    .await
+                    .unwrap();
+                OperationKind::Startup
+            } else {
+                worker.scan_and_reconcile().await.unwrap();
+                OperationKind::ReconciliationScan
+            };
+
+            let mutations = exchange.mutations().split_off(setup);
+            let what: Vec<_> = mutations.iter().map(|m| m.what).collect();
+            assert!(what.contains(&"POST /fapi/v1/order"), "the UNTRACKED close: {what:?}");
+            assert!(what.contains(&"DELETE /fapi/v1/algoOrder"), "the orphan cancel: {what:?}");
+            for mutation in mutations {
+                assert_eq!(mutation.permit, Some(expected), "{mutation:?}");
+                let gate = mutation.gate.unwrap();
+                assert_eq!(
+                    (gate.permits, gate.internal, gate.unpermitted),
+                    (1, 1, 0),
+                    "{mutation:?}"
+                );
+            }
+            assert_eq!(journal.gate().snapshot().permits, 0);
+        }
+    }
+
+    /// Each class of an orphan's cancel: a definite one and a "gone" are
+    /// reported as before, an unknown or failed cancel is only logged, and the
+    /// row says which it was.
+    #[tokio::test]
+    async fn an_orphan_cancel_is_journaled_and_reported_by_class() {
+        use robson_exec::{
+            order_journal::VenueOutcome,
+            venue::{OrderLookup, StopCancelOutcome as VenueCancel},
+        };
+        type Case = (Result<VenueCancel, ExecError>, &'static str, Option<VenueOutcome>, usize);
+        let cases: Vec<Case> = vec![
+            (
+                Ok(VenueCancel::Cancelled {
+                    filled_before_cancel: Decimal::ZERO,
+                    fills: None,
+                }),
+                "cancelled",
+                Some(VenueOutcome::Success),
+                1,
+            ),
+            (
+                Ok(VenueCancel::AlreadyGone {
+                    final_state: OrderLookup::Terminal {
+                        filled_qty: dec!(0.010),
+                        cancelled_qty: Decimal::ZERO,
+                        fills: None,
+                    },
+                }),
+                "gone_terminal",
+                Some(VenueOutcome::GoneTerminal),
+                1,
+            ),
+            (
+                Ok(VenueCancel::AlreadyGone { final_state: OrderLookup::Unknown }),
+                "gone_unresolved",
+                None,
+                1,
+            ),
+            (Ok(VenueCancel::Unknown), "indeterminate", None, 0),
+            (Err(ExecError::Timeout("no answer".to_string())), "error", None, 0),
+            (
+                Err(ExecError::OrderRejected("Unknown order sent.".to_string())),
+                "error",
+                None,
+                0,
+            ),
+        ];
+        for (outcome, label, venue_outcome, reported) in cases {
+            let mut sweep = orphan_sweep().await;
+            sweep.exchange.set_stop_cancel_outcome_next(outcome);
+
+            sweep.worker.scan_and_reconcile().await.unwrap();
+
+            assert_eq!(sweep.orphan_events(), reported, "{label}");
+            let row = sweep.cancel_row();
+            assert_eq!(
+                row.intent.unwrap().cancels_order_id.as_deref(),
+                Some(sweep.orphan_id.as_str()),
+                "{label}"
+            );
+            let outcome = row.outcome.unwrap_or_else(|| panic!("{label}: no outcome"));
+            assert_eq!(outcome.cancel_class, Some(label), "{label}");
+            assert_eq!(outcome.venue_outcome, venue_outcome, "{label}");
+            assert_eq!(outcome.uncertain_at.is_some(), venue_outcome.is_none(), "{label}");
+        }
+    }
+
+    /// An orphan cancel's journal write that never answers costs its bound and
+    /// nothing else: the request goes out and the scan carries on.
+    #[tokio::test]
+    async fn a_hung_cancel_write_never_holds_the_orphan_sweep() {
+        use robson_exec::{order_journal::JournalFault, venue::OrderLookup};
+        for write in 0..2 {
+            let mut sweep = orphan_sweep().await;
+            sweep.backend.fail_commit(write, Some(JournalFault::Hang));
+            sweep.exchange.set_stop_cancel_outcome_next(Ok(
+                robson_exec::venue::StopCancelOutcome::AlreadyGone {
+                    final_state: OrderLookup::Unknown,
+                },
+            ));
+
+            let scan = sweep.worker.scan_and_reconcile();
+            let scanned = tokio::time::timeout(Duration::from_secs(5), scan).await;
+
+            scanned.expect("the journal held the sweep").unwrap();
+            assert_eq!(sweep.orphan_events(), 1, "write {write}");
+            sweep.journal.flush_pending().await;
+            let outcome = sweep.cancel_row().outcome.expect("the outcome lands on a retry");
+            assert_eq!(outcome.cancel_class, Some("gone_unresolved"), "write {write}");
+            assert!(outcome.uncertain_at.is_some(), "write {write}");
+        }
+    }
+
+    /// An orphan's cancel is its own intent, naming the order it cancels.
+    #[tokio::test]
+    async fn an_orphan_cancel_is_journaled_against_the_order_it_cancels() {
+        use robson_exec::order_journal::IntentKind;
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol.clone(), Side::Long);
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some("CURRENT-STOP".to_string());
+        }
+        position.insurance_stop_id = Some("CURRENT-STOP".to_string());
+        store.positions().save(&position).await.unwrap();
+        let orphan = exchange
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.010)).unwrap(),
+                Price::new(dec!(99)).unwrap(),
+                "ins-orphan-1",
+            )
+            .await
+            .unwrap();
+        exchange.set_open_position(
+            symbol,
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        let (worker, backend) = journaled_worker(exchange.clone(), store, event_bus);
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert!(!exchange.has_stop_order(&orphan.exchange_order_id));
+        let cancel = backend
+            .rows()
+            .into_iter()
+            .find(|row| row.intent.as_ref().unwrap().kind == IntentKind::Cancel)
+            .expect("the cancel is journaled");
+        assert_eq!(
+            cancel.intent.unwrap().cancels_order_id.as_deref(),
+            Some(orphan.exchange_order_id.as_str())
+        );
     }
 
     #[tokio::test]
@@ -1969,6 +2617,330 @@ mod tests {
             }
         }
         assert!(orphan_event_seen, "expected InsuranceStopOrphanCancelled audit event");
+    }
+
+    /// ADR-0056 §5: an UNTRACKED position whose quantity went off the grid
+    /// rounds on the rules held, and a rules rejection earns one refresh
+    /// and resubmission.
+    #[tokio::test]
+    async fn test_untracked_close_follows_the_refresh_once_rule() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let rules = |step| {
+            robson_domain::SymbolTradingRules::new(
+                symbol.clone(),
+                dec!(0.1),
+                dec!(0),
+                step,
+                step,
+                dec!(120),
+                dec!(0),
+                2,
+                3,
+            )
+            .unwrap()
+        };
+        // The cache says 0.001; the venue has moved to 0.01.
+        exchange.set_trading_rules(rules(dec!(0.001)));
+        exchange.set_venue_rules(rules(dec!(0.01)));
+        exchange.set_open_position(
+            symbol.clone(),
+            Side::Long,
+            Quantity::new(dec!(0.105)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(exchange.position_close_call_count(), 2, "one resubmission");
+        assert_eq!(exchange.rules_refresh_call_count(), 1, "one refresh");
+
+        // 0.100 went out of 0.105. The rest survives for the next scan, where the
+        // venue refuses it for being under a lot, and the scan says so.
+        let held = exchange.get_all_open_positions().await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].quantity.as_decimal(), dec!(0.005));
+        assert!(worker.scan_and_reconcile().await.is_err());
+        assert_eq!(exchange.position_close_call_count(), 3, "one attempt, refused");
+        let held = exchange.get_all_open_positions().await.unwrap();
+        assert_eq!(held[0].quantity.as_decimal(), dec!(0.005));
+    }
+
+    #[tokio::test]
+    async fn test_untracked_close_second_rules_rejection_does_not_loop() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        exchange.set_open_position(
+            symbol.clone(),
+            Side::Long,
+            Quantity::new(dec!(0.105)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        exchange.set_trading_rules(
+            robson_domain::SymbolTradingRules::new(
+                symbol.clone(),
+                dec!(0.1),
+                dec!(0),
+                dec!(0.001),
+                dec!(0.001),
+                dec!(120),
+                dec!(0),
+                2,
+                3,
+            )
+            .unwrap(),
+        );
+        exchange.set_rules_rejections_next(100);
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        assert!(worker.scan_and_reconcile().await.is_err());
+        assert_eq!(exchange.position_close_call_count(), 2);
+    }
+
+    /// ADR-0056 §5: a short manual final trade is not evidence of a close,
+    /// whatever residual the leg stands at. It stays unresolved, and
+    /// `/reconcile-close` is the recourse.
+    #[tokio::test]
+    async fn test_a_short_manual_trade_leaves_a_leg_with_a_residual_unresolved() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        let mut position = tracked_active_position(symbol.clone(), Side::Long);
+        position.quantity = Quantity::new(dec!(0.01)).unwrap();
+        position.residual_quantity = Some(dec!(0.004));
+        position.entry_filled_at = Some(Utc::now() - chrono::Duration::hours(1));
+        store.positions().save(&position).await.unwrap();
+
+        exchange.set_user_trades(&symbol.as_pair(), vec![UserTradeRecord {
+            exchange_order_id: "manual-1".to_string(),
+            exchange_trade_id: "trade-1".to_string(),
+            fill_price: Price::new(dec!(90)).unwrap(),
+            filled_quantity: Quantity::new(dec!(0.004)).unwrap(),
+            fee: dec!(0.1),
+            fee_asset: "USDT".to_string(),
+            filled_at: Utc::now() - chrono::Duration::minutes(5),
+        }]);
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+        worker.scan_and_reconcile().await.unwrap();
+
+        let loaded = store.positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Active { .. }), "{:?}", loaded.state);
+    }
+
+    /// ADR-0056 §5, the whole way: a short exit closes the leg, and the next
+    /// scan finds what the venue still holds with no leg, and closes it as
+    /// UNTRACKED.
+    #[tokio::test]
+    async fn test_a_short_exit_closes_the_leg_and_the_next_scan_sweeps_the_rest() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let position = tracked_active_position(symbol.clone(), Side::Long);
+        store.positions().save(&position).await.unwrap();
+        exchange.set_short_fill_next(dec!(0.006));
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.position_manager.read().await.close_position(position.id).await.unwrap();
+
+        let loaded = store.positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Closed { .. }), "{:?}", loaded.state);
+
+        exchange.set_open_position(
+            symbol,
+            Side::Long,
+            Quantity::new(dec!(0.004)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(exchange.position_close_call_count(), 1);
+        assert_eq!(exchange.open_positions_len(), 0);
+    }
+
+    /// The below-lot variant: the rest cannot be closed, the scan says so and
+    /// it stays on the venue, visibly. It does not stop the pass for
+    /// everything else.
+    #[tokio::test]
+    async fn test_a_remainder_below_the_lot_stays_visible_and_does_not_stop_the_scan() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let mut events = event_bus.subscribe();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let rules = robson_domain::SymbolTradingRules::new(
+            symbol.clone(),
+            dec!(0.1),
+            dec!(0),
+            dec!(0.01),
+            dec!(0.01),
+            dec!(120),
+            dec!(0),
+            2,
+            2,
+        )
+        .unwrap();
+        exchange.set_trading_rules(rules.clone());
+        exchange.set_venue_rules(rules);
+        exchange.set_open_position(
+            symbol.clone(),
+            Side::Long,
+            Quantity::new(dec!(0.004)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        // Another leg, missing from the venue: the pass must still get to it.
+        let other_symbol = Symbol::from_pair("ETHUSDT").unwrap();
+        let other = tracked_active_position(other_symbol, Side::Long);
+        store.positions().save(&other).await.unwrap();
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        assert!(worker.scan_and_reconcile().await.is_err());
+
+        assert_eq!(exchange.open_positions_len(), 1, "it stays on the venue");
+        assert!(
+            worker.missing_observations.lock().await.contains_key(&other.id),
+            "the rest of the pass still ran"
+        );
+        let mut failed = false;
+        while let Some(Ok(event)) = events.try_recv() {
+            failed |= matches!(event, DaemonEvent::SafetyExitFailed { .. });
+        }
+        assert!(failed, "and it is reported");
+    }
+
+    fn leg_closed_at(symbol: Symbol, closed_at: DateTime<Utc>) -> Position {
+        let mut leg = tracked_active_position(symbol, Side::Long);
+        leg.closed_at = Some(closed_at);
+        leg.state = PositionState::Closed {
+            exit_price: Price::new(dec!(99)).unwrap(),
+            realized_pnl: Decimal::ZERO,
+            exit_reason: robson_domain::ExitReason::InsuranceStop,
+        };
+        leg
+    }
+
+    /// A stop that outlives its leg on a symbol the venue shows flat, whichever
+    /// race or panic path left it, goes within a scan. A day later the symbol
+    /// is no longer visited.
+    #[tokio::test]
+    async fn test_a_stop_left_on_a_flat_symbol_goes_while_its_leg_closed_recently() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let stop_on = |symbol: Symbol, client_id: &'static str| {
+            let exchange = exchange.clone();
+            async move {
+                exchange
+                    .place_stop_market_order(
+                        &symbol,
+                        OrderSide::Sell,
+                        Quantity::new(dec!(0.010)).unwrap(),
+                        Price::new(dec!(99)).unwrap(),
+                        client_id,
+                    )
+                    .await
+                    .unwrap()
+                    .exchange_order_id
+            }
+        };
+        let recent = Symbol::from_pair("BTCUSDT").unwrap();
+        let old = Symbol::from_pair("ETHUSDT").unwrap();
+        let recent_stop = stop_on(recent.clone(), "ins-left-recent").await;
+        let old_stop = stop_on(old.clone(), "ins-left-old").await;
+        let now = Utc::now();
+        store
+            .positions()
+            .save(&leg_closed_at(recent, now - chrono::Duration::hours(23)))
+            .await
+            .unwrap();
+        store
+            .positions()
+            .save(&leg_closed_at(old, now - chrono::Duration::hours(25)))
+            .await
+            .unwrap();
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert!(!exchange.has_stop_order(&recent_stop));
+        assert!(exchange.has_stop_order(&old_stop));
+    }
+
+    /// The window reaches into the month before, and no further than 24 h.
+    #[tokio::test]
+    async fn test_the_closed_leg_window_crosses_a_month_boundary() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let at = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
+        for (pair, closed_at) in [
+            ("XRPUSDT", "2027-03-01T00:00:00Z"),
+            ("BTCUSDT", "2027-03-01T00:30:00Z"),
+            ("ETHUSDT", "2027-02-28T23:00:00Z"),
+            ("SOLUSDT", "2027-02-27T23:00:00Z"),
+        ] {
+            let symbol = Symbol::from_pair(pair).unwrap();
+            store.positions().save(&leg_closed_at(symbol, at(closed_at))).await.unwrap();
+        }
+        let worker = create_worker(exchange, store, event_bus, Duration::from_secs(0));
+
+        let symbols = worker.recently_closed_symbols(at("2027-03-01T01:00:00Z")).await;
+
+        let expected: HashSet<Symbol> = ["XRPUSDT", "BTCUSDT", "ETHUSDT"]
+            .into_iter()
+            .map(|pair| Symbol::from_pair(pair).unwrap())
+            .collect();
+        assert_eq!(symbols, expected);
+    }
+
+    /// The sweep's added cost: one per symbol it would otherwise not have
+    /// visited.
+    #[tokio::test]
+    async fn test_the_sweep_counts_only_the_symbols_it_would_not_have_visited() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let held = Symbol::from_pair("BTCUSDT").unwrap();
+        store
+            .positions()
+            .save(&tracked_active_position(held.clone(), Side::Long))
+            .await
+            .unwrap();
+        exchange.set_open_position(
+            held,
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        for pair in ["BTCUSDT", "ETHUSDT"] {
+            let symbol = Symbol::from_pair(pair).unwrap();
+            store.positions().save(&leg_closed_at(symbol, Utc::now())).await.unwrap();
+        }
+        let (worker, metrics) = create_worker_with_metrics(
+            exchange.clone(),
+            store.clone(),
+            event_bus,
+            Duration::from_secs(0),
+        );
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(metrics.closed_symbol_visit_count(), 1.0, "BTCUSDT is visited anyway");
     }
 
     #[tokio::test]

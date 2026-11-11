@@ -47,6 +47,48 @@ pub struct GoogleClaims {
     pub exp: usize,
 }
 
+/// How the caller of an authenticated route proved who it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorAuth {
+    /// A verified Google ID token.
+    Verified,
+    /// The legacy shared token: it proves possession, not a person.
+    Asserted,
+}
+
+impl OperatorAuth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Asserted => "asserted",
+        }
+    }
+}
+
+/// Who called an authenticated route, kept in the request's extensions by the
+/// auth layer for routes that record a decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorIdentity {
+    pub subject: String,
+    pub auth: OperatorAuth,
+}
+
+impl OperatorIdentity {
+    pub fn from_claims(claims: &GoogleClaims) -> Self {
+        Self {
+            subject: claims.email.clone().unwrap_or_else(|| claims.sub.clone()),
+            auth: OperatorAuth::Verified,
+        }
+    }
+
+    pub fn legacy_token() -> Self {
+        Self {
+            subject: "legacy-bearer-token".to_string(),
+            auth: OperatorAuth::Asserted,
+        }
+    }
+}
+
 /// Verification failure. Deliberately opaque: `Display` is for server-side
 /// logs only and must never be rendered into an HTTP response body.
 #[derive(Debug, thiserror::Error)]

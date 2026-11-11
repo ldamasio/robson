@@ -1,0 +1,27 @@
+{
+  "clean_exit": {
+    "events": [
+      "insurance_stop_cancelled",
+      "exit_order_placed",
+      "exit_triggered",
+      "position_closed"
+    ],
+    "state": "closed",
+    "stop_live": false
+  },
+  "exit_fill_below_leg_quantity": {
+    "events": [
+      "exit_order_placed",
+      "position_closed"
+    ],
+    "state": "closed",
+    "stop_live": true
+  },
+  "exit_order_fails": {
+    "events": [
+      "insurance_stop_cancelled"
+    ],
+    "state": "active",
+    "stop_live": false
+  }
+}

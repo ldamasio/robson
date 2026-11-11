@@ -48,6 +48,7 @@
     "insufficientCapitalBanner": "Insufficient capital to operate",
     "unmatchedIncomeBanner": "{count} exchange income item(s) unmatched to any Robson position · capital_base recalibration blocked",
     "unmatchedIncomeAction": "ack: robson-cli income ack <id>",
+    "monthlyBudgetBasisInvalidBanner": "Monthly budget accounting is invalid. New entries are blocked until it is corrected; open positions keep their stops.",
     "monthlyBudgetExhaustedBanner": "Monthly risk budget exhausted. New entries unlock at the month rollover.",
     "monthlyBudgetLowBanner": "Monthly risk budget nearly used. Only entries that risk less than what is left will be admitted.",
     "addFunds": "Add funds",

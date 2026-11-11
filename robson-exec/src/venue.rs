@@ -10,7 +10,7 @@
 //! Step 2 only introduces the contracts; [`ExchangePort`] and [`IncomePort`]
 //! remain as a forwarding layer over them (`compat.rs`). Callers branch on
 //! [`VenueCapabilities`], never on [`VenueId`]. [`StopCancelOutcome`] here is
-//! the venue contract; the legacy two-variant outcome stays at
+//! the venue contract; its lossless mirror stays at
 //! `robson_exec::ports::StopCancelOutcome` until the legacy port is removed.
 //!
 //! [`ExchangePort`]: crate::ports::ExchangePort
@@ -20,7 +20,7 @@ use std::{
     collections::HashMap,
     fmt,
     future::Future,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::Duration,
 };
 
@@ -32,6 +32,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::ExecError,
+    gate::OperationGate,
+    order_journal::{begin_send, report_rejected, report_send_started, OrderJournal, SendRefusal},
     ports::{
         ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord, OpenOrderRecord,
         OrderResult, SpotBalance, SpotOrder, SpotOrderRequest, Transfer, TransferId,
@@ -132,6 +134,7 @@ impl VenueFinalityRule {
                 AttemptEvidence::AllRejected { .. } => OrderLookup::Absent { finality: self },
                 AttemptEvidence::NoRecord
                 | AttemptEvidence::Truncated
+                | AttemptEvidence::Unavailable
                 | AttemptEvidence::Unresolved { .. } => OrderLookup::Unknown,
             },
         }
@@ -149,6 +152,8 @@ pub enum AttemptEvidence {
     /// The ledger dropped evidence for capacity, so nothing can be concluded
     /// about any client id.
     Truncated,
+    /// The durable evidence could not be read: nothing can be concluded.
+    Unavailable,
     /// `unresolved` attempts are not proven rejected (in flight, dropped,
     /// accepted or indeterminate); `rejected` others were refused.
     Unresolved { unresolved: u64, rejected: u64 },
@@ -187,21 +192,22 @@ struct LedgerState {
 /// indeterminate attempt is evicted, a rejected retry starts a fresh record
 /// that reads `AllRejected`.
 ///
-/// **Restart limitation.** The evidence is in memory until ADR-0056 step 7
-/// persists it, and a restart has the same false-fresh shape: an attempt by an
-/// earlier (or any other) process left no record here, so a rejected retry
-/// with the same client id reads `AllRejected` and a not-found becomes a false
-/// `Absent`, although the other attempt may have been accepted. Without a
-/// retry the empty ledger reads `NoRecord`, which is `Unknown`. Until step 7,
-/// no caller may act on `Absent` for a client id that another process may have
-/// submitted. Step 7 must persist each attempt durably before its request is
-/// sent and each rejection when observed, reload them on startup, treat an
-/// attempt without a persisted rejection as unresolved, and keep the truncated
-/// state across restarts.
+/// **Across a restart.** On its own this ledger cannot see an earlier
+/// process's attempts. With the [`OrderJournal`] attached,
+/// [`Self::final_evidence`] answers from the durable rows; `evidence` stays
+/// the in-memory view. A daemon with no database has neither, and every
+/// not-found on an earlier process's id stays `Unknown`.
 #[derive(Debug)]
 pub struct SubmitAttemptLedger {
     capacity: usize,
     state: Mutex<LedgerState>,
+    journal: OnceLock<Arc<OrderJournal>>,
+}
+
+impl fmt::Debug for OrderJournal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OrderJournal")
+    }
 }
 
 impl SubmitAttemptLedger {
@@ -210,15 +216,42 @@ impl SubmitAttemptLedger {
         Self {
             capacity,
             state: Mutex::new(LedgerState::default()),
+            journal: OnceLock::new(),
         }
+    }
+
+    /// Answer the finality rule from the durable journal from now on.
+    pub fn attach_journal(&self, journal: Arc<OrderJournal>) {
+        let _ = self.journal.set(journal);
     }
 
     fn lock(&self) -> MutexGuard<'_, LedgerState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Register one attempt, unresolved until [`SubmitAttempt::rejected`].
+    /// Start a send: the gate's send start, then one attempt registered,
+    /// unresolved until [`SubmitAttempt::rejected`]. Every send passes here
+    /// last, immediately before its request (ADR-0056 step 7).
+    ///
+    /// # Errors
+    /// The gate refused an entry because the daemon is stopping. Nothing is
+    /// registered and nothing may be sent: a proven no-send.
+    pub fn begin_send<'a>(
+        &'a self,
+        client_order_id: &'a str,
+    ) -> Result<SubmitAttempt<'a>, SendRefusal> {
+        begin_send(client_order_id)?;
+        Ok(self.register(client_order_id))
+    }
+
+    /// Register one attempt and report its ticket without the gate's refusal:
+    /// for tests of the ledger. A send goes through [`Self::begin_send`].
     pub fn begin<'a>(&'a self, client_order_id: &'a str) -> SubmitAttempt<'a> {
+        report_send_started(client_order_id);
+        self.register(client_order_id)
+    }
+
+    fn register<'a>(&'a self, client_order_id: &'a str) -> SubmitAttempt<'a> {
         let mut state = self.lock();
         if !state.truncated {
             if let Some(counts) = state.attempts.get_mut(client_order_id) {
@@ -238,18 +271,23 @@ impl SubmitAttemptLedger {
         SubmitAttempt { ledger: self, client_order_id }
     }
 
-    /// Run `request` as one attempt with `client_order_id`. The attempt is on
-    /// record before `request` is first polled, so before anything can be
-    /// sent, and stays unresolved if this future is dropped at any point.
+    /// Run `request` as one attempt with `client_order_id`. The gate's send
+    /// start runs and the attempt is on record immediately before `request` is
+    /// first polled, with no await in between, so before anything can be sent;
+    /// the attempt stays unresolved if this future is dropped at any point.
     /// `is_rejection` is the venue's allow-list of authoritative rejections;
     /// any other outcome leaves the attempt unresolved.
-    pub async fn submit<T, E>(
+    ///
+    /// # Errors
+    /// `request`'s error, or the gate's refusal of an entry, which never polls
+    /// `request`.
+    pub async fn submit<T, E: From<SendRefusal>>(
         &self,
         client_order_id: &str,
         is_rejection: impl FnOnce(&E) -> bool,
         request: impl Future<Output = Result<T, E>>,
     ) -> Result<T, E> {
-        let attempt = self.begin(client_order_id);
+        let attempt = self.begin_send(client_order_id)?;
         let result = request.await;
         if let Err(error) = &result {
             if is_rejection(error) {
@@ -257,6 +295,31 @@ impl SubmitAttemptLedger {
             }
         }
         result
+    }
+
+    /// The evidence the finality rule decides on (ADR-0056 step 7, rule 4):
+    /// with a journal attached, the durable rows and the journal's memory, and
+    /// an attempt unresolved here can only keep it unresolved. Without one,
+    /// this ledger alone.
+    pub async fn final_evidence(&self, client_order_id: &str) -> AttemptEvidence {
+        let local = self.evidence(client_order_id);
+        let Some(journal) = self.journal.get() else {
+            return local;
+        };
+        let durable = journal.attempt_evidence(client_order_id).await;
+        match (durable, self.evidence(client_order_id), local) {
+            (
+                AttemptEvidence::AllRejected { .. },
+                unresolved @ AttemptEvidence::Unresolved { .. },
+                _,
+            )
+            | (
+                AttemptEvidence::AllRejected { .. },
+                _,
+                unresolved @ AttemptEvidence::Unresolved { .. },
+            ) => unresolved,
+            (durable, ..) => durable,
+        }
     }
 
     /// The evidence for `client_order_id` as of now.
@@ -289,6 +352,7 @@ impl SubmitAttempt<'_> {
     /// The venue authoritatively refused this attempt. Consumes the handle, so
     /// one attempt cannot be counted twice.
     pub fn rejected(self) {
+        report_rejected(self.client_order_id);
         let mut state = self.ledger.lock();
         // Missing only after truncation, when nothing is recorded any more.
         if let Some(counts) = state.attempts.get_mut(self.client_order_id) {
@@ -584,7 +648,41 @@ pub trait TradingPort: Send + Sync {
         self.trading_rules(symbol).await
     }
 
+    /// Rules for admission (ADR-0056 §5): validated within the TTL or
+    /// refreshed now, never a stale snapshot. An error fails admission closed.
+    /// Default: `trading_rules`.
+    async fn trading_rules_fresh(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules(symbol).await
+    }
+
+    /// The last validated rules of any age, for risk reduction (ADR-0056 §5):
+    /// no venue request and no wait on a refresh in flight. Default: `None`.
+    fn last_validated_rules(&self, _symbol: &Symbol) -> Option<SymbolTradingRules> {
+        None
+    }
+
+    /// Whether the last validated rules are missing or past their TTL, so a
+    /// caller that must not wait can ask for a refresh on the side.
+    /// Default: `false`.
+    fn rules_refresh_due(&self, _symbol: &Symbol) -> bool {
+        false
+    }
+
+    /// Re-read the rules after a rules rejection, updating what
+    /// `last_validated_rules` serves. Never serves a stale snapshot. Bounded by
+    /// the venue under the ADR-0056 §10 ceiling. Default: `trading_rules`.
+    async fn refresh_trading_rules(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules(symbol).await
+    }
+
     /// Place a market order. `intent = Reduce` must only reduce exposure.
+    ///
+    /// `Entry` validates against fresh rules and fails closed; `Reduce` sends
+    /// `quantity` as given, with no metadata lookup here: [`crate::quantize`]
+    /// decides it (ADR-0056 §5).
     async fn place_market_order(
         &self,
         symbol: &Symbol,
@@ -596,7 +694,9 @@ pub trait TradingPort: Send + Sync {
 
     /// Place exchange-resident protection of kind
     /// `capabilities().protection` (ADR-0039). `trigger` is chart-derived
-    /// (ADR-0021), never a percentage of entry.
+    /// (ADR-0021), never a percentage of entry. `quantity` and `trigger` are
+    /// sent as given, with no metadata lookup: [`crate::quantize`] decides
+    /// them.
     async fn place_protection(
         &self,
         symbol: &Symbol,
@@ -631,12 +731,9 @@ pub trait TradingPort: Send + Sync {
     /// id, read after the not-found responses returned; otherwise it is
     /// `Unknown`, however much time has passed. A request failure is `Err`.
     ///
-    /// **Restart limitation.** The evidence does not survive a restart until
-    /// ADR-0056 step 7 persists it. An attempt by an earlier (or any other)
-    /// process is not on record, so a rejected retry with the same client id
-    /// yields a false `Absent` although that attempt may have been accepted.
-    /// Until then, no caller may act on `Absent` for a client id that another
-    /// process may have submitted. The ledger states what step 7 must do.
+    /// With the order journal attached the evidence is durable and spans
+    /// restarts (ADR-0056 step 7, rule 4): at least one row, all rejected,
+    /// nothing unlanded in memory.
     async fn order_by_client_id(
         &self,
         symbol: &Symbol,
@@ -794,6 +891,13 @@ pub trait FundingPort: Send + Sync {
 /// accessors for the account-kind specific and optional ones.
 pub trait Venue: TradingPort + AccountPort {
     fn id(&self) -> &VenueId;
+    /// Give the venue's attempt ledger the durable journal. A venue without a
+    /// ledger has nothing to attach.
+    fn attach_order_journal(&self, _journal: Arc<OrderJournal>) {}
+    /// Give the venue's transport the permit gate (ADR-0056 step 7): every
+    /// mutation it sends passes [`OperationGate::mutation`] first. No default:
+    /// a venue says how its mutations reach the gate.
+    fn attach_gate(&self, gate: Arc<OperationGate>);
     fn position_account(&self) -> Option<&dyn PositionAccountPort>;
     fn inventory(&self) -> Option<&dyn InventoryPort>;
     fn settlement(&self) -> &dyn SettlementPort;
@@ -870,13 +974,14 @@ pub async fn replace_place_then_cancel<T: TradingPort + ?Sized>(
     {
         Ok(placed) => placed,
         Err(error) => {
-            return Ok(match attempts.evidence(&new.client_order_id) {
+            return Ok(match attempts.final_evidence(&new.client_order_id).await {
                 AttemptEvidence::AllRejected { .. } => {
                     ReplaceOutcome::OldKeptNewRejected { reason: error.to_string() }
                 },
                 // The successor may exist.
                 AttemptEvidence::NoRecord
                 | AttemptEvidence::Truncated
+                | AttemptEvidence::Unavailable
                 | AttemptEvidence::Unresolved { .. } => ReplaceOutcome::Unknown { new: None },
             });
         },
@@ -979,6 +1084,10 @@ mod tests {
         }
     }
 
+    fn refused() -> ExecError {
+        ExecError::OrderRejected("refused".to_string())
+    }
+
     #[tokio::test]
     async fn submit_registers_before_the_request_is_polled() {
         let ledger = SubmitAttemptLedger::new(8);
@@ -987,7 +1096,7 @@ mod tests {
                 unresolved: 1,
                 rejected: 0
             });
-            Err::<(), &str>("refused")
+            Err::<(), ExecError>(ExecError::OrderRejected("refused".to_string()))
         };
         let submit = ledger.submit("c1", |_| true, request);
         // Futures are lazy: built but never polled, nothing was sent.
@@ -999,7 +1108,11 @@ mod tests {
     #[tokio::test]
     async fn dropped_submit_stays_unresolved_even_after_a_rejected_retry() {
         let ledger = SubmitAttemptLedger::new(8);
-        let stuck = ledger.submit("c1", |_: &()| true, std::future::pending::<Result<(), ()>>());
+        let stuck = ledger.submit(
+            "c1",
+            |_: &ExecError| true,
+            std::future::pending::<Result<(), ExecError>>(),
+        );
         // One poll sends the request; the elapsed timeout then drops the future.
         assert!(tokio::time::timeout(Duration::from_millis(1), stuck).await.is_err());
         assert_eq!(ledger.evidence("c1"), AttemptEvidence::Unresolved {
@@ -1008,7 +1121,7 @@ mod tests {
         });
         assert!(is_unknown(&ledger, "c1"));
 
-        let retry = ledger.submit("c1", |_| true, async { Err::<(), ()>(()) });
+        let retry = ledger.submit("c1", |_| true, async { Err::<(), _>(refused()) });
         assert!(retry.await.is_err());
         assert_eq!(ledger.evidence("c1"), AttemptEvidence::Unresolved {
             unresolved: 1,
@@ -1020,9 +1133,9 @@ mod tests {
     #[tokio::test]
     async fn submit_leaves_outcomes_outside_the_allow_list_unresolved() {
         let ledger = SubmitAttemptLedger::new(8);
-        let accepted = ledger.submit("ok", |_: &()| true, async { Ok::<(), ()>(()) });
+        let accepted = ledger.submit("ok", |_: &ExecError| true, async { Ok::<(), _>(()) });
         accepted.await.unwrap();
-        let failed = ledger.submit("failed", |_| false, async { Err::<(), ()>(()) });
+        let failed = ledger.submit("failed", |_| false, async { Err::<(), _>(refused()) });
         assert!(failed.await.is_err());
         for id in ["ok", "failed"] {
             assert_eq!(ledger.evidence(id), AttemptEvidence::Unresolved {

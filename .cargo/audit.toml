@@ -7,5 +7,6 @@ ignore = [
   "RUSTSEC-2024-0437", # protobuf 2.x: fix is semver-major, blocked on prometheus. /metrics is cluster-internal. 2026-07-05
   "RUSTSEC-2026-0235", # rkyv 0.7: fix is 0.8 semver-major, blocked on rust_decimal optional edge; never compiled (feature unenabled). 2026-08-04
   "RUSTSEC-2026-0387", # crypto-bigint 0.5: fix is 0.7.6 semver-major, blocked on jsonwebtoken's p256/elliptic-curve 0.13 edge; ES256 path never used (RS256 only, no private keys). 2026-10-28
+  "RUSTSEC-2026-0459", # libsqlite3-sys 0.30 (SQLite WAL uninit memory): fix 0.39 accepted by no sqlx release (0.8.0 ^0.28, 0.8.1–0.8.6 ^0.30.1, 0.9.0 <0.38); via optional sqlx-sqlite, never compiled (postgres only). Re-evaluate when sqlx accepts >= 0.39 or any path compiles SQLite (see osv-scanner.toml). 2026-11-09
   # GHSA-qwgh-2vcv-g2f7 (block-buffer 0.10) has no RUSTSEC id yet; documented in osv-scanner.toml only. 2026-10-28
 ]

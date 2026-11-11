@@ -9,7 +9,7 @@ use robson_domain::{Candle, OrderSide, Price, Quantity, Side, Symbol, SymbolTrad
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::error::ExecError;
+use crate::{error::ExecError, venue::OrderLookup};
 
 // =============================================================================
 // Exchange Port
@@ -145,6 +145,31 @@ pub trait ExchangePort: Send + Sync {
     /// preview may never delay or degrade a real close. Default: the normal
     /// lookup, for adapters without a shared cache.
     async fn trading_rules_preview(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules(symbol).await
+    }
+
+    /// Rules for admission (ADR-0056 §5): validated within the TTL or
+    /// refreshed now, never a stale snapshot. An error fails admission closed.
+    async fn trading_rules_fresh(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules(symbol).await
+    }
+
+    /// The last validated rules of any age, for risk reduction: no venue
+    /// request and no wait on a refresh in flight.
+    fn last_validated_rules(&self, _symbol: &Symbol) -> Option<SymbolTradingRules> {
+        None
+    }
+
+    /// Whether the last validated rules are missing or past their TTL.
+    fn rules_refresh_due(&self, _symbol: &Symbol) -> bool {
+        false
+    }
+
+    /// Re-read the rules after a rules rejection (ADR-0056 §5 and §10).
+    async fn refresh_trading_rules(
         &self,
         symbol: &Symbol,
     ) -> Result<SymbolTradingRules, ExecError> {
@@ -363,15 +388,25 @@ pub trait ExchangePort: Send + Sync {
     ) -> Result<Vec<UserTradeRecord>, ExecError>;
 }
 
-/// Result of cancelling a reduce-only protective stop (ADR-0039).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of cancelling a reduce-only protective stop (ADR-0039). Mirrors
+/// [`crate::venue::StopCancelOutcome`] variant for variant, payload included;
+/// callers read it through [`crate::cancel::classify_cancel`] (ADR-0056 step
+/// 7).
+#[derive(Debug, Clone)]
 pub enum StopCancelOutcome {
-    /// The exchange acknowledged the cancel; the stop never executed.
-    Cancelled,
+    /// The exchange acknowledged the cancel. `filled_before_cancel` is the
+    /// stop's cumulative execution at cancel time (zero for a conditional
+    /// stop that never triggered).
+    Cancelled {
+        filled_before_cancel: Decimal,
+        fills: Option<OrderResult>,
+    },
     /// The exchange no longer knows the order. It was most likely triggered
     /// and filled, so callers must preserve the stop id as reconciliation
     /// evidence instead of recording a cancellation.
-    AlreadyGone,
+    AlreadyGone { final_state: OrderLookup },
+    /// The cancel's outcome could not be established.
+    Indeterminate,
 }
 
 /// USD-M Futures account settings for a symbol.

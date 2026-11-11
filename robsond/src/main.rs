@@ -36,7 +36,9 @@ mod db;
 #[cfg(feature = "postgres")]
 use std::sync::Arc;
 
-use robsond::{exit_code_for_daemon_error, Config, Daemon, DaemonResult, VenueFactory};
+use robsond::{
+    exit_code_for_daemon_error, stop::StopRequest, Config, Daemon, DaemonResult, VenueFactory,
+};
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -61,18 +63,41 @@ fn map_daemon_result(result: DaemonResult<()>) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "crash-points")]
+    arm_crash_harness();
+
+    // SIGTERM and SIGINT ask for the stop from here on, before configuration
+    // and the database connection (ADR-0056 step 7): as PID 1 the process sees
+    // SIGTERM only once a handler is installed. The `db` commands keep the
+    // default handling.
+    let stop = StopRequest::default();
+    let _signals = if runs_the_daemon() {
+        Some(robsond::stop::listen_for_signals(&stop).map_err(anyhow::Error::msg)?)
+    } else {
+        None
+    };
+
     // 8 MiB worker stacks (default 2 MiB): robsond aborted twice in
     // production (2026-06-30, 2026-07-02) with tokio-runtime-worker stack
     // overflows that leave no backtrace. Larger stacks close that crash
     // class while the offending path is still being hunted.
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(8 * 1024 * 1024)
-        .build()?
-        .block_on(async_main())
+        .build()?;
+    let result = runtime.block_on(async_main(stop));
+    // Teardown never outlasts the stop's deadline (ADR-0056 step 7): a task or
+    // a worker thread still running then is abandoned, not waited for.
+    runtime.shutdown_timeout(robsond::stop::teardown_bound());
+    result
 }
 
-async fn async_main() -> anyhow::Result<()> {
+/// Whether this run is the daemon rather than a `db` command.
+fn runs_the_daemon() -> bool {
+    !(cfg!(feature = "postgres") && std::env::args().nth(1).as_deref() == Some("db"))
+}
+
+async fn async_main(stop: StopRequest) -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(fmt::layer())
@@ -114,47 +139,20 @@ async fn async_main() -> anyhow::Result<()> {
         {
             info!(%tenant_id, "PostgreSQL configured, creating shared connection pool");
 
-            // Retry initial DB connect with exponential backoff so that transient DNS
-            // failures during pod startup do not cause an immediate exitCode=1.
-            // Kubernetes restarts are a last resort, not the normal retry mechanism.
-            // Cap: ~2 minutes total (1+2+4+8+16+32+60 = 123 s across 7 attempts).
-            let pool = {
-                const MAX_ATTEMPTS: u32 = 7;
-                const MAX_BACKOFF_SECS: u64 = 60;
-                let mut backoff_secs: u64 = 1;
-                let mut attempt: u32 = 0;
-                loop {
-                    attempt += 1;
-                    match sqlx::PgPool::connect(database_url).await {
-                        Ok(p) => {
-                            if attempt > 1 {
-                                info!(attempt, "PostgreSQL connection established after retry");
-                            }
-                            break p;
-                        },
-                        Err(e) if attempt >= MAX_ATTEMPTS => {
-                            tracing::error!(
-                                attempt,
-                                error = %e,
-                                "PostgreSQL connection failed after retries"
-                            );
-                            return Err(e.into());
-                        },
-                        Err(e) => {
-                            tracing::warn!(
-                                attempt,
-                                retry_in_secs = backoff_secs,
-                                error = %e,
-                                "PostgreSQL connection failed, retrying"
-                            );
-                            tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs))
-                                .await;
-                            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-                        },
-                    }
-                }
+            // A stop asked for while connecting ends the start here, with
+            // nothing sent, whether or not the database comes back.
+            let pool = tokio::select! {
+                biased;
+                _ = stop.asked() => {
+                    tracing::warn!(
+                        cause = stop.cause(),
+                        "Stop requested before the start completed: nothing started, no marker \
+                         written"
+                    );
+                    return Ok(());
+                },
+                connected = connect_database(database_url) => connected?,
             };
-            db::verify_adr0052_schema_readiness(&pool).await?;
             let pool = Arc::new(pool);
 
             // Create projection recovery adapter (uses same pool)
@@ -175,15 +173,63 @@ async fn async_main() -> anyhow::Result<()> {
             pg_pool,
         )
         .with_funding_recovery_route(parts.funding_recovery);
-        map_daemon_result(daemon.run().await)?;
+        map_daemon_result(daemon.run_until(stop).await)?;
     }
 
     #[cfg(not(feature = "postgres"))]
     {
         let daemon = Daemon::with_venue(config, parts.venue, parts.market_data, parts.ohlcv)
             .with_funding_recovery_route(parts.funding_recovery);
-        map_daemon_result(daemon.run().await)?;
+        map_daemon_result(daemon.run_until(stop).await)?;
     }
 
     Ok(())
+}
+
+/// Connect to PostgreSQL and check the schema is ready. The first connection
+/// is retried with exponential backoff so that transient DNS failures during
+/// pod startup do not cause an immediate exitCode=1; Kubernetes restarts are a
+/// last resort, not the normal retry mechanism. Cap: about 2 minutes in all
+/// (1+2+4+8+16+32+60 = 123 s across 7 attempts).
+#[cfg(feature = "postgres")]
+async fn connect_database(database_url: &str) -> anyhow::Result<sqlx::PgPool> {
+    const MAX_ATTEMPTS: u32 = 7;
+    const MAX_BACKOFF_SECS: u64 = 60;
+    let mut backoff_secs: u64 = 1;
+    let mut attempt: u32 = 0;
+    let pool = loop {
+        attempt += 1;
+        match sqlx::PgPool::connect(database_url).await {
+            Ok(p) => {
+                if attempt > 1 {
+                    info!(attempt, "PostgreSQL connection established after retry");
+                }
+                break p;
+            },
+            Err(e) if attempt >= MAX_ATTEMPTS => {
+                tracing::error!(attempt, error = %e, "PostgreSQL connection failed after retries");
+                return Err(e.into());
+            },
+            Err(e) => {
+                tracing::warn!(
+                    attempt,
+                    retry_in_secs = backoff_secs,
+                    error = %e,
+                    "PostgreSQL connection failed, retrying"
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+            },
+        }
+    };
+    db::verify_adr0052_schema_readiness(&pool).await?;
+    Ok(pool)
+}
+
+/// `.env` first, as `Config::from_env` loads it: a production marker that only
+/// exists there must be refused before any connection is built.
+#[cfg(feature = "crash-points")]
+fn arm_crash_harness() {
+    let _ = dotenvy::dotenv();
+    robson_exec::crash_points::arm_from_env();
 }

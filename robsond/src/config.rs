@@ -101,6 +101,10 @@ impl Default for FundingConfig {
     }
 }
 
+/// Stream namespaces the position manager writes and applies itself; the
+/// projection worker may not poll them.
+pub const MANAGED_STREAM_NAMESPACES: [&str; 2] = ["position:", "system:"];
+
 /// Projection configuration.
 #[derive(Debug, Clone)]
 pub struct ProjectionConfig {
@@ -693,6 +697,7 @@ impl Config {
 
         let stream_key =
             env::var("PROJECTION_STREAM_KEY").unwrap_or_else(|_| "robson:daemon".to_string());
+        Self::refuse_a_managed_stream_namespace(&stream_key)?;
 
         let poll_interval_str =
             env::var("PROJECTION_POLL_INTERVAL_MS").unwrap_or_else(|_| "100".to_string());
@@ -709,6 +714,21 @@ impl Config {
             stream_key,
             poll_interval_ms,
         })
+    }
+
+    /// The projection worker applies the stream it polls with no stream lock,
+    /// so it must never poll one the position manager writes (ADR-0056 step 7):
+    /// `position:` and `system:` are applied, serialized and suspended there.
+    fn refuse_a_managed_stream_namespace(stream_key: &str) -> DaemonResult<()> {
+        for namespace in MANAGED_STREAM_NAMESPACES {
+            if stream_key.starts_with(namespace) {
+                return Err(DaemonError::Config(format!(
+                    "PROJECTION_STREAM_KEY {stream_key} is in the {namespace} namespace, which the \
+                     daemon writes and applies itself; refusing to start"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn load_market_data_config() -> DaemonResult<MarketDataConfig> {
@@ -1222,6 +1242,38 @@ mod tests {
         assert!(!rendered.contains("do-not-log-secret"));
         assert!(rendered.contains("api_key_configured: true"));
         assert!(rendered.contains("api_secret_configured: true"));
+    }
+
+    /// ADR-0056 step 7: the worker never polls a stream the manager applies.
+    #[test]
+    fn test_projection_stream_key_refuses_a_managed_namespace() {
+        let _lock = env_lock().lock().unwrap();
+        for (key, refused) in [
+            ("position:01a1c6b7-3a98-738c-b45e-c504a90376f8", true),
+            ("system:month_boundary:2026-11", true),
+            ("system:", true),
+            ("robson:daemon", false),
+            ("funding:saga", false),
+        ] {
+            let _env = EnvGuard::new(&[
+                ("DATABASE_URL", None),
+                ("PROJECTION_TENANT_ID", None),
+                ("PROJECTION_STREAM_KEY", Some(key)),
+            ]);
+            match Config::load_projection_config() {
+                Err(DaemonError::Config(message)) if refused => {
+                    assert!(message.contains("PROJECTION_STREAM_KEY"), "{message}");
+                },
+                Ok(config) if !refused => assert_eq!(config.stream_key, key),
+                other => panic!("{key}: {other:?}"),
+            }
+        }
+        let _env = EnvGuard::new(&[
+            ("DATABASE_URL", None),
+            ("PROJECTION_TENANT_ID", None),
+            ("PROJECTION_STREAM_KEY", None),
+        ]);
+        assert_eq!(Config::load_projection_config().unwrap().stream_key, "robson:daemon");
     }
 
     #[test]
