@@ -227,8 +227,8 @@ pub static QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK: LazyLock<Counter> = LazyLock::
 
 /// Event-log streams that refuse appends, by `kind` (`position`, `system`):
 /// suspended in this process, or loaded at start and not repaired (ADR-0056
-/// step 7, PR P). A suspended system stream of the current month keeps
-/// admissions closed.
+/// step 7, PR P). A suspended system stream makes its month's accounting
+/// invalid, current or history (PR F).
 pub static STREAMS_SUSPENDED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "robsond_streams_suspended",

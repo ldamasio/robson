@@ -13,8 +13,9 @@
 //! suspension is recorded durably through the journal's retry set, which sets
 //! the latch, and is loaded back at the next start. A position stream is then
 //! repaired ([`repair_position_stream`]); a system stream stays suspended until
-//! step 8, and while its month is the current one admissions stay closed (the
-//! fence PR replaces that rule with its accounting contract and release).
+//! step 8, and its month's accounting is invalid, whether that month is current
+//! or history and whatever a release does (design §2.5): the invalid-basis path
+//! reads [`EventStreams::month_suspended`], held here, so it adds no query.
 //!
 //! Lock order (design §2.10): the manager lock, a stream's lock, the gate
 //! mutex, the journal's memory mutex. The two registries here are sync leaves
@@ -28,7 +29,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use robson_domain::PositionId;
 use robson_exec::order_journal::StreamSuspensionRow;
 use tokio::sync::OwnedMutexGuard;
@@ -228,17 +229,12 @@ impl EventStreams {
             .any(|entry| entry.stream == ManagedStream::Position(position_id))
     }
 
-    /// Whether the system stream of this month is suspended.
+    /// Whether the system stream of this month is suspended: one loaded at
+    /// start, which nothing clears before step 8, or one suspended since.
     pub(crate) fn month_suspended(&self, year: i32, month: u32) -> bool {
         self.suspended_table()
             .values()
             .any(|entry| entry.stream == ManagedStream::Month { year, month })
-    }
-
-    /// Whether the current UTC month's system stream is suspended.
-    pub(crate) fn current_month_suspended(&self) -> Option<(i32, u32)> {
-        let now = Utc::now();
-        self.month_suspended(now.year(), now.month()).then(|| (now.year(), now.month()))
     }
 
     /// The suspended position streams, in key order.

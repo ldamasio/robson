@@ -960,7 +960,8 @@ Production uses `robson:daemon`, the default.
 - **A suspended system stream of the current month keeps admissions closed after a restart**, through the same admission checks.
   This is P's stopgap for the window before the fence PR, which replaces it with the exact accounting-invalid contract and its
   release. In P there is no release, so admissions stay closed while that month is current, until the fence PR ships. P does not
-  suppress automatic MonthlyHalt on that month and does not mark its month view invalid; both are the fence PR's. Legs open
+  suppress automatic MonthlyHalt on that month and does not mark its month view invalid; both are the fence PR's. (Replaced by
+  the fence PR's part 1, below: the check moved to the invalid-basis path.) Legs open
   before the restart stay managed. "No suspended system stream" is therefore a deploy check. **It replaces a self-heal:** today a
   month reset whose write failed is retried by the next boundary poll, within 60 s, and that retry appends a fresh reset (or, if
   deduplicated, applies the landed one again) and heals the month. From P the stream is suspended, the retry is refused on every
@@ -1014,6 +1015,30 @@ the wallet read keeps failing. `robsond_month_boundary_pending` reports a failed
 This extends the #300 invalid-basis path for a missing reset ahead of the fence PR; F's accounting-invalid contract for
 suspended system streams builds on the same flag. F's suspended-stream contract, its month view for history and its
 release are not part of this. No migration.
+
+*Fence (PR F).* Incidents, the generation, the memory-first fence, `marker_version 2`, audited release, the pending list, the
+orphan-cancel veto, and accounting invalid for suspended streams, in parts, each deployable alone in this order.
+
+*Part 1, accounting invalid for a suspended system stream.* Design §2.5's contract, on #300's invalid-basis path and #320's
+sites, replacing P's stopgap: `basis_invalid = capital_base <= 0 OR the month has no landed reset OR the requested month's system
+stream is suspended`. The suspension is the one held in memory by the stream registry, loaded at start from `stream_suspensions` and
+updated under the stream's lock, so the check adds no query; `load_monthly_state` reads it for the month it is asked about. So
+while the current month's system stream is suspended: the canonical snapshot sets `capital_base_invalid`, with no remaining
+capacity and no slots; automatic budget-based MonthlyHalt is not evaluated, whatever the realized losses (reached from an exit
+fill, `reconcile_close` and the late re-read in `budget_basis_is_invalid_now`); a signal and an approval reach the gate with no
+capital and are denied, never as an exhausted budget; an arm and an entry preview answer `AdmissionsClosed` (503); `/status`
+reports the basis invalid. The month view reports `capacity_invalid`, zero new-entry cells, for any month whose stream is
+suspended, the current one and **history** alike: a later month does not make it right, and no release clears it. The latch is
+untouched by this: it closes admissions for its own reasons. Protection, reductions, recovery and `POST /monthly-halt` are
+unchanged, as for #300. A system stream stays suspended until step 8's replay-safe repair, so each of these holds until then.
+
+What part 1 changes in production: P's stopgap refused an arm, a signal and an approval through `check_admissions_open` while the
+current month's stream was suspended; from part 1 the arm and the preview answer the same 503 from the basis, and a signal or an
+approval is a governed denial from the gate with no capital, re-armed under the backoff, where it was an `admissions_closed`
+refusal. Automatic MonthlyHalt on that month no longer runs against its untrusted base, and that month's view reports no capacity,
+then and later. With no stream suspended nothing changes; `stream_suspensions` holds no open row in production today. Rollback:
+the image before it, which keeps migrations 31 to 33, restores P's stopgap and its unsuppressed MonthlyHalt; no condition beyond
+P's (boundary B, no open suspension) is added.
 
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze
