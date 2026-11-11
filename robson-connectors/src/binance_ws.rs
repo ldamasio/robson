@@ -111,7 +111,10 @@ impl BinanceWebSocketClient {
         Self { base_url, testnet: false }
     }
 
-    fn symbol_stream_url(&self, symbol: &str, stream: &str) -> String {
+    /// The raw-stream URL a symbol subscription opens:
+    /// `<base>/ws/<symbol>@<stream>`, symbol lowercased (crate-visible for
+    /// the spot feed's URL test, ADR-0056 step 8b).
+    pub(crate) fn symbol_stream_url(&self, symbol: &str, stream: &str) -> String {
         format!("{}/ws/{}@{}", self.base_url, symbol.to_lowercase(), stream)
     }
 

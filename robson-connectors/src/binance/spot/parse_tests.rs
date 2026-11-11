@@ -424,7 +424,8 @@ fn a_trade_parses_as_documented() {
     }]);
 }
 
-/// Every fixture says where it came from and when it was read.
+/// Every fixture says where it came from and when it was read: 8a's on
+/// 2026-11-10, 8b's on 2026-11-11.
 #[test]
 fn every_fixture_states_its_source_and_access_date() {
     let sources = value(SOURCES);
@@ -448,7 +449,8 @@ fn every_fixture_states_its_source_and_access_date() {
             ) || url == "https://api.binance.com/api/v3/exchangeInfo?symbol=BTCUSDT",
             "{name}: {url}"
         );
-        assert_eq!(source["accessed"], "2026-11-10", "{name}");
+        let accessed = source["accessed"].as_str().unwrap();
+        assert!(["2026-11-10", "2026-11-11"].contains(&accessed), "{name}: {accessed}");
         assert!(!source["how"].as_str().unwrap().is_empty(), "{name}");
     }
 }
