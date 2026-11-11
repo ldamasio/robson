@@ -676,6 +676,78 @@ mod tests {
         assert_eq!((report.result, report.marker), (StopResult::Clean, MarkerWrite::Written));
     }
 
+    /// The marker of a stop: it checks, as it is written, that nothing on
+    /// record is open.
+    struct RecordChecked {
+        backend: Arc<StubJournalBackend>,
+        open_at_marker: Mutex<Option<bool>>,
+    }
+
+    #[async_trait]
+    impl StopMarker for RecordChecked {
+        async fn mark_clean(&self) -> Result<(), String> {
+            let open = self.backend.incidents().iter().any(|row| row.released_by.is_none());
+            *self.open_at_marker.lock().unwrap() = Some(open);
+            Ok(())
+        }
+    }
+
+    /// Review round 1: an incident upsert delayed in the retry loop, a
+    /// release, then a stop. The stop's final flush waits for the delayed
+    /// upsert instead of writing it again, the release answers `persisting`
+    /// until it has landed, and when the marker is written nothing on record
+    /// is open.
+    #[tokio::test]
+    async fn a_delayed_incident_write_then_a_release_leave_nothing_open_at_the_marker() {
+        use robson_exec::{
+            gate::IncidentReason,
+            order_journal::{ReleaseRecord, ReleaseRefusal},
+        };
+
+        let release = |journal: &OrderJournal| ReleaseRecord {
+            decision_id: uuid::Uuid::now_v7(),
+            generation: journal.gate().generation(),
+            actor: "operator".to_string(),
+            auth_kind: "verified",
+            note: "reviewed".to_string(),
+            treatment: "unbooked_accepted",
+            decided_at: chrono::Utc::now(),
+        };
+        let (backend, journal) = stub_journal();
+        journal.gate().record(IncidentReason::UncleanStart);
+        let held = backend.hold_next_incident_write();
+        let retry_loop = {
+            let journal = Arc::clone(&journal);
+            tokio::spawn(async move { journal.flush_pending().await })
+        };
+        while backend.incident_write_attempts() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let stop_flush = {
+            let journal = Arc::clone(&journal);
+            tokio::spawn(async move { journal.flush_pending().await })
+        };
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let early = journal.release(release(&journal)).await;
+        assert!(matches!(early, Err(ReleaseRefusal::Persisting { .. })), "{early:?}");
+        held.notify_one();
+        retry_loop.await.unwrap();
+        stop_flush.await.unwrap();
+        assert!(journal.release(release(&journal)).await.unwrap().fence_open);
+
+        let marker = RecordChecked {
+            backend: Arc::clone(&backend),
+            open_at_marker: Mutex::new(None),
+        };
+        let report =
+            run_stop(&journal, Instant::now(), || {}, Some(&marker), StopTimings::default()).await;
+        assert_eq!((report.result, report.marker), (StopResult::Clean, MarkerWrite::Written));
+        assert_eq!(*marker.open_at_marker.lock().unwrap(), Some(false));
+        assert_eq!(backend.incident_write_attempts(), 1);
+    }
+
     fn journal_with_latch() -> (Arc<StubJournalBackend>, Arc<OrderJournal>) {
         let (backend, journal) = stub_journal();
         journal.gate().mutation("POST /fapi/v1/order").unwrap();

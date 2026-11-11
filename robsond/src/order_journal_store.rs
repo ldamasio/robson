@@ -297,7 +297,13 @@ impl JournalBackend for PgJournalBackend {
     /// checked at the commit.
     async fn release(&self, release: &ReleaseRecord) -> Result<ReleaseCounts, String> {
         let error = |e: sqlx::Error| e.to_string();
-        let mut tx = self.daemon_pool.begin().await.map_err(error)?;
+        // A connection whose release did not finish (the caller's bound
+        // dropped it, or an error cut it) is closed, not handed back: returned
+        // to the pool it would wait on a ping with no deadline, holding a
+        // daemon-pool slot (J's rule for the journal's own pool).
+        let connection = self.daemon_pool.acquire().await.map_err(error)?;
+        let mut held = RetiringConnection { connection, finished: false };
+        let mut tx = held.connection.begin().await.map_err(error)?;
         // A row with no `uncertain_at` is never tombstoned, nor one with an
         // outcome, proven unsent, or already disposed of.
         let tombstoned = sqlx::query(
@@ -367,6 +373,7 @@ impl JournalBackend for PgJournalBackend {
         .await
         .map_err(error)?;
         tx.commit().await.map_err(error)?;
+        held.finished = true;
         Ok(ReleaseCounts {
             intents_tombstoned: tombstoned,
             incidents_released: released,

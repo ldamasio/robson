@@ -419,3 +419,149 @@ async fn a_release_is_one_simple_query_commit(pool: PgPool) {
     assert_eq!(counts.intents_tombstoned, 1);
     assert_eq!(proxy.stats().commits, 1);
 }
+
+// ---- Review round 1: a release's connection, and a retry at the same
+// generation
+
+use std::{sync::Arc, time::Duration};
+
+use robson_exec::{
+    order_journal::{OrderJournal, ReleaseRefusal},
+    venue::VenueId,
+};
+use robson_testkit::db_proxy::ProxyMode;
+
+/// A daemon pool of one connection through a proxy, with a short acquire
+/// bound, and a journal on it whose release waits at most `release_bound`.
+async fn proxied_journal(
+    pool: &PgPool,
+    tenant: Uuid,
+    release_bound: Duration,
+) -> (DbProxy, PgPool, Arc<OrderJournal>) {
+    let options = pool.connect_options();
+    let upstream = tokio::net::lookup_host((options.get_host(), options.get_port()))
+        .await
+        .unwrap()
+        .next()
+        .unwrap();
+    let proxy = DbProxy::start(upstream).await.unwrap();
+    let database = options.get_database().expect("sqlx::test names its database");
+    let url = database_url_through(&std::env::var("DATABASE_URL").unwrap(), proxy.addr(), database)
+        .unwrap();
+    let daemon_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(1))
+        .connect(&url)
+        .await
+        .unwrap();
+    let journal = Arc::new(
+        OrderJournal::new(
+            Arc::new(PgJournalBackend::new(&daemon_pool, tenant)),
+            &VenueId::new("test:venue"),
+        )
+        .with_release_bound(release_bound),
+    );
+    (proxy, daemon_pool, journal)
+}
+
+fn release_now(journal: &OrderJournal) -> ReleaseRecord {
+    ReleaseRecord {
+        decision_id: Uuid::now_v7(),
+        generation: journal.gate().generation(),
+        actor: "operator@example.test".to_string(),
+        auth_kind: "verified",
+        note: "reviewed".to_string(),
+        treatment: "unbooked_accepted",
+        decided_at: Utc::now(),
+    }
+}
+
+/// A release whose connection goes silent mid-transaction times out at its
+/// bound, and its connection is closed, not returned: the daemon's
+/// one-connection pool serves again once the network does, and a retry at the
+/// same generation releases and opens the fence. Returned to the pool, that
+/// connection would wait for answers the network swallowed, holding the only
+/// slot. The release's decision insert is slowed on the server so the network
+/// can go silent while the transaction is open.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_release_that_timed_out_frees_its_connection_for_the_retry(pool: PgPool) {
+    let tenant = Uuid::now_v7();
+    let (proxy, daemon_pool, journal) =
+        proxied_journal(&pool, tenant, Duration::from_millis(1500)).await;
+    journal.gate().record(IncidentReason::UncleanStart);
+    assert_eq!(journal.flush_pending().await, 1);
+    sqlx::query(
+        "CREATE FUNCTION slow_decision() RETURNS trigger AS $$
+         BEGIN PERFORM pg_sleep(1); RETURN NEW; END $$ LANGUAGE plpgsql",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER slow_decision BEFORE INSERT ON journal_decisions
+         FOR EACH ROW EXECUTE FUNCTION slow_decision()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let silenced = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        proxy.set_mode(ProxyMode::Blackhole);
+    };
+    let (silent, ()) = tokio::join!(journal.release(release_now(&journal)), silenced);
+    assert!(matches!(silent, Err(ReleaseRefusal::Backend(_))), "{silent:?}");
+    assert!(journal.gate().fenced());
+    // Closed, the connection ends the server's transaction and frees its lock
+    // on journal_decisions. Returned to the pool, it would keep that
+    // transaction open on the server for good, and this would wait forever:
+    // bounded, so a regression fails here instead of hanging.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        sqlx::query("DROP TRIGGER slow_decision ON journal_decisions").execute(&pool),
+    )
+    .await
+    .expect("the silenced release's transaction still holds its lock on the server")
+    .unwrap();
+    proxy.set_mode(ProxyMode::Pass);
+
+    let retried = journal.release(release_now(&journal)).await.unwrap();
+    assert!(retried.fence_open);
+    assert_eq!(retried.counts.incidents_released, 1, "the first never committed");
+    sqlx::query("SELECT 1").execute(&daemon_pool).await.expect("the pool serves");
+    assert!(open_incidents(&pool, tenant).await.is_empty());
+}
+
+/// A release whose commit landed and whose acknowledgement was lost answers
+/// that it did not complete and leaves the fence closed. The retry at the same
+/// generation finds nothing more to release, records its decision, and opens
+/// the fence; the incident was released once, by the first.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_release_whose_ack_was_lost_is_retried_at_the_same_generation(pool: PgPool) {
+    let tenant = Uuid::now_v7();
+    let (proxy, _daemon_pool, journal) =
+        proxied_journal(&pool, tenant, Duration::from_millis(500)).await;
+    journal.gate().record(IncidentReason::UncleanStart);
+    assert_eq!(journal.flush_pending().await, 1);
+    let generation = journal.gate().generation();
+
+    proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE recovery_incidents"));
+    let lost = journal.release(release_now(&journal)).await;
+    assert!(matches!(lost, Err(ReleaseRefusal::Backend(_))), "{lost:?}");
+    assert_eq!(proxy.stats().commit_acks_dropped, 1);
+    assert!(journal.gate().fenced(), "unknown: the fence stays closed");
+    assert!(open_incidents(&pool, tenant).await.is_empty(), "it had committed");
+
+    let retried = journal.release(release_now(&journal)).await.unwrap();
+    assert_eq!(retried.generation, generation);
+    assert!(retried.fence_open);
+    assert_eq!(retried.counts.incidents_released, 0, "released once, by the first");
+    let decisions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM journal_decisions WHERE kind = 'release'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(decisions, 2);
+}

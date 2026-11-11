@@ -1041,15 +1041,22 @@ the image before it, which keeps migrations 31 to 33, restores P's stopgap and i
 P's (boundary B, no open suspension) is added.
 
 *Part 2, incidents, the generation, the memory-first fence, `marker_version 2` and the audited release.* `robson_exec::gate`
-holds the fence, the generation and the open incidents; the journal records into them; `recovery_incidents` is migration 34.
+holds the fence, the generation and the open incidents; the journal records into them; `recovery_incidents` is migration 34,
+and the index on the intents a release tombstones migration 35.
+
+**What the fence covers: journaled intents.** An occurrence comes from the journal and the gate: every order, protective stop,
+cancel and sweep close the journal records (§2.1), and the gate's own sources. Funding conversions and transfers are not
+journaled (§2.1, as approved for J) and stay outside: a funding transfer whose request times out ends its operation as before,
+with no incident, and neither kind is ever evidence a release relies on.
 
 - **Occurrences.** Whatever the daemon cannot explain is an occurrence, recorded in one critical section under the gate's mutex
   at the moment it is known and before any await: the latch first for a latch-class reason, then the fence closes, the
   generation moves, and the incident of its reason is opened or counted, its upsert waiting in `persistence_pending`. Protection
   never waits for that write. Where the journal records one it takes the gate's mutex before its own memory, the order of §2.10.
-  The reasons and their sources: `uncertain_outcome`, every intent whose outcome is uncertain (a timeout, a transport error, a
-  strict commit that is itself uncertain, every uncertain cancel class, an operation dropped mid-send), stamped in the same
-  section with `uncertain_generation` and `uncertain_at`; `unlanded_send`, a bounded send whose row did not land, recorded before
+  The reasons and their sources: `uncertain_outcome`, every journaled intent whose outcome is uncertain (a timeout, a transport
+  error, a strict commit that is itself uncertain, every uncertain cancel class, an operation dropped mid-send, and the original
+  of a refused retry, registered as its fresh-id replacement starts, before the replacement's commit or answer is awaited),
+  stamped in the same section with `uncertain_generation` and `uncertain_at`; `unlanded_send`, a bounded send whose row did not land, recorded before
   its request leaves; `persistence_failure`, history discarded on a full retry set or a row conflicting on retry;
   `stream_suspended`; `operation_aborted`; `unpermitted_mutation`; `unclean_start`; `generation_exhausted`. All but
   `unclean_start` and `uncertain_outcome` set the latch, as P's latch sources already did.
@@ -1059,7 +1066,9 @@ holds the fence, the generation and the open incidents; the journal records into
 - **Incidents.** One open row per reason and tenant (partial unique index), with first and last time, count and first and last
   generation; released with the decision that released it. An upsert only grows the open row's values, so a replay, a late older
   snapshot or a reordering converge, and against a released row it opens a new one. The retry loop writes incident upserts first
-  in each pass, then suspensions, then intents, each part stopping at its own first failure. At most one upsert per reason
+  in each pass, then suspensions, then intents, each part stopping at its own first failure. **Passes never overlap:** the retry
+  loop and the stop's final flush take one async lock for a whole pass, so no snapshot of an incident is written twice, and an
+  upsert delayed in one pass cannot land after another pass landed it and a release removed it. At most one upsert per reason
   waits, beside the 1,024 rows and suspensions and not counted against them (eight at most), so an incident is never the entry a
   full set drops; `robsond_journal_retry_set_depth` counts them.
 - **The fence.** Closed by any occurrence; checked at the three admission sites, beside the latch (an arm and an approval answer
@@ -1073,8 +1082,9 @@ holds the fence, the generation and the open incidents; the journal records into
   `unclean_start`; and it reads every incident no release covered. The daemon seeds the gate from that, and any open incident
   closes the fence. An open incident of a reason this binary does not know refuses the start.
 - **The marker.** A clean stop writes `marker_version = 2`, and only with the fence open and no incident open, besides S's
-  conditions (`incident_open` otherwise). A quiescent epoch whose incidents were released marks clean; one that ever latched
-  cannot.
+  conditions (`incident_open` otherwise). The marker's own statement also refuses while any incident of the tenant is open on
+  record (`marker_failed`, unconfirmed), so memory and the record must agree. A quiescent epoch whose incidents were released
+  marks clean; one that ever latched cannot.
 - **Release.** `POST /recovery/release` with `{generation, note, treatment}`, `treatment` the accounting treatment of what remains
   (`unbooked_accepted` in the core); authenticated, a verified identity recorded `verified` and the legacy token `asserted`. It
   answers 401 without an identity and 400 without a note or a treatment; 409 `latched` while the latch is set; 409 `stale`, with
@@ -1086,13 +1096,24 @@ holds the fence, the generation and the open incidents; the journal records into
   generation and both counts in its payload). Then, under the gate's mutex, the fence opens only if the generation is still the
   quoted one and the latch clear; otherwise the newer incident stays open and the answer says `fence_open: false`. A transaction
   that fails, or does not answer within 10 s, answers 503 and leaves the fence closed: it may have committed, and a retry quoting
-  the same generation then finds nothing more to do and opens it. No slot, no manager lock. **Release is risk acceptance, never
+  the same generation then finds nothing more to do and opens it. Its connection, from the daemon's pool, is closed rather than
+  returned when the transaction did not finish, J's rule for the journal's pool: returned, it would wait on a ping with no
+  deadline and hold a slot of the daemon's pool, so retries would starve. No slot, no manager lock. **Release is risk acceptance, never
   finality:** it sets no venue outcome and books nothing. A tombstone satisfies boundary B as a disposition does.
 - **Volume.** Repeated uncertain cancels, one intent per exit attempt while a failure lasts, are each stamped, each one entry of
   the retry set until it lands, and all counted on the one open `uncertain_outcome` incident; one release tombstones all of them
   in one statement, and the release refuses until each stamp has landed. With the database down they fill the retry set, and
   its overflow is a `persistence_failure`, which latches. A disposition through `/recovery/disposition` stays per intent and is
   not needed for what a release covers.
+- **Migrations.** 34 adds `recovery_incidents` and lets `journal_decisions` record a release, in one transaction. 35 builds
+  `idx_order_intents_uncertain_open` with `CREATE INDEX CONCURRENTLY`, outside any transaction (SQLx 0.8.6's `-- no-transaction`
+  first line; the file holds that one statement), so the deploy's migration hook never blocks the running daemon's journal
+  writes: a plain build would hold a lock conflicting with every insert and update of `order_intents` for as long as it scans
+  the table, longer than a journal commit's 500 ms. A build that fails partway leaves an invalid index that the next run's
+  `IF NOT EXISTS` accepts; queries stay correct, only slower, and the deploy check is `pg_index.indisvalid`. There is no
+  `persisted_state_version` record (design §6): no step-7 PR wrote one and this one does not. What guards the schema is
+  SQLx's migration validation (an image refuses an applied migration it does not embed) and the journal's readiness probe
+  (an image refuses to start without the tables it uses, `recovery_incidents` included).
 - **Metrics.** `robsond_admission_fence_closed{reason}`, 1 for the reason of each open incident while the fence is closed, with
   every reason and `unknown` exported at 0 from startup; `robsond_recovery_incidents_open{reason}`; `robsond_graceful_stop_total`
   gains `incident_open`; `robsond_insurance_stop_stale_positions` now exports at 0 from startup, where it was absent until a stop
@@ -1104,8 +1125,8 @@ What part 2 changes in production:
   uncertain intent the earlier binaries left is stamped then, and that release tombstones them.
 - After that, a deploy whose previous process stopped clean at version 2 starts unfenced; a crash, a SIGKILL, a stop past its
   deadline or with an incident open makes the next start fenced.
-- Any uncertain venue outcome closes admissions until a release. On USD-M that includes every software-exit cancel answered
-  "already gone" (design §2.3); nothing trades on USD-M today.
+- Any uncertain outcome of a journaled intent closes admissions until a release. On USD-M that includes every software-exit
+  cancel answered "already gone" (design §2.3); nothing trades on USD-M today. Funding conversions and transfers are outside it.
 - A latch-class occurrence closes admissions as P's latch already did, and its release waits for a restart.
 
 **Rollback across part 2** is design §9's F row. Roll forward, or to an image that keeps fencing and audited release. Back to P
@@ -1113,8 +1134,8 @@ only when the **final, quiesced F epoch** stopped clean at version 2 (checked wi
 `process_epochs` row has `clean_stop_at` and `marker_version = 2`, which the stop writes only with the latch clear, nothing
 pending or unlanded, permits drained, none aborted and no incident open), boundary B holds
 (`order_intents_blocking_rollback` empty), and no stream is suspended (`stream_suspensions` has no open row). The rollback image
-must keep migrations 31 to 34: SQLx's migrator rejects an applied migration missing from its embedded set, so pinning P's image
-is refused by its own migration hook; "an image of P" means P's code with migration 34 kept. P and S then write version 1, so
+must keep migrations 31 to 35: SQLx's migrator rejects an applied migration missing from its embedded set, so pinning P's image
+is refused by its own migration hook; "an image of P" means P's code with migrations 34 and 35 kept. P and S then write version 1, so
 re-deploying F starts fenced. An older binary ignores `recovery_incidents` and the stamps, which is why rolling back needs the
 final epoch's clean marker first.
 

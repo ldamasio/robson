@@ -221,14 +221,24 @@ impl IncidentRecord {
     }
 }
 
-/// Mark `epoch` as stopped clean. The caller bounds the wait.
+/// Mark `epoch` as stopped clean. The caller bounds the wait. The marker is
+/// never written while an incident of the epoch's tenant is open on record,
+/// whatever this process's memory says (ADR-0056 step 7, PR F): the stop's
+/// own check reads memory, and this one reads the record in the same
+/// statement.
 ///
 /// # Errors
-/// The update failed, or found no unmarked row for the epoch.
+/// The update failed, or found no unmarked row for the epoch, or an incident
+/// is open on record.
 pub async fn mark_clean_stop(pool: &PgPool, epoch: Epoch) -> Result<(), String> {
     let marked = sqlx::query(
         "UPDATE process_epochs SET clean_stop_at = NOW(), marker_version = $2
-         WHERE epoch_id = $1 AND clean_stop_at IS NULL",
+         WHERE epoch_id = $1 AND clean_stop_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM recovery_incidents
+               WHERE recovery_incidents.tenant_id = process_epochs.tenant_id
+                 AND recovery_incidents.released_at IS NULL
+           )",
     )
     .bind(epoch.epoch_id)
     .bind(MARKER_VERSION)
@@ -238,7 +248,10 @@ pub async fn mark_clean_stop(pool: &PgPool, epoch: Epoch) -> Result<(), String> 
     if marked.rows_affected() == 1 {
         Ok(())
     } else {
-        Err(format!("epoch {} has no unmarked row", epoch.epoch_seq))
+        Err(format!(
+            "epoch {} has no unmarked row, or an incident is open on record",
+            epoch.epoch_seq
+        ))
     }
 }
 
@@ -328,6 +341,7 @@ mod tests {
         let first = start_epoch(&pool, tenant, "test").await.unwrap();
         assert_eq!(first.predecessor, Predecessor::None);
 
+        release_all(&pool, tenant).await;
         mark_clean_stop(&pool, first.epoch).await.unwrap();
         assert!(mark_clean_stop(&pool, first.epoch).await.is_err(), "a marker is written once");
         let second = start_epoch(&pool, tenant, "test").await.unwrap();
@@ -459,22 +473,56 @@ mod tests {
     }
 
     /// A start after a version 2 marker is clean: it stamps nothing and opens
-    /// nothing, but still loads an incident a release never covered.
+    /// nothing, but still loads an incident open on record, here one written
+    /// after the marker.
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
     async fn a_clean_start_opens_nothing_and_loads_what_is_still_open(pool: PgPool) {
         let tenant = Uuid::now_v7();
         let first = start_epoch(&pool, tenant, "test").await.unwrap();
+        release_all(&pool, tenant).await;
         mark_clean_stop(&pool, first.epoch).await.unwrap();
         intent(&pool, tenant, "dead", None, None).await;
+        sqlx::query(
+            "INSERT INTO recovery_incidents (incident_id, tenant_id, reason, first_at, last_at, \
+                 count, first_generation, last_generation) \
+             VALUES ($1, $2, 'uncertain_outcome', NOW(), NOW(), 1, 7, 7)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let clean = start_epoch(&pool, tenant, "test").await.unwrap();
         assert_eq!((clean.unclean_generation, clean.stamped_intents), (None, 0));
         assert_eq!(stamps(&pool, tenant).await, [("dead".to_string(), None, false)]);
-        // The first start's `unclean_start` was never released.
         assert_eq!(clean.open_incidents.len(), 1);
-        assert_eq!(clean.open_incidents[0].reason, IncidentReason::UncleanStart);
+        assert_eq!(clean.open_incidents[0].reason, IncidentReason::UncertainOutcome);
         assert_eq!(clean.open_incidents[0].count, 1);
+    }
+
+    /// Release every open incident of `tenant`, as a release's transaction
+    /// does.
+    async fn release_all(pool: &PgPool, tenant_id: Uuid) {
+        let decision = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO journal_decisions (decision_id, kind, actor, auth_kind, note, payload) \
+             VALUES ($1, 'release', 'test', 'verified', 'released', '{}')",
+        )
+        .bind(decision)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE recovery_incidents SET released_at = NOW(), decision_id = $2 \
+             WHERE tenant_id = $1 AND released_at IS NULL",
+        )
+        .bind(tenant_id)
+        .bind(decision)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     /// An open incident of a reason this binary does not know refuses the
@@ -502,6 +550,28 @@ mod tests {
         let refused = start_epoch(&pool, tenant, "test").await;
         assert!(matches!(refused, Err(DaemonError::Config(ref e)) if e.contains("does not know")));
         assert!(epochs(&pool, tenant).await.is_empty());
+    }
+
+    /// Review round 1: the marker is not written while an incident is open on
+    /// record, even when nothing in memory says so; once it is released, it is.
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn no_marker_is_written_over_an_open_incident_on_record(pool: PgPool) {
+        let tenant = Uuid::now_v7();
+        let start = start_epoch(&pool, tenant, "test").await.unwrap();
+        assert_eq!(start.open_incidents.len(), 1, "no predecessor: unclean_start");
+
+        let refused = mark_clean_stop(&pool, start.epoch).await;
+        assert!(matches!(&refused, Err(e) if e.contains("incident")), "{refused:?}");
+        assert_eq!(epochs(&pool, tenant).await, [(start.epoch.epoch_seq, false, None)]);
+
+        release_all(&pool, tenant).await;
+        mark_clean_stop(&pool, start.epoch).await.unwrap();
+        assert_eq!(epochs(&pool, tenant).await, [(
+            start.epoch.epoch_seq,
+            true,
+            Some(MARKER_VERSION)
+        )]);
     }
 
     /// Make every epoch insert fail on the server.

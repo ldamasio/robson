@@ -53,11 +53,6 @@ ALTER TABLE recovery_incidents
         FOREIGN KEY (decision_id) REFERENCES journal_decisions (decision_id)
         DEFERRABLE INITIALLY DEFERRED;
 
--- What a release tombstones, and the pending list's uncertain intents: stamped,
--- with no outcome, not proven unsent and no disposition.
-CREATE INDEX idx_order_intents_uncertain_open
-    ON order_intents (tenant_id, uncertain_generation)
-    WHERE uncertain_generation IS NOT NULL
-      AND venue_outcome IS NULL
-      AND NOT not_sent
-      AND disposition_kind IS NULL;
+-- The index on the intents a release tombstones is migration 35: it is built
+-- concurrently, outside any transaction, so live journal writes never wait on
+-- it.

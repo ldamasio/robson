@@ -482,6 +482,9 @@ pub struct StubJournalBackend {
     suspension_writes_fail: AtomicBool,
     incidents: Mutex<Vec<StubIncidentRow>>,
     incident_writes_fail: AtomicBool,
+    incident_write_attempts: AtomicU64,
+    incident_write_hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    commit_hold: Mutex<Option<(usize, Arc<tokio::sync::Notify>)>>,
     releases: Mutex<Vec<ReleaseRecord>>,
     release_fails: AtomicBool,
 }
@@ -562,6 +565,27 @@ impl StubJournalBackend {
         self.suspensions.lock().unwrap().clone()
     }
 
+    /// Hold the next incident upsert, before it is applied, until the returned
+    /// handle is notified.
+    pub fn hold_next_incident_write(&self) -> Arc<tokio::sync::Notify> {
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *self.incident_write_hold.lock().unwrap() = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// Incident upserts begun so far, held or not.
+    pub fn incident_write_attempts(&self) -> u64 {
+        self.incident_write_attempts.load(Ordering::SeqCst)
+    }
+
+    /// Hold commit number `index` (from 0), before it is applied, until the
+    /// returned handle is notified.
+    pub fn hold_commit(&self, index: usize) -> Arc<tokio::sync::Notify> {
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *self.commit_hold.lock().unwrap() = Some((index, Arc::clone(&hold)));
+        hold
+    }
+
     /// Every incident upsert fails, while the other writes go on as scripted.
     pub fn set_incident_writes_fail(&self, fail: bool) {
         self.incident_writes_fail.store(fail, Ordering::SeqCst);
@@ -628,7 +652,24 @@ impl StubJournalBackend {
 #[async_trait]
 impl JournalBackend for StubJournalBackend {
     async fn commit(&self, batch: &JournalBatch) -> Result<(), CommitFailure> {
-        self.commits.lock().unwrap().push(batch.clone());
+        let index = {
+            let mut commits = self.commits.lock().unwrap();
+            commits.push(batch.clone());
+            commits.len() - 1
+        };
+        let hold = {
+            let mut armed = self.commit_hold.lock().unwrap();
+            match armed.take() {
+                Some((at, hold)) if at == index => Some(hold),
+                other => {
+                    *armed = other;
+                    None
+                },
+            }
+        };
+        if let Some(hold) = hold {
+            hold.notified().await;
+        }
         let delay = *self.commit_delay.lock().unwrap();
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
@@ -686,6 +727,11 @@ impl JournalBackend for StubJournalBackend {
     }
 
     async fn upsert_incident(&self, incident: &Incident) -> Result<(), CommitFailure> {
+        self.incident_write_attempts.fetch_add(1, Ordering::SeqCst);
+        let hold = self.incident_write_hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            hold.notified().await;
+        }
         if self.incident_writes_fail.load(Ordering::SeqCst) {
             return Err(CommitFailure::Known("injected: incidents refused".to_string()));
         }
@@ -914,6 +960,10 @@ pub struct OrderJournal {
     operation_statements_max: AtomicU32,
     operations_over_statement_bound: AtomicU64,
     non_reuse_ids_lost: AtomicU64,
+    /// Held for one whole retry pass: passes never overlap (an async lock,
+    /// taken with no other lock held).
+    flush_pass: tokio::sync::Mutex<()>,
+    release_bound: Duration,
 }
 
 impl OrderJournal {
@@ -932,6 +982,8 @@ impl OrderJournal {
             operation_statements_max: AtomicU32::new(0),
             operations_over_statement_bound: AtomicU64::new(0),
             non_reuse_ids_lost: AtomicU64::new(0),
+            flush_pass: tokio::sync::Mutex::new(()),
+            release_bound: RELEASE_BOUND,
         }
     }
 
@@ -943,6 +995,12 @@ impl OrderJournal {
     /// Shorten the commit bound, for tests that wait it out.
     pub fn with_commit_bound(mut self, bound: Duration) -> Self {
         self.commit_bound = bound;
+        self
+    }
+
+    /// Shorten the release's bound, for tests that wait it out.
+    pub fn with_release_bound(mut self, bound: Duration) -> Self {
+        self.release_bound = bound;
         self
     }
 
@@ -1412,8 +1470,33 @@ impl OrderJournal {
         if let Some(memory) = self.lock().intents.get_mut(&intent.client_order_id) {
             memory.replaced_by = Some(fresh.clone());
         }
+        // The refused original is uncertain from here: one request went out
+        // under it with no definite answer and none more will. Its occurrence,
+        // stamp and incident are registered now, before the replacement's
+        // commit or venue answer is awaited (design §2.2).
+        self.settle_refused_original(intent);
         self.before_send(&fresh, WriteClass::Bounded).await?;
         Ok(fresh)
+    }
+
+    /// Register the uncertain ending of a refused retry's original, at once
+    /// and with no await: its occurrence closes the fence and stamps it, and
+    /// its write waits in the retry set. Nothing when its ending is already
+    /// registered or is not uncertain.
+    fn settle_refused_original(&self, intent: &JournaledIntent) {
+        let outcome = {
+            let state = self.lock();
+            let Some(memory) = state.intents.get(&intent.client_order_id) else {
+                return;
+            };
+            if memory.row.intent_id != intent.intent_id || memory.outcome.is_some() {
+                return;
+            }
+            Self::failed_outcome(memory)
+        };
+        if let Some(outcome) = outcome.filter(OutcomeRow::is_uncertain) {
+            self.register_outcome(intent, outcome);
+        }
     }
 
     fn replacement_of(&self, intent: &JournaledIntent) -> Option<JournaledIntent> {
@@ -1516,7 +1599,7 @@ impl OrderJournal {
     }
 
     async fn finish_failed_own(&self, intent: &JournaledIntent) {
-        let outcome = {
+        let ending = {
             let mut state = self.lock();
             let Some(memory) = state.intents.get_mut(&intent.client_order_id) else {
                 return;
@@ -1525,11 +1608,16 @@ impl OrderJournal {
                 return;
             }
             memory.sealed = true;
-            Self::failed_outcome(memory)
+            // Settled already (a refused retry's original): only its write.
+            match &memory.outcome {
+                Some(_) => Err(memory.batch()),
+                None => Ok(Self::failed_outcome(memory)),
+            }
         };
-        match outcome {
-            Some(outcome) => self.write_outcome(intent, outcome).await,
-            None => {
+        match ending {
+            Err(registered) => self.commit_outcome(intent, &registered).await,
+            Ok(Some(outcome)) => self.write_outcome(intent, outcome).await,
+            Ok(None) => {
                 self.lock().intents.remove(&intent.client_order_id);
             },
         }
@@ -1606,40 +1694,71 @@ impl OrderJournal {
     /// uncertain outcome records its `uncertain_outcome` occurrence first, in
     /// the same critical section, and carries the generation it got: the fence
     /// is closed before anything is awaited (design §2.2).
-    async fn write_outcome(&self, intent: &JournaledIntent, mut outcome: OutcomeRow) {
-        let (batch, occurrences) = {
+    async fn write_outcome(&self, intent: &JournaledIntent, outcome: OutcomeRow) {
+        if let Some(batch) = self.register_outcome(intent, outcome) {
+            self.commit_outcome(intent, &batch).await;
+        }
+    }
+
+    /// The synchronous half of [`Self::write_outcome`]: in one critical
+    /// section, the gate's mutex before this journal's memory, an uncertain
+    /// outcome records its occurrence and carries its generation, and the
+    /// outcome is registered for retry. The batch to commit, or `None` when the
+    /// intent is not this one in memory.
+    fn register_outcome(
+        &self,
+        intent: &JournaledIntent,
+        mut outcome: OutcomeRow,
+    ) -> Option<JournalBatch> {
+        let (batch, occurrence, discarded) = {
             let (mut gate, mut state) = self.lock_both();
-            let Some(memory) = state.intents.get_mut(&intent.client_order_id) else {
-                return;
-            };
+            let memory = state.intents.get_mut(&intent.client_order_id)?;
             if memory.row.intent_id != intent.intent_id {
-                return;
+                return None;
             }
-            let mut occurrences = Vec::new();
-            if outcome.is_uncertain() {
+            let occurrence = outcome.is_uncertain().then(|| {
                 let occurrence = gate.occur(IncidentReason::UncertainOutcome);
                 outcome.uncertain_generation = Some(occurrence.generation);
-                occurrences.push(occurrence);
-            }
+                occurrence
+            });
             memory.sealed = true;
             memory.outcome = Some(outcome);
             memory.outcome_landed = false;
             let batch = memory.batch();
             let discarded = Self::enqueue(&mut gate, &mut state, &intent.client_order_id);
-            (batch, (occurrences, discarded))
+            (batch, occurrence, discarded)
         };
-        let (occurrences, discarded) = occurrences;
-        occurrences.iter().for_each(Occurrence::log);
+        if let Some(occurrence) = occurrence {
+            occurrence.log();
+        }
         if let Some(occurrence) = discarded {
             Self::report_discarded(&intent.client_order_id, &occurrence);
         }
-        match self.bounded_commit(&batch).await {
-            Ok(()) => Self::landed(&mut self.lock(), &intent.client_order_id, &batch),
-            Err(failure) => warn!(
-                client_order_id = %intent.client_order_id,
-                ?failure,
-                "Journal result write failed; it will be retried"
-            ),
+        Some(batch)
+    }
+
+    /// The registered outcome's write, bounded; on failure the retry set
+    /// keeps it.
+    async fn commit_outcome(&self, intent: &JournaledIntent, batch: &JournalBatch) {
+        match self.bounded_commit(batch).await {
+            Ok(()) => Self::landed(&mut self.lock(), &intent.client_order_id, batch),
+            Err(failure) => {
+                warn!(
+                    client_order_id = %intent.client_order_id,
+                    ?failure,
+                    "Journal result write failed; it will be retried"
+                );
+                // Unless the retry set had no room for it: then its history
+                // goes now, as an overflow's does.
+                let mut state = self.lock();
+                let unkept = state
+                    .intents
+                    .get(&intent.client_order_id)
+                    .is_some_and(|memory| memory.outcome.is_some() && !memory.in_retry_set);
+                if unkept {
+                    state.intents.remove(&intent.client_order_id);
+                }
+            },
         }
     }
 
@@ -1680,7 +1799,9 @@ impl OrderJournal {
             return Ok(());
         }
         memory.sealed = true;
-        if memory.outcome.is_some() {
+        // A refused retry's original keeps its memory until its replacement
+        // ends: it names the replacement.
+        if memory.outcome.is_some() && memory.replaced_by.is_none() {
             state.intents.remove(client_order_id);
         }
         Err(Some(gate.occur(IncidentReason::PersistenceFailure)))
@@ -1713,6 +1834,10 @@ impl OrderJournal {
     /// after a few bounds even when each succeeds slowly. Returns the entries
     /// written.
     pub async fn flush_pending(&self) -> usize {
+        // One pass at a time: the retry loop and the stop's final flush never
+        // write the same snapshot twice, so an incident upsert delayed in one
+        // cannot land after another landed it and a release removed it.
+        let _pass = self.flush_pass.lock().await;
         let started = std::time::Instant::now();
         let pass_bound = self.commit_bound * RETRY_PASS_COMMIT_BOUNDS;
         let mut written = self.flush_incidents(started, pass_bound).await;
@@ -1869,14 +1994,14 @@ impl OrderJournal {
                 return Err(ReleaseRefusal::Persisting { pending });
             }
         }
-        let counts = match tokio::time::timeout(RELEASE_BOUND, self.backend.release(&request)).await
-        {
+        let release = self.backend.release(&request);
+        let counts = match tokio::time::timeout(self.release_bound, release).await {
             Ok(Ok(counts)) => counts,
             Ok(Err(error)) => return Err(ReleaseRefusal::Backend(error)),
             Err(_) => {
                 return Err(ReleaseRefusal::Backend(format!(
-                    "no answer within {} s; it may have committed",
-                    RELEASE_BOUND.as_secs()
+                    "no answer within {} ms; it may have committed",
+                    self.release_bound.as_millis()
                 )))
             },
         };
@@ -3732,6 +3857,41 @@ mod tests {
         let refused = unpersisted.release(release_of(unpersisted.gate().generation())).await;
         assert!(matches!(refused, Err(ReleaseRefusal::Backend(_))), "{refused:?}");
         assert!(unpersisted.gate().fenced());
+    }
+
+    /// Review round 1: retry passes never overlap. With one pass's incident
+    /// upsert held, a second pass, the stop's final flush say, waits for it
+    /// instead of writing the same snapshot again; a release meanwhile answers
+    /// `persisting`; once the first lands the release goes through and nothing
+    /// is written after it.
+    #[tokio::test]
+    async fn retry_passes_never_overlap() {
+        let (backend, journal) = journal();
+        journal.gate().record(IncidentReason::UncleanStart);
+        let held = backend.hold_next_incident_write();
+        let pass = |journal: &Arc<OrderJournal>| {
+            let journal = Arc::clone(journal);
+            tokio::spawn(async move { journal.flush_pending().await })
+        };
+        let first = pass(&journal);
+        while backend.incident_write_attempts() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let second = pass(&journal);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(backend.incident_write_attempts(), 1, "the second pass waits");
+        let early = journal.release(release_of(journal.gate().generation())).await;
+        assert!(matches!(early, Err(ReleaseRefusal::Persisting { .. })), "{early:?}");
+
+        held.notify_one();
+        assert_eq!(first.await.unwrap(), 1);
+        assert_eq!(second.await.unwrap(), 0, "nothing left for it");
+        let released = journal.release(release_of(journal.gate().generation())).await.unwrap();
+        assert!(released.fence_open);
+        assert_eq!(backend.incident_write_attempts(), 1);
+        assert!(backend.incidents().iter().all(|row| row.released_by.is_some()));
     }
 
     /// Each source of the latch records its reason: a bounded send without
