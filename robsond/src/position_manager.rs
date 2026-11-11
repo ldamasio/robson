@@ -10114,7 +10114,9 @@ mod tests {
     /// A triggered while being replaced: its market order is working, the venue
     /// still holds the leg, and the heal accepts B and finds A already gone. A
     /// then fills the whole leg. That close is still its stop's, and the budget
-    /// has to see it.
+    /// has to see it. A's cancel was uncertain, so an incident is open, and the
+    /// sweep keeps B, an orphan now, until a release (ADR-0056 step 7, PR F,
+    /// design §2.9).
     #[tokio::test]
     async fn a_stop_replaced_while_it_executes_keeps_its_loss_in_the_budget() {
         let manager = create_test_manager().await;
@@ -10134,7 +10136,12 @@ mod tests {
         let manager = missing_path_ran(manager).await;
 
         the_stop_loss_is_in_the_budget(&manager, &leg).await;
-        assert!(!exchange.has_stop_order(&stop_b), "and the sweep takes B");
+        let journal = manager.order_journal();
+        let reasons: Vec<_> =
+            journal.gate().open_incidents().iter().map(|incident| incident.reason).collect();
+        assert_eq!(reasons, [robson_exec::gate::IncidentReason::UncertainOutcome]);
+        assert!(exchange.has_stop_order(&stop_b), "the sweep keeps B while the incident is open");
+        assert_eq!(journal.withheld_report().orders[0].exchange_order_id, stop_b);
     }
 
     /// The scan's two reads are not one: an ordinary stop fill between them

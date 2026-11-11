@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed - The orphan sweep keeps protective orders while anything is unresolved (ADR-0056 step 7, PR F, part 4)
+
+- While an incident is open, the fence closed or the latch set, the reconciliation sweep no longer cancels orphan `ins-`
+  stop orders: such an order may be the only protection of exposure nothing owns. The scan checks at its start and before
+  each cancel's journal write, and the transport refuses the cancel at its handoff if the fence closed meanwhile; refused
+  there, its intent is recorded as not sent. Ordinary protective cancels are unaffected.
+- Each scan reports what it withheld, at most 500 orders listed and every one counted, in `GET /recovery/pending`
+  (`withheld_protective_orders`); `robsond_orphan_cancel_withheld_total` and
+  `robsond_orphan_cancel_withheld_overflow_total` count them. The list's cap never limits the veto.
+
 ### Added - The pending list (ADR-0056 step 7, PR F, part 3)
 
 - `GET /recovery/pending` (authenticated) shows the current generation a release must quote, the fence and the latch, the
