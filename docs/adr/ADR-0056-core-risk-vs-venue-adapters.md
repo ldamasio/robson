@@ -1145,6 +1145,22 @@ is refused by its own migration hook; "an image of P" means P's code with migrat
 re-deploying F starts fenced. An older binary ignores `recovery_incidents` and the stamps, which is why rolling back needs the
 final epoch's clean marker first.
 
+*Part 3, the pending list.* `GET /recovery/pending?page=N` (authenticated) shows what is unresolved and what a release would
+cover, design §2.8: the current generation, which a release must quote; whether the fence is closed and the latch set; aborted
+operations and unpermitted mutations; the epoch and why its start was unclean; and six collections, each one page of at most 100
+with its total, the same page of each: the open incidents (reason, first and last time, count, first and last generation); the
+**uncertain intents**, stamped with no outcome, not proven unsent and no disposition, which is what a release quoting their
+generation or a later one tombstones; the operations **in flight**, from `operations_in_flight` (at most 32), with their intents
+and whether each send started, which a release never covers; what is **persisting** in `persistence_pending` (intents, stream
+suspensions and incident upserts), for which a release answers `persisting`; the open **stream suspensions**, with their
+checkpoints and repair errors; and the legs now `entering` or `exiting`. The fence, the incidents, the operations and the
+persisting entries are read from memory; the other three collections are a count and a page each, six SQL queries per call. No
+venue request, no slot, no manager lock. It requires an identity itself, as release and disposition do, so it answers 401 even
+where neither Google auth nor the legacy token is configured. `page` is turned into one offset, saturated once and shared by
+every collection, memory and SQL alike: a page past every total is empty in each. It is a view only: it changes nothing, and
+part 2's release works without it (a stale request answers the current generation). Rollback across part 3 alone: to part 2's
+image, which keeps migrations 34 and 35.
+
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
 migrations. Where this ADR names a persisted-state version (steps 5 and 7) it is target architecture: no step has written a
 `persisted_state_version` record, and nothing checks one. What guards the schema today is SQLx's migration validation (an

@@ -122,60 +122,45 @@ impl Harness {
         self.daemon_with_env(crash_point, &[("ROBSON_LEGACY_API_TOKEN", OPERATOR_TOKEN)])
     }
 
-    /// Ask an operated daemon for a release at `generation`.
-    async fn post_release(&self, daemon: &DaemonProcess, generation: i64) -> (u16, Value) {
+    /// The pending list of an operated daemon.
+    async fn pending(&self, daemon: &DaemonProcess) -> Value {
         let response = reqwest::Client::new()
-            .post(format!("{}/recovery/release", daemon.api_url()))
+            .get(format!("{}/recovery/pending", daemon.api_url()))
             .bearer_auth(OPERATOR_TOKEN)
             .timeout(STEP)
-            .json(&json!({
-                "generation": generation,
-                "note": "harness",
-                "treatment": "unbooked_accepted",
-            }))
             .send()
             .await
-            .expect("the release answers");
-        let status = response.status().as_u16();
-        (status, response.json().await.expect("json"))
-    }
-
-    /// The current generation, as a release quoting a stale one answers it.
-    async fn generation(&self, daemon: &DaemonProcess) -> i64 {
-        let (status, body) = self.post_release(daemon, -1).await;
-        assert_eq!((status, body["error"].clone()), (409, json!("stale")), "{body}");
-        body["current_generation"].as_i64().expect("the current generation")
+            .expect("the pending list answers");
+        assert!(response.status().is_success(), "{}", daemon.log_tail());
+        response.json().await.expect("json")
     }
 
     /// Release an operated daemon at its current generation, once nothing
     /// persists: the operator's audited release (ADR-0056 step 7, PR F).
     async fn release(&self, daemon: &DaemonProcess) -> Value {
         for _ in 0..50 {
-            let generation = self.generation(daemon).await;
-            let (status, body) = self.post_release(daemon, generation).await;
-            if status == 200 {
+            let generation = self.pending(daemon).await["generation"].clone();
+            let response = reqwest::Client::new()
+                .post(format!("{}/recovery/release", daemon.api_url()))
+                .bearer_auth(OPERATOR_TOKEN)
+                .timeout(STEP)
+                .json(&json!({
+                    "generation": generation,
+                    "note": "harness",
+                    "treatment": "unbooked_accepted",
+                }))
+                .send()
+                .await
+                .expect("the release answers");
+            let status = response.status();
+            let body: Value = response.json().await.expect("json");
+            if status.is_success() {
                 return body;
             }
             assert_eq!(body["error"], "persisting", "{status}: {body}\n{}", daemon.log_tail());
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("the release kept answering persisting\n{}", daemon.log_tail());
-    }
-
-    /// `robsond_admission_fence_closed{reason}` as the daemon exports it.
-    async fn fence_closed_by(&self, daemon: &DaemonProcess, reason: &str) -> bool {
-        let metrics = reqwest::Client::new()
-            .get(format!("{}/metrics", daemon.api_url()))
-            .timeout(STEP)
-            .send()
-            .await
-            .expect("the metrics answer")
-            .text()
-            .await
-            .expect("text");
-        let series = format!("robsond_admission_fence_closed{{reason=\"{reason}\"}} ");
-        let line = metrics.lines().find(|line| line.starts_with(&series));
-        line.expect("the fence exports every reason").ends_with(" 1")
     }
 
     fn daemon(&self, crash_point: Option<&str>) -> DaemonProcess {
@@ -1200,7 +1185,7 @@ async fn killed_around_its_marker_the_epoch_says_whether_it_was_written(pool: Pg
         let log = plain(daemon.log());
         assert!(log.contains("Process epoch started after an unclean stop"), "{log}");
         assert!(log.contains("no_marker"), "{log}");
-        assert!(harness.fence_closed_by(&daemon, "unclean_start").await);
+        assert_eq!(harness.pending(&daemon).await["fenced"], true);
         assert_eq!(harness.release(&daemon).await["fence_open"], true);
         daemon.send_signal("TERM").expect("signal");
         daemon.wait_killed_at(STOP_AFTER_MARKER, GRACE).await.expect("killed after");
@@ -1224,16 +1209,29 @@ async fn an_unclean_start_is_fenced_until_an_audited_release_then_stops_clean(po
 
         let b = harness.operated(None);
         b.wait_ready(STEP).await.expect("B ready");
-        assert!(plain(b.log()).contains("no_marker"), "{}", b.log_tail());
-        assert!(harness.fence_closed_by(&b, "unclean_start").await);
-        assert_eq!(harness.open_incidents().await, ["unclean_start"]);
-        let generation = harness.generation(&b).await;
+        let pending = harness.pending(&b).await;
+        assert_eq!(pending["fenced"], true, "{pending}");
+        assert_eq!(pending["epoch"]["unclean_reason"], "no_marker", "{pending}");
+        assert_eq!(pending["incidents"]["items"][0]["reason"], "unclean_start", "{pending}");
+        let generation = pending["generation"].as_i64().expect("a generation");
         assert_eq!(generation & 0xffff_ffff, 1, "the unclean start's own occurrence");
         let refused = arm_immediate(b.api_url()).await.unwrap().expect_err("fenced");
         assert!(refused.contains("503") && refused.contains("fence"), "{refused}");
 
-        let (status, stale) = harness.post_release(&b, generation - 1).await;
-        assert_eq!(status, 409);
+        let stale = reqwest::Client::new()
+            .post(format!("{}/recovery/release", b.api_url()))
+            .bearer_auth(OPERATOR_TOKEN)
+            .timeout(STEP)
+            .json(&json!({
+                "generation": generation - 1,
+                "note": "harness",
+                "treatment": "unbooked_accepted",
+            }))
+            .send()
+            .await
+            .expect("the release answers");
+        assert_eq!(stale.status(), reqwest::StatusCode::CONFLICT);
+        let stale: Value = stale.json().await.unwrap();
         assert_eq!(
             (stale["error"].clone(), stale["current_generation"].clone()),
             (json!("stale"), json!(generation))
@@ -1241,7 +1239,7 @@ async fn an_unclean_start_is_fenced_until_an_audited_release_then_stops_clean(po
         let released = harness.release(&b).await;
         assert_eq!(released["fence_open"], true, "{released}");
         assert_eq!(released["incidents_released"], 1, "{released}");
-        assert!(!harness.fence_closed_by(&b, "unclean_start").await);
+        assert_eq!(harness.pending(&b).await["fenced"], false);
         arm_immediate(b.api_url())
             .await
             .unwrap()
@@ -1263,8 +1261,10 @@ async fn an_unclean_start_is_fenced_until_an_audited_release_then_stops_clean(po
 
         let c = harness.operated(None);
         c.wait_ready(STEP).await.expect("C ready");
-        assert!(plain(c.log()).contains("predecessor stopped clean"), "{}", c.log_tail());
-        assert!(!harness.fence_closed_by(&c, "unclean_start").await);
+        let pending = harness.pending(&c).await;
+        assert_eq!(pending["fenced"], false, "{pending}");
+        assert_eq!(pending["incidents"]["total"], 0, "{pending}");
+        assert_eq!(pending["epoch"]["unclean_reason"], Value::Null, "{pending}");
         assert_eq!(harness.epochs().await, [(false, None), (true, Some(2)), (false, None)]);
         assert!(harness.open_incidents().await.is_empty());
     })
