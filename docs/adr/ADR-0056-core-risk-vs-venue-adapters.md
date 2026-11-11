@@ -1177,7 +1177,7 @@ orphan exclusion by linkage), so that failure has nothing to veto yet.
 **Reporting.** Each scan replaces the report of what it withheld, kept on the journal: at most 500 orders listed (symbol, venue
 order id, client id), `total` counting every one, `truncated` past 500. `robsond_orphan_cancel_withheld_total` counts each order
 withheld by each scan, `robsond_orphan_cancel_withheld_overflow_total` those past the 500, both exported from startup. The pending
-list shows the report as `withheld_protective_orders`. **Truncating the report never narrows enforcement:** the veto applied to
+list shows the report as `withheld_protective_orders`, paged from the same saturated offset as its other collections. **Truncating the report never narrows enforcement:** the veto applied to
 every order, listed or not.
 
 **Why, and the cost.** While something is unresolved, an `ins-` order outside coverage may be the only protection of exposure

@@ -1516,7 +1516,7 @@ where
         items: report
             .orders
             .into_iter()
-            .skip(page * PENDING_PAGE_SIZE)
+            .skip(offset)
             .take(PENDING_PAGE_SIZE)
             .map(|order| PendingWithheldOrder {
                 symbol: order.symbol,
@@ -6902,6 +6902,8 @@ mod tests {
         assert!(past.uncertain_intents.items.is_empty());
         assert!(past.incidents.items.is_empty() && past.in_flight.items.is_empty());
         assert!(past.persisting.items.is_empty() && past.legs_in_flight.items.is_empty());
+        let withheld = &past.withheld_protective_orders;
+        assert_eq!((withheld.total, withheld.items.len()), (2, 0), "the report pages the same");
         drop(operation);
 
         let unauthenticated = app
