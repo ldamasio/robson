@@ -551,10 +551,18 @@ pub struct VenueOrderRecord {
     pub stop_price: Option<Decimal>,
     /// Recorded, never used to decide (design §3.4.2).
     pub expiry_reason: Option<String>,
-    /// The venue's times as given, in milliseconds: recorded for audit, never
-    /// used to decide (design §16, v10).
+    /// The venue's times as given, in milliseconds, each only when the
+    /// answer carries it. Recorded for audit, never used to decide (design
+    /// §16, v10): their meanings are not documented.
+    ///
+    /// `transactTime`: placement and cancel answers.
     pub transact_time_ms: Option<i64>,
+    /// `time`: order lookups and listings.
+    pub time_ms: Option<i64>,
+    /// `updateTime`: order lookups and listings.
     pub update_time_ms: Option<i64>,
+    /// `workingTime`: placement answers, lookups and listings.
+    pub working_time_ms: Option<i64>,
 }
 
 impl VenueOrderRecord {

@@ -44,6 +44,8 @@ fn successor() -> VenueOrderRecord {
         expiry_reason: None,
         transact_time_ms: Some(1_762_819_200_000),
         update_time_ms: None,
+        time_ms: None,
+        working_time_ms: None,
     }
 }
 

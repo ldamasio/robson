@@ -908,8 +908,12 @@ mod tests {
             cumulative_quote_qty: Some(dec!(23750.125)),
             stop_price: None,
             expiry_reason: None,
+            // Four distinct values: each keeps its own field through a round
+            // trip.
             transact_time_ms: Some(1_762_819_200_000),
-            update_time_ms: None,
+            update_time_ms: Some(1_762_819_200_002),
+            time_ms: Some(1_762_819_200_001),
+            working_time_ms: Some(1_762_819_200_003),
         }
     }
 
@@ -940,6 +944,21 @@ mod tests {
         let parsed: OrderResult = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.fills, result.fills);
         assert_eq!(parsed.record, result.record);
+        let record = parsed.record.unwrap();
+        assert_eq!(
+            (
+                record.transact_time_ms,
+                record.time_ms,
+                record.update_time_ms,
+                record.working_time_ms
+            ),
+            (
+                Some(1_762_819_200_000),
+                Some(1_762_819_200_001),
+                Some(1_762_819_200_002),
+                Some(1_762_819_200_003)
+            )
+        );
         assert_eq!(parsed.fee_evidence, result.fee_evidence);
 
         for evidence in [

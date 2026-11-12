@@ -206,6 +206,8 @@ mod tests {
                 expiry_reason: Some(text.to_string()),
                 transact_time_ms: None,
                 update_time_ms: None,
+                time_ms: None,
+                working_time_ms: None,
             })),
         ];
         for error in &errors {
