@@ -768,6 +768,42 @@ mod tests {
         assert_eq!(parsed.fill_price.as_decimal(), dec!(95000));
     }
 
+    /// A fixed result, for the byte goldens below.
+    fn golden_result() -> OrderResult {
+        OrderResult {
+            exchange_order_id: "77".to_string(),
+            client_order_id: "c-1".to_string(),
+            fill_price: Price::new(dec!(95000.5)).unwrap(),
+            filled_quantity: Quantity::new(dec!(0.25)).unwrap(),
+            fee: dec!(0.01),
+            fee_asset: "USDT".to_string(),
+            filled_at: DateTime::parse_from_rfc3339("2026-11-11T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        }
+    }
+
+    /// The bytes an `OrderResult` serializes to, captured before ADR-0056
+    /// step 8 (PR 8c) added its evidence fields: a result without them must
+    /// keep serializing exactly so.
+    const GOLDEN_RESULT: &str = r#"{"exchange_order_id":"77","client_order_id":"c-1","fill_price":"95000.5","filled_quantity":"0.25","fee":"0.01","fee_asset":"USDT","filled_at":"2026-11-11T00:00:00Z"}"#;
+
+    #[test]
+    fn an_order_result_without_new_fields_serializes_as_before() {
+        assert_eq!(serde_json::to_string(&golden_result()).unwrap(), GOLDEN_RESULT);
+        let success = crate::intent::IntentResult::Success(golden_result());
+        assert_eq!(
+            serde_json::to_string(&success).unwrap(),
+            format!(r#"{{"Success":{GOLDEN_RESULT}}}"#)
+        );
+    }
+
+    #[test]
+    fn an_order_result_from_before_8c_deserializes() {
+        let parsed: OrderResult = serde_json::from_str(GOLDEN_RESULT).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), GOLDEN_RESULT);
+    }
+
     #[test]
     fn test_price_update_serialization() {
         let update = PriceUpdate {

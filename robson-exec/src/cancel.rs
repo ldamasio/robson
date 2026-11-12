@@ -126,6 +126,34 @@ mod tests {
         }
     }
 
+    /// The cancel evidence bytes, captured before ADR-0056 step 8 (PR 8c)
+    /// added `OrderResult`'s evidence fields. USD-M's `venue_evidence` must
+    /// not change.
+    #[test]
+    fn usdm_cancel_evidence_is_byte_identical() {
+        let cancelled = classify_cancel(Ok(StopCancelOutcome::Cancelled {
+            filled_before_cancel: dec!(0),
+            fills: None,
+        }));
+        assert_eq!(
+            cancelled.evidence().unwrap().to_string(),
+            r#"{"filled_before_cancel":"0","fills":null}"#
+        );
+        let mut result = fill();
+        result.filled_at = chrono::DateTime::parse_from_rfc3339("2026-11-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let terminal = gone(OrderLookup::Terminal {
+            filled_qty: dec!(0.1),
+            cancelled_qty: dec!(0),
+            fills: Some(result),
+        });
+        assert_eq!(
+            terminal.evidence().unwrap().to_string(),
+            r#"{"filled_qty":"0.1","fills":{"client_order_id":"ins-1","exchange_order_id":"77","fee":"0.01","fee_asset":"USDT","fill_price":"90","filled_at":"2026-11-11T00:00:00Z","filled_quantity":"0.1"}}"#
+        );
+    }
+
     fn gone(final_state: OrderLookup) -> CancelClass {
         classify_cancel(Ok(StopCancelOutcome::AlreadyGone { final_state }))
     }
