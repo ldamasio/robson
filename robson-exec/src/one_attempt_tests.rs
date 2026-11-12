@@ -310,24 +310,30 @@ async fn a_ledger_needs_a_journal_with_the_capability() {
     assert_eq!(sent.load(Ordering::SeqCst), 0);
 }
 
+/// An outcome closes the grant, whether its write lands (the memory goes) or
+/// waits in the retry set (the memory stays, holding the outcome).
 #[tokio::test]
 async fn a_completed_intent_sends_nothing() {
-    for success in [true, false] {
-        let (_, journal) = flagged();
+    for (success, landed) in [(true, true), (false, true), (true, false), (false, false)] {
+        let (backend, journal) = flagged();
         let (ledger, sent) = (ledger_for(&journal), AtomicUsize::new(0));
         let op = operation(&journal);
         let intent = open(&op, &journal, "x").await;
         in_scope(&op, async {
             let _guard = journal.authorize_send(&intent, WriteClass::Strict).await.unwrap();
+            if !landed {
+                backend.set_fail_all(Some(JournalFault::Known));
+            }
             if success {
                 journal.finish_success(&intent, None).await;
             } else {
                 journal.finish_failed(&intent).await;
             }
+            assert_eq!(journal.lock().intents.contains_key("x"), !landed);
             assert!(send(&ledger, "x", &sent).await.is_err());
         })
         .await;
-        assert_eq!(sent.load(Ordering::SeqCst), 0, "success {success}");
+        assert_eq!(sent.load(Ordering::SeqCst), 0, "success {success}, landed {landed}");
     }
 }
 
@@ -732,4 +738,36 @@ async fn random_interleavings_send_at_most_once() {
         assert!(in_scope(&op, send(&ledger, "x", &sent)).await.is_err(), "case {case}");
         assert!(journal.lock().intents.values().all(|memory| memory.grant.is_none()));
     }
+}
+
+/// The unlanded first send's row lands later through the retry pass, with no
+/// outcome yet: the taken grant is not given back.
+#[tokio::test]
+async fn a_late_row_landing_restores_no_grant() {
+    let (backend, journal) = flagged();
+    let (ledger, sent) = (ledger_for(&journal), AtomicUsize::new(0));
+    let op = operation(&journal);
+    let intent = open(&op, &journal, "x").await;
+    backend.push_fault(JournalFault::Known);
+    in_scope(&op, async {
+        let _guard = journal.authorize_send(&intent, WriteClass::Bounded).await.unwrap();
+        send(&ledger, "x", &sent).await.unwrap();
+        assert!(backend.row("x").is_none(), "the row did not land");
+        assert!(journal.flush_pending().await > 0);
+        assert!(backend.row("x").is_some(), "the retry pass landed it");
+        assert!(send(&ledger, "x", &sent).await.is_err());
+    })
+    .await;
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+}
+
+/// An intent opened outside any operation gets no grant, Strict or Bounded.
+#[tokio::test]
+async fn an_intent_outside_an_operation_gets_no_grant() {
+    let (backend, journal) = flagged();
+    let intent = journal.open_intent(spec("x", IntentKind::Exit));
+    for class in [WriteClass::Strict, WriteClass::Bounded] {
+        assert!(journal.authorize_send(&intent, class).await.is_err(), "{class:?}");
+    }
+    assert!(backend.commits().is_empty(), "nothing was committed");
 }
