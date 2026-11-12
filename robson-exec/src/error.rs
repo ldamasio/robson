@@ -37,6 +37,13 @@ pub enum ExecError {
     #[error("Exchange error: {0}")]
     SendRefused(String),
 
+    /// A MARKET order the venue accepted and expired with nothing executed
+    /// (ADR-0056 step 8). Not a rejection: the venue did accept it, so it is
+    /// never evidence that the order was never accepted. The order's record
+    /// travels with it.
+    #[error("Order expired unfilled: {}", .0.exchange_order_id)]
+    ExpiredUnfilled(Box<crate::venue::VenueOrderRecord>),
+
     /// Intent journal error
     #[error("Intent journal error: {0}")]
     IntentJournal(String),

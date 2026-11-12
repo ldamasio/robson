@@ -123,6 +123,9 @@ mod tests {
             fee: dec!(0.01),
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
+            fills: Vec::new(),
+            record: None,
+            fee_evidence: Default::default(),
         }
     }
 
@@ -186,6 +189,24 @@ mod tests {
                 actual: text.to_string(),
                 advice: text.to_string(),
             },
+            ExecError::ExpiredUnfilled(Box::new(crate::venue::VenueOrderRecord {
+                exchange_order_id: text.to_string(),
+                client_order_id: text.to_string(),
+                orig_client_order_id: None,
+                symbol: "BTCUSDT".to_string(),
+                side: robson_domain::OrderSide::Buy,
+                order_type: "MARKET".to_string(),
+                protection_kind: None,
+                status: "EXPIRED".to_string(),
+                phase: crate::venue::OrderPhase::Terminal,
+                orig_qty: dec!(0.1),
+                executed_qty: dec!(0),
+                cumulative_quote_qty: Some(dec!(0)),
+                stop_price: None,
+                expiry_reason: Some(text.to_string()),
+                transact_time_ms: None,
+                update_time_ms: None,
+            })),
         ];
         for error in &errors {
             match error {
@@ -202,7 +223,8 @@ mod tests {
                 | ExecError::InvalidState(_)
                 | ExecError::Config(_)
                 | ExecError::Timeout(_)
-                | ExecError::FuturesSafetyViolation { .. } => {},
+                | ExecError::FuturesSafetyViolation { .. }
+                | ExecError::ExpiredUnfilled(_) => {},
             }
         }
         errors

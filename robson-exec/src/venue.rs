@@ -36,7 +36,7 @@ use crate::{
     order_journal::{begin_send, report_rejected, report_send_started, OrderJournal, SendRefusal},
     ports::{
         ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord, OpenOrderRecord,
-        OrderResult, SpotBalance, SpotOrder, SpotOrderRequest, Transfer, TransferId,
+        OrderResult, SpotBalance, SpotOrder, SpotOrderRequest, TradeFill, Transfer, TransferId,
         UniversalTransferType, UserTradeRecord,
     },
 };
@@ -53,6 +53,9 @@ pub struct VenueId(String);
 impl VenueId {
     /// Binance USDⓈ-M perpetual futures.
     pub const BINANCE_USDM: &'static str = "binance:usdm";
+    /// Binance spot (ADR-0056 step 8). No factory selects it before step 8's
+    /// activation.
+    pub const BINANCE_SPOT: &'static str = "binance:spot";
 
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
@@ -470,6 +473,116 @@ pub enum OrderLookup {
     Unknown,
 }
 
+/// Lifecycle phase of an order, read from its status alone (ADR-0056 step
+/// 8, design §3.4.2). The expiry reason never changes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderPhase {
+    /// On the book or executing (Binance spot: `NEW`, `PARTIALLY_FILLED`,
+    /// `PENDING_NEW`).
+    Live,
+    /// Nothing more executes (Binance spot: `FILLED`, `CANCELED`, `EXPIRED`,
+    /// `EXPIRED_IN_MATCH`, `REJECTED`).
+    Terminal,
+    /// A status that is neither (Binance spot: `PENDING_CANCEL`, documented as
+    /// unused, and anything unrecognised).
+    Unknown,
+}
+
+/// The venue's own record of one order, as one answer gave it (ADR-0056 step
+/// 8, design §3.6): what a balance account's evidence rests on. Quantities are
+/// the venue's; nothing here is derived from fills or fees.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VenueOrderRecord {
+    pub exchange_order_id: String,
+    /// The order's client id now. A cancel renames it on Binance spot (F12).
+    pub client_order_id: String,
+    /// The id the order was placed under, when the answer names it apart
+    /// (a cancel answer's `origClientOrderId`).
+    pub orig_client_order_id: Option<String>,
+    /// The venue's symbol, as given (`BTCUSDT`).
+    pub symbol: String,
+    pub side: OrderSide,
+    /// The venue's order type, as given (`MARKET`, `STOP_LOSS`, ...).
+    pub order_type: String,
+    /// Set by the adapter only when `order_type` is exactly the venue's
+    /// exchange-resident protection primitive (Binance spot: `STOP_LOSS`, never
+    /// `STOP_LOSS_LIMIT`).
+    pub protection_kind: Option<ProtectionKind>,
+    /// The venue's status, as given.
+    pub status: String,
+    pub phase: OrderPhase,
+    pub orig_qty: Decimal,
+    /// Cumulative executed quantity.
+    pub executed_qty: Decimal,
+    /// Cumulative quote quantity; `None` when the venue reports it as
+    /// unavailable (never read as zero).
+    pub cumulative_quote_qty: Option<Decimal>,
+    pub stop_price: Option<Decimal>,
+    /// Recorded, never used to decide (design §3.4.2).
+    pub expiry_reason: Option<String>,
+    /// The venue's times as given, in milliseconds: recorded for audit, never
+    /// used to decide (design §16, v10).
+    pub transact_time_ms: Option<i64>,
+    pub update_time_ms: Option<i64>,
+}
+
+impl VenueOrderRecord {
+    /// `0 ≤ executed_qty ≤ orig_qty`: a record outside it is no evidence.
+    pub fn quantities_consistent(&self) -> bool {
+        self.executed_qty >= Decimal::ZERO && self.executed_qty <= self.orig_qty
+    }
+}
+
+/// Which order a single observation asks for (ADR-0056 step 8). By exchange id
+/// once one is known; by client id only while none is recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderRef {
+    ExchangeId(String),
+    ClientId(String),
+}
+
+/// The typed answer to one cancel request (ADR-0056 step 8,
+/// [`InventoryPort::cancel_order_once`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CancelAnswer {
+    /// The venue cancelled it: the answer's own record is terminal, matches
+    /// the order and has consistent quantities.
+    Cancelled(VenueOrderRecord),
+    /// The venue said the order is not open (Binance spot: HTTP 400 with
+    /// -2011 or -2013). It proves nothing about execution: an exact lookup
+    /// decides, in a later request.
+    NotFound { code: i64 },
+    /// Sent, and the answer established nothing.
+    Unknown { reason: String },
+}
+
+/// The typed answer to one order lookup (ADR-0056 step 8,
+/// [`InventoryPort::observe_order`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderObservation {
+    /// The order's own record: ids and symbol match, quantities consistent.
+    Found(VenueOrderRecord),
+    /// The venue does not know it (Binance spot: HTTP 400 with -2013). Only
+    /// the caller, through [`VenueFinalityRule::classify_not_found`] over the
+    /// journal's evidence, may turn this into [`OrderLookup::Absent`].
+    NotFound,
+    /// Archived by the venue (Binance spot: HTTP 400 with -2026). Never
+    /// [`OrderLookup::Absent`].
+    Archived,
+}
+
+/// One page of an order's trades (ADR-0056 step 8,
+/// [`InventoryPort::order_trades_page`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TradePage {
+    /// Distinct trades of the order, each with its time.
+    pub trades: Vec<TradeFill>,
+    /// Where the next page starts, when this one was full; `None` when the
+    /// venue had no more. Stored durably by the caller, and read in a later
+    /// request.
+    pub next_from_id: Option<u64>,
+}
+
 /// Outcome of cancelling a protective stop (ADR-0056 §2).
 #[derive(Debug, Clone)]
 pub enum StopCancelOutcome {
@@ -591,15 +704,29 @@ pub struct Holding {
 pub struct AccountOpenOrder {
     pub symbol: Symbol,
     pub order: OpenOrderRecord,
+    /// The order's full record, when the venue's listing gives one (ADR-0056
+    /// step 8).
+    pub record: Option<VenueOrderRecord>,
 }
 
 /// Account-wide observation of a balance account: every nonzero holding of
 /// every asset and every open order, independent of configured symbols.
+///
+/// Its reads are not one atomic snapshot (design §3.1): it detects and bounds,
+/// and never certifies by itself; deciding when an observation is coherent is
+/// reconciliation's (ADR-0056 step 8, 8k).
 #[derive(Debug, Clone, PartialEq)]
 pub struct InventoryObservation {
     pub holdings: Vec<(String, Holding)>,
     pub open_orders: Vec<AccountOpenOrder>,
     pub as_of: DateTime<Utc>,
+    /// Open order lists on the account (Robson places none).
+    pub open_order_lists: usize,
+    /// The account's identity and authorisation as the venue reports them.
+    pub uid: String,
+    pub can_trade: bool,
+    pub account_type: String,
+    pub permissions: Vec<String>,
 }
 
 /// Base-asset inventory bought by Robson's legs, derived from authoritative
@@ -830,11 +957,39 @@ pub trait PositionAccountPort: Send + Sync {
 }
 
 /// Required when `account_kind = BalanceAccount` (ADR-0056 step 8).
+///
+/// The three single-request methods are what the leg owner uses for
+/// cancellation and recovery reads (design §3.5.1, §3.14): each sends exactly
+/// one request, never retries and holds no lock. `Err` is a proven no-send or,
+/// for the reads, a request that established nothing. They have no default
+/// bodies: a default could only refuse, never invent an absence or evidence.
 #[async_trait]
 pub trait InventoryPort: Send + Sync {
     async fn account_observation(&self) -> Result<InventoryObservation, ExecError>;
 
     async fn governed_inventory(&self, symbol: &Symbol) -> Result<GovernedInventory, ExecError>;
+
+    /// One cancel request by exchange order id.
+    async fn cancel_order_once(
+        &self,
+        symbol: &Symbol,
+        order_id: &str,
+    ) -> Result<CancelAnswer, ExecError>;
+
+    /// One lookup, returning the order's full record.
+    async fn observe_order(
+        &self,
+        symbol: &Symbol,
+        by: &OrderRef,
+    ) -> Result<OrderObservation, ExecError>;
+
+    /// One page of an order's trades, from trade id `from_id` on.
+    async fn order_trades_page(
+        &self,
+        symbol: &Symbol,
+        order_id: &str,
+        from_id: u64,
+    ) -> Result<TradePage, ExecError>;
 }
 
 /// Settlement evidence (required on every venue): realized P&L, commission

@@ -9,7 +9,10 @@ use robson_domain::{Candle, OrderSide, Price, Quantity, Side, Symbol, SymbolTrad
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::ExecError, venue::OrderLookup};
+use crate::{
+    error::ExecError,
+    venue::{OrderLookup, VenueOrderRecord},
+};
 
 // =============================================================================
 // Exchange Port
@@ -437,6 +440,84 @@ pub struct OrderResult {
     pub fee_asset: String,
     /// When the order was filled
     pub filled_at: DateTime<Utc>,
+    /// Per-trade evidence (ADR-0056 step 8). Empty on USD-M and the stub, and
+    /// then omitted, so their serialized results are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fills: Vec<TradeFill>,
+    /// The venue's own record of the order, when the adapter has one (a
+    /// balance account's every result). `None` on USD-M and the stub, and
+    /// then omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<VenueOrderRecord>,
+    /// What `fee` and `fee_asset` are worth. `AsReported` on USD-M and the
+    /// stub, and then omitted.
+    #[serde(default, skip_serializing_if = "FeeEvidence::is_as_reported")]
+    pub fee_evidence: FeeEvidence,
+}
+
+impl OrderResult {
+    /// The commission total with its asset, or `None` when the adapter could
+    /// not establish one ([`FeeEvidence::Unavailable`]): the per-trade
+    /// commissions in [`Self::fills`] are then the only fee evidence. A
+    /// balance-account consumer reads fees through this, never through `fee`.
+    pub fn fee_total(&self) -> Option<(Decimal, &str)> {
+        match self.fee_evidence {
+            FeeEvidence::AsReported | FeeEvidence::Total => Some((self.fee, &self.fee_asset)),
+            FeeEvidence::Unavailable(_) => None,
+        }
+    }
+}
+
+/// One trade of an order, as the venue reported it (ADR-0056 step 8).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TradeFill {
+    /// The venue's trade id, unique within the symbol.
+    pub trade_id: String,
+    pub price: Decimal,
+    pub qty: Decimal,
+    /// The trade's quote amount: the venue's figure, or `price × qty` where the
+    /// answer gives none (a FULL placement answer).
+    pub quote_qty: Decimal,
+    pub commission: Decimal,
+    pub commission_asset: String,
+    /// The trade's time, `None` when the answer carries none (a FULL placement
+    /// answer). Never filled in from another clock.
+    pub time: Option<DateTime<Utc>>,
+}
+
+/// How far `OrderResult::fee` and `fee_asset` can be trusted (ADR-0056 step 8,
+/// design §3.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FeeEvidence {
+    /// What the adapter reported, with today's meaning (USD-M, the stub).
+    #[default]
+    AsReported,
+    /// The sum of commissions over a complete, consistent set of fills in one
+    /// asset, or zero when nothing executed.
+    Total,
+    /// No total: `fee` and `fee_asset` are placeholders only.
+    Unavailable(FeeGap),
+}
+
+impl FeeEvidence {
+    pub fn is_as_reported(&self) -> bool {
+        matches!(self, Self::AsReported)
+    }
+}
+
+/// Why there is no commission total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FeeGap {
+    /// The answer carried no fills although the order executed.
+    NoFills,
+    /// The fills cover less than the executed quantity.
+    Incomplete,
+    /// The fills contradict each other or the order's record.
+    Conflicting,
+    /// The commissions are in more than one asset.
+    MixedAssets,
+    /// A checked calculation overflowed.
+    Overflow,
 }
 
 /// An open (unfilled) conditional/algo stop order observed on the exchange.
@@ -759,6 +840,9 @@ mod tests {
             fee: dec!(0.001),
             fee_asset: "BNB".to_string(),
             filled_at: Utc::now(),
+            fills: Vec::new(),
+            record: None,
+            fee_evidence: FeeEvidence::AsReported,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -780,6 +864,9 @@ mod tests {
             filled_at: DateTime::parse_from_rfc3339("2026-11-11T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
+            fills: Vec::new(),
+            record: None,
+            fee_evidence: FeeEvidence::AsReported,
         }
     }
 
@@ -802,6 +889,98 @@ mod tests {
     fn an_order_result_from_before_8c_deserializes() {
         let parsed: OrderResult = serde_json::from_str(GOLDEN_RESULT).unwrap();
         assert_eq!(serde_json::to_string(&parsed).unwrap(), GOLDEN_RESULT);
+    }
+
+    fn spot_record() -> VenueOrderRecord {
+        VenueOrderRecord {
+            exchange_order_id: "77".to_string(),
+            client_order_id: "c-1".to_string(),
+            orig_client_order_id: None,
+            symbol: "BTCUSDT".to_string(),
+            side: OrderSide::Buy,
+            order_type: "MARKET".to_string(),
+            protection_kind: None,
+            status: "FILLED".to_string(),
+            phase: crate::venue::OrderPhase::Terminal,
+            orig_qty: dec!(0.25),
+            executed_qty: dec!(0.25),
+            cumulative_quote_qty: Some(dec!(23750.125)),
+            stop_price: None,
+            expiry_reason: None,
+            transact_time_ms: Some(1_762_819_200_000),
+            update_time_ms: None,
+        }
+    }
+
+    /// A spot result keeps its evidence through a round trip, and only an
+    /// empty result omits it.
+    #[test]
+    fn evidence_fields_serialize_only_when_present() {
+        let mut result = golden_result();
+        result.fills = vec![TradeFill {
+            trade_id: "9".to_string(),
+            price: dec!(95000.5),
+            qty: dec!(0.25),
+            quote_qty: dec!(23750.125),
+            commission: dec!(0.00025),
+            commission_asset: "BTC".to_string(),
+            time: None,
+        }];
+        result.record = Some(spot_record());
+        result.fee_evidence = FeeEvidence::Unavailable(FeeGap::MixedAssets);
+        let json = serde_json::to_string(&result).unwrap();
+        for key in [
+            r#""fills":["#,
+            r#""record":{"#,
+            r#""fee_evidence":{"Unavailable":"MixedAssets"}"#,
+        ] {
+            assert!(json.contains(key), "{key} in {json}");
+        }
+        let parsed: OrderResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.fills, result.fills);
+        assert_eq!(parsed.record, result.record);
+        assert_eq!(parsed.fee_evidence, result.fee_evidence);
+
+        for evidence in [
+            FeeEvidence::Total,
+            FeeEvidence::Unavailable(FeeGap::NoFills),
+        ] {
+            let mut only = golden_result();
+            only.fee_evidence = evidence;
+            assert_ne!(serde_json::to_string(&only).unwrap(), GOLDEN_RESULT, "{evidence:?}");
+        }
+    }
+
+    /// An unavailable total never reads as a fee, zero included.
+    #[test]
+    fn only_an_established_total_is_a_fee_total() {
+        let mut result = golden_result();
+        assert_eq!(result.fee_total(), Some((dec!(0.01), "USDT")));
+        result.fee_evidence = FeeEvidence::Total;
+        assert_eq!(result.fee_total(), Some((dec!(0.01), "USDT")));
+        for gap in [
+            FeeGap::NoFills,
+            FeeGap::Incomplete,
+            FeeGap::Conflicting,
+            FeeGap::MixedAssets,
+            FeeGap::Overflow,
+        ] {
+            result.fee_evidence = FeeEvidence::Unavailable(gap);
+            result.fee = Decimal::ZERO;
+            assert_eq!(result.fee_total(), None, "{gap:?}");
+        }
+    }
+
+    #[test]
+    fn a_record_is_consistent_only_within_its_original_quantity() {
+        let mut record = spot_record();
+        assert!(record.quantities_consistent());
+        record.executed_qty = dec!(0.26);
+        assert!(!record.quantities_consistent());
+        record.executed_qty = dec!(-0.01);
+        assert!(!record.quantities_consistent());
+        record.executed_qty = Decimal::ZERO;
+        assert!(record.quantities_consistent());
     }
 
     #[test]

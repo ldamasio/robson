@@ -20,10 +20,11 @@ use crate::{
     gate::{GateSnapshot, OperationGate, OperationKind},
     order_journal,
     ports::{
-        CandleInterval, ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord,
-        MarketDataPort, OhlcvPort, OpenOrderRecord, OrderResult, PriceUpdate, SpotBalance,
-        SpotOrder, SpotOrderQuantity, SpotOrderRequest, SpotOrderSide, TradeFeedMessage,
-        TradeFeedPort, TradeStream, Transfer, TransferId, UniversalTransferType, UserTradeRecord,
+        CandleInterval, ExchangePosition, FeeEvidence, FuturesBalance, FuturesSettings,
+        IncomeRecord, MarketDataPort, OhlcvPort, OpenOrderRecord, OrderResult, PriceUpdate,
+        SpotBalance, SpotOrder, SpotOrderQuantity, SpotOrderRequest, SpotOrderSide,
+        TradeFeedMessage, TradeFeedPort, TradeStream, Transfer, TransferId, UniversalTransferType,
+        UserTradeRecord,
     },
     venue::{
         self, AccountKind, Cash, EntryOrReduce, ExecutionCostEnvelope, FeeAssetPolicy,
@@ -834,6 +835,9 @@ impl StubExchange {
             fee,
             fee_asset: "USDT".to_string(),
             filled_at,
+            fills: Vec::new(),
+            record: None,
+            fee_evidence: FeeEvidence::AsReported,
         };
         self.filled_stop_orders
             .write()
@@ -995,6 +999,9 @@ impl venue::TradingPort for StubExchange {
             fee,
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
+            fills: Vec::new(),
+            record: None,
+            fee_evidence: FeeEvidence::AsReported,
         };
         let delta = if intent.is_reduce() {
             -quantity.as_decimal()
@@ -1074,6 +1081,9 @@ impl venue::TradingPort for StubExchange {
                 fee: Decimal::ZERO,
                 fee_asset: "USDT".to_string(),
                 filled_at: placed_at,
+                fills: Vec::new(),
+                record: None,
+                fee_evidence: FeeEvidence::AsReported,
             },
         })
     }
@@ -1611,6 +1621,9 @@ impl venue::PositionAccountPort for StubExchange {
             fee,
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
+            fills: Vec::new(),
+            record: None,
+            fee_evidence: FeeEvidence::AsReported,
         };
         self.client_orders
             .write()
@@ -2146,6 +2159,9 @@ mod tests {
             fee: dec!(9.5),
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
+            fills: Vec::new(),
+            record: None,
+            fee_evidence: FeeEvidence::AsReported,
         };
 
         exchange.set_order_result("12345", order_result.clone());

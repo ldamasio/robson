@@ -316,6 +316,9 @@ mod tests {
             fee: dec!(0.001),
             fee_asset: "BNB".to_string(),
             filled_at: Utc::now(),
+            fills: Vec::new(),
+            record: None,
+            fee_evidence: Default::default(),
         };
 
         journal.complete(id, IntentResult::Success(order_result)).unwrap();

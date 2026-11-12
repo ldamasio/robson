@@ -4399,6 +4399,9 @@ mod tests {
             fee: rust_decimal_macros::dec!(0.01),
             fee_asset: "USDT".to_string(),
             filled_at,
+            fills: Vec::new(),
+            record: None,
+            fee_evidence: Default::default(),
         }
     }
 
