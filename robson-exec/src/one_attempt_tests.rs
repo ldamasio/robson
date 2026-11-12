@@ -699,6 +699,59 @@ async fn failure_finalization_closes_the_grant_before_its_send_start() {
     }
 }
 
+/// An authorization whose commit is still pending when failure finalization
+/// begins gets no grant, even though its commit lands before the failure is
+/// registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_authorization_gets_no_grant_once_failure_finalization_began() {
+    let backend = Arc::new(StubJournalBackend::default());
+    let journal = Arc::new(
+        OrderJournal::new(backend.clone(), &VenueId::new("test:spot"))
+            .with_commit_bound(Duration::from_secs(30))
+            .with_one_attempt_per_client_id(true),
+    );
+    let ledger = ledger_for(&journal);
+    let op = operation(&journal);
+    let intent = open(&op, &journal, "x").await;
+    let hold = backend.hold_commit(0);
+    // 0: pending, 1: granted, 2: refused.
+    let result = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let authorizing = {
+        let (journal, op, intent, result) =
+            (Arc::clone(&journal), Arc::clone(&op), intent.clone(), Arc::clone(&result));
+        tokio::spawn(async move {
+            op.scope(async {
+                let granted = journal.authorize_send(&intent, WriteClass::Strict).await;
+                result.store(if granted.is_ok() { 1 } else { 2 }, Ordering::SeqCst);
+                granted.ok()
+            })
+            .await
+        })
+    };
+    while backend.commits().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    {
+        let (result, ledger) = (Arc::clone(&result), Arc::clone(&ledger));
+        // In the window: the commit lands and the authorization completes on
+        // the other worker before the failure is registered.
+        journal.on_failure_snapshot(Box::new(move || {
+            hold.notify_one();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while result.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(ledger.begin_send("x").is_err(), "no send starts in the window");
+        }));
+    }
+    in_scope(&op, journal.finish_failed(&intent)).await;
+    let guard = authorizing.await.unwrap();
+    assert_eq!(result.load(Ordering::SeqCst), 2, "the authorization was refused its grant");
+    assert!(guard.is_none());
+    let outcome = backend.row("x").unwrap().outcome.unwrap();
+    assert!(outcome.not_sent, "a proven no-send");
+}
+
 /// The other order: the send started before the failure's snapshot, so the
 /// outcome reads its ticket and is uncertain, never `not_sent`.
 #[tokio::test]

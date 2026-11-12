@@ -2333,11 +2333,12 @@ impl OrderJournal {
     /// its failure finalization, in the caller's critical section, the one
     /// that computes the failed outcome: a send start after it is refused (a
     /// proven no-send), and one before it shows in the ticket the outcome
-    /// reads. Nothing when the flag is off.
+    /// reads. A live grant is left in place for the send start to refuse,
+    /// and the outcome's registration clears it; an authorization still
+    /// committing gets none. Nothing when the flag is off.
     fn close_for_failure(&self, memory: &mut IntentMemory) {
         if self.one_attempt_per_client_id {
             memory.closing = true;
-            memory.grant = None;
         }
     }
 
