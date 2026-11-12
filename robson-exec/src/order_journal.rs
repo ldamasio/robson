@@ -81,6 +81,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
     future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
@@ -1578,43 +1579,70 @@ impl OrderJournal {
     /// `kind` when it holds none. A nested operation never takes a second slot
     /// or changes class.
     ///
+    /// `work` is boxed at the call (see [`Permit::run`]).
+    ///
     /// # Errors
     /// A new permit was refused; nothing ran.
-    pub async fn with_permit<F: Future>(
+    pub fn with_permit<F: Future>(
         self: &Arc<Self>,
         kind: OperationKind,
         work: F,
+    ) -> impl Future<Output = Result<F::Output, PermitRefusal>> + use<'_, F> {
+        self.with_permit_boxed(kind, Box::pin(work))
+    }
+
+    async fn with_permit_boxed<F: Future>(
+        self: &Arc<Self>,
+        kind: OperationKind,
+        work: Pin<Box<F>>,
     ) -> Result<F::Output, PermitRefusal> {
         if in_operation() {
             return Ok(work.await);
         }
-        Ok(self.acquire(kind)?.run(work).await)
+        Ok(self.acquire(kind)?.run_unboxed(work).await)
     }
 
     /// Run `work` in this task's operation, or in a new one without a permit
-    /// when the task is in none.
-    pub async fn within_operation<F: Future>(self: &Arc<Self>, work: F) -> F::Output {
+    /// when the task is in none. `work` is boxed at the call (see
+    /// [`Permit::run`]).
+    pub fn within_operation<F: Future>(
+        self: &Arc<Self>,
+        work: F,
+    ) -> impl Future<Output = F::Output> + use<'_, F> {
+        self.within_operation_boxed(Box::pin(work))
+    }
+
+    async fn within_operation_boxed<F: Future>(self: &Arc<Self>, work: Pin<Box<F>>) -> F::Output {
         if in_operation() {
             return work.await;
         }
-        self.begin_operation().scope(work).await
+        self.begin_operation().scope_unboxed(work).await
     }
 
     /// Run an admission in this task's operation, or in one of its own when
     /// the task is in none, and say whether the entry `client_order_id`
     /// reached its send. Read from the operation's registry, on `Ok` and `Err`
-    /// alike, before an operation of its own ends.
-    pub async fn run_admission<F: Future>(
+    /// alike, before an operation of its own ends. `work` is boxed at the call
+    /// (see [`Permit::run`]).
+    pub fn run_admission<'a, 'b, F: Future>(
+        self: &'a Arc<Self>,
+        client_order_id: Option<&'b str>,
+        work: F,
+    ) -> impl Future<Output = (F::Output, bool)> + use<'a, 'b, F> {
+        self.run_admission_boxed(client_order_id, Box::pin(work))
+    }
+
+    async fn run_admission_boxed<F: Future>(
         self: &Arc<Self>,
         client_order_id: Option<&str>,
-        work: F,
+        work: Pin<Box<F>>,
     ) -> (F::Output, bool) {
         if let Ok(id) = CURRENT_OPERATION.try_with(|current| current.id) {
             let output = work.await;
             return (output, self.entry_ticket_in(id, client_order_id));
         }
         let operation = self.begin_operation();
-        let output = operation.scope(work).await;
+        let output = operation.scope_unboxed(work).await;
         let ticket = self.entry_ticket_in(operation.id, client_order_id);
         (output, ticket)
     }
@@ -2905,8 +2933,13 @@ pub struct Operation {
 }
 
 impl Operation {
-    /// Run `work` as this operation.
-    pub async fn scope<F: Future>(&self, work: F) -> F::Output {
+    /// Run `work` as this operation. `work` is boxed at the call (see
+    /// [`Permit::run`]).
+    pub fn scope<F: Future>(&self, work: F) -> impl Future<Output = F::Output> + use<'_, F> {
+        self.scope_unboxed(Box::pin(work))
+    }
+
+    async fn scope_unboxed<F: Future>(&self, work: F) -> F::Output {
         let current = CurrentOperation {
             journal: Arc::clone(&self.journal),
             id: self.id,
@@ -3036,16 +3069,35 @@ impl Permit {
 
     /// Run `work` under this permit and complete it when `work` returns.
     /// Dropping the returned future before then aborts the permit.
-    pub async fn run<F: Future>(mut self, work: F) -> F::Output {
-        let output = self.scope(work).await;
+    ///
+    /// `work` is boxed here, at the call, as it is by every public wrapper of
+    /// this module ([`Self::scope`], [`Operation::scope`],
+    /// [`OrderJournal::with_permit`], [`OrderJournal::within_operation`],
+    /// [`OrderJournal::run_admission`]): an operation's future is large, and
+    /// each nested `async` wrapper would otherwise hold its own copy of it, as
+    /// would every frame that polls it. Only the allocation and the move into
+    /// the box happen at the call; the rest waits for the first poll. Internal
+    /// forwarding goes through the private, non-boxing bodies, so one public
+    /// call allocates once.
+    pub fn run<F: Future>(self, work: F) -> impl Future<Output = F::Output> + use<F> {
+        self.run_unboxed(Box::pin(work))
+    }
+
+    async fn run_unboxed<F: Future>(mut self, work: F) -> F::Output {
+        let output = self.scope_unboxed(work).await;
         self.completed = true;
         output
     }
 
-    /// Run `work` under this permit, which stays held.
-    pub async fn scope<F: Future>(&self, work: F) -> F::Output {
+    /// Run `work` under this permit, which stays held. `work` is boxed at the
+    /// call (see [`Self::run`]).
+    pub fn scope<F: Future>(&self, work: F) -> impl Future<Output = F::Output> + use<'_, F> {
+        self.scope_unboxed(Box::pin(work))
+    }
+
+    async fn scope_unboxed<F: Future>(&self, work: F) -> F::Output {
         match &self.operation {
-            Some(operation) => operation.scope(work).await,
+            Some(operation) => operation.scope_unboxed(work).await,
             None => work.await,
         }
     }

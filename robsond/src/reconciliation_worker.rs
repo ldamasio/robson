@@ -468,9 +468,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     /// startup scan is part of the startup operation.
     pub async fn scan_and_reconcile(&self) -> DaemonResult<usize> {
         let journal = self.order_journal().await;
-        journal
-            .with_permit(OperationKind::ReconciliationScan, Box::pin(self.scan_once()))
-            .await?
+        journal.with_permit(OperationKind::ReconciliationScan, self.scan_once()).await?
     }
 
     async fn scan_once(&self) -> DaemonResult<usize> {
