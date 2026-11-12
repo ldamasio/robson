@@ -741,6 +741,14 @@ async fn a_pending_authorization_gets_no_grant_once_failure_finalization_began()
             while result.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            // The authorization must have completed inside the window, before
+            // the failure registers, and been refused there: only grant()'s
+            // closing check can refuse it now (no outcome yet, memory kept).
+            assert_eq!(
+                result.load(Ordering::SeqCst),
+                2,
+                "the authorization completed in the window and was refused its grant"
+            );
             assert!(ledger.begin_send("x").is_err(), "no send starts in the window");
         }));
     }
