@@ -461,22 +461,33 @@ async fn a_late_outcome_failure_restores_no_grant() {
 
 #[tokio::test]
 async fn a_panic_while_holding_the_guard_revokes_it() {
+    const PAYLOAD: &str = "unwinding with the guard held";
     let (_, journal) = flagged();
     let (ledger, sent) = (ledger_for(&journal), AtomicUsize::new(0));
     let op = operation(&journal);
     let intent = open(&op, &journal, "x").await;
+    let acquired = Arc::new(AtomicBool::new(false));
     let panicked = {
         let (journal, op, intent) = (Arc::clone(&journal), Arc::clone(&op), intent.clone());
+        let acquired = Arc::clone(&acquired);
         tokio::spawn(async move {
             op.scope(async {
-                let _guard = journal.authorize_send(&intent, WriteClass::Strict).await.unwrap();
-                panic!("unwinding with the guard held");
+                let guard = journal.authorize_send(&intent, WriteClass::Strict).await;
+                // An authorization failure is no panic of ours: report it as an
+                // ordinary return, which fails the assertions below.
+                let Ok(_guard) = guard else {
+                    return;
+                };
+                acquired.store(true, Ordering::SeqCst);
+                std::panic::panic_any(PAYLOAD);
             })
             .await
         })
         .await
     };
-    assert!(panicked.unwrap_err().is_panic());
+    assert!(acquired.load(Ordering::SeqCst), "the guard was acquired before the panic");
+    let payload = panicked.expect_err("the task panicked").into_panic();
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&PAYLOAD), "the intended panic");
     assert!(in_scope(&op, send(&ledger, "x", &sent)).await.is_err());
     assert_eq!(sent.load(Ordering::SeqCst), 0);
 }
