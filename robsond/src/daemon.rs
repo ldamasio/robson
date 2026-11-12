@@ -191,7 +191,11 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
         return executor;
     };
     let backend = Arc::new(crate::order_journal_store::PgJournalBackend::new(pool, tenant_id));
-    let journal = Arc::new(OrderJournal::new(backend, venue.id()));
+    // ADR-0056 step 8: the capability is fixed before the journal is shared.
+    let one_attempt = venue.capabilities().one_attempt_per_client_id;
+    let journal = Arc::new(
+        OrderJournal::new(backend, venue.id()).with_one_attempt_per_client_id(one_attempt),
+    );
     venue.attach_order_journal(Arc::clone(&journal));
     executor.with_order_journal(journal)
 }
@@ -4399,6 +4403,7 @@ mod tests {
             fee: rust_decimal_macros::dec!(0.01),
             fee_asset: "USDT".to_string(),
             filled_at,
+            evidence: None,
         }
     }
 

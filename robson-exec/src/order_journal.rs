@@ -63,6 +63,16 @@
 //! at its send, a typed no-send; a sweep meeting an entry's claim defers. No
 //! one waits on a claim.
 //!
+//! **One attempt per client id (ADR-0056 step 8, PR 8c).** A journal built
+//! with [`OrderJournal::with_one_attempt_per_client_id`] (a venue whose
+//! capability says so: Binance spot) refuses any attempt after the first, and
+//! its sends need a grant: only [`OrderJournal::authorize_send`] gives one,
+//! with a [`SendAuthorization`] guard that revokes it when dropped, and the
+//! venue's one-attempt ledger takes it at the send start
+//! ([`OrderJournal::begin_authorized_send`]). The authorization, its guard and
+//! the request's await belong in one cancellable async scope. With the flag
+//! off (USD-M, the stub) none of this runs.
+//!
 //! The sync mutex here is a leaf and is never held across an await. The gate's
 //! mutex comes before it in the lock order, and nothing here takes the gate's
 //! while holding this one.
@@ -862,6 +872,48 @@ enum UnlandedKept {
     Lost,
 }
 
+/// The grant of one send on a one-attempt journal (ADR-0056 step 8), from
+/// [`OrderJournal::authorize_send`]. Dropping it revokes the grant if the send
+/// start has not taken it, so a cancelled submission leaves nothing for a
+/// later one to take. Hold it, in the same cancellable scope, across exactly
+/// the one request it authorizes. It may move to another task, which can only
+/// use it inside the same live operation. Elsewhere it holds nothing.
+pub struct SendAuthorization {
+    journal: Arc<OrderJournal>,
+    client_order_id: String,
+    grant_id: Option<u64>,
+}
+
+impl SendAuthorization {
+    pub fn client_order_id(&self) -> &str {
+        &self.client_order_id
+    }
+
+    /// Whether this guard holds a grant (a one-attempt journal).
+    pub fn is_granted(&self) -> bool {
+        self.grant_id.is_some()
+    }
+}
+
+impl fmt::Debug for SendAuthorization {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SendAuthorization")
+            .field("client_order_id", &self.client_order_id)
+            .field("grant_id", &self.grant_id)
+            .finish()
+    }
+}
+
+impl Drop for SendAuthorization {
+    /// Takes the journal's memory mutex only: never drop a guard while
+    /// holding it (the journal itself never holds a guard).
+    fn drop(&mut self) {
+        if let Some(grant_id) = self.grant_id {
+            self.journal.revoke(&self.client_order_id, grant_id);
+        }
+    }
+}
+
 /// Handle on an intent registered with [`OrderJournal::open_intent`].
 #[derive(Debug, Clone)]
 pub struct JournaledIntent {
@@ -928,6 +980,24 @@ struct IntentMemory {
     in_retry_set: bool,
     /// The inventory an entry claims at its send (PR O).
     ownership: Option<OwnershipKey>,
+    /// The send this intent's one attempt may make, on a one-attempt journal
+    /// (ADR-0056 step 8): set by `authorize_send`, taken at the send start,
+    /// revoked by its guard's drop, cleared by an outcome or the operation's
+    /// end. Never set again once taken.
+    grant: Option<Grant>,
+    /// Failure finalization has begun, on a one-attempt journal (ADR-0056
+    /// step 8): set in the critical section that computes the failed outcome,
+    /// so no grant is given or taken after that snapshot. Distinct from
+    /// `sealed`, which an overflow sets too without closing the first send.
+    closing: bool,
+}
+
+/// One authorized send (ADR-0056 step 8). A plain value: the guard that
+/// revokes it lives with the caller, never in the journal's memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Grant {
+    attempt_id: Uuid,
+    grant_id: u64,
 }
 
 impl IntentMemory {
@@ -1157,6 +1227,15 @@ pub struct OrderJournal {
     release_bound: Duration,
     /// The orphan sweep's last report, a sync leaf held with no other lock.
     withheld: Mutex<WithheldReport>,
+    /// One attempt per client id, with granted sends (ADR-0056 step 8). Fixed
+    /// before the journal is shared; `false` for USD-M and the stub.
+    one_attempt_per_client_id: bool,
+    /// The next grant id: never reused in this journal's life. Exhausted, it
+    /// grants nothing more.
+    next_grant: AtomicU64,
+    /// Test seam: runs once between a failure's snapshot and its registration.
+    #[cfg(test)]
+    after_failure_snapshot: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl OrderJournal {
@@ -1178,6 +1257,10 @@ impl OrderJournal {
             flush_pass: tokio::sync::Mutex::new(()),
             release_bound: RELEASE_BOUND,
             withheld: Mutex::default(),
+            one_attempt_per_client_id: false,
+            next_grant: AtomicU64::new(1),
+            #[cfg(test)]
+            after_failure_snapshot: Mutex::new(None),
         }
     }
 
@@ -1190,6 +1273,19 @@ impl OrderJournal {
     pub fn with_commit_bound(mut self, bound: Duration) -> Self {
         self.commit_bound = bound;
         self
+    }
+
+    /// One attempt per client id, with granted sends (ADR-0056 step 8): for a
+    /// venue whose capability says so. Set it before the journal is shared;
+    /// nothing changes it afterwards.
+    pub fn with_one_attempt_per_client_id(mut self, on: bool) -> Self {
+        self.one_attempt_per_client_id = on;
+        self
+    }
+
+    /// Whether this journal allows one attempt per client id and grants sends.
+    pub fn one_attempt_per_client_id(&self) -> bool {
+        self.one_attempt_per_client_id
     }
 
     /// Shorten the release's bound, for tests that wait it out.
@@ -1583,6 +1679,8 @@ impl OrderJournal {
             replaced_by: None,
             in_retry_set: false,
             ownership: None,
+            grant: None,
+            closing: false,
         });
         handle
     }
@@ -1603,15 +1701,20 @@ impl OrderJournal {
     }
 
     /// Commit one more attempt ahead of its request. `Ok` authorizes exactly
-    /// one send under this client id.
+    /// one send under this client id. On a one-attempt journal it refuses any
+    /// attempt after the first and grants no send: only
+    /// [`Self::authorize_send`] does.
     pub async fn before_send(
         &self,
         intent: &JournaledIntent,
         class: WriteClass,
     ) -> Result<(), SendRefusal> {
+        let one_attempt = self.one_attempt_per_client_id;
         let (batch, attempt_id, first) = {
             let mut state = self.lock();
-            if class == WriteClass::Strict && !state.operations.contains_key(&intent.operation) {
+            if (class == WriteClass::Strict || one_attempt)
+                && !state.operations.contains_key(&intent.operation)
+            {
                 return Err(SendRefusal::NotSent("operation is not registered".to_string()));
             }
             if state.discarded.contains(&intent.client_order_id) {
@@ -1634,6 +1737,11 @@ impl OrderJournal {
                 memory.retry_refused = !memory.attempts.is_empty();
                 return Err(SendRefusal::NotSent(
                     "an earlier commit on this id failed".to_string(),
+                ));
+            }
+            if one_attempt && !memory.attempts.is_empty() {
+                return Err(SendRefusal::NotSent(
+                    "one attempt per client id on this venue".to_string(),
                 ));
             }
             let first = memory.attempts.is_empty();
@@ -1708,6 +1816,160 @@ impl OrderJournal {
                 memory.commit_uncertain = true;
                 Err(SendRefusal::UncertainCommit(reason))
             },
+        }
+    }
+
+    /// Commit an order's one attempt and grant its one send, on a one-attempt
+    /// journal (ADR-0056 step 8). The grant lives as long as the returned
+    /// guard: dropping it unused revokes it, so the guard, this call and the
+    /// request's await belong in one cancellable async scope. A Strict attempt
+    /// is granted only once its row landed; a Bounded one once the commit's
+    /// outcome is decided, including J's unlanded first send. A pending commit
+    /// grants nothing. Elsewhere it is [`Self::before_send`], with a guard
+    /// that holds nothing.
+    ///
+    /// # Errors
+    /// As [`Self::before_send`]; also a cancel (which takes no grant) and an
+    /// exhausted grant counter.
+    pub async fn authorize_send(
+        self: &Arc<Self>,
+        intent: &JournaledIntent,
+        class: WriteClass,
+    ) -> Result<SendAuthorization, SendRefusal> {
+        let grant_id = if self.one_attempt_per_client_id {
+            let cancel = self.lock().intents.get(&intent.client_order_id).is_some_and(|memory| {
+                memory.row.intent_id == intent.intent_id && memory.row.kind == IntentKind::Cancel
+            });
+            if cancel {
+                return Err(SendRefusal::NotSent("a cancel takes no send grant".to_string()));
+            }
+            self.before_send(intent, class).await?;
+            // No await from here to the guard: a cancellation lands before the
+            // grant or after the guard holds it. The grant re-checks, under
+            // the mutex, what before_send decided on: the attempt is this
+            // intent's one, with no outcome, in a live operation.
+            Some(self.grant_last(intent)?)
+        } else {
+            self.before_send(intent, class).await?;
+            None
+        };
+        Ok(SendAuthorization {
+            journal: Arc::clone(self),
+            client_order_id: intent.client_order_id.clone(),
+            grant_id,
+        })
+    }
+
+    /// Grant the send of `intent`'s one attempt, which `before_send` just
+    /// authorized: a landed row, or J's unlanded first Bounded send.
+    fn grant_last(&self, intent: &JournaledIntent) -> Result<u64, SendRefusal> {
+        let mut state = self.lock();
+        let attempt_id = state
+            .intents
+            .get(&intent.client_order_id)
+            .filter(|memory| memory.row.intent_id == intent.intent_id)
+            .and_then(|memory| memory.attempts.last())
+            .map(|attempt| attempt.row.attempt_id);
+        let Some(attempt_id) = attempt_id else {
+            return Err(SendRefusal::NotSent(
+                "no send grant: the id's history is gone".to_string(),
+            ));
+        };
+        self.grant(&mut state, &intent.client_order_id, attempt_id)
+    }
+
+    /// Grant the send of `client_order_id`'s attempt `attempt_id`, under the
+    /// memory mutex, unless its outcome is registered or its operation ended.
+    /// A seal alone does not refuse: an overflow seals against further
+    /// attempts, not this one's send.
+    fn grant(
+        &self,
+        state: &mut JournalState,
+        client_order_id: &str,
+        attempt_id: Uuid,
+    ) -> Result<u64, SendRefusal> {
+        let refused = |why: &str| Err(SendRefusal::NotSent(format!("no send grant: {why}")));
+        let Some(memory) = state.intents.get(client_order_id) else {
+            return refused("the id's history is gone");
+        };
+        if memory.outcome.is_some() {
+            return refused("the order has its outcome");
+        }
+        if memory.closing {
+            return refused("its failure is being finalized");
+        }
+        if !state.operations.contains_key(&memory.operation) {
+            return refused("its operation ended");
+        }
+        let Some(grant_id) = self.next_grant_id() else {
+            return refused("the grant counter is exhausted");
+        };
+        if let Some(memory) = state.intents.get_mut(client_order_id) {
+            memory.grant = Some(Grant { attempt_id, grant_id });
+        }
+        Ok(grant_id)
+    }
+
+    /// A grant id never used before in this journal's life, or `None` once
+    /// the counter is exhausted.
+    fn next_grant_id(&self) -> Option<u64> {
+        self.next_grant
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |next| next.checked_add(1))
+            .ok()
+    }
+
+    /// Exhaust the grant counter, for the test that it fails closed.
+    #[cfg(test)]
+    pub(crate) fn exhaust_grants(&self) {
+        self.next_grant.store(u64::MAX, Ordering::SeqCst);
+    }
+
+    /// Revoke grant `grant_id` of `client_order_id` if it is still unused:
+    /// the drop of its guard. The memory mutex only, recovering from poison;
+    /// no callback, nothing logged under it.
+    fn revoke(&self, client_order_id: &str, grant_id: u64) {
+        let mut state = self.lock();
+        if let Some(memory) = state.intents.get_mut(client_order_id) {
+            if memory.grant.is_some_and(|grant| grant.grant_id == grant_id) {
+                memory.grant = None;
+            }
+        }
+    }
+
+    /// Take the grant of `client_order_id`'s last attempt at its send start,
+    /// for this task's operation of this journal. It is gone whatever follows.
+    fn take_grant(
+        &self,
+        state: &mut JournalState,
+        client_order_id: &str,
+    ) -> Result<(), SendRefusal> {
+        let refused = |why: &str| Err(SendRefusal::NotSent(format!("send not granted: {why}")));
+        let operation = CURRENT_OPERATION
+            .try_with(|current| {
+                std::ptr::eq(Arc::as_ptr(&current.journal), self).then_some(current.id)
+            })
+            .ok()
+            .flatten();
+        let Some(operation) = operation else {
+            return refused("not in an operation of this journal");
+        };
+        let registered = state.operations.contains_key(&operation);
+        let Some(memory) = state.intents.get_mut(client_order_id) else {
+            return refused("no intent with this id");
+        };
+        if memory.operation != operation || !registered {
+            return refused("the intent belongs to another operation");
+        }
+        if memory.outcome.is_some() {
+            return refused("the order has its outcome");
+        }
+        if memory.closing {
+            return refused("its failure is being finalized");
+        }
+        let last = memory.attempts.last().map(|attempt| attempt.row.attempt_id);
+        match memory.grant.take() {
+            Some(grant) if Some(grant.attempt_id) == last => Ok(()),
+            _ => refused("no live grant"),
         }
     }
 
@@ -1815,13 +2077,14 @@ impl OrderJournal {
     /// registered or is not uncertain.
     fn settle_refused_original(&self, intent: &JournaledIntent) {
         let outcome = {
-            let state = self.lock();
-            let Some(memory) = state.intents.get(&intent.client_order_id) else {
+            let mut state = self.lock();
+            let Some(memory) = state.intents.get_mut(&intent.client_order_id) else {
                 return;
             };
             if memory.row.intent_id != intent.intent_id || memory.outcome.is_some() {
                 return;
             }
+            self.close_for_failure(memory);
             Self::failed_outcome(memory)
         };
         if let Some(outcome) = outcome.filter(OutcomeRow::is_uncertain) {
@@ -1852,8 +2115,32 @@ impl OrderJournal {
     /// await. A send with no intent here (funding) is counted and has no
     /// ticket.
     fn begin_send(&self, client_order_id: &str) -> Result<(), SendRefusal> {
+        self.begin_send_checked(client_order_id, false)
+    }
+
+    /// The send start of a one-attempt ledger (ADR-0056 step 8): first, in the
+    /// same critical section, this task's operation takes the grant of the
+    /// order's one attempt; then [`Self::begin_send`]'s rules and ticket. A
+    /// refusal is a proven no-send, and the grant is gone either way.
+    ///
+    /// # Errors
+    /// Not a one-attempt journal, no live grant, another operation's intent,
+    /// an outcome already registered; or what [`Self::begin_send`] refuses.
+    pub(crate) fn begin_authorized_send(&self, client_order_id: &str) -> Result<(), SendRefusal> {
+        if !self.one_attempt_per_client_id {
+            return Err(SendRefusal::NotSent(
+                "send not granted: this journal grants no sends".to_string(),
+            ));
+        }
+        self.begin_send_checked(client_order_id, true)
+    }
+
+    fn begin_send_checked(&self, client_order_id: &str, granted: bool) -> Result<(), SendRefusal> {
         let mut gate = self.gate.lock();
         let mut state = self.lock();
+        if granted {
+            self.take_grant(&mut state, client_order_id)?;
+        }
         let entry = state
             .intents
             .get(client_order_id)
@@ -2021,6 +2308,7 @@ impl OrderJournal {
                 return None;
             }
             memory.sealed = true;
+            self.close_for_failure(memory);
             // Settled already (a refused retry's original): only its write,
             // and none once it has landed.
             match &memory.outcome {
@@ -2029,6 +2317,8 @@ impl OrderJournal {
                 None => Ok(Self::failed_outcome(memory)),
             }
         };
+        #[cfg(test)]
+        self.run_failure_snapshot_hook();
         match ending {
             Err(registered) => Some(registered),
             Ok(Some(outcome)) => self.register_outcome(intent, outcome),
@@ -2037,6 +2327,35 @@ impl OrderJournal {
                 None
             },
         }
+    }
+
+    /// On a one-attempt journal (ADR-0056 step 8), close the intent's send for
+    /// its failure finalization, in the caller's critical section, the one
+    /// that computes the failed outcome: a send start after it is refused (a
+    /// proven no-send), and one before it shows in the ticket the outcome
+    /// reads. A live grant is left in place for the send start to refuse,
+    /// and the outcome's registration clears it; an authorization still
+    /// committing gets none. Nothing when the flag is off.
+    fn close_for_failure(&self, memory: &mut IntentMemory) {
+        if self.one_attempt_per_client_id {
+            memory.closing = true;
+        }
+    }
+
+    /// Run the test seam set by [`Self::on_failure_snapshot`], once.
+    #[cfg(test)]
+    fn run_failure_snapshot_hook(&self) {
+        let hook = self.after_failure_snapshot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Run `hook` once, between the next failure's snapshot and its
+    /// registration, with no lock held.
+    #[cfg(test)]
+    pub(crate) fn on_failure_snapshot(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.after_failure_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
     }
 
     /// `None` when nothing was sent and no row can exist: nothing to write.
@@ -2177,6 +2496,7 @@ impl OrderJournal {
                 occurrence
             });
             memory.sealed = true;
+            memory.grant = None;
             memory.outcome = Some(outcome);
             memory.outcome_landed = false;
             let batch = memory.batch();
@@ -2627,6 +2947,10 @@ impl Drop for Operation {
         if self.listed_unpermitted {
             state.unpermitted_listed -= 1;
         }
+        // ADR-0056 step 8: nothing of this operation is sent after it ends.
+        for memory in state.intents.values_mut().filter(|memory| memory.operation == self.id) {
+            memory.grant = None;
+        }
         // PR O: every claim of this operation goes with it, whatever its
         // intents' memory holds, and so does a key no one holds any more.
         let id = self.id;
@@ -2745,6 +3069,10 @@ impl Drop for Permit {
         gate.release(self.kind.class());
     }
 }
+
+#[cfg(test)]
+#[path = "one_attempt_tests.rs"]
+mod one_attempt_tests;
 
 #[cfg(test)]
 mod tests {

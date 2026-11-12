@@ -385,6 +385,7 @@ mod tests {
             fee: dec!(0.01),
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
+            evidence: None,
         };
         let gone = |final_state| StopCancelOutcome::AlreadyGone { final_state };
         for outcome in [
@@ -445,6 +446,7 @@ mod tests {
             fee: dec!(0.95),
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
+            evidence: None,
         };
         s.set_order_result("42", fill);
 
@@ -665,6 +667,7 @@ mod recorded_forwarding {
             fee: Decimal::ZERO,
             fee_asset: "USDT".to_string(),
             filled_at: DateTime::from_timestamp(0, 0).unwrap(),
+            evidence: None,
         }
     }
 

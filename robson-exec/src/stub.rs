@@ -834,6 +834,7 @@ impl StubExchange {
             fee,
             fee_asset: "USDT".to_string(),
             filled_at,
+            evidence: None,
         };
         self.filled_stop_orders
             .write()
@@ -995,6 +996,7 @@ impl venue::TradingPort for StubExchange {
             fee,
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
+            evidence: None,
         };
         let delta = if intent.is_reduce() {
             -quantity.as_decimal()
@@ -1074,6 +1076,7 @@ impl venue::TradingPort for StubExchange {
                 fee: Decimal::ZERO,
                 fee_asset: "USDT".to_string(),
                 filled_at: placed_at,
+                evidence: None,
             },
         })
     }
@@ -1611,6 +1614,7 @@ impl venue::PositionAccountPort for StubExchange {
             fee,
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
+            evidence: None,
         };
         self.client_orders
             .write()
@@ -1697,6 +1701,7 @@ impl venue::AccountPort for StubExchange {
             replacement: ReplacementProtocol::PlaceThenCancel,
             has_funding: self.has_funding,
             order_finality: STUB_FINALITY,
+            one_attempt_per_client_id: false,
         }
     }
 }
@@ -2146,6 +2151,7 @@ mod tests {
             fee: dec!(9.5),
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
+            evidence: None,
         };
 
         exchange.set_order_result("12345", order_result.clone());

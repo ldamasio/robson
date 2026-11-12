@@ -1697,6 +1697,7 @@ mod tests {
             fee: dec!(0.01),
             fee_asset: "USDT".to_string(),
             filled_at,
+            evidence: None,
         }
     }
 

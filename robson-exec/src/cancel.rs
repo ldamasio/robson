@@ -123,7 +123,36 @@ mod tests {
             fee: dec!(0.01),
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
+            evidence: None,
         }
+    }
+
+    /// The cancel evidence bytes, captured before ADR-0056 step 8 (PR 8c)
+    /// added `OrderResult`'s evidence fields. USD-M's `venue_evidence` must
+    /// not change.
+    #[test]
+    fn usdm_cancel_evidence_is_byte_identical() {
+        let cancelled = classify_cancel(Ok(StopCancelOutcome::Cancelled {
+            filled_before_cancel: dec!(0),
+            fills: None,
+        }));
+        assert_eq!(
+            cancelled.evidence().unwrap().to_string(),
+            r#"{"filled_before_cancel":"0","fills":null}"#
+        );
+        let mut result = fill();
+        result.filled_at = chrono::DateTime::parse_from_rfc3339("2026-11-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let terminal = gone(OrderLookup::Terminal {
+            filled_qty: dec!(0.1),
+            cancelled_qty: dec!(0),
+            fills: Some(result),
+        });
+        assert_eq!(
+            terminal.evidence().unwrap().to_string(),
+            r#"{"filled_qty":"0.1","fills":{"client_order_id":"ins-1","exchange_order_id":"77","fee":"0.01","fee_asset":"USDT","fill_price":"90","filled_at":"2026-11-11T00:00:00Z","filled_quantity":"0.1"}}"#
+        );
     }
 
     fn gone(final_state: OrderLookup) -> CancelClass {
@@ -158,6 +187,26 @@ mod tests {
                 actual: text.to_string(),
                 advice: text.to_string(),
             },
+            ExecError::ExpiredUnfilled(Box::new(crate::venue::VenueOrderRecord {
+                exchange_order_id: text.to_string(),
+                client_order_id: text.to_string(),
+                orig_client_order_id: None,
+                symbol: "BTCUSDT".to_string(),
+                side: robson_domain::OrderSide::Buy,
+                order_type: "MARKET".to_string(),
+                protection_kind: None,
+                status: "EXPIRED".to_string(),
+                phase: crate::venue::OrderPhase::Terminal,
+                orig_qty: dec!(0.1),
+                executed_qty: dec!(0),
+                cumulative_quote_qty: Some(dec!(0)),
+                stop_price: None,
+                expiry_reason: Some(text.to_string()),
+                transact_time_ms: None,
+                update_time_ms: None,
+                time_ms: None,
+                working_time_ms: None,
+            })),
         ];
         for error in &errors {
             match error {
@@ -174,7 +223,8 @@ mod tests {
                 | ExecError::InvalidState(_)
                 | ExecError::Config(_)
                 | ExecError::Timeout(_)
-                | ExecError::FuturesSafetyViolation { .. } => {},
+                | ExecError::FuturesSafetyViolation { .. }
+                | ExecError::ExpiredUnfilled(_) => {},
             }
         }
         errors

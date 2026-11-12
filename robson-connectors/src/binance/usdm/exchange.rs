@@ -128,6 +128,7 @@ fn fill_evidence(response: BinanceOrderResponse) -> Result<Option<OrderResult>, 
         fee,
         fee_asset,
         filled_at,
+        evidence: None,
     }))
 }
 
@@ -627,6 +628,7 @@ impl BinanceExchangeAdapter {
             fee,
             fee_asset,
             filled_at,
+            evidence: None,
         }))
     }
 }
@@ -929,6 +931,7 @@ impl TradingPort for BinanceExchangeAdapter {
             fee,
             fee_asset,
             filled_at,
+            evidence: None,
         })
     }
 
@@ -1009,6 +1012,7 @@ impl TradingPort for BinanceExchangeAdapter {
                 fee: Decimal::ZERO,
                 fee_asset: "USDT".to_string(),
                 filled_at: placed_at,
+                evidence: None,
             },
         })
     }
@@ -1468,6 +1472,7 @@ impl AccountPort for BinanceExchangeAdapter {
             replacement: ReplacementProtocol::PlaceThenCancel,
             has_funding: true,
             order_finality: USDM_FINALITY,
+            one_attempt_per_client_id: false,
         }
     }
 }
@@ -2217,6 +2222,36 @@ mod submit_attempt_evidence {
             let (venue, _, _) = metadata_venue(None, Some((200, order(status)))).await;
             assert!(reduce(&venue, "exit-2").await.is_err(), "{status}");
         }
+    }
+
+    /// ADR-0056 step 8 (PR 8c): USD-M results carry no per-trade evidence and
+    /// no record, whatever the answer holds, so their serialized form and
+    /// meaning are unchanged.
+    #[tokio::test]
+    async fn usdm_results_carry_no_fills() {
+        let body = r#"{"symbol":"BTCUSDT","orderId":7,"clientOrderId":"c1",
+            "updateTime":1700000000000,"price":"0","avgPrice":"90000","origQty":"0.4",
+            "executedQty":"0.4","cumQuote":"36000","status":"FILLED","side":"SELL",
+            "type":"MARKET","fills":[{"price":"90000","qty":"0.4","commission":"0.1",
+            "commissionAsset":"USDT"}]}"#;
+        let (venue, _, _) = metadata_venue(None, Some((200, body.to_string()))).await;
+        let result = TradingPort::place_market_order(
+            &*venue,
+            &btcusdt(),
+            OrderSide::Sell,
+            Quantity::new(dec!(0.4)).unwrap(),
+            "exit-1",
+            EntryOrReduce::Reduce,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.fee, dec!(0.1));
+        assert!(result.evidence.is_none());
+        assert!(result.fills().is_empty());
+        assert!(result.record().is_none());
+        assert_eq!(result.fee_evidence(), robson_exec::ports::FeeEvidence::AsReported);
+        // USD-M allows a resubmission under the same id (ADR-0056 §5).
+        assert!(!venue.capabilities().one_attempt_per_client_id);
     }
 
     /// A later attempt on a persistent rejection does not refresh again within
