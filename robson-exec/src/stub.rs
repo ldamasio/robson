@@ -1710,6 +1710,7 @@ impl venue::AccountPort for StubExchange {
             replacement: ReplacementProtocol::PlaceThenCancel,
             has_funding: self.has_funding,
             order_finality: STUB_FINALITY,
+            one_attempt_per_client_id: false,
         }
     }
 }

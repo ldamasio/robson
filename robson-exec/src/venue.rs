@@ -200,11 +200,17 @@ struct LedgerState {
 /// [`Self::final_evidence`] answers from the durable rows; `evidence` stays
 /// the in-memory view. A daemon with no database has neither, and every
 /// not-found on an earlier process's id stays `Unknown`.
+///
+/// **One attempt per client id (ADR-0056 step 8).** A ledger built with
+/// [`Self::one_attempt`] starts a send only by taking the grant its attached
+/// journal gave the order ([`OrderJournal::authorize_send`]); with no journal
+/// attached, or one without the capability, it refuses every send.
 #[derive(Debug)]
 pub struct SubmitAttemptLedger {
     capacity: usize,
     state: Mutex<LedgerState>,
     journal: OnceLock<Arc<OrderJournal>>,
+    one_attempt: bool,
 }
 
 impl fmt::Debug for OrderJournal {
@@ -220,7 +226,14 @@ impl SubmitAttemptLedger {
             capacity,
             state: Mutex::new(LedgerState::default()),
             journal: OnceLock::new(),
+            one_attempt: false,
         }
+    }
+
+    /// A ledger whose every send needs its journal's grant (ADR-0056 step 8):
+    /// for a venue with `one_attempt_per_client_id`.
+    pub fn one_attempt(capacity: usize) -> Self {
+        Self { one_attempt: true, ..Self::new(capacity) }
     }
 
     /// Answer the finality rule from the durable journal from now on.
@@ -243,7 +256,16 @@ impl SubmitAttemptLedger {
         &'a self,
         client_order_id: &'a str,
     ) -> Result<SubmitAttempt<'a>, SendRefusal> {
-        begin_send(client_order_id)?;
+        if self.one_attempt {
+            let Some(journal) = self.journal.get() else {
+                return Err(SendRefusal::NotSent(
+                    "send not granted: the one-attempt ledger has no journal".to_string(),
+                ));
+            };
+            journal.begin_authorized_send(client_order_id)?;
+        } else {
+            begin_send(client_order_id)?;
+        }
         Ok(self.register(client_order_id))
     }
 
@@ -386,6 +408,11 @@ pub struct VenueCapabilities {
     /// [`ExecutionCostEnvelope::funding`].
     pub has_funding: bool,
     pub order_finality: VenueFinalityRule,
+    /// Whether every client id is sent at most once (ADR-0056 step 8): the
+    /// venue accepts an id again once its earlier order filled (Binance spot,
+    /// F12), so a resubmission under the same id bounds nothing. The journal
+    /// built for such a venue refuses a second attempt and grants each send.
+    pub one_attempt_per_client_id: bool,
 }
 
 // =============================================================================

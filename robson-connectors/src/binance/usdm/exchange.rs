@@ -1480,6 +1480,7 @@ impl AccountPort for BinanceExchangeAdapter {
             replacement: ReplacementProtocol::PlaceThenCancel,
             has_funding: true,
             order_finality: USDM_FINALITY,
+            one_attempt_per_client_id: false,
         }
     }
 }
@@ -2256,6 +2257,8 @@ mod submit_attempt_evidence {
         assert!(result.fills.is_empty());
         assert!(result.record.is_none());
         assert_eq!(result.fee_evidence, FeeEvidence::AsReported);
+        // USD-M allows a resubmission under the same id (ADR-0056 §5).
+        assert!(!venue.capabilities().one_attempt_per_client_id);
     }
 
     /// A later attempt on a persistent rejection does not refresh again within
