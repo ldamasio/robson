@@ -25,7 +25,7 @@ use robson_exec::{
     gate::OperationGate,
     order_journal::OrderJournal,
     ports::{
-        ExchangePosition, FeeEvidence, FuturesBalance, FuturesSettings, IncomeRecord, IncomeType,
+        ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord, IncomeType,
         OpenOrderRecord, SpotBalance, SpotOrder, SpotOrderQuantity, SpotOrderRequest,
         SpotOrderSide, Transfer, TransferId, UniversalTransferType, UserTradeRecord,
     },
@@ -128,9 +128,7 @@ fn fill_evidence(response: BinanceOrderResponse) -> Result<Option<OrderResult>, 
         fee,
         fee_asset,
         filled_at,
-        fills: Vec::new(),
-        record: None,
-        fee_evidence: FeeEvidence::AsReported,
+        evidence: None,
     }))
 }
 
@@ -630,9 +628,7 @@ impl BinanceExchangeAdapter {
             fee,
             fee_asset,
             filled_at,
-            fills: Vec::new(),
-            record: None,
-            fee_evidence: FeeEvidence::AsReported,
+            evidence: None,
         }))
     }
 }
@@ -935,9 +931,7 @@ impl TradingPort for BinanceExchangeAdapter {
             fee,
             fee_asset,
             filled_at,
-            fills: Vec::new(),
-            record: None,
-            fee_evidence: FeeEvidence::AsReported,
+            evidence: None,
         })
     }
 
@@ -1018,9 +1012,7 @@ impl TradingPort for BinanceExchangeAdapter {
                 fee: Decimal::ZERO,
                 fee_asset: "USDT".to_string(),
                 filled_at: placed_at,
-                fills: Vec::new(),
-                record: None,
-                fee_evidence: FeeEvidence::AsReported,
+                evidence: None,
             },
         })
     }
@@ -2254,9 +2246,10 @@ mod submit_attempt_evidence {
         .await
         .unwrap();
         assert_eq!(result.fee, dec!(0.1));
-        assert!(result.fills.is_empty());
-        assert!(result.record.is_none());
-        assert_eq!(result.fee_evidence, FeeEvidence::AsReported);
+        assert!(result.evidence.is_none());
+        assert!(result.fills().is_empty());
+        assert!(result.record().is_none());
+        assert_eq!(result.fee_evidence(), robson_exec::ports::FeeEvidence::AsReported);
         // USD-M allows a resubmission under the same id (ADR-0056 §5).
         assert!(!venue.capabilities().one_attempt_per_client_id);
     }

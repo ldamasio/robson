@@ -1697,9 +1697,7 @@ mod tests {
             fee: dec!(0.01),
             fee_asset: "USDT".to_string(),
             filled_at,
-            fills: Vec::new(),
-            record: None,
-            fee_evidence: Default::default(),
+            evidence: None,
         }
     }
 

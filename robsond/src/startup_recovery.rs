@@ -1416,9 +1416,7 @@ mod tests {
             fee: Decimal::ZERO,
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
-            fills: Vec::new(),
-            record: None,
-            fee_evidence: Default::default(),
+            evidence: None,
         });
 
         let mut position = btcusdt_long_position(Uuid::now_v7());

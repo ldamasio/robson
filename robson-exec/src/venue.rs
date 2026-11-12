@@ -1267,7 +1267,7 @@ pub async fn replace_cancel_then_place<T: TradingPort + AccountPort + ?Sized>(
         },
     };
     let protection = venue.capabilities().protection;
-    let Some(record) = placed.acceptance.record.clone() else {
+    let Some(record) = placed.acceptance.record().cloned() else {
         return Ok(ReplaceOutcome::Unknown { new: Some(placed) });
     };
     Ok(match record.phase {

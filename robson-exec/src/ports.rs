@@ -440,32 +440,81 @@ pub struct OrderResult {
     pub fee_asset: String,
     /// When the order was filled
     pub filled_at: DateTime<Utc>,
-    /// Per-trade evidence (ADR-0056 step 8). Empty on USD-M and the stub, and
-    /// then omitted, so their serialized results are unchanged.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fills: Vec<TradeFill>,
-    /// The venue's own record of the order, when the adapter has one (a
-    /// balance account's every result). `None` on USD-M and the stub, and
-    /// then omitted. Boxed: results travel inside deep futures (a debug test
-    /// overflowed its stack with the record inline), and the record is large.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub record: Option<Box<VenueOrderRecord>>,
-    /// What `fee` and `fee_asset` are worth. `AsReported` on USD-M and the
-    /// stub, and then omitted.
-    #[serde(default, skip_serializing_if = "FeeEvidence::is_as_reported")]
-    pub fee_evidence: FeeEvidence,
+    /// Per-trade fills, the venue's own record of the order and what `fee`
+    /// is worth (ADR-0056 step 8): `None` on USD-M and the stub. One box,
+    /// flattened: its fields serialize at the top level (`fills`, `record`,
+    /// `fee_evidence`), each omitted when empty, so a result without evidence
+    /// serializes as before; and `OrderResult` grows by one pointer only, as
+    /// results travel inside deep futures (a debug test's stack is near its
+    /// limit). Read it through [`Self::fills`], [`Self::record`] and
+    /// [`Self::fee_evidence`]. A result without any of the three fields
+    /// deserializes as `None`.
+    #[serde(flatten, deserialize_with = "evidence_or_none")]
+    pub evidence: Option<Box<OrderEvidence>>,
+}
+
+/// Reads the flattened evidence as a struct, not as an `Option`: a flattened
+/// `Option` would read malformed evidence as `None` instead of failing.
+/// Evidence that is all empty reads back as `None`, as it was before 8c.
+fn evidence_or_none<'de, D>(deserializer: D) -> Result<Option<Box<OrderEvidence>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let evidence = OrderEvidence::deserialize(deserializer)?;
+    Ok(Some(Box::new(evidence)).filter(|evidence| !evidence.is_empty()))
 }
 
 impl OrderResult {
+    /// Per-trade evidence; empty when the venue gave none.
+    pub fn fills(&self) -> &[TradeFill] {
+        self.evidence.as_deref().map_or(&[], |evidence| evidence.fills.as_slice())
+    }
+
+    /// The venue's own record of the order, when the adapter has one (a
+    /// balance account's every result).
+    pub fn record(&self) -> Option<&VenueOrderRecord> {
+        self.evidence.as_deref().and_then(|evidence| evidence.record.as_ref())
+    }
+
+    /// What `fee` and `fee_asset` are worth; `AsReported` without evidence.
+    pub fn fee_evidence(&self) -> FeeEvidence {
+        self.evidence
+            .as_deref()
+            .map_or(FeeEvidence::AsReported, |evidence| evidence.fee_evidence)
+    }
+
     /// The commission total with its asset, or `None` when the adapter could
     /// not establish one ([`FeeEvidence::Unavailable`]): the per-trade
     /// commissions in [`Self::fills`] are then the only fee evidence. A
     /// balance-account consumer reads fees through this, never through `fee`.
     pub fn fee_total(&self) -> Option<(Decimal, &str)> {
-        match self.fee_evidence {
+        match self.fee_evidence() {
             FeeEvidence::AsReported | FeeEvidence::Total => Some((self.fee, &self.fee_asset)),
             FeeEvidence::Unavailable(_) => None,
         }
+    }
+}
+
+/// What an adapter knows of an order beyond `OrderResult`'s scalars (ADR-0056
+/// step 8). Each field is omitted from serialization when empty.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OrderEvidence {
+    /// Per-trade evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fills: Vec<TradeFill>,
+    /// The venue's own record of the order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<VenueOrderRecord>,
+    /// What `fee` and `fee_asset` are worth.
+    #[serde(default, skip_serializing_if = "FeeEvidence::is_as_reported")]
+    pub fee_evidence: FeeEvidence,
+}
+
+impl OrderEvidence {
+    /// No fills, no record and a fee as reported: what a result without
+    /// evidence means.
+    pub fn is_empty(&self) -> bool {
+        self.fills.is_empty() && self.record.is_none() && self.fee_evidence.is_as_reported()
     }
 }
 
@@ -841,9 +890,7 @@ mod tests {
             fee: dec!(0.001),
             fee_asset: "BNB".to_string(),
             filled_at: Utc::now(),
-            fills: Vec::new(),
-            record: None,
-            fee_evidence: FeeEvidence::AsReported,
+            evidence: None,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -865,9 +912,7 @@ mod tests {
             filled_at: DateTime::parse_from_rfc3339("2026-11-11T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
-            fills: Vec::new(),
-            record: None,
-            fee_evidence: FeeEvidence::AsReported,
+            evidence: None,
         }
     }
 
@@ -890,6 +935,32 @@ mod tests {
     fn an_order_result_from_before_8c_deserializes() {
         let parsed: OrderResult = serde_json::from_str(GOLDEN_RESULT).unwrap();
         assert_eq!(serde_json::to_string(&parsed).unwrap(), GOLDEN_RESULT);
+        assert!(parsed.evidence.is_none(), "{:?}", parsed.evidence);
+        assert!(parsed.fills().is_empty());
+        assert!(parsed.record().is_none());
+        assert_eq!(parsed.fee_evidence(), FeeEvidence::AsReported);
+    }
+
+    /// Malformed evidence fails to deserialize; it never reads as none.
+    #[test]
+    fn malformed_evidence_is_an_error() {
+        let base = GOLDEN_RESULT.trim_end_matches('}');
+        for field in [
+            r#""fills":5"#,
+            r#""fills":[{"trade_id":"9"}]"#,
+            r#""record":{"exchange_order_id":"77"}"#,
+            r#""fee_evidence":"Sometimes""#,
+        ] {
+            let json = format!("{base},{field}}}");
+            assert!(serde_json::from_str::<OrderResult>(&json).is_err(), "{json}");
+        }
+    }
+
+    /// OrderResult grows by one pointer over its pre-8c size (136 bytes on
+    /// 64-bit targets): results travel inside deep futures.
+    #[test]
+    fn an_order_result_grows_by_one_pointer_only() {
+        assert_eq!(std::mem::size_of::<OrderResult>(), 136 + std::mem::size_of::<usize>());
     }
 
     fn spot_record() -> VenueOrderRecord {
@@ -922,17 +993,19 @@ mod tests {
     #[test]
     fn evidence_fields_serialize_only_when_present() {
         let mut result = golden_result();
-        result.fills = vec![TradeFill {
-            trade_id: "9".to_string(),
-            price: dec!(95000.5),
-            qty: dec!(0.25),
-            quote_qty: dec!(23750.125),
-            commission: dec!(0.00025),
-            commission_asset: "BTC".to_string(),
-            time: None,
-        }];
-        result.record = Some(Box::new(spot_record()));
-        result.fee_evidence = FeeEvidence::Unavailable(FeeGap::MixedAssets);
+        result.evidence = Some(Box::new(OrderEvidence {
+            fills: vec![TradeFill {
+                trade_id: "9".to_string(),
+                price: dec!(95000.5),
+                qty: dec!(0.25),
+                quote_qty: dec!(23750.125),
+                commission: dec!(0.00025),
+                commission_asset: "BTC".to_string(),
+                time: None,
+            }],
+            record: Some(spot_record()),
+            fee_evidence: FeeEvidence::Unavailable(FeeGap::MixedAssets),
+        }));
         let json = serde_json::to_string(&result).unwrap();
         for key in [
             r#""fills":["#,
@@ -942,9 +1015,10 @@ mod tests {
             assert!(json.contains(key), "{key} in {json}");
         }
         let parsed: OrderResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.fills, result.fills);
-        assert_eq!(parsed.record, result.record);
-        let record = parsed.record.unwrap();
+        assert_eq!(parsed.evidence, result.evidence);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json, "spot JSON round-trips");
+        assert_eq!(parsed.fills(), result.fills());
+        let record = parsed.record().unwrap();
         assert_eq!(
             (
                 record.transact_time_ms,
@@ -959,16 +1033,36 @@ mod tests {
                 Some(1_762_819_200_003)
             )
         );
-        assert_eq!(parsed.fee_evidence, result.fee_evidence);
+        assert_eq!(parsed.fee_evidence(), result.fee_evidence());
 
+        // Each field alone is serialized, and only it, and reads back.
+        let alone = |evidence: OrderEvidence| {
+            let mut only = golden_result();
+            only.evidence = Some(Box::new(evidence.clone()));
+            let json = serde_json::to_string(&only).unwrap();
+            let back: OrderResult = serde_json::from_str(&json).unwrap();
+            let expected = Some(Box::new(evidence)).filter(|e| !e.is_empty());
+            assert_eq!(back.evidence, expected, "{json}");
+            json
+        };
         for evidence in [
             FeeEvidence::Total,
             FeeEvidence::Unavailable(FeeGap::NoFills),
         ] {
-            let mut only = golden_result();
-            only.fee_evidence = evidence;
-            assert_ne!(serde_json::to_string(&only).unwrap(), GOLDEN_RESULT, "{evidence:?}");
+            let json = alone(OrderEvidence {
+                fee_evidence: evidence,
+                ..OrderEvidence::default()
+            });
+            assert!(json.contains("fee_evidence") && !json.contains("fills"), "{json}");
+            assert!(!json.contains("\"record\""), "{json}");
         }
+        let json = alone(OrderEvidence {
+            record: Some(spot_record()),
+            ..OrderEvidence::default()
+        });
+        assert!(json.contains("\"record\"") && !json.contains("fee_evidence"), "{json}");
+        // Evidence that is all empty serializes as no evidence at all.
+        assert_eq!(alone(OrderEvidence::default()), GOLDEN_RESULT);
     }
 
     /// An unavailable total never reads as a fee, zero included.
@@ -976,7 +1070,9 @@ mod tests {
     fn only_an_established_total_is_a_fee_total() {
         let mut result = golden_result();
         assert_eq!(result.fee_total(), Some((dec!(0.01), "USDT")));
-        result.fee_evidence = FeeEvidence::Total;
+        let with =
+            |fee_evidence| Some(Box::new(OrderEvidence { fee_evidence, ..Default::default() }));
+        result.evidence = with(FeeEvidence::Total);
         assert_eq!(result.fee_total(), Some((dec!(0.01), "USDT")));
         for gap in [
             FeeGap::NoFills,
@@ -985,7 +1081,7 @@ mod tests {
             FeeGap::MixedAssets,
             FeeGap::Overflow,
         ] {
-            result.fee_evidence = FeeEvidence::Unavailable(gap);
+            result.evidence = with(FeeEvidence::Unavailable(gap));
             result.fee = Decimal::ZERO;
             assert_eq!(result.fee_total(), None, "{gap:?}");
         }

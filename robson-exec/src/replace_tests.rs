@@ -10,7 +10,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use super::*;
-use crate::ports::FeeEvidence;
+use crate::ports::{FeeEvidence, OrderEvidence};
 
 fn btcusdt() -> Symbol {
     Symbol::from_pair("BTCUSDT").unwrap()
@@ -60,9 +60,11 @@ fn placed(record: Option<VenueOrderRecord>) -> PlacedStop {
             fee: Decimal::ZERO,
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
-            fills: Vec::new(),
-            record: record.map(Box::new),
-            fee_evidence: FeeEvidence::Total,
+            evidence: Some(Box::new(OrderEvidence {
+                fills: Vec::new(),
+                record,
+                fee_evidence: FeeEvidence::Total,
+            })),
         },
     }
 }
