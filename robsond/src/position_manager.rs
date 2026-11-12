@@ -13354,6 +13354,15 @@ mod tests {
         sweep.complete();
     }
 
+    /// `execute_and_persist` returns its future boxed (ADR-0056 step 8, stack
+    /// headroom): a pointer, whatever the batch's future holds.
+    #[tokio::test]
+    async fn execute_and_persist_returns_its_future_boxed() {
+        let manager = create_test_manager().await;
+        let batch = manager.execute_and_persist(Vec::new());
+        assert_eq!(std::mem::size_of_val(&batch), std::mem::size_of::<usize>());
+    }
+
     /// An `Immediate` arm enters synchronously: under the claim, its entry
     /// is refused at its send and nothing reaches the venue.
     #[tokio::test]

@@ -5299,4 +5299,56 @@ mod tests {
                 .await;
         }
     }
+
+    /// Every public wrapper boxes its work at the call (ADR-0056 step 8, stack
+    /// headroom): its future is the same size whatever the work holds.
+    #[test]
+    fn the_wrappers_box_their_work() {
+        use std::mem::size_of_val;
+        async fn big() {
+            let pad = [0u8; 64 * 1024];
+            std::future::ready(()).await;
+            std::hint::black_box(&pad);
+        }
+        let small = || async {};
+        assert!(size_of_val(&big()) >= 64 * 1024, "the fixture holds 64 KiB across an await");
+        let kind = OperationKind::MainLoop;
+        let (_, held) = journal();
+        assert_eq!(
+            size_of_val(&held.with_permit(kind, big())),
+            size_of_val(&held.with_permit(kind, small())),
+            "with_permit"
+        );
+        assert_eq!(
+            size_of_val(&held.within_operation(big())),
+            size_of_val(&held.within_operation(small())),
+            "within_operation"
+        );
+        assert_eq!(
+            size_of_val(&held.run_admission(Some("c"), big())),
+            size_of_val(&held.run_admission(Some("c"), small())),
+            "run_admission"
+        );
+        let operation = held.begin_operation();
+        assert_eq!(
+            size_of_val(&operation.scope(big())),
+            size_of_val(&operation.scope(small())),
+            "Operation::scope"
+        );
+        let permit = held.acquire(kind).unwrap();
+        assert_eq!(
+            size_of_val(&permit.scope(big())),
+            size_of_val(&permit.scope(small())),
+            "Permit::scope"
+        );
+        permit.complete();
+        // `run` takes its permit, and an unpolled run aborts it when dropped:
+        // one journal each.
+        let ((_, first), (_, second)) = (journal(), journal());
+        assert_eq!(
+            size_of_val(&first.acquire(kind).unwrap().run(big())),
+            size_of_val(&second.acquire(kind).unwrap().run(small())),
+            "Permit::run"
+        );
+    }
 }

@@ -59,6 +59,8 @@ pub mod query;
 pub mod query_engine;
 pub mod reconciliation_worker;
 mod sse;
+#[cfg(test)]
+mod stack_budget_tests;
 pub mod startup_recovery;
 pub mod stop;
 pub mod venue;
