@@ -460,6 +460,10 @@ impl StopRef {
 /// An accepted (unfilled) protective stop: its reference plus the acceptance
 /// record the executor journals (zero fill, the requested trigger echoed as
 /// `fill_price`, acceptance time as `filled_at`).
+///
+/// On a balance account (ADR-0056 step 8) `acceptance.record` carries the
+/// venue's record of the stop, whatever its status, and `Ok` by itself never
+/// means the stop is resting or the leg protected: the record decides.
 #[derive(Debug, Clone)]
 pub struct PlacedStop {
     pub stop: StopRef,
@@ -615,14 +619,21 @@ pub struct TradePage {
 pub enum StopCancelOutcome {
     /// The venue acknowledged the cancel. `filled_before_cancel` is the
     /// stop's cumulative execution at cancel time (zero for a conditional
-    /// stop that never triggered).
+    /// stop that never triggered). On a balance account (ADR-0056 step 8)
+    /// only an answer of exactly success whose own record is terminal, with a
+    /// parsed, consistent executed quantity, is this; any other success is
+    /// `Unknown`.
     Cancelled {
         filled_before_cancel: Decimal,
         fills: Option<OrderResult>,
     },
     /// The venue no longer knows the order; the commonest reason is that it
-    /// triggered. `final_state` is `Unknown` unless the adapter established
-    /// it without an extra venue request.
+    /// triggered. On a position account, `final_state` is `Unknown` unless the
+    /// adapter established it without an extra venue request. On a balance
+    /// account (ADR-0056 step 8, design §3.4.2), after the venue's not-found
+    /// the adapter looks the order up once by its exchange id and returns what
+    /// that establishes; a further not-found proves nothing. `Terminal.fills`
+    /// is `Some` only when trades with distinct ids sum to `filled_qty`.
     AlreadyGone { final_state: OrderLookup },
     /// The cancel outcome is indeterminate; reconcile before any further
     /// submission.
@@ -633,7 +644,9 @@ pub enum StopCancelOutcome {
 #[derive(Debug, Clone)]
 pub enum ReplaceOutcome {
     /// The successor is accepted and the old stop is gone with `old_filled`
-    /// cumulative execution.
+    /// cumulative execution. Under `CancelThenPlace` the successor's record
+    /// is live, unexecuted and matches what was asked; it still certifies no
+    /// protection (ADR-0056 step 8: that is the core's).
     Replaced {
         new: PlacedStop,
         old_filled: Decimal,
@@ -653,6 +666,19 @@ pub enum ReplaceOutcome {
     /// even the placement outcome is unknown. Reconcile before any further
     /// submission.
     Unknown { new: Option<PlacedStop> },
+    /// `CancelThenPlace` only: the old stop executed `old_filled` before it
+    /// ended, so the quantity to protect changed. Nothing was placed: the
+    /// caller recomputes it (ADR-0056 step 8).
+    OldExecuted { old_filled: Decimal },
+    /// `CancelThenPlace` only: the successor answered live and executing.
+    SuccessorExecuting { new: PlacedStop },
+    /// `CancelThenPlace` only: the successor's own record is terminal (an
+    /// expiry with nothing executed included): it protects nothing.
+    SuccessorTerminal { new: PlacedStop },
+    /// `CancelThenPlace` only: the successor is live but its record does not
+    /// match what was asked (symbol, references, side, protection kind,
+    /// quantity, trigger).
+    SuccessorMismatched { new: PlacedStop },
 }
 
 // =============================================================================
@@ -850,7 +876,9 @@ pub trait TradingPort: Send + Sync {
     /// `capabilities().protection` (ADR-0039). `trigger` is chart-derived
     /// (ADR-0021), never a percentage of entry. `quantity` and `trigger` are
     /// sent as given, with no metadata lookup: [`crate::quantize`] decides
-    /// them.
+    /// them. On a balance account `Ok` carries the venue's record in
+    /// `acceptance.record` and does not by itself mean resting (ADR-0056 step
+    /// 8).
     async fn place_protection(
         &self,
         symbol: &Symbol,
@@ -1181,6 +1209,92 @@ pub async fn replace_place_then_cancel<T: TradingPort + ?Sized>(
         Ok(_) | Err(_) => Ok(ReplaceOutcome::Unknown { new: Some(placed) }),
     }
 }
+
+/// `ReplacementProtocol::CancelThenPlace` over [`TradingPort`] (ADR-0056 step
+/// 8): the venue-neutral helper for the conformance suite. Production
+/// replacement on a balance account is the core's transition protocol.
+///
+/// The old stop is cancelled first and nothing is placed unless that cancel
+/// is definite (R1). When the old stop executed, the quantity to protect
+/// changed: [`ReplaceOutcome::OldExecuted`], nothing placed. A failed
+/// placement is a rejection only with [`AttemptEvidence::AllRejected`] for the
+/// successor's id, read after the failure; the venue's message is never read,
+/// so this never yields `TriggerAlreadyCrossed`. A placement that answered is
+/// read from its record: only a live, unexecuted record matching what was
+/// asked is [`ReplaceOutcome::Replaced`], which still certifies no protection.
+pub async fn replace_cancel_then_place<T: TradingPort + AccountPort + ?Sized>(
+    venue: &T,
+    attempts: &SubmitAttemptLedger,
+    symbol: &Symbol,
+    old: &StopRef,
+    new: StopParams,
+) -> Result<ReplaceOutcome, ExecError> {
+    let old_filled = match venue.cancel_protection(symbol, old).await {
+        Ok(StopCancelOutcome::Cancelled { filled_before_cancel, .. }) => filled_before_cancel,
+        Ok(StopCancelOutcome::AlreadyGone {
+            final_state: OrderLookup::Terminal { filled_qty, .. },
+        }) => filled_qty,
+        Ok(_) | Err(_) => return Ok(ReplaceOutcome::Unknown { new: None }),
+    };
+    if old_filled != Decimal::ZERO {
+        return Ok(ReplaceOutcome::OldExecuted { old_filled });
+    }
+    let placed = match venue
+        .place_protection(symbol, new.close_side, new.quantity, new.trigger, &new.client_order_id)
+        .await
+    {
+        Ok(placed) => placed,
+        Err(error) => {
+            return Ok(match attempts.final_evidence(&new.client_order_id).await {
+                AttemptEvidence::AllRejected { .. } => ReplaceOutcome::OldCancelledNewRejected {
+                    old_filled,
+                    reason: error.to_string(),
+                },
+                AttemptEvidence::NoRecord
+                | AttemptEvidence::Truncated
+                | AttemptEvidence::Unavailable
+                | AttemptEvidence::Unresolved { .. } => ReplaceOutcome::Unknown { new: None },
+            });
+        },
+    };
+    let protection = venue.capabilities().protection;
+    let Some(record) = placed.acceptance.record.clone() else {
+        return Ok(ReplaceOutcome::Unknown { new: Some(placed) });
+    };
+    Ok(match record.phase {
+        OrderPhase::Unknown => ReplaceOutcome::Unknown { new: Some(placed) },
+        OrderPhase::Terminal => ReplaceOutcome::SuccessorTerminal { new: placed },
+        OrderPhase::Live if record.executed_qty > Decimal::ZERO => {
+            ReplaceOutcome::SuccessorExecuting { new: placed }
+        },
+        OrderPhase::Live if successor_matches(&record, symbol, &placed.stop, &new, protection) => {
+            ReplaceOutcome::Replaced { new: placed, old_filled }
+        },
+        OrderPhase::Live => ReplaceOutcome::SuccessorMismatched { new: placed },
+    })
+}
+
+/// Whether a successor's own record is the stop that was asked for.
+fn successor_matches(
+    record: &VenueOrderRecord,
+    symbol: &Symbol,
+    stop: &StopRef,
+    new: &StopParams,
+    protection: ProtectionKind,
+) -> bool {
+    record.symbol == symbol.as_pair()
+        && record.exchange_order_id == stop.exchange_order_id
+        && record.client_order_id == new.client_order_id
+        && record.side == new.close_side
+        && record.protection_kind == Some(protection)
+        && record.orig_qty == new.quantity.as_decimal()
+        && record.stop_price == Some(new.trigger.as_decimal())
+        && record.executed_qty == Decimal::ZERO
+}
+
+#[cfg(test)]
+#[path = "replace_tests.rs"]
+mod replace_tests;
 
 #[cfg(test)]
 mod tests {
