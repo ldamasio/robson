@@ -577,8 +577,8 @@ pub enum OrderRef {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CancelAnswer {
     /// The venue cancelled it: the answer's own record is terminal, matches
-    /// the order and has consistent quantities.
-    Cancelled(VenueOrderRecord),
+    /// the order and has consistent quantities. Boxed: the record is large.
+    Cancelled(Box<VenueOrderRecord>),
     /// The venue said the order is not open (Binance spot: HTTP 400 with
     /// -2011 or -2013). It proves nothing about execution: an exact lookup
     /// decides, in a later request.
@@ -592,7 +592,8 @@ pub enum CancelAnswer {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderObservation {
     /// The order's own record: ids and symbol match, quantities consistent.
-    Found(VenueOrderRecord),
+    /// Boxed: the record is large.
+    Found(Box<VenueOrderRecord>),
     /// The venue does not know it (Binance spot: HTTP 400 with -2013). Only
     /// the caller, through [`VenueFinalityRule::classify_not_found`] over the
     /// journal's evidence, may turn this into [`OrderLookup::Absent`].
