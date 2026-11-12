@@ -59,7 +59,7 @@ fn placed(record: Option<VenueOrderRecord>) -> PlacedStop {
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
             fills: Vec::new(),
-            record,
+            record: record.map(Box::new),
             fee_evidence: FeeEvidence::Total,
         },
     }

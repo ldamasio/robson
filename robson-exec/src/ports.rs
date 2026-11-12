@@ -446,9 +446,10 @@ pub struct OrderResult {
     pub fills: Vec<TradeFill>,
     /// The venue's own record of the order, when the adapter has one (a
     /// balance account's every result). `None` on USD-M and the stub, and
-    /// then omitted.
+    /// then omitted. Boxed: results travel inside deep futures (a debug test
+    /// overflowed its stack with the record inline), and the record is large.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub record: Option<VenueOrderRecord>,
+    pub record: Option<Box<VenueOrderRecord>>,
     /// What `fee` and `fee_asset` are worth. `AsReported` on USD-M and the
     /// stub, and then omitted.
     #[serde(default, skip_serializing_if = "FeeEvidence::is_as_reported")]
@@ -926,7 +927,7 @@ mod tests {
             commission_asset: "BTC".to_string(),
             time: None,
         }];
-        result.record = Some(spot_record());
+        result.record = Some(Box::new(spot_record()));
         result.fee_evidence = FeeEvidence::Unavailable(FeeGap::MixedAssets);
         let json = serde_json::to_string(&result).unwrap();
         for key in [
