@@ -656,11 +656,63 @@ async fn without_the_capability_the_same_id_retry_is_still_authorized() {
     assert!(journal.lock().intents.values().all(|memory| memory.grant.is_none()));
 }
 
+/// Code review round 1, P2: failure finalization interleaved between a
+/// granted authorization and its send start. The send start that comes after
+/// the failure's snapshot is refused, so the `not_sent` it records is a
+/// proven no-send.
+#[tokio::test]
+async fn failure_finalization_closes_the_grant_before_its_send_start() {
+    for class in [WriteClass::Strict, WriteClass::Bounded] {
+        let (backend, journal) = flagged();
+        let ledger = ledger_for(&journal);
+        let op = operation(&journal);
+        let intent = open(&op, &journal, "x").await;
+        let started = Arc::new(AtomicUsize::new(0));
+        in_scope(&op, async {
+            let guard = journal.authorize_send(&intent, class).await.unwrap();
+            let (ledger, started) = (Arc::clone(&ledger), Arc::clone(&started));
+            // Between the failure's snapshot and its registration, the grant's
+            // holder reaches the send start.
+            journal.on_failure_snapshot(Box::new(move || {
+                if ledger.begin_send("x").is_ok() {
+                    started.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+            journal.finish_failed(&intent).await;
+            drop(guard);
+        })
+        .await;
+        let outcome = backend.row("x").unwrap().outcome.unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 0, "{class:?}: refused after the closure");
+        assert!(outcome.not_sent, "{class:?}: a proven no-send");
+    }
+}
+
+/// The other order: the send started before the failure's snapshot, so the
+/// outcome reads its ticket and is uncertain, never `not_sent`.
+#[tokio::test]
+async fn a_send_started_before_failure_finalization_is_never_not_sent() {
+    let (backend, journal) = flagged();
+    let (ledger, sent) = (ledger_for(&journal), AtomicUsize::new(0));
+    let op = operation(&journal);
+    let intent = open(&op, &journal, "x").await;
+    in_scope(&op, async {
+        let _guard = journal.authorize_send(&intent, WriteClass::Strict).await.unwrap();
+        send(&ledger, "x", &sent).await.unwrap();
+        journal.finish_failed(&intent).await;
+    })
+    .await;
+    let outcome = backend.row("x").unwrap().outcome.unwrap();
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    assert!(!outcome.not_sent && outcome.is_uncertain(), "{outcome:?}");
+}
+
 /// Seeded random interleavings (no new dependency): tasks that authorize and
 /// send, send directly, are cancelled at a random point, or drop their guard
 /// first, over random commit delays and faults, Strict and Bounded. At most
 /// one request per id; none when no authorization succeeded; none after every
-/// guard is gone.
+/// guard is gone. One strategy races failure finalization against the
+/// submissions: a request that went out is never recorded `not_sent`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn random_interleavings_send_at_most_once() {
     let mut seed: u64 = 0x8c1_5eed;
@@ -690,7 +742,7 @@ async fn random_interleavings_send_at_most_once() {
         let intent = open(&op, &journal, "x").await;
         let tasks: Vec<_> = (0..2 + next() % 4)
             .map(|_| {
-                let strategy = next() % 4;
+                let strategy = next() % 5;
                 let cancel_after = Duration::from_micros(next() % 3000);
                 let (journal, ledger, op, intent) =
                     (Arc::clone(&journal), Arc::clone(&ledger), Arc::clone(&op), intent.clone());
@@ -700,6 +752,11 @@ async fn random_interleavings_send_at_most_once() {
                         let submission = async {
                             if strategy == 1 {
                                 let _ = send(&ledger, "x", &sent).await;
+                                return;
+                            }
+                            if strategy == 4 {
+                                tokio::time::sleep(cancel_after).await;
+                                journal.finish_failed(&intent).await;
                                 return;
                             }
                             let Ok(guard) = journal.authorize_send(&intent, class).await else {
@@ -735,6 +792,14 @@ async fn random_interleavings_send_at_most_once() {
         if authorized == 0 {
             assert_eq!(sent_now, 0, "case {case}: sent with no authorization");
         }
+        let recorded_not_sent = journal
+            .lock()
+            .intents
+            .get("x")
+            .and_then(|memory| memory.outcome.as_ref().map(|outcome| outcome.not_sent))
+            .or_else(|| backend.row("x").and_then(|row| row.outcome).map(|o| o.not_sent))
+            .unwrap_or(false);
+        assert!(!(sent_now == 1 && recorded_not_sent), "case {case}: a sent request is not_sent");
         assert!(in_scope(&op, send(&ledger, "x", &sent)).await.is_err(), "case {case}");
         assert!(journal.lock().intents.values().all(|memory| memory.grant.is_none()));
     }
