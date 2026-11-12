@@ -8,9 +8,16 @@
 //! the heaviest measured. The child must run exactly one test and pass it;
 //! anything else fails, with the cause and the redacted tails of its output.
 //!
-//! The child's output is read by two threads. Once the child has ended they
-//! get [`READ_DEADLINE`] to reach end of file; a reader still blocked then
-//! (a descendant holding the pipe open) is abandoned and named as the cause.
+//! The child's output is read by two threads. Once the child has ended, each
+//! has until [`READ_DEADLINE`] past that moment to reach end of file; a reader
+//! still blocked then (a descendant holding the pipe open) is abandoned, and
+//! the message names its stream.
+//!
+//! Redaction is one conservative rule, [`redact`], that every string reaching a
+//! message goes through: from the first URL scheme (`…://`) in a line to its
+//! end, everything is replaced, whether the line is whole or cut and whatever
+//! follows; then the parent's `DATABASE_URL` value and its password, exactly,
+//! and the start of either left at a line's end. Detail after a URL is lost.
 
 use std::{
     collections::VecDeque,
@@ -148,7 +155,7 @@ fn drain(stream: impl Read, secrets: &[String]) -> Drained {
         let text = String::from_utf8_lossy(&line);
         drained.ran_one |= text == "running 1 test";
         drained.overflow |= text.contains(OVERFLOW);
-        let mut kept = redact(&text, truncated, secrets);
+        let mut kept = redact(&text, secrets);
         if text.starts_with("test result:") {
             drained.summary = parse_summary(&text);
             drained.summary_text = Some(kept.clone());
@@ -163,45 +170,44 @@ fn drain(stream: impl Read, secrets: &[String]) -> Drained {
     }
 }
 
-/// Redact one line before it is kept: each secret's exact value, a URL's
-/// userinfo, and, in a cut line, a URL whose userinfo the cut may have
-/// separated from its `@`, or a secret the cut left only the start of.
-fn redact(line: &str, truncated: bool, secrets: &[String]) -> String {
-    let mut out = line.to_string();
+/// What replaces a line from its first URL scheme on.
+const URL_REDACTED: &str = "<url redacted>";
+
+/// Redact one line, in two layers. First, from the start of the first URL
+/// scheme (the run of `[A-Za-z0-9+.-]` before the first `://`, or the `://`
+/// itself) to the end of the line, on the raw text, so nothing a secret
+/// replacement does can hide a URL. Then each secret, and the password of a
+/// secret that parses as a URL, exactly; and the start of either, four bytes
+/// or more, where it ends the line (cut there, or at end of file).
+fn redact(line: &str, secrets: &[String]) -> String {
+    let mut out = match line.find("://") {
+        Some(colon) => {
+            let start = line[..colon]
+                .char_indices()
+                .rev()
+                .take_while(|&(_, c)| c.is_ascii_alphanumeric() || "+.-".contains(c))
+                .last()
+                .map_or(colon, |(start, _)| start);
+            format!("{}{URL_REDACTED}", &line[..start])
+        },
+        None => line.to_string(),
+    };
     for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
-        out = out.replace(secret.as_str(), "[redacted]");
-        if truncated {
-            let bytes = secret.as_bytes();
+        let password = secret
+            .split_once("://")
+            .and_then(|(_, rest)| rest.rsplit_once('@'))
+            .and_then(|(userinfo, _)| userinfo.split_once(':'))
+            .map(|(_, password)| password)
+            .filter(|password| !password.is_empty());
+        for value in std::iter::once(secret.as_str()).chain(password) {
+            out = out.replace(value, "[redacted]");
+            let bytes = value.as_bytes();
             if let Some(len) =
                 (4..bytes.len()).rev().find(|&len| out.as_bytes().ends_with(&bytes[..len]))
             {
                 out.truncate(out.len() - len);
                 out.push_str("[redacted]");
             }
-        }
-    }
-    // After `scheme://`, the authority runs to the first `/`, `?`, `#`,
-    // whitespace, double quote or the end; userinfo is everything before its
-    // last `@`. When in doubt, more goes: an `@` later in the same word (a raw
-    // `/`, `?` or `#` in a password) redacts up to it, and a cut line's
-    // authority with no `@` is redacted to the end.
-    let mut from = 0;
-    while let Some(found) = out[from..].find("://") {
-        let start = from + found + 3;
-        let word_end = out[start..]
-            .find(|c: char| c.is_whitespace() || c == '"')
-            .map_or(out.len(), |end| start + end);
-        let authority_end =
-            out[start..word_end].find(['/', '?', '#']).map_or(word_end, |end| start + end);
-        let at = out[start..authority_end].rfind('@').or_else(|| out[start..word_end].rfind('@'));
-        if let Some(at) = at {
-            out.replace_range(start..start + at, "***");
-            from = start + 3;
-        } else if truncated && word_end == out.len() {
-            out.replace_range(start.., "***[cut]");
-            break;
-        } else {
-            from = start;
         }
     }
     out
@@ -242,19 +248,30 @@ fn run(exe: &std::path::Path, name: &str, secrets: &[String]) -> Result<(), Stri
             },
         }
     };
-    let ended = Instant::now();
-    let out = out_receiver.recv_timeout(READ_DEADLINE);
-    let err = err_receiver.recv_timeout(READ_DEADLINE.saturating_sub(ended.elapsed()));
-    let (Ok(out), Ok(err)) = (out, err) else {
-        return Err(redact(
-            &format!(
-                "{}; its output was still open {READ_DEADLINE:?} after it ended (a descendant \
-                 holding the pipe?): reader abandoned",
-                status.err().unwrap_or_else(|| "finished".to_string())
-            ),
-            false,
-            secrets,
-        ));
+    // Each reader has until the same instant, READ_DEADLINE past the child's
+    // end; the second does not inherit what the first used.
+    let read_by = Instant::now() + READ_DEADLINE;
+    let receive = |receiver: mpsc::Receiver<Drained>, stream: &str| {
+        receiver
+            .recv_timeout(read_by.saturating_duration_since(Instant::now()))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => format!(
+                    "its {stream} was still open {READ_DEADLINE:?} after it ended (a descendant \
+                     holding the pipe?): reader abandoned"
+                ),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    format!("its {stream} reader ended without a result")
+                },
+            })
+    };
+    let (out, err) = (receive(out_receiver, "stdout"), receive(err_receiver, "stderr"));
+    let (out, err) = match (out, err) {
+        (Ok(out), Ok(err)) => (out, err),
+        (out, err) => {
+            let causes: Vec<String> =
+                [status.err(), out.err(), err.err()].into_iter().flatten().collect();
+            return Err(redact(&causes.join("; "), secrets));
+        },
     };
     status
         .and_then(|status| judge(status, &out, &err))
@@ -266,7 +283,7 @@ fn run(exe: &std::path::Path, name: &str, secrets: &[String]) -> Result<(), Stri
 fn report(cause: &str, out: &Drained, err: &Drained, secrets: &[String]) -> String {
     format!(
         "{}\n--- stdout, last {TAIL_CAP} B, redacted ---\n{}\n--- stderr, last {TAIL_CAP} B, redacted ---\n{}",
-        redact(cause, false, secrets),
+        redact(cause, secrets),
         out.tail(),
         err.tail()
     )
@@ -316,34 +333,58 @@ fn the_heaviest_paths_fit_the_debug_stack_budget() {
 /// A synthetic credential; never a real one.
 const CANARY: &str = "postgres://canary-user:canary-pass@127.0.0.1:5432/canary";
 
+/// No canary secret, in any punctuated form, survives in `text`.
 fn assert_clean(text: &str) {
-    for part in [
-        "canary-user",
-        "canary-pass",
-        "canary-u",
-        "canary-p",
-        "nary-pa",
-        "-pass@",
-        "user:",
+    assert!(!text.contains("canary"), "a canary survived in {text:?}");
+}
+
+#[test]
+fn a_url_is_redacted_to_the_end_of_its_line_without_any_secret() {
+    let redacted = redact(&format!("connecting to {CANARY} (attempt 2)"), &[]);
+    assert_eq!(redacted, "connecting to <url redacted>");
+    assert_eq!(redact("no url here", &[]), "no url here");
+}
+
+#[test]
+fn an_exact_secret_and_its_password_are_redacted() {
+    let dsn = "host=db user=canary-user password=canary-pass".to_string();
+    assert_eq!(redact(&format!("dsn {dsn} rejected"), &[dsn]), "dsn [redacted] rejected");
+    let line = "auth failed, password canary-pass";
+    assert_eq!(redact(line, &[CANARY.to_string()]), "auth failed, password [redacted]");
+}
+
+#[test]
+fn a_secret_prefix_of_a_url_never_hides_the_url() {
+    // The parent's value is a credential-free prefix of the child's URL.
+    let redacted = redact("postgres://db:canary-pass@other/test", &["postgres://db".to_string()]);
+    assert_clean(&redacted);
+}
+
+#[test]
+fn userinfo_punctuation_never_ends_the_redaction() {
+    for (user, pass) in [
+        ("canary-user", "canary-pass(alt)"),
+        ("canary(u)", "canary(p)"),
+        ("canary'user", "canary'pass"),
+        ("canary!user", "canary!pass"),
+        ("canary*user", "canary*pass"),
+        ("canary;user", "canary;pass"),
+        ("canary=user", "canary=pass"),
+        ("canary-user", "canary/pass"),
+        ("canary-user", "canary#pass?x"),
     ] {
-        assert!(!text.contains(part), "{part} survived in {text:?}");
+        let line = format!("refused: postgres://{user}:{pass}@db/test now");
+        assert_eq!(redact(&line, &[]), "refused: <url redacted>", "{line}");
     }
 }
 
 #[test]
-fn a_url_userinfo_is_redacted_without_any_secret() {
-    let line = format!("connecting to {CANARY} (attempt 2)");
-    let redacted = redact(&line, false, &[]);
-    assert_clean(&redacted);
-    assert!(redacted.contains("postgres://***@127.0.0.1:5432/canary"), "{redacted}");
-}
-
-#[test]
-fn an_exact_database_url_value_is_redacted() {
-    let secret = "host=db user=canary-user password=canary-pass".to_string();
-    let redacted = redact(&format!("dsn {secret} rejected"), false, &[secret]);
-    assert_clean(&redacted);
-    assert_eq!(redacted, "dsn [redacted] rejected");
+fn a_fragment_cut_at_end_of_file_is_redacted() {
+    // Below the line cap, with no newline: the child died mid-URL.
+    let drained = drain(&b"connecting postgres://canary-user:canary-pass"[..], &[]);
+    assert_clean(&drained.tail());
+    let drained = drain(&b"password=canary-pa"[..], &["x://u:canary-pass@h".to_string()]);
+    assert_clean(&drained.tail());
 }
 
 #[test]
@@ -382,8 +423,8 @@ fn an_overlong_line_is_cut_and_its_cut_credential_redacted() {
     assert_clean(&drained.tail());
     assert!(drained.ran_one, "a line after the overlong one is still read");
     let first = drained.tail.front().expect("the cut line");
-    assert!(first.len() <= LINE_CAP + "***[cut] [line cut]".len(), "{}", first.len());
-    assert!(first.ends_with("[line cut]"), "{first}");
+    assert!(first.len() <= LINE_CAP + " [line cut]".len(), "{}", first.len());
+    assert!(first.ends_with("<url redacted> [line cut]"), "{first}");
 }
 
 #[test]
@@ -398,32 +439,18 @@ fn a_million_empty_lines_keep_the_tail_bounded() {
 }
 
 #[test]
-fn userinfo_punctuation_never_ends_the_redaction() {
-    for (user, pass) in [
-        ("canary-user", "canary-pass(alt)"),
-        ("canary(u)", "canary(p)"),
-        ("canary'user", "canary'pass"),
-        ("canary!user", "canary!pass"),
-        ("canary*user", "canary*pass"),
-        ("canary;user", "canary;pass"),
-        ("canary=user", "canary=pass"),
-        ("canary-user", "canary/pass"),
-        ("canary-user", "canary#pass?x"),
-    ] {
-        let line = format!("refused: postgres://{user}:{pass}@db/test now");
-        let redacted = redact(&line, false, &[]);
-        assert_eq!(redacted, "refused: postgres://***@db/test now", "{line}");
-    }
-}
-
-#[test]
 fn a_credential_in_a_summary_line_never_reaches_the_message() {
     use std::os::unix::process::ExitStatusExt;
-    let child = format!("running 1 test\ntest result: {CANARY} 1 passed\n");
-    let (out, err) = (drain(child.as_bytes(), &[]), drain(&b""[..], &[]));
-    let cause = judge(ExitStatus::from_raw(0), &out, &err).expect_err("not a pass");
-    assert!(cause.starts_with("unexpected summary"), "{cause}");
-    let message = report(&cause, &out, &err, &[]);
-    assert_clean(&message);
-    assert!(message.contains("postgres://***@"), "{message}");
+    // Whole, then cut at end of file below the cap.
+    for child in [
+        format!("running 1 test\ntest result: {CANARY} 1 passed\n"),
+        "running 1 test\ntest result: postgres://canary-user:canary-pass".to_string(),
+    ] {
+        let (out, err) = (drain(child.as_bytes(), &[]), drain(&b""[..], &[]));
+        let cause = judge(ExitStatus::from_raw(0), &out, &err).expect_err("not a pass");
+        assert!(cause.starts_with("unexpected summary"), "{cause}");
+        let message = report(&cause, &out, &err, &[]);
+        assert_clean(&message);
+        assert!(message.contains(URL_REDACTED), "{message}");
+    }
 }
