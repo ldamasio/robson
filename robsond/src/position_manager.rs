@@ -1495,7 +1495,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// (ADR-0052 Decision 5). Append and projection apply still happen in
     /// separate steps, so this is fail-fast ordered visibility, not an atomic
     /// multi-step guarantee.
-    async fn execute_and_persist(
+    ///
+    /// The future is returned boxed: it is awaited at many sites, each of
+    /// which would otherwise hold it inline, as would every debug frame that
+    /// polls one (ADR-0056 step 8, stack headroom). Only the allocation happens
+    /// at the call; the batch runs when it is polled.
+    fn execute_and_persist(
+        &self,
+        actions: Vec<EngineAction>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = DaemonResult<Vec<ActionResult>>> + '_>>
+    {
+        Box::pin(self.execute_and_persist_unboxed(actions))
+    }
+
+    async fn execute_and_persist_unboxed(
         &self,
         actions: Vec<EngineAction>,
     ) -> DaemonResult<Vec<ActionResult>> {
@@ -2877,10 +2890,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let (executed, ticket_issued) = self
             .executor
             .order_journal()
-            .run_admission(
-                entry_client_order_id.as_deref(),
-                Box::pin(self.execute_and_persist(actions)),
-            )
+            .run_admission(entry_client_order_id.as_deref(), self.execute_and_persist(actions))
             .await;
         // On Ok and Err alike, and whatever became of persisting the result: a
         // ticket means this admission reached the venue's send.
