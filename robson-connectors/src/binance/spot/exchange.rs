@@ -1,18 +1,20 @@
-//! The Binance spot venue, `binance:spot` (ADR-0056 step 8, PR 8c-2): the
-//! adapter over the shared REST client, its rules cache, and the read side of
-//! the venue ports.
+//! The Binance spot venue, `binance:spot` (ADR-0056 step 8, PRs 8c-2 and
+//! 8c-3a): the adapter over the shared REST client, its rules cache, the read
+//! side of the venue ports and order placement.
 //!
 //! Built here: trading rules through [`SpotRulesCache`]; the venue's order
 //! records ([`VenueOrderRecord`], phase from status alone); account and
 //! inventory reads; `order_by_client_id`, `open_protective_orders`, and the
 //! single-request `observe_order` and `order_trades_page` the leg owner uses
 //! (8c plan, C1). Every read is one of 8a's [`SpotRestReader`] reads at its
-//! documented weight, one request, no retry.
+//! documented weight, one request, no retry. `place_market_order` and
+//! `place_protection` send one order each through `trading.rs`, under the
+//! one-attempt ledger (8c-3a).
 //!
-//! Not built here: every method that places, cancels or replaces an order,
-//! and the composite lookups beside them, are 8c-3's. Until then each
-//! returns [`ExecError::Config`] and sends nothing. Ledger, costs and
-//! settlement are later steps' (8e, 8g, 8l) and refuse the same way.
+//! Not built here: cancelling and replacing an order, and the composite
+//! lookups beside them, are 8c-3b's. Until then each returns
+//! [`ExecError::Config`] and sends nothing. Ledger, costs and settlement are
+//! later steps' (8e, 8g, 8l) and refuse the same way.
 //!
 //! No production path constructs [`BinanceSpotAdapter`]: the factory refuses
 //! `binance_spot` until step 8's activation (SD12; `inertness_tests.rs`).
@@ -27,6 +29,7 @@ use robson_exec::{
     gate::OperationGate,
     order_journal::OrderJournal,
     ports::{OpenOrderRecord, TradeFill, UserTradeRecord},
+    quantize,
     venue::{
         AccountKind, AccountOpenOrder, AccountPort, CancelAnswer, Cash, EntryOrReduce,
         ExecutionCostEnvelope, FundingPort, GovernedInventory, Holding, InventoryObservation,
@@ -46,6 +49,7 @@ use super::{
     rest::{SpotOrderRef, SpotReadError, SpotRestReader},
     rules::SpotSymbolRules,
     trades::SpotTrade,
+    trading::{self, NewOrder, OrderKind, SPOT_STP_MODE},
 };
 use crate::binance_rest::BinanceRestClient;
 
@@ -64,7 +68,7 @@ pub struct BinanceSpotAdapter {
     client: Arc<BinanceRestClient>,
     reader: SpotRestReader,
     rules: SpotRulesCache,
-    /// Every send needs the attached journal's grant (8c-1); 8c-3 sends.
+    /// Every order sent needs the attached journal's grant (8c-1).
     submit_attempts: SubmitAttemptLedger,
 }
 
@@ -100,13 +104,19 @@ impl BinanceSpotAdapter {
     pub(super) fn reader(&self) -> &SpotRestReader {
         &self.reader
     }
+
+    /// The attempt ledger, for the placement tests.
+    #[cfg(test)]
+    pub(super) fn ledger(&self) -> &SubmitAttemptLedger {
+        &self.submit_attempts
+    }
 }
 
-/// What a method that sends an order or a cancel answers before 8c-3: a
+/// What a method that cancels or replaces an order answers before 8c-3b: a
 /// proven no-send.
 fn not_yet(what: &str) -> ExecError {
     ExecError::Config(format!(
-        "binance:spot {what} arrives with ADR-0056 step 8, PR 8c-3; nothing was sent"
+        "binance:spot {what} arrives with ADR-0056 step 8, PR 8c-3b; nothing was sent"
     ))
 }
 
@@ -128,7 +138,7 @@ fn rules_error(error: SpotRulesError) -> ExecError {
 /// An order's phase, from its status alone (design §3.4.2; enums.md
 /// L45-L57). `PENDING_CANCEL` is documented as unused (L54) and, like any
 /// other status, is `Unknown`.
-fn order_phase(status: &str) -> OrderPhase {
+pub(super) fn order_phase(status: &str) -> OrderPhase {
     match status {
         "NEW" | "PARTIALLY_FILLED" | "PENDING_NEW" => OrderPhase::Live,
         "FILLED" | "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" | "REJECTED" => OrderPhase::Terminal,
@@ -281,26 +291,100 @@ impl TradingPort for BinanceSpotAdapter {
             .map_err(rules_error)
     }
 
+    /// One MARKET order with `FULL` (`POST /api/v3/order`, weight 1; 8c plan
+    /// §4), through the one-attempt ledger: nothing is sent without the
+    /// journal's grant for `client_order_id`, and never twice.
+    ///
+    /// Spot holds no short: an entry buys and a reduction sells; the other
+    /// two are refused with nothing sent. An entry is checked against fresh
+    /// rules ([`quantize::market_quantity`]) and refused when the symbol does
+    /// not allow `EXPIRE_MAKER`; a reduction goes out as given.
+    ///
+    /// `Ok` is `FILLED`, or `EXPIRED` with execution, as the result of
+    /// `executedQty`, with the record, the fills and typed fee evidence. An
+    /// expiry with nothing executed is [`ExecError::ExpiredUnfilled`], never
+    /// a rejection. HTTP 400 with -2010 is `OrderRejected` and with -1013
+    /// `RulesRejected`. Everything else is an uncertain `Err`, among them a
+    /// 200 with `CANCELED`, `REJECTED` or `EXPIRED_IN_MATCH`: this sends one
+    /// request only, and the caller's later [`InventoryPort::observe_order`]
+    /// resolves it.
     async fn place_market_order(
         &self,
-        _symbol: &Symbol,
-        _side: OrderSide,
-        _quantity: Quantity,
-        _client_order_id: &str,
-        _intent: EntryOrReduce,
+        symbol: &Symbol,
+        side: OrderSide,
+        quantity: Quantity,
+        client_order_id: &str,
+        intent: EntryOrReduce,
     ) -> Result<OrderResult, ExecError> {
-        Err(not_yet("place_market_order"))
+        if matches!(
+            (intent, side),
+            (EntryOrReduce::Entry, OrderSide::Sell) | (EntryOrReduce::Reduce, OrderSide::Buy)
+        ) {
+            return Err(ExecError::Config(format!(
+                "binance:spot has no short: a {intent:?} cannot {side:?}; nothing was sent"
+            )));
+        }
+        let quantity = match intent {
+            EntryOrReduce::Entry => {
+                let rules = self.trading_rules_fresh(symbol).await?;
+                let allowed = self.rules.spot_rules(symbol).is_some_and(|spot| {
+                    spot.allowed_stp_modes.iter().any(|mode| mode == SPOT_STP_MODE)
+                });
+                if !allowed {
+                    return Err(ExecError::Config(format!(
+                        "binance:spot {} does not allow {SPOT_STP_MODE}; nothing was sent",
+                        symbol.as_pair()
+                    )));
+                }
+                quantize::market_quantity(&rules, quantity)?
+            },
+            EntryOrReduce::Reduce => quantity,
+        };
+        let order = NewOrder {
+            symbol,
+            side,
+            quantity: quantity.as_decimal(),
+            client_order_id,
+            kind: OrderKind::Market,
+        };
+        let quote_precision = self.rules.spot_rules(symbol).map(|spot| spot.quote_asset_precision);
+        trading::place_market(&self.client, &self.submit_attempts, order, quote_precision).await
     }
 
+    /// One `STOP_LOSS` SELL with `stopPrice` and `RESULT` (`POST
+    /// /api/v3/order`, weight 1; 8c plan §4), through the one-attempt ledger.
+    /// `quantity` and `trigger` go out as given. A BUY is refused with
+    /// nothing sent.
+    ///
+    /// Any 200 that echoes the request is `Ok`, whatever the status: the
+    /// record in `acceptance` says whether the stop rests, and `Ok` alone
+    /// never means protected. HTTP 400 with -2010 is `OrderRejected` and with
+    /// -1013 `RulesRejected`; everything else is an uncertain `Err` that the
+    /// caller's later lookup resolves.
     async fn place_protection(
         &self,
-        _symbol: &Symbol,
-        _close_side: OrderSide,
-        _quantity: Quantity,
-        _trigger: Price,
-        _client_order_id: &str,
+        symbol: &Symbol,
+        close_side: OrderSide,
+        quantity: Quantity,
+        trigger: Price,
+        client_order_id: &str,
     ) -> Result<PlacedStop, ExecError> {
-        Err(not_yet("place_protection"))
+        if close_side != OrderSide::Sell {
+            return Err(ExecError::Config(
+                "binance:spot protection sells what it holds: a BUY stop is refused; nothing \
+                 was sent"
+                    .to_string(),
+            ));
+        }
+        trading::place_stop(
+            &self.client,
+            &self.submit_attempts,
+            symbol,
+            quantity,
+            trigger,
+            client_order_id,
+        )
+        .await
     }
 
     async fn cancel_protection(
@@ -585,8 +669,7 @@ impl Venue for BinanceSpotAdapter {
         self.submit_attempts.attach_journal(journal);
     }
 
-    /// Every signed mutation will go through the REST client, which passes
-    /// the gate (8c-3).
+    /// Every order goes through the REST client, which passes the gate.
     fn attach_gate(&self, gate: Arc<OperationGate>) {
         self.client.attach_gate(gate);
     }

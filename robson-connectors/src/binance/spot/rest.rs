@@ -174,8 +174,8 @@ impl SpotReadError {
         }
     }
 
-    /// Type a non-success answer.
-    fn from_answer(http_status: u16, body: String) -> Self {
+    /// Type a non-success answer (a read's, or an order's: 8c-3).
+    pub(super) fn from_answer(http_status: u16, body: String) -> Self {
         match serde_json::from_str::<ErrorBody>(&body) {
             Ok(ErrorBody { code, msg }) => Self::from_api(http_status, code, msg),
             Err(_) if http_status >= 500 => {

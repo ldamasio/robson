@@ -144,7 +144,7 @@ fn code_only(text: &str) -> String {
 /// the existing port each implements, with that port's own types; 8c's venue
 /// exactly the venue contracts it implements and the types they carry. No
 /// other spot file takes any.
-const PORT_ITEMS: [(&str, &[&str]); 3] = [
+const PORT_ITEMS: [(&str, &[&str]); 4] = [
     ("market_data.rs", &["TradeFeedMessage", "TradeFeedPort", "TradeStream"]),
     ("ohlcv.rs", &["CandleInterval", "ExecError", "OhlcvPort"]),
     ("exchange.rs", &[
@@ -155,6 +155,7 @@ const PORT_ITEMS: [(&str, &[&str]); 3] = [
         "ports::OpenOrderRecord",
         "ports::TradeFill",
         "ports::UserTradeRecord",
+        "quantize",
         "venue::AccountKind",
         "venue::AccountOpenOrder",
         "venue::AccountPort",
@@ -190,6 +191,19 @@ const PORT_ITEMS: [(&str, &[&str]); 3] = [
         "venue::VenueCapabilities",
         "venue::VenueFinalityRule",
         "venue::VenueId",
+        "venue::VenueOrderRecord",
+    ]),
+    ("trading.rs", &[
+        "ExecError",
+        "OrderResult",
+        "ports::FeeEvidence",
+        "ports::FeeGap",
+        "ports::OrderEvidence",
+        "ports::TradeFill",
+        "venue::PlacedStop",
+        "venue::ProtectionKind",
+        "venue::StopRef",
+        "venue::SubmitAttemptLedger",
         "venue::VenueOrderRecord",
     ]),
 ];
@@ -579,22 +593,23 @@ fn the_feed_and_the_klines_read_public_market_data_only() {
     }
 }
 
-/// No mutation, and SD12 point 3 for this module: no configuration key.
+/// Mutations only through the answer helpers, and only from `trading.rs`;
+/// SD12 point 3 for this module: no configuration key.
 #[test]
 fn the_spot_module_sends_no_mutation_and_reads_no_configuration() {
     let sources = spot_production_sources();
     assert!(sources.len() >= 7, "{} production sources", sources.len());
     for (path, text) in sources {
-        for mutation in [
-            "post_signed",
-            "delete_signed",
-            "pass_gate",
-            ".post(",
-            ".put(",
-            ".delete(",
-            ".patch(",
-        ] {
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        for mutation in [".post(", ".put(", ".delete(", ".patch(", "reqwest"] {
             assert!(!text.contains(mutation), "{} contains {mutation}", path.display());
+        }
+        for name in ["post_signed", "delete_signed", "pass_gate"] {
+            assert!(!has_word(&text, name), "{} names {name}", path.display());
+        }
+        for helper in ["post_signed_answer", "delete_signed_answer"] {
+            let allowed = file == "trading.rs";
+            assert!(allowed || !has_word(&text, helper), "{} names {helper}", path.display());
         }
         for configuration in ["env::var", "std::env", "ROBSON_", "dotenv"] {
             assert!(!text.contains(configuration), "{} reads {configuration}", path.display());
