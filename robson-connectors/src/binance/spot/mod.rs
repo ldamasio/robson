@@ -16,6 +16,7 @@
 //! `995f6eb3` of `binance/binance-spot-api-docs`, read 2026-11-10 and
 //! 2026-11-11 (design note v16 §2, F13–F17, F22, F23, F25).
 
+mod cache;
 mod market_data;
 mod ohlcv;
 mod records;
@@ -45,3 +46,7 @@ mod ohlcv_tests;
 mod parse_tests;
 #[cfg(test)]
 mod read_tests;
+#[cfg(test)]
+mod rules_tests;
+#[cfg(test)]
+mod stand_in;
