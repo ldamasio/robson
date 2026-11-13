@@ -626,6 +626,11 @@ impl SpotBook {
         self.lock().prices.get(symbol).copied()
     }
 
+    /// `symbol`'s rules, as the book was built with them.
+    pub fn rules(&self, symbol: &str) -> Option<BookRules> {
+        self.lock().rules.get(symbol).cloned()
+    }
+
     // What a venue does with a request.
 
     /// A MARKET order: executes at once at the current price (`Filled`), or
