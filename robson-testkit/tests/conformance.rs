@@ -387,3 +387,20 @@ async fn run_b_balance_stub() {
     let outcomes = run_table(&B_TABLE, b_scenario).await;
     accept("B", make_b().venue(), &B_TABLE, &outcomes);
 }
+
+fn pending(table: &[Expected]) -> Vec<Property> {
+    table
+        .iter()
+        .filter(|e| matches!(e.coverage, Pending(_)))
+        .map(|e| e.property)
+        .collect()
+}
+
+/// The plan's pending lists (8d plan §4): `check` accepts a `Pending` entry
+/// wherever a clause applies, so a scenario downgraded to `Pending` would
+/// pass it; these pin the lists, and any other `Pending` is a plan change.
+#[test]
+fn the_pending_lists_are_the_plans() {
+    assert_eq!(pending(&P_TABLE), [N3b, A1b, A5p]);
+    assert_eq!(pending(&B_TABLE), Vec::<Property>::new());
+}
