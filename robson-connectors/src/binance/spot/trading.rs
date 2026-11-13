@@ -1,6 +1,6 @@
-//! Binance spot order placement (ADR-0056 step 8, PR 8c-3a): the one place a
-//! spot order is sent, its parameters, the typing of the venue's answer and
-//! the evidence a placement answer carries (8c plan §3–§5).
+//! Binance spot order mutations (ADR-0056 step 8, PRs 8c-3a and 8c-3b): the
+//! one place a spot order is sent or cancelled, the parameters, the typing of
+//! the venue's answers and the evidence they carry (8c plan §3–§5).
 //!
 //! **One way out.** [`send_new_order`] is the only caller of the client's
 //! `post_signed_answer`, and calls it inside [`SubmitAttemptLedger::submit`].
@@ -30,13 +30,25 @@
 //! not one documented value is refused here, before the ledger records
 //! anything.
 //!
+//! **Cancels.** [`cancel_once`] is the only caller of `delete_signed_answer`:
+//! one `DELETE` by `orderId`, outside the ledger, as a cancel creates no order
+//! and takes no grant (8c-1). Only an exact 200 whose own record is terminal,
+//! of this order and consistent is `Cancelled`; HTTP 400 with -2011 or -2013
+//! is `NotFound`, which proves nothing about execution: -2011
+//! `CANCEL_REJECTED` (errors.md L431-L433) is a generic refusal, not proof
+//! the order is absent or no longer open, and only the follow-up exact lookup
+//! decides. Everything else that was sent is `Unknown` (8c plan C1).
+//!
 //! Line numbers are in `binance-spot-api-docs` at `995f6eb3`.
 
 use chrono::DateTime;
 use robson_domain::{OrderSide, Price, Quantity, Symbol};
 use robson_exec::{
     ports::{FeeEvidence, FeeGap, OrderEvidence, TradeFill},
-    venue::{PlacedStop, ProtectionKind, StopRef, SubmitAttemptLedger, VenueOrderRecord},
+    venue::{
+        CancelAnswer, OrderPhase, PlacedStop, ProtectionKind, StopRef, SubmitAttemptLedger,
+        VenueOrderRecord,
+    },
     ExecError, OrderResult,
 };
 use rust_decimal::Decimal;
@@ -71,6 +83,12 @@ impl SpotWrite {
         path: "/api/v3/order",
         weight: 1,
         orders: 1,
+    };
+    /// `DELETE /api/v3/order`: weight 1, no order (rest-api.md L2393-L2402).
+    pub const CANCEL_ORDER: Self = Self {
+        path: "/api/v3/order",
+        weight: 1,
+        orders: 0,
     };
 }
 
@@ -378,6 +396,23 @@ enum FillSet {
     Unusable(FeeGap),
 }
 
+/// 8c plan §5 rule 3 for one fill or trade: `price > 0`, `qty > 0`,
+/// `commission ≥ 0` and an asset.
+fn valid_fill(price: Decimal, qty: Decimal, commission: Decimal, asset: &str) -> bool {
+    qty > Decimal::ZERO && price > Decimal::ZERO && commission >= Decimal::ZERO && !asset.is_empty()
+}
+
+/// A venue trade under the evidence rules: rule 3 as for a fill, and a quote
+/// amount that is never negative. The quote is the venue's figure, kept as
+/// given for its rounding. Zero stays valid: the docs show the figure only as
+/// `price × qty` (rest-api.md L4773-L4775) with no positivity rule, and a dust
+/// trade's product can fall below one unit of `quoteAssetPrecision` (L961);
+/// R3 then reconciles the sum against the order's own quote.
+fn valid_trade(trade: &TradeFill) -> bool {
+    valid_fill(trade.price, trade.qty, trade.commission, &trade.commission_asset)
+        && trade.quote_qty >= Decimal::ZERO
+}
+
 /// The fills of an order that executed `executed`: each with a trade id,
 /// `qty > 0`, `price > 0`, `commission ≥ 0` and an asset; an identical
 /// duplicate counts once, a different one under the same id is a conflict;
@@ -389,11 +424,7 @@ fn fill_set(fills: Option<&[SpotFill]>, executed: Decimal) -> FillSet {
     };
     let mut distinct: Vec<&SpotFill> = Vec::with_capacity(fills.len());
     for fill in fills {
-        let valid = fill.qty > Decimal::ZERO
-            && fill.price > Decimal::ZERO
-            && fill.commission >= Decimal::ZERO
-            && !fill.commission_asset.is_empty();
-        if !valid {
+        if !valid_fill(fill.price, fill.qty, fill.commission, &fill.commission_asset) {
             return FillSet::Unusable(FeeGap::Conflicting);
         }
         match distinct.iter().find(|seen| seen.trade_id == fill.trade_id) {
@@ -453,7 +484,7 @@ fn quotes_agree(
 }
 
 /// The commission total of complete fills, in their one asset (C5).
-fn commission_total(fills: &[TradeFill]) -> Result<(Decimal, String), FeeGap> {
+pub(super) fn commission_total(fills: &[TradeFill]) -> Result<(Decimal, String), FeeGap> {
     let Some(first) = fills.first() else {
         return Err(FeeGap::NoFills);
     };
@@ -646,4 +677,213 @@ pub(super) async fn place_stop(
         kind: OrderKind::StopLoss { trigger: trigger.as_decimal() },
     };
     send_new_order(client, ledger, &order, |body| read_stop(body, &order, trigger)).await
+}
+
+/// A `DELETE /api/v3/order` answer (rest-api.md L2419-L2453): the order's
+/// record after the cancel. `clientOrderId` is the cancel's own id; the
+/// order's is `origClientOrderId` (F12).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SpotCancelAnswer {
+    pub symbol: String,
+    pub order_id: u64,
+    pub order_list_id: i64,
+    pub orig_client_order_id: String,
+    pub client_order_id: String,
+    pub transact_time: i64,
+    pub orig_qty: Decimal,
+    pub executed_qty: Decimal,
+    #[serde(deserialize_with = "known_quote_qty")]
+    pub cummulative_quote_qty: Option<Decimal>,
+    pub status: String,
+    #[serde(rename = "type")]
+    pub order_type: String,
+    pub side: String,
+    #[serde(default)]
+    pub stop_price: Option<Decimal>,
+    #[serde(default)]
+    pub expiry_reason: Option<String>,
+}
+
+/// One cancel of `order_id` on `symbol`: `DELETE /api/v3/order` by `orderId`
+/// alone (rest-api.md L2393-L2417), the only `delete_signed_answer` call. A
+/// cancel creates no order and takes no grant; the client passes the gate
+/// before it signs, and sends once on the single-shot transport. A symbol
+/// that is not one value is refused first, with nothing sent.
+pub(super) async fn cancel_once(
+    client: &BinanceRestClient,
+    symbol: &Symbol,
+    order_id: u64,
+) -> Result<CancelAnswer, ExecError> {
+    if let Some(refusal) = malformed(symbol, None) {
+        return Err(refusal);
+    }
+    let params = vec![
+        ("symbol", symbol.as_pair()),
+        ("orderId", order_id.to_string()),
+    ];
+    let answer = client.delete_signed_answer(SpotWrite::CANCEL_ORDER.path, params).await;
+    cancel_answer(answer, symbol, order_id)
+}
+
+/// A cancel's answer, typed (8c plan C1): `Err` only for a proven no-send.
+fn cancel_answer(
+    answer: Result<RestAnswer, BinanceRestError>,
+    symbol: &Symbol,
+    order_id: u64,
+) -> Result<CancelAnswer, ExecError> {
+    let unknown = |reason: String| Ok(CancelAnswer::Unknown { reason });
+    let answer = match answer {
+        Ok(answer) => answer,
+        // Refused by the gate before anything was built or sent.
+        Err(BinanceRestError::Refused(why)) => return Err(ExecError::SendRefused(why)),
+        Err(BinanceRestError::SignatureError(why)) => {
+            return Err(ExecError::SendRefused(format!(
+                "binance:spot cancel not signed, nothing sent: {why}"
+            )))
+        },
+        // A timeout or a failed transport: the cancel may have reached it.
+        Err(other) => return unknown(other.to_string()),
+    };
+    let status = answer.status.as_u16();
+    if status != 200 {
+        return Ok(match SpotReadError::from_answer(status, answer.body) {
+            SpotReadError::Api { http_status: 400, code: -2011, .. } => {
+                CancelAnswer::NotFound { code: -2011 }
+            },
+            SpotReadError::NoSuchOrder { http_status: 400, .. } => {
+                CancelAnswer::NotFound { code: -2013 }
+            },
+            other => CancelAnswer::Unknown {
+                reason: format!("HTTP {status}: {other}"),
+            },
+        });
+    }
+    let parsed: SpotCancelAnswer = match parse_json("cancel answer", &answer.body) {
+        Ok(parsed) => parsed,
+        Err(error) => return unknown(error.to_string()),
+    };
+    let side = match parsed.side.as_str() {
+        "BUY" => OrderSide::Buy,
+        "SELL" => OrderSide::Sell,
+        other => return unknown(format!("cancel of {order_id} answered side {other}")),
+    };
+    let record = VenueOrderRecord {
+        exchange_order_id: parsed.order_id.to_string(),
+        client_order_id: parsed.client_order_id,
+        orig_client_order_id: Some(parsed.orig_client_order_id),
+        symbol: parsed.symbol,
+        side,
+        protection_kind: (parsed.order_type == "STOP_LOSS")
+            .then_some(ProtectionKind::MarketOnTrigger),
+        order_type: parsed.order_type,
+        phase: order_phase(&parsed.status),
+        status: parsed.status,
+        orig_qty: parsed.orig_qty,
+        executed_qty: parsed.executed_qty,
+        cumulative_quote_qty: parsed.cummulative_quote_qty,
+        stop_price: parsed.stop_price,
+        expiry_reason: parsed.expiry_reason,
+        transact_time_ms: Some(parsed.transact_time),
+        time_ms: None,
+        update_time_ms: None,
+        working_time_ms: None,
+    };
+    let checks = [
+        (record.symbol == symbol.as_pair(), "another symbol"),
+        (parsed.order_id == order_id, "another order"),
+        (parsed.order_list_id == -1, "an order list"),
+        (record.quantities_consistent(), "executedQty beyond origQty"),
+        (record.phase == OrderPhase::Terminal, "a status that is not terminal"),
+    ];
+    if let Some((_, what)) = checks.iter().find(|(holds, _)| !holds) {
+        return unknown(format!(
+            "cancel of {order_id} answered 200 with {what} ({} {} {})",
+            record.symbol, record.exchange_order_id, record.status
+        ));
+    }
+    Ok(CancelAnswer::Cancelled(Box::new(record)))
+}
+
+/// The fills rule (8c plan §4) over an order's own record and the trades read
+/// for it, with §5's evidence rules: a result only for a terminal order whose
+/// trades are each valid (rule 3, and no negative quote amount), distinct by
+/// id, and sum exactly to its `executedQty` (v16 §3.7), and whose quote, when
+/// the record gives one, agrees with theirs within R3's tolerance (rule 5,
+/// `quote_precision` from the cached rules, 0 without). Every sum and quotient
+/// is checked (rule 6). A zero record quote with execution is inconsistent
+/// (rule 2), and a conflict lets the record stand: either way the fills are
+/// withheld. `None` never undoes the record's terminality or quantity: the
+/// caller keeps them. The price is the record's quote over `executedQty`, else
+/// the trades'; the time the last trade's; the fee a `Total` in one asset, else
+/// unavailable. The client id is the one the order was placed under when the
+/// record names it apart (a cancel's answer).
+pub(super) fn terminal_result(
+    record: &VenueOrderRecord,
+    trades: Vec<TradeFill>,
+    quote_precision: Option<u32>,
+) -> Option<OrderResult> {
+    let executed = record.executed_qty;
+    if record.phase != OrderPhase::Terminal || executed <= Decimal::ZERO {
+        return None;
+    }
+    if record.cumulative_quote_qty == Some(Decimal::ZERO) {
+        return None;
+    }
+    let mut distinct: Vec<TradeFill> = Vec::with_capacity(trades.len());
+    for trade in trades {
+        if !valid_trade(&trade) {
+            return None;
+        }
+        match distinct.iter().find(|seen| seen.trade_id == trade.trade_id) {
+            Some(seen) if *seen == trade => {},
+            Some(_) => return None,
+            None => distinct.push(trade),
+        }
+    }
+    let (mut qty, mut quote) = (Decimal::ZERO, Decimal::ZERO);
+    for trade in &distinct {
+        qty = qty.checked_add(trade.qty)?;
+        quote = quote.checked_add(trade.quote_qty)?;
+    }
+    if qty != executed {
+        return None;
+    }
+    let price = match record.cumulative_quote_qty {
+        Some(record_quote) => {
+            if quotes_agree(record_quote, quote, distinct.len(), quote_precision).is_err() {
+                warn!(
+                    order_id = %record.exchange_order_id,
+                    %record_quote,
+                    trades_quote = %quote,
+                    "Binance spot trades disagree with the order's quote; fills withheld"
+                );
+                return None;
+            }
+            record_quote.checked_div(executed)
+        },
+        None => quote.checked_div(qty),
+    }?;
+    let filled_at = distinct.iter().filter_map(|trade| trade.time).max()?;
+    let (fee, fee_asset, fee_evidence) = match commission_total(&distinct) {
+        Ok((total, asset)) => (total, asset, FeeEvidence::Total),
+        Err(gap) => (Decimal::ZERO, String::new(), FeeEvidence::Unavailable(gap)),
+    };
+    Some(OrderResult {
+        exchange_order_id: record.exchange_order_id.clone(),
+        client_order_id: record
+            .orig_client_order_id
+            .clone()
+            .unwrap_or_else(|| record.client_order_id.clone()),
+        fill_price: Price::new(price).ok()?,
+        filled_quantity: Quantity::new(executed).ok()?,
+        fee,
+        fee_asset,
+        filled_at,
+        evidence: Some(Box::new(OrderEvidence {
+            fills: distinct,
+            record: Some(record.clone()),
+            fee_evidence,
+        })),
+    })
 }

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
-use robson_domain::{OrderSide, Price, Quantity, Symbol};
+use robson_domain::{OrderSide, Price, Symbol};
 use robson_exec::{
     order_journal::{
         AttemptRow, IntentKind, IntentRow, JournalBackend, JournalBatch, OrderJournal,
@@ -13,7 +13,7 @@ use robson_exec::{
     venue::{
         capability_mismatches, AccountKind, AccountPort, InventoryPort, MarketKind, OrderLookup,
         OrderObservation, OrderPhase, OrderRef, ProtectionKind, ReplacementProtocol,
-        SettlementPort, StopParams, StopRef, TradingPort, Venue, VenueId,
+        SettlementPort, TradingPort, Venue, VenueId,
     },
     ExecError,
 };
@@ -96,34 +96,13 @@ fn a_testnet_client_is_refused() {
     assert!(matches!(BinanceSpotAdapter::new(client), Err(ExecError::Config(_))));
 }
 
-/// Every method that cancels or replaces an order (8c-3b), and every read a
-/// later step owns, refuses with `Config` and sends nothing. Placement is
-/// `trading_tests.rs`'.
+/// Every read a later step owns refuses with `Config` and sends nothing.
+/// Placement is `trading_tests.rs`', cancels `cancel_tests.rs`'.
 #[tokio::test]
-async fn every_cancel_and_every_later_read_is_refused_with_no_request() {
+async fn every_later_read_is_refused_with_no_request() {
     let (venue, seen) = answering(200, "{}").await;
     let btc = symbol("BTCUSDT");
-    let qty = Quantity::new(dec!(0.001)).unwrap();
-    let price = Price::new(dec!(90000)).unwrap();
-    let stop = StopRef::new("1");
-    let params = StopParams {
-        close_side: OrderSide::Sell,
-        quantity: qty,
-        trigger: price,
-        client_order_id: "ins-1".to_string(),
-    };
-    let mut refusals: Vec<(&str, ExecError)> = vec![
-        ("cancel_protection", venue.cancel_protection(&btc, &stop).await.unwrap_err()),
-        (
-            "replace_protection",
-            venue.replace_protection(&btc, &stop, params).await.unwrap_err(),
-        ),
-        ("cancel_order", venue.cancel_order(&btc, "1").await.unwrap_err()),
-        ("order_by_exchange_id", venue.order_by_exchange_id(&btc, "1").await.unwrap_err()),
-        ("protection_fill", venue.protection_fill(&btc, &stop).await.unwrap_err()),
-        ("cancel_order_once", venue.cancel_order_once(&btc, "1").await.unwrap_err()),
-    ];
-    refusals.extend([
+    let refusals: Vec<(&str, ExecError)> = vec![
         ("governed_inventory", venue.governed_inventory(&btc).await.unwrap_err()),
         ("execution_costs", venue.execution_costs(&btc).await.unwrap_err()),
         ("settlement_since", venue.settlement_since(Utc::now(), 10).await.unwrap_err()),
@@ -136,7 +115,7 @@ async fn every_cancel_and_every_later_read_is_refused_with_no_request() {
             venue.observe_order(&btc, &OrderRef::ExchangeId("x1".into())).await.unwrap_err(),
         ),
         ("order_trades_page", venue.order_trades_page(&btc, "x1", 0).await.unwrap_err()),
-    ]);
+    ];
     for (name, error) in &refusals {
         assert!(matches!(error, ExecError::Config(_)), "{name}: {error:?}");
     }

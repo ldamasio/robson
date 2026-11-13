@@ -1,5 +1,5 @@
-//! ADR-0056 steps 8a, 8b, 8c-2a, 8c-2b and 8c-3a merge inert (SD12, design
-//! note v16 §12.2).
+//! ADR-0056 steps 8a, 8b, 8c-2a, 8c-2b, 8c-3a and 8c-3b merge inert (SD12,
+//! design note v16 §12.2).
 //!
 //! Lexical regression checks over the workspace's Rust sources as they are on
 //! disk, backed by a review of each part's diff and call paths (a name split
@@ -15,11 +15,13 @@
 //!   types those carry, by path;
 //! - an order leaves only through `trading.rs`: one `post_signed_answer` call,
 //!   inside `SubmitAttemptLedger::submit` on a one-attempt ledger, so it takes
-//!   the journal's grant (8c-1) and the client's gate. This is a lexical
-//!   regression check, not a proof: an eager block inside `submit`'s arguments
-//!   would pass it; review establishes the lazy path. No spot file calls the
-//!   non-answer forms (`.post(`, `post_signed(`, `delete_signed(`), names the
-//!   gate, or holds an HTTP client; cancelling waits for 8c-3b;
+//!   the journal's grant (8c-1) and the client's gate. A cancel leaves only
+//!   through `trading.rs` too: one `delete_signed_answer` call, outside the
+//!   ledger and in a function that takes none, as a cancel takes no grant.
+//!   These are lexical regression checks, not a proof: an eager block inside
+//!   `submit`'s arguments would pass them; review establishes the lazy path. No
+//!   spot file calls the non-answer forms (`.post(`, `post_signed(`,
+//!   `delete_signed(`), names the gate, or holds an HTTP client;
 //! - every read goes through the client's spot read helpers, encoded and
 //!   single-shot, from the reader (`rest.rs`) and the klines (`ohlcv.rs`,
 //!   public only); no spot file names a legacy GET helper (8c-3, round 2);
@@ -201,6 +203,7 @@ const PORT_ITEMS: [(&str, &[&str]); 4] = [
         "venue::VenueFinalityRule",
         "venue::VenueId",
         "venue::VenueOrderRecord",
+        "venue::replace_cancel_then_place",
     ]),
     ("trading.rs", &[
         "ExecError",
@@ -209,6 +212,8 @@ const PORT_ITEMS: [(&str, &[&str]); 4] = [
         "ports::FeeGap",
         "ports::OrderEvidence",
         "ports::TradeFill",
+        "venue::CancelAnswer",
+        "venue::OrderPhase",
         "venue::PlacedStop",
         "venue::ProtectionKind",
         "venue::StopRef",
@@ -390,6 +395,7 @@ fn the_matchers_find_what_they_look_for() {
         "SPOT_STP_MODE",
         "SpotOrderAnswer",
         "SpotFill",
+        "SpotCancelAnswer",
     ] {
         assert!(names.iter().any(|name| name == expected), "{expected} in {names:?}");
     }
@@ -617,21 +623,27 @@ fn squeezed(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// The function a mention that ends `before` sits in, from its `fn` on, and
+/// its signature without whitespace.
+fn enclosing_function(before: &str) -> Option<(&str, String)> {
+    let start = before
+        .match_indices("fn ")
+        .filter(|(at, _)| !before[..*at].chars().next_back().is_some_and(is_ident))
+        .map(|(at, _)| at)
+        .last()?;
+    let function = &before[start..];
+    let signature = squeezed(&function[..function.find('{').unwrap_or(function.len())]);
+    Some((function, signature))
+}
+
 /// Whether the mention of the POST helper that ends `before`, the code of
 /// `trading.rs` up to it, sits inside the argument list of one
 /// `ledger.submit(...)` call, in a function that takes
 /// `ledger: &SubmitAttemptLedger`.
 fn inside_ledger_submit(before: &str) -> bool {
-    let Some(start) = before
-        .match_indices("fn ")
-        .filter(|(at, _)| !before[..*at].chars().next_back().is_some_and(is_ident))
-        .map(|(at, _)| at)
-        .last()
-    else {
+    let Some((function, signature)) = enclosing_function(before) else {
         return false;
     };
-    let function = &before[start..];
-    let signature = squeezed(&function[..function.find('{').unwrap_or(function.len())]);
     if !signature.contains("ledger:&SubmitAttemptLedger") {
         return false;
     }
@@ -654,11 +666,12 @@ fn inside_ledger_submit(before: &str) -> bool {
 }
 
 /// How `text`, the spot production file `file`, could send a mutation other
-/// than through the POST answer helper under the one-attempt ledger: a
-/// non-answer form (`.post(`, `post_signed(`, `delete_signed(`, any other
-/// verb), the gate or an HTTP client by name, a ledger that is not
-/// one-attempt, the helper outside `trading.rs`, or a call of it there
-/// outside `ledger.submit(...)`. Cancelling is 8c-3b's: no DELETE helper yet.
+/// than an order through the POST answer helper under the one-attempt ledger
+/// or a cancel through the DELETE one outside it: a non-answer form
+/// (`.post(`, `post_signed(`, `delete_signed(`, any other verb), the gate or
+/// an HTTP client by name, a ledger that is not one-attempt, a helper outside
+/// `trading.rs`, a POST there outside `ledger.submit(...)`, or a DELETE there
+/// inside it or in a function that takes the ledger.
 fn mutation_violations(file: &str, text: &str) -> Vec<String> {
     let mut violations = Vec::new();
     for form in [
@@ -675,29 +688,39 @@ fn mutation_violations(file: &str, text: &str) -> Vec<String> {
             violations.push(format!("contains {form}"));
         }
     }
-    for name in [
-        "post_signed",
-        "delete_signed",
-        "pass_gate",
-        "delete_signed_answer",
-    ] {
+    for name in ["post_signed", "delete_signed", "pass_gate"] {
         if has_word(text, name) {
             violations.push(format!("names {name}"));
         }
     }
-    let helper = "post_signed_answer";
     if file != "trading.rs" {
-        if has_word(text, helper) {
-            violations.push(format!("names {helper} outside trading.rs"));
+        for helper in ["post_signed_answer", "delete_signed_answer"] {
+            if has_word(text, helper) {
+                violations.push(format!("names {helper} outside trading.rs"));
+            }
         }
         return violations;
     }
     let code = code_only(text);
-    for (at, _) in code.match_indices(helper) {
-        let word = !code[..at].chars().next_back().is_some_and(is_ident)
-            && !code[at + helper.len()..].chars().next().is_some_and(is_ident);
-        if word && !inside_ledger_submit(&code[..at]) {
-            violations.push(format!("calls {helper} outside SubmitAttemptLedger::submit"));
+    let mentions = |helper: &'static str| {
+        let code = &code;
+        code.match_indices(helper)
+            .filter(move |(at, _)| {
+                !code[..*at].chars().next_back().is_some_and(is_ident)
+                    && !code[at + helper.len()..].chars().next().is_some_and(is_ident)
+            })
+            .map(|(at, _)| at)
+    };
+    for at in mentions("post_signed_answer") {
+        if !inside_ledger_submit(&code[..at]) {
+            violations.push("calls post_signed_answer outside SubmitAttemptLedger::submit".into());
+        }
+    }
+    for at in mentions("delete_signed_answer") {
+        let takes_ledger = enclosing_function(&code[..at])
+            .is_some_and(|(_, signature)| signature.contains("SubmitAttemptLedger"));
+        if takes_ledger || inside_ledger_submit(&code[..at]) {
+            violations.push("a cancel takes no grant: delete_signed_answer by a ledger".into());
         }
     }
     violations
@@ -784,6 +807,9 @@ fn the_mutation_checker_refuses_every_way_around_the_ledger() {
                    read(client.post_signed_answer(PATH, params).await)\n        })\n        \
                    .await\n}";
     assert_eq!(mutation_violations("trading.rs", through), Vec::<String>::new());
+    let cancel = "async fn cancel(client: &C, symbol: &Symbol, id: u64) -> R {\n    \
+                  typed(client.delete_signed_answer(PATH, params).await)\n}";
+    assert_eq!(mutation_violations("trading.rs", cancel), Vec::<String>::new());
     let around = [
         // No ledger at all.
         ("trading.rs", "async fn f(client: &C) { client.post_signed_answer(P, p).await }"),
@@ -821,6 +847,17 @@ fn the_mutation_checker_refuses_every_way_around_the_ledger() {
         ("trading.rs", "fn f() { self.client.post_signed(\"/api/v3/order\", p) }"),
         ("trading.rs", "fn f() { self.client.delete_signed(\"/api/v3/order\", p) }"),
         ("exchange.rs", "fn f() { client.delete_signed_answer(P, p) }"),
+        // A cancel through the ledger, or beside it: a cancel takes no grant.
+        (
+            "trading.rs",
+            "async fn f(client: &C, ledger: &SubmitAttemptLedger) { ledger.submit(i, r, async { \
+             client.delete_signed_answer(P, p).await }).await }",
+        ),
+        (
+            "trading.rs",
+            "async fn f(client: &C, ledger: &SubmitAttemptLedger) { \
+             client.delete_signed_answer(P, p).await }",
+        ),
         ("trading.rs", "fn f() { client.pass_gate(\"POST\", P) }"),
         ("rest.rs", "use reqwest::Client;"),
         ("exchange.rs", "fn f() -> SubmitAttemptLedger { SubmitAttemptLedger::new(64) }"),
@@ -831,7 +868,8 @@ fn the_mutation_checker_refuses_every_way_around_the_ledger() {
 }
 
 /// An order leaves only through `trading.rs`'s one POST, inside the
-/// one-attempt ledger; SD12 point 3 for this module: no configuration key.
+/// one-attempt ledger, and a cancel only through its one DELETE, outside it;
+/// SD12 point 3 for this module: no configuration key.
 #[test]
 fn the_spot_module_sends_orders_only_through_the_ledger_and_reads_no_configuration() {
     let sources = spot_production_sources();
@@ -849,5 +887,6 @@ fn the_spot_module_sends_orders_only_through_the_ledger_and_reads_no_configurati
         code_only(text)
     };
     assert_eq!(code("trading.rs").matches("post_signed_answer").count(), 1, "one POST call");
+    assert_eq!(code("trading.rs").matches("delete_signed_answer").count(), 1, "one DELETE call");
     assert!(code("exchange.rs").contains("SubmitAttemptLedger::one_attempt("));
 }

@@ -49,14 +49,14 @@ fn qty(value: Decimal) -> Quantity {
     Quantity::new(value).unwrap()
 }
 
-fn error_body(name: &str) -> String {
+pub(super) fn error_body(name: &str) -> String {
     serde_json::from_str::<Value>(ERRORS).unwrap()[name]
         .as_str()
         .unwrap()
         .to_string()
 }
 
-fn requests(seen: &Seens) -> Vec<String> {
+pub(super) fn requests(seen: &Seens) -> Vec<String> {
     seen.lock().unwrap().iter().map(Seen::identity).collect()
 }
 
@@ -65,7 +65,7 @@ fn posts(seen: &Seens) -> usize {
 }
 
 /// A one-attempt journal for the spot venue, over the stub backend.
-fn spot_journal() -> Arc<OrderJournal> {
+pub(super) fn spot_journal() -> Arc<OrderJournal> {
     let journal = OrderJournal::new(
         Arc::new(StubJournalBackend::default()),
         &VenueId::new(VenueId::BINANCE_SPOT),
@@ -92,7 +92,7 @@ async fn venue(
 
 /// Run `place` as the owner will (8c plan §7): inside one operation, under a
 /// fresh Strict grant for `id`, the guard held across the one request.
-async fn granted<T>(
+pub(super) async fn granted<T>(
     journal: &Arc<OrderJournal>,
     id: &str,
     kind: IntentKind,
@@ -115,7 +115,7 @@ async fn granted<T>(
 }
 
 /// The parameters an answer echoes from its request.
-fn echo(answer: &mut Value, request: &Seen) {
+pub(super) fn echo(answer: &mut Value, request: &Seen) {
     for (field, param) in [
         ("symbol", "symbol"),
         ("side", "side"),
@@ -143,7 +143,7 @@ fn full(request: &Seen, edit: impl FnOnce(&mut Value)) -> String {
 
 /// The documented `RESULT` answer to a stop `request`, resting with nothing
 /// executed, then `edit`ed.
-fn result(request: &Seen, edit: impl FnOnce(&mut Value)) -> String {
+pub(super) fn result(request: &Seen, edit: impl FnOnce(&mut Value)) -> String {
     let mut answer: Value = serde_json::from_str(ORDER_RESULT).unwrap();
     echo(&mut answer, request);
     answer["status"] = json!("NEW");
