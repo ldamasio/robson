@@ -16,7 +16,8 @@
 //! 5. Spawn WebSocket clients (market data)
 //! 6. Spawn projection worker (if database configured)
 //! 7. Main event loop (process events, market data)
-//! 8. Graceful shutdown on SIGINT/SIGTERM
+//! 8. Two-phase stop on SIGTERM/SIGINT (ADR-0056 step 7): drain, close, mark
+//!    the epoch clean only on a clean pass (`stop`)
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -28,8 +29,10 @@ use robson_engine::Engine;
 #[cfg(feature = "postgres")]
 use robson_eventlog::{query_events, query_stream_in_seq_order, EventEnvelope, QueryOptions};
 use robson_exec::{
-    venue::Venue, ExchangePort, Executor, IntentJournal, OhlcvPort, StubExchange, StubTradeFeed,
-    TradeFeedPort,
+    gate::{OperationKind, PermitRefusal},
+    order_journal::OrderJournal,
+    venue::Venue,
+    ExchangePort, Executor, IntentJournal, OhlcvPort, StubExchange, StubTradeFeed, TradeFeedPort,
 };
 // Optional projection recovery for crash recovery
 #[cfg(feature = "postgres")]
@@ -66,6 +69,7 @@ use crate::{
     position_manager::{PositionManager, ReconcileCloseOutcome, ReconciledCloseInput},
     query_engine::{QueryRecorder, TracingQueryRecorder},
     reconciliation_worker::{gather_real_evidence, ReconciliationWorker},
+    stop::{StopMarker, StopReport, StopRequest, StopTimings},
 };
 
 // =============================================================================
@@ -119,6 +123,15 @@ pub struct Daemon<E: Venue + 'static, S: Store + 'static> {
     pg_pool: Option<Arc<sqlx::PgPool>>,
     /// Last month processed by the month-boundary poller.
     last_month_check: Arc<RwLock<(i32, u32)>>,
+    /// `robsond_month_boundary_pending`, which that poller sets. A field so a
+    /// test can watch its own.
+    month_boundary_pending: prometheus::Gauge,
+    /// The executor's journal, whose gate gives every operation its permit
+    /// (ADR-0056 step 7). Held here so nothing reaches it through the manager
+    /// lock.
+    order_journal: Arc<OrderJournal>,
+    /// Bounds of the two-phase stop.
+    stop_timings: StopTimings,
 }
 
 /// Parse entry_mode and approval_mode strings from DB into EntryPolicyConfig.
@@ -154,6 +167,101 @@ fn initial_month_check() -> Arc<RwLock<(i32, u32)>> {
     Arc::new(RwLock::new((0, 0)))
 }
 
+/// Pass every venue mutation through the gate of the executor's journal
+/// (ADR-0056 step 7), and return that journal.
+fn gated<E: Venue + 'static, S: Store + 'static>(
+    venue: &Arc<E>,
+    executor: &Executor<E, S>,
+) -> Arc<OrderJournal> {
+    let journal = executor.order_journal();
+    venue.attach_gate(Arc::clone(journal.gate()));
+    journal
+}
+
+/// Give the executor the durable order journal, when there is a database for
+/// it, on its own small pool (ADR-0056 step 7).
+#[cfg(feature = "postgres")]
+fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
+    executor: Executor<E, S>,
+    venue: &Arc<E>,
+    pool: &Option<Arc<sqlx::PgPool>>,
+    config: &Config,
+) -> Executor<E, S> {
+    let (Some(pool), Some(tenant_id)) = (pool, config.projection.tenant_id) else {
+        return executor;
+    };
+    let backend = Arc::new(crate::order_journal_store::PgJournalBackend::new(pool, tenant_id));
+    // ADR-0056 step 8: the capability is fixed before the journal is shared.
+    let one_attempt = venue.capabilities().one_attempt_per_client_id;
+    let journal = Arc::new(
+        OrderJournal::new(backend, venue.id()).with_one_attempt_per_client_id(one_attempt),
+    );
+    venue.attach_order_journal(Arc::clone(&journal));
+    executor.with_order_journal(journal)
+}
+
+/// `work`, unless the stop has its result first: then that result, and `work`
+/// is dropped. A stop has a result before its deadline only when no permit is
+/// held, so this never cuts short an operation the stop is waiting for.
+async fn unless_stopped<T>(
+    work: impl std::future::Future<Output = T>,
+    stopping: &mut tokio::task::JoinHandle<StopReport>,
+) -> Result<T, Result<StopReport, tokio::task::JoinError>> {
+    tokio::select! {
+        done = work => Ok(done),
+        stopped = stopping => Err(stopped),
+    }
+}
+
+/// Writes the clean-stop marker on this process's epoch.
+#[cfg(feature = "postgres")]
+struct EpochMarker {
+    pool: Arc<sqlx::PgPool>,
+    epoch: crate::process_epoch::Epoch,
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait::async_trait]
+impl StopMarker for EpochMarker {
+    async fn mark_clean(&self) -> Result<(), String> {
+        crate::process_epoch::mark_clean_stop(&self.pool, self.epoch).await
+    }
+}
+
+/// Keep writing what did not land, and publish the journal's gauges.
+async fn run_order_journal_retry(
+    journal: Arc<OrderJournal>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tick.tick() => {},
+        }
+        journal.flush_pending().await;
+        crate::metrics::observe_order_journal(&journal);
+        crate::metrics::observe_fence(&journal);
+    }
+    // One last pass; the stop's own flush makes it complete.
+    journal.flush_pending().await;
+    crate::metrics::observe_order_journal(&journal);
+}
+
+/// A venue that can mutate starts only on a process epoch (ADR-0056 step 7):
+/// without one, the fence PR's generation has no high half and a later start
+/// cannot tell how this one ended. The stub, the simulator, may start without.
+fn refuse_an_epochless_venue(venue: &robson_exec::venue::VenueId) -> DaemonResult<()> {
+    if venue.as_str() == robson_exec::stub::STUB_VENUE_ID {
+        return Ok(());
+    }
+    Err(DaemonError::Config(format!(
+        "Venue {venue} starts only on a process epoch, which needs DATABASE_URL and a build with \
+         PostgreSQL; refusing to start. Only ROBSON_VENUE=stub runs without one"
+    )))
+}
+
 impl Daemon<StubExchange, MemoryStore> {
     /// Create a new daemon with stub components (for testing/development).
     pub fn new_stub(config: Config) -> Self {
@@ -163,6 +271,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
+        let order_journal = gated(&exchange, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
         // Execution-cost buffer parameters are operator-configured and must
@@ -217,6 +326,9 @@ impl Daemon<StubExchange, MemoryStore> {
             #[cfg(feature = "postgres")]
             pg_pool: None,
             last_month_check: initial_month_check(),
+            month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
+            order_journal,
+            stop_timings: StopTimings::default(),
         }
     }
 
@@ -250,6 +362,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
+        let order_journal = gated(&exchange, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
         let risk_config = RiskConfig::new(capital)?
@@ -292,6 +405,9 @@ impl Daemon<StubExchange, MemoryStore> {
             #[cfg(feature = "postgres")]
             pg_pool: None,
             last_month_check: initial_month_check(),
+            month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
+            order_journal,
+            stop_timings: StopTimings::default(),
         })
     }
 
@@ -304,12 +420,35 @@ impl Daemon<StubExchange, MemoryStore> {
         projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
         pg_pool: Option<Arc<sqlx::PgPool>>,
     ) -> Self {
+        Self::stub_with_recovery(config, projection_recovery, pg_pool, false)
+    }
+
+    /// The same, with the durable order journal production wires: its
+    /// incidents land, and a release is possible.
+    #[cfg(all(test, feature = "postgres"))]
+    pub fn new_stub_with_durable_journal(config: Config, pg_pool: Arc<sqlx::PgPool>) -> Self {
+        Self::stub_with_recovery(config, None, Some(pg_pool), true)
+    }
+
+    #[cfg(all(test, feature = "postgres"))]
+    fn stub_with_recovery(
+        config: Config,
+        projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
+        pg_pool: Option<Arc<sqlx::PgPool>>,
+        durable_journal: bool,
+    ) -> Self {
         use robson_domain::RiskConfig;
 
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
-        let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
+        let executor = Executor::new(Arc::clone(&exchange), journal, store.clone());
+        let executor = Arc::new(if durable_journal {
+            with_durable_order_journal(executor, &exchange, &pg_pool, &config)
+        } else {
+            executor
+        });
+        let order_journal = gated(&exchange, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder: Arc<dyn QueryRecorder> =
             if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
@@ -370,6 +509,9 @@ impl Daemon<StubExchange, MemoryStore> {
             projection_recovery,
             pg_pool,
             last_month_check: initial_month_check(),
+            month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
+            order_journal,
+            stop_timings: StopTimings::default(),
         }
     }
 }
@@ -388,6 +530,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(Arc::clone(&venue), journal, store.clone()));
+        let order_journal = gated(&venue, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
         // Placeholder capital; will be updated from exchange in run().
@@ -444,6 +587,9 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             #[cfg(feature = "postgres")]
             pg_pool: None,
             last_month_check: initial_month_check(),
+            month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
+            order_journal,
+            stop_timings: StopTimings::default(),
         }
     }
 
@@ -461,7 +607,9 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
 
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
-        let executor = Arc::new(Executor::new(Arc::clone(&venue), journal, store.clone()));
+        let executor = Executor::new(Arc::clone(&venue), journal, store.clone());
+        let executor = Arc::new(with_durable_order_journal(executor, &venue, &pg_pool, &config));
+        let order_journal = gated(&venue, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
 
         let query_recorder: Arc<dyn QueryRecorder> =
@@ -528,6 +676,9 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             projection_recovery,
             pg_pool,
             last_month_check: initial_month_check(),
+            month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
+            order_journal,
+            stop_timings: StopTimings::default(),
         }
     }
 }
@@ -536,7 +687,18 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     /// Set where older unfinished funding sagas are recovered when the venue
     /// has no funding surface.
     pub fn with_funding_recovery_route(mut self, route: Option<Arc<E>>) -> Self {
+        if let Some(route) = &route {
+            route.attach_gate(Arc::clone(self.order_journal.gate()));
+        }
         self.funding_recovery_route = route;
+        self
+    }
+
+    /// Change the stop's bounds, for tests that wait them out. Exists only in
+    /// tests and crash-points builds.
+    #[cfg(any(test, feature = "crash-points"))]
+    pub fn with_stop_timings(mut self, timings: StopTimings) -> Self {
+        self.stop_timings = timings;
         self
     }
 
@@ -610,21 +772,152 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     ///
     /// This method blocks until shutdown is requested (SIGINT/SIGTERM).
     pub async fn run(self) -> DaemonResult<()> {
-        self.run_until(tokio_util::sync::CancellationToken::new()).await
+        let stop = StopRequest::default();
+        let _signals = crate::stop::listen_for_signals(&stop).map_err(DaemonError::Config)?;
+        self.run_until(stop).await
     }
 
-    async fn run_until(self, shutdown: tokio_util::sync::CancellationToken) -> DaemonResult<()> {
+    /// Run the daemon until `stop` is asked for, for a caller that listens for
+    /// the stop signals itself, as `main` does from its start (ADR-0056 step
+    /// 7). A stop already asked for starts nothing.
+    pub async fn run_until(self, stop: StopRequest) -> DaemonResult<()> {
         info!(
             version = env!("CARGO_PKG_VERSION"),
             environment = %self.config.environment,
             "Starting Robson daemon"
         );
 
-        // Shutdown token for coordinating graceful shutdown
-        let shutdown_sig = shutdown.clone();
+        let journal = Arc::clone(&self.order_journal);
+        crate::metrics::init_operation_gate_metrics();
+        crate::metrics::observe_streams_suspended(0, 0);
+        crate::metrics::observe_fence(&journal);
+        self.month_boundary_pending.set(0.0);
+        journal.gate().set_observer(Arc::new(crate::metrics::GateMetrics));
 
+        // Cancelled when the stop enters Closing: the main loop, the workers,
+        // the detectors and the API listener.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        // The journal's readiness and this process's epoch. A stop asked for
+        // meanwhile ends the start here: nothing has been sent, and an epoch
+        // that landed stays unmarked.
+        let marker = tokio::select! {
+            biased;
+            _ = stop.asked() => {
+                warn!(
+                    cause = stop.cause(),
+                    "Stop requested before the start completed: nothing started, no marker written"
+                );
+                return Ok(());
+            },
+            prepared = Box::pin(self.prepare_start(&journal)) => prepared?,
+        };
+
+        // The stop runs beside everything below from here on. It cancels the
+        // detectors through their token, never through the manager lock.
+        let mut stopping = {
+            let detectors = self.position_manager.read().await.detector_shutdown_token();
+            let closing = shutdown.clone();
+            let close = move || {
+                closing.cancel();
+                detectors.cancel();
+            };
+            tokio::spawn(crate::stop::stop_when_asked(
+                stop,
+                Arc::clone(&journal),
+                close,
+                marker,
+                self.stop_timings,
+            ))
+        };
+
+        // The startup phase holds the startup slot's permit throughout; the
+        // startup scan and startup recovery run under it. Then the API, the
+        // workers and the main loop. Neither is waited for once the stop has
+        // its result. Both halves are boxed, their futures being large: the
+        // startup half by its permit's `run`, the serving half here.
+        let mut workers = Vec::new();
+        let started = match journal.acquire(OperationKind::Startup) {
+            Ok(permit) => unless_stopped(permit.run(self.start_up(&shutdown)), &mut stopping).await,
+            // The stop is already closing: nothing starts.
+            Err(PermitRefusal::Stopping(_)) => Ok(Ok(())),
+            Err(refusal) => return Err(refusal.into()),
+        };
+        let stopped = match started {
+            Ok(started) => {
+                started?;
+                // A stop that reached Closing during startup starts nothing more.
+                if shutdown.is_cancelled() {
+                    None
+                } else {
+                    let serving = Box::pin(self.serve(&journal, &shutdown, &mut workers));
+                    match unless_stopped(serving, &mut stopping).await {
+                        Ok(served) => {
+                            served?;
+                            None
+                        },
+                        Err(stopped) => Some(stopped),
+                    }
+                }
+            },
+            Err(stopped) => Some(stopped),
+        };
+        let report = match stopped {
+            Some(stopped) => stopped,
+            None => stopping.await,
+        }
+        .map_err(|error| DaemonError::Config(format!("The stop task ended abnormally: {error}")))?;
+
+        // What holds no permit is given what is left of the deadline; the
+        // runtime's teardown gets the rest, if any.
+        info!(count = workers.len(), "Waiting for workers to finish...");
+        for handle in workers {
+            let _ = tokio::time::timeout_at(report.deadline, handle).await;
+        }
+        let _ = tokio::time::timeout_at(report.deadline, self.shutdown()).await;
+
+        Ok(())
+    }
+
+    /// Before anything can be sent: the journal's readiness, which warms its
+    /// pool and refuses a schema without its tables, then this process's
+    /// epoch, with a strict commit (ADR-0056 step 7). Only the stub starts
+    /// without one. The marker a clean stop writes on it.
+    async fn prepare_start(
+        &self,
+        journal: &OrderJournal,
+    ) -> DaemonResult<Option<Box<dyn StopMarker>>> {
+        journal
+            .check_ready()
+            .await
+            .map_err(|error| DaemonError::Config(format!("Order journal not ready: {error}")))?;
+        self.start_epoch().await
+    }
+
+    /// The startup phase, under the startup permit: capital, recovery from the
+    /// event log, the stale-active gate, the startup scan and startup recovery.
+    async fn start_up(&self, shutdown: &tokio_util::sync::CancellationToken) -> DaemonResult<()> {
         // 0. Initialize capital from exchange (best-effort)
         self.initialize_capital().await;
+
+        // 0a. The streams earlier processes left suspended (ADR-0056 step 7):
+        // position streams are repaired, validated then applied in pages; what
+        // stays suspended takes no appends, and a suspended system stream of
+        // this month keeps admissions closed.
+        #[cfg(feature = "postgres")]
+        {
+            let manager = self.position_manager.read().await;
+            let loaded = manager.load_stream_suspensions().await?;
+            if loaded > 0 {
+                let (cleared, suspended) = manager.repair_suspended_position_streams().await;
+                warn!(
+                    loaded,
+                    cleared,
+                    suspended,
+                    "Event streams suspended by an earlier process; position streams repaired"
+                );
+            }
+        }
 
         // 1. Rebuild store from event log (crash recovery)
         self.rebuild_store().await?;
@@ -658,8 +951,10 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             reconciliation_interval,
             missing_grace,
             shutdown.clone(),
-        );
+        )
+        .with_order_journal(Arc::clone(&self.order_journal));
         info!("Running startup reconciliation scan");
+        robson_exec::crash_point!(STARTUP_BEFORE_SCAN);
         let untracked_count = startup_reconciliation.scan_and_reconcile_blocking().await?;
         if untracked_count > 0 {
             return Err(DaemonError::Config(format!(
@@ -691,12 +986,24 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 },
             }
         }
+        Ok(())
+    }
 
+    /// Start the API and the workers, then run the main loop until the stop
+    /// enters Closing. The workers' handles go to `workers` as they start.
+    async fn serve(
+        &self,
+        journal: &Arc<OrderJournal>,
+        shutdown: &tokio_util::sync::CancellationToken,
+        workers: &mut Vec<tokio::task::JoinHandle<()>>,
+    ) -> DaemonResult<()> {
         // 4. Start API server
-        let api_addr = self.start_api_server().await?;
+        let api_addr = self.start_api_server_until(shutdown.clone()).await?;
         info!(%api_addr, "API server started");
 
         // 5. Spawn reconciliation worker (uses explicit missing_grace from config)
+        let reconciliation_interval = Duration::from_secs(self.config.reconciliation.interval_secs);
+        let missing_grace = Duration::from_secs(self.config.reconciliation.missing_grace_secs);
         let reconciliation_worker = ReconciliationWorker::new_with_missing_grace(
             Arc::clone(&self.exchange),
             Arc::clone(&self.position_manager),
@@ -705,12 +1012,13 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             reconciliation_interval,
             missing_grace,
             shutdown.clone(),
-        );
-        let reconciliation_handle = tokio::spawn(async move {
+        )
+        .with_order_journal(Arc::clone(journal));
+        workers.push(tokio::spawn(async move {
             if let Err(e) = reconciliation_worker.run().await {
                 error!(error = %e, "Reconciliation worker failed");
             }
-        });
+        }));
 
         // 6. Spawn WebSocket clients (Phase 6: Market Data) plus the REST fallback
         //    companion per symbol (ADR-0044): if the WS feed goes silent past the
@@ -728,7 +1036,6 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             exchange: Arc::clone(&self.exchange),
             position_manager: Arc::clone(&self.position_manager),
         });
-        let mut ws_handles = Vec::with_capacity(self.config.market_data.symbols.len() * 2);
         for symbol_str in &self.config.market_data.symbols {
             let symbol = Symbol::from_pair(symbol_str).map_err(|e| {
                 DaemonError::Config(format!("Invalid symbol {}: {}", symbol_str, e))
@@ -736,22 +1043,20 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             let health = Arc::new(FeedHealth::new());
             let handle =
                 market_data_manager.spawn_ws_client(symbol.clone(), Arc::clone(&health))?;
-            ws_handles.push(handle);
+            workers.push(handle);
             let fallback_handle = market_data_manager.spawn_rest_fallback(
                 symbol,
                 health,
                 Arc::clone(&fallback_support),
                 fallback_cfg,
             );
-            ws_handles.push(fallback_handle);
+            workers.push(fallback_handle);
             info!(symbol = %symbol_str, "WebSocket client + REST fallback spawned");
         }
 
         // 7. Spawn projection worker (if pg_pool configured)
         #[cfg(feature = "postgres")]
-        let projection_handle = if let (Some(pool), Some(tenant_id)) =
-            (&self.pg_pool, self.config.projection.tenant_id)
-        {
+        if let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id) {
             info!(
                 stream_key = %self.config.projection.stream_key,
                 %tenant_id,
@@ -762,48 +1067,35 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 ProjectionWorker::new((**pool).clone(), self.config.projection.clone(), tenant_id);
 
             let worker_shutdown = shutdown.clone();
-            Some(tokio::spawn(async move {
+            workers.push(tokio::spawn(async move {
                 if let Err(e) = worker.run(worker_shutdown).await {
                     error!(error = %e, "Projection worker failed");
                 }
-            }))
+            }));
         } else {
             info!("No projection worker configured");
-            None
-        };
-
-        #[cfg(not(feature = "postgres"))]
-        let projection_handle: Option<tokio::task::JoinHandle<()>> = None;
+        }
 
         #[cfg(feature = "postgres")]
-        let funding_handle = if let Some(service) = self.funding_worker_service() {
-            let worker = FundingWorker::new(service);
+        if let Some(service) = self.funding_worker_service() {
+            let worker = FundingWorker::new(service).with_order_journal(Arc::clone(journal));
             let worker_shutdown = shutdown.clone();
-            Some(tokio::spawn(async move {
+            workers.push(tokio::spawn(async move {
                 if let Err(e) = worker.run(worker_shutdown).await {
                     error!(error = %e, "Funding worker failed");
                 }
-            }))
-        } else {
-            None
-        };
-
-        #[cfg(not(feature = "postgres"))]
-        let funding_handle: Option<tokio::task::JoinHandle<()>> = None;
+            }));
+        }
 
         // 8a. Spawn the invalid-basis alarm (ADR-0051 §1 — if pg_pool configured).
         #[cfg(feature = "postgres")]
-        let budget_basis_alarm_handle = self
-            .pg_pool
-            .as_ref()
-            .map(|pool| tokio::spawn(BudgetBasisAlarm::new(pool).run(shutdown.clone())));
-
-        #[cfg(not(feature = "postgres"))]
-        let budget_basis_alarm_handle: Option<tokio::task::JoinHandle<()>> = None;
+        if let Some(pool) = &self.pg_pool {
+            workers.push(tokio::spawn(BudgetBasisAlarm::new(pool).run(shutdown.clone())));
+        }
 
         // 8b. Spawn income ledger worker (ADR-0045 §1 — if pg_pool configured).
         #[cfg(feature = "postgres")]
-        let income_ledger_handle = if let Some(pool) = &self.pg_pool {
+        if let Some(pool) = &self.pg_pool {
             info!("Starting income ledger worker (ADR-0045)");
             let worker = IncomeLedgerWorker::new(
                 Arc::clone(&self.exchange),
@@ -814,54 +1106,40 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 std::time::Duration::from_secs(60),
                 shutdown.clone(),
             );
-            Some(tokio::spawn(async move {
+            workers.push(tokio::spawn(async move {
                 if let Err(e) = worker.run().await {
                     error!(error = %e, "Income ledger worker failed");
                 }
-            }))
+            }));
         } else {
             info!("No income ledger worker configured (no pg_pool)");
-            None
-        };
+        }
 
-        #[cfg(not(feature = "postgres"))]
-        let income_ledger_handle: Option<tokio::task::JoinHandle<()>> = None;
+        // 7a. Keep the order journal's retry set moving (ADR-0056 step 7).
+        crate::metrics::observe_order_journal(journal);
+        workers.push(tokio::spawn(run_order_journal_retry(Arc::clone(journal), shutdown.clone())));
 
         // 8. Subscribe to event bus
         let mut event_receiver = self.event_bus.subscribe();
-
-        // 9. Spawn ctrl+c handler
-        let ctrl_c_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            if let Err(_) = tokio::signal::ctrl_c().await {
-                error!("Failed to install ctrl+c handler");
-            }
-            info!("Received ctrl+c, initiating shutdown");
-            ctrl_c_shutdown.cancel();
-        });
 
         let mut month_boundary_interval =
             tokio::time::interval(tokio::time::Duration::from_secs(60));
         month_boundary_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // 10. Main event loop
+        // 10. Main event loop, until the stop enters Closing. An event being
+        // handled finishes first: the select only chooses the next one.
         info!("Entering main event loop");
         loop {
             tokio::select! {
-                // Shutdown requested
                 _ = shutdown.cancelled() => {
-                    info!("Shutdown requested");
+                    info!("Main loop closing");
                     break;
                 }
 
                 // Process events from event bus
                 Some(event_result) = event_receiver.recv() => {
                     match event_result {
-                        Ok(event) => {
-                            if let Err(e) = self.handle_event(event).await {
-                                error!(error = %e, "Error handling event");
-                            }
-                        }
+                        Ok(event) => self.handle_event_permitted(journal, event).await,
                         Err(lag_msg) => {
                             warn!(%lag_msg, "Event receiver lagged");
                         }
@@ -877,40 +1155,65 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             }
         }
 
-        // 11. Graceful shutdown
-        shutdown_sig.cancel(); // Ensure any remaining tasks are cancelled
-
-        info!("Waiting for reconciliation worker to finish...");
-        let _ = tokio::time::timeout(Duration::from_secs(10), reconciliation_handle).await;
-
-        info!(count = ws_handles.len(), "Waiting for WebSocket clients to finish...");
-        for handle in ws_handles {
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), handle).await;
-        }
-
-        if let Some(handle) = projection_handle {
-            info!("Waiting for projection worker to finish...");
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(30), handle).await;
-        }
-
-        if let Some(handle) = funding_handle {
-            info!("Waiting for funding worker to finish...");
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
-        }
-
-        if let Some(handle) = budget_basis_alarm_handle {
-            info!("Waiting for budget basis alarm to finish...");
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
-        }
-
-        if let Some(handle) = income_ledger_handle {
-            info!("Waiting for income ledger worker to finish...");
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
-        }
-
-        self.shutdown().await?;
-
         Ok(())
+    }
+
+    /// One main-loop event, under the main loop's permit (ADR-0056 step 7).
+    async fn handle_event_permitted(&self, journal: &Arc<OrderJournal>, event: DaemonEvent) {
+        let handled = match journal.acquire(OperationKind::MainLoop) {
+            Ok(permit) => permit.run(self.handle_event(event)).await,
+            Err(refusal) => {
+                warn!(%refusal, "Main loop event not handled");
+                return;
+            },
+        };
+        if let Err(e) = handled {
+            error!(error = %e, "Error handling event");
+        }
+    }
+
+    /// Insert this process's epoch, strictly, and record whether its start is
+    /// unclean (ADR-0056 step 7). The fence is seeded from it before any venue
+    /// request: the generation's high half, the `unclean_start` occurrence,
+    /// and every incident no release covered, any of which closes it. The
+    /// marker a clean stop writes on it. Without a database there is none, and
+    /// only the stub may start.
+    #[cfg(feature = "postgres")]
+    async fn start_epoch(&self) -> DaemonResult<Option<Box<dyn StopMarker>>> {
+        let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id)
+        else {
+            refuse_an_epochless_venue(self.exchange.id())?;
+            return Ok(None);
+        };
+        let start =
+            crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION")).await?;
+        crate::process_epoch::record_start(&start);
+        let view = robson_exec::gate::EpochView {
+            epoch_seq: start.epoch.epoch_seq,
+            unclean_reason: start.predecessor.unclean_reason(),
+        };
+        self.order_journal.gate().begin_epoch(
+            view,
+            start.unclean_generation,
+            start.open_incidents.clone(),
+        );
+        crate::metrics::observe_fence(&self.order_journal);
+        self.position_manager
+            .read()
+            .await
+            .event_streams()
+            .set_epoch(start.epoch.epoch_id);
+        Ok(Some(Box::new(EpochMarker {
+            pool: Arc::clone(pool),
+            epoch: start.epoch,
+        })))
+    }
+
+    /// A build without PostgreSQL has no epochs: only the stub may start.
+    #[cfg(not(feature = "postgres"))]
+    async fn start_epoch(&self) -> DaemonResult<Option<Box<dyn StopMarker>>> {
+        refuse_an_epochless_venue(self.exchange.id())?;
+        Ok(None)
     }
 
     async fn poll_month_boundary(&self, now: DateTime<Utc>) -> DaemonResult<bool> {
@@ -927,7 +1230,11 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             "Month boundary detected, processing reset"
         );
 
-        self.handle_month_boundary(now).await?;
+        // Pending until this month's reset lands or is found. A failure leaves
+        // last_month_check behind, so the next poll retries.
+        let handled = self.handle_month_boundary(now).await;
+        self.month_boundary_pending.set(if handled.is_ok() { 0.0 } else { 1.0 });
+        handled?;
 
         let mut last_month_check = self.last_month_check.write().await;
         *last_month_check = current_month;
@@ -981,32 +1288,66 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 .expect("midnight must be valid"),
             chrono::Utc,
         );
-        let prev_capital = {
-            let manager = self.position_manager.read().await;
-            manager.load_capital_base_for_month(prev_month).await.unwrap_or(Decimal::ZERO)
-        };
         let all_open_positions = self.store.positions().find_active().await?;
         let armed_count = all_open_positions
             .iter()
             .filter(|p| matches!(p.state, PositionState::Armed))
             .count() as u32;
-        let armed_risk = prev_capital * Decimal::new(1, 2) * Decimal::from(armed_count);
+        // Only the base the previous month's reset recorded. A failed read
+        // appends no reset: counting Armed risk as zero would overstate the
+        // basis for the whole month. The next poll retries.
+        let prev_capital = {
+            let manager = self.position_manager.read().await;
+            manager.recorded_capital_base(prev_month).await
+        };
+        let prev_capital = prev_capital.inspect_err(|e| {
+            error!(
+                error = %e,
+                year = now.year(),
+                month = now.month(),
+                "Month boundary reset deferred: the previous month's capital base could not be \
+                 read; no reset appended, retrying at the next poll"
+            );
+        })?;
+        let armed_risk = match prev_capital {
+            Some(prev_capital) => prev_capital * Decimal::new(1, 2) * Decimal::from(armed_count),
+            // Bootstrap: with nothing Armed the previous base reserves nothing.
+            None if armed_count == 0 => Decimal::ZERO,
+            None => {
+                let reason = format!(
+                    "{armed_count} Armed position(s) need the previous month's capital base for \
+                     their reservation, and no reset recorded one; disarm them or record that \
+                     base"
+                );
+                error!(
+                    year = now.year(),
+                    month = now.month(),
+                    armed_count,
+                    "Month boundary reset deferred: {reason}; no reset appended, retrying at the \
+                     next poll"
+                );
+                return Err(DaemonError::MonthBoundaryDeferred { reason });
+            },
+        };
         let carried_risk = carried_risk_committed + armed_risk;
 
         // current_equity per ADR-0024 §6: wallet balance from the exchange.
         // The capital_base is pessimistic: it subtracts carried_risk (worst case
         // loss from inherited positions) from current_equity. This guarantees
-        // every month starts with 4 available slots.
+        // every month starts with 4 available slots. Only the operated wallet
+        // sets the basis: a failed read appends no reset, and the next poll
+        // retries until the venue answers.
         let current_equity = match self.exchange.get_futures_balance().await {
             Ok(balance) => balance.wallet_balance,
             Err(e) => {
-                warn!(
+                error!(
                     error = %e,
-                    "Failed to query exchange balance for month boundary — \
-                     falling back to local equity estimate"
+                    year = now.year(),
+                    month = now.month(),
+                    "Month boundary reset deferred: the wallet balance could not be read; no \
+                     reset appended, retrying at the next poll"
                 );
-                let manager = self.position_manager.read().await;
-                manager.compute_current_equity().await?
+                return Err(e.into());
             },
         };
         let capital_base = (current_equity - carried_risk).max(rust_decimal::Decimal::ZERO);
@@ -1495,7 +1836,9 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
 
     /// Read back what `positions_current` does not carry (ADR-0056 §5): the
     /// leg's rules snapshot, its latest residual and the stops it displaced,
-    /// from the event log, in stream order. One query per recovered leg.
+    /// from the event log, in stream order. One query per recovered leg. The
+    /// same rows rebuild a stop heal left outstanding by the last process: an
+    /// `Active` leg whose latest stop event is a failure (ADR-0056 step 7).
     ///
     /// A query that fails aborts startup: the database is needed anyway, the
     /// pod restarts and retries, and exchange stops stay live meanwhile. A
@@ -1509,11 +1852,20 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         tenant_id: uuid::Uuid,
         position: &mut Position,
     ) -> DaemonResult<()> {
-        const LEG_EVIDENCE: [&str; 4] = [
-            "entry_signal_received",
-            "residual_inventory_recorded",
+        const STOP_FAILED: &str = "insurance_stop_failed";
+        const STOP_EVENTS: [&str; 4] = [
             "insurance_stop_placed",
             "insurance_stop_replaced",
+            "insurance_stop_cancelled",
+            STOP_FAILED,
+        ];
+        const LEG_EVIDENCE: [&str; 6] = [
+            "entry_signal_received",
+            "residual_inventory_recorded",
+            STOP_EVENTS[0],
+            STOP_EVENTS[1],
+            STOP_EVENTS[2],
+            STOP_EVENTS[3],
         ];
         let Some(pool) = &self.pg_pool else {
             return Ok(());
@@ -1530,6 +1882,12 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                     position.id
                 ))
             })?;
+        let heal_outstanding = matches!(position.state, PositionState::Active { .. })
+            && envelopes
+                .iter()
+                .rev()
+                .find(|envelope| STOP_EVENTS.contains(&envelope.event_type.as_str()))
+                .is_some_and(|envelope| envelope.event_type == STOP_FAILED);
         for envelope in envelopes {
             if let Err(error) =
                 position.restore_leg_evidence_record(&envelope.event_type, envelope.payload)
@@ -1548,6 +1906,13 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 position_id = %position.id,
                 "Residual row unreadable; admissions stay blocked until this leg closes (ADR-0056 §5)"
             );
+        }
+        if heal_outstanding {
+            self.position_manager
+                .read()
+                .await
+                .schedule_stop_heal_after_restart(position.id)
+                .await;
         }
         Ok(())
     }
@@ -1705,6 +2070,15 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     /// Public to allow integration tests to start the server and get the
     /// address.
     pub async fn start_api_server(&self) -> DaemonResult<SocketAddr> {
+        self.start_api_server_until(tokio_util::sync::CancellationToken::new()).await
+    }
+
+    /// Start the API server; it stops accepting when `shutdown` is cancelled
+    /// and lets the requests in flight finish.
+    async fn start_api_server_until(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> DaemonResult<SocketAddr> {
         let (circuit_breaker, prices) = {
             let pm = self.position_manager.read().await;
             (pm.circuit_breaker(), pm.price_cache())
@@ -1767,7 +2141,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             funding: self.config.funding.clone(),
             funding_route_mode: self.funding_worker_route().1,
             venue_feed,
-            order_journal: Arc::new(robson_exec::order_journal::OrderJournal::unpersisted()),
+            order_journal: Arc::clone(&self.order_journal),
         });
 
         let router = create_router(state);
@@ -1783,7 +2157,9 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
 
         // Spawn the server task
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, router).await {
+            let serving =
+                axum::serve(listener, router).with_graceful_shutdown(shutdown.cancelled_owned());
+            if let Err(e) = serving.await {
                 error!(error = %e, "API server error");
             }
         });
@@ -2266,6 +2642,39 @@ mod tests {
         }
     }
 
+    /// Without a database only the stub starts: a venue that can mutate,
+    /// selected explicitly or from credentials, is refused at its epoch, which
+    /// comes before any request to it (ADR-0056 step 7).
+    #[tokio::test]
+    async fn without_a_database_only_the_stub_starts() {
+        use crate::config::{Environment::*, VenueSelection::*};
+
+        let cases = [
+            (Stub, false, false, Development, true),
+            (Unset, false, false, Production, true),
+            (Unset, true, false, Development, true),
+            (BinanceUsdm, true, true, Development, false),
+            (Unset, true, true, Development, false),
+            (Unset, true, false, Production, false),
+        ];
+        for (selection, credentials, use_testnet, environment, starts) in cases {
+            let case = format!("{selection:?} {credentials} {use_testnet} {environment:?}");
+            let daemon = daemon_from_factory(factory_config(
+                selection,
+                credentials,
+                use_testnet,
+                environment,
+            ));
+            match daemon.start_epoch().await {
+                Ok(_) => assert!(starts, "{case}: {} started", daemon.exchange.id()),
+                Err(error) => {
+                    assert!(!starts, "{case}: {error}");
+                    assert!(error.to_string().contains("process epoch"), "{case}: {error}");
+                },
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_factory_stub_serves_no_endpoint_that_creates_a_saga() {
         use crate::config::{Environment::Development, VenueSelection::*};
@@ -2442,6 +2851,77 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 2, 8, 29, 4).single().unwrap();
         assert!(daemon.poll_month_boundary(now).await.unwrap());
         assert!(!daemon.poll_month_boundary(now).await.unwrap());
+    }
+
+    /// The `MonthBoundaryReset` events in the daemon's store: base, carried
+    /// risk, month, year.
+    async fn month_resets(
+        daemon: &Daemon<StubExchange, MemoryStore>,
+    ) -> Vec<(Decimal, Decimal, u32, i32)> {
+        let events = daemon.store.events().get_all_events().await.unwrap();
+        events
+            .iter()
+            .filter_map(|event| match event {
+                robson_domain::Event::MonthBoundaryReset {
+                    capital_base,
+                    carried_positions_risk,
+                    month,
+                    year,
+                    ..
+                } => Some((*capital_base, *carried_positions_risk, *month, *year)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A gauge of the test's own in place of the shared one.
+    fn watch_month_boundary_pending(
+        daemon: &mut Daemon<StubExchange, MemoryStore>,
+    ) -> prometheus::Gauge {
+        let pending = prometheus::Gauge::new("test_month_boundary_pending", "test").unwrap();
+        daemon.month_boundary_pending = pending.clone();
+        pending
+    }
+
+    /// ADR-0024 §6: only the operated wallet sets the basis. A boundary whose
+    /// wallet read fails appends no reset, with no local estimate in its place;
+    /// the month stays pending and the next poll appends the wallet's basis.
+    /// The configured capital (10,000) differs from the wallet (8,000), so a
+    /// fallback to it would show.
+    #[tokio::test]
+    async fn a_failed_wallet_read_appends_no_reset_and_the_next_poll_retries() {
+        let mut daemon = Daemon::new_stub(Config::test());
+        let pending = watch_month_boundary_pending(&mut daemon);
+        daemon.exchange.set_futures_balance(dec!(8000));
+        let boundary = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
+
+        daemon.exchange.set_fail_next(true);
+        let error = daemon.poll_month_boundary(boundary).await.unwrap_err();
+
+        assert!(matches!(error, DaemonError::Exec(_)), "{error:?}");
+        assert!(month_resets(&daemon).await.is_empty());
+        assert_eq!(pending.get(), 1.0);
+
+        let retry = boundary + chrono::Duration::seconds(60);
+        assert!(daemon.poll_month_boundary(retry).await.unwrap());
+
+        assert_eq!(month_resets(&daemon).await, vec![(dec!(8000), dec!(0), 5, 2026)]);
+        assert_eq!(pending.get(), 0.0);
+        assert!(!daemon.poll_month_boundary(retry).await.unwrap());
+    }
+
+    /// The pending gauge exports 0 from startup, before any poll.
+    #[tokio::test]
+    async fn the_month_boundary_gauge_starts_at_zero() {
+        let mut daemon = Daemon::new_stub(Config::test());
+        let pending = watch_month_boundary_pending(&mut daemon);
+        pending.set(1.0);
+        let stop = StopRequest::default();
+        stop.ask();
+
+        daemon.run_until(stop).await.unwrap();
+
+        assert_eq!(pending.get(), 0.0);
     }
 
     /// ADR-0056 §5: a restart reads the leg evidence back from `event_log`,
@@ -2637,6 +3117,164 @@ mod tests {
         assert_eq!(reread.residual_quantity, Some(dec!(0.005)));
     }
 
+    /// ADR-0056 step 7, PR C: a stop heal the last process left outstanding is
+    /// rebuilt from the event log, on real rows, in stream order.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn restart_rebuilds_a_stop_heal_from_the_latest_stop_event(pool: sqlx::PgPool) {
+        use robson_domain::Event;
+        let tenant_id = uuid::Uuid::from_u128(0x56603);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let price = || Price::new(dec!(76000)).unwrap();
+        let failed = |position_id| Event::InsuranceStopFailed {
+            position_id,
+            stop_price: Price::zero(),
+            error: "order gateway unavailable".to_string(),
+            timestamp: Utc::now(),
+        };
+        let placed = |position_id| Event::InsuranceStopPlaced {
+            position_id,
+            order_id: "ins-2".to_string(),
+            stop_price: price(),
+            timestamp: Utc::now(),
+        };
+        let replaced = |position_id| Event::InsuranceStopReplaced {
+            position_id,
+            previous_order_id: "ins-1".to_string(),
+            order_id: "ins-2".to_string(),
+            stop_price: price(),
+            timestamp: Utc::now(),
+        };
+        let cancelled = |position_id| Event::InsuranceStopCancelled {
+            position_id,
+            order_id: "ins-1".to_string(),
+            timestamp: Utc::now(),
+        };
+        let unrelated = |position_id| Event::ResidualInventoryRecorded {
+            position_id,
+            order_kind: robson_domain::ReductionKind::Protection,
+            requested_quantity: dec!(0.105),
+            accepted_quantity: dec!(0.1),
+            residual_quantity: dec!(0.005),
+            exchange_order_id: None,
+            fill_price: None,
+            fee: None,
+            step_size: None,
+            min_qty: None,
+            timestamp: Utc::now(),
+        };
+        let active = PositionState::Active {
+            current_price: Price::new(dec!(77500)).unwrap(),
+            trailing_stop: price(),
+            favorable_extreme: Price::new(dec!(77500)).unwrap(),
+            extreme_at: Utc::now(),
+            insurance_stop_id: Some("ins-1".to_string()),
+            invalidation_guard_level: None,
+            last_emitted_stop: None,
+        };
+        let exiting = PositionState::Exiting {
+            exit_order_id: uuid::Uuid::now_v7(),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+        let id = uuid::Uuid::nil();
+        let cases: Vec<(&str, PositionState, Vec<Event>, bool)> = vec![
+            ("latest is failed", active.clone(), vec![placed(id), failed(id)], true),
+            (
+                "a later event of another kind changes nothing",
+                active.clone(),
+                vec![placed(id), failed(id), unrelated(id)],
+                true,
+            ),
+            ("failed then placed", active.clone(), vec![failed(id), placed(id)], false),
+            ("failed then replaced", active.clone(), vec![failed(id), replaced(id)], false),
+            ("failed then cancelled", active.clone(), vec![failed(id), cancelled(id)], false),
+            ("no stop event at all", active.clone(), vec![unrelated(id)], false),
+            ("not Active", exiting, vec![placed(id), failed(id)], false),
+        ];
+
+        for (name, state, events, expected) in cases {
+            let mut position = Position::new(
+                uuid::Uuid::now_v7(),
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                robson_domain::Side::Long,
+            );
+            position.quantity = robson_domain::Quantity::new(dec!(0.105)).unwrap();
+            position.state = state;
+            let stream = format!("position:{}", position.id);
+            for event in events {
+                let mut payload = serde_json::to_value(&event).unwrap();
+                payload["position_id"] = serde_json::json!(position.id);
+                let envelope =
+                    robson_eventlog::Event::new(tenant_id, &stream, event.event_type(), payload);
+                robson_eventlog::append_event(&pool, &stream, None, envelope).await.unwrap();
+            }
+
+            daemon.restore_leg_evidence(tenant_id, &mut position).await.unwrap();
+
+            let manager = daemon.position_manager.read().await;
+            assert_eq!(
+                manager.stop_heal_deadline_for_test(position.id).await.is_some(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// The whole restore path: a leg recovered from the projection with a
+    /// failure as its latest stop event comes out with its heal scheduled.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn restore_positions_schedules_the_heal_a_failed_stop_left(pool: sqlx::PgPool) {
+        let tenant_id = uuid::Uuid::from_u128(0x56604);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let mut position = Position::new(
+            uuid::Uuid::now_v7(),
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            robson_domain::Side::Long,
+        );
+        position.quantity = robson_domain::Quantity::new(dec!(0.105)).unwrap();
+        position.state = PositionState::Active {
+            current_price: Price::new(dec!(77500)).unwrap(),
+            trailing_stop: Price::new(dec!(76000)).unwrap(),
+            favorable_extreme: Price::new(dec!(77500)).unwrap(),
+            extreme_at: Utc::now(),
+            insurance_stop_id: Some("ins-1".to_string()),
+            invalidation_guard_level: None,
+            last_emitted_stop: None,
+        };
+        let id = position.id;
+        let stream = format!("position:{id}");
+        let event = robson_domain::Event::InsuranceStopFailed {
+            position_id: id,
+            stop_price: Price::zero(),
+            error: "order gateway unavailable".to_string(),
+            timestamp: Utc::now(),
+        };
+        let envelope = robson_eventlog::Event::new(
+            tenant_id,
+            &stream,
+            event.event_type(),
+            serde_json::to_value(&event).unwrap(),
+        );
+        robson_eventlog::append_event(&pool, &stream, None, envelope).await.unwrap();
+        let daemon = Daemon::new_stub_with_recovery(
+            config,
+            Some(Arc::new(OneLegProjectionRecovery(position))),
+            Some(Arc::new(pool.clone())),
+        );
+
+        daemon.restore_positions().await.unwrap();
+
+        let manager = daemon.position_manager.read().await;
+        assert!(manager.stop_heal_deadline_for_test(id).await.is_some());
+        assert_eq!(daemon.store.positions().find_active().await.unwrap().len(), 1);
+    }
+
     /// The daemon itself starts the ADR-0051 §1 alarm: a zero basis on an idle
     /// system raises the exported metric with nothing else asking.
     #[cfg(feature = "postgres")]
@@ -2666,7 +3304,7 @@ mod tests {
         config.projection.tenant_id = Some(uuid::Uuid::from_u128(0x13203));
         let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool)));
 
-        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown = StopRequest::default();
         let raised = async {
             let mut raised = false;
             for _ in 0..1000 {
@@ -2676,7 +3314,7 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            shutdown.cancel();
+            shutdown.ask();
             raised
         };
 
@@ -2818,7 +3456,7 @@ mod tests {
         .unwrap();
         assert_eq!(event_count, 1);
 
-        // Same text as load_capital_base_for_month, so same parameter types: SQLx
+        // Same parameter types as the production reads of this table: SQLx
         // caches the prepared statement per connection.
         let capital_base: Decimal = sqlx::query_scalar(
             "SELECT capital_base FROM monthly_state WHERE year = $1 AND month = $2",
@@ -2829,6 +3467,214 @@ mod tests {
         .await
         .unwrap();
         assert!(capital_base > Decimal::ZERO, "capital_base = {capital_base}");
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn month_reset_events(pool: &sqlx::PgPool, tenant_id: uuid::Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_log WHERE tenant_id = $1 AND event_type = 'month_boundary_reset'",
+        )
+        .bind(tenant_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The month's row as the reset leaves it: base and reset time. Text of its
+    /// own, so no production statement is cached with other parameter types.
+    #[cfg(feature = "postgres")]
+    async fn month_row(
+        pool: &sqlx::PgPool,
+        at: chrono::DateTime<Utc>,
+    ) -> Option<(Decimal, Option<chrono::DateTime<Utc>>)> {
+        sqlx::query_as(
+            "SELECT capital_base, boundary_reset_at FROM monthly_state \
+             WHERE year = $1 AND month = $2 /* test */",
+        )
+        .bind(at.year() as i16)
+        .bind(at.month() as i16)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// On PostgreSQL: a boundary whose wallet read fails leaves nothing in
+    /// `event_log` or `monthly_state`, so the month is not marked as reset, and
+    /// the next poll persists the wallet's basis.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_failed_wallet_read_at_the_boundary_persists_no_reset(pool: sqlx::PgPool) {
+        let tenant_id = uuid::Uuid::from_u128(0x13205);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let mut daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let pending = watch_month_boundary_pending(&mut daemon);
+        daemon.exchange.set_futures_balance(dec!(8000));
+        let boundary = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
+
+        daemon.exchange.set_fail_next(true);
+        let error = daemon.poll_month_boundary(boundary).await.unwrap_err();
+
+        assert!(matches!(error, DaemonError::Exec(_)), "{error:?}");
+        assert_eq!(month_reset_events(&pool, tenant_id).await, 0);
+        assert_eq!(month_row(&pool, boundary).await, None);
+        assert_eq!(pending.get(), 1.0);
+
+        let retry = boundary + chrono::Duration::seconds(60);
+        assert!(daemon.poll_month_boundary(retry).await.unwrap());
+
+        assert_eq!(month_reset_events(&pool, tenant_id).await, 1);
+        assert_eq!(month_row(&pool, boundary).await, Some((dec!(8000), Some(retry))));
+        assert_eq!(pending.get(), 0.0);
+    }
+
+    /// An Armed leg in the in-memory book, to be reserved at the boundary.
+    #[cfg(feature = "postgres")]
+    async fn save_armed(daemon: &Daemon<StubExchange, MemoryStore>) {
+        let mut armed =
+            Position::new(uuid::Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        armed.state = PositionState::Armed;
+        daemon.store.positions().save(&armed).await.unwrap();
+    }
+
+    /// The previous month's base cannot be read (a NaN, which no `Decimal`
+    /// holds), so Armed risk is unknown: the boundary appends no reset rather
+    /// than count it as zero. Once the row reads, the next poll appends it,
+    /// reserving 1% of that recorded base (9,000), not of the configured
+    /// capital (10,000), for the Armed leg.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_failed_previous_month_read_at_the_boundary_persists_no_reset(pool: sqlx::PgPool) {
+        let previous = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
+        sqlx::query(
+            "INSERT INTO monthly_state (year, month, capital_base, boundary_reset_at, created_at) \
+             VALUES ($1, $2, 'NaN', $3, $3)",
+        )
+        .bind(previous.year() as i16)
+        .bind(previous.month() as i16)
+        .bind(previous)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let tenant_id = uuid::Uuid::from_u128(0x13206);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let mut daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let pending = watch_month_boundary_pending(&mut daemon);
+        save_armed(&daemon).await;
+        let boundary = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 1).single().unwrap();
+
+        let error = daemon.poll_month_boundary(boundary).await.unwrap_err();
+
+        assert!(matches!(error, DaemonError::Database(_)), "{error:?}");
+        assert_eq!(month_reset_events(&pool, tenant_id).await, 0);
+        assert_eq!(month_row(&pool, boundary).await, None);
+        assert_eq!(pending.get(), 1.0);
+
+        sqlx::query("UPDATE monthly_state SET capital_base = 9000 WHERE year = $1 AND month = $2")
+            .bind(previous.year() as i16)
+            .bind(previous.month() as i16)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retry = boundary + chrono::Duration::seconds(60);
+        assert!(daemon.poll_month_boundary(retry).await.unwrap());
+
+        assert_eq!(month_reset_events(&pool, tenant_id).await, 1);
+        assert_eq!(month_row(&pool, boundary).await, Some((dec!(9910), Some(retry))));
+        assert_eq!(month_resets(&daemon).await, vec![(dec!(9910), dec!(90), 6, 2026)]);
+        assert_eq!(pending.get(), 0.0);
+    }
+
+    /// With an Armed leg, a previous month with no recorded base, no row or a
+    /// row no reset stamped, defers the reset instead of reserving 1% of the
+    /// configured capital. Once a reset-stamped base is on record, it lands.
+    /// With nothing Armed, the fresh-database test above shows a missing
+    /// previous month needs nothing.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn an_armed_leg_without_a_recorded_previous_base_defers_the_reset(pool: sqlx::PgPool) {
+        let tenant_id = uuid::Uuid::from_u128(0x13207);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let mut daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let pending = watch_month_boundary_pending(&mut daemon);
+        save_armed(&daemon).await;
+        let previous = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
+        let boundary = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 1).single().unwrap();
+
+        let missing = daemon.poll_month_boundary(boundary).await.unwrap_err();
+        assert!(matches!(missing, DaemonError::MonthBoundaryDeferred { .. }), "{missing:?}");
+
+        sqlx::query(
+            "INSERT INTO monthly_state (year, month, capital_base, created_at) \
+             VALUES ($1, $2, 9000, $3)",
+        )
+        .bind(previous.year() as i16)
+        .bind(previous.month() as i16)
+        .bind(previous)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let unstamped = daemon.poll_month_boundary(boundary).await.unwrap_err();
+        assert!(matches!(unstamped, DaemonError::MonthBoundaryDeferred { .. }), "{unstamped:?}");
+        assert_eq!(month_reset_events(&pool, tenant_id).await, 0);
+        assert_eq!(month_row(&pool, boundary).await, None);
+        assert_eq!(pending.get(), 1.0);
+
+        sqlx::query(
+            "UPDATE monthly_state SET boundary_reset_at = created_at \
+             WHERE year = $1 AND month = $2",
+        )
+        .bind(previous.year() as i16)
+        .bind(previous.month() as i16)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(daemon.poll_month_boundary(boundary).await.unwrap());
+
+        assert_eq!(month_row(&pool, boundary).await, Some((dec!(9910), Some(boundary))));
+        assert_eq!(pending.get(), 0.0);
+    }
+
+    /// Before the first poll of a month with no landed reset, the daemon's own
+    /// manager refuses entries; the poll lands the reset and they reopen. The
+    /// guard reads `monthly_state`, not the pending gauge.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn admissions_reopen_once_the_boundary_poll_lands_the_reset(pool: sqlx::PgPool) {
+        let tenant_id = uuid::Uuid::from_u128(0x13208);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let mut daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let pending = watch_month_boundary_pending(&mut daemon);
+        daemon.exchange.set_futures_balance(dec!(8000));
+        let now = Utc::now();
+        let manager = Arc::clone(&daemon.position_manager);
+
+        let before = manager.read().await.admission_capital_base(now).await;
+        assert!(matches!(before, Err(DaemonError::AdmissionsClosed { .. })), "{before:?}");
+        assert!(
+            manager
+                .read()
+                .await
+                .canonical_budget_snapshot(now)
+                .await
+                .unwrap()
+                .capital_base_invalid
+        );
+        assert_eq!(pending.get(), 0.0, "the gauge is not what refuses");
+
+        assert!(daemon.poll_month_boundary(now).await.unwrap());
+
+        let snapshot = manager.read().await.canonical_budget_snapshot(now).await.unwrap();
+        assert!(!snapshot.capital_base_invalid);
+        assert_eq!(snapshot.capital_base, dec!(8000));
+        assert_eq!(manager.read().await.admission_capital_base(now).await.unwrap(), dec!(8000));
     }
 
     #[tokio::test]
@@ -3034,6 +3880,386 @@ mod tests {
     // TD-2026-05-05-001 Slice 5A — Startup stale-active gate tests
     // -------------------------------------------------------------------------
 
+    // ---- Operation permits and the stop (ADR-0056 step 7, PR S) --------
+
+    /// Every venue mutation the stub saw ran under `kind`, the one permit held,
+    /// in one internal slot.
+    fn assert_every_mutation_under(exchange: &StubExchange, kind: OperationKind) {
+        let mutations = exchange.mutations();
+        assert!(!mutations.is_empty(), "the operation reached the venue");
+        for mutation in mutations {
+            assert_eq!(mutation.permit, Some(kind), "{mutation:?}");
+            let gate = mutation.gate.expect("the daemon's stub passes the gate");
+            assert_eq!((gate.permits, gate.internal, gate.unpermitted), (1, 1, 0), "{mutation:?}");
+        }
+    }
+
+    /// One main-loop event runs under the main loop's permit, the entry it
+    /// makes and that entry's stop included; once Closing has begun, a new
+    /// event is not handled at all.
+    #[tokio::test]
+    async fn a_main_loop_event_runs_under_the_main_loop_permit() {
+        use robson_domain::{DetectorSignal, Symbol};
+        use rust_decimal_macros::dec;
+
+        let daemon = Daemon::new_stub_with_capital(Config::test(), dec!(10000)).unwrap();
+        let arm = || async {
+            daemon
+                .position_manager
+                .read()
+                .await
+                .arm_position(
+                    Symbol::from_pair("BTCUSDT").unwrap(),
+                    Side::Long,
+                    RiskConfig::new(dec!(10000)).unwrap(),
+                    Some(TechnicalStopDistance::from_entry_and_stop(
+                        Price::new(dec!(100)).unwrap(),
+                        Price::new(dec!(90)).unwrap(),
+                    )),
+                    uuid::Uuid::now_v7(),
+                )
+                .await
+                .unwrap()
+        };
+        let signal = |position: &robson_domain::Position| {
+            DaemonEvent::DetectorSignal(DetectorSignal {
+                signal_id: uuid::Uuid::now_v7(),
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: Side::Long,
+                entry_price: Price::new(dec!(95000)).unwrap(),
+                stop_loss: Price::new(dec!(86000)).unwrap(),
+                technical_stop_analysis: None,
+                timestamp: Utc::now(),
+            })
+        };
+
+        let first = arm().await;
+        daemon.handle_event_permitted(&daemon.order_journal, signal(&first)).await;
+        let what: Vec<_> = daemon.exchange.mutations().iter().map(|m| m.what).collect();
+        assert!(what.contains(&"POST /fapi/v1/order"), "the entry: {what:?}");
+        assert!(what.contains(&"POST /fapi/v1/algoOrder"), "its stop: {what:?}");
+        assert_every_mutation_under(&daemon.exchange, OperationKind::MainLoop);
+
+        let second = arm().await;
+        daemon.order_journal.gate().begin_closing();
+        let sent = daemon.exchange.mutations().len();
+        daemon.handle_event_permitted(&daemon.order_journal, signal(&second)).await;
+        assert_eq!(daemon.exchange.mutations().len(), sent);
+        let second = daemon.store.positions().find_by_id(second.id).await.unwrap().unwrap();
+        assert!(matches!(second.state, PositionState::Armed), "{:?}", second.state);
+        assert_eq!(daemon.order_journal.gate().snapshot().permits, 0);
+    }
+
+    /// A main-loop event that never finishes holds its permit past the stop's
+    /// deadline: the daemon does not wait for it. The stop ends unclean at the
+    /// deadline, and the daemon returns then, dropping the event, aborted.
+    #[tokio::test]
+    async fn a_stuck_main_loop_event_does_not_hold_the_daemon_past_the_stop_deadline() {
+        use robson_domain::{DetectorSignal, Symbol};
+        use rust_decimal_macros::dec;
+
+        let timings = StopTimings {
+            drain_limit: Duration::from_millis(200),
+            deadline: Duration::from_millis(600),
+        };
+        let daemon = Daemon::new_stub_with_capital(Config::test(), dec!(10000))
+            .unwrap()
+            .with_stop_timings(timings);
+        let (exchange, event_bus, journal) = (
+            Arc::clone(&daemon.exchange),
+            Arc::clone(&daemon.event_bus),
+            Arc::clone(&daemon.order_journal),
+        );
+        let venue = Arc::clone(&exchange);
+        let position = daemon
+            .position_manager
+            .read()
+            .await
+            .arm_position(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                RiskConfig::new(dec!(10000)).unwrap(),
+                Some(TechnicalStopDistance::from_entry_and_stop(
+                    Price::new(dec!(100)).unwrap(),
+                    Price::new(dec!(90)).unwrap(),
+                )),
+                uuid::Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+        let _held = exchange.hold_next_mutation();
+        let stop = StopRequest::default();
+        let asking = {
+            let stop = stop.clone();
+            async move {
+                let signal = DaemonEvent::DetectorSignal(DetectorSignal {
+                    signal_id: uuid::Uuid::now_v7(),
+                    position_id: position.id,
+                    symbol: position.symbol.clone(),
+                    side: Side::Long,
+                    entry_price: Price::new(dec!(95000)).unwrap(),
+                    stop_loss: Price::new(dec!(86000)).unwrap(),
+                    technical_stop_analysis: None,
+                    timestamp: Utc::now(),
+                });
+                // Sent until the main loop, once listening, takes it: its entry
+                // reaches the venue and is held there, with the main loop's
+                // permit. The detector listens too, and ignores it.
+                while venue.mutations().is_empty() {
+                    event_bus.send(signal.clone());
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                stop.ask();
+                tokio::time::Instant::now()
+            }
+        };
+        let running = async { tokio::join!(Box::pin(daemon.run_until(stop.clone())), asking) };
+        let (result, asked) = tokio::time::timeout(Duration::from_secs(20), running)
+            .await
+            .expect("the daemon returns once the stop has its result");
+        result.unwrap();
+        let took = asked.elapsed();
+        assert!(took >= timings.deadline && took < Duration::from_secs(3), "{took:?}");
+        assert_eq!(exchange.mutations().len(), 1, "the entry's first request was the one held");
+        assert_eq!(journal.gate().snapshot().aborted, 1, "dropped at the deadline");
+    }
+
+    /// A startup still holding its permit at the stop's deadline is not waited
+    /// for either: the stop ends unclean, and the daemon returns then, the
+    /// startup dropped, aborted.
+    #[tokio::test]
+    async fn a_stuck_startup_does_not_hold_the_daemon_past_the_stop_deadline() {
+        use rust_decimal_macros::dec;
+
+        let timings = StopTimings {
+            drain_limit: Duration::from_millis(200),
+            deadline: Duration::from_millis(600),
+        };
+        let daemon = Daemon::new_stub(Config::test()).with_stop_timings(timings);
+        let (exchange, journal) = (Arc::clone(&daemon.exchange), Arc::clone(&daemon.order_journal));
+        // An untracked position: the startup scan closes it, and the close is
+        // held at the venue, under the startup permit.
+        exchange.set_open_position(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+            Quantity::new(dec!(0.01)).unwrap(),
+            Price::new(dec!(95000)).unwrap(),
+        );
+        let _held = exchange.hold_next_mutation();
+        let stop = StopRequest::default();
+        let asking = {
+            let (stop, venue) = (stop.clone(), Arc::clone(&exchange));
+            async move {
+                while venue.mutations().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                stop.ask();
+                tokio::time::Instant::now()
+            }
+        };
+        let running = async { tokio::join!(Box::pin(daemon.run_until(stop.clone())), asking) };
+        let (result, asked) = tokio::time::timeout(Duration::from_secs(20), running)
+            .await
+            .expect("the daemon returns once the stop has its result");
+        result.unwrap();
+        let took = asked.elapsed();
+        assert!(took >= timings.deadline && took < Duration::from_secs(3), "{took:?}");
+        assert_eq!(exchange.mutations().len(), 1, "the startup's close was the one held");
+        assert_eq!(journal.gate().snapshot().aborted, 1, "dropped at the deadline");
+    }
+
+    /// The startup phase holds the startup slot's one permit, and the startup
+    /// scan's close of an untracked position runs under it, not under a
+    /// reconciliation permit of its own.
+    #[tokio::test]
+    async fn the_startup_scan_runs_under_the_startup_permit() {
+        use rust_decimal_macros::dec;
+
+        let daemon = Daemon::new_stub(Config::test());
+        let (exchange, journal) = (Arc::clone(&daemon.exchange), Arc::clone(&daemon.order_journal));
+        exchange.set_open_position(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+            Quantity::new(dec!(0.01)).unwrap(),
+            Price::new(dec!(95000)).unwrap(),
+        );
+
+        let result = daemon.run_until(StopRequest::default()).await;
+
+        assert!(
+            matches!(result, Err(DaemonError::Config(ref error)) if error.contains("UNTRACKED")),
+            "{result:?}"
+        );
+        assert_every_mutation_under(&exchange, OperationKind::Startup);
+        let gate = journal.gate().snapshot();
+        assert_eq!((gate.permits, gate.aborted), (0, 0));
+    }
+
+    /// A predecessor that stopped clean at version 2, so the next start of
+    /// `tenant` is clean and opens no incident (ADR-0056 step 7, PR F).
+    #[cfg(feature = "postgres")]
+    async fn seed_clean_predecessor(pool: &sqlx::PgPool, tenant: uuid::Uuid) {
+        sqlx::query(
+            "INSERT INTO process_epochs (epoch_id, tenant_id, binary_version, clean_stop_at, \
+                 marker_version) VALUES ($1, $2, 'test-seed', NOW(), 2)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(tenant)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The two-phase stop through the daemon itself: its epoch lands at
+    /// start, a clean stop marks it at version 2 and returns, and a stop after
+    /// an aborted permit leaves its epoch unmarked.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_daemon_stop_marks_its_epoch_only_when_clean(pool: sqlx::PgPool) {
+        let tenant = uuid::Uuid::now_v7();
+        seed_clean_predecessor(&pool, tenant).await;
+        for (run, abort) in [(2, false), (3, true)] {
+            let mut config = Config::test();
+            config.projection.tenant_id = Some(tenant);
+            let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())))
+                .with_stop_timings(StopTimings {
+                    drain_limit: Duration::from_secs(2),
+                    deadline: Duration::from_secs(10),
+                });
+            let journal = Arc::clone(&daemon.order_journal);
+            let stop = StopRequest::default();
+            let asking = {
+                let (pool, stop) = (pool.clone(), stop.clone());
+                async move {
+                    // The epoch lands before anything else is done.
+                    loop {
+                        let epochs: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM process_epochs WHERE tenant_id = $1",
+                        )
+                        .bind(tenant)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                        if epochs == run {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    if abort {
+                        drop(journal.acquire(OperationKind::Panic).unwrap());
+                    }
+                    stop.ask();
+                }
+            };
+            let started = std::time::Instant::now();
+            let (result, ()) = tokio::join!(Box::pin(daemon.run_until(stop.clone())), asking);
+            result.unwrap();
+            assert!(started.elapsed() < Duration::from_secs(10), "run {run}");
+        }
+
+        let marks: Vec<(bool, Option<i16>)> = sqlx::query_as(
+            "SELECT clean_stop_at IS NOT NULL, marker_version FROM process_epochs
+             WHERE tenant_id = $1 ORDER BY epoch_seq",
+        )
+        .bind(tenant)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(marks, [(true, Some(2)), (true, Some(2)), (false, None)]);
+    }
+
+    /// Design §8: A starts unclean and stops without a release, B is fenced
+    /// at start, releases and stops clean, C starts clean. Every start of a
+    /// tenant with no epoch on record is unclean too, and an incident open at
+    /// the stop keeps the marker off (ADR-0056 step 7, PR F).
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn an_unclean_start_is_fenced_until_a_release_and_only_then_stops_clean(
+        pool: sqlx::PgPool,
+    ) {
+        use robson_exec::order_journal::ReleaseRecord;
+
+        let tenant = uuid::Uuid::now_v7();
+        let mut fenced_at_start = Vec::new();
+        for (run, release) in [(1, false), (2, true), (3, false)] {
+            let mut config = Config::test();
+            config.projection.tenant_id = Some(tenant);
+            let daemon = Daemon::new_stub_with_durable_journal(config, Arc::new(pool.clone()))
+                .with_stop_timings(StopTimings {
+                    drain_limit: Duration::from_secs(2),
+                    deadline: Duration::from_secs(10),
+                });
+            let durable = Arc::clone(&daemon.order_journal);
+            let stop = StopRequest::default();
+            let asking = {
+                let (pool, stop, journal) = (pool.clone(), stop.clone(), Arc::clone(&durable));
+                async move {
+                    loop {
+                        let epochs: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM process_epochs WHERE tenant_id = $1",
+                        )
+                        .bind(tenant)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                        if epochs == run {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let fenced = journal.gate().fenced();
+                    if release {
+                        journal.flush_pending().await;
+                        let receipt = journal
+                            .release(ReleaseRecord {
+                                decision_id: uuid::Uuid::now_v7(),
+                                generation: journal.gate().generation(),
+                                actor: "test".to_string(),
+                                auth_kind: "verified",
+                                note: "reviewed".to_string(),
+                                treatment: "unbooked_accepted",
+                                decided_at: Utc::now(),
+                            })
+                            .await
+                            .unwrap();
+                        assert!(receipt.fence_open);
+                        assert_eq!(receipt.counts.incidents_released, 1);
+                    }
+                    stop.ask();
+                    fenced
+                }
+            };
+            let (result, fenced) = tokio::join!(Box::pin(daemon.run_until(stop.clone())), asking);
+            result.unwrap();
+            fenced_at_start.push(fenced);
+        }
+        assert_eq!(fenced_at_start, [true, true, false]);
+
+        let marks: Vec<(bool, Option<i16>)> = sqlx::query_as(
+            "SELECT clean_stop_at IS NOT NULL, marker_version FROM process_epochs
+             WHERE tenant_id = $1 ORDER BY epoch_seq",
+        )
+        .bind(tenant)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(marks, [(false, None), (true, Some(2)), (true, Some(2))]);
+        let (open, count): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*) FILTER (WHERE released_at IS NULL), MAX(count) \
+             FROM recovery_incidents WHERE tenant_id = $1",
+        )
+        .bind(tenant)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((open, count), (0, 2), "A's and B's unclean starts, one incident, released");
+    }
+
     fn active_position(symbol: robson_domain::Symbol, side: Side) -> robson_domain::Position {
         use rust_decimal_macros::dec;
         let mut pos = robson_domain::Position::new(uuid::Uuid::now_v7(), symbol, side);
@@ -3176,6 +4402,7 @@ mod tests {
             fee: rust_decimal_macros::dec!(0.01),
             fee_asset: "USDT".to_string(),
             filled_at,
+            evidence: None,
         }
     }
 

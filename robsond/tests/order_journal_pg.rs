@@ -25,16 +25,18 @@ use proptest::{
 use robson_exec::{
     order_journal::{
         AttemptRow, CommitFailure, IntentKind, IntentRow, IntentSpec, JournalBackend, JournalBatch,
-        JournaledIntent, Operation, OrderJournal, OutcomeRow, SendRefusal, VenueOutcome,
-        WriteClass, DEFAULT_ACCOUNT_SCOPE,
+        JournaledIntent, Operation, OrderJournal, OutcomeRow, SendRefusal, StreamSuspensionRow,
+        VenueOutcome, WriteClass, DEFAULT_ACCOUNT_SCOPE,
     },
     venue::{AttemptEvidence, OrderLookup, SubmitAttemptLedger, VenueFinalityRule, VenueId},
+    ExecError, StopCancelOutcome,
 };
 use robson_testkit::{
     daemon_process::database_url_through,
     db_proxy::{DbProxy, ProxyMode},
 };
 use robsond::order_journal_store::PgJournalBackend;
+use rust_decimal::Decimal;
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, Connection, PgPool};
 use uuid::Uuid;
@@ -57,6 +59,17 @@ fn spec(id: &str, kind: IntentKind) -> IntentSpec {
         client_order_id: id.to_string(),
         cancels_order_id: None,
         params: json!({ "symbol": "BTCUSDT" }),
+    }
+}
+
+/// A venue's error in these tests: whether it is an authoritative rejection.
+/// The gate's refusal of an entry is none.
+#[derive(Debug)]
+struct Answer(bool);
+
+impl From<SendRefusal> for Answer {
+    fn from(_: SendRefusal) -> Self {
+        Self(false)
     }
 }
 
@@ -219,7 +232,7 @@ async fn absent_needs_every_durable_attempt_rejected_across_a_restart(pool: PgPo
     let (operation, intent) = opened(&first, "a", IntentKind::Exit).await;
     operation.scope(first.before_send(&intent, WriteClass::Bounded)).await.unwrap();
     operation
-        .scope(ledger.submit("a", |_: &()| true, async { Err::<(), ()>(()) }))
+        .scope(ledger.submit("a", |_: &Answer| true, async { Err::<(), _>(Answer(true)) }))
         .await
         .unwrap_err();
     // In memory, so unresolved, although it is rejected.
@@ -369,7 +382,8 @@ async fn a_stalled_journal_commit_times_out_at_its_bound(pool: PgPool) {
     let (operation, exit) = opened(&journal, "x", IntentKind::Exit).await;
     operation.scope(journal.before_send(&exit, WriteClass::Bounded)).await.unwrap();
     assert!(journal.latch_set());
-    assert_eq!(journal.retry_set_depth(), 1);
+    // The exit's row, and the `unlanded_send` incident's upsert (PR F).
+    assert_eq!(journal.retry_set_depth(), 2);
 }
 
 // Boundary B
@@ -418,6 +432,84 @@ async fn boundary_b_lists_exactly_the_outstanding_intents_with_no_disposition(po
     .await
     .unwrap();
     assert_eq!(blockers(&pool).await, vec!["unstamped"]);
+}
+
+/// A cancel's class on real SQL (ADR-0056 step 7, PR C): `gone_terminal` passes
+/// the column's check, the fills land as evidence, and boundary B lists exactly
+/// the uncertain classes.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_cancel_lands_its_class_and_evidence_on_real_sql(pool: PgPool) {
+    let journal = real_journal(&pool);
+    let gone = |final_state| Ok(StopCancelOutcome::AlreadyGone { final_state });
+    let cases: Vec<(&str, Result<StopCancelOutcome, ExecError>)> = vec![
+        (
+            "cancelled",
+            Ok(StopCancelOutcome::Cancelled {
+                filled_before_cancel: Decimal::ZERO,
+                fills: None,
+            }),
+        ),
+        (
+            "gone_terminal",
+            gone(OrderLookup::Terminal {
+                filled_qty: Decimal::new(25, 2),
+                cancelled_qty: Decimal::ZERO,
+                fills: None,
+            }),
+        ),
+        ("gone_unresolved", gone(OrderLookup::Unknown)),
+        ("indeterminate", Ok(StopCancelOutcome::Indeterminate)),
+        ("error", Err(ExecError::Timeout("no answer".to_string()))),
+    ];
+    for (order, result) in cases {
+        let operation = journal.begin_operation();
+        let class = operation.scope(journal.journaled_cancel(None, order, async { result })).await;
+        assert_eq!(class.label(), order);
+    }
+
+    let row = |order: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Option<String>, Option<String>, Option<serde_json::Value>, bool)>(
+                "SELECT venue_outcome, cancel_class, venue_evidence, uncertain_at IS NOT NULL
+                 FROM order_intents WHERE cancels_order_id = $1 AND kind = 'cancel'",
+            )
+            .bind(order)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let (outcome, class, evidence, uncertain) = row("cancelled").await;
+    assert_eq!(outcome.as_deref(), Some("success"));
+    assert_eq!(class.as_deref(), Some("cancelled"));
+    assert_eq!(evidence.unwrap()["fills"], serde_json::Value::Null);
+    assert!(!uncertain);
+
+    let (outcome, class, evidence, uncertain) = row("gone_terminal").await;
+    assert_eq!(outcome.as_deref(), Some("gone_terminal"));
+    assert_eq!(class.as_deref(), Some("gone_terminal"));
+    assert_eq!(evidence.unwrap()["filled_qty"], json!(Decimal::new(25, 2)));
+    assert!(!uncertain);
+
+    for order in ["gone_unresolved", "indeterminate", "error"] {
+        let (outcome, class, evidence, uncertain) = row(order).await;
+        assert_eq!(outcome, None, "{order}");
+        assert_eq!(class.as_deref(), Some(order));
+        assert_eq!(evidence, None, "{order}");
+        assert!(uncertain, "{order}");
+    }
+
+    let mut blocking: Vec<String> = sqlx::query_scalar(
+        "SELECT cancels_order_id FROM order_intents
+         WHERE intent_id IN (SELECT intent_id FROM order_intents_blocking_rollback)",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    blocking.sort();
+    assert_eq!(blocking, vec!["error", "gone_unresolved", "indeterminate"]);
 }
 
 /// The constraints hold the predicate even for a write that skips the
@@ -740,6 +832,27 @@ impl JournalBackend for Injecting {
     ) -> Result<Vec<bool>, String> {
         self.real.attempt_states(venue_id, account_scope, client_order_id).await
     }
+
+    async fn record_suspension(
+        &self,
+        suspension: &StreamSuspensionRow,
+    ) -> Result<(), CommitFailure> {
+        self.real.record_suspension(suspension).await
+    }
+
+    async fn upsert_incident(
+        &self,
+        incident: &robson_exec::gate::Incident,
+    ) -> Result<(), CommitFailure> {
+        self.real.upsert_incident(incident).await
+    }
+
+    async fn release(
+        &self,
+        release: &robson_exec::order_journal::ReleaseRecord,
+    ) -> Result<robson_exec::order_journal::ReleaseCounts, String> {
+        self.real.release(release).await
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -919,12 +1032,12 @@ async fn absent_and_id_reuse_hold_under_generated_sequential_schedules(pool: PgP
                                 .operation
                                 .scope(process.ledger.submit(
                                     &client,
-                                    |rejected: &bool| *rejected,
+                                    |answer: &Answer| answer.0,
                                     async {
                                         match answer {
-                                            VenueAnswer::Accepted => Ok::<(), bool>(()),
-                                            VenueAnswer::Rejected => Err(true),
-                                            VenueAnswer::Unknown => Err(false),
+                                            VenueAnswer::Accepted => Ok::<(), Answer>(()),
+                                            VenueAnswer::Rejected => Err(Answer(true)),
+                                            VenueAnswer::Unknown => Err(Answer(false)),
                                         }
                                     },
                                 ))
@@ -1023,12 +1136,12 @@ async fn run_planned_intent(
                 }
             }
             let answered = ledger
-                .submit(&id, |rejected: &bool| *rejected, async {
+                .submit(&id, |answer: &Answer| answer.0, async {
                     tokio::task::yield_now().await;
                     match answer {
                         VenueAnswerKind::Accepted => Ok(()),
-                        VenueAnswerKind::Rejected => Err(true),
-                        VenueAnswerKind::Unknown => Err(false),
+                        VenueAnswerKind::Rejected => Err(Answer(true)),
+                        VenueAnswerKind::Unknown => Err(Answer(false)),
                     }
                 })
                 .await;

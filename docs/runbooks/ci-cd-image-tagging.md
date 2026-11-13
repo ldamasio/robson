@@ -12,7 +12,7 @@ for the Robson Rust runtime. The pipeline lives in `.github/workflows/robsond.ym
 | Tag Pattern | When Created | Use Case | Example |
 |-------------|--------------|----------|---------|
 | `sha-<8chars>` | Every push to `main` that changes the root Rust workspace or Docker build inputs, and every `workflow_dispatch` on `main` | **Production** | `sha-776a72f9` |
-| `latest` | Same runs as the `sha-` tag | Dev/local only | `latest` |
+| `latest` | Runs that move the production pin | Dev/local only | `latest` |
 
 ### SHA Tags (Golden Standard)
 
@@ -53,7 +53,9 @@ which needs a report on every PR. `push` keeps the filter because a run on `main
 
 > **Important**: Of the files in `.github/workflows/`, only `robsond.yml` triggers this
 > workflow on `push`, so merging a change to it publishes an image and restarts the daemon.
-> For a deploy with no change to any of these paths, use `workflow_dispatch` manually:
+> For a deploy with no change to any of these paths, use `workflow_dispatch` manually. It builds
+> `main`'s tip and, like a push, only moves the pin forward, so it cannot roll back (see
+> [Rollback](#rollback)):
 > ```bash
 > gh workflow run robsond.yml --repo ldamasio/robson --ref main
 > ```
@@ -83,11 +85,30 @@ This is a summary; `robsond.yml` is the source of truth.
 
 1. Docker Buildx setup
 2. Login to GHCR (`ghcr.io`) with `GITOPS_TOKEN`
-3. Build from `Dockerfile`, push tags `sha-<8chars>` and `latest`
-4. Clone `rbxrobotica/rbx-infra`, set `images[].newTag` for `ghcr.io/rbxrobotica/robson-v2` in
-   `apps/prod/robson/kustomization.yml` with `yq`, fail if the file does not end up with the new
-   tag, commit and push (three attempts, rebasing between them)
-5. ArgoCD detects the commit and syncs `robson-prod` automatically
+3. Build from `Dockerfile`, push tag `sha-<8chars>`
+4. Clone `rbxrobotica/rbx-infra` and check the pin in `apps/prod/robson/kustomization.yml` with
+   `scripts/promotion-guard.sh`. If this commit is older than the pinned one or no longer on
+   `main`, leave the pin alone and end green with a `Pin not moved` notice (see
+   [the troubleshooting entry](#build--push-is-green-but-the-pin-did-not-move)). Otherwise set
+   `images[].newTag` for `ghcr.io/rbxrobotica/robson-v2` with `yq`, fail if the file does not end
+   up with the new tag, commit and push. A rejected push starts over from a fresh rbx-infra `main`,
+   guard included, up to three pushes; a newer pin that beat the last push is still a skip.
+5. Move `latest` to the image, only if the pin moved
+6. ArgoCD detects the commit and syncs `robson-prod` automatically
+
+Runs on `main` never cancel each other: each commit has its own concurrency group. This job runs one
+at a time across them (job group `robsond-promote`, `queue: max`, so a waiting job is never replaced),
+which keeps the pin and `latest` together. Two merges a few minutes apart can each restart the
+daemon, in order; a run that reaches the job after a newer commit is pinned skips.
+
+When a dependency of this job fails:
+
+| Fails | Pin | Shows as | Next step |
+|-------|-----|----------|-----------|
+| GHCR build or push | Unchanged | Red at `Build and push` | Re-run the failed job |
+| GitHub: fetching this repository, cloning or pushing rbx-infra | Unchanged, unless a push landed and only its acknowledgement was lost | Red at `Update image tags in rbx-infra`; the summary says the pin is unknown | [Manual Deployment](#manual-deployment-fallback), which checks the pin first |
+| GHCR, moving `latest` | **Already moved**, production deploys | Red at `Move latest to this image`; the summary says the pin moved | [Troubleshooting](#build--push-fails-at-move-latest-to-this-image) |
+| Nothing: a newer commit is pinned | Unchanged | Green, `Pin not moved` notice | None |
 
 ---
 
@@ -172,9 +193,10 @@ Three things can defeat a rollback:
 - **New event types in the range.** An older projector returns `MissingHandler` for an event type
   it does not know. If the range wrote new event types in production, read the rollback notes in
   the ADR for that change first.
-- **The next promotion.** Any later `build-and-push` run on `main` overwrites the pin: a merge that
-  touches a path in `push.paths`, or a `workflow_dispatch`. Step 2 stops these until the fix is
-  ready for `main`; that fix is what makes the recovery last.
+- **The next promotion.** Any later `build-and-push` run on `main` for a commit newer than the
+  target overwrites the pin: a merge that touches a path in `push.paths`, a `workflow_dispatch`, or a
+  re-run. The guard does not stop these, because they move the pin forward. Step 2 stops these until
+  the fix is ready for `main`; that fix is what makes the recovery last.
 
 ```bash
 # 1. Find the running image and the earlier tags. A tag is the first 8 chars of a commit in this repo.
@@ -183,8 +205,14 @@ gh api 'repos/rbxrobotica/rbx-infra/commits?path=apps/prod/robson/kustomization.
   --jq '.[] | "\(.commit.author.date[0:16]) \(.commit.message | split("\n")[0])"'
 SHA_TAG="sha-<previous>"
 
-# 2. Stop promotions: hold merges, and wait for or cancel any run still in progress.
-gh run list --repo ldamasio/robson --workflow robsond.yml --branch main --limit 5
+# 2. Stop promotions: hold merges, then wait for or cancel (gh run cancel <id>) every run of this
+#    workflow on main that has not completed. One sweep reads every run of the workflow, unfiltered,
+#    so a run that changes status during the check is still caught, and no search cap applies. The
+#    output must be exactly "scan complete"; a failed page leaves that line out. A run GitHub refuses
+#    to cancel (409, "has not been queued yet") can still start later and promote, so wait for it.
+gh api --paginate 'repos/ldamasio/robson/actions/workflows/robsond.yml/runs?per_page=100' \
+  --jq '.workflow_runs[] | select(.head_branch == "main" and .event != "pull_request" and .status != "completed") | "\(.id) \(.head_sha[0:8]) \(.event) \(.status)"' \
+  && echo "scan complete"
 
 #    Then wait for ArgoCD, because a queued or running hook can still apply a migration. All three
 #    must hold. For a sync stuck on a hook, see "The daemon stays on the old image".
@@ -231,11 +259,17 @@ in front of the script, which runs the same check.
 
 ## Manual Deployment (Fallback)
 
-If `Update image tags in rbx-infra` fails, the image is already in GHCR, the pin did not move, and
-the cluster stays on the previous tag.
+If `Update image tags in rbx-infra` fails, the image is already in GHCR, and the pin most likely did
+not move. A push can land while its acknowledgement is lost, so check the pin first; if it already
+shows the run's tag, the deploy is under way and there is nothing to do here:
 
-Both options below set the pin to that run's commit, even when a newer one is already deployed, so
-use them only if no newer run has promoted since.
+```bash
+gh api repos/rbxrobotica/rbx-infra/contents/apps/prod/robson/kustomization.yml --jq .content | base64 -d | grep newTag
+```
+
+A re-run checks the pin again and leaves it alone if a newer commit is pinned by then. A re-run of a
+run whose commit predates `scripts/promotion-guard.sh` has no guard, and neither does the hand bump:
+use those only if no newer run has promoted since.
 
 First re-run the failed job:
 
@@ -311,6 +345,31 @@ in the `Update image tags in rbx-infra` step or in rbx-infra, then follow
 
 Every push was rejected. Check the step log, and check that `GITOPS_TOKEN` can still write to
 `rbxrobotica/rbx-infra`. Then follow [Manual Deployment](#manual-deployment-fallback).
+
+### Build & Push is green but the pin did not move
+
+The step log and the run summary say `Pin not moved` and why. The guard skipped the bump: this
+commit is older than the pinned one (a run that started late, or a re-run), it is no longer on
+`main`, or the pin names a commit off `main` and this commit is not the tip. The `sha-<8chars>` image
+is in GHCR; `latest` did not move. Nothing needs fixing. Running this commit anyway is a
+[Rollback](#rollback).
+
+### Build & Push fails at `Move latest to this image`
+
+The pin has already moved and ArgoCD deploys this commit; the run summary says so. Only `latest`,
+which is dev/local only, still names an older image. Production needs nothing, and the next
+promotion moves `latest` again.
+
+To fix it sooner, do not copy this run's tag: a newer run may have promoted since. Re-run the failed
+job, which waits its turn and skips if a newer commit is pinned, but rebuilds the image and pushes it
+again under the tag production runs. Or, while no `Build & Push Image` job is running or waiting,
+copy the tag production pins now, with a GHCR login that can write packages:
+
+```bash
+SHA_TAG=$(gh api repos/rbxrobotica/rbx-infra/contents/apps/prod/robson/kustomization.yml --jq .content \
+  | base64 -d | sed -n 's/^ *newTag: //p')
+docker buildx imagetools create --tag ghcr.io/rbxrobotica/robson-v2:latest "ghcr.io/rbxrobotica/robson-v2:${SHA_TAG}"
+```
 
 ### The daemon stays on the old image after a pin bump
 

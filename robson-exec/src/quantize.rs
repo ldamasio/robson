@@ -22,7 +22,7 @@ use robson_domain::{OrderSide, Price, Quantity, Symbol, SymbolTradingRules};
 use rust_decimal::Decimal;
 use tracing::warn;
 
-use crate::{error::ExecError, ports::ExchangePort};
+use crate::{error::ExecError, gate::Phase, order_journal, ports::ExchangePort};
 
 /// How long a reduction, or managing a leg, may wait for metadata end to end:
 /// the venue's request timeout covers one request, not the queue for the
@@ -175,6 +175,19 @@ pub enum ReductionOutcome<T> {
     },
 }
 
+/// Which submission of one reduction a `submit` call is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Submission {
+    /// The first, under the intent's own client id.
+    First,
+    /// The one resubmission after a rules rejection, under the same client id.
+    SameIdRetry,
+    /// The journal refused that resubmission before it left, so the refreshed
+    /// order goes out once under a fresh client id. Carries the venue's rules
+    /// rejection of the first submission: nothing else can reach this.
+    FreshIdAfterRefusedRetry { rules_rejection: String },
+}
+
 /// Submit a risk-reducing order under ADR-0056 §5.
 ///
 /// 1. Takes the last validated rules, then the leg's `snapshot`: no venue
@@ -190,7 +203,13 @@ pub enum ReductionOutcome<T> {
 /// 3. On [`ExecError::RulesRejected`], refreshes **once** and submits **once**
 ///    more. A second rejection is returned to the caller, which keeps whatever
 ///    protection the leg already has. [`ReductionOutcome::NotExecutable`] means
-///    the venue refused and the newest rules that could be had agree.
+///    the venue refused and the newest rules that could be had agree. While the
+///    daemon is closing there is no refresh: the rejection ends as a failed
+///    refresh does (ADR-0056 step 7).
+/// 4. If the journal refuses that resubmission, [`ExecError::SendRefused`], it
+///    never left and its client id is closed. The refreshed order goes out once
+///    under a fresh id, at once: on a cancel-first exit the stop is already
+///    gone. No loop: whatever that submission returns is the result.
 ///
 /// The caller supplies one client id for every submission: a rules rejection
 /// is one intent retried, and on `binance:usdm` the reduce-only flag bounds
@@ -209,7 +228,7 @@ pub async fn submit_reduction<E, T, F, Fut>(
 ) -> Result<ReductionOutcome<T>, ExecError>
 where
     E: ExchangePort + ?Sized,
-    F: FnMut(Quantity, Option<SymbolTradingRules>) -> Fut,
+    F: FnMut(Quantity, Option<SymbolTradingRules>, Submission) -> Fut,
     Fut: Future<Output = Result<T, ExecError>>,
 {
     let held = match exchange.last_validated_rules(symbol).or_else(|| snapshot.cloned()) {
@@ -232,7 +251,7 @@ where
         ReductionPlan::NotExecutable { .. } => (requested, Decimal::ZERO),
     };
 
-    let reason = match submit(quantity, held.clone()).await {
+    let reason = match submit(quantity, held.clone(), Submission::First).await {
         Ok(accepted) => {
             return Ok(ReductionOutcome::Submitted {
                 accepted,
@@ -245,14 +264,20 @@ where
         Err(error) => return Err(error),
     };
 
-    warn!(
-        symbol = %symbol.as_pair(),
-        quantity = %quantity.as_decimal(),
-        %reason,
-        "Venue refused a reduction on its rules; refreshing once and resubmitting"
-    );
-    let rules = match bounded_metadata(metadata_limit, exchange.refresh_trading_rules(symbol)).await
-    {
+    // A stopping daemon spends its deadline on the work in flight, not on a
+    // refresh (ADR-0056 step 7): this ends as a failed refresh would.
+    let refreshed = if order_journal::current_phase() == Some(Phase::Closing) {
+        Err(ExecError::Exchange("no rules refresh while the daemon is closing".to_string()))
+    } else {
+        warn!(
+            symbol = %symbol.as_pair(),
+            quantity = %quantity.as_decimal(),
+            %reason,
+            "Venue refused a reduction on its rules; refreshing once and resubmitting"
+        );
+        bounded_metadata(metadata_limit, exchange.refresh_trading_rules(symbol)).await
+    };
+    let rules = match refreshed {
         Ok(fresh) => Some(fresh),
         Err(error) => {
             warn!(symbol = %symbol.as_pair(), %error, "Rules refresh failed after a rejection");
@@ -271,7 +296,18 @@ where
             return Ok(ReductionOutcome::NotExecutable { residual, rules });
         },
     };
-    let accepted = submit(quantity, rules.clone()).await?;
+    let accepted = match submit(quantity, rules.clone(), Submission::SameIdRetry).await {
+        Err(ExecError::SendRefused(refusal)) => {
+            warn!(
+                symbol = %symbol.as_pair(),
+                %refusal,
+                "Journal refused the resubmission; sending it once under a fresh client id"
+            );
+            let fresh = Submission::FreshIdAfterRefusedRetry { rules_rejection: reason };
+            submit(quantity, rules.clone(), fresh).await?
+        },
+        other => other?,
+    };
     Ok(ReductionOutcome::Submitted { accepted, quantity, residual, rules })
 }
 
@@ -423,7 +459,7 @@ mod tests {
                 qty(dec!(0.1055)),
                 None,
                 Duration::from_millis(10),
-                |submitted, rules| async move {
+                |submitted, rules, _| async move {
                     assert!(rules.is_none());
                     Ok::<_, ExecError>(submitted)
                 },
@@ -455,7 +491,7 @@ mod tests {
                 qty(dec!(0.1)),
                 Some(&btcusdt()),
                 Duration::from_millis(10),
-                |_, _| {
+                |_, _, _| {
                     submissions += 1;
                     async { Err::<Quantity, _>(ExecError::RulesRejected("refused".to_string())) }
                 },
@@ -466,5 +502,56 @@ mod tests {
 
         assert!(matches!(outcome, Err(ExecError::RulesRejected(_))), "{outcome:?}");
         assert_eq!(submissions, 1);
+    }
+
+    /// A closing daemon spends its deadline on the work in flight: a rules
+    /// rejection earns no refresh then and ends as a failed refresh does
+    /// (ADR-0056 step 7). Open, the same rejection is refreshed and
+    /// resubmitted.
+    #[tokio::test]
+    async fn a_closing_daemon_skips_the_refresh_after_a_rules_rejection() {
+        use std::sync::Arc;
+
+        use crate::{gate::OperationKind, order_journal::OrderJournal};
+
+        for closing in [false, true] {
+            let exchange = crate::stub::StubExchange::new(dec!(95000));
+            let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+            exchange.set_trading_rules(btcusdt());
+            let journal = Arc::new(OrderJournal::unpersisted());
+            let permit = journal.acquire(OperationKind::MainLoop).unwrap();
+            if closing {
+                journal.gate().begin_closing();
+            }
+            let mut submissions = 0;
+            let outcome = permit
+                .run(submit_reduction(
+                    &exchange,
+                    &symbol,
+                    qty(dec!(0.1)),
+                    Some(&btcusdt()),
+                    NOT_FOREVER,
+                    |submitted, _, _| {
+                        submissions += 1;
+                        let first = submissions == 1;
+                        async move {
+                            if first {
+                                Err(ExecError::RulesRejected("refused".to_string()))
+                            } else {
+                                Ok(submitted)
+                            }
+                        }
+                    },
+                ))
+                .await;
+
+            if closing {
+                assert!(matches!(outcome, Err(ExecError::RulesRejected(_))), "{outcome:?}");
+                assert_eq!((submissions, exchange.rules_refresh_call_count()), (1, 0));
+            } else {
+                assert!(matches!(outcome, Ok(ReductionOutcome::Submitted { .. })), "{outcome:?}");
+                assert_eq!((submissions, exchange.rules_refresh_call_count()), (2, 1));
+            }
+        }
     }
 }

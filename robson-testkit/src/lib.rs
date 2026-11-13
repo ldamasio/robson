@@ -1,12 +1,17 @@
 //! Test helpers for Robson v2 database-backed tests.
 //!
 //! Provides seeding helpers for tenant/account, event appending, and projection
-//! state.
+//! state, and [`spot_book`], an in-memory spot balance account for venue tests.
 
 pub mod daemon_process;
 pub mod db_proxy;
 pub mod fake_venue;
 mod helpers;
+pub mod spot_book;
+#[cfg(test)]
+mod spot_book_model_tests;
+#[cfg(test)]
+mod spot_book_tests;
 
 use anyhow::Result;
 pub use helpers::{

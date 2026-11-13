@@ -240,7 +240,7 @@ async fn place_stop(
         quantity,
         None,
         quantize::METADATA_WAIT_BOUND,
-        |submitted, rules| {
+        |submitted, rules, _| {
             let trigger = quantize::protective_trigger(rules.as_ref(), OrderSide::Sell, trigger);
             let venue = venue.clone();
             let symbol = symbol.clone();
@@ -306,7 +306,7 @@ async fn observe_all_rows() -> Vec<Value> {
                         qty(quantity),
                         None,
                         quantize::METADATA_WAIT_BOUND,
-                        |submitted, _rules| {
+                        |submitted, _rules, _| {
                             TradingPort::place_market_order(
                                 &*venue,
                                 &symbol,
@@ -331,7 +331,7 @@ async fn observe_all_rows() -> Vec<Value> {
                         qty(quantity),
                         None,
                         quantize::METADATA_WAIT_BOUND,
-                        |submitted, _rules| {
+                        |submitted, _rules, _| {
                             PositionAccountPort::close_position_market(
                                 &*venue,
                                 &symbol,

@@ -26,6 +26,8 @@ use robson_connectors::{
 };
 use robson_domain::{Exchange, OrderSide, Price, Quantity, Symbol, SymbolTradingRules};
 use robson_exec::{
+    gate::OperationGate,
+    order_journal::OrderJournal,
     ports::{OpenOrderRecord, OrderResult, UserTradeRecord},
     venue::{
         AccountPort, Cash, EntryOrReduce, ExecutionCostEnvelope, FundingPort, InventoryPort, Mark,
@@ -214,6 +216,14 @@ impl AccountPort for VenueRuntime {
 impl Venue for VenueRuntime {
     fn id(&self) -> &VenueId {
         forward!(self, venue => venue.id())
+    }
+
+    fn attach_order_journal(&self, journal: Arc<OrderJournal>) {
+        forward!(self, venue => venue.attach_order_journal(journal))
+    }
+
+    fn attach_gate(&self, gate: Arc<OperationGate>) {
+        forward!(self, venue => venue.attach_gate(gate))
     }
 
     fn position_account(&self) -> Option<&dyn PositionAccountPort> {
@@ -406,7 +416,7 @@ mod tests {
     use robson_connectors::binance::usdm::{
         MAINNET_MARKET_WS_ENDPOINT, TESTNET_MARKET_WS_ENDPOINT,
     };
-    use robson_exec::venue::capability_mismatches;
+    use robson_exec::venue::{capability_mismatches, AccountKind, MarketKind};
 
     use super::*;
 
@@ -520,6 +530,87 @@ mod tests {
 
         let error = refused(&config(VenueSelection::Stub, false, false, Environment::Production));
         assert!(error.contains("ROBSON_VENUE=stub"), "{error}");
+    }
+
+    /// ADR-0056 step 8 stays unselectable until its activation (8o):
+    /// `binance_spot` is refused before the factory, and no selection the
+    /// factory takes, with any credentials in any environment, builds a spot
+    /// venue or route, a one-attempt venue, or a feed on any base but USD-M's
+    /// and the stub's. Every case is built or refused exactly as the factory's
+    /// rules say, so no regression hides as a skipped case. The connector side
+    /// checks that nothing outside it names the spot module
+    /// (`inertness_tests.rs`).
+    #[test]
+    fn no_selection_builds_a_spot_venue() {
+        let refused = VenueSelection::parse(Some("binance_spot")).unwrap_err().to_string();
+        assert!(refused.contains("ROBSON_VENUE=binance_spot"), "{refused}");
+
+        use Environment::{Development, Production, Test};
+        for selection in [
+            VenueSelection::Unset,
+            VenueSelection::BinanceUsdm,
+            VenueSelection::Stub,
+        ] {
+            // A new selection fails to compile here, so this test is revisited.
+            match selection {
+                VenueSelection::Unset | VenueSelection::BinanceUsdm | VenueSelection::Stub => {},
+            }
+            let mut built = 0;
+            for credentials in [false, true] {
+                for use_testnet in [false, true] {
+                    for environment in [Test, Development, Production] {
+                        let config = config(selection, credentials, use_testnet, environment);
+                        let case =
+                            format!("{selection:?} {credentials} {use_testnet} {environment:?}");
+                        // The factory's rules: unset always builds (falling back
+                        // to the stub); binance_usdm only with credentials and
+                        // a testnet or production marker; stub anywhere but
+                        // production.
+                        let expected = match selection {
+                            VenueSelection::Unset => true,
+                            VenueSelection::BinanceUsdm => {
+                                credentials && (use_testnet || environment == Production)
+                            },
+                            VenueSelection::Stub => environment != Production,
+                        };
+                        let parts = match (VenueFactory::build(&config), expected) {
+                            (Ok(parts), true) => parts,
+                            (Err(_), false) => continue,
+                            (Ok(parts), false) => {
+                                panic!("{case}: built {} where it must refuse", parts.venue.id())
+                            },
+                            (Err(error), true) => panic!("{case}: refused: {error}"),
+                        };
+                        built += 1;
+                        for venue in std::iter::once(&parts.venue).chain(&parts.funding_recovery) {
+                            assert_ne!(venue.id().as_str(), "binance:spot", "{case}");
+                            let capabilities = venue.capabilities();
+                            assert_ne!(capabilities.market_kind, MarketKind::Spot, "{case}");
+                            assert_ne!(
+                                capabilities.account_kind,
+                                AccountKind::BalanceAccount,
+                                "{case}"
+                            );
+                            assert!(venue.inventory().is_none(), "{case}");
+                            assert!(!capabilities.one_attempt_per_client_id, "{case}");
+                        }
+                        for endpoint in parts.market_data.endpoints() {
+                            assert!(
+                                [
+                                    MAINNET_MARKET_WS_ENDPOINT,
+                                    TESTNET_MARKET_WS_ENDPOINT,
+                                    robson_exec::stub::STUB_FEED_ENDPOINT,
+                                ]
+                                .contains(&endpoint.as_str()),
+                                "{case}: a feed on {endpoint}"
+                            );
+                        }
+                    }
+                }
+            }
+            // Not vacuous: every selection builds a venue somewhere.
+            assert!(built > 0, "{selection:?} built nothing");
+        }
     }
 
     #[test]

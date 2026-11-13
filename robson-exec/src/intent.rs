@@ -316,6 +316,7 @@ mod tests {
             fee: dec!(0.001),
             fee_asset: "BNB".to_string(),
             filled_at: Utc::now(),
+            evidence: None,
         };
 
         journal.complete(id, IntentResult::Success(order_result)).unwrap();

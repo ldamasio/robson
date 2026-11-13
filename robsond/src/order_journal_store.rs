@@ -1,4 +1,5 @@
-//! PostgreSQL side of the order journal (ADR-0056 step 7, PR J).
+//! PostgreSQL side of the order journal (ADR-0056 step 7, PR J), with the
+//! fence PR's incidents and release.
 //!
 //! Every write is one explicit transaction ending in `Transaction::commit`,
 //! which goes out as a simple-query `COMMIT`. Nothing here commits implicitly.
@@ -7,7 +8,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use robson_exec::order_journal::{CommitFailure, JournalBackend, JournalBatch};
+use robson_exec::{
+    gate::Incident,
+    order_journal::{
+        CommitFailure, JournalBackend, JournalBatch, ReleaseCounts, ReleaseRecord,
+        StreamSuspensionRow,
+    },
+};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{pool::PoolConnection, postgres::PgPoolOptions, Connection, PgPool, Postgres};
@@ -41,6 +48,9 @@ const JOURNAL_READY_WAIT: Duration = Duration::from_secs(10);
 
 pub struct PgJournalBackend {
     pool: PgPool,
+    /// The daemon's pool, for a release: an operator's transaction never
+    /// takes one of the journal's two connections from an order.
+    daemon_pool: PgPool,
     tenant_id: Uuid,
     ready_wait: Duration,
 }
@@ -57,6 +67,7 @@ impl PgJournalBackend {
             .connect_lazy_with((*daemon_pool.connect_options()).clone());
         Self {
             pool,
+            daemon_pool: daemon_pool.clone(),
             tenant_id,
             ready_wait: JOURNAL_READY_WAIT,
         }
@@ -77,7 +88,8 @@ impl PgJournalBackend {
                 let connection = self.pool.acquire().await?;
                 let mut read = RetiringConnection { connection, finished: false };
                 sqlx::query(
-                    "SELECT 1 FROM order_intents, submit_attempts, journal_decisions LIMIT 0",
+                    "SELECT 1 FROM order_intents, submit_attempts, journal_decisions, \
+                     stream_suspensions, recovery_incidents LIMIT 0",
                 )
                 .execute(&mut *read.connection)
                 .await?;
@@ -171,7 +183,8 @@ impl PgJournalBackend {
                     cancel_class = COALESCE(cancel_class, $3),
                     not_sent = not_sent OR $4,
                     venue_evidence = COALESCE(venue_evidence, $5),
-                    uncertain_at = COALESCE(uncertain_at, $6)
+                    uncertain_at = COALESCE(uncertain_at, $6),
+                    uncertain_generation = COALESCE(uncertain_generation, $7)
                 WHERE intent_id = $1
                 "#,
             )
@@ -181,6 +194,7 @@ impl PgJournalBackend {
             .bind(outcome.not_sent)
             .bind(&outcome.venue_evidence)
             .bind(outcome.uncertain_at)
+            .bind(outcome.uncertain_generation)
             .execute(&mut **tx)
             .await
             .map_err(known)?;
@@ -201,6 +215,169 @@ impl JournalBackend for PgJournalBackend {
         tx.commit().await.map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
         write.finished = true;
         Ok(())
+    }
+
+    async fn record_suspension(
+        &self,
+        suspension: &StreamSuspensionRow,
+    ) -> Result<(), CommitFailure> {
+        let known = |e: sqlx::Error| CommitFailure::Known(e.to_string());
+        let connection = self.pool.acquire().await.map_err(known)?;
+        let mut write = RetiringConnection { connection, finished: false };
+        let mut tx = write.connection.begin().await.map_err(known)?;
+        // An open suspension of the stream, or this one replayed, stands.
+        sqlx::query(
+            r#"
+            INSERT INTO stream_suspensions (
+                suspension_id, tenant_id, stream_key, stream_kind, failed_seq, month, error,
+                epoch_id, suspended_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(suspension.suspension_id)
+        .bind(self.tenant_id)
+        .bind(&suspension.stream_key)
+        .bind(suspension.stream_kind)
+        .bind(suspension.failed_seq)
+        .bind(suspension.month)
+        .bind(&suspension.error)
+        .bind(suspension.epoch_id)
+        .bind(suspension.suspended_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(known)?;
+        tx.commit().await.map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
+        write.finished = true;
+        Ok(())
+    }
+
+    async fn upsert_incident(&self, incident: &Incident) -> Result<(), CommitFailure> {
+        let known = |e: sqlx::Error| CommitFailure::Known(e.to_string());
+        let connection = self.pool.acquire().await.map_err(known)?;
+        let mut write = RetiringConnection { connection, finished: false };
+        let mut tx = write.connection.begin().await.map_err(known)?;
+        // Every value only grows, so a replay or a reordering converges. A
+        // released row does not conflict: this opens a new one.
+        sqlx::query(
+            r#"
+            INSERT INTO recovery_incidents (
+                incident_id, tenant_id, reason, first_at, last_at, count, first_generation,
+                last_generation
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (tenant_id, reason) WHERE released_at IS NULL DO UPDATE SET
+                first_at = LEAST(recovery_incidents.first_at, EXCLUDED.first_at),
+                last_at = GREATEST(recovery_incidents.last_at, EXCLUDED.last_at),
+                count = GREATEST(recovery_incidents.count, EXCLUDED.count),
+                first_generation =
+                    LEAST(recovery_incidents.first_generation, EXCLUDED.first_generation),
+                last_generation =
+                    GREATEST(recovery_incidents.last_generation, EXCLUDED.last_generation)
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(self.tenant_id)
+        .bind(incident.reason.as_str())
+        .bind(incident.first_at)
+        .bind(incident.last_at)
+        .bind(incident.count)
+        .bind(incident.first_generation)
+        .bind(incident.last_generation)
+        .execute(&mut *tx)
+        .await
+        .map_err(known)?;
+        tx.commit().await.map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
+        write.finished = true;
+        Ok(())
+    }
+
+    /// One transaction of five statements, `BEGIN` and `COMMIT` included
+    /// (design §2.8): tombstone, release, decision. The decision comes last,
+    /// with what the two before it did; the incidents' reference to it is
+    /// checked at the commit.
+    async fn release(&self, release: &ReleaseRecord) -> Result<ReleaseCounts, String> {
+        let error = |e: sqlx::Error| e.to_string();
+        // A connection whose release did not finish (the caller's bound
+        // dropped it, or an error cut it) is closed, not handed back: returned
+        // to the pool it would wait on a ping with no deadline, holding a
+        // daemon-pool slot (J's rule for the journal's own pool).
+        let connection = self.daemon_pool.acquire().await.map_err(error)?;
+        let mut held = RetiringConnection { connection, finished: false };
+        let mut tx = held.connection.begin().await.map_err(error)?;
+        // A row with no `uncertain_at` is never tombstoned, nor one with an
+        // outcome, proven unsent, or already disposed of.
+        let tombstoned = sqlx::query(
+            r#"
+            UPDATE order_intents SET
+                disposition_kind = 'accepted_risk',
+                disposition_treatment = $3,
+                risk_accepted_at = $4,
+                risk_accepted_by = $5,
+                risk_accepted_auth = $6,
+                risk_accepted_note = $7
+            WHERE tenant_id = $1
+              AND uncertain_generation IS NOT NULL
+              AND uncertain_generation <= $2
+              AND uncertain_at IS NOT NULL
+              AND venue_outcome IS NULL
+              AND NOT not_sent
+              AND disposition_kind IS NULL
+            "#,
+        )
+        .bind(self.tenant_id)
+        .bind(release.generation)
+        .bind(release.treatment)
+        .bind(release.decided_at)
+        .bind(&release.actor)
+        .bind(release.auth_kind)
+        .bind(&release.note)
+        .execute(&mut *tx)
+        .await
+        .map_err(error)?
+        .rows_affected();
+        let released = sqlx::query(
+            r#"
+            UPDATE recovery_incidents SET released_at = $3, decision_id = $4
+            WHERE tenant_id = $1 AND released_at IS NULL AND last_generation <= $2
+            "#,
+        )
+        .bind(self.tenant_id)
+        .bind(release.generation)
+        .bind(release.decided_at)
+        .bind(release.decision_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(error)?
+        .rows_affected();
+        let payload = serde_json::json!({
+            "generation": release.generation,
+            "intents_tombstoned": tombstoned,
+            "incidents_released": released,
+        });
+        sqlx::query(
+            r#"
+            INSERT INTO journal_decisions (
+                decision_id, kind, intent_id, actor, auth_kind, note, treatment, evidence,
+                payload, decided_at
+            ) VALUES ($1, 'release', NULL, $2, $3, $4, $5, NULL, $6, $7)
+            "#,
+        )
+        .bind(release.decision_id)
+        .bind(&release.actor)
+        .bind(release.auth_kind)
+        .bind(&release.note)
+        .bind(release.treatment)
+        .bind(&payload)
+        .bind(release.decided_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(error)?;
+        tx.commit().await.map_err(error)?;
+        held.finished = true;
+        Ok(ReleaseCounts {
+            intents_tombstoned: tombstoned,
+            incidents_released: released,
+        })
     }
 
     async fn check_ready(&self) -> Result<(), String> {

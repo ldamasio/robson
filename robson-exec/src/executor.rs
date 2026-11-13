@@ -22,9 +22,14 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    cancel::CancelClass,
     error::{ExecError, ExecResult},
     intent::{Intent, IntentAction, IntentJournal, IntentResult},
-    ports::{ExchangePort, OrderResult, StopCancelOutcome},
+    order_journal::{
+        self, IntentKind, IntentSpec, JournaledIntent, OrderJournal, OwnershipKey, SendRefusal,
+        WriteClass,
+    },
+    ports::{ExchangePort, OrderResult},
     quantize::{self, ReductionOutcome},
 };
 
@@ -52,6 +57,10 @@ pub enum ActionResult {
     /// (EntryExecutionRejected) was applied to the in-memory store. The caller
     /// is responsible for persisting it to the PostgreSQL eventlog.
     EntryExecutionRejected { event: Event, error: String },
+    /// Proven no-send (ADR-0056 step 7): no request left for this entry, so the
+    /// caller may give the detector back. Carries no event, so a database
+    /// failure that caused it cannot also lose it.
+    EntryNotSent { signal_id: Uuid, reason: String },
     /// The venue refused the exit and the newest rules agree the whole leg
     /// rounds below the lot minimum (ADR-0056 §5). Nothing executed, the
     /// rest of the batch is not run, and the leg keeps its state. `event` is
@@ -97,12 +106,30 @@ pub struct Executor<E: ExchangePort, S: Store> {
     journal: Arc<IntentJournal>,
     /// Store for persisting positions, orders, events
     store: Arc<S>,
+    /// Durable order journal (ADR-0056 step 7)
+    order_journal: Arc<OrderJournal>,
 }
 
 impl<E: ExchangePort, S: Store> Executor<E, S> {
-    /// Create a new executor.
+    /// Create a new executor. Its order journal keeps nothing until
+    /// [`Self::with_order_journal`] gives it a durable one.
     pub fn new(exchange: Arc<E>, journal: Arc<IntentJournal>, store: Arc<S>) -> Self {
-        Self { exchange, journal, store }
+        Self {
+            exchange,
+            journal,
+            store,
+            order_journal: Arc::new(OrderJournal::unpersisted()),
+        }
+    }
+
+    pub fn with_order_journal(mut self, order_journal: Arc<OrderJournal>) -> Self {
+        self.order_journal = order_journal;
+        self
+    }
+
+    /// The order journal this executor writes to.
+    pub fn order_journal(&self) -> Arc<OrderJournal> {
+        Arc::clone(&self.order_journal)
     }
 
     /// Return the latest exchange price for a symbol.
@@ -120,6 +147,14 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
     /// Actions are executed in order. If one fails, subsequent actions
     /// are not executed.
     pub async fn execute(&self, actions: Vec<EngineAction>) -> ExecResult<Vec<ActionResult>> {
+        if order_journal::in_operation() {
+            return self.execute_batch(actions).await;
+        }
+        let operation = self.order_journal.begin_operation();
+        operation.scope(self.execute_batch(actions)).await
+    }
+
+    async fn execute_batch(&self, actions: Vec<EngineAction>) -> ExecResult<Vec<ActionResult>> {
         let mut results = Vec::with_capacity(actions.len());
 
         for action in actions {
@@ -139,6 +174,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                     result,
                     ActionResult::OrderFailed { .. }
                         | ActionResult::EntryExecutionRejected { .. }
+                        | ActionResult::EntryNotSent { .. }
                         | ActionResult::ExitNotExecutable { .. }
                 );
                 results.push(result);
@@ -364,7 +400,47 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             "Placing entry order"
         );
 
-        // 5. Execute on exchange exactly once. A timeout/transport failure after
+        // 5. Commit the intent first (strict): no row, no request.
+        let journaled = self.order_journal.open_intent(IntentSpec {
+            position_id: Some(position_id),
+            kind: IntentKind::Entry,
+            client_order_id: client_order_id.clone(),
+            cancels_order_id: None,
+            params: serde_json::json!({
+                "symbol": symbol.as_pair(),
+                "side": side,
+                "quantity": quantity.as_decimal(),
+                "signal_id": signal_id,
+            }),
+        });
+        // The inventory it opens: claimed at its send, with its ticket, and
+        // held until its operation ends (ADR-0056 step 7, PR O).
+        self.order_journal
+            .own_entry_key(&journaled, OwnershipKey::of_entry(&symbol, side));
+        if let Err(refusal) = self.order_journal.before_send(&journaled, WriteClass::Strict).await {
+            warn!(%position_id, %signal_id, %refusal, "Entry not sent");
+            self.order_journal.finish_failed(&journaled).await;
+            self.journal.complete(signal_id, IntentResult::Failed(refusal.to_string()))?;
+            return match refusal {
+                SendRefusal::NotSent(reason) => {
+                    Ok(ActionResult::EntryNotSent { signal_id, reason })
+                },
+                // The row may exist: this is not a proven no-send.
+                SendRefusal::UncertainCommit(_) => {
+                    self.entry_order_failed(
+                        position_id,
+                        cycle_id,
+                        order_id,
+                        client_order_id,
+                        signal_id,
+                        refusal.to_string(),
+                    )
+                    .await
+                },
+            };
+        }
+
+        // 6. Execute on exchange exactly once. A timeout/transport failure after
         // order acceptance is ambiguous for MARKET orders; automatic retry can
         // create duplicate real positions. Reconciliation must resolve drift.
         crate::crash_point!(ENTRY_BEFORE_SEND);
@@ -374,7 +450,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             .await;
         crate::crash_point!(ENTRY_AFTER_ACK);
 
-        // 6. Record result and emit appropriate domain event
+        // 7. Record result and emit appropriate domain event
         match &result {
             Ok(order_result) => {
                 info!(
@@ -383,6 +459,9 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                     fill_price = %order_result.fill_price.as_decimal(),
                     "Entry order filled"
                 );
+                self.order_journal
+                    .finish_success(&journaled, Some(order_evidence(order_result)))
+                    .await;
                 self.journal.complete(signal_id, IntentResult::Success(order_result.clone()))?;
 
                 // Emit EntryOrderAccepted (post-exchange ack, no fill fields)
@@ -407,27 +486,58 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             },
             Err(e) => {
                 error!(%position_id, error = %e, "Entry order failed");
+                // No ticket: the adapter refused before the request left.
+                let sent = self.order_journal.ticket_issued(&journaled);
+                self.order_journal.finish_failed(&journaled).await;
+                if !sent {
+                    self.journal.complete(signal_id, IntentResult::Failed(e.to_string()))?;
+                    return Ok(ActionResult::EntryNotSent { signal_id, reason: e.to_string() });
+                }
 
                 // Emit EntryOrderFailed before journal completion
-                let event = Event::EntryOrderFailed {
-                    position_id,
-                    cycle_id,
-                    order_id,
-                    client_order_id,
-                    signal_id,
-                    reason: e.to_string(),
-                    timestamp: chrono::Utc::now(),
-                };
-                self.store.events().append(&event).await?;
-                self.store.apply_event(&event)?;
-
-                self.journal.complete(signal_id, IntentResult::Failed(e.to_string()))?;
+                let error = e.to_string();
+                let failed = self
+                    .entry_order_failed(
+                        position_id,
+                        cycle_id,
+                        order_id,
+                        client_order_id,
+                        signal_id,
+                        error.clone(),
+                    )
+                    .await?;
+                self.journal.complete(signal_id, IntentResult::Failed(error))?;
 
                 // Return Ok(OrderFailed) — event already applied to store.
                 // Caller persists to PostgreSQL eventlog via execute_and_persist().
-                Ok(ActionResult::OrderFailed { event, error: e.to_string() })
+                Ok(failed)
             },
         }
+    }
+
+    /// Emit `EntryOrderFailed`. Its projection changes nothing, and it never
+    /// makes an unknown outcome a rejection.
+    async fn entry_order_failed(
+        &self,
+        position_id: PositionId,
+        cycle_id: Uuid,
+        order_id: robson_domain::OrderId,
+        client_order_id: String,
+        signal_id: Uuid,
+        reason: String,
+    ) -> ExecResult<ActionResult> {
+        let event = Event::EntryOrderFailed {
+            position_id,
+            cycle_id,
+            order_id,
+            client_order_id,
+            signal_id,
+            reason: reason.clone(),
+            timestamp: chrono::Utc::now(),
+        };
+        self.store.events().append(&event).await?;
+        self.store.apply_event(&event)?;
+        Ok(ActionResult::OrderFailed { event, error: reason })
     }
 
     /// Execute a market exit under the risk-reduction rule (ADR-0056 §5).
@@ -475,7 +585,19 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             "Placing exit order"
         );
 
-        // 3. Execute on exchange
+        // 3. Execute on exchange, each submission journaled ahead of it
+        let journaled = self.order_journal.open_intent(IntentSpec {
+            position_id: Some(position_id),
+            kind: IntentKind::Exit,
+            client_order_id: client_order_id.clone(),
+            cancels_order_id: None,
+            params: serde_json::json!({
+                "symbol": symbol.as_pair(),
+                "side": side,
+                "quantity": quantity.as_decimal(),
+                "reason": reason,
+            }),
+        });
         let leg = self.leg(position_id).await;
         let outcome = quantize::submit_reduction(
             &*self.exchange,
@@ -483,9 +605,17 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             quantity,
             leg.as_ref().and_then(|leg| leg.rules_snapshot.as_ref()),
             quantize::METADATA_WAIT_BOUND,
-            |submitted, _rules| {
-                self.exchange
-                    .place_market_order(&symbol, side, submitted, &client_order_id, true)
+            |submitted, _rules, submission| {
+                let (journaled, symbol) = (&journaled, &symbol);
+                async move {
+                    let client_order_id = self
+                        .order_journal
+                        .authorize_reduction(journaled, submission, || Uuid::now_v7().to_string())
+                        .await?;
+                    self.exchange
+                        .place_market_order(symbol, side, submitted, &client_order_id, true)
+                        .await
+                }
             },
         )
         .await;
@@ -501,6 +631,9 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                     ?reason,
                     "Exit order filled"
                 );
+                self.order_journal
+                    .finish_success(&journaled, Some(order_evidence(&order_result)))
+                    .await;
                 self.journal.complete(intent_id, IntentResult::Success(order_result.clone()))?;
 
                 // A fill closes the leg, whatever it left: what the venue still holds
@@ -556,6 +689,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                     %residual,
                     "Exit has nothing executable: the leg rounds below the lot minimum (ADR-0056 §5)"
                 );
+                self.order_journal.finish_failed(&journaled).await;
                 self.journal.complete(
                     intent_id,
                     IntentResult::Failed(format!("{residual} below the lot minimum")),
@@ -574,6 +708,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             },
             Err(e) => {
                 error!(%position_id, error = %e, "Exit order failed");
+                self.order_journal.finish_failed(&journaled).await;
                 self.journal.complete(intent_id, IntentResult::Failed(e.to_string()))?;
                 Err(e)
             },
@@ -676,6 +811,46 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         })
     }
 
+    /// Cancel a protective stop as its own journal intent.
+    async fn journaled_cancel(
+        &self,
+        position_id: PositionId,
+        symbol: &robson_domain::Symbol,
+        order_id: &str,
+    ) -> CancelClass {
+        self.order_journal
+            .journaled_cancel(
+                Some(position_id),
+                order_id,
+                self.exchange.cancel_stop_market_order(symbol, order_id),
+            )
+            .await
+    }
+
+    /// The protection intent of one stop placement.
+    fn protection_intent(
+        &self,
+        position_id: PositionId,
+        symbol: &robson_domain::Symbol,
+        side: OrderSide,
+        quantity: Quantity,
+        stop_price: Price,
+        client_order_id: &str,
+    ) -> JournaledIntent {
+        self.order_journal.open_intent(IntentSpec {
+            position_id: Some(position_id),
+            kind: IntentKind::Protection,
+            client_order_id: client_order_id.to_string(),
+            cancels_order_id: None,
+            params: serde_json::json!({
+                "symbol": symbol.as_pair(),
+                "side": side,
+                "quantity": quantity.as_decimal(),
+                "stop_price": stop_price.as_decimal(),
+            }),
+        })
+    }
+
     /// Take back a stop the venue accepted for a leg that has left `Active`.
     /// Nothing is recorded on the leg, and no sweep visits a flat symbol with
     /// no open leg, so this is the only thing that keeps the stop off a
@@ -689,8 +864,9 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
     ) -> ExecResult<Vec<ActionResult>> {
         warn!(%position_id, "Leg left Active while its stop was being placed; withdrawing the stop");
         for order_id in order_ids {
-            if let Err(error) = self.exchange.cancel_stop_market_order(symbol, order_id).await {
-                warn!(%position_id, %order_id, %error, "Failed to withdraw the stop");
+            let class = self.journaled_cancel(position_id, symbol, order_id).await;
+            if !class.is_definite() {
+                warn!(%position_id, %order_id, ?class, "Stop withdrawal is uncertain");
             }
         }
         self.journal.complete(
@@ -739,14 +915,25 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             "Placing insurance stop"
         );
 
+        let journaled = self.protection_intent(
+            position_id,
+            &symbol,
+            side,
+            quantity,
+            stop_price,
+            &client_order_id,
+        );
         let outcome = self
-            .submit_protection(position_id, &symbol, side, quantity, stop_price, &client_order_id)
+            .submit_protection(position_id, &symbol, side, quantity, stop_price, &journaled)
             .await;
 
         match outcome {
             Ok(ReductionOutcome::Submitted {
                 accepted: order_result, residual, rules, ..
             }) => {
+                self.order_journal
+                    .finish_success(&journaled, Some(order_evidence(&order_result)))
+                    .await;
                 if self.leg_left_active(position_id).await {
                     return self
                         .withdraw_stop(position_id, intent_id, &symbol, &[order_result
@@ -789,6 +976,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                 Ok(results)
             },
             Ok(ReductionOutcome::NotExecutable { residual, rules }) => {
+                self.order_journal.finish_failed(&journaled).await;
                 self.protection_not_executable(
                     position_id,
                     intent_id,
@@ -801,6 +989,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             },
             Err(e) => {
                 warn!(%position_id, error = %e, "Insurance stop placement failed");
+                self.order_journal.finish_failed(&journaled).await;
                 self.journal.complete(intent_id, IntentResult::Failed(e.to_string()))?;
                 Ok(vec![self.emit_insurance_stop_failed(position_id, stop_price, e).await])
             },
@@ -817,7 +1006,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         side: OrderSide,
         quantity: Quantity,
         stop_price: Price,
-        client_order_id: &str,
+        journaled: &JournaledIntent,
     ) -> ExecResult<ReductionOutcome<OrderResult>> {
         let leg = self.leg(position_id).await;
         quantize::submit_reduction(
@@ -826,15 +1015,20 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             quantity,
             leg.as_ref().and_then(|leg| leg.rules_snapshot.as_ref()),
             quantize::METADATA_WAIT_BOUND,
-            |submitted, rules| {
+            |submitted, rules, submission| {
                 let trigger = quantize::protective_trigger(rules.as_ref(), side, stop_price);
-                self.exchange.place_stop_market_order(
-                    symbol,
-                    side,
-                    submitted,
-                    trigger,
-                    client_order_id,
-                )
+                async move {
+                    let client_order_id = self
+                        .order_journal
+                        .authorize_reduction(journaled, submission, || {
+                            format!("ins-{}", Uuid::now_v7().simple())
+                        })
+                        .await?;
+                    crate::crash_point!(PROTECTION_BEFORE_SEND);
+                    self.exchange
+                        .place_stop_market_order(symbol, side, submitted, trigger, &client_order_id)
+                        .await
+                }
             },
         )
         .await
@@ -926,21 +1120,23 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         //    after its one refresh and resubmission (ADR-0056 §5), the previous stop is
         //    still live on the exchange: protection is preserved and the failure is
         //    audit-only.
+        let journaled = self.protection_intent(
+            position_id,
+            &symbol,
+            side,
+            quantity,
+            new_stop_price,
+            &client_order_id,
+        );
         let (order_result, residual, rules) = match self
-            .submit_protection(
-                position_id,
-                &symbol,
-                side,
-                quantity,
-                new_stop_price,
-                &client_order_id,
-            )
+            .submit_protection(position_id, &symbol, side, quantity, new_stop_price, &journaled)
             .await
         {
             Ok(ReductionOutcome::Submitted { accepted, residual, rules, .. }) => {
                 (accepted, residual, rules)
             },
             Ok(ReductionOutcome::NotExecutable { residual, rules }) => {
+                self.order_journal.finish_failed(&journaled).await;
                 return self
                     .protection_not_executable(
                         position_id,
@@ -959,12 +1155,17 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                     error = %e,
                     "Insurance stop replacement placement failed; previous stop remains live"
                 );
+                self.order_journal.finish_failed(&journaled).await;
                 self.journal.complete(intent_id, IntentResult::Failed(e.to_string()))?;
                 return Ok(vec![
                     self.emit_insurance_stop_failed(position_id, new_stop_price, e).await,
                 ]);
             },
         };
+        // The placement's own result, whatever becomes of the predecessor.
+        self.order_journal
+            .finish_success(&journaled, Some(order_evidence(&order_result)))
+            .await;
 
         if self.leg_left_active(position_id).await {
             return self
@@ -975,28 +1176,18 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                 .await;
         }
 
-        // 2. Cancel the previous stop. "Unknown order"/already-gone is expected (it may
-        //    have just filled); any other failure is logged and tolerated — the
-        //    replacement is already protecting the position.
-        match self.exchange.cancel_stop_market_order(&symbol, &previous_order_id).await {
-            Ok(_) => {},
-            Err(e) if Self::is_unknown_order_error(&e) => {
-                warn!(
-                    %position_id,
-                    %previous_order_id,
-                    error = %e,
-                    "Previous insurance stop already gone during replace"
-                );
-            },
-            Err(e) => {
-                warn!(
-                    %position_id,
-                    %previous_order_id,
-                    error = %e,
-                    "Previous insurance stop cancel failed after replacement placement; \
-                     tolerating the transient double stop (reduce-only)"
-                );
-            },
+        // 2. Cancel the previous stop. Whatever becomes of it, it is its own intent and
+        //    the placement above stays a success: an uncertain cancel is logged and
+        //    tolerated, since the replacement is already protecting the position.
+        let class = self.journaled_cancel(position_id, &symbol, &previous_order_id).await;
+        if !class.is_definite() {
+            warn!(
+                %position_id,
+                %previous_order_id,
+                ?class,
+                "Previous insurance stop cancel is uncertain after replacement placement; \
+                 tolerating the transient double stop (reduce-only)"
+            );
         }
 
         // The leg can close while that cancel is out, past the check above.
@@ -1046,9 +1237,15 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
     }
 
     /// Cancel the protective insurance stop when the software exit takes over
-    /// (ADR-0039). An "unknown order" error is treated as success (the stop is
-    /// already gone); any other failure becomes an audit-only
-    /// `InsuranceStopFailed`. Never errors out of the batch.
+    /// (ADR-0039). Only a typed `Cancelled` records a cancellation (ADR-0056
+    /// step 7): an order found gone keeps its stop id, and an error of any kind
+    /// becomes an audit-only `InsuranceStopFailed`.
+    ///
+    /// The cancel is not rate-limited: while the id stays on the leg it goes
+    /// out again before each exit attempt, because a retried cancel can be what
+    /// lets the next exit through. No class stops the exit behind it. A failed
+    /// append or application of the `Cancelled` event does, as it always has,
+    /// and the failure event's append is awaited.
     async fn execute_cancel_insurance_stop(
         &self,
         position_id: PositionId,
@@ -1062,17 +1259,28 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             "Cancelling insurance stop"
         );
 
-        match self.exchange.cancel_stop_market_order(&symbol, &order_id).await {
-            Ok(StopCancelOutcome::Cancelled) => {},
+        let error = match self.journaled_cancel(position_id, &symbol, &order_id).await {
+            CancelClass::Cancelled { .. } => {
+                let event = Event::InsuranceStopCancelled {
+                    position_id,
+                    order_id,
+                    timestamp: chrono::Utc::now(),
+                };
+                self.store.events().append(&event).await?;
+                self.store.apply_event(&event)?;
+                return Ok(ActionResult::EventEmitted(event));
+            },
             // The exchange no longer knows the order. The dominant cause is
             // that the stop TRIGGERED and closed the position, so emitting
             // InsuranceStopCancelled here would both misreport the outcome and
             // clear `insurance_stop_id` — the pointer reverse reconciliation
-            // needs to resolve the real fill (2026-07-31 incident).
-            Ok(StopCancelOutcome::AlreadyGone) => {
+            // needs to resolve the real fill (2026-07-31 incident). Terminal
+            // evidence or not, the leg's close is left to the evidence paths.
+            class @ (CancelClass::GoneTerminal { .. } | CancelClass::GoneUnresolved { .. }) => {
                 warn!(
                     %position_id,
                     %order_id,
+                    ?class,
                     "Insurance stop already gone on exchange; preserving stop id as \
                      reconciliation evidence instead of recording a cancellation"
                 );
@@ -1080,36 +1288,14 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                     "insurance stop {order_id} already gone on exchange"
                 )));
             },
-            Err(e) if Self::is_unknown_order_error(&e) => {
-                warn!(
-                    %position_id,
-                    %order_id,
-                    error = %e,
-                    "Insurance stop already gone; treating cancel as success"
-                );
+            CancelClass::Indeterminate => {
+                ExecError::Timeout("protective stop cancel outcome is indeterminate".to_string())
             },
-            Err(e) => {
-                warn!(%position_id, error = %e, "Insurance stop cancellation failed");
-                return Ok(self
-                    .emit_insurance_stop_failed(
-                        position_id,
-                        // No new stop price for a pure cancel; carry zero as a sentinel.
-                        Price::zero(),
-                        e,
-                    )
-                    .await);
-            },
-        }
-
-        let event = Event::InsuranceStopCancelled {
-            position_id,
-            order_id,
-            timestamp: chrono::Utc::now(),
+            CancelClass::Errored(error) => error,
         };
-        self.store.events().append(&event).await?;
-        self.store.apply_event(&event)?;
-
-        Ok(ActionResult::EventEmitted(event))
+        warn!(%position_id, %error, "Insurance stop cancellation failed");
+        // No new stop price for a pure cancel; carry zero as a sentinel.
+        Ok(self.emit_insurance_stop_failed(position_id, Price::zero(), error).await)
     }
 
     /// Build, persist, and apply an `InsuranceStopFailed` audit event
@@ -1136,15 +1322,6 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         ActionResult::EventEmitted(event)
     }
 
-    /// True when an exchange error means the target order no longer exists
-    /// (already filled or cancelled), so a cancel/replace can proceed or be
-    /// treated as success. Binance maps "Unknown order sent" (-2011) and
-    /// related rejection codes to `ExecError::OrderRejected`.
-    fn is_unknown_order_error(error: &ExecError) -> bool {
-        matches!(error, ExecError::OrderRejected(_))
-            || matches!(error, ExecError::Exchange(msg) if msg.to_lowercase().contains("order"))
-    }
-
     /// Get the intent journal (for inspection/recovery).
     pub fn journal(&self) -> &IntentJournal {
         &self.journal
@@ -1154,6 +1331,15 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
     pub fn store(&self) -> &S {
         &self.store
     }
+}
+
+/// What the venue answered, for the intent's `venue_evidence`.
+fn order_evidence(order: &OrderResult) -> serde_json::Value {
+    serde_json::json!({
+        "exchange_order_id": order.exchange_order_id,
+        "fill_price": order.fill_price.as_decimal(),
+        "filled_quantity": order.filled_quantity.as_decimal(),
+    })
 }
 
 /// What a residual event says about the order behind it (ADR-0056 §5).
@@ -1214,6 +1400,976 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
 
         Executor::new(exchange, journal, store)
+    }
+
+    // ---- ADR-0056 step 7, PR J: journal boundaries ------------------------------
+
+    use crate::order_journal::{JournalFault, StubJournalBackend};
+
+    struct JournalRig {
+        exchange: Arc<StubExchange>,
+        backend: Arc<StubJournalBackend>,
+        journal: Arc<OrderJournal>,
+        executor: Executor<StubExchange, MemoryStore>,
+    }
+
+    const SYMBOL: &str = "BTCUSDT";
+    const FAULTS: [JournalFault; 4] = [
+        JournalFault::Known,
+        JournalFault::AckLost,
+        JournalFault::NotLandedUncertain,
+        JournalFault::Hang,
+    ];
+
+    fn journal_rig() -> JournalRig {
+        journal_rig_with_bound(std::time::Duration::from_millis(20))
+    }
+
+    fn journal_rig_with_bound(bound: std::time::Duration) -> JournalRig {
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        let backend = Arc::new(StubJournalBackend::default());
+        let journal = Arc::new(
+            OrderJournal::new(backend.clone(), &crate::venue::VenueId::new("test:venue"))
+                .with_commit_bound(bound),
+        );
+        let executor = Executor::new(
+            Arc::clone(&exchange),
+            Arc::new(IntentJournal::new()),
+            Arc::new(MemoryStore::new()),
+        )
+        .with_order_journal(Arc::clone(&journal));
+        JournalRig { exchange, backend, journal, executor }
+    }
+
+    impl JournalRig {
+        fn sent_market_orders(&self) -> u64 {
+            self.exchange.market_order_call_count()
+        }
+
+        fn kinds_of_rows(&self) -> Vec<IntentKind> {
+            self.backend.rows().iter().map(|r| r.intent.as_ref().unwrap().kind).collect()
+        }
+
+        fn row_of_kind(&self, kind: IntentKind) -> crate::order_journal::StubJournalRow {
+            self.backend
+                .rows()
+                .into_iter()
+                .find(|r| r.intent.as_ref().unwrap().kind == kind)
+                .unwrap_or_else(|| panic!("no {kind:?} row: {:?}", self.kinds_of_rows()))
+        }
+
+        async fn active_position(&self, stop_id: Option<&str>) -> Position {
+            let symbol = Symbol::from_pair(SYMBOL).unwrap();
+            let mut position = Position::new(Uuid::now_v7(), symbol, Side::Long);
+            position.entry_price = Some(Price::new(dec!(95000)).unwrap());
+            position.quantity = Quantity::new(dec!(0.1)).unwrap();
+            position.state = PositionState::Active {
+                current_price: Price::new(dec!(95000)).unwrap(),
+                trailing_stop: Price::new(dec!(90000)).unwrap(),
+                favorable_extreme: Price::new(dec!(95000)).unwrap(),
+                extreme_at: chrono::Utc::now(),
+                insurance_stop_id: stop_id.map(str::to_string),
+                invalidation_guard_level: None,
+                last_emitted_stop: None,
+            };
+            self.executor.store().positions().save(&position).await.unwrap();
+            position
+        }
+
+        async fn placed_stop(&self, position_id: PositionId) -> String {
+            let placed = self
+                .executor
+                .execute(vec![EngineAction::PlaceInsuranceStop {
+                    position_id,
+                    symbol: Symbol::from_pair(SYMBOL).unwrap(),
+                    side: OrderSide::Sell,
+                    quantity: Quantity::new(dec!(0.1)).unwrap(),
+                    stop_price: Price::new(dec!(90000)).unwrap(),
+                }])
+                .await
+                .unwrap();
+            match &placed[0] {
+                ActionResult::OrderPlaced { order, .. } => order.exchange_order_id.clone(),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    fn entry_action() -> EngineAction {
+        EngineAction::PlaceEntryOrder {
+            position_id: Uuid::now_v7(),
+            cycle_id: Some(Uuid::now_v7()),
+            symbol: Symbol::from_pair(SYMBOL).unwrap(),
+            side: OrderSide::Buy,
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            order_id: Uuid::now_v7(),
+            client_order_id: Uuid::now_v7().to_string(),
+            expected_price: Price::new(dec!(95000)).unwrap(),
+            signal_id: Uuid::now_v7(),
+        }
+    }
+
+    #[tokio::test]
+    async fn entry_pre_send_commit_known_failure_is_typed_and_sends_nothing() {
+        let rig = journal_rig();
+        rig.backend.push_fault(JournalFault::Known);
+        let results = rig.executor.execute(vec![entry_action()]).await.unwrap();
+        assert!(matches!(results[0], ActionResult::EntryNotSent { .. }), "{results:?}");
+        assert_eq!(rig.sent_market_orders(), 0);
+        assert!(rig.backend.rows().is_empty(), "no row, so nothing to mark");
+    }
+
+    #[tokio::test]
+    async fn entry_pre_send_commit_uncertain_sends_nothing_and_is_not_a_no_send() {
+        for fault in [
+            JournalFault::AckLost,
+            JournalFault::NotLandedUncertain,
+            JournalFault::Hang,
+        ] {
+            let rig = journal_rig();
+            rig.backend.push_fault(fault);
+            let results = rig.executor.execute(vec![entry_action()]).await.unwrap();
+            assert!(matches!(results[0], ActionResult::OrderFailed { .. }), "{fault:?}");
+            assert_eq!(rig.sent_market_orders(), 0, "{fault:?}");
+            let outcome = rig.row_of_kind(IntentKind::Entry).outcome.unwrap();
+            assert!(outcome.uncertain_at.is_some() && !outcome.not_sent, "{fault:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn entry_result_write_failure_keeps_the_venue_result() {
+        for fault in FAULTS {
+            let rig = journal_rig();
+            rig.backend.fail_commit(1, Some(fault));
+            let results = rig.executor.execute(vec![entry_action()]).await.unwrap();
+            assert!(matches!(results[0], ActionResult::OrderPlaced { .. }), "{fault:?}");
+            assert_eq!(rig.sent_market_orders(), 1, "{fault:?}");
+            assert!(!rig.journal.latch_set(), "{fault:?}");
+            rig.journal.flush_pending().await;
+            let outcome = rig.row_of_kind(IntentKind::Entry).outcome.unwrap();
+            assert!(outcome.venue_outcome.is_some(), "{fault:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn exit_is_sent_through_every_journal_fault() {
+        for fault in FAULTS {
+            for write in 0..2 {
+                let rig = journal_rig();
+                let position = rig.active_position(None).await;
+                rig.backend.fail_commit(write, Some(fault));
+                let results =
+                    rig.executor.execute(vec![exit_action(position.id, dec!(0.1))]).await.unwrap();
+                let case = format!("{fault:?} write {write}");
+                assert!(
+                    results.iter().any(|r| matches!(r, ActionResult::OrderPlaced { .. })),
+                    "{case}: {results:?}"
+                );
+                assert_eq!(rig.sent_market_orders(), 1, "{case}");
+                assert_eq!(rig.journal.latch_set(), write == 0, "{case}");
+                rig.journal.flush_pending().await;
+                let row = rig.row_of_kind(IntentKind::Exit);
+                assert_eq!(row.attempts.len(), 1, "{case}");
+                assert!(row.outcome.unwrap().venue_outcome.is_some(), "{case}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_placement_is_sent_through_every_journal_fault() {
+        for fault in FAULTS {
+            for write in 0..2 {
+                let rig = journal_rig();
+                let position = rig.active_position(None).await;
+                rig.backend.fail_commit(write, Some(fault));
+                rig.placed_stop(position.id).await;
+                let case = format!("{fault:?} write {write}");
+                assert_eq!(rig.exchange.protection_call_count(), 1, "{case}");
+                assert_eq!(rig.journal.latch_set(), write == 0, "{case}");
+                rig.journal.flush_pending().await;
+                let outcome = rig.row_of_kind(IntentKind::Protection).outcome.unwrap();
+                assert!(outcome.venue_outcome.is_some(), "{case}");
+            }
+        }
+    }
+
+    /// A replacement is two intents: writes 0 and 1 belong to the placement, 2
+    /// and 3 to the predecessor's cancel. Nothing stops either request.
+    #[tokio::test]
+    async fn replacement_keeps_going_through_every_journal_fault() {
+        for fault in FAULTS {
+            for write in 0..4 {
+                let rig = journal_rig();
+                let position = rig.active_position(None).await;
+                let old = rig.placed_stop(position.id).await;
+                rig.backend.fail_commit(write, Some(fault));
+
+                let results = rig
+                    .executor
+                    .execute(vec![EngineAction::ReplaceInsuranceStop {
+                        position_id: position.id,
+                        symbol: Symbol::from_pair(SYMBOL).unwrap(),
+                        side: OrderSide::Sell,
+                        quantity: Quantity::new(dec!(0.1)).unwrap(),
+                        previous_order_id: old.clone(),
+                        new_stop_price: Price::new(dec!(91000)).unwrap(),
+                    }])
+                    .await
+                    .unwrap();
+                let case = format!("{fault:?} write {write}");
+                assert!(
+                    results.iter().any(|r| matches!(r, ActionResult::OrderPlaced { .. })),
+                    "{case}: {results:?}"
+                );
+                assert_eq!(rig.exchange.protection_call_count(), 2, "{case}");
+                assert!(
+                    !rig.exchange.has_stop_order(&old),
+                    "{case}: the predecessor was cancelled"
+                );
+                assert_eq!(rig.journal.latch_set(), write == 0 || write == 2, "{case}");
+                rig.journal.flush_pending().await;
+                let cancel = rig.row_of_kind(IntentKind::Cancel);
+                assert_eq!(cancel.intent.unwrap().cancels_order_id.as_deref(), Some(old.as_str()));
+                assert_eq!(cancel.outcome.unwrap().cancel_class, Some("cancelled"));
+            }
+        }
+    }
+
+    /// The cancel of a replacement is its own intent: an unresolved one leaves
+    /// the placement a success.
+    #[tokio::test]
+    async fn a_failed_predecessor_cancel_never_touches_the_placement() {
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        let old = rig.placed_stop(position.id).await;
+        rig.exchange.set_cancel_fails_next(true);
+        rig.executor
+            .execute(vec![EngineAction::ReplaceInsuranceStop {
+                position_id: position.id,
+                symbol: Symbol::from_pair(SYMBOL).unwrap(),
+                side: OrderSide::Sell,
+                quantity: Quantity::new(dec!(0.1)).unwrap(),
+                previous_order_id: old,
+                new_stop_price: Price::new(dec!(91000)).unwrap(),
+            }])
+            .await
+            .unwrap();
+        let cancel = rig.row_of_kind(IntentKind::Cancel).outcome.unwrap();
+        assert!(cancel.uncertain_at.is_some());
+        assert!(rig
+            .backend
+            .rows()
+            .iter()
+            .filter(|r| r.intent.as_ref().unwrap().kind == IntentKind::Protection)
+            .all(|r| r.outcome.as_ref().unwrap().venue_outcome.is_some()));
+    }
+
+    /// A stop accepted for a leg that left `Active` is withdrawn: the
+    /// placement stays a success and each withdrawal is a cancel intent.
+    #[tokio::test]
+    async fn withdrawal_keeps_going_through_every_journal_fault() {
+        for fault in FAULTS {
+            for write in 2..4 {
+                let rig = journal_rig();
+                let position = rig.active_position(None).await;
+                let store = Arc::clone(&rig.executor.store);
+                let position_id = position.id;
+                rig.exchange.set_after_next_stop_accepted(move || {
+                    let price = Price::new(dec!(90000)).unwrap();
+                    store
+                        .apply_event(&Event::PositionClosed {
+                            position_id,
+                            exit_reason: ExitReason::InsuranceStop,
+                            entry_price: price,
+                            exit_price: price,
+                            realized_pnl: Decimal::ZERO,
+                            total_fees: Decimal::ZERO,
+                            closure_evidence: robson_domain::ClosureEvidence::real_exit_fill(None),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .unwrap();
+                });
+                rig.backend.fail_commit(write, Some(fault));
+
+                rig.executor
+                    .execute(vec![EngineAction::PlaceInsuranceStop {
+                        position_id: position.id,
+                        symbol: Symbol::from_pair(SYMBOL).unwrap(),
+                        side: OrderSide::Sell,
+                        quantity: Quantity::new(dec!(0.1)).unwrap(),
+                        stop_price: Price::new(dec!(90000)).unwrap(),
+                    }])
+                    .await
+                    .unwrap();
+                let case = format!("{fault:?} write {write}");
+                assert_eq!(rig.exchange.stop_order_count(), 0, "{case}: withdrawn");
+                assert_eq!(rig.journal.latch_set(), write == 2, "{case}");
+                rig.journal.flush_pending().await;
+                let placement = rig.row_of_kind(IntentKind::Protection);
+                assert!(placement.outcome.unwrap().venue_outcome.is_some(), "{case}");
+                assert!(rig.row_of_kind(IntentKind::Cancel).outcome.is_some(), "{case}");
+            }
+        }
+    }
+
+    /// The first submission's rules rejection does not resolve the attempt, so
+    /// the resubmission's commit carries both.
+    #[tokio::test]
+    async fn the_quantisation_retry_needs_its_own_completeness_commit() {
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+        rig.exchange.set_rules_rejections_next(1);
+        rig.executor.execute(vec![exit_action(position.id, dec!(0.1))]).await.unwrap();
+        assert_eq!(rig.sent_market_orders(), 2);
+        assert_eq!(rig.row_of_kind(IntentKind::Exit).attempts.len(), 2);
+    }
+
+    fn exit_rows(
+        rig: &JournalRig,
+    ) -> (
+        crate::order_journal::StubJournalRow,
+        Option<crate::order_journal::StubJournalRow>,
+    ) {
+        let rows: Vec<_> = rig
+            .backend
+            .rows()
+            .into_iter()
+            .filter(|row| row.intent.as_ref().unwrap().kind == IntentKind::Exit)
+            .collect();
+        let fresh = rows.iter().find(|row| {
+            row.intent.as_ref().unwrap().params.get("replaces_client_order_id").is_some()
+        });
+        let sealed = rows
+            .iter()
+            .find(|row| {
+                row.intent.as_ref().unwrap().params.get("replaces_client_order_id").is_none()
+            })
+            .expect("the first intent");
+        (sealed.clone(), fresh.cloned())
+    }
+
+    /// Stop cancelled, exit rejected on rules, the same-id retry refused by the
+    /// journal: the fresh-id exit reaches the venue in the same call.
+    #[tokio::test]
+    async fn a_refused_retry_after_the_stop_is_cancelled_exits_under_a_fresh_id() {
+        for fault in FAULTS {
+            let rig = journal_rig();
+            let position = rig.active_position(None).await;
+            let stop = rig.placed_stop(position.id).await;
+            rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+            rig.exchange.set_rules_rejections_next(1);
+            // Cancel: 0 and 1. Exit: 2 is the first commit, 3 the same-id retry's.
+            rig.backend.fail_commit(3, Some(fault));
+
+            let results = rig
+                .executor
+                .execute(vec![
+                    cancel_action(position.id, &stop),
+                    exit_action(position.id, dec!(0.1)),
+                ])
+                .await
+                .unwrap();
+
+            assert!(!rig.exchange.has_stop_order(&stop), "{fault:?}");
+            assert!(
+                results.iter().any(|r| matches!(r, ActionResult::OrderPlaced { .. })),
+                "{fault:?}: {results:?}"
+            );
+            let sent = rig.exchange.market_order_client_ids();
+            assert_eq!(sent.len(), 2, "{fault:?}: the rejected one and the fresh one: {sent:?}");
+            assert_ne!(sent[0], sent[1], "{fault:?}: nothing more under the sealed id");
+
+            rig.journal.flush_pending().await;
+            let (sealed, fresh) = exit_rows(&rig);
+            let fresh = fresh.expect("the fresh intent is on record");
+            assert_eq!(sealed.intent.as_ref().unwrap().client_order_id, sent[0], "{fault:?}");
+            assert_eq!(fresh.intent.as_ref().unwrap().client_order_id, sent[1], "{fault:?}");
+            assert_eq!(
+                fresh.intent.as_ref().unwrap().params["replaces_client_order_id"],
+                sent[0].as_str(),
+                "{fault:?}"
+            );
+            assert!(!sealed.attempts.is_empty(), "{fault:?}: the rejected attempt is on record");
+            let sealed_outcome = sealed.outcome.expect("the sealed intent has an ending");
+            assert!(sealed_outcome.uncertain_at.is_some(), "{fault:?}");
+            assert_eq!(sealed_outcome.venue_outcome, None, "{fault:?}");
+            assert_eq!(
+                fresh.outcome.expect("the fresh intent has an ending").venue_outcome,
+                Some(crate::order_journal::VenueOutcome::Success),
+                "{fault:?}"
+            );
+        }
+    }
+
+    /// ADR-0056 step 7, PR F, review round 1: a refused retry's original is
+    /// uncertain the moment its fresh-id replacement starts, so its incident
+    /// closes the fence before the replacement's commit or venue answer is
+    /// awaited. With the replacement's commit held mid-flight, an entry sent
+    /// through the venue's real send start is refused, and only the rejected
+    /// exit and its replacement reach the venue. For every way the same-id
+    /// retry's commit can fail, the review's own sequence (an uncertain
+    /// retry commit, which seals the original with no occurrence) included.
+    #[tokio::test]
+    async fn a_refused_retrys_original_fences_before_its_replacement_is_awaited() {
+        use crate::{
+            gate::{IncidentReason, OperationKind},
+            venue::{EntryOrReduce, TradingPort},
+        };
+
+        for fault in FAULTS {
+            let rig = journal_rig_with_bound(std::time::Duration::from_secs(5));
+            let position = rig.active_position(None).await;
+            rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+            rig.exchange.set_rules_rejections_next(1);
+            // Exit: 0 is its first commit, 1 the same-id retry's, refused; 2
+            // the replacement's, held.
+            rig.backend.fail_commit(1, Some(fault));
+            let held = rig.backend.hold_commit(2);
+
+            let exiting = rig.executor.execute(vec![exit_action(position.id, dec!(0.1))]);
+            let meanwhile = async {
+                while rig.backend.commits().len() < 3 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(rig.sent_market_orders(), 1, "{fault:?}: only the rejected one so far");
+                assert!(
+                    rig.journal.gate().fenced(),
+                    "{fault:?}: fenced while the replacement is held"
+                );
+                let reasons: Vec<_> =
+                    rig.journal.gate().open_incidents().iter().map(|i| i.reason).collect();
+                assert_eq!(reasons, [IncidentReason::UncertainOutcome], "{fault:?}");
+                let entry = rig
+                    .journal
+                    .acquire(OperationKind::Arm)
+                    .unwrap()
+                    .run(async {
+                        let entry = rig.journal.open_intent(IntentSpec {
+                            position_id: None,
+                            kind: IntentKind::Entry,
+                            client_order_id: "e-while-held".to_string(),
+                            cancels_order_id: None,
+                            params: serde_json::Value::Null,
+                        });
+                        rig.journal.before_send(&entry, WriteClass::Strict).await.unwrap();
+                        TradingPort::place_market_order(
+                            &*rig.exchange,
+                            &Symbol::from_pair(SYMBOL).unwrap(),
+                            robson_domain::OrderSide::Buy,
+                            Quantity::new(dec!(0.1)).unwrap(),
+                            "e-while-held",
+                            EntryOrReduce::Entry,
+                        )
+                        .await
+                    })
+                    .await;
+                assert!(
+                    matches!(&entry, Err(ExecError::SendRefused(why)) if why.contains("fenced")),
+                    "{fault:?}: {entry:?}"
+                );
+                held.notify_one();
+            };
+            let (results, ()) = tokio::join!(exiting, meanwhile);
+
+            let results = results.unwrap();
+            assert!(
+                results.iter().any(|r| matches!(r, ActionResult::OrderPlaced { .. })),
+                "{fault:?}: {results:?}"
+            );
+            let sent = rig.exchange.market_order_client_ids();
+            assert_eq!(sent.len(), 2, "{fault:?}: the rejected exit and its replacement: {sent:?}");
+            assert!(!sent.contains(&"e-while-held".to_string()), "{fault:?}");
+            rig.journal.flush_pending().await;
+            let (sealed, _) = exit_rows(&rig);
+            let outcome = sealed.outcome.expect("the original's ending");
+            assert!(
+                outcome.uncertain_at.is_some() && outcome.uncertain_generation.is_some(),
+                "{fault:?}"
+            );
+            assert_eq!(rig.journal.gate().open_incidents()[0].count, 1, "{fault:?}: recorded once");
+        }
+    }
+
+    /// ADR-0056 step 7, PR F, review round 2: while the replacement waits at
+    /// the venue, the retry flush lands the original's uncertain ending and its
+    /// incident, and a release at that generation opens the fence. The
+    /// original's link to its replacement survives the flush, so the
+    /// replacement's own ending is recorded at its completion, inside the
+    /// enclosing operation (a reconciliation scan's outlives the exit): an
+    /// uncertain one fences at once, and an entry is then refused at its send;
+    /// a known success is recorded with its evidence, and nothing is
+    /// classified uncertain when the operation ends.
+    #[tokio::test]
+    async fn a_replacement_link_survives_the_retry_flush_and_a_release() {
+        use crate::{
+            gate::{IncidentReason, OperationKind},
+            order_journal::ReleaseRecord,
+            venue::{EntryOrReduce, TradingPort},
+        };
+
+        let faults = [
+            JournalFault::Known,
+            JournalFault::AckLost,
+            JournalFault::NotLandedUncertain,
+        ];
+        for fault in faults {
+            for uncertain in [true, false] {
+                let ending = if uncertain { "uncertain" } else { "accepted" };
+                let case = format!("{fault:?}, the replacement {ending}");
+                let rig = journal_rig_with_bound(std::time::Duration::from_secs(5));
+                let position = rig.active_position(None).await;
+                rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+                rig.exchange.set_rules_rejections_next(1);
+                // Exit: 0 is its first commit, 1 the same-id retry's, refused;
+                // 2 the replacement's, held until the venue hold is set.
+                rig.backend.fail_commit(1, Some(fault));
+                let held = rig.backend.hold_commit(2);
+
+                let scan = rig.journal.begin_operation();
+                let exiting =
+                    scan.scope(rig.executor.execute(vec![exit_action(position.id, dec!(0.1))]));
+                let meanwhile = async {
+                    while rig.backend.commits().len() < 3 {
+                        tokio::task::yield_now().await;
+                    }
+                    // The replacement goes on to the venue and waits there.
+                    let at_venue = rig.exchange.hold_next_mutation();
+                    held.notify_one();
+                    while rig.exchange.mutations().len() < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                    rig.journal.flush_pending().await;
+                    assert_eq!(rig.journal.retry_set_depth(), 0, "{case}: the original landed");
+                    let generation = rig.journal.gate().generation();
+                    let receipt = rig
+                        .journal
+                        .release(ReleaseRecord {
+                            decision_id: Uuid::now_v7(),
+                            generation,
+                            actor: "operator@example.com".to_string(),
+                            auth_kind: "verified",
+                            note: "reviewed".to_string(),
+                            treatment: "unbooked_accepted",
+                            decided_at: chrono::Utc::now(),
+                        })
+                        .await
+                        .unwrap();
+                    assert!(receipt.fence_open, "{case}");
+                    if uncertain {
+                        rig.exchange.set_order_fail_next(true);
+                    }
+                    at_venue.notify_one();
+                    generation
+                };
+                let (results, released) = tokio::join!(exiting, meanwhile);
+                assert_eq!(
+                    rig.exchange.market_order_client_ids().len(),
+                    2,
+                    "{case}: the rejected exit and its replacement"
+                );
+
+                // The exit is over; the operation that ran it is not.
+                if uncertain {
+                    assert!(rig.journal.gate().fenced(), "{case}: fenced at once: {results:?}");
+                    let incidents = rig.journal.gate().open_incidents();
+                    assert_eq!(incidents.len(), 1, "{case}");
+                    assert_eq!(incidents[0].reason, IncidentReason::UncertainOutcome, "{case}");
+                    assert!(incidents[0].first_generation > released, "{case}");
+                    let entry = rig
+                        .journal
+                        .acquire(OperationKind::Arm)
+                        .unwrap()
+                        .run(async {
+                            let entry = rig.journal.open_intent(IntentSpec {
+                                position_id: None,
+                                kind: IntentKind::Entry,
+                                client_order_id: "e-after".to_string(),
+                                cancels_order_id: None,
+                                params: serde_json::Value::Null,
+                            });
+                            rig.journal.before_send(&entry, WriteClass::Strict).await.unwrap();
+                            TradingPort::place_market_order(
+                                &*rig.exchange,
+                                &Symbol::from_pair(SYMBOL).unwrap(),
+                                robson_domain::OrderSide::Buy,
+                                Quantity::new(dec!(0.1)).unwrap(),
+                                "e-after",
+                                EntryOrReduce::Entry,
+                            )
+                            .await
+                        })
+                        .await;
+                    assert!(
+                        matches!(&entry, Err(ExecError::SendRefused(why)) if why.contains("fenced")),
+                        "{case}: {entry:?}"
+                    );
+                } else {
+                    let results = results.unwrap();
+                    assert!(
+                        results.iter().any(|r| matches!(r, ActionResult::OrderPlaced { .. })),
+                        "{case}: {results:?}"
+                    );
+                    assert!(!rig.journal.gate().fenced(), "{case}");
+                    assert!(rig.journal.gate().open_incidents().is_empty(), "{case}");
+                }
+                rig.journal.flush_pending().await;
+                let (_, fresh) = exit_rows(&rig);
+                let fresh = fresh.expect("the replacement is on record").outcome;
+                let fresh = fresh.expect("the replacement's ending is on record");
+                if uncertain {
+                    assert!(fresh.uncertain_generation.is_some_and(|g| g > released), "{case}");
+                } else {
+                    assert_eq!(
+                        fresh.venue_outcome,
+                        Some(crate::order_journal::VenueOutcome::Success),
+                        "{case}"
+                    );
+                    assert!(fresh.venue_evidence.is_some(), "{case}: its evidence");
+                    assert!(fresh.uncertain_at.is_none(), "{case}");
+                }
+                assert!(rig.journal.is_quiescent(), "{case}: the link consumed at completion");
+
+                drop(scan);
+                assert_eq!(rig.journal.gate().fenced(), uncertain, "{case}: after the operation");
+                assert_eq!(
+                    rig.journal.gate().open_incidents().len(),
+                    usize::from(uncertain),
+                    "{case}: nothing more at the operation's end"
+                );
+                rig.journal.flush_pending().await;
+                assert!(rig.journal.is_quiescent(), "{case}: the link consumed, memory empty");
+            }
+        }
+    }
+
+    /// Retry set full, discarded set with room: the exit's first commit fails,
+    /// so its id can only be kept as discarded, and the same-id retry is
+    /// refused on that. The fresh-id exit still reaches the venue in the
+    /// same call.
+    #[tokio::test]
+    async fn a_retry_refused_on_a_discarded_id_exits_under_a_fresh_id() {
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        let stop = rig.placed_stop(position.id).await;
+        rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+
+        rig.backend.set_fail_all(Some(JournalFault::Known));
+        let filling = rig.journal.begin_operation();
+        filling
+            .scope(async {
+                for index in 0..order_journal::RETRY_SET_CAPACITY {
+                    let intent = rig.journal.open_intent(IntentSpec {
+                        position_id: None,
+                        kind: IntentKind::Exit,
+                        client_order_id: format!("filling-{index}"),
+                        cancels_order_id: None,
+                        params: serde_json::Value::Null,
+                    });
+                    rig.journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
+                }
+            })
+            .await;
+        rig.backend.set_fail_all(None);
+        // Full, and the `unlanded_send` incident's upsert beside it (PR F).
+        assert_eq!(rig.journal.retry_set_depth(), order_journal::RETRY_SET_CAPACITY + 1);
+
+        rig.exchange.set_rules_rejections_next(1);
+        // Cancel: 0 and 1. Exit: 2 is its first commit.
+        rig.backend.fail_commit(2, Some(JournalFault::Known));
+
+        let results = rig
+            .executor
+            .execute(vec![
+                cancel_action(position.id, &stop),
+                exit_action(position.id, dec!(0.1)),
+            ])
+            .await
+            .unwrap();
+
+        assert!(!rig.exchange.has_stop_order(&stop), "the stop was cancelled");
+        assert!(
+            results.iter().any(|r| matches!(r, ActionResult::OrderPlaced { .. })),
+            "{results:?}"
+        );
+        let sent = rig.exchange.market_order_client_ids();
+        assert_eq!(sent.len(), 2, "the rejected one and the fresh one: {sent:?}");
+        assert_ne!(sent[0], sent[1], "nothing more under the discarded id");
+        assert_eq!(rig.journal.non_reuse_ids_lost(), 0, "its id was kept");
+        let fresh = rig.backend.row(&sent[1]).expect("the fresh intent is on record");
+        assert_eq!(
+            fresh.outcome.expect("it has an ending").venue_outcome,
+            Some(crate::order_journal::VenueOutcome::Success)
+        );
+    }
+
+    /// Both memories full: the first commit fails and the id cannot be kept, so
+    /// it is only sealed. The retry is refused on that, and the fresh-id exit
+    /// goes out all the same, with every journal write failing.
+    #[tokio::test]
+    async fn a_retry_refused_on_a_sealed_id_exits_under_a_fresh_id() {
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        let stop = rig.placed_stop(position.id).await;
+        rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+        rig.backend.saturate(&rig.journal).await;
+        rig.exchange.set_rules_rejections_next(1);
+
+        let results = rig
+            .executor
+            .execute(vec![
+                cancel_action(position.id, &stop),
+                exit_action(position.id, dec!(0.1)),
+            ])
+            .await
+            .unwrap();
+
+        assert!(!rig.exchange.has_stop_order(&stop), "the stop was cancelled");
+        assert!(
+            results.iter().any(|r| matches!(r, ActionResult::OrderPlaced { .. })),
+            "{results:?}"
+        );
+        let sent = rig.exchange.market_order_client_ids();
+        assert_eq!(sent.len(), 2, "the rejected one and the fresh one: {sent:?}");
+        assert_ne!(sent[0], sent[1], "nothing more under the sealed id");
+    }
+
+    /// The fresh send is rejected too: exactly one fallback, the ordinary
+    /// error.
+    #[tokio::test]
+    async fn a_rejected_fresh_send_is_the_one_fallback_and_returns_the_ordinary_error() {
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+        rig.exchange.set_rules_rejections_next(2);
+        rig.backend.fail_commit(1, Some(JournalFault::Known));
+
+        let error = rig
+            .executor
+            .execute(vec![exit_action(position.id, dec!(0.1))])
+            .await
+            .expect_err("the fresh send was refused too");
+
+        assert!(matches!(error, ExecError::RulesRejected(_)), "{error:?}");
+        assert_eq!(rig.sent_market_orders(), 2, "one first, one fresh, no loop");
+        let (sealed, fresh) = exit_rows(&rig);
+        let sent = rig.exchange.market_order_client_ids();
+        assert_eq!(sealed.intent.as_ref().unwrap().client_order_id, sent[0]);
+        assert!(fresh.expect("on record").outcome.expect("ended").uncertain_at.is_some());
+    }
+
+    /// An uncertain first attempt never reaches the fallback or a retry.
+    #[tokio::test]
+    async fn an_uncertain_first_attempt_does_not_fall_back() {
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+        rig.exchange.set_order_fail_next(true);
+        // Every commit after the first fails, so a retry could only be refused.
+        rig.backend.fail_commit(1, Some(JournalFault::Known));
+
+        let error = rig
+            .executor
+            .execute(vec![exit_action(position.id, dec!(0.1))])
+            .await
+            .expect_err("the send failed");
+
+        assert!(matches!(error, ExecError::Exchange(_)), "{error:?}");
+        assert_eq!(rig.sent_market_orders(), 1);
+        let (_, fresh) = exit_rows(&rig);
+        assert!(fresh.is_none());
+    }
+
+    /// Stops have the same resubmission, and the fresh id keeps the `ins-`
+    /// prefix the orphan sweep recognises.
+    #[tokio::test]
+    async fn a_refused_stop_retry_is_placed_under_a_fresh_ins_id() {
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+        rig.exchange.set_rules_rejections_next(1);
+        rig.backend.fail_commit(1, Some(JournalFault::Known));
+
+        let id = rig.placed_stop(position.id).await;
+
+        assert!(rig.exchange.has_stop_order(&id));
+        assert_eq!(rig.exchange.protection_call_count(), 2);
+        let stored = rig.exchange.stop_order(&id).expect("the stop");
+        assert!(stored.client_order_id.starts_with("ins-"), "{}", stored.client_order_id);
+        let replacing = rig
+            .backend
+            .rows()
+            .into_iter()
+            .find(|row| {
+                row.intent.as_ref().unwrap().params.get("replaces_client_order_id").is_some()
+            })
+            .expect("the fresh intent");
+        assert_eq!(replacing.intent.unwrap().client_order_id, stored.client_order_id);
+    }
+
+    #[tokio::test]
+    async fn an_entry_refused_before_the_send_has_no_ticket_and_is_not_sent() {
+        let rig = journal_rig();
+        rig.exchange.set_refuse_before_send_next(true);
+        let results = rig.executor.execute(vec![entry_action()]).await.unwrap();
+        assert!(matches!(results[0], ActionResult::EntryNotSent { .. }), "{results:?}");
+        assert!(rig.row_of_kind(IntentKind::Entry).outcome.unwrap().not_sent);
+    }
+
+    #[tokio::test]
+    async fn an_entry_failing_after_its_ticket_stays_an_unknown_outcome() {
+        let rig = journal_rig();
+        rig.exchange.set_order_fail_next(true);
+        let results = rig.executor.execute(vec![entry_action()]).await.unwrap();
+        assert!(matches!(results[0], ActionResult::OrderFailed { .. }), "{results:?}");
+        let outcome = rig.row_of_kind(IntentKind::Entry).outcome.unwrap();
+        assert!(outcome.uncertain_at.is_some() && outcome.venue_outcome.is_none());
+    }
+
+    /// Reviewed statement counts for each real path, read off the counter that
+    /// production exports.
+    #[tokio::test]
+    async fn each_order_path_issues_its_reviewed_statement_count() {
+        let rig = journal_rig();
+        rig.executor.execute(vec![entry_action()]).await.unwrap();
+        assert_eq!(rig.journal.operation_statements_max(), 9, "entry");
+
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        rig.executor.execute(vec![exit_action(position.id, dec!(0.1))]).await.unwrap();
+        assert_eq!(rig.journal.operation_statements_max(), 9, "exit");
+
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+        rig.exchange.set_rules_rejections_next(1);
+        rig.executor.execute(vec![exit_action(position.id, dec!(0.1))]).await.unwrap();
+        assert_eq!(rig.journal.operation_statements_max(), 13, "exit with one retry");
+
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        let old = rig.placed_stop(position.id).await;
+        assert_eq!(rig.journal.operation_statements_max(), 9, "stop");
+        rig.executor
+            .execute(vec![EngineAction::ReplaceInsuranceStop {
+                position_id: position.id,
+                symbol: Symbol::from_pair(SYMBOL).unwrap(),
+                side: OrderSide::Sell,
+                quantity: Quantity::new(dec!(0.1)).unwrap(),
+                previous_order_id: old,
+                new_stop_price: Price::new(dec!(91000)).unwrap(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(rig.journal.operation_statements_max(), 18, "replacement");
+
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+        rig.exchange.set_rules_rejections_next(1);
+        rig.backend.fail_commit(1, Some(JournalFault::Known));
+        rig.executor.execute(vec![exit_action(position.id, dec!(0.1))]).await.unwrap();
+        assert_eq!(rig.journal.operation_statements_max(), 22, "exit with a replaced retry");
+
+        // The worst reviewed case: a replaced retry on a placement that then
+        // withdraws both stops, because the leg left `Active` meanwhile.
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        let old = rig.placed_stop(position.id).await;
+        rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
+        rig.exchange.set_rules_rejections_next(1);
+        rig.backend.fail_commit(1, Some(JournalFault::Known));
+        let store = Arc::clone(&rig.executor.store);
+        let position_id = position.id;
+        rig.exchange.set_after_next_stop_accepted(move || {
+            let price = Price::new(dec!(90000)).unwrap();
+            store
+                .apply_event(&Event::PositionClosed {
+                    position_id,
+                    exit_reason: ExitReason::InsuranceStop,
+                    entry_price: price,
+                    exit_price: price,
+                    realized_pnl: Decimal::ZERO,
+                    total_fees: Decimal::ZERO,
+                    closure_evidence: robson_domain::ClosureEvidence::real_exit_fill(None),
+                    timestamp: chrono::Utc::now(),
+                })
+                .unwrap();
+        });
+        rig.executor
+            .execute(vec![EngineAction::ReplaceInsuranceStop {
+                position_id: position.id,
+                symbol: Symbol::from_pair(SYMBOL).unwrap(),
+                side: OrderSide::Sell,
+                quantity: Quantity::new(dec!(0.1)).unwrap(),
+                previous_order_id: old,
+                new_stop_price: Price::new(dec!(91000)).unwrap(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(rig.journal.operation_statements_max(), 40, "the worst reviewed case");
+        assert_eq!(rig.journal.operations_over_statement_bound(), 0);
+        assert_eq!(rig.journal.operations_over_statement_bound(), 0);
+    }
+
+    /// With the journal's memories full and its writes failing, every
+    /// protective send still reaches the venue, on the real executor path.
+    #[tokio::test]
+    async fn a_saturated_failing_journal_stops_no_protective_send() {
+        // A cancel-first exit: the stop goes, and so does the market exit.
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        let stop = rig.placed_stop(position.id).await;
+        rig.backend.saturate(&rig.journal).await;
+        let lost_before = rig.journal.non_reuse_ids_lost();
+        let results = rig
+            .executor
+            .execute(vec![
+                cancel_action(position.id, &stop),
+                exit_action(position.id, dec!(0.1)),
+            ])
+            .await
+            .unwrap();
+        assert!(!rig.exchange.has_stop_order(&stop), "the stop was cancelled");
+        assert_eq!(rig.sent_market_orders(), 1, "and the exit reached the venue");
+        assert!(
+            results.iter().any(|r| matches!(r, ActionResult::OrderPlaced { .. })),
+            "{results:?}"
+        );
+        assert!(rig.journal.non_reuse_ids_lost() > lost_before);
+
+        // An initial stop.
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        rig.backend.saturate(&rig.journal).await;
+        rig.placed_stop(position.id).await;
+        assert_eq!(rig.exchange.protection_call_count(), 1);
+
+        // A replacement places its successor and cancels its predecessor.
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        let old = rig.placed_stop(position.id).await;
+        rig.backend.saturate(&rig.journal).await;
+        rig.executor
+            .execute(vec![EngineAction::ReplaceInsuranceStop {
+                position_id: position.id,
+                symbol: Symbol::from_pair(SYMBOL).unwrap(),
+                side: OrderSide::Sell,
+                quantity: Quantity::new(dec!(0.1)).unwrap(),
+                previous_order_id: old.clone(),
+                new_stop_price: Price::new(dec!(91000)).unwrap(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(rig.exchange.protection_call_count(), 2);
+        assert!(!rig.exchange.has_stop_order(&old));
+    }
+
+    #[tokio::test]
+    async fn every_order_is_listed_in_flight_only_while_it_runs() {
+        let rig = journal_rig();
+        rig.executor.execute(vec![entry_action()]).await.unwrap();
+        assert_eq!(rig.journal.operations_in_flight(), 0);
     }
 
     // ---- ADR-0056 §5 ----------------------------------------------------------
@@ -2339,6 +3495,527 @@ mod tests {
         }
         assert!(!exchange.has_stop_order(&previous_id), "previous stop must be cancelled");
         assert_eq!(exchange.stop_order_count(), 1);
+    }
+
+    // ---- ADR-0056 step 7, PR C: typed cancel classes
+    // ------------------------------
+
+    use crate::{
+        order_journal::VenueOutcome,
+        venue::{OrderLookup, StopCancelOutcome as VenueCancel},
+    };
+
+    /// Every class, each with its expected label; the last one is the broad
+    /// variant and message that used to read as "cancelled".
+    fn cancel_cases() -> Vec<(Result<VenueCancel, ExecError>, &'static str)> {
+        vec![
+            (
+                Ok(VenueCancel::Cancelled {
+                    filled_before_cancel: Decimal::ZERO,
+                    fills: None,
+                }),
+                "cancelled",
+            ),
+            (
+                Ok(VenueCancel::AlreadyGone {
+                    final_state: OrderLookup::Terminal {
+                        filled_qty: dec!(0.1),
+                        cancelled_qty: Decimal::ZERO,
+                        fills: None,
+                    },
+                }),
+                "gone_terminal",
+            ),
+            (
+                Ok(VenueCancel::AlreadyGone { final_state: OrderLookup::Unknown }),
+                "gone_unresolved",
+            ),
+            (Ok(VenueCancel::Unknown), "indeterminate"),
+            (Err(ExecError::Timeout("venue timed out".to_string())), "error"),
+            (Err(ExecError::OrderRejected("Unknown order sent.".to_string())), "error"),
+        ]
+    }
+
+    fn expected_outcome(label: &str) -> Option<VenueOutcome> {
+        match label {
+            "cancelled" => Some(VenueOutcome::Success),
+            "gone_terminal" => Some(VenueOutcome::GoneTerminal),
+            _ => None,
+        }
+    }
+
+    fn replace_action(position_id: PositionId, previous: &str) -> EngineAction {
+        EngineAction::ReplaceInsuranceStop {
+            position_id,
+            symbol: Symbol::from_pair(SYMBOL).unwrap(),
+            side: OrderSide::Sell,
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            previous_order_id: previous.to_string(),
+            new_stop_price: Price::new(dec!(91000)).unwrap(),
+        }
+    }
+
+    fn place_action(position_id: PositionId) -> EngineAction {
+        EngineAction::PlaceInsuranceStop {
+            position_id,
+            symbol: Symbol::from_pair(SYMBOL).unwrap(),
+            side: OrderSide::Sell,
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            stop_price: Price::new(dec!(90000)).unwrap(),
+        }
+    }
+
+    /// The batch under a bound, so a journal write that blocks fails the test
+    /// instead of hanging it.
+    async fn execute_bounded(
+        rig: &JournalRig,
+        actions: Vec<EngineAction>,
+    ) -> ExecResult<Vec<ActionResult>> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rig.executor.execute(actions))
+            .await
+            .expect("a journal write held the batch")
+    }
+
+    impl JournalRig {
+        fn rows_of_kind(&self, kind: IntentKind) -> Vec<crate::order_journal::StubJournalRow> {
+            self.backend
+                .rows()
+                .into_iter()
+                .filter(|r| r.intent.as_ref().unwrap().kind == kind)
+                .collect()
+        }
+
+        /// The one row of a cancel of `order_id`, ending as `label`.
+        fn assert_cancel_row(&self, label: &str, order_id: &str) {
+            let row = self
+                .rows_of_kind(IntentKind::Cancel)
+                .into_iter()
+                .find(|r| r.intent.as_ref().unwrap().cancels_order_id.as_deref() == Some(order_id))
+                .unwrap_or_else(|| panic!("{label}: no cancel of {order_id}"));
+            let intent = row.intent.unwrap();
+            assert!(intent.client_order_id.starts_with("cxl-"), "{label}: a local id");
+            assert_eq!(row.attempts.len(), 1, "{label}");
+            let outcome = row.outcome.unwrap_or_else(|| panic!("{label}: no outcome"));
+            assert_eq!(outcome.cancel_class, Some(label), "{label}");
+            assert_eq!(outcome.venue_outcome, expected_outcome(label), "{label}");
+            assert_eq!(
+                outcome.uncertain_at.is_some(),
+                expected_outcome(label).is_none(),
+                "{label}"
+            );
+            assert!(!outcome.not_sent, "{label}");
+        }
+
+        /// Each placement ended a plain success, untouched by any cancel.
+        fn assert_placements_succeeded(&self, count: usize, label: &str) {
+            let placements = self.rows_of_kind(IntentKind::Protection);
+            assert_eq!(placements.len(), count, "{label}");
+            for placement in placements {
+                let outcome = placement.outcome.unwrap_or_else(|| panic!("{label}: no outcome"));
+                assert_eq!(outcome.venue_outcome, Some(VenueOutcome::Success), "{label}");
+                assert_eq!(outcome.cancel_class, None, "{label}");
+                assert_eq!(outcome.uncertain_at, None, "{label}");
+            }
+        }
+
+        async fn events(&self, position_id: PositionId) -> Vec<Event> {
+            self.executor.store().events().find_by_position(position_id).await.unwrap()
+        }
+
+        async fn stop_id_of(&self, position_id: PositionId) -> Option<String> {
+            let leg = self
+                .executor
+                .store()
+                .positions()
+                .find_by_id(position_id)
+                .await
+                .unwrap()
+                .unwrap();
+            match leg.state {
+                PositionState::Active { insurance_stop_id, .. } => insurance_stop_id,
+                other => panic!("the leg left Active: {other:?}"),
+            }
+        }
+
+        /// A leg that closes the moment the next stop is accepted, so that
+        /// stop is withdrawn.
+        async fn leg_closing_at_the_next_stop(&self) -> Position {
+            let position = self.active_position(None).await;
+            let store = Arc::clone(&self.executor.store);
+            let position_id = position.id;
+            self.exchange.set_after_next_stop_accepted(move || {
+                let price = Price::new(dec!(90000)).unwrap();
+                store
+                    .apply_event(&Event::PositionClosed {
+                        position_id,
+                        exit_reason: ExitReason::InsuranceStop,
+                        entry_price: price,
+                        exit_price: price,
+                        realized_pnl: Decimal::ZERO,
+                        total_fees: Decimal::ZERO,
+                        closure_evidence: robson_domain::ClosureEvidence::real_exit_fill(None),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .unwrap();
+            });
+            position
+        }
+    }
+
+    /// Replacement, every class: the placement stays a success and the
+    /// predecessor's cancel keeps its own class on its own intent.
+    #[tokio::test]
+    async fn a_replacement_succeeds_under_every_cancel_class() {
+        for (outcome, label) in cancel_cases() {
+            let rig = journal_rig();
+            let position = rig.active_position(None).await;
+            let old = rig.placed_stop(position.id).await;
+            rig.exchange.set_stop_cancel_outcome_next(outcome);
+
+            let results =
+                rig.executor.execute(vec![replace_action(position.id, &old)]).await.unwrap();
+
+            let new_id = match &results[0] {
+                ActionResult::OrderPlaced {
+                    event: Some(Event::InsuranceStopReplaced { previous_order_id, order_id, .. }),
+                    ..
+                } => {
+                    assert_eq!(previous_order_id, &old, "{label}");
+                    order_id.clone()
+                },
+                other => panic!("{label}: {other:?}"),
+            };
+            assert!(rig.exchange.has_stop_order(&new_id), "{label}: the successor is live");
+            rig.assert_cancel_row(label, &old);
+            rig.assert_placements_succeeded(2, label);
+            let events = rig.events(position.id).await;
+            assert!(
+                !events.iter().any(|e| matches!(
+                    e,
+                    Event::InsuranceStopCancelled { .. } | Event::InsuranceStopFailed { .. }
+                )),
+                "{label}: {events:?}"
+            );
+        }
+    }
+
+    /// The case §2.3 item 4 names: placement succeeded, cancel uncertain, and
+    /// the two are separate intents whose rows do not share anything.
+    #[tokio::test]
+    async fn a_successful_placement_never_absorbs_an_uncertain_cancel() {
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        let old = rig.placed_stop(position.id).await;
+        rig.exchange
+            .set_stop_cancel_outcome_next(Err(ExecError::Timeout("cancel unanswered".to_string())));
+
+        rig.executor.execute(vec![replace_action(position.id, &old)]).await.unwrap();
+
+        let placements = rig.rows_of_kind(IntentKind::Protection);
+        let cancels = rig.rows_of_kind(IntentKind::Cancel);
+        assert_eq!((placements.len(), cancels.len()), (2, 1));
+        let cancel = cancels.into_iter().next().unwrap();
+        let cancel_intent = cancel.intent.unwrap();
+        for placement in placements {
+            let intent = placement.intent.unwrap();
+            assert_ne!(intent.intent_id, cancel_intent.intent_id);
+            assert_ne!(intent.client_order_id, cancel_intent.client_order_id);
+            assert_eq!(intent.cancels_order_id, None);
+            let outcome = placement.outcome.unwrap();
+            assert_eq!(outcome.venue_outcome, Some(VenueOutcome::Success));
+            assert_eq!(outcome.uncertain_at, None);
+        }
+        let outcome = cancel.outcome.unwrap();
+        assert_eq!(outcome.venue_outcome, None);
+        assert_eq!(outcome.cancel_class, Some("error"));
+        assert!(outcome.uncertain_at.is_some());
+    }
+
+    /// Withdrawal, every class: the placement stays a success, the cancel
+    /// keeps its class, and the leg is left alone.
+    #[tokio::test]
+    async fn a_withdrawal_records_every_cancel_class() {
+        for (outcome, label) in cancel_cases() {
+            let rig = journal_rig();
+            let position = rig.leg_closing_at_the_next_stop().await;
+            rig.exchange.set_stop_cancel_outcome_next(outcome);
+
+            let results = rig.executor.execute(vec![place_action(position.id)]).await.unwrap();
+
+            assert!(matches!(results[0], ActionResult::StateUpdated), "{label}: {results:?}");
+            let placed = rig.row_of_kind(IntentKind::Protection);
+            let evidence = placed.outcome.as_ref().unwrap().venue_evidence.clone().unwrap();
+            let stop_id = evidence["exchange_order_id"].as_str().unwrap().to_string();
+            rig.assert_cancel_row(label, &stop_id);
+            rig.assert_placements_succeeded(1, label);
+            assert!(
+                rig.events(position.id).await.is_empty(),
+                "{label}: a withdrawal emits nothing"
+            );
+        }
+    }
+
+    /// A replacement that withdraws both stops: each cancel is its own intent,
+    /// and an uncertain first one does not stop the second.
+    #[tokio::test]
+    async fn each_withdrawn_stop_keeps_its_own_class() {
+        let rig = journal_rig();
+        let position = rig.leg_closing_at_the_next_stop().await;
+        let old = live_stop(&rig.executor).await;
+        rig.exchange.set_stop_cancel_outcome_next(Ok(VenueCancel::Unknown));
+
+        rig.executor.execute(vec![replace_action(position.id, &old)]).await.unwrap();
+
+        let placed = rig.row_of_kind(IntentKind::Protection);
+        let evidence = placed.outcome.as_ref().unwrap().venue_evidence.clone().unwrap();
+        let new_id = evidence["exchange_order_id"].as_str().unwrap().to_string();
+        rig.assert_cancel_row("indeterminate", &new_id);
+        rig.assert_cancel_row("cancelled", &old);
+        assert!(!rig.exchange.has_stop_order(&old), "the second withdrawal went out");
+        assert_eq!(rig.rows_of_kind(IntentKind::Cancel).len(), 2);
+    }
+
+    /// The software-exit table of §2.3 item 4, row by row.
+    #[tokio::test]
+    async fn a_software_exit_cancel_acts_on_its_class() {
+        for (outcome, label) in cancel_cases() {
+            let rig = journal_rig();
+            let position = rig.active_position(Some("stop-1")).await;
+            rig.exchange.set_stop_cancel_outcome_next(outcome);
+
+            let results =
+                rig.executor.execute(vec![cancel_action(position.id, "stop-1")]).await.unwrap();
+
+            rig.assert_cancel_row(label, "stop-1");
+            let events = rig.events(position.id).await;
+            let cancelled = events
+                .iter()
+                .filter(|e| matches!(e, Event::InsuranceStopCancelled { .. }))
+                .count();
+            let failed =
+                events.iter().filter(|e| matches!(e, Event::InsuranceStopFailed { .. })).count();
+            let stop_id = rig.stop_id_of(position.id).await;
+            match label {
+                "cancelled" => {
+                    assert!(
+                        matches!(
+                            results[0],
+                            ActionResult::EventEmitted(Event::InsuranceStopCancelled { .. })
+                        ),
+                        "{label}: {results:?}"
+                    );
+                    assert_eq!((cancelled, failed), (1, 0), "{label}");
+                    assert_eq!(stop_id, None, "{label}: the id goes with a real cancel");
+                },
+                "gone_terminal" | "gone_unresolved" => {
+                    assert!(matches!(results[0], ActionResult::Skipped(_)), "{label}: {results:?}");
+                    assert_eq!((cancelled, failed), (0, 0), "{label}");
+                    assert_eq!(stop_id.as_deref(), Some("stop-1"), "{label}: the id stays");
+                },
+                "indeterminate" | "error" => {
+                    assert!(
+                        matches!(
+                            results[0],
+                            ActionResult::EventEmitted(Event::InsuranceStopFailed { .. })
+                        ),
+                        "{label}: {results:?}"
+                    );
+                    assert_eq!((cancelled, failed), (0, 1), "{label}");
+                    assert_eq!(stop_id.as_deref(), Some("stop-1"), "{label}: the id stays");
+                },
+                other => panic!("unexpected label {other}"),
+            }
+        }
+    }
+
+    /// "The exit proceeds as today": the market exit runs behind every class.
+    #[tokio::test]
+    async fn the_exit_proceeds_behind_every_cancel_class() {
+        for (outcome, label) in cancel_cases() {
+            let rig = journal_rig();
+            let position = rig.active_position(Some("stop-1")).await;
+            rig.exchange.set_stop_cancel_outcome_next(outcome);
+
+            let results = rig
+                .executor
+                .execute(vec![
+                    cancel_action(position.id, "stop-1"),
+                    exit_action(position.id, dec!(0.1)),
+                ])
+                .await
+                .unwrap();
+
+            assert!(
+                results.iter().any(|r| matches!(r, ActionResult::OrderPlaced { .. })),
+                "{label}: {results:?}"
+            );
+            assert_eq!(rig.sent_market_orders(), 1, "{label}");
+            rig.assert_cancel_row(label, "stop-1");
+            assert_eq!(rig.rows_of_kind(IntentKind::Exit).len(), 1, "{label}");
+        }
+    }
+
+    /// A stop that really filled on the stub reaches `GoneTerminal` through the
+    /// ordinary path, with its fills on the cancel intent's evidence.
+    #[tokio::test]
+    async fn a_filled_stop_records_its_fill_on_the_cancel_intent() {
+        let rig = journal_rig();
+        let position = rig.active_position(None).await;
+        let stop = rig.placed_stop(position.id).await;
+        rig.exchange.fill_stop_order(&stop).unwrap();
+
+        let results = rig.executor.execute(vec![cancel_action(position.id, &stop)]).await.unwrap();
+
+        assert!(matches!(results[0], ActionResult::Skipped(_)), "{results:?}");
+        rig.assert_cancel_row("gone_terminal", &stop);
+        let cancel = rig.row_of_kind(IntentKind::Cancel).outcome.unwrap();
+        let evidence = cancel.venue_evidence.expect("the fills are on the cancel intent");
+        assert_eq!(evidence["filled_qty"], serde_json::json!(dec!(0.1)));
+        assert_eq!(
+            evidence["fills"]["exchange_order_id"].as_str(),
+            Some(format!("TRIGGERED-{stop}").as_str())
+        );
+    }
+
+    /// `is_unknown_order_error` is gone: neither the variants nor the text it
+    /// keyed on can record a cancellation or clear the stop id.
+    #[tokio::test]
+    async fn no_error_text_records_a_cancellation() {
+        for text in [
+            "Unknown order sent.",
+            "Order does not exist.",
+            "order already gone",
+            "order cancelled",
+        ] {
+            for error in [
+                ExecError::OrderRejected(text.to_string()),
+                ExecError::Exchange(text.to_string()),
+            ] {
+                let case = format!("{error:?}");
+                let rig = journal_rig();
+                let position = rig.active_position(Some("stop-1")).await;
+                rig.exchange.set_stop_cancel_outcome_next(Err(error));
+
+                let results =
+                    rig.executor.execute(vec![cancel_action(position.id, "stop-1")]).await.unwrap();
+
+                assert!(
+                    matches!(
+                        results[0],
+                        ActionResult::EventEmitted(Event::InsuranceStopFailed { .. })
+                    ),
+                    "{case}: {results:?}"
+                );
+                assert_eq!(rig.stop_id_of(position.id).await.as_deref(), Some("stop-1"), "{case}");
+                rig.assert_cancel_row("error", "stop-1");
+            }
+        }
+    }
+
+    /// Replacement: a cancel's journal write that never answers, before the
+    /// request or after it, costs only its bound. Writes 0 and 1 are the
+    /// placement's, 2 and 3 the cancel's.
+    #[tokio::test]
+    async fn a_hung_cancel_write_never_holds_a_replacement() {
+        for write in 2..4 {
+            for (outcome, label) in cancel_cases() {
+                let rig = journal_rig();
+                let position = rig.active_position(None).await;
+                let old = rig.placed_stop(position.id).await;
+                rig.backend.fail_commit(write, Some(JournalFault::Hang));
+                rig.exchange.set_stop_cancel_outcome_next(outcome);
+
+                let results =
+                    execute_bounded(&rig, vec![replace_action(position.id, &old)]).await.unwrap();
+
+                assert!(
+                    matches!(results[0], ActionResult::OrderPlaced {
+                        event: Some(Event::InsuranceStopReplaced { .. }),
+                        ..
+                    }),
+                    "{label} write {write}: {results:?}"
+                );
+                rig.journal.flush_pending().await;
+                rig.assert_cancel_row(label, &old);
+                rig.assert_placements_succeeded(2, label);
+            }
+        }
+    }
+
+    /// Withdrawal: the same, the placement's writes being 0 and 1.
+    #[tokio::test]
+    async fn a_hung_cancel_write_never_holds_a_withdrawal() {
+        for write in 2..4 {
+            for (outcome, label) in cancel_cases() {
+                let rig = journal_rig();
+                let position = rig.leg_closing_at_the_next_stop().await;
+                rig.backend.fail_commit(write, Some(JournalFault::Hang));
+                rig.exchange.set_stop_cancel_outcome_next(outcome);
+
+                let results = execute_bounded(&rig, vec![place_action(position.id)]).await.unwrap();
+
+                assert!(
+                    matches!(results[0], ActionResult::StateUpdated),
+                    "{label} write {write}: {results:?}"
+                );
+                rig.journal.flush_pending().await;
+                assert_eq!(rig.rows_of_kind(IntentKind::Cancel).len(), 1, "{label} write {write}");
+            }
+        }
+    }
+
+    /// Software exit: the same, and the market exit behind the cancel still
+    /// reaches the venue.
+    #[tokio::test]
+    async fn a_hung_cancel_write_never_holds_the_exit() {
+        for write in 0..2 {
+            for (outcome, label) in cancel_cases() {
+                let rig = journal_rig();
+                let position = rig.active_position(Some("stop-1")).await;
+                rig.backend.fail_commit(write, Some(JournalFault::Hang));
+                rig.exchange.set_stop_cancel_outcome_next(outcome);
+
+                let results = execute_bounded(&rig, vec![
+                    cancel_action(position.id, "stop-1"),
+                    exit_action(position.id, dec!(0.1)),
+                ])
+                .await
+                .unwrap();
+
+                assert_eq!(rig.sent_market_orders(), 1, "{label} write {write}");
+                assert!(
+                    results.iter().any(|r| matches!(r, ActionResult::OrderPlaced { .. })),
+                    "{label} write {write}: {results:?}"
+                );
+                rig.journal.flush_pending().await;
+                rig.assert_cancel_row(label, "stop-1");
+            }
+        }
+    }
+
+    /// The cancel is not rate-limited: while the id stays on the leg, each
+    /// attempt goes out again as its own intent, and an error audits each time.
+    #[tokio::test]
+    async fn a_software_exit_cancel_repeats_on_every_attempt() {
+        let first = cancel_cases().into_iter().filter(|(_, label)| *label != "cancelled");
+        let second = cancel_cases().into_iter().filter(|(_, label)| *label != "cancelled");
+        for ((outcome, label), (again, _)) in first.zip(second) {
+            let rig = journal_rig();
+            let position = rig.active_position(Some("stop-1")).await;
+            let audits = |events: Vec<Event>| {
+                events.iter().filter(|e| matches!(e, Event::InsuranceStopFailed { .. })).count()
+            };
+
+            rig.exchange.set_stop_cancel_outcome_next(outcome);
+            rig.executor.execute(vec![cancel_action(position.id, "stop-1")]).await.unwrap();
+            let audited = audits(rig.events(position.id).await);
+            rig.exchange.set_stop_cancel_outcome_next(again);
+            rig.executor.execute(vec![cancel_action(position.id, "stop-1")]).await.unwrap();
+
+            assert_eq!(rig.exchange.stop_cancel_call_count(), 2, "{label}");
+            assert_eq!(rig.rows_of_kind(IntentKind::Cancel).len(), 2, "{label}");
+            assert_eq!(audits(rig.events(position.id).await), audited * 2, "{label}");
+        }
     }
 
     /// Regression: 2026-07-31 production incident.

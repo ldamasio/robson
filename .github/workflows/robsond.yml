@@ -30,9 +30,13 @@ on:
 permissions:
   contents: read
 
+# On main no run cancels another. With one group per ref, a run that started
+# late or a re-run of an old one cancelled the newer run in progress. Each main
+# commit now gets its own group, and the promotion guard in build-and-push
+# decides which run moves the pin. Elsewhere a new run still cancels the old.
 concurrency:
-  group: robsond-${{ github.ref }}
-  cancel-in-progress: true
+  group: robsond-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   IMAGE: ghcr.io/rbxrobotica/robson-v2
@@ -186,10 +190,22 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     if: github.ref == 'refs/heads/main'
+    # One promotion at a time across main commits, so the pin and latest move
+    # together. queue: max keeps every waiting job (the default would replace
+    # the pending one, letting a late run cancel a newer one); the guard skips
+    # whichever waited behind a newer commit.
+    concurrency:
+      group: robsond-promote
+      cancel-in-progress: false
+      queue: max
 
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # scripts/promotion-guard.sh compares this commit with the pinned
+          # one, which needs main's history, not only this commit.
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -206,17 +222,18 @@ jobs:
         run: echo "sha_tag=sha-$(echo ${{ github.sha }} | cut -c1-8)" >> $GITHUB_OUTPUT
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ steps.meta.outputs.sha_tag }}
-            ${{ env.IMAGE }}:latest
+          # latest moves only with the pin; see "Move latest to this image".
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.sha_tag }}
           no-cache: false
 
       - name: Update image tags in rbx-infra
+        id: pin
         env:
           GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
           SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
@@ -236,40 +253,96 @@ jobs:
           # editing them is a no-op for the cluster and corrupts the
           # placeholder; bump the kustomize pin instead.
           K=apps/prod/robson/kustomization.yml
-          yq -i "(.images[] | select(.name == \"ghcr.io/rbxrobotica/robson-v2\") | .newTag) = \"${SHA_TAG}\"" "$K"
-          grep -q "newTag: ${SHA_TAG}$" "$K" || { echo "::error::kustomize pin was not updated in $K"; exit 1; }
+          PIN='.images[] | select(.name == "ghcr.io/rbxrobotica/robson-v2") | .newTag'
 
-          git add "$K"
-
-          if git diff --staged --quiet; then
-            echo "No manifest changes needed (already at ${SHA_TAG})"
-            exit 0
-          fi
-
-          git commit -m "chore(robson-v2): update image tag to ${SHA_TAG}" \
-            -m "Automated update by Robson v2 CI/CD pipeline." \
-            -m "Triggered by: ${REPO}@${SHA}" \
-            -m "[skip ci]"
-
-          for i in 1 2 3; do
-            if git push origin main; then
-              echo "Manifests pushed - ArgoCD will auto-sync"
+          # Three pushes; the fourth pass only checks the pin, so a run that a
+          # newer pin beat on the last push ends as a skip, not a failure.
+          for i in 1 2 3 4; do
+            # Never move the pin backwards (scripts/promotion-guard.sh). The
+            # guard reads the pin from the rbx-infra commit this push builds
+            # on: a newer pin pushed meanwhile rejects the push, and the next
+            # pass checks again from a fresh rbx-infra main.
+            PINNED=$(yq "$PIN" "$K")
+            git -C "$GITHUB_WORKSPACE" fetch --quiet --no-tags origin main
+            TIP=$(git -C "$GITHUB_WORKSPACE" rev-parse FETCH_HEAD)
+            VERDICT=$(cd "$GITHUB_WORKSPACE" && bash scripts/promotion-guard.sh "$SHA" "$PINNED" "$TIP")
+            echo "$VERDICT"
+            if [ "${VERDICT%%:*}" != promote ]; then
+              echo "::notice title=Pin not moved::$VERDICT"
+              echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "Push attempt $i failed, rebasing..."
-            git pull --rebase origin main
+
+            yq -i "($PIN) = \"${SHA_TAG}\"" "$K"
+            grep -q "newTag: ${SHA_TAG}$" "$K" || { echo "::error::kustomize pin was not updated in $K"; exit 1; }
+
+            git add "$K"
+
+            if git diff --staged --quiet; then
+              echo "No manifest changes needed (already at ${SHA_TAG})"
+              echo "promoted=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$i" = 4 ]; then
+              echo "::error::Failed to push to rbx-infra after 3 attempts"
+              exit 1
+            fi
+
+            git commit -m "chore(robson-v2): update image tag to ${SHA_TAG}" \
+              -m "Automated update by Robson v2 CI/CD pipeline." \
+              -m "Triggered by: ${REPO}@${SHA}" \
+              -m "[skip ci]"
+
+            if git push origin main; then
+              echo "Manifests pushed - ArgoCD will auto-sync"
+              echo "promoted=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Push attempt $i failed, starting over from rbx-infra main..."
+            git fetch origin main
+            git reset --hard FETCH_HEAD
           done
 
-          echo "::error::Failed to push to rbx-infra after 3 attempts"
-          exit 1
+      # Copies the pushed manifest; nothing is rebuilt.
+      - name: Move latest to this image
+        id: latest
+        if: steps.pin.outputs.promoted == 'true'
+        env:
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+        run: docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$SHA_TAG"
 
+      # Runs after a failure too: "Move latest" can fail once the pin has
+      # moved, and the summary must still say that production is deploying.
       - name: Summary
+        if: always()
+        env:
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+          BUILD: ${{ steps.build.outcome }}
+          PIN_STEP: ${{ steps.pin.outcome }}
+          PROMOTED: ${{ steps.pin.outputs.promoted }}
+          VERDICT: ${{ steps.pin.outputs.verdict }}
+          LATEST: ${{ steps.latest.outcome }}
         run: |
-          echo "## Robson v2 Published" >> $GITHUB_STEP_SUMMARY
+          if [ "$PROMOTED" = true ]; then
+            PIN_ROW="moved to \`$SHA_TAG\`; ArgoCD will auto-sync"
+          elif [ -n "$VERDICT" ]; then
+            PIN_ROW="not moved. $VERDICT"
+          elif [ "$PIN_STEP" = skipped ]; then
+            PIN_ROW="not moved: an earlier step failed"
+          else
+            # A push can land while its acknowledgement is lost.
+            PIN_ROW="unknown (update step: $PIN_STEP); check the pin in rbx-infra"
+          fi
+          case "$LATEST" in
+            success) LATEST_ROW="moved" ;;
+            failure) LATEST_ROW="failed to move; production is unaffected (see the runbook)" ;;
+            *) LATEST_ROW="not moved" ;;
+          esac
+          echo "## Robson v2 CI/CD" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| | |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| Image | \`${{ env.IMAGE }}:${{ steps.meta.outputs.sha_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ env.IMAGE }}:${{ steps.meta.outputs.sha_tag }}\` (push: $BUILD) |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "ArgoCD will auto-sync when rbx-infra manifest is updated." >> $GITHUB_STEP_SUMMARY
+          echo "| Production pin | $PIN_ROW |" >> $GITHUB_STEP_SUMMARY
+          echo "| latest | $LATEST_ROW |" >> $GITHUB_STEP_SUMMARY

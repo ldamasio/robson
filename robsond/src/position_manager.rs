@@ -38,8 +38,8 @@ use robson_engine::{
 #[cfg(feature = "postgres")]
 use robson_eventlog::{append_event, ActorType as EventlogActorType, Event as EventlogEvent};
 use robson_exec::{
-    quantize, venue::VenueId, ActionResult, ExchangePort, ExchangePosition, ExecError, Executor,
-    OhlcvPort, StubOhlcv,
+    gate::OperationKind, quantize, venue::VenueId, ActionResult, ExchangePort, ExchangePosition,
+    ExecError, Executor, OhlcvPort, StubOhlcv,
 };
 #[cfg(feature = "postgres")]
 use robson_projector::apply_event_to_projections;
@@ -60,6 +60,7 @@ use crate::{
     detector::DetectorTask,
     error::{DaemonError, DaemonResult},
     event_bus::{DaemonEvent, EventBus, FeedKey, MarketData},
+    event_streams::EventStreams,
     query::{
         ActorKind, CommandSource, ContextSummary, ExecutionQuery, QueryKind, QueryOutcome,
         QueryState,
@@ -151,7 +152,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// Consecutive governed re-arms per position (risk denial, expired
     /// approval, an admission that failed before the executor). Drives the
     /// exponential backoff on the re-armed detector's first evaluation;
-    /// cleared when an admission reaches the executor or the approval queue.
+    /// cleared when an admission's entry reaches the venue's send or the
+    /// approval queue.
     governed_rearm_counts: Arc<RwLock<HashMap<PositionId, u32>>>,
     /// Entry-time invalidation guard level captured from the detector signal
     /// (ADR-0042), keyed by position. Populated when a signal carrying a guard
@@ -228,6 +230,9 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// the position remains unresolved, so the set is bounded by the current
     /// risk-open portfolio. Read-only snapshots never touch this dedup state.
     latent_risk_warning_positions: RwLock<HashSet<PositionId>>,
+    /// The streams `persist_event_to_log` writes: their locks and which ones
+    /// refuse appends (ADR-0056 step 7, PR P).
+    event_streams: EventStreams,
     /// Optional postgres pool for persisting domain events to robson-eventlog.
     #[cfg(feature = "postgres")]
     event_log_pool: Option<PgPool>,
@@ -395,7 +400,8 @@ enum AdmissionReach {
     DetectorSpent(PositionId),
     /// The entry's actions went to the executor. An order may be on the
     /// exchange, so the flow never re-arms from here: the fill path and
-    /// reconciliation own the position.
+    /// reconciliation own the position. A proven no-send on a leg with no
+    /// admission evidence goes back to `DetectorSpent`.
     Executor,
 }
 
@@ -405,6 +411,27 @@ pub(crate) struct MonthlyRiskState {
     pub month_peak_net: Decimal,
     pub trades_opened: i32,
     pub budget_model: MonthlyBudgetModel,
+    /// The month's row carries `boundary_reset_at`: its `MonthBoundaryReset`
+    /// landed. A missing row, or one another writer created before the
+    /// reset, has none. Without a database there is no reset to look for,
+    /// and this is true.
+    pub boundary_reset_landed: bool,
+    /// The month's system stream is suspended (ADR-0056 step 7, design §2.5):
+    /// a reset or recalibration of it may have landed in the log and not in
+    /// `monthly_state`, so nothing read here can be trusted to meter it. Read
+    /// from the suspensions held in memory, no query, whether the month is
+    /// current or history, and whatever a release did.
+    pub month_suspended: bool,
+}
+
+impl MonthlyRiskState {
+    /// The basis cannot meter the month (ADR-0051 §1): `capital_base <= 0`;
+    /// or the month's reset has not landed, so the base read is configured
+    /// capital or a value no reset wrote, not the operated wallet's; or the
+    /// month's system stream is suspended (ADR-0056 step 7).
+    pub(crate) fn basis_invalid(&self) -> bool {
+        self.capital_base <= Decimal::ZERO || !self.boundary_reset_landed || self.month_suspended
+    }
 }
 
 /// Freshness bound for `/status` reads of the tick-path price cache. Matches
@@ -544,32 +571,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .sum()
     }
 
-    /// Compute current equity per ADR-0024 §6:
-    ///
-    /// ```text
-    /// current_equity = initial_capital + all_time_realized_pnl + unrealized_pnl
-    /// ```
-    ///
-    /// Where:
-    /// - `initial_capital`: operator's declared starting capital from config
-    /// - `all_time_realized_pnl`: Σ(realized_pnl − fees_paid) for every closed
-    ///   position since the system started
-    /// - `unrealized_pnl`: mark-to-market PnL of Active positions
-    pub(crate) async fn compute_current_equity(&self) -> DaemonResult<Decimal> {
-        let initial_capital = self.configured_capital();
-
-        // All-time realized PnL (net of fees)
-        let all_closed = self.store.positions().find_all_closed().await?;
-        let all_time_realized: Decimal =
-            all_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
-
-        // Unrealized PnL of open Active positions at live marks
-        let active = self.store.positions().find_risk_open().await?;
-        let unrealized = self.unrealized_pnl_marked(&active).await;
-
-        Ok(initial_capital + all_time_realized + unrealized)
-    }
-
     #[cfg(feature = "postgres")]
     fn event_stream_key(event: &Event) -> String {
         match event {
@@ -581,33 +582,68 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
     }
 
-    #[cfg(feature = "postgres")]
-    pub(crate) async fn load_capital_base_for_month(
+    /// The basis an arm sizes with: the month's persisted `capital_base`. A
+    /// month whose reset has not landed refuses the arm, since that basis did
+    /// not come from the operated wallet, and so does a month whose system
+    /// stream is suspended (ADR-0056 step 7). A basis <= 0 is returned as it
+    /// is, for `with_capital` to refuse (ADR-0051 §1).
+    pub(crate) async fn admission_capital_base(
         &self,
         now: chrono::DateTime<chrono::Utc>,
     ) -> DaemonResult<Decimal> {
-        let configured_capital = self.configured_capital();
-        let Some(pool) = &self.event_log_pool else {
-            return Ok(configured_capital);
-        };
+        let monthly = self.load_monthly_state(now).await?;
+        if monthly.month_suspended {
+            return Err(DaemonError::AdmissionsClosed {
+                reason: format!(
+                    "the {:04}-{:02} system stream is suspended, so its accounting cannot meter \
+                     entries; they stay closed while that month is current",
+                    now.year(),
+                    now.month()
+                ),
+            });
+        }
+        if !monthly.boundary_reset_landed {
+            return Err(DaemonError::AdmissionsClosed {
+                reason: format!(
+                    "the {:04}-{:02} month-boundary reset has not landed; entries wait for a \
+                     basis from the operated wallet",
+                    now.year(),
+                    now.month()
+                ),
+            });
+        }
+        Ok(monthly.capital_base)
+    }
 
-        let row = sqlx::query_as::<_, (Decimal,)>(
-            "SELECT capital_base FROM monthly_state WHERE year = $1 AND month = $2",
+    /// The capital base a month's reset recorded, for the next boundary's
+    /// Armed reservation: `None` when the month has no row, or a row no reset
+    /// stamped, so nothing on record says what its base was. Without a
+    /// database there is no record, and the configured capital stands in.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn recorded_capital_base(
+        &self,
+        month: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<Option<Decimal>> {
+        let Some(pool) = &self.event_log_pool else {
+            return Ok(Some(self.configured_capital()));
+        };
+        let base = sqlx::query_scalar::<_, Decimal>(
+            "SELECT capital_base FROM monthly_state \
+             WHERE year = $1 AND month = $2 AND boundary_reset_at IS NOT NULL",
         )
-        .bind(now.year())
-        .bind(now.month() as i16)
+        .bind(month.year() as i16)
+        .bind(month.month() as i16)
         .fetch_optional(pool)
         .await?;
-
-        Ok(row.map(|(capital_base,)| capital_base).unwrap_or(configured_capital))
+        Ok(base)
     }
 
     #[cfg(not(feature = "postgres"))]
-    pub(crate) async fn load_capital_base_for_month(
+    pub(crate) async fn recorded_capital_base(
         &self,
-        _now: chrono::DateTime<chrono::Utc>,
-    ) -> DaemonResult<Decimal> {
-        Ok(self.configured_capital())
+        _month: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<Option<Decimal>> {
+        Ok(Some(self.configured_capital()))
     }
 
     /// Load the full persisted monthly risk state from `monthly_state`.
@@ -634,16 +670,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         };
 
         let configured_capital = self.configured_capital();
-        let row = sqlx::query_as::<_, (Decimal, Decimal, Decimal, i32, String)>(
-            "SELECT capital_base, realized_loss, month_peak_net, trades_opened, monthly_budget_model FROM monthly_state WHERE year = $1 AND month = $2",
+        let row = sqlx::query_as::<_, (Decimal, Decimal, Decimal, i32, String, bool)>(
+            "SELECT capital_base, realized_loss, month_peak_net, trades_opened, monthly_budget_model, boundary_reset_at IS NOT NULL FROM monthly_state WHERE year = $1 AND month = $2",
         )
         .bind(now.year())
         .bind(now.month() as i16)
         .fetch_optional(pool)
         .await?;
 
-        if let Some((capital_base, realized_loss, month_peak_net, trades_opened, stored_model)) =
-            row
+        if let Some((
+            capital_base,
+            realized_loss,
+            month_peak_net,
+            trades_opened,
+            stored_model,
+            boundary_reset_landed,
+        )) = row
         {
             let budget_model = MonthlyBudgetModel::from_persisted(&stored_model);
             if stored_model != budget_model.as_str() {
@@ -659,6 +701,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 month_peak_net,
                 trades_opened,
                 budget_model,
+                boundary_reset_landed,
+                month_suspended: self.event_streams.month_suspended(now.year(), now.month()),
             });
         }
 
@@ -701,6 +745,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             month_peak_net: Decimal::ZERO,
             trades_opened: 0,
             budget_model: inherited_model,
+            boundary_reset_landed: false,
+            month_suspended: self.event_streams.month_suspended(now.year(), now.month()),
         })
     }
 
@@ -767,6 +813,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             month_peak_net: realized_peak.max(cached_peak),
             trades_opened: monthly_closed.len() as i32,
             budget_model,
+            boundary_reset_landed: true,
+            month_suspended: self.event_streams.month_suspended(now.year(), now.month()),
         })
     }
 
@@ -1016,6 +1064,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             month_peak_refreshed_at: Arc::new(Mutex::new(None)),
             shadow_slots_last: Mutex::new(None),
             latent_risk_warning_positions: RwLock::new(HashSet::new()),
+            event_streams: EventStreams::default(),
             #[cfg(feature = "postgres")]
             event_log_pool: None,
             #[cfg(feature = "postgres")]
@@ -1177,6 +1226,70 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         });
     }
 
+    /// The streams this manager writes (ADR-0056 step 7, PR P).
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub(crate) fn event_streams(&self) -> &EventStreams {
+        &self.event_streams
+    }
+
+    /// Load the stream suspensions on record that no repair cleared (ADR-0056
+    /// step 7, PR P). At start, before anything is appended. How many.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn load_stream_suspensions(&self) -> DaemonResult<usize> {
+        let (Some(pool), Some(tenant_id)) = (&self.event_log_pool, self.event_log_tenant_id) else {
+            return Ok(0);
+        };
+        let loaded = crate::event_streams::load_open_suspensions(pool, tenant_id).await?;
+        for (stream_key, suspended) in &loaded {
+            warn!(
+                %stream_key,
+                kind = suspended.stream.kind(),
+                repaired_through_seq = ?suspended.repaired_through_seq,
+                "Event stream suspended by an earlier process; it takes no appends"
+            );
+        }
+        let count = loaded.len();
+        self.event_streams.restore(loaded);
+        Ok(count)
+    }
+
+    /// Repair the suspended position streams (ADR-0056 step 7, PR P), at start
+    /// under the startup permit, before the store is rebuilt from the
+    /// projection. A system stream is never repaired here. How many were
+    /// cleared, and how many stay suspended, their legs' snapshots invalid.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn repair_suspended_position_streams(&self) -> (usize, usize) {
+        let (Some(pool), Some(tenant_id)) = (&self.event_log_pool, self.event_log_tenant_id) else {
+            return (0, 0);
+        };
+        let (mut cleared, mut suspended) = (0, 0);
+        for (stream_key, entry) in self.event_streams.suspended_positions() {
+            match crate::event_streams::repair_position_stream(
+                pool,
+                tenant_id,
+                &self.event_streams,
+                &stream_key,
+                &entry,
+            )
+            .await
+            {
+                crate::event_streams::RepairOutcome::Cleared { applied } => {
+                    info!(%stream_key, applied, "Suspended position stream repaired and cleared");
+                    cleared += 1;
+                },
+                outcome => {
+                    error!(
+                        %stream_key,
+                        ?outcome,
+                        "Position stream stays suspended; its leg's snapshot is invalid"
+                    );
+                    suspended += 1;
+                },
+            }
+        }
+        (cleared, suspended)
+    }
+
     /// Configure eventlog persistence for domain events (MIG-v2.5#2).
     ///
     /// When set, every domain event emitted through the executor is also
@@ -1197,10 +1310,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Persist a single domain event to robson-eventlog and apply it to
     /// projections.
     ///
-    /// When `event_log_pool` is configured this is a **fail-fast** operation.
-    /// Any failure in append OR projection apply is returned as
-    /// `DaemonError::EventLog` so that callers propagate the error and
-    /// abort the current execution cycle.
+    /// When `event_log_pool` is configured a failure in append OR projection
+    /// apply is returned as `DaemonError::EventLog`, and the stream is
+    /// suspended (ADR-0056 step 7, PR P): it refuses every later append in this
+    /// process, `DaemonError::StreamSuspended`, so its projection lags its log
+    /// by exactly the suffix that did not apply, which a restart repairs. The
+    /// suspension is recorded through the journal's retry set and sets the
+    /// latch. A caller that already has a venue result keeps it either way.
     ///
     /// Rationale: the synchronous apply on the write path is the only active
     /// projection update mechanism for `positions_current`. Silencing failures
@@ -1208,35 +1324,82 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// knowledge, making crash recovery unreliable. (MIG-v2.5#2 design
     /// decision.)
     ///
-    /// When no pool is configured (in-memory only mode) returns `Ok(())`
-    /// immediately.
+    /// The stream's lock is held through the suspension check, the append, the
+    /// apply and the suspension, so a writer queued behind a failure sees the
+    /// suspension first. When no pool is configured (in-memory only mode) a
+    /// stream never fails, and this returns `Ok(())` unless one was suspended.
     ///
     /// Stream key pattern:
     /// - position-scoped events: `position:{position_id}`
     /// - system-scoped events: dedicated stream chosen by event type
     #[cfg(feature = "postgres")]
     async fn persist_event_to_log(&self, event: &Event) -> DaemonResult<()> {
+        let stream_key = Self::event_stream_key(event);
+        let _stream = self.event_streams.lock(&stream_key).await;
+        if self.event_streams.is_suspended(&stream_key) {
+            return Err(DaemonError::StreamSuspended {
+                stream_key,
+                event_type: event.event_type().to_string(),
+            });
+        }
         let (pool, tenant_id) = match (&self.event_log_pool, &self.event_log_tenant_id) {
             (Some(pool), Some(tid)) => (pool, *tid),
             _ => return Ok(()), // No eventlog configured — in-memory only mode
         };
+        match Self::append_and_apply(pool, tenant_id, &stream_key, event).await {
+            Ok(seq) => {
+                tracing::debug!(
+                    event_type = event.event_type(),
+                    position_id = %event.position_id(),
+                    seq,
+                    "Domain event persisted to eventlog and projection applied"
+                );
+                Ok(())
+            },
+            Err((failed_seq, message)) => {
+                if let Some(suspension) =
+                    self.event_streams.suspend(&stream_key, failed_seq, &message)
+                {
+                    error!(
+                        %stream_key,
+                        ?failed_seq,
+                        error = %message,
+                        "Event stream suspended: it takes no more appends in this process, and \
+                         admissions are closed until a restart (ADR-0056 step 7)"
+                    );
+                    self.executor.order_journal().record_suspension(suspension);
+                }
+                Err(DaemonError::EventLog(message))
+            },
+        }
+    }
 
-        let position_id = event.position_id();
-        let stream_key = Self::event_stream_key(event);
+    /// Append `event` and apply it. The seq it applied at, or the seq that did
+    /// not apply (`None` when the append failed or its seq is unknown) and why.
+    #[cfg(feature = "postgres")]
+    async fn append_and_apply(
+        pool: &PgPool,
+        tenant_id: Uuid,
+        stream_key: &str,
+        event: &Event,
+    ) -> Result<i64, (Option<i64>, String)> {
         let event_type = event.event_type().to_string();
 
         // Serialize full domain event as payload
         let payload = serde_json::to_value(event).map_err(|e| {
-            DaemonError::EventLog(format!(
-                "Failed to serialize {} for eventlog (stream {}): {}",
-                event_type, stream_key, e
-            ))
+            (
+                None,
+                format!(
+                    "Failed to serialize {} for eventlog (stream {}): {}",
+                    event_type, stream_key, e
+                ),
+            )
         })?;
 
-        let eventlog_event = EventlogEvent::new(tenant_id, &stream_key, &event_type, payload)
+        let eventlog_event = EventlogEvent::new(tenant_id, stream_key, &event_type, payload)
             .with_actor(EventlogActorType::Daemon, Some("robsond".to_string()));
 
-        let event_id = match append_event(pool, &stream_key, None, eventlog_event).await {
+        let event_id = match append_event(pool, stream_key, None, eventlog_event).await {
             Ok(id) => id,
             Err(robson_eventlog::EventLogError::IdempotentDuplicate(id)) => {
                 // Duplicate means the append already happened, but projection apply may
@@ -1251,10 +1414,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 id
             },
             Err(e) => {
-                return Err(DaemonError::EventLog(format!(
-                    "Failed to append {} to eventlog (stream {}): {}",
-                    event_type, stream_key, e
-                )));
+                return Err((
+                    None,
+                    format!(
+                        "Failed to append {} to eventlog (stream {}): {}",
+                        event_type, stream_key, e
+                    ),
+                ));
             },
         };
 
@@ -1271,26 +1437,25 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         .fetch_one(pool)
         .await
         .map_err(|e| {
-            DaemonError::EventLog(format!(
-                "Failed to fetch envelope for {} (stream {}, event_id {}): {}",
-                event_type, stream_key, event_id, e
-            ))
+            (
+                None,
+                format!(
+                    "Failed to fetch envelope for {} (stream {}, event_id {}): {}",
+                    event_type, stream_key, event_id, e
+                ),
+            )
         })?;
 
         apply_event_to_projections(pool, &envelope).await.map_err(|e| {
-            DaemonError::EventLog(format!(
-                "Failed to apply {} to projection (stream {}, seq {}): {}",
-                event_type, stream_key, envelope.seq, e
-            ))
+            (
+                Some(envelope.seq),
+                format!(
+                    "Failed to apply {} to projection (stream {}, seq {}): {}",
+                    event_type, stream_key, envelope.seq, e
+                ),
+            )
         })?;
-
-        tracing::debug!(
-            event_type = %event_type,
-            %position_id,
-            seq = envelope.seq,
-            "Domain event persisted to eventlog and projection applied"
-        );
-        Ok(())
+        Ok(envelope.seq)
     }
 
     #[cfg(not(feature = "postgres"))]
@@ -1312,10 +1477,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// - `ActionResult::EntryExecutionRejected { event, .. }` - internal
     ///   pre-placement safety/policy rejections
     ///
-    /// When `event_log_pool` is configured, persistence is **fail-fast**: any
-    /// failure in `persist_event_to_log()` (append OR projection apply) is
-    /// propagated as a `DaemonError::EventLog` and the caller must abort
-    /// the current execution cycle.
+    /// When `event_log_pool` is configured, persistence of what precedes a
+    /// venue request, and of a batch with no venue action, is **fail-fast**:
+    /// any failure in `persist_event_to_log()` (append OR projection apply, or
+    /// a suspended stream) is propagated and the caller must abort the current
+    /// execution cycle. **A venue result is never dropped** (ADR-0056 step 7,
+    /// PR P): once a batch has reached the venue, its results come back whether
+    /// or not their events persisted, so an entry still gets its stop and an
+    /// exit still closes its leg. The failure itself suspended its stream and
+    /// set the latch.
     ///
     /// This prevents silent projection drift during execution when PostgreSQL
     /// is in use. On the entry path it makes pre-exchange events a real
@@ -1325,7 +1495,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// (ADR-0052 Decision 5). Append and projection apply still happen in
     /// separate steps, so this is fail-fast ordered visibility, not an atomic
     /// multi-step guarantee.
-    async fn execute_and_persist(
+    ///
+    /// The future is returned boxed: it is awaited at many sites, each of
+    /// which would otherwise hold it inline, as would every debug frame that
+    /// polls one (ADR-0056 step 8, stack headroom). Only the allocation happens
+    /// at the call; the batch runs when it is polled.
+    fn execute_and_persist(
+        &self,
+        actions: Vec<EngineAction>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = DaemonResult<Vec<ActionResult>>> + '_>>
+    {
+        Box::pin(self.execute_and_persist_unboxed(actions))
+    }
+
+    async fn execute_and_persist_unboxed(
         &self,
         actions: Vec<EngineAction>,
     ) -> DaemonResult<Vec<ActionResult>> {
@@ -1387,16 +1570,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     error,
                     ..
                 }) => {
-                    stale.insert(
-                        *position_id,
-                        std::time::Instant::now() + INSURANCE_STOP_RETRY_BACKOFF,
-                    );
+                    // Any deadline on record stands, overdue included, so failures
+                    // cannot keep postponing the heal. The heal pushes its own
+                    // window before it acts, so a failed heal still backs off.
+                    let now = std::time::Instant::now();
+                    let retry_at =
+                        *stale.entry(*position_id).or_insert(now + INSURANCE_STOP_RETRY_BACKOFF);
                     changed = true;
                     warn!(
                         %position_id,
                         stop_price = %stop_price.as_decimal(),
                         %error,
-                        retry_in_secs = INSURANCE_STOP_RETRY_BACKOFF.as_secs(),
+                        retry_in_secs = retry_at.saturating_duration_since(now).as_secs(),
                         "Exchange insurance stop is behind the software stop plan; re-placement scheduled (ADR-0039)"
                     );
                 },
@@ -1496,6 +1681,31 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             retry_in_secs = INSURANCE_STOP_RETRY_BACKOFF.as_secs(),
             "Active leg has no exchange stop; re-placement scheduled (ADR-0039)"
         );
+    }
+
+    /// A leg's latest stop event is a failure and this is a new process
+    /// (ADR-0056 step 7): the retry window does not survive a restart, and an
+    /// id still on record hides the leg from the check above. An entry
+    /// already here stands.
+    pub(crate) async fn schedule_stop_heal_after_restart(&self, position_id: PositionId) {
+        let mut stale = self.insurance_stop_stale.write().await;
+        stale
+            .entry(position_id)
+            .or_insert_with(|| std::time::Instant::now() + INSURANCE_STOP_RETRY_BACKOFF);
+        crate::metrics::INSURANCE_STOP_STALE_POSITIONS.set(stale.len() as f64);
+        warn!(
+            %position_id,
+            retry_in_secs = INSURANCE_STOP_RETRY_BACKOFF.as_secs(),
+            "Latest stop event of this leg is a failure; re-placement scheduled after a restart (ADR-0039)"
+        );
+    }
+
+    #[cfg(all(test, feature = "postgres"))]
+    pub(crate) async fn stop_heal_deadline_for_test(
+        &self,
+        position_id: PositionId,
+    ) -> Option<std::time::Instant> {
+        self.insurance_stop_stale.read().await.get(&position_id).copied()
     }
 
     /// The orphan sweep found this leg's recorded stop gone from the venue's
@@ -1639,16 +1849,24 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // recovery, and audit-only cycles: exchange side effects run before a
         // PostgreSQL outage is surfaced. In particular, a filled position
         // must still receive insurance and an exit order must still reach the
-        // exchange even when the event log is unavailable.
+        // exchange even when the event log is unavailable. A batch that went to
+        // the venue keeps its results when they fail to persist.
         if !entry_admission_barrier {
+            let reaches_venue =
+                actions.iter().any(|action| !matches!(action, EngineAction::EmitEvent(_)));
             let results = self.executor.execute(actions).await?;
-            self.persist_action_results(&results).await?;
+            if reaches_venue {
+                self.persist_venue_results(&results).await;
+            } else {
+                self.persist_action_results(&results).await?;
+            }
             return Ok(results);
         }
 
         let mut results = Vec::with_capacity(actions.len());
 
         for action in actions {
+            let places_entry = matches!(action, EngineAction::PlaceEntryOrder { .. });
             let mut action_results = self.executor.execute(vec![action]).await?;
             let result = action_results.pop().ok_or_else(|| {
                 DaemonError::Config(
@@ -1658,11 +1876,23 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
             // Persist before advancing to the next action. A failure here is
             // the barrier that prevents a later exchange action from running.
-            self.persist_action_result(&result).await?;
+            // The entry order's own answer, once it was sent, is a venue result:
+            // kept, so its fill still reaches `handle_entry_fill` and the stop.
+            let sent = matches!(
+                result,
+                ActionResult::OrderPlaced { .. } | ActionResult::OrderFailed { .. }
+            );
+            if places_entry && sent {
+                self.persist_venue_result(&result).await;
+            } else {
+                self.persist_action_result(&result).await?;
+            }
 
             let should_stop = matches!(
                 result,
-                ActionResult::OrderFailed { .. } | ActionResult::EntryExecutionRejected { .. }
+                ActionResult::OrderFailed { .. }
+                    | ActionResult::EntryExecutionRejected { .. }
+                    | ActionResult::EntryNotSent { .. }
             );
             results.push(result);
             if should_stop {
@@ -1678,6 +1908,46 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             self.persist_action_result(result).await?;
         }
         Ok(())
+    }
+
+    /// Persist what came back from the venue, keeping it whatever happens
+    /// (ADR-0056 step 7, PR P). Each result is tried: another stream may still
+    /// take its event, while the failed one now refuses.
+    async fn persist_venue_results(&self, results: &[ActionResult]) {
+        for result in results {
+            self.persist_venue_result(result).await;
+        }
+    }
+
+    async fn persist_venue_result(&self, result: &ActionResult) {
+        if let Err(error) = self.persist_action_result(result).await {
+            error!(
+                %error,
+                "Venue result kept although its event did not persist; its stream is \
+                 suspended and admissions are closed until a restart (ADR-0056 step 7)"
+            );
+        }
+    }
+
+    /// Record the close of a leg whose fill already happened at the venue. A
+    /// close that does not persist is kept (ADR-0056 step 7, PR P): the leg is
+    /// closed in memory, the failure suspended its stream and set the latch,
+    /// and what follows a close still runs. Whether it persisted.
+    async fn record_venue_close(&self, event: Event) -> DaemonResult<bool> {
+        let position_id = event.position_id();
+        match self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.is_event_not_persisted() => {
+                error!(
+                    %position_id,
+                    %error,
+                    "Leg closed in memory; its close did not persist (stream suspended, \
+                     admissions closed until a restart, ADR-0056 step 7)"
+                );
+                Ok(false)
+            },
+            Err(error) => Err(error),
+        }
     }
 
     async fn persist_action_result(&self, result: &ActionResult) -> DaemonResult<()> {
@@ -1745,6 +2015,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         info!("Position manager shutdown complete ({count} detectors terminated)");
     }
 
+    /// The token that stops the detectors and the approval timers, for a stop
+    /// that must not wait on the manager lock (ADR-0056 step 7).
+    pub(crate) fn detector_shutdown_token(&self) -> CancellationToken {
+        self.shutdown_token.clone()
+    }
+
     /// Get a child cancellation token for a new detector.
     ///
     /// Child tokens are cancelled when the parent is cancelled.
@@ -1772,6 +2048,24 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
     async fn record_query_failure(&self, query: &ExecutionQuery) -> DaemonResult<()> {
         self.record_query_transition(query, "failed").await
+    }
+
+    /// Record a query's transition once its venue work is done or has been
+    /// given up for this leg. A failed audit write is reported, counted and
+    /// goes no further (ADR-0056 step 7, PR P): the venue outcome stands, and
+    /// what follows it, the next leg of a tick or of `/panic` included, still
+    /// runs. Records ahead of a venue request stay barriers.
+    async fn record_after_venue_work(&self, query: &ExecutionQuery, transition_cause: &str) {
+        if let Err(error) = self.record_query_transition(query, transition_cause).await {
+            crate::metrics::QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK.inc();
+            error!(
+                query_id = %query.id,
+                position_id = ?query.position_id,
+                transition_cause,
+                %error,
+                "Query audit write failed after its venue work; the outcome stands"
+            );
+        }
     }
 
     fn set_query_context_summary(query: &mut ExecutionQuery, active_positions_count: usize) {
@@ -1965,11 +2259,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let monthly_unrealized_pnl = budget.month_equity_net - budget.governed_realized_net;
 
         // The gate decides next, on this value: it must see a basis that went
-        // invalid during the snapshot.
-        let capital = Self::capital_for_the_gate(
-            budget.capital_base,
-            self.budget_basis_is_invalid_now().await,
-        );
+        // invalid during the snapshot, and no capital for one that was invalid
+        // in it, such as a base no reset wrote. With no capital the gate
+        // denies, and never as an exhausted budget.
+        let snapshot_capital = if budget.capital_base_invalid {
+            Decimal::ZERO
+        } else {
+            budget.capital_base
+        };
+        let capital =
+            Self::capital_for_the_gate(snapshot_capital, self.budget_basis_is_invalid_now().await);
 
         Ok(RiskContext::with_month_equity(
             capital,
@@ -2063,7 +2362,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         side: Side,
     ) -> DaemonResult<EntryPreviewJob<E>> {
         let now = chrono::Utc::now();
-        let capital = self.load_capital_base_for_month(now).await?;
+        let capital = self.admission_capital_base(now).await?;
         let risk_config = self
             .risk_config_snapshot()
             .with_capital(capital)
@@ -2212,9 +2511,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         .await
     }
 
-    /// Reset the governed re-arm backoff once an admission reaches the
-    /// executor or the approval queue. Not earlier: a failure that recurs
-    /// after the risk gate would otherwise re-arm every 5 s for good.
+    /// Reset the governed re-arm backoff once an admission's entry reaches the
+    /// venue's send (it holds a ticket) or the approval queue. Not earlier: a
+    /// failure that recurs before either would otherwise re-arm every 5 s for
+    /// good.
     async fn clear_governed_rearm_backoff(&self, position_id: PositionId) {
         self.governed_rearm_counts.write().await.remove(&position_id);
     }
@@ -2509,6 +2809,52 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         queries
     }
 
+    /// A proven no-send, nothing on the venue. With ADR-0052 admission evidence
+    /// on the leg no second admission can succeed (the engine refuses one
+    /// against an existing ruler, and the ruler is immutable), so the attempt
+    /// ends now with its own reason and the operator re-arms. `true` means the
+    /// attempt is over and nothing may re-arm.
+    ///
+    /// If the exhaustion cannot be appended the error is returned and this
+    /// process still holds the record, so it re-arms nothing. A restart loses
+    /// that record: it can restore the detector, and the engine's evidence
+    /// check then rejects the next signal and makes it terminal.
+    async fn end_attempt_on_admission_evidence(
+        &self,
+        position_id: PositionId,
+        signal_id: Option<Uuid>,
+        reason: &str,
+    ) -> DaemonResult<bool> {
+        let Some(position) = self.store.positions().find_by_id(position_id).await? else {
+            return Ok(true);
+        };
+        if !position.carries_admission_evidence() {
+            return Ok(false);
+        }
+        self.mark_entry_exhausted(position_id, signal_id, "entry_not_sent", reason)
+            .await?;
+        Ok(true)
+    }
+
+    /// The executor proved nothing went out. Without admission evidence the
+    /// detector goes back under the governed backoff. An error leaves `reach`
+    /// alone: the detector stays spent.
+    async fn recover_from_entry_not_sent(
+        &self,
+        position_id: PositionId,
+        signal_id: Uuid,
+        reason: &str,
+        reach: &mut AdmissionReach,
+    ) -> DaemonResult<()> {
+        if !self
+            .end_attempt_on_admission_evidence(position_id, Some(signal_id), reason)
+            .await?
+        {
+            *reach = AdmissionReach::DetectorSpent(position_id);
+        }
+        Ok(())
+    }
+
     async fn execute_signal_query(
         &self,
         query: &mut ExecutionQuery,
@@ -2532,10 +2878,26 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.record_query_transition(query, "acting").await?;
 
         // From here an order may reach the exchange: an error no longer
-        // re-arms the detector.
+        // re-arms the detector, unless the executor proves nothing was sent.
         *reach = AdmissionReach::Executor;
-        self.clear_governed_rearm_backoff(position_id).await;
-        let results = match self.execute_and_persist(governed.into_actions()).await {
+        let actions = governed.into_actions();
+        let entry_client_order_id = actions.iter().find_map(|action| match action {
+            EngineAction::PlaceEntryOrder { client_order_id, .. } => Some(client_order_id.clone()),
+            _ => None,
+        });
+        // Under the permit the caller holds, which the stop below shares
+        // (ADR-0056 step 7); in an operation of its own only without one.
+        let (executed, ticket_issued) = self
+            .executor
+            .order_journal()
+            .run_admission(entry_client_order_id.as_deref(), self.execute_and_persist(actions))
+            .await;
+        // On Ok and Err alike, and whatever became of persisting the result: a
+        // ticket means this admission reached the venue's send.
+        if ticket_issued {
+            self.clear_governed_rearm_backoff(position_id).await;
+        }
+        let results = match executed {
             Ok(r) => r,
             Err(e) => {
                 query.fail(format!("{}", e), "acting".to_string());
@@ -2597,8 +2959,30 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         "Entry order rejected before fill"
                     );
                     query.fail(error.clone(), "acting".to_string());
-                    self.record_query_failure(query).await?;
+                    // Nothing went out either, and the safety event stands. A
+                    // legacy leg behaves as before: spent, no re-arm.
+                    let signal_id = match &event {
+                        Event::EntryExecutionRejected { signal_id, .. } => Some(*signal_id),
+                        _ => None,
+                    };
+                    let ended = self
+                        .end_attempt_on_admission_evidence(position_id, signal_id, &error)
+                        .await;
+                    let recorded = self.record_query_failure(query).await;
+                    ended?;
+                    recorded?;
                     return Err(DaemonError::Exec(ExecError::InvalidState(error)));
+                },
+                ActionResult::EntryNotSent { signal_id, reason } => {
+                    warn!(%position_id, %reason, "Entry not sent");
+                    query.fail(reason.clone(), "acting".to_string());
+                    let recovered = self
+                        .recover_from_entry_not_sent(position_id, signal_id, &reason, reach)
+                        .await;
+                    let recorded = self.record_query_failure(query).await;
+                    recovered?;
+                    recorded?;
+                    return Err(DaemonError::Exec(ExecError::SendRefused(reason)));
                 },
                 ActionResult::ExitNotExecutable { .. } | ActionResult::ExitFailed { .. } => {
                     warn!(%position_id, "Unexpected exit outcome in an entry flow");
@@ -2621,10 +3005,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
             query.fail(format!("{}", e), "acting".to_string());
-            self.record_query_failure(query).await?;
+            self.record_after_venue_work(query, "failed").await;
             return Err(DaemonError::Config(format!("Query completion error: {}", e)));
         }
-        self.record_query_transition(query, "completed").await?;
+        self.record_after_venue_work(query, "completed").await;
 
         Ok(())
     }
@@ -2667,6 +3051,39 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// A residual on any open leg blocks new admissions until that leg closes
     /// (ADR-0056 §5). A check of its own: a residual never enters the budget or
     /// latent risk, so it can neither fail the snapshot nor defer MonthlyHalt.
+    /// Admissions close for the rest of this process once the journal latch is
+    /// set, whatever set it (ADR-0056 step 7, PR P): a bounded send whose row
+    /// did not land, discarded history, an aborted operation, a mutation
+    /// without a permit, a suspended stream. The latch is checked again at an
+    /// entry's send. A suspended system stream of the current month is not a
+    /// check here: it makes the month's accounting invalid, through the
+    /// invalid-basis path (`MonthlyRiskState::basis_invalid`). From PR F they
+    /// also stay closed while the admission fence is: an incident is open,
+    /// whatever opened it, until an operator's audited release; the fence is
+    /// checked again at an entry's send.
+    fn check_admissions_open(&self) -> DaemonResult<()> {
+        let journal = self.executor.order_journal();
+        if journal.latch_set() {
+            return Err(DaemonError::AdmissionsClosed {
+                reason: "the journal latch is set; admissions stay closed until a restart"
+                    .to_string(),
+            });
+        }
+        let gate = journal.gate();
+        if gate.fenced() {
+            let reasons: Vec<&str> =
+                gate.open_incidents().iter().map(|incident| incident.reason.as_str()).collect();
+            return Err(DaemonError::AdmissionsClosed {
+                reason: format!(
+                    "the admission fence is closed (open incidents: {}); an operator's audited \
+                     release, POST /recovery/release, reopens it",
+                    reasons.join(", ")
+                ),
+            });
+        }
+        Ok(())
+    }
+
     async fn check_no_unresolved_residual(&self) -> DaemonResult<()> {
         let open = self.store.positions().find_active().await?;
         let Some(leg) = open.iter().find(|leg| leg.has_unresolved_residual()) else {
@@ -2726,8 +3143,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                                     "Processing detector signal from EventBus"
                                 );
 
-                                // Call handle_signal - now we have Arc<Self>!
-                                if let Err(e) = manager.handle_signal(signal).await {
+                                // Under the main loop's slot, whose part this
+                                // plays (ADR-0056 step 7).
+                                let handled = manager
+                                    .executor
+                                    .order_journal()
+                                    .with_permit(
+                                        OperationKind::SignalListener,
+                                        manager.handle_signal(signal),
+                                    )
+                                    .await
+                                    .unwrap_or_else(|refused| Err(refused.into()));
+                                if let Err(e) = handled {
                                     error!(
                                         %position_id,
                                         %signal_id,
@@ -2833,6 +3260,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             return Err(DaemonError::MonthlyHaltActive { reason: snap.reason.unwrap_or_default() });
         }
         self.check_no_unresolved_residual().await?;
+        self.check_admissions_open()?;
 
         // Generate position ID upfront (used in event and returned to caller)
         let position_id = Uuid::now_v7();
@@ -3053,6 +3481,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
     /// Returns an `Arc` to the circuit breaker so API handlers can read/write
     /// it.
+    pub fn order_journal(&self) -> Arc<robson_exec::order_journal::OrderJournal> {
+        self.executor.order_journal()
+    }
+
     pub fn circuit_breaker(&self) -> Arc<CircuitBreaker> {
         Arc::clone(&self.circuit_breaker)
     }
@@ -3090,7 +3522,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// ADR-0051 budget snapshot.
     ///
     /// Trigger condition: `remaining_budget <= 0` on a valid basis. With
-    /// `capital_base <= 0` nothing fires (ADR-0051 §1).
+    /// `capital_base <= 0`, or before the month's reset has landed, nothing
+    /// fires (ADR-0051 §1).
     /// where:
     ///   remaining_budget = (capital_base × max_monthly_drawdown_pct) −
     /// consumed − latent_risk
@@ -3131,7 +3564,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             error!(
                 capital_base = %snapshot.capital_base,
                 risk_open_positions = local_risk_open.len(),
-                "MonthlyHalt not evaluated: the monthly budget basis is invalid (ADR-0051 §1); open positions are kept"
+                "MonthlyHalt not evaluated: the monthly budget basis is invalid, capital_base <= 0, the month's reset not landed (ADR-0051 §1) or its system stream suspended (ADR-0056 step 7); open positions are kept"
             );
             return false;
         }
@@ -3203,7 +3636,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// longer stand.
     async fn budget_basis_is_invalid_now(&self) -> DaemonResult<bool> {
         let monthly = self.load_monthly_state(chrono::Utc::now()).await?;
-        Ok(monthly.capital_base <= Decimal::ZERO)
+        Ok(monthly.basis_invalid())
     }
 
     /// A re-read that fails is a governed denial like any other, which re-arms
@@ -3363,10 +3796,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Ok(_) => {
                 if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count: 1 }) {
                     query.fail(format!("{}", e), "acting".to_string());
-                    self.record_query_failure(&query).await?;
+                    self.record_after_venue_work(&query, "failed").await;
                     return Err(DaemonError::Config(format!("Query completion error: {}", e)));
                 }
-                self.record_query_transition(&query, "completed").await?;
+                self.record_after_venue_work(&query, "completed").await;
                 Ok(())
             },
             Err(e) => {
@@ -3702,6 +4135,21 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             )
             .await;
             return Err(blocked);
+        }
+        if let Err(closed) = self.check_admissions_open() {
+            let reason = closed.to_string();
+            query.fail(reason.clone(), "processing".to_string());
+            self.record_query_failure(&query).await?;
+            self.event_bus.send(DaemonEvent::EntryRejected {
+                position_id,
+                reason_code: "admissions_closed".to_string(),
+                reason,
+                terminal: false,
+                rejected_at: chrono::Utc::now(),
+            });
+            self.rearm_detector_after_governed_block(position_id, &position, "admissions closed")
+                .await;
+            return Err(closed);
         }
 
         // Cache the entry-time invalidation guard level (ADR-0042) for the fill
@@ -4046,6 +4494,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             return Err(DaemonError::MonthlyHaltActive { reason: snap.reason.unwrap_or_default() });
         }
         self.check_no_unresolved_residual().await?;
+        self.check_admissions_open()?;
 
         let mut record = {
             let mut pending_approvals = self.pending_approvals.write().await;
@@ -4572,6 +5021,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             let actions = Self::stamp_cycle_id(decision.actions, query.id);
             let results = match self.execute_and_persist(actions).await {
                 Ok(r) => r,
+                // A batch with no venue action whose event did not persist; on
+                // a suspended stream every such batch is refused. It fails this
+                // leg's query only: the other legs on this tick still trail and
+                // exit (ADR-0056 step 7, PR P).
+                Err(e) if e.is_event_not_persisted() => {
+                    error!(
+                        position_id = %position.id,
+                        error = %e,
+                        "Tick batch did not persist; continuing with the other legs"
+                    );
+                    query.fail(format!("{}", e), "acting".to_string());
+                    self.record_after_venue_work(&query, "failed").await;
+                    continue;
+                },
                 Err(e) => {
                     // #142: a reduce-only rejection with the exchange flat
                     // means the exchange-side insurance stop already closed
@@ -4610,13 +5073,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         };
                         if let Err(complete_error) = query.complete(outcome) {
                             query.fail(format!("{}", complete_error), "acting".to_string());
-                            self.record_query_failure(&query).await?;
+                            self.record_after_venue_work(&query, "failed").await;
                             return Err(DaemonError::Config(format!(
                                 "Query completion error: {}",
                                 complete_error
                             )));
                         }
-                        self.record_query_transition(&query, "completed").await?;
+                        self.record_after_venue_work(&query, "completed").await;
                         continue;
                     }
                     // The venue refused this exit: on its rules after one refresh
@@ -4625,7 +5088,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     if matches!(
                         e,
                         DaemonError::Exec(
-                            ExecError::RulesRejected(_) | ExecError::ReduceOnlyRejected(_)
+                            ExecError::RulesRejected(_)
+                                | ExecError::ReduceOnlyRejected(_)
+                                | ExecError::SendRefused(_)
                         )
                     ) {
                         warn!(
@@ -4695,10 +5160,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // Complete query with success
             if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
                 query.fail(format!("{}", e), "acting".to_string());
-                self.record_query_failure(&query).await?;
+                self.record_after_venue_work(&query, "failed").await;
                 return Err(DaemonError::Config(format!("Query completion error: {}", e)));
             }
-            self.record_query_transition(&query, "completed").await?;
+            self.record_after_venue_work(&query, "completed").await;
         }
 
         if let Some(error) = first_missing_rules {
@@ -4792,7 +5257,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             closure_evidence: robson_domain::ClosureEvidence::real_exit_fill(None),
             timestamp: filled_at,
         };
-        self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
+        self.record_venue_close(event).await?;
 
         // Record realized PnL in Prometheus metrics
         crate::metrics::POSITION_PNL
@@ -4988,7 +5453,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             closure_evidence: ClosureEvidence::Reconciled(input.evidence),
             timestamp: input.closed_at,
         };
-        self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
+        self.record_venue_close(event).await?;
 
         crate::metrics::POSITION_PNL
             .with_label_values(&[&input.position_id.to_string()])
@@ -5056,14 +5521,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     self.record_query_accepted(&query).await?;
 
                     match self.panic_close_position_internal(position.id, &mut query).await {
-                        Ok(_) => {
+                        Ok(persisted) => {
+                            if !persisted {
+                                error!(
+                                    position_id = %position.id,
+                                    "Panic: leg closed, its close event did not persist"
+                                );
+                            }
                             if let Err(e) =
                                 query.complete(QueryOutcome::ActionsExecuted { actions_count: 1 })
                             {
                                 query.fail(format!("{}", e), "acting".to_string());
-                                self.record_query_failure(&query).await?;
+                                self.record_after_venue_work(&query, "failed").await;
                             } else {
-                                self.record_query_transition(&query, "completed").await?;
+                                self.record_after_venue_work(&query, "completed").await;
                             }
                             closed_ids.push(position.id);
                         },
@@ -5082,7 +5553,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                                 QueryState::Denied { check, .. } => format!("denied:{}", check),
                             };
                             query.fail(format!("{}", e), phase);
-                            self.record_query_failure(&query).await?;
+                            // The other legs are still closed.
+                            self.record_after_venue_work(&query, "failed").await;
                             error!(position_id = %position.id, error = %e, "Failed to panic close");
                         },
                     }
@@ -5142,12 +5614,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// errors. The caller is responsible for failure recording. This
     /// prevents double-fail.
     ///
-    /// Emits PositionClosed event which will be applied by projection.
+    /// Emits PositionClosed event which will be applied by projection. Whether
+    /// that close persisted: the leg is closed either way.
     async fn panic_close_position_internal(
         &self,
         position_id: PositionId,
         query: &mut ExecutionQuery,
-    ) -> DaemonResult<()> {
+    ) -> DaemonResult<bool> {
         // Transition to Processing
         if let Err(e) = query.transition(QueryState::Processing) {
             return Err(DaemonError::Config(format!("Query transition error: {}", e)));
@@ -5239,7 +5712,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             timestamp: filled_at,
         };
 
-        self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
+        let persisted = self.record_venue_close(event).await?;
 
         // Send to event bus for real-time notification
         self.event_bus.send(DaemonEvent::CorePositionClosed {
@@ -5248,7 +5721,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             side: position.side,
         });
 
-        Ok(())
+        Ok(persisted)
     }
 
     /// Kill detector task for a position.
@@ -5429,6 +5902,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let engine = self.engine();
 
         for position in positions {
+            // Its projection may lag its log (ADR-0056 step 7, PR P): the leg's
+            // snapshot is invalid whatever its pricing would say.
+            if self.event_streams.position_suspended(position.id) {
+                failures.push(LatentRiskResolutionFailure {
+                    position_id: position.id,
+                    state: position.state.name().to_string(),
+                    reason: "its event stream is suspended".to_string(),
+                });
+                continue;
+            }
             if position.stop_policy == StopPolicy::LegacyUncapped {
                 if let Some(pricing) = Self::legacy_resolved_position_risk(position) {
                     total += pricing.risk;
@@ -5578,15 +6061,33 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             self.resolve_latent_risk_for_positions(&local_risk_open, &rules_by_symbol);
         let latent_risk_invalid = !latent_risk_failures.is_empty();
 
-        let capital_base_invalid = monthly.capital_base <= Decimal::ZERO;
-        if capital_base_invalid {
+        let capital_base_invalid = monthly.basis_invalid();
+        if monthly.capital_base <= Decimal::ZERO {
             error!(
                 capital_base = %monthly.capital_base,
                 year = now.year(),
                 month = now.month(),
                 "ADR-0051 §1: monthly budget snapshot is invalid because capital_base <= 0; new entries denied, open positions kept"
             );
+        } else if !monthly.boundary_reset_landed {
+            warn!(
+                capital_base = %monthly.capital_base,
+                year = now.year(),
+                month = now.month(),
+                "Monthly budget snapshot is invalid: the month's reset has not landed, so its basis is not the operated wallet's; new entries denied, open positions kept"
+            );
+        } else if monthly.month_suspended {
+            error!(
+                capital_base = %monthly.capital_base,
+                year = now.year(),
+                month = now.month(),
+                "Monthly budget snapshot is invalid: the month's system stream is suspended, so its accounting is untrusted (ADR-0056 step 7); new entries denied, automatic MonthlyHalt not evaluated, open positions kept"
+            );
         }
+        // A base no reset wrote, or a month whose stream is suspended, meters
+        // nothing, so it reports no capacity.
+        let capacity_unknown =
+            latent_risk_invalid || !monthly.boundary_reset_landed || monthly.month_suspended;
         let budget_amount = self.trading_policy.monthly_budget(monthly.capital_base);
 
         let consumed_hwm = (month_peak_net - month_equity_net).max(Decimal::ZERO);
@@ -5595,13 +6096,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             MonthlyBudgetModel::HwmV1 => consumed_hwm,
             MonthlyBudgetModel::NetFromStartNonExpandingV1 => consumed_nfs,
         };
-        let remaining_hwm = if latent_risk_invalid {
+        let remaining_hwm = if capacity_unknown {
             Decimal::ZERO
         } else {
             self.trading_policy
                 .remaining_budget(monthly.capital_base, consumed_hwm, latent_risk)
         };
-        let remaining_nfs = if latent_risk_invalid {
+        let remaining_nfs = if capacity_unknown {
             Decimal::ZERO
         } else {
             self.trading_policy
@@ -5611,13 +6112,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             MonthlyBudgetModel::HwmV1 => remaining_hwm,
             MonthlyBudgetModel::NetFromStartNonExpandingV1 => remaining_nfs,
         };
-        let slots_hwm = if latent_risk_invalid {
+        let slots_hwm = if capacity_unknown {
             0
         } else {
             self.trading_policy
                 .slots_available(monthly.capital_base, consumed_hwm, latent_risk)
         };
-        let slots_nfs = if latent_risk_invalid {
+        let slots_nfs = if capacity_unknown {
             0
         } else {
             self.trading_policy
@@ -6069,6 +6570,15 @@ mod tests {
         event_bus: Arc<EventBus>,
         approval_policy: ApprovalPolicy,
     ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        create_test_manager_with_order_journal(store, event_bus, approval_policy, None).await
+    }
+
+    async fn create_test_manager_with_order_journal(
+        store: Arc<MemoryStore>,
+        event_bus: Arc<EventBus>,
+        approval_policy: ApprovalPolicy,
+        order_journal: Option<Arc<robson_exec::order_journal::OrderJournal>>,
+    ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         exchange.set_trading_rules(
             robson_domain::SymbolTradingRules::new(
@@ -6085,7 +6595,11 @@ mod tests {
             .unwrap(),
         );
         let journal = Arc::new(IntentJournal::new());
-        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let executor = Executor::new(exchange, journal, store.clone());
+        let executor = Arc::new(match order_journal {
+            Some(order_journal) => executor.with_order_journal(order_journal),
+            None => executor,
+        });
         let risk_config = RiskConfig::new(dec!(10000)).unwrap(); // 1% cap
         let engine = Engine::new(risk_config);
 
@@ -6172,44 +6686,6 @@ mod tests {
             prev_hash: None,
             hash: None,
         }
-    }
-
-    #[cfg(feature = "postgres")]
-    #[sqlx::test(migrations = "../migrations")]
-    #[ignore = "requires DATABASE_URL"]
-    async fn eventlog_failure_during_exit_cycle_still_reaches_exchange(pool: sqlx::PgPool) {
-        let manager = create_postgres_test_manager(pool.clone());
-        pool.close().await;
-
-        let position_id = Uuid::now_v7();
-        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        let quantity = Quantity::new(dec!(0.01)).unwrap();
-        let trigger = Price::new(dec!(94000)).unwrap();
-        let actions = vec![
-            EngineAction::EmitEvent(Event::ExitTriggered {
-                position_id,
-                reason: robson_domain::ExitReason::TrailingStop,
-                trigger_price: trigger,
-                stop_price: trigger,
-                timestamp: chrono::Utc::now(),
-            }),
-            EngineAction::PlaceExitOrder {
-                position_id,
-                cycle_id: Some(Uuid::now_v7()),
-                symbol,
-                side: Side::Long.exit_action(),
-                quantity,
-                reason: robson_domain::ExitReason::TrailingStop,
-            },
-        ];
-
-        let error = manager.execute_and_persist(actions).await.unwrap_err();
-        assert!(matches!(error, DaemonError::EventLog(_)));
-        assert_eq!(
-            manager.exchange().market_order_call_count(),
-            1,
-            "exit availability must retain execute-all-then-persist semantics"
-        );
     }
 
     /// Cancel-first: the stop's cancel happened, so it must reach the event log
@@ -7862,6 +8338,8 @@ mod tests {
         assert!(manager.circuit_breaker.blocks_new_entries().await);
     }
 
+    /// The current month's row as its landed reset leaves it, with this
+    /// basis.
     #[cfg(feature = "postgres")]
     async fn set_month_basis(pool: &sqlx::PgPool, capital_base: Decimal) {
         let now = chrono::Utc::now();
@@ -7869,10 +8347,12 @@ mod tests {
             r#"
             INSERT INTO monthly_state (
                 year, month, capital_base, month_peak_net,
-                monthly_budget_model, created_at
+                monthly_budget_model, boundary_reset_at, created_at
             )
-            VALUES ($1, $2, $3, 0, 'net_from_start_non_expanding_v1', $4)
-            ON CONFLICT (year, month) DO UPDATE SET capital_base = EXCLUDED.capital_base
+            VALUES ($1, $2, $3, 0, 'net_from_start_non_expanding_v1', $4, $4)
+            ON CONFLICT (year, month) DO UPDATE SET
+                capital_base = EXCLUDED.capital_base,
+                boundary_reset_at = EXCLUDED.boundary_reset_at
             "#,
         )
         .bind(now.year() as i16)
@@ -7885,7 +8365,6 @@ mod tests {
     }
 
     /// An Armed BTCUSDT position and the signal that would enter it.
-    #[cfg(feature = "postgres")]
     async fn armed_position_and_signal(
         manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
     ) -> (Position, DetectorSignal) {
@@ -7986,6 +8465,144 @@ mod tests {
         assert_denied_and_book_kept(&manager, &armed, &leg).await;
     }
 
+    /// The current month's row as a writer other than the reset leaves it: a
+    /// base, no `boundary_reset_at`.
+    #[cfg(feature = "postgres")]
+    async fn set_unreset_month_row(pool: &sqlx::PgPool, capital_base: Decimal) {
+        let now = chrono::Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO monthly_state (year, month, capital_base, month_peak_net, created_at)
+            VALUES ($1, $2, $3, 50, $4)
+            ON CONFLICT (year, month) DO UPDATE SET
+                capital_base = EXCLUDED.capital_base,
+                boundary_reset_at = NULL
+            "#,
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .bind(capital_base)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Every admission check refuses the month's basis.
+    #[cfg(feature = "postgres")]
+    async fn assert_basis_refused(manager: &Arc<PositionManager<StubExchange, MemoryStore>>) {
+        let now = chrono::Utc::now();
+        let snapshot = manager.canonical_budget_snapshot(now).await.unwrap();
+        assert!(snapshot.capital_base_invalid);
+        assert_eq!(snapshot.slots_active, 0);
+        assert_eq!(snapshot.remaining_active, Decimal::ZERO);
+        assert!(manager.budget_basis_is_invalid_now().await.unwrap());
+        let arm = manager.admission_capital_base(now).await;
+        assert!(matches!(arm, Err(DaemonError::AdmissionsClosed { .. })), "{arm:?}");
+        let preview = manager
+            .prepare_entry_preview(Symbol::from_pair("BTCUSDT").unwrap(), Side::Long)
+            .await
+            .err();
+        assert!(matches!(preview, Some(DaemonError::AdmissionsClosed { .. })), "{preview:?}");
+    }
+
+    /// Until the month's reset lands, its basis is configured capital, not the
+    /// operated wallet's: the snapshot, the late revalidation, an arm, a
+    /// preview and a signal all refuse it. A row the peak writer created reads
+    /// the same. Once the reset stamps the row, admissions reopen, and an
+    /// approval answered after the stamp went missing is denied.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn admissions_wait_for_the_month_reset_to_land(pool: sqlx::PgPool) {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+
+        let manager = create_postgres_test_manager(pool.clone());
+        let leg = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let (armed, signal) = armed_position_and_signal(&manager).await;
+
+        assert_basis_refused(&manager).await;
+        manager.handle_signal(signal.clone()).await.unwrap();
+        assert_denied_and_book_kept(&manager, &armed, &leg).await;
+
+        set_unreset_month_row(&pool, dec!(10000)).await;
+        assert_basis_refused(&manager).await;
+
+        set_month_basis(&pool, dec!(10000)).await;
+        let now = chrono::Utc::now();
+        let snapshot = manager.canonical_budget_snapshot(now).await.unwrap();
+        assert!(!snapshot.capital_base_invalid);
+        assert!(snapshot.slots_active > 0);
+        assert!(!manager.budget_basis_is_invalid_now().await.unwrap());
+        assert_eq!(manager.admission_capital_base(now).await.unwrap(), dec!(10000));
+        manager.entry_policies.write().await.insert(
+            armed.id,
+            EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::HumanConfirmation),
+        );
+        manager.handle_signal(signal_again(&signal)).await.unwrap();
+        let query_id = {
+            let pending = manager.pending_approvals.read().await;
+            *pending.keys().next().expect("the gate admits once the reset landed")
+        };
+
+        set_unreset_month_row(&pool, dec!(10000)).await;
+        let result = manager.approve_query(query_id).await;
+
+        assert!(matches!(result, Err(DaemonError::ApprovalDenied { .. })), "{result:?}");
+        assert_denied_and_book_kept(&manager, &armed, &leg).await;
+    }
+
+    /// The worst pending window: the startup wallet read failed, leaving the
+    /// placeholder capital of 1, the boundary keeps deferring, and carried legs
+    /// reserve far more than 4% of 1. A realized loss and a signal neither
+    /// latch MonthlyHalt nor close anything; the legs keep their stops.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_pending_reset_on_placeholder_capital_neither_halts_nor_closes(pool: sqlx::PgPool) {
+        let manager = create_postgres_test_manager(pool.clone());
+        manager.update_engine_capital(dec!(1));
+        let leg = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let other = save_active_position(&manager, "SOLUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let now = chrono::Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO positions_current (
+                position_id, tenant_id, account_id, symbol, side,
+                entry_price, entry_quantity, entry_filled_at,
+                technical_stop_price, technical_stop_distance, current_quantity,
+                trailing_stop_price, current_price, realized_pnl, total_fees, exit_reason,
+                state, last_event_id, last_seq, created_at, updated_at, closed_at
+            ) VALUES (
+                $1, $2, $3, 'BTCUSDT', 'long',
+                100, 1, $4,
+                90, 10, 1,
+                90, 90, -90, 10, 'TrailingStop',
+                'closed', $5, 1, $4, $4, $4
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(manager.event_log_tenant_id.unwrap())
+        .bind(Uuid::now_v7())
+        .bind(now)
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let snapshot = manager.canonical_budget_snapshot(now).await.unwrap();
+        assert_eq!(snapshot.capital_base, dec!(1));
+        assert_eq!(snapshot.governed_realized_net, dec!(-100), "the loss is seen");
+
+        assert!(!manager.evaluate_monthly_halt().await);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+        let (armed, signal) = armed_position_and_signal(&manager).await;
+        manager.handle_signal(signal).await.unwrap();
+
+        assert_denied_and_book_kept(&manager, &armed, &leg).await;
+        assert!(is_still_active(&manager, &other).await);
+    }
+
     /// The production query recorder on the same database as the event log, so
     /// a failed audit write fails the admission as in production.
     /// `TracingQueryRecorder` never fails.
@@ -7994,10 +8611,23 @@ mod tests {
         pool: sqlx::PgPool,
         approval_ttl_seconds: u64,
     ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        audited_postgres_test_manager_with_journal(pool, approval_ttl_seconds, None)
+    }
+
+    #[cfg(feature = "postgres")]
+    fn audited_postgres_test_manager_with_journal(
+        pool: sqlx::PgPool,
+        approval_ttl_seconds: u64,
+        order_journal: Option<Arc<robson_exec::order_journal::OrderJournal>>,
+    ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
-        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let executor = Executor::new(exchange, journal, store.clone());
+        let executor = Arc::new(match order_journal {
+            Some(order_journal) => executor.with_order_journal(order_journal),
+            None => executor,
+        });
         let engine = Engine::new(RiskConfig::new(dec!(10000)).unwrap());
         let tenant_id = Uuid::now_v7();
 
@@ -8344,18 +8974,19 @@ mod tests {
     /// The boundary: once the entry's actions reach the executor an order may
     /// exist, so no failure from there re-arms. Before the order: the first
     /// entry event fails to persist, which also keeps the order back
-    /// (ADR-0052). After it: the last audit write fails.
+    /// (ADR-0052). After it: the last audit write fails, which since PR P
+    /// keeps the entry's outcome and answers `Ok` (ADR-0056 step 7).
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
     async fn a_failure_once_the_executor_has_the_entry_does_not_rearm(pool: sqlx::PgPool) {
         set_month_basis(&pool, dec!(10000)).await;
         let cases = [
-            ("NEW.event_type = 'entry_signal_received'".to_string(), 0),
-            (audit_write("completed"), 1),
+            ("NEW.event_type = 'entry_signal_received'".to_string(), 0, false),
+            (audit_write("completed"), 1, true),
         ];
 
-        for (condition, orders) in cases {
+        for (condition, orders, kept) in cases {
             let manager = create_audited_postgres_test_manager(pool.clone(), 300);
             let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
 
@@ -8363,13 +8994,373 @@ mod tests {
             let result = manager.handle_signal(signal).await;
             restore_event_log_writes(&pool).await;
 
-            assert!(result.is_err(), "{condition}: {result:?}");
+            assert_eq!(result.is_ok(), kept, "{condition}: {result:?}");
             assert_eq!(manager.exchange().market_order_call_count(), orders, "{condition}");
             assert!(!manager.detectors.read().await.contains_key(&armed.id), "{condition}");
             assert_eq!(
                 manager.governed_rearm_counts.read().await.get(&armed.id),
                 None,
                 "{condition}"
+            );
+        }
+    }
+
+    // ---- ADR-0056 step 7, PR J: typed refusal and the backoff reset ------------
+
+    /// A manager whose order journal answers from a scripted backend.
+    async fn journaled_manager() -> (
+        Arc<PositionManager<StubExchange, MemoryStore>>,
+        Arc<robson_exec::order_journal::StubJournalBackend>,
+    ) {
+        let backend = Arc::new(robson_exec::order_journal::StubJournalBackend::default());
+        let journal = Arc::new(
+            robson_exec::order_journal::OrderJournal::new(
+                backend.clone(),
+                &robson_exec::venue::VenueId::new("test:venue"),
+            )
+            .with_commit_bound(std::time::Duration::from_millis(20)),
+        );
+        let manager = create_test_manager_with_order_journal(
+            Arc::new(MemoryStore::new()),
+            Arc::new(EventBus::new(100)),
+            ApprovalPolicy::new(Decimal::from(100u32), 300),
+            Some(journal),
+        )
+        .await;
+        (manager, backend)
+    }
+
+    /// A position with `failures` earlier governed re-arms behind it.
+    async fn armed_with_backoff(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        failures: u32,
+    ) -> (Position, DetectorSignal) {
+        let (armed, signal) = armed_position_and_signal(manager).await;
+        manager.governed_rearm_counts.write().await.insert(armed.id, failures);
+        (armed, signal)
+    }
+
+    /// A position armed the production way: `ExecutableSpan`, with its signal.
+    async fn production_policy_position_and_signal(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> (Position, DetectorSignal) {
+        manager.exchange().set_trading_rules(
+            robson_domain::SymbolTradingRules::new(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                dec!(0.01),
+                Decimal::ZERO,
+                dec!(0.000001),
+                dec!(0.000001),
+                dec!(1000000),
+                Decimal::ZERO,
+                2,
+                6,
+            )
+            .unwrap(),
+        );
+        let position = manager
+            .arm_position(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                create_test_risk_config(),
+                None,
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(position.stop_policy, StopPolicy::ExecutableSpan);
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol: position.symbol.clone(),
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(90250)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+        (position, signal)
+    }
+
+    /// ADR-0052: a proven no-send has already written the immutable ruler, so a
+    /// re-arm could never admit. The attempt ends with its own reason, audited,
+    /// nothing went out, and a later signal stays refused.
+    #[tokio::test]
+    async fn a_no_send_on_a_production_policy_leg_ends_the_attempt() {
+        use robson_exec::order_journal::JournalFault;
+        for refuse_in_adapter in [false, true] {
+            let (manager, backend) = journaled_manager().await;
+            let (armed, signal) = production_policy_position_and_signal(&manager).await;
+            if refuse_in_adapter {
+                manager.exchange().set_refuse_before_send_next(true);
+            } else {
+                backend.push_fault(JournalFault::Known);
+            }
+
+            let result = manager.handle_signal(signal.clone()).await;
+
+            assert!(
+                matches!(result, Err(DaemonError::Exec(ExecError::SendRefused(_)))),
+                "{result:?}"
+            );
+            assert_eq!(manager.exchange().market_order_call_count(), 0);
+            assert!(!manager.detectors.read().await.contains_key(&armed.id), "no re-arm");
+            assert!(manager.is_entry_exhausted(armed.id).await);
+            let stored = manager.get_position(armed.id).await.unwrap().unwrap();
+            assert!(matches!(stored.state, PositionState::Armed));
+            assert!(stored.carries_admission_evidence(), "the ruler was not cleared");
+            let events = manager.store.events().find_by_position(armed.id).await.unwrap();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                Event::EntryAttemptExhausted { reason_code, signal_id, .. }
+                    if reason_code == "entry_not_sent" && *signal_id == Some(signal.signal_id)
+            )));
+
+            // The next signal changes nothing and sends nothing.
+            let _ = manager
+                .handle_signal(DetectorSignal { signal_id: Uuid::now_v7(), ..signal })
+                .await;
+            assert_eq!(manager.exchange().market_order_call_count(), 0);
+            assert!(!manager.detectors.read().await.contains_key(&armed.id));
+        }
+    }
+
+    /// The account's futures settings refuse the entry after the ruler was
+    /// written. It is a proven no-send: the safety event stands and the attempt
+    /// ends, as for any other.
+    #[tokio::test]
+    async fn a_futures_settings_refusal_on_a_production_policy_leg_ends_the_attempt() {
+        let (manager, _backend) = journaled_manager().await;
+        let (armed, signal) = production_policy_position_and_signal(&manager).await;
+        manager.exchange().set_futures_settings("Hedge", 1);
+
+        let result = manager.handle_signal(signal.clone()).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert!(!manager.detectors.read().await.contains_key(&armed.id), "no re-arm");
+        assert!(manager.is_entry_exhausted(armed.id).await);
+        let stored = manager.get_position(armed.id).await.unwrap().unwrap();
+        assert!(stored.carries_admission_evidence());
+        let events = manager.store.events().find_by_position(armed.id).await.unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::EntryExecutionRejected { .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::EntryAttemptExhausted { reason_code, signal_id, .. }
+                if reason_code == "entry_not_sent" && *signal_id == Some(signal.signal_id)
+        )));
+    }
+
+    /// A legacy leg keeps exactly what it had: the safety event, a spent
+    /// detector, no exhaustion and no new re-arm.
+    #[tokio::test]
+    async fn a_futures_settings_refusal_on_a_legacy_leg_changes_nothing() {
+        let (manager, _backend) = journaled_manager().await;
+        let (armed, signal) = armed_with_backoff(&manager, 2).await;
+        manager.exchange().set_futures_settings("Hedge", 1);
+
+        let result = manager.handle_signal(signal).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(!manager.detectors.read().await.contains_key(&armed.id), "no re-arm");
+        assert!(!manager.is_entry_exhausted(armed.id).await);
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), Some(&2));
+        let events = manager.store.events().find_by_position(armed.id).await.unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::EntryExecutionRejected { .. })));
+        assert!(!events.iter().any(|e| matches!(e, Event::EntryAttemptExhausted { .. })));
+    }
+
+    /// The exhaustion itself cannot be recorded: the detector stays spent, and
+    /// nothing re-arms.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn an_exhaustion_that_cannot_be_recorded_leaves_the_detector_spent(pool: sqlx::PgPool) {
+        use robson_exec::order_journal::{JournalFault, OrderJournal, StubJournalBackend};
+        let backend = Arc::new(StubJournalBackend::default());
+        let journal = Arc::new(OrderJournal::new(
+            backend.clone(),
+            &robson_exec::venue::VenueId::new("test:venue"),
+        ));
+        set_month_basis(&pool, dec!(10000)).await;
+        let manager = audited_postgres_test_manager_with_journal(pool.clone(), 300, Some(journal));
+        let (armed, signal) = production_policy_position_and_signal(&manager).await;
+        backend.push_fault(JournalFault::Known);
+
+        fail_event_log_writes(&pool, "NEW.event_type = 'entry_attempt_exhausted'").await;
+        let result = manager.handle_signal(signal).await;
+        restore_event_log_writes(&pool).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert!(!manager.detectors.read().await.contains_key(&armed.id), "no re-arm");
+    }
+
+    /// #301's paths: a failure before the executor has written no evidence, so
+    /// on a production-policy leg the re-arm does recover.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_failure_before_the_executor_leaves_no_evidence_and_the_rearm_recovers(
+        pool: sqlx::PgPool,
+    ) {
+        set_month_basis(&pool, dec!(10000)).await;
+        let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+        let (armed, signal) = production_policy_position_and_signal(&manager).await;
+
+        fail_event_log_writes(&pool, &audit_write("acting")).await;
+        let result = manager.handle_signal(signal.clone()).await;
+        restore_event_log_writes(&pool).await;
+
+        assert!(result.is_err(), "{result:?}");
+        let stored = manager.get_position(armed.id).await.unwrap().unwrap();
+        assert!(!stored.carries_admission_evidence(), "the failure came before the ruler");
+        assert!(manager.detectors.read().await.contains_key(&armed.id), "re-armed");
+
+        detector_fired(&manager, armed.id).await;
+        manager.handle_signal(signal_again(&signal)).await.expect("the re-arm admits");
+        assert_eq!(manager.exchange().market_order_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_strict_commit_known_failure_re_arms_under_the_growing_backoff() {
+        use robson_exec::order_journal::JournalFault;
+        let (manager, backend) = journaled_manager().await;
+        let (armed, signal) = armed_with_backoff(&manager, 2).await;
+        // The two pre-send barrier events are not journal writes: the first
+        // journal commit is the entry's.
+        backend.push_fault(JournalFault::Known);
+        let signal_for_retry = signal.clone();
+
+        let result = manager.handle_signal(signal).await;
+
+        assert!(
+            matches!(result, Err(DaemonError::Exec(ExecError::SendRefused(_)))),
+            "{result:?}"
+        );
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert!(manager.detectors.read().await.contains_key(&armed.id), "re-armed");
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), Some(&3));
+
+        // On a legacy leg the re-arm is real: the next signal admits.
+        if let Some(rearmed) = manager.detectors.write().await.remove(&armed.id) {
+            rearmed.abort();
+        }
+        manager
+            .handle_signal(DetectorSignal {
+                signal_id: Uuid::now_v7(),
+                ..signal_for_retry
+            })
+            .await
+            .expect("the re-arm admits");
+        assert_eq!(manager.exchange().market_order_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_inside_the_adapter_before_the_send_re_arms() {
+        let (manager, _backend) = journaled_manager().await;
+        let (armed, signal) = armed_with_backoff(&manager, 1).await;
+        manager.exchange().set_refuse_before_send_next(true);
+
+        let result = manager.handle_signal(signal).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(manager.detectors.read().await.contains_key(&armed.id), "re-armed");
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), Some(&2));
+    }
+
+    /// An uncertain commit may have left a row, so it stays executor-class:
+    /// no re-arm, and with no ticket the backoff is not reset either.
+    #[tokio::test]
+    async fn an_uncertain_commit_neither_re_arms_nor_resets_the_backoff() {
+        use robson_exec::order_journal::JournalFault;
+        for fault in [
+            JournalFault::AckLost,
+            JournalFault::NotLandedUncertain,
+            JournalFault::Hang,
+        ] {
+            let (manager, backend) = journaled_manager().await;
+            let (armed, signal) = armed_with_backoff(&manager, 2).await;
+            backend.push_fault(fault);
+
+            let result = manager.handle_signal(signal).await;
+
+            assert!(result.is_err(), "{fault:?}: {result:?}");
+            assert_eq!(manager.exchange().market_order_call_count(), 0, "{fault:?}");
+            assert!(!manager.detectors.read().await.contains_key(&armed.id), "{fault:?}");
+            assert_eq!(
+                manager.governed_rearm_counts.read().await.get(&armed.id),
+                Some(&2),
+                "{fault:?}"
+            );
+        }
+    }
+
+    /// #301's reset, after the ticket: a failed send still reached the venue.
+    #[tokio::test]
+    async fn a_ticketed_entry_that_failed_resets_the_backoff_and_does_not_re_arm() {
+        let (manager, _backend) = journaled_manager().await;
+        let (armed, signal) = armed_with_backoff(&manager, 3).await;
+        manager.exchange().set_order_fail_next(true);
+
+        let result = manager.handle_signal(signal).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(manager.exchange().market_order_call_count(), 1);
+        assert!(!manager.detectors.read().await.contains_key(&armed.id));
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), None);
+    }
+
+    /// The journal's result write fails, in each way it can: the fill is kept
+    /// and the exchange stop still goes on.
+    #[tokio::test]
+    async fn a_failed_journal_result_write_keeps_the_fill_and_places_the_stop() {
+        use robson_exec::order_journal::JournalFault;
+        for fault in [
+            JournalFault::Known,
+            JournalFault::AckLost,
+            JournalFault::NotLandedUncertain,
+            JournalFault::Hang,
+        ] {
+            let (manager, backend) = journaled_manager().await;
+            let (armed, signal) = armed_with_backoff(&manager, 1).await;
+            backend.fail_commit(1, Some(fault));
+
+            manager
+                .handle_signal(signal)
+                .await
+                .unwrap_or_else(|e| panic!("{fault:?}: {e:?}"));
+
+            let position = manager.get_position(armed.id).await.unwrap().unwrap();
+            assert!(matches!(position.state, PositionState::Active { .. }), "{fault:?}");
+            assert_eq!(manager.exchange().protection_call_count(), 1, "{fault:?}");
+            assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), None);
+        }
+    }
+
+    /// A failed pre-send barrier is no ticket: the backoff stands, and it is
+    /// still not a no-send the flow can re-arm from. A barrier stays a barrier.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_failed_pre_send_barrier_keeps_the_backoff_and_sends_nothing(pool: sqlx::PgPool) {
+        set_month_basis(&pool, dec!(10000)).await;
+        for event in ["entry_signal_received", "entry_order_requested"] {
+            let manager = create_audited_postgres_test_manager(pool.clone(), 300);
+            let (armed, signal) = recorded_armed_position_and_signal(&manager).await;
+            manager.governed_rearm_counts.write().await.insert(armed.id, 4);
+
+            let condition = format!("NEW.event_type = '{event}'");
+            fail_event_log_writes(&pool, &condition).await;
+            let result = manager.handle_signal(signal).await;
+            restore_event_log_writes(&pool).await;
+
+            assert!(result.is_err(), "{event}: {result:?}");
+            assert_eq!(manager.exchange().market_order_call_count(), 0, "{event}");
+            assert_eq!(
+                manager.governed_rearm_counts.read().await.get(&armed.id),
+                Some(&4),
+                "{event}"
             );
         }
     }
@@ -8649,6 +9640,27 @@ mod tests {
         writes: &[Decimal],
         stall: sqlx::Transaction<'_, sqlx::Postgres>,
     ) {
+        wait_for_a_held_snapshot(pool).await;
+        for capital_base in writes {
+            set_month_basis(pool, *capital_base).await;
+        }
+        stall.rollback().await.unwrap();
+    }
+
+    /// Once a snapshot is held there, rewrite the month's row without its
+    /// reset stamp and let the snapshot go on.
+    #[cfg(feature = "postgres")]
+    async fn unstamp_the_reset_while_a_snapshot_waits(
+        pool: &sqlx::PgPool,
+        stall: sqlx::Transaction<'_, sqlx::Postgres>,
+    ) {
+        wait_for_a_held_snapshot(pool).await;
+        set_unreset_month_row(pool, dec!(1000)).await;
+        stall.rollback().await.unwrap();
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn wait_for_a_held_snapshot(pool: &sqlx::PgPool) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let waiting: i64 = sqlx::query_scalar(
@@ -8670,10 +9682,6 @@ mod tests {
         })
         .await
         .expect("the snapshot must reach the locked table");
-        for capital_base in writes {
-            set_month_basis(pool, *capital_base).await;
-        }
-        stall.rollback().await.unwrap();
     }
 
     /// ADR-0051 §1 over random schedules: whatever the basis goes through while
@@ -8740,6 +9748,75 @@ mod tests {
         }
 
         assert!(fired_any && spared_any, "the schedules must reach both outcomes");
+    }
+
+    /// A reset stamp that goes missing while a snapshot waits is seen where
+    /// the decision is made: the halt does not fire on the exhausted budget
+    /// the snapshot read, and the gate gets no capital.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_reset_that_goes_missing_during_the_snapshot_is_seen_at_the_decision(
+        pool: sqlx::PgPool,
+    ) {
+        set_month_basis(&pool, dec!(1000)).await;
+        let manager = create_postgres_test_manager(pool.clone());
+        let leg = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(10)).await;
+        let snapshot = manager.canonical_budget_snapshot(chrono::Utc::now()).await.unwrap();
+        assert!(!snapshot.capital_base_invalid);
+        assert!(snapshot.remaining_active <= Decimal::ZERO, "{}", snapshot.remaining_active);
+
+        let stall = stall_on_positions_current(&pool).await;
+        let (fired, ()) = tokio::join!(
+            manager.evaluate_monthly_halt(),
+            unstamp_the_reset_while_a_snapshot_waits(&pool, stall)
+        );
+
+        assert!(!fired);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+        assert!(is_still_active(&manager, &leg).await);
+
+        set_month_basis(&pool, dec!(1000)).await;
+        let stall = stall_on_positions_current(&pool).await;
+        let (context, ()) = tokio::join!(
+            manager.build_risk_context(),
+            unstamp_the_reset_while_a_snapshot_waits(&pool, stall)
+        );
+
+        assert_eq!(context.unwrap().capital, Decimal::ZERO);
+    }
+
+    /// The other way round: the reset lands while a snapshot that read the
+    /// month as pending waits. Nothing decides on that snapshot's numbers,
+    /// which no reset wrote: the halt is not evaluated and the gate gets no
+    /// capital. The next decision reads the landed basis.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_reset_that_lands_during_the_snapshot_does_not_validate_it(pool: sqlx::PgPool) {
+        let manager = create_postgres_test_manager(pool.clone());
+        let leg = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(10)).await;
+        let landing = [dec!(1000)];
+
+        let stall = stall_on_positions_current(&pool).await;
+        let (fired, ()) = tokio::join!(
+            manager.evaluate_monthly_halt(),
+            write_the_basis_while_a_snapshot_waits(&pool, &landing, stall)
+        );
+
+        assert!(!fired);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+        assert!(is_still_active(&manager, &leg).await);
+
+        sqlx::query("DELETE FROM monthly_state").execute(&pool).await.unwrap();
+        let stall = stall_on_positions_current(&pool).await;
+        let (context, ()) = tokio::join!(
+            manager.build_risk_context(),
+            write_the_basis_while_a_snapshot_waits(&pool, &landing, stall)
+        );
+
+        assert_eq!(context.unwrap().capital, Decimal::ZERO);
+        assert_eq!(manager.build_risk_context().await.unwrap().capital, dec!(1000));
     }
 
     /// Reconciliation passes, with the manager held the way the daemon holds
@@ -9047,7 +10124,9 @@ mod tests {
     /// A triggered while being replaced: its market order is working, the venue
     /// still holds the leg, and the heal accepts B and finds A already gone. A
     /// then fills the whole leg. That close is still its stop's, and the budget
-    /// has to see it.
+    /// has to see it. A's cancel was uncertain, so an incident is open, and the
+    /// sweep keeps B, an orphan now, until a release (ADR-0056 step 7, PR F,
+    /// design §2.9).
     #[tokio::test]
     async fn a_stop_replaced_while_it_executes_keeps_its_loss_in_the_budget() {
         let manager = create_test_manager().await;
@@ -9067,7 +10146,12 @@ mod tests {
         let manager = missing_path_ran(manager).await;
 
         the_stop_loss_is_in_the_budget(&manager, &leg).await;
-        assert!(!exchange.has_stop_order(&stop_b), "and the sweep takes B");
+        let journal = manager.order_journal();
+        let reasons: Vec<_> =
+            journal.gate().open_incidents().iter().map(|incident| incident.reason).collect();
+        assert_eq!(reasons, [robson_exec::gate::IncidentReason::UncertainOutcome]);
+        assert!(exchange.has_stop_order(&stop_b), "the sweep keeps B while the incident is open");
+        assert_eq!(journal.withheld_report().orders[0].exchange_order_id, stop_b);
     }
 
     /// The scan's two reads are not one: an ordinary stop fill between them
@@ -10047,6 +11131,368 @@ mod tests {
         }
         let events = manager.store.events().find_by_position(position.id).await.unwrap();
         assert!(events.iter().any(|event| matches!(event, Event::PositionClosed { .. })));
+    }
+
+    /// ADR-0056 step 7, §2.3 item 5: a stop-out whose software cancel finds the
+    /// order gone with no final state, then an overtaken close. The close
+    /// never resolves the cancel: its row stays uncertain, with the leg closed.
+    #[tokio::test]
+    async fn an_overtaken_close_never_resolves_an_uncertain_cancel() {
+        let (manager, backend) = journaled_manager().await;
+        let mut position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let entry_price = Price::new(dec!(100)).unwrap();
+        let trailing_stop = Price::new(dec!(90)).unwrap();
+        position.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(entry_price, trailing_stop));
+        let exchange = manager.executor.exchange();
+        let stop = exchange
+            .place_stop_market_order(
+                &position.symbol,
+                position.side.exit_action(),
+                position.quantity,
+                trailing_stop,
+                "ins-test-overtaken",
+            )
+            .await
+            .unwrap()
+            .exchange_order_id;
+        position.insurance_stop_id = Some(stop.clone());
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some(stop.clone());
+        }
+        manager.store.positions().save(&position).await.unwrap();
+
+        exchange.set_price("BTCUSDT", trailing_stop.as_decimal());
+        exchange.fill_stop_order(&stop).unwrap();
+        exchange.set_reject_reduce_only_next(true);
+        exchange.set_stop_cancel_outcome_next(Ok(
+            robson_exec::venue::StopCancelOutcome::AlreadyGone {
+                final_state: robson_exec::venue::OrderLookup::Unknown,
+            },
+        ));
+
+        manager
+            .process_market_data(MarketData {
+                venue: test_venue(),
+                symbol: position.symbol.clone(),
+                price: Price::new(dec!(89)).unwrap(),
+                timestamp: chrono::Utc::now(),
+                source: crate::event_bus::MarketDataSource::Ws,
+            })
+            .await
+            .unwrap();
+
+        let closed = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(closed.state, PositionState::Closed { .. }), "{:?}", closed.state);
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(!events.iter().any(|e| matches!(e, Event::InsuranceStopCancelled { .. })));
+        let cancel = backend
+            .rows()
+            .into_iter()
+            .find(|r| {
+                r.intent.as_ref().unwrap().kind == robson_exec::order_journal::IntentKind::Cancel
+            })
+            .expect("the cancel is journaled");
+        assert_eq!(cancel.intent.unwrap().cancels_order_id.as_deref(), Some(stop.as_str()));
+        let outcome = cancel.outcome.expect("its outcome is written");
+        assert_eq!(outcome.cancel_class, Some("gone_unresolved"));
+        assert_eq!(outcome.venue_outcome, None, "the close settles nothing about the cancel");
+        assert!(outcome.uncertain_at.is_some());
+    }
+
+    /// ADR-0056 step 7, PR C: a leg crossing its stop, a broad cancel error, an
+    /// exit failing with a generic error, later ticks. The cancel goes out
+    /// again before every exit attempt, the heal's deadline stands, and a batch
+    /// that finishes after that deadline leaves it due for the next tick.
+    #[tokio::test]
+    async fn repeated_crossing_ticks_repeat_the_cancel_and_do_not_starve_the_heal() {
+        let (manager, backend) = journaled_manager().await;
+        let (position, stop) = active_leg_with_live_stop(&manager).await;
+        let exchange = manager.exchange();
+        let broad = || Err(ExecError::Exchange("order gateway unavailable".to_string()));
+        let cancel_rows = || {
+            backend
+                .rows()
+                .iter()
+                .filter(|r| {
+                    r.intent.as_ref().unwrap().kind
+                        == robson_exec::order_journal::IntentKind::Cancel
+                })
+                .count()
+        };
+        let failures = || async {
+            let events = manager.store.events().find_by_position(position.id).await.unwrap();
+            events.iter().filter(|e| matches!(e, Event::InsuranceStopFailed { .. })).count()
+        };
+
+        exchange.set_stop_cancel_outcome_next(broad());
+        exchange.set_order_fail_next(true);
+        let first = stop_crossing_tick(&manager, &position).await;
+        assert!(first.is_err(), "the exit failed: {first:?}");
+        assert_eq!(exchange.stop_cancel_call_count(), 1);
+        assert_eq!(exchange.market_order_call_count(), 1);
+        assert_eq!(failures().await, 1);
+        assert_eq!(cancel_rows(), 1);
+        let deadline = manager.insurance_stop_stale.read().await[&position.id];
+
+        for tick in 2..=4u64 {
+            exchange.set_stop_cancel_outcome_next(broad());
+            exchange.set_order_fail_next(true);
+            let again = stop_crossing_tick(&manager, &position).await;
+            assert!(again.is_err(), "tick {tick}: the exit failed again: {again:?}");
+            assert_eq!(exchange.stop_cancel_call_count(), tick, "tick {tick}: cancelled again");
+            assert_eq!(exchange.market_order_call_count(), tick, "tick {tick}: the exit ran");
+            assert_eq!(failures().await, tick as usize, "tick {tick}: its own audit");
+            assert_eq!(cancel_rows(), tick as usize, "tick {tick}: its own intent");
+            assert_eq!(
+                manager.insurance_stop_stale.read().await[&position.id],
+                deadline,
+                "tick {tick}: the heal's deadline stands"
+            );
+        }
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert_eq!(leg.insurance_stop_id.as_deref(), Some(stop.as_str()), "the id was kept");
+
+        // This batch started with the deadline ahead and its bookkeeping runs
+        // after the deadline has passed: the overdue deadline stays.
+        let overdue = std::time::Instant::now();
+        let stale = Arc::clone(&manager.insurance_stop_stale);
+        let id = position.id;
+        exchange.set_after_next_stop_cancel(move || {
+            stale.try_write().unwrap().insert(id, overdue);
+        });
+        exchange.set_stop_cancel_outcome_next(broad());
+        exchange.set_order_fail_next(true);
+        assert!(stop_crossing_tick(&manager, &position).await.is_err());
+        assert_eq!(manager.insurance_stop_stale.read().await[&position.id], overdue);
+
+        // The next tick sees it due and replaces the stop against the kept id.
+        let placements = exchange.protection_call_count();
+        stop_crossing_tick(&manager, &position).await.unwrap();
+        assert_eq!(exchange.protection_call_count(), placements + 1, "the heal placed a stop");
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::InsuranceStopReplaced { previous_order_id, .. }
+                    if previous_order_id == &stop
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// Codex round 2 on PR C: a timed-out cancel leaves the stop live and the
+    /// exit fails. On the next tick the cancel goes out again before the exit,
+    /// so a stop that can now be cancelled is gone when the exit goes out.
+    #[tokio::test]
+    async fn a_retried_cancel_clears_a_live_stop_before_the_next_exit() {
+        let (manager, backend) = journaled_manager().await;
+        let (position, stop) = active_leg_with_live_stop(&manager).await;
+        let exchange = manager.exchange();
+        exchange.set_stop_cancel_outcome_next(Err(ExecError::Timeout("no answer".to_string())));
+        exchange.set_order_fail_next(true);
+        assert!(stop_crossing_tick(&manager, &position).await.is_err());
+        assert!(exchange.has_stop_order(&stop), "the timed-out cancel left it live");
+
+        let exits_at_cancel = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let (seen, venue) = (Arc::clone(&exits_at_cancel), Arc::clone(&exchange));
+        exchange.set_after_next_stop_cancel(move || {
+            seen.store(venue.market_order_call_count(), std::sync::atomic::Ordering::SeqCst);
+        });
+        stop_crossing_tick(&manager, &position).await.unwrap();
+
+        assert_eq!(
+            exits_at_cancel.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the cancel went out before this tick's exit"
+        );
+        assert_eq!(exchange.stop_cancel_call_count(), 2);
+        assert!(!exchange.has_stop_order(&stop), "the retried cancel took the stop");
+        assert_eq!(exchange.market_order_call_count(), 2, "and the exit followed it");
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::InsuranceStopCancelled { .. })));
+        let classes: Vec<_> = backend
+            .rows()
+            .iter()
+            .filter_map(|r| r.outcome.as_ref().and_then(|o| o.cancel_class))
+            .collect();
+        assert!(classes.contains(&"error") && classes.contains(&"cancelled"), "{classes:?}");
+    }
+
+    /// ADR-0056 step 7, PR C, Codex round 3: a new process over a leg whose
+    /// latest stop event is a failure, price back above the stop, open-orders
+    /// reads failing, placement available. The rebuilt retry still comes due
+    /// and replaces the stop against the id it kept.
+    #[tokio::test]
+    async fn a_heal_rebuilt_at_restart_replaces_the_kept_stop_with_open_orders_failing() {
+        let manager = create_test_manager().await;
+        let (position, stop) = active_leg_with_live_stop(&manager).await;
+        let exchange = manager.exchange();
+        exchange.set_open_orders_fail(true);
+
+        // Without the rebuild nothing here would notice the leg.
+        quiet_tick(&manager, &position).await;
+        assert!(!manager.insurance_stop_stale.read().await.contains_key(&position.id));
+
+        manager.schedule_stop_heal_after_restart(position.id).await;
+        let window = stop_retry_in(&manager, position.id).await;
+        assert!(window > std::time::Duration::from_secs(25), "{window:?}");
+        assert!(window <= INSURANCE_STOP_RETRY_BACKOFF, "{window:?}");
+        let placements = exchange.protection_call_count();
+        quiet_tick(&manager, &position).await;
+        assert_eq!(exchange.protection_call_count(), placements, "not due yet");
+
+        manager
+            .insurance_stop_stale
+            .write()
+            .await
+            .insert(position.id, std::time::Instant::now());
+        quiet_tick(&manager, &position).await;
+
+        assert_eq!(exchange.protection_call_count(), placements + 1, "the heal placed a stop");
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::InsuranceStopReplaced { previous_order_id, .. }
+                    if previous_order_id == &stop
+            )),
+            "{events:?}"
+        );
+        assert!(!manager.insurance_stop_stale.read().await.contains_key(&position.id));
+    }
+
+    #[tokio::test]
+    async fn a_heal_rebuilt_at_restart_keeps_an_entry_already_there() {
+        let manager = create_test_manager().await;
+        let id = Uuid::now_v7();
+        let ahead = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        manager.insurance_stop_stale.write().await.insert(id, ahead);
+
+        manager.schedule_stop_heal_after_restart(id).await;
+
+        assert_eq!(manager.insurance_stop_stale.read().await[&id], ahead);
+    }
+
+    /// A successful startup-recovery placement or replacement clears the
+    /// rebuilt retry through the ordinary bookkeeping.
+    #[tokio::test]
+    async fn a_startup_recovery_stop_clears_the_rebuilt_retry() {
+        let manager = create_test_manager().await;
+        let (position, stop) = active_leg_with_live_stop(&manager).await;
+        let replace = EngineAction::ReplaceInsuranceStop {
+            position_id: position.id,
+            symbol: position.symbol.clone(),
+            side: position.side.exit_action(),
+            quantity: position.quantity,
+            previous_order_id: stop,
+            new_stop_price: Price::new(dec!(91)).unwrap(),
+        };
+        let place = EngineAction::PlaceInsuranceStop {
+            position_id: position.id,
+            symbol: position.symbol.clone(),
+            side: position.side.exit_action(),
+            quantity: position.quantity,
+            stop_price: Price::new(dec!(91)).unwrap(),
+        };
+
+        for action in [replace, place] {
+            manager.schedule_stop_heal_after_restart(position.id).await;
+            manager.execute_and_persist_recovery(vec![action]).await.unwrap();
+            assert!(!manager.insurance_stop_stale.read().await.contains_key(&position.id));
+        }
+    }
+
+    fn stop_failed(position_id: PositionId) -> ActionResult {
+        ActionResult::EventEmitted(Event::InsuranceStopFailed {
+            position_id,
+            stop_price: Price::zero(),
+            error: "venue".to_string(),
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
+    /// Only an absent deadline gets a new window: one on record stands,
+    /// overdue included.
+    #[tokio::test]
+    async fn a_stop_failure_keeps_any_heal_deadline_on_record() {
+        let manager = create_test_manager().await;
+        let id = Uuid::now_v7();
+
+        manager.note_insurance_stop_results(&[stop_failed(id)]).await;
+        assert!(stop_retry_in(&manager, id).await > std::time::Duration::from_secs(25), "absent");
+
+        let ahead = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        manager.insurance_stop_stale.write().await.insert(id, ahead);
+        manager.note_insurance_stop_results(&[stop_failed(id)]).await;
+        assert_eq!(manager.insurance_stop_stale.read().await[&id], ahead, "ahead");
+
+        let overdue = std::time::Instant::now();
+        manager.insurance_stop_stale.write().await.insert(id, overdue);
+        manager.note_insurance_stop_results(&[stop_failed(id)]).await;
+        assert_eq!(manager.insurance_stop_stale.read().await[&id], overdue, "overdue");
+
+        manager
+            .note_insurance_stop_results(&[ActionResult::ProtectionNotExecutable {
+                position_id: id,
+            }])
+            .await;
+        assert!(stop_retry_in(&manager, id).await > INSURANCE_STOP_RETRY_BACKOFF, "long window");
+    }
+
+    /// A failed trailing replacement finding an overdue deadline leaves it due,
+    /// and the heal that follows pushes its window first: one heal, not one on
+    /// every tick.
+    #[tokio::test]
+    async fn a_failed_replacement_on_an_overdue_deadline_is_not_a_heal_on_every_tick() {
+        let manager = create_test_manager().await;
+        let (position, stop) = active_leg_with_live_stop(&manager).await;
+        let exchange = manager.exchange();
+        let overdue = std::time::Instant::now();
+        manager.insurance_stop_stale.write().await.insert(position.id, overdue);
+
+        exchange.set_order_fail_next(true);
+        manager
+            .execute_and_persist(vec![EngineAction::ReplaceInsuranceStop {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: position.side.exit_action(),
+                quantity: position.quantity,
+                previous_order_id: stop,
+                new_stop_price: Price::new(dec!(91)).unwrap(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(manager.insurance_stop_stale.read().await[&position.id], overdue);
+
+        exchange.set_order_fail_next(true);
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(manager.retry_stale_insurance_stop(&leg).await, "it was due");
+        assert!(
+            stop_retry_in(&manager, position.id).await > std::time::Duration::from_secs(25),
+            "the heal pushed its window before it failed"
+        );
+
+        let placements = exchange.protection_call_count();
+        assert!(!manager.retry_stale_insurance_stop(&leg).await, "not due again");
+        assert_eq!(exchange.protection_call_count(), placements);
+    }
+
+    /// A heal pushes its own window before it acts, so one that fails still
+    /// backs off although a deadline ahead now stands.
+    #[tokio::test]
+    async fn a_failed_heal_still_backs_off() {
+        let manager = create_test_manager().await;
+        let (position, _) = active_leg_with_live_stop(&manager).await;
+        manager.exchange().set_order_fail_next(true);
+
+        retry_stop_now(&manager, position.id).await;
+
+        assert!(
+            stop_retry_in(&manager, position.id).await > std::time::Duration::from_secs(25),
+            "the failed heal waits a full window"
+        );
     }
 
     /// Regression for #142: while fill evidence is not visible yet, later
@@ -11689,6 +13135,263 @@ mod tests {
         assert!(events.iter().any(|event| matches!(event, Event::EntrySignalReceived { .. })));
     }
 
+    /// An `Immediate` arm enters, and places the entry's stop, under the arm's
+    /// own permit: one ordinary slot, no second permit, every venue mutation
+    /// under it, and the entry and its stop charged to one operation
+    /// (ADR-0056 step 7).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_immediate_arm_enters_and_protects_under_its_own_permit() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        use robson_exec::venue::Venue;
+
+        let manager = create_test_manager().await;
+        let journal = manager.order_journal();
+        manager.exchange().attach_gate(Arc::clone(journal.gate()));
+        let policy =
+            EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::Automatic);
+
+        let position = journal
+            .acquire(OperationKind::Arm)
+            .unwrap()
+            .run(manager.arm_position_with_policy(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                create_test_risk_config(),
+                None,
+                Uuid::now_v7(),
+                policy,
+            ))
+            .await
+            .unwrap();
+
+        assert!(matches!(position.state, PositionState::Active { .. }), "{:?}", position.state);
+        let mutations = manager.exchange().mutations();
+        let what: Vec<_> = mutations.iter().map(|m| m.what).collect();
+        assert!(what.contains(&"POST /fapi/v1/order"), "the entry: {what:?}");
+        assert!(what.contains(&"POST /fapi/v1/algoOrder"), "its stop: {what:?}");
+        for mutation in mutations {
+            assert_eq!(mutation.permit, Some(OperationKind::Arm), "{mutation:?}");
+            let gate = mutation.gate.unwrap();
+            assert_eq!((gate.permits, gate.ordinary, gate.unpermitted), (1, 1, 0), "{mutation:?}");
+        }
+        assert_eq!(journal.operation_statements_max(), 18, "entry and stop, one operation");
+        assert_eq!(journal.gate().snapshot().permits, 0);
+    }
+
+    /// Once the daemon is stopping, an entry from the main loop is refused at
+    /// its send: a typed no-send, nothing reaches the venue, and a leg with
+    /// admission evidence ends its attempt (ADR-0056 step 7, design §2.4).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_entry_refused_at_its_send_while_draining_ends_as_a_no_send() {
+        use robson_exec::venue::Venue;
+
+        let manager = create_test_manager().await;
+        let journal = manager.order_journal();
+        manager.exchange().attach_gate(Arc::clone(journal.gate()));
+        let position = manager
+            .arm_position(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(TechnicalStopDistance::from_entry_and_stop(
+                    Price::new(dec!(100)).unwrap(),
+                    Price::new(dec!(90)).unwrap(),
+                )),
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol: position.symbol.clone(),
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(86000)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        let permit = journal.acquire(OperationKind::MainLoop).unwrap();
+        journal.gate().begin_draining();
+        let refused = permit.run(manager.handle_signal(signal)).await;
+
+        assert!(
+            matches!(refused, Err(DaemonError::Exec(ExecError::SendRefused(_)))),
+            "{refused:?}"
+        );
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert!(
+            manager.exchange().mutations().iter().all(|m| m.what != "POST /fapi/v1/order"),
+            "no order went out"
+        );
+        assert_eq!(journal.gate().snapshot().sends_started, 0);
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Armed), "{:?}", leg.state);
+        assert!(
+            manager.is_entry_exhausted(position.id).await,
+            "evidence-bearing: the attempt ends"
+        );
+    }
+
+    // ---- ADR-0056 step 7, PR O: an entry meets a sweep's claim ----
+
+    /// A sweep's claim on BTCUSDT long, held by an operation of its own, as a
+    /// scan holds it around an UNTRACKED close.
+    async fn a_sweep_holds_btc_long(
+        journal: &Arc<robson_exec::order_journal::OrderJournal>,
+    ) -> (robson_exec::order_journal::Permit, robson_exec::order_journal::SweepClaim) {
+        use robson_exec::order_journal::OwnershipKey;
+        let permit = journal.acquire(OperationKind::ReconciliationScan).unwrap();
+        let key = OwnershipKey::new(&Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        let claim = permit.scope(async { journal.claim_sweep(key) }).await.unwrap();
+        (permit, claim)
+    }
+
+    /// Every route of an entry reaches its send and meets the sweep's claim
+    /// there: a typed no-send, nothing at the venue. A signal on a leg with
+    /// admission evidence ends its attempt (D15).
+    #[tokio::test]
+    async fn a_signal_on_a_production_policy_leg_under_a_sweep_claim_ends_its_attempt() {
+        let (manager, _backend) = journaled_manager().await;
+        let journal = manager.order_journal();
+        let (armed, signal) = production_policy_position_and_signal(&manager).await;
+        let (sweep, claim) = a_sweep_holds_btc_long(&journal).await;
+
+        let result = manager.handle_signal(signal).await;
+
+        assert!(
+            matches!(result, Err(DaemonError::Exec(ExecError::SendRefused(ref why))) if why.contains("sweep")),
+            "{result:?}"
+        );
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert!(manager.is_entry_exhausted(armed.id).await);
+        assert_eq!(journal.gate().snapshot().entries_refused_ownership, 1);
+        journal.release_sweep(claim);
+        sweep.complete();
+        assert!(journal.claims_view().is_empty());
+    }
+
+    /// A legacy leg re-arms under the governed backoff; its re-entry, once the
+    /// sweep is done, takes its own claim at its send and fills.
+    #[tokio::test]
+    async fn a_legacy_leg_refused_under_a_sweep_claim_re_arms_and_enters_after() {
+        let (manager, _backend) = journaled_manager().await;
+        let journal = manager.order_journal();
+        let (armed, signal) = armed_with_backoff(&manager, 2).await;
+        let (sweep, claim) = a_sweep_holds_btc_long(&journal).await;
+
+        let result = manager.handle_signal(signal.clone()).await;
+
+        assert!(
+            matches!(result, Err(DaemonError::Exec(ExecError::SendRefused(_)))),
+            "{result:?}"
+        );
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert!(manager.detectors.read().await.contains_key(&armed.id), "re-armed");
+        assert_eq!(manager.governed_rearm_counts.read().await.get(&armed.id), Some(&3));
+        journal.release_sweep(claim);
+        sweep.complete();
+
+        if let Some(rearmed) = manager.detectors.write().await.remove(&armed.id) {
+            rearmed.abort();
+        }
+        manager
+            .handle_signal(DetectorSignal { signal_id: Uuid::now_v7(), ..signal })
+            .await
+            .expect("the key is free: the re-entry admits");
+        assert_eq!(manager.exchange().market_order_call_count(), 1);
+        assert!(journal.claims_view().is_empty(), "its claim went with its operation");
+    }
+
+    /// An approval resumes an entry: it too meets the claim at its send.
+    #[tokio::test]
+    async fn an_approval_under_a_sweep_claim_sends_nothing() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        let manager = create_test_manager().await;
+        let journal = manager.order_journal();
+        let position = manager
+            .arm_position_with_policy(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(TechnicalStopDistance::from_entry_and_stop(
+                    Price::new(dec!(100)).unwrap(),
+                    Price::new(dec!(90)).unwrap(),
+                )),
+                Uuid::now_v7(),
+                EntryPolicyConfig::new(
+                    EntryPolicy::ConfirmedTrend,
+                    DomainApprovalPolicy::HumanConfirmation,
+                ),
+            )
+            .await
+            .unwrap();
+        manager
+            .handle_signal(DetectorSignal {
+                signal_id: Uuid::now_v7(),
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: Side::Long,
+                entry_price: Price::new(dec!(95000)).unwrap(),
+                stop_loss: Price::new(dec!(85500)).unwrap(),
+                technical_stop_analysis: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let query_id = *manager.pending_approvals.read().await.keys().next().unwrap();
+        let (sweep, claim) = a_sweep_holds_btc_long(&journal).await;
+
+        let result = manager.approve_query(query_id).await;
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert_eq!(journal.gate().snapshot().entries_refused_ownership, 1);
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Armed), "{:?}", leg.state);
+        journal.release_sweep(claim);
+        sweep.complete();
+    }
+
+    /// `execute_and_persist` returns its future boxed (ADR-0056 step 8, stack
+    /// headroom): a pointer, whatever the batch's future holds.
+    #[tokio::test]
+    async fn execute_and_persist_returns_its_future_boxed() {
+        let manager = create_test_manager().await;
+        let batch = manager.execute_and_persist(Vec::new());
+        assert_eq!(std::mem::size_of_val(&batch), std::mem::size_of::<usize>());
+    }
+
+    /// An `Immediate` arm enters synchronously: under the claim, its entry
+    /// is refused at its send and nothing reaches the venue.
+    #[tokio::test]
+    async fn an_immediate_arm_under_a_sweep_claim_sends_nothing() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        let manager = create_test_manager().await;
+        let journal = manager.order_journal();
+        let (sweep, claim) = a_sweep_holds_btc_long(&journal).await;
+
+        let _ = journal
+            .acquire(OperationKind::Arm)
+            .unwrap()
+            .run(manager.arm_position_with_policy(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                create_test_risk_config(),
+                None,
+                Uuid::now_v7(),
+                EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::Automatic),
+            ))
+            .await;
+
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert_eq!(journal.gate().snapshot().entries_refused_ownership, 1);
+        journal.release_sweep(claim);
+        sweep.complete();
+        assert!(journal.claims_view().is_empty());
+    }
+
     /// A capital-capped immediate entry must ACTIVATE, not be denied by the
     /// risk gate's qty × entry round-trip (2026-07-04 prod incident: the
     /// Decimal round-trip exceeded capital by ~1e-22 and the gate rejected
@@ -12261,7 +13964,7 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
-    async fn test_losing_close_before_first_boundary_poll_keeps_a_valid_base(pool: sqlx::PgPool) {
+    async fn test_losing_close_before_first_boundary_poll_writes_no_zero_base(pool: sqlx::PgPool) {
         let manager = create_postgres_test_manager(pool.clone());
         let now = chrono::Utc::now();
 
@@ -12281,8 +13984,10 @@ mod tests {
         );
         apply_event_to_projections(&pool, &envelope).await.unwrap();
 
+        // No row, so no zero: the base is the configured capital, and invalid
+        // only because the month's reset has not landed.
         let snapshot = manager.canonical_budget_snapshot(now).await.unwrap();
-        assert!(!snapshot.capital_base_invalid);
+        assert!(snapshot.capital_base_invalid);
         assert_eq!(snapshot.capital_base, dec!(10000));
         assert!(!manager.evaluate_monthly_halt().await);
         assert!(!manager.circuit_breaker().blocks_new_entries().await);
@@ -14087,4 +15792,6 @@ mod tests {
         assert_eq!(ctx.open_positions.len(), 1, "active positions must still count after restart");
         assert_eq!(ctx.open_positions[0].symbol, "BTCUSDT");
     }
+
+    mod persistence;
 }

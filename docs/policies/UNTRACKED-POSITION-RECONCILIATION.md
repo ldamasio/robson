@@ -3,7 +3,7 @@
 **Status**: Active
 **Effective Date**: 2026-04-18
 **Owner**: Risk Engineering / robsond Runtime
-**Version**: 1.5
+**Version**: 1.7
 **Companion ADR**: [ADR-0022 — Robson-Authored Position Invariant](../adr/ADR-0022-robson-authored-position-invariant.md)
 
 ---
@@ -380,6 +380,17 @@ in-process event bus and SSE surface; the daemon logs them, but does not persist
 the required `position_untracked_detected` or `untracked_position_closed`
 events in `event_log`.
 
+Since ADR-0056 step 7 (PR O, part 2) the worker claims each position's symbol and
+side before it classifies it, and holds the claim through every submission of
+its close. A position whose symbol and side a live entry holds, from the entry's
+send until its operation ends, is not classified: the close is deferred to the
+next scan, logged and counted in `robsond_untracked_close_deferred_total`, since
+that inventory is the entry's (its leg tracks it once recorded). Meanwhile an
+entry that reaches its send while a close of its symbol and side is in flight
+is refused there, a typed no-send, counted in
+`robsond_entry_refused_ownership_total`. Base-asset inventory shared across spot
+symbols is step 8's.
+
 Since ADR-0056 step 6 (§5), when an exit or stop fill closes a leg whatever
 quantity executed, inventory the venue still holds is swept here as UNTRACKED even
 though it is traceable to a closed Robson leg. This is the approved rule for
@@ -458,6 +469,12 @@ The runtime MUST enforce I1/I2 with at least the following mechanisms:
    robsond-authored protective orders. Cancel errors are tolerated (logged, scan
    continues); each cancellation emits an `InsuranceStopOrphanCancelled` audit
    event. See [ADR-0039](../adr/ADR-0039-exchange-side-insurance-stop.md).
+   Since ADR-0056 step 7 (PR O, part 1) the sweep revalidates ownership before it
+   cancels, because it reads the legs before the open orders: an order a live
+   operation placed or is cancelling, or one a leg has recorded since, is kept
+   and counted in `robsond_orphan_cancel_owned_total`, not cancelled. While an
+   incident is open, the fence closed or the latch set, the sweep cancels no
+   orphan at all (ADR-0056 step 7, PR F).
 
 ---
 
@@ -607,6 +624,8 @@ Do not run this command against the current runtime; the endpoint does not exist
 | 1.3 | 2026-07-02 | Added orphan insurance-order sweep to Enforcement (ADR-0039). | Claude (glm-5.2) |
 | 1.4 | 2026-09-27 | Retired legacy PositionMonitor runtime wiring; documented current Futures `(symbol, side)` matching and the durable I2 audit gap. | Codex |
 | 1.5 | 2026-09-27 | Removed legacy PositionMonitor application artifacts; retained applied migrations and the infrastructure flag only for rollback safety. | Codex |
+| 1.6 | 2026-11-11 | The orphan insurance-order sweep revalidates ownership before it cancels, and withholds while anything is unresolved (ADR-0056 step 7, PRs O and F). | Claude Opus 5.5 |
+| 1.7 | 2026-11-11 | Current implementation boundary: a live entry's symbol and side defers the UNTRACKED close, and an entry is refused while a close of its symbol and side is in flight (ADR-0056 step 7, PR O, part 2). | Claude Opus 5.5 |
 
 ---
 

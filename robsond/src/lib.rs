@@ -49,6 +49,7 @@ pub mod daemon;
 pub mod detector;
 pub mod error;
 pub mod event_bus;
+mod event_streams;
 pub mod funding;
 pub mod google_jwks;
 pub mod market_data;
@@ -58,7 +59,10 @@ pub mod query;
 pub mod query_engine;
 pub mod reconciliation_worker;
 mod sse;
+#[cfg(test)]
+mod stack_budget_tests;
 pub mod startup_recovery;
+pub mod stop;
 pub mod venue;
 
 #[cfg(feature = "postgres")]
@@ -67,6 +71,8 @@ pub mod budget_basis_alarm;
 pub mod income_ledger;
 #[cfg(feature = "postgres")]
 pub mod order_journal_store;
+#[cfg(feature = "postgres")]
+pub mod process_epoch;
 
 #[cfg(feature = "postgres")]
 pub mod projection_worker;

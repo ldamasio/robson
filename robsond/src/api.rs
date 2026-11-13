@@ -21,7 +21,7 @@ use axum::{
     middleware::Next,
     response::{
         sse::{KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     routing::{delete, get, post},
     Json, Router,
@@ -36,6 +36,7 @@ use robson_domain::{
 #[cfg(feature = "postgres")]
 use robson_eventlog::{query_events, QueryOptions};
 use robson_exec::{
+    gate::{OperationKind, PermitRefusal},
     order_journal::OrderJournal,
     venue::{MarketKind, Venue, VenueId},
     ExchangePort, ExchangePosition, UniversalTransferType,
@@ -47,7 +48,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::warn;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -239,7 +240,8 @@ pub struct StatusResponse {
     /// Starting capital basis for the current month.
     pub capital_base: Decimal,
     /// Whether the persisted monthly budget basis is invalid under ADR-0051
-    /// §1 (`capital_base <= 0`).
+    /// §1 (`capital_base <= 0`, or the month's reset has not landed), or its
+    /// latent risk unresolved.
     pub monthly_budget_basis_invalid: bool,
     /// Current futures wallet balance reported by the exchange.
     pub wallet_balance: Decimal,
@@ -258,6 +260,12 @@ pub struct MonthlyPositionsResponse {
     pub positions: Vec<PositionSummary>,
     pub occupied_slots: usize,
     pub slot_cells_total: usize,
+    /// The month's basis cannot meter capacity, and its new-entry cells are
+    /// zero: for the current month, `capital_base <= 0` or its reset has not
+    /// landed (ADR-0051 §1); for any month, current or history, its system
+    /// stream is suspended (ADR-0056 step 7), whatever a release did.
+    #[serde(default)]
+    pub capacity_invalid: bool,
 }
 
 /// Durable audit events for one UTC calendar day, newest first.
@@ -769,11 +777,67 @@ where
         .route("/funding", get(funding_list_handler::<E, S>))
         .route("/capital/refresh", post(capital_refresh_handler::<E, S>));
     #[cfg(feature = "postgres")]
-    let authenticated =
-        authenticated.route("/recovery/disposition", post(recovery_disposition_handler::<E, S>));
+    let authenticated = authenticated
+        .route("/recovery/disposition", post(recovery_disposition_handler::<E, S>))
+        .route("/recovery/release", post(recovery_release_handler::<E, S>))
+        .route("/recovery/pending", get(recovery_pending_handler::<E, S>));
     let authenticated = authenticated.layer(auth_layer).with_state(state);
 
     read_only.merge(authenticated).layer(build_cors_layer())
+}
+
+// =============================================================================
+// Operation permits (ADR-0056 step 7)
+// =============================================================================
+
+/// Run one mutating API operation under its permit, taken here: before any
+/// manager lock, venue request or other mutation, and held until `work`
+/// returns. Handlers pass `work` boxed: a whole operation's future is large. A
+/// full class answers 503 `busy` and a stopping daemon 503 `stopping`, both at
+/// once and with nothing done.
+///
+/// The operation runs in its own task, which owns the permit; the handler only
+/// awaits its answer. A client that disconnects drops the handler, not the
+/// operation, which runs on to completion. One that panics drops its permit
+/// unfinished, so it is aborted and sets the latch, and the answer is 500.
+async fn permitted<E, S, R>(
+    state: &ApiState<E, S>,
+    kind: OperationKind,
+    work: impl std::future::Future<Output = R> + Send + 'static,
+) -> Response
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+    R: IntoResponse + Send + 'static,
+{
+    match state.order_journal.acquire(kind) {
+        Ok(permit) => match tokio::spawn(permit.run(work)).await {
+            Ok(answer) => answer.into_response(),
+            Err(failed) => {
+                error!(kind = kind.as_str(), error = %failed, "API operation failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { error: "operation failed".to_string() }),
+                )
+                    .into_response()
+            },
+        },
+        Err(refusal) => {
+            let error = match refusal {
+                PermitRefusal::Busy(class) => {
+                    crate::metrics::API_SLOT_BUSY.with_label_values(&[class.label()]).inc();
+                    warn!(kind = kind.as_str(), class = class.label(), "API slot class full");
+                    "busy"
+                },
+                PermitRefusal::Stopping(_) => "stopping",
+            };
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse { error: error.to_string() }),
+            )
+                .into_response()
+        },
+    }
 }
 
 // =============================================================================
@@ -1010,6 +1074,520 @@ where
     }
 }
 
+/// `POST /recovery/release` (ADR-0056 step 7, PR F, design §2.7): the
+/// operator's audited acceptance of the risk behind every open incident and
+/// uncertain intent up to the generation quoted, which must be the current one
+/// (`GET /recovery/pending` shows it).
+#[cfg(feature = "postgres")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseBody {
+    generation: i64,
+    note: String,
+    /// The accounting treatment of the remaining liabilities.
+    treatment: LiabilityTreatment,
+}
+
+/// What a release did.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReleaseResponse {
+    pub decision_id: Uuid,
+    pub generation: i64,
+    pub intents_tombstoned: u64,
+    pub incidents_released: u64,
+    /// Whether the admission fence opened. False when an occurrence moved the
+    /// generation meanwhile: the newer incident stays open, and so does the
+    /// fence.
+    pub fence_open: bool,
+}
+
+/// Why a release was refused, with what the operator needs to retry it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReleaseRefusedResponse {
+    /// `latched`, `stale`, `persisting` or `release_not_completed`.
+    pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<usize>,
+}
+
+/// Release is risk acceptance, never finality: it sets no venue outcome and
+/// books nothing. It takes no slot and no manager lock. Refused while the
+/// latch is set (a restart clears it), for a stale generation, and while
+/// anything waits to persist; then one transaction tombstones the uncertain
+/// intents at or below the generation and releases the incidents it covers,
+/// and the fence opens only if the generation did not move meanwhile.
+#[cfg(feature = "postgres")]
+async fn recovery_release_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    identity: Option<axum::Extension<OperatorIdentity>>,
+    Json(body): Json<ReleaseBody>,
+) -> Result<Json<ReleaseResponse>, (StatusCode, Json<ReleaseRefusedResponse>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    use robson_exec::order_journal::{ReleaseRecord, ReleaseRefusal};
+
+    let refused = |status: StatusCode, error: &str| {
+        (
+            status,
+            Json(ReleaseRefusedResponse {
+                error: error.to_string(),
+                current_generation: None,
+                pending: None,
+            }),
+        )
+    };
+    let Some(axum::Extension(identity)) = identity else {
+        return Err(refused(StatusCode::UNAUTHORIZED, "a verified identity is required"));
+    };
+    let note = body.note.trim();
+    if note.is_empty() {
+        return Err(refused(StatusCode::BAD_REQUEST, "a note is required"));
+    }
+    let record = ReleaseRecord {
+        decision_id: Uuid::now_v7(),
+        generation: body.generation,
+        actor: identity.subject,
+        auth_kind: identity.auth.as_str(),
+        note: note.to_string(),
+        treatment: body.treatment.as_str(),
+        decided_at: Utc::now(),
+    };
+    let (actor, auth_kind) = (record.actor.clone(), record.auth_kind);
+    let released = state.order_journal.release(record).await;
+    crate::metrics::observe_fence(&state.order_journal);
+    match released {
+        Ok(receipt) => {
+            warn!(
+                %actor,
+                auth_kind,
+                generation = receipt.generation,
+                intents_tombstoned = receipt.counts.intents_tombstoned,
+                incidents_released = receipt.counts.incidents_released,
+                fence_open = receipt.fence_open,
+                decision_id = %receipt.decision_id,
+                "Recovery release recorded: risk accepted, nothing booked"
+            );
+            Ok(Json(ReleaseResponse {
+                decision_id: receipt.decision_id,
+                generation: receipt.generation,
+                intents_tombstoned: receipt.counts.intents_tombstoned,
+                incidents_released: receipt.counts.incidents_released,
+                fence_open: receipt.fence_open,
+            }))
+        },
+        Err(ReleaseRefusal::Latched) => Err(refused(StatusCode::CONFLICT, "latched")),
+        Err(ReleaseRefusal::Stale { current }) => Err((
+            StatusCode::CONFLICT,
+            Json(ReleaseRefusedResponse {
+                error: "stale".to_string(),
+                current_generation: Some(current),
+                pending: None,
+            }),
+        )),
+        Err(ReleaseRefusal::Persisting { pending }) => Err((
+            StatusCode::CONFLICT,
+            Json(ReleaseRefusedResponse {
+                error: "persisting".to_string(),
+                current_generation: None,
+                pending: Some(pending),
+            }),
+        )),
+        Err(ReleaseRefusal::Backend(error)) => {
+            tracing::error!(%error, "Recovery release did not complete; the fence stays closed");
+            Err(refused(StatusCode::SERVICE_UNAVAILABLE, "release_not_completed"))
+        },
+    }
+}
+
+/// Items of one page of the pending list.
+pub const PENDING_PAGE_SIZE: usize = 100;
+
+/// One page of a pending collection, with its total.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingPage<T> {
+    pub total: u64,
+    pub items: Vec<T>,
+}
+
+impl<T> PendingPage<T> {
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    /// The page starting at `offset`, the one offset every collection of a
+    /// request shares.
+    fn of(all: Vec<T>, offset: usize) -> Self {
+        let total = all.len() as u64;
+        let items = all.into_iter().skip(offset).take(PENDING_PAGE_SIZE);
+        Self { total, items: items.collect() }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingIncident {
+    pub reason: String,
+    pub first_at: chrono::DateTime<Utc>,
+    pub last_at: chrono::DateTime<Utc>,
+    pub count: i64,
+    pub first_generation: i64,
+    pub last_generation: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingIntent {
+    pub intent_id: Uuid,
+    pub client_order_id: String,
+    pub kind: String,
+    pub position_id: Option<Uuid>,
+    pub cancels_order_id: Option<String>,
+    pub uncertain_at: Option<chrono::DateTime<Utc>>,
+    pub uncertain_generation: i64,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingOperation {
+    /// The permit's kind; `None` for an operation without one.
+    pub permit: Option<String>,
+    pub intents: Vec<PendingOperationIntent>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingOperationIntent {
+    pub client_order_id: String,
+    pub kind: String,
+    pub send_started: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingWrite {
+    /// `intent`, `suspension` or `incident`.
+    pub kind: String,
+    /// The client id, the stream key or the incident's reason.
+    pub key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingStream {
+    pub stream_key: String,
+    pub stream_kind: String,
+    pub failed_seq: Option<i64>,
+    pub repaired_through_seq: Option<i64>,
+    pub month: Option<NaiveDate>,
+    pub error: String,
+    pub repair_error: Option<String>,
+    pub suspended_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingLeg {
+    pub position_id: Uuid,
+    pub symbol: String,
+    pub side: String,
+    pub state: String,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingEpoch {
+    pub epoch_seq: i64,
+    /// Why this start was unclean; absent when it was clean.
+    pub unclean_reason: Option<String>,
+}
+
+/// `GET /recovery/pending` (design §2.8): what is unresolved and what a
+/// release would cover. Each collection is one page of at most 100 with its
+/// total; `?page=` selects the same page of each.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingResponse {
+    /// The current generation: the one a release must quote.
+    pub generation: i64,
+    pub fenced: bool,
+    pub latch: bool,
+    pub aborted_operations: u64,
+    pub unpermitted_mutations: u64,
+    pub epoch: Option<PendingEpoch>,
+    pub page: usize,
+    pub incidents: PendingPage<PendingIncident>,
+    /// Stamped, with no outcome and no tombstone: what a release quoting
+    /// their generation or a later one tombstones.
+    pub uncertain_intents: PendingPage<PendingIntent>,
+    /// From `operations_in_flight`: never released.
+    pub in_flight: PendingPage<PendingOperation>,
+    /// From `persistence_pending`: a release answers `persisting` while any.
+    pub persisting: PendingPage<PendingWrite>,
+    pub suspended_streams: PendingPage<PendingStream>,
+    /// Legs now `entering` or `exiting`.
+    pub legs_in_flight: PendingPage<PendingLeg>,
+    /// The orphan sweep's last report of the `ins-` orders it withheld
+    /// (design §2.9).
+    pub withheld_protective_orders: PendingWithheld,
+}
+
+/// The orphan sweep's last report: at most 500 orders listed, `total`
+/// counting every one withheld, `truncated` when some are not listed. The veto
+/// applied to every one.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingWithheld {
+    pub total: u64,
+    pub truncated: bool,
+    /// When the last scan reported; absent before the first.
+    pub at: Option<chrono::DateTime<Utc>>,
+    pub items: Vec<PendingWithheldOrder>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingWithheldOrder {
+    pub symbol: String,
+    pub exchange_order_id: String,
+    pub client_order_id: String,
+}
+
+#[cfg(feature = "postgres")]
+#[derive(Debug, Deserialize)]
+struct PendingQuery {
+    page: Option<usize>,
+}
+
+/// The pending list: memory (the gate, `operations_in_flight`,
+/// `persistence_pending`) and six SQL queries, a count and a page for each of
+/// three durable collections. No venue request, no manager lock. It requires
+/// an identity itself, as release and disposition do: with neither Google
+/// auth nor the legacy token configured the router lets a request through
+/// unauthenticated, and this answers 401 then.
+#[cfg(feature = "postgres")]
+async fn recovery_pending_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    identity: Option<axum::Extension<OperatorIdentity>>,
+    Query(query): Query<PendingQuery>,
+) -> Result<Json<PendingResponse>, (StatusCode, Json<ErrorResponse>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let fail = |status: StatusCode, message: &str| {
+        (status, Json(ErrorResponse { error: message.to_string() }))
+    };
+    if identity.is_none() {
+        return Err(fail(StatusCode::UNAUTHORIZED, "a verified identity is required"));
+    }
+    let (Some(pool), Some(tenant_id)) = (&state.pg_pool, state.tenant_id) else {
+        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "no database is configured"));
+    };
+    let page = query.page.unwrap_or(0);
+    // One offset for every collection, saturated once: a page past every total
+    // is empty in each, memory and SQL alike, and never overflows.
+    let offset = page.saturating_mul(PENDING_PAGE_SIZE);
+    let sql_offset = i64::try_from(offset).unwrap_or(i64::MAX);
+    let limit = PENDING_PAGE_SIZE as i64;
+    let journal = &state.order_journal;
+    let gate = journal.gate().snapshot();
+
+    let incidents = journal
+        .gate()
+        .open_incidents()
+        .into_iter()
+        .map(|incident| PendingIncident {
+            reason: incident.reason.as_str().to_string(),
+            first_at: incident.first_at,
+            last_at: incident.last_at,
+            count: incident.count,
+            first_generation: incident.first_generation,
+            last_generation: incident.last_generation,
+        })
+        .collect();
+    let in_flight = journal
+        .operations_in_flight_view()
+        .into_iter()
+        .map(|operation| PendingOperation {
+            permit: operation.permit.map(|kind| kind.as_str().to_string()),
+            intents: operation
+                .intents
+                .into_iter()
+                .map(|(client_order_id, kind, send_started)| PendingOperationIntent {
+                    client_order_id,
+                    kind: kind.as_str().to_string(),
+                    send_started,
+                })
+                .collect(),
+        })
+        .collect();
+    let persisting = journal
+        .pending_entries()
+        .into_iter()
+        .map(|entry| {
+            use robson_exec::order_journal::PendingEntry;
+            let (kind, key) = match entry {
+                PendingEntry::Intent(id) => ("intent", id),
+                PendingEntry::Suspension(key) => ("suspension", key),
+                PendingEntry::Incident(reason) => ("incident", reason.as_str().to_string()),
+            };
+            PendingWrite { kind: kind.to_string(), key }
+        })
+        .collect();
+
+    let unavailable = |error: sqlx::Error| {
+        tracing::error!(%error, "Reading the pending list failed");
+        fail(StatusCode::SERVICE_UNAVAILABLE, "database unavailable")
+    };
+    const UNCERTAIN: &str = "FROM order_intents WHERE tenant_id = $1 \
+        AND uncertain_generation IS NOT NULL AND venue_outcome IS NULL AND NOT not_sent \
+        AND disposition_kind IS NULL";
+    let uncertain_total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) {UNCERTAIN}"))
+        .bind(tenant_id)
+        .fetch_one(pool.as_ref())
+        .await
+        .map_err(unavailable)?;
+    type IntentRow = (
+        Uuid,
+        String,
+        String,
+        Option<Uuid>,
+        Option<String>,
+        Option<chrono::DateTime<Utc>>,
+        i64,
+        chrono::DateTime<Utc>,
+    );
+    let uncertain: Vec<IntentRow> = sqlx::query_as(&format!(
+        "SELECT intent_id, client_order_id, kind, position_id, cancels_order_id, uncertain_at, \
+         uncertain_generation, created_at {UNCERTAIN} \
+         ORDER BY uncertain_generation, created_at LIMIT $2 OFFSET $3"
+    ))
+    .bind(tenant_id)
+    .bind(limit)
+    .bind(sql_offset)
+    .fetch_all(pool.as_ref())
+    .await
+    .map_err(unavailable)?;
+
+    const SUSPENDED: &str = "FROM stream_suspensions WHERE tenant_id = $1 AND cleared_at IS NULL";
+    let suspended_total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) {SUSPENDED}"))
+        .bind(tenant_id)
+        .fetch_one(pool.as_ref())
+        .await
+        .map_err(unavailable)?;
+    type StreamRow = (
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<NaiveDate>,
+        String,
+        Option<String>,
+        chrono::DateTime<Utc>,
+    );
+    let suspended: Vec<StreamRow> = sqlx::query_as(&format!(
+        "SELECT stream_key, stream_kind, failed_seq, repaired_through_seq, month, error, \
+         repair_error, suspended_at {SUSPENDED} ORDER BY suspended_at LIMIT $2 OFFSET $3"
+    ))
+    .bind(tenant_id)
+    .bind(limit)
+    .bind(sql_offset)
+    .fetch_all(pool.as_ref())
+    .await
+    .map_err(unavailable)?;
+
+    const LEGS: &str = "FROM positions_current WHERE tenant_id = $1 \
+        AND state IN ('entering', 'exiting')";
+    let legs_total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) {LEGS}"))
+        .bind(tenant_id)
+        .fetch_one(pool.as_ref())
+        .await
+        .map_err(unavailable)?;
+    let legs: Vec<(Uuid, String, String, String, chrono::DateTime<Utc>)> =
+        sqlx::query_as(&format!(
+            "SELECT position_id, symbol, side, state, updated_at {LEGS} \
+             ORDER BY updated_at LIMIT $2 OFFSET $3"
+        ))
+        .bind(tenant_id)
+        .bind(limit)
+        .bind(sql_offset)
+        .fetch_all(pool.as_ref())
+        .await
+        .map_err(unavailable)?;
+
+    let total = |count: i64| u64::try_from(count).unwrap_or(0);
+    let report = journal.withheld_report();
+    let withheld_protective_orders = PendingWithheld {
+        total: report.total,
+        truncated: report.truncated,
+        at: report.at,
+        items: report
+            .orders
+            .into_iter()
+            .skip(offset)
+            .take(PENDING_PAGE_SIZE)
+            .map(|order| PendingWithheldOrder {
+                symbol: order.symbol,
+                exchange_order_id: order.exchange_order_id,
+                client_order_id: order.client_order_id,
+            })
+            .collect(),
+    };
+    Ok(Json(PendingResponse {
+        generation: gate.generation,
+        fenced: gate.fenced,
+        latch: journal.latch_set(),
+        aborted_operations: gate.aborted,
+        unpermitted_mutations: gate.unpermitted,
+        epoch: journal.gate().epoch().map(|epoch| PendingEpoch {
+            epoch_seq: epoch.epoch_seq,
+            unclean_reason: epoch.unclean_reason.map(str::to_string),
+        }),
+        page,
+        incidents: PendingPage::of(incidents, offset),
+        uncertain_intents: PendingPage {
+            total: total(uncertain_total),
+            items: uncertain
+                .into_iter()
+                .map(|row| PendingIntent {
+                    intent_id: row.0,
+                    client_order_id: row.1,
+                    kind: row.2,
+                    position_id: row.3,
+                    cancels_order_id: row.4,
+                    uncertain_at: row.5,
+                    uncertain_generation: row.6,
+                    created_at: row.7,
+                })
+                .collect(),
+        },
+        in_flight: PendingPage::of(in_flight, offset),
+        persisting: PendingPage::of(persisting, offset),
+        suspended_streams: PendingPage {
+            total: total(suspended_total),
+            items: suspended
+                .into_iter()
+                .map(|row| PendingStream {
+                    stream_key: row.0,
+                    stream_kind: row.1,
+                    failed_seq: row.2,
+                    repaired_through_seq: row.3,
+                    month: row.4,
+                    error: row.5,
+                    repair_error: row.6,
+                    suspended_at: row.7,
+                })
+                .collect(),
+        },
+        legs_in_flight: PendingPage {
+            total: total(legs_total),
+            items: legs
+                .into_iter()
+                .map(|(position_id, symbol, side, state, updated_at)| PendingLeg {
+                    position_id,
+                    symbol,
+                    side,
+                    state,
+                    updated_at,
+                })
+                .collect(),
+        },
+        withheld_protective_orders,
+    }))
+}
+
 async fn metrics_handler() -> impl IntoResponse {
     let body = crate::metrics::render();
     (
@@ -1078,8 +1656,24 @@ where
     )
 }
 
+/// `POST /funding/execute`, ordinary class: the saga can convert and transfer
+/// before it reaches the manager, so the slot is taken first.
 #[cfg(feature = "postgres")]
 async fn funding_execute_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    headers: HeaderMap,
+    Json(request): Json<ExecuteFundingRequest>,
+) -> Response
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let work = Box::pin(funding_execute(State(Arc::clone(&state)), headers, Json(request)));
+    permitted(&state, OperationKind::FundingExecute, work).await
+}
+
+#[cfg(feature = "postgres")]
+async fn funding_execute<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
     headers: HeaderMap,
     Json(request): Json<ExecuteFundingRequest>,
@@ -1149,7 +1743,26 @@ where
         .into_response()
 }
 
+/// `POST /funding/recover-spot-usdt-to-futures`. A request that executes takes
+/// an ordinary slot before its first venue read; a dry run mutates nothing and
+/// takes none.
 async fn funding_recover_spot_usdt_to_futures_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Json(request): Json<FundingRecoverSpotUsdtRequest>,
+) -> Response
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let executes = request.execute && !request.dry_run;
+    let work = Box::pin(recover_spot_usdt(State(Arc::clone(&state)), Json(request)));
+    if !executes {
+        return work.await.into_response();
+    }
+    permitted(&state, OperationKind::RecoverSpotUsdt, work).await
+}
+
+async fn recover_spot_usdt<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
     Json(request): Json<FundingRecoverSpotUsdtRequest>,
 ) -> impl IntoResponse
@@ -1860,11 +2473,17 @@ where
     let occupied_slots = positions.len();
     let inherited_slots =
         positions.iter().filter(|position| position.created_at < requested).count();
-    let base_slots_available = TradingPolicy::default().slots_available(
-        monthly.capital_base,
-        realized_loss,
-        Decimal::ZERO,
-    ) as usize;
+    let now = chrono::Utc::now();
+    let current_month = (requested.year(), requested.month()) == (now.year(), now.month());
+    // A suspended month stays untrusted after it becomes history: a later month
+    // does not make it right (ADR-0056 step 7, design §2.5).
+    let capacity_invalid = (current_month && monthly.basis_invalid()) || monthly.month_suspended;
+    let base_slots_available = if capacity_invalid {
+        0
+    } else {
+        TradingPolicy::default().slots_available(monthly.capital_base, realized_loss, Decimal::ZERO)
+            as usize
+    };
     let slot_cells_total = base_slots_available.saturating_add(inherited_slots);
 
     Ok(Json(MonthlyPositionsResponse {
@@ -1872,6 +2491,7 @@ where
         positions,
         occupied_slots,
         slot_cells_total,
+        capacity_invalid,
     }))
 }
 
@@ -1916,8 +2536,21 @@ where
     ))
 }
 
-/// Arm a new position.
+/// `POST /positions`, ordinary class.
 async fn arm_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Json(req): Json<ArmRequest>,
+) -> Response
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let work = Box::pin(arm(State(Arc::clone(&state)), Json(req)));
+    permitted(&state, OperationKind::Arm, work).await
+}
+
+/// Arm a new position.
+async fn arm<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
     Json(req): Json<ArmRequest>,
 ) -> Result<(StatusCode, Json<ArmResponse>), (StatusCode, Json<ErrorResponse>)>
@@ -1964,17 +2597,21 @@ where
     //
     // The caller never supplies capital. Position sizing is derived:
     //   position_size = (capital_base × 1%) / technical_stop_distance
+    //
+    // A month whose reset has not landed answers 503: its basis did not come
+    // from the operated wallet.
     let capital = {
         let manager = state.position_manager.read().await;
-        manager.load_capital_base_for_month(chrono::Utc::now()).await
+        manager.admission_capital_base(chrono::Utc::now()).await
     };
-    let capital = capital.map_err(|e| {
-        (
+    let capital = capital.map_err(|e| match e {
+        DaemonError::AdmissionsClosed { .. } => to_error_response(e),
+        e => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: format!("Failed to load capital base: {}", e),
             }),
-        )
+        ),
     })?;
     // Rebuild from the engine snapshot so the operator-configured
     // execution-cost parameters survive the capital swap (ADR-0039).
@@ -2020,8 +2657,21 @@ where
     ))
 }
 
-/// Cancel an Armed position or close an Active position.
+/// `DELETE /positions/:id`, protective class.
 async fn cancel_or_close_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Path(id): Path<Uuid>,
+) -> Response
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let work = Box::pin(cancel_or_close(State(Arc::clone(&state)), Path(id)));
+    permitted(&state, OperationKind::CancelOrClose, work).await
+}
+
+/// Cancel an Armed position or close an Active position.
+async fn cancel_or_close<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)>
@@ -2035,8 +2685,22 @@ where
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Inject a signal (for testing).
+/// `POST /positions/:id/signal`, ordinary class.
 async fn signal_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<SignalRequest>,
+) -> Response
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let work = Box::pin(inject_signal(State(Arc::clone(&state)), Path(id), Json(req)));
+    permitted(&state, OperationKind::Signal, work).await
+}
+
+/// Inject a signal (for testing).
+async fn inject_signal<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
     Path(id): Path<Uuid>,
     Json(req): Json<SignalRequest>,
@@ -2093,8 +2757,18 @@ where
     Ok(StatusCode::OK)
 }
 
+/// `POST /panic`, protective class.
+async fn panic_handler<E, S>(State(state): State<Arc<ApiState<E, S>>>) -> Response
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let work = Box::pin(panic_close_all(State(Arc::clone(&state))));
+    permitted(&state, OperationKind::Panic, work).await
+}
+
 /// Emergency close all positions.
-async fn panic_handler<E, S>(
+async fn panic_close_all<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
 ) -> Result<Json<PanicResponse>, (StatusCode, Json<ErrorResponse>)>
 where
@@ -2110,8 +2784,21 @@ where
     }))
 }
 
-/// Approve a pending query and resume execution.
+/// `POST /queries/:id/approve`, ordinary class.
 async fn approve_query_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Path(id): Path<Uuid>,
+) -> Response
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let work = Box::pin(approve_query(State(Arc::clone(&state)), Path(id)));
+    permitted(&state, OperationKind::Approve, work).await
+}
+
+/// Approve a pending query and resume execution.
+async fn approve_query<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApproveQueryResponse>, (StatusCode, Json<ErrorResponse>)>
@@ -2128,12 +2815,26 @@ where
     }))
 }
 
+/// `POST /reconcile-close`, protective class: MonthlyHalt and `/panic` are
+/// reachable under its permit.
+async fn reconcile_close_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Json(req): Json<ReconcileCloseRequest>,
+) -> Response
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let work = Box::pin(reconcile_close(State(Arc::clone(&state)), Json(req)));
+    permitted(&state, OperationKind::ReconcileClose, work).await
+}
+
 /// `POST /reconcile-close` — operator-driven manual reconciliation close.
 ///
 /// Accepts real evidence (`OrderFillRecord` or `UserTradeRecord`) and closes
 /// a stale-Active position. Rejects `AccountSnapshot` and `Estimated` in
 /// Slice 5B1.
-async fn reconcile_close_handler<E, S>(
+async fn reconcile_close<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
     Json(req): Json<ReconcileCloseRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)>
@@ -2544,6 +3245,19 @@ where
     Json(snap.into())
 }
 
+/// `POST /monthly-halt`, protective class.
+async fn monthly_halt_trigger_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Json(req): Json<MonthlyHaltTriggerRequest>,
+) -> Response
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let work = Box::pin(trigger_monthly_halt(State(Arc::clone(&state)), Json(req)));
+    permitted(&state, OperationKind::MonthlyHalt, work).await
+}
+
 /// POST /monthly-halt — operator-initiated conservative MonthlyHalt trigger.
 ///
 /// Idempotent: if already in MonthlyHalt, returns current status without
@@ -2552,7 +3266,7 @@ where
 ///
 /// Note: there is no reset endpoint. MonthlyHalt persists until next calendar
 /// month. Allowing a reset without explicit policy evidence is not permitted.
-async fn monthly_halt_trigger_handler<E, S>(
+async fn trigger_monthly_halt<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
     Json(req): Json<MonthlyHaltTriggerRequest>,
 ) -> Result<Json<MonthlyHaltStatusResponse>, (StatusCode, Json<ErrorResponse>)>
@@ -2582,6 +3296,7 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::ApprovalDenied { .. } => StatusCode::CONFLICT,
         DaemonError::MonthlyHaltActive { .. } => StatusCode::SERVICE_UNAVAILABLE,
         DaemonError::ResidualInventoryUnresolved { .. } => StatusCode::CONFLICT,
+        DaemonError::AdmissionsClosed { .. } => StatusCode::SERVICE_UNAVAILABLE,
         DaemonError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // Exchange transport failures are upstream errors, not client errors.
         // Immediate-mode arm calls handle_signal synchronously; a connection or
@@ -2592,10 +3307,13 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::Exec(robson_exec::ExecError::Exchange(_))
         | DaemonError::Exec(robson_exec::ExecError::RulesRejected(_))
         | DaemonError::Exec(robson_exec::ExecError::ReduceOnlyRejected(_))
+        | DaemonError::Exec(robson_exec::ExecError::SendRefused(_))
         | DaemonError::Exec(robson_exec::ExecError::Timeout(_)) => StatusCode::BAD_GATEWAY,
         DaemonError::Exec(_) => StatusCode::BAD_REQUEST,
         DaemonError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        DaemonError::EventLog(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        DaemonError::EventLog(_) | DaemonError::StreamSuspended { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        },
         #[cfg(feature = "postgres")]
         DaemonError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         #[cfg(feature = "postgres")]
@@ -3226,10 +3944,10 @@ mod tests {
     };
     use robson_engine::Engine;
     use robson_exec::{
-        ExchangePort, ExchangePosition, ExecError, Executor, FuturesBalance, FuturesSettings,
-        IntentJournal, OpenOrderRecord, OrderResult, SpotBalance, SpotOrder, SpotOrderRequest,
-        StopCancelOutcome, StubExchange, Transfer, TransferId, UniversalTransferType,
-        UserTradeRecord,
+        gate::SlotClass, order_journal::Permit, ExchangePort, ExchangePosition, ExecError,
+        Executor, FuturesBalance, FuturesSettings, IntentJournal, OpenOrderRecord, OrderResult,
+        SpotBalance, SpotOrder, SpotOrderRequest, StopCancelOutcome, StubExchange, Transfer,
+        TransferId, UniversalTransferType, UserTradeRecord,
     };
     use robson_store::MemoryStore;
     use rust_decimal::Decimal;
@@ -3428,6 +4146,7 @@ mod tests {
         let position_manager = Arc::new(RwLock::new(manager));
         let circuit_breaker = position_manager.read().await.circuit_breaker();
 
+        let order_journal = position_manager.read().await.order_journal();
         Arc::new(ApiState {
             exchange,
             position_manager,
@@ -3443,7 +4162,7 @@ mod tests {
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
-            order_journal: Arc::new(OrderJournal::unpersisted()),
+            order_journal,
         })
     }
 
@@ -3710,6 +4429,7 @@ mod tests {
         )
         .with_event_log(pool.clone(), tenant_id);
         let circuit_breaker = manager.circuit_breaker();
+        let order_journal = manager.order_journal();
         let app = create_router(Arc::new(ApiState {
             exchange,
             position_manager: Arc::new(RwLock::new(manager)),
@@ -3723,7 +4443,7 @@ mod tests {
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
-            order_journal: Arc::new(OrderJournal::unpersisted()),
+            order_journal,
         }));
 
         // Each close is a net loss of 100 on a base of 10000: budget 400, one
@@ -3787,6 +4507,120 @@ mod tests {
 
         seed_close(month_start(2027, 4)).await;
         assert_eq!(view().await, (2, 2), "close exactly at the month's start");
+    }
+
+    /// Until the current month's reset lands, `/status` and that month's view
+    /// report the basis invalid with no new-entry capacity, and an arm answers
+    /// 503 with nothing armed. A row the peak writer created reads the same.
+    /// Once the reset stamps the row, both report capacity and the arm goes
+    /// through.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_month_without_a_landed_reset_reports_no_capacity(pool: sqlx::PgPool) {
+        let tenant_id = Uuid::now_v7();
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        let store = Arc::new(MemoryStore::new());
+        let executor = Arc::new(Executor::new(
+            Arc::clone(&exchange),
+            Arc::new(IntentJournal::new()),
+            store.clone(),
+        ));
+        let event_bus = Arc::new(crate::event_bus::EventBus::new(100));
+        let manager = PositionManager::new(
+            Engine::new(RiskConfig::new(dec!(10000)).unwrap()),
+            executor,
+            store.clone(),
+            Arc::clone(&event_bus),
+            Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
+        )
+        .with_event_log(pool.clone(), tenant_id);
+        let circuit_breaker = manager.circuit_breaker();
+        let order_journal = manager.order_journal();
+        let app = create_router(Arc::new(ApiState {
+            exchange,
+            position_manager: Arc::new(RwLock::new(manager)),
+            event_bus,
+            circuit_breaker,
+            wallet_balance_cache: Mutex::new(None),
+            pg_pool: Some(Arc::new(pool.clone())),
+            tenant_id: Some(tenant_id),
+            google_auth: None,
+            legacy_api_token: None,
+            funding: FundingConfig::default(),
+            funding_route_mode: FundingRouteMode::Selected,
+            venue_feed: VenueFeedView::default(),
+            order_journal,
+        }));
+        let now = chrono::Utc::now();
+        let this_month = format!("{:04}-{:02}", now.year(), now.month());
+        let capacity = || async {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri("/status").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let status: StatusResponse = serde_json::from_slice(&body).unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/positions?month={this_month}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let month: MonthlyPositionsResponse = serde_json::from_slice(&body).unwrap();
+            (
+                status.monthly_budget_basis_invalid,
+                status.new_slots_available,
+                month.capacity_invalid,
+                month.slot_cells_total,
+            )
+        };
+        let arm = || async {
+            let body = serde_json::json!({ "symbol": "BTCUSDT", "side": "long" });
+            app.clone()
+                .oneshot(api_request("POST", "/positions", Some(body)))
+                .await
+                .unwrap()
+                .status()
+        };
+
+        assert_eq!(capacity().await, (true, 0, true, 0), "no row");
+        assert_eq!(arm().await, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(store.positions().find_active().await.unwrap().is_empty());
+
+        sqlx::query(
+            "INSERT INTO monthly_state (year, month, capital_base, month_peak_net, created_at) \
+             VALUES ($1, $2, 10000, 0, $3)",
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(capacity().await, (true, 0, true, 0), "a row no reset stamped");
+        assert_eq!(arm().await, StatusCode::SERVICE_UNAVAILABLE);
+
+        sqlx::query(
+            "UPDATE monthly_state SET boundary_reset_at = $3 WHERE year = $1 AND month = $2",
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(capacity().await, (false, 4, false, 4), "the reset landed");
+        assert_eq!(arm().await, StatusCode::CREATED);
     }
 
     #[tokio::test]
@@ -3866,6 +4700,56 @@ mod tests {
         assert_eq!(may_month.positions[0].id, ada_armed.id);
         assert_eq!(may_month.positions[1].id, btc_long.id);
         assert_eq!(may_month.positions[2].id, btc_short.id);
+    }
+
+    /// A month whose system stream is suspended reports no new-entry capacity,
+    /// and keeps reporting it once it is history: the month after it does not
+    /// make it right, and neither does a release (ADR-0056 step 7, design
+    /// §2.5). Its inherited cells still show; the month after it is unaffected.
+    #[tokio::test]
+    async fn a_suspended_month_reports_no_capacity_as_history_too() {
+        let (app, _event_bus, position_manager) = create_test_app_with_event_bus(100).await;
+        let april = month_start(2026, 4);
+        let mut inherited =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        inherited.created_at = april - chrono::Duration::days(2);
+        inherited.updated_at = april + chrono::Duration::days(3);
+        inherited.state = PositionState::Armed;
+        inherited.entry_price = Some(Price::new(dec!(100)).unwrap());
+        {
+            let manager = position_manager.write().await;
+            manager.store().positions().save(&inherited).await.unwrap();
+        }
+        let view = |month: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/positions?month={month}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let month: MonthlyPositionsResponse = serde_json::from_slice(&body).unwrap();
+                (month.capacity_invalid, month.occupied_slots, month.slot_cells_total)
+            }
+        };
+        assert_eq!(view("2026-04").await, (false, 1, 5), "trusted: four new cells");
+
+        position_manager.read().await.event_streams().restore([(
+            "system:month_boundary:2026-04".to_string(),
+            crate::event_streams::Suspended {
+                suspension_id: Uuid::now_v7(),
+                stream: crate::event_streams::ManagedStream::Month { year: 2026, month: 4 },
+                repaired_through_seq: None,
+            },
+        )]);
+        assert_eq!(view("2026-04").await, (true, 1, 1), "only the inherited cell");
+        assert!(!view("2026-05").await.0, "the next month is its own");
     }
 
     #[tokio::test]
@@ -3978,6 +4862,9 @@ mod tests {
         );
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
+        // As the daemon wires it: the stub's mutations pass the executor
+        // journal's gate (ADR-0056 step 7).
+        exchange.attach_gate(Arc::clone(executor.order_journal().gate()));
         let event_bus = Arc::new(crate::event_bus::EventBus::new(capacity));
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
@@ -4009,7 +4896,7 @@ mod tests {
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
-            order_journal: Arc::new(OrderJournal::unpersisted()),
+            order_journal: position_manager.read().await.order_journal(),
         });
 
         (create_router(state), event_bus, position_manager, exchange)
@@ -4037,6 +4924,7 @@ mod tests {
         let position_manager = Arc::new(RwLock::new(manager));
         let circuit_breaker = position_manager.read().await.circuit_breaker();
 
+        let order_journal = position_manager.read().await.order_journal();
         let state = Arc::new(ApiState {
             exchange,
             position_manager,
@@ -4052,7 +4940,7 @@ mod tests {
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
-            order_journal: Arc::new(OrderJournal::unpersisted()),
+            order_journal,
         });
 
         create_router(state)
@@ -4157,6 +5045,16 @@ mod tests {
         journal: Arc<OrderJournal>,
         legacy: Option<&str>,
     ) -> Router {
+        recovery_app(pool, journal, legacy, None).await
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn recovery_app(
+        pool: sqlx::PgPool,
+        journal: Arc<OrderJournal>,
+        legacy: Option<&str>,
+        tenant_id: Option<Uuid>,
+    ) -> Router {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(
@@ -4182,7 +5080,7 @@ mod tests {
             circuit_breaker,
             wallet_balance_cache: Mutex::new(None),
             pg_pool: Some(Arc::new(pool)),
-            tenant_id: None,
+            tenant_id,
             google_auth: legacy.is_some().then(test_google_auth_config),
             legacy_api_token: legacy.map(str::to_string),
             funding: FundingConfig::default(),
@@ -5084,8 +5982,14 @@ mod tests {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         exchange.set_spot_balance("USDT", dec!(25), Decimal::ZERO);
         exchange.set_futures_balance(dec!(100));
-        let (app, _, _, exchange) =
+        let (app, _, position_manager, exchange) =
             create_test_app_with_event_bus_and_exchange(100, exchange).await;
+        // A dry run mutates nothing and takes no slot: it answers with the
+        // ordinary class full (ADR-0056 step 7).
+        let journal = position_manager.read().await.order_journal();
+        let held: Vec<_> = (0..robson_exec::gate::ORDINARY_API_SLOTS)
+            .map(|_| journal.acquire(OperationKind::Arm).unwrap())
+            .collect();
 
         let body = serde_json::json!({ "asset": "USDT", "dry_run": true });
         let response = app
@@ -5108,6 +6012,7 @@ mod tests {
         assert_eq!(json.amount, dec!(25));
         assert_eq!(json.spot_usdt_after_expected, dec!(25));
         assert_eq!(json.futures_usdt_wallet_after_expected, dec!(100));
+        held.into_iter().for_each(Permit::complete);
     }
 
     #[tokio::test]
@@ -5179,6 +6084,7 @@ mod tests {
         assert_eq!(json.spot_usdt_after_actual, Some(Decimal::ZERO));
         assert_eq!(json.futures_usdt_wallet_after_actual, Some(dec!(125)));
         assert_eq!(json.correlation_id, "test-recover-usdt");
+        assert_every_mutation_under(&exchange, OperationKind::RecoverSpotUsdt);
     }
 
     // #[tokio::test]
@@ -5759,6 +6665,282 @@ mod tests {
         std::env::remove_var("ROBSON_CORS_ALLOWED_ORIGINS");
     }
 
+    // ---- ADR-0056 step 7, PR F: POST /recovery/release, GET /recovery/pending
+
+    /// A pool that never connects: for routes that must not reach a database.
+    #[cfg(feature = "postgres")]
+    fn unreachable_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .unwrap()
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn post_release(app: &Router, bearer: Option<&str>, body: Value) -> (StatusCode, Value) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/recovery/release")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(bearer) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    #[cfg(feature = "postgres")]
+    fn release_body(generation: i64, note: &str) -> Value {
+        json!({ "generation": generation, "note": note, "treatment": "unbooked_accepted" })
+    }
+
+    /// The release endpoint: authenticated; a note and the treatment are
+    /// mandatory; a stale generation answers 409 with the current one, a write
+    /// still persisting 409 `persisting`, a latch 409 `latched`; the current
+    /// generation releases and opens the fence. No manager lock, no slot.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn the_release_endpoint_refuses_until_it_can_release() {
+        use robson_exec::{gate::IncidentReason, order_journal::StubJournalBackend};
+
+        let backend = Arc::new(StubJournalBackend::default());
+        let journal = Arc::new(OrderJournal::new(backend.clone(), &VenueId::new("test:venue")));
+        journal.gate().record(IncidentReason::UncleanStart);
+        let app = recovery_app(unreachable_pool(), Arc::clone(&journal), Some(LEGACY), None).await;
+        let current = journal.gate().generation();
+
+        let (status, _) = post_release(&app, None, release_body(current, "x")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = post_release(&app, Some(LEGACY), release_body(current, "  ")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) =
+            post_release(&app, Some(LEGACY), json!({ "generation": current, "note": "x" })).await;
+        assert!(status.is_client_error(), "a treatment is mandatory: {status} {body}");
+
+        let (status, body) = post_release(&app, Some(LEGACY), release_body(current, "x")).await;
+        assert_eq!((status, body["error"].clone()), (StatusCode::CONFLICT, json!("persisting")));
+        journal.flush_pending().await;
+        let (status, body) = post_release(&app, Some(LEGACY), release_body(current - 1, "x")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "stale");
+        assert_eq!(body["current_generation"], current);
+        assert!(journal.gate().fenced());
+
+        let (status, body) = post_release(&app, Some(LEGACY), release_body(current, "x")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            (body["fence_open"].clone(), body["incidents_released"].clone()),
+            (json!(true), json!(1))
+        );
+        assert!(!journal.gate().fenced());
+        let recorded = &backend.releases()[0];
+        assert_eq!(
+            (recorded.actor.as_str(), recorded.auth_kind),
+            ("legacy-bearer-token", "asserted")
+        );
+
+        journal.gate().record(IncidentReason::OperationAborted);
+        journal.flush_pending().await;
+        let latest = journal.gate().generation();
+        let (status, body) = post_release(&app, Some(LEGACY), release_body(latest, "x")).await;
+        assert_eq!((status, body["error"].clone()), (StatusCode::CONFLICT, json!("latched")));
+        assert!(journal.gate().fenced());
+    }
+
+    /// Design §2.8: the pending list shows the current generation, the open
+    /// incidents, the uncertain intents a release would tombstone, what is in
+    /// flight and persisting, the suspended streams, the legs entering or
+    /// exiting and the epoch; each paged at 100 with its total. Authenticated.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn the_pending_list_shows_what_a_release_would_cover(pool: sqlx::PgPool) {
+        use robson_exec::{
+            gate::{EpochView, IncidentReason},
+            order_journal::{IntentKind, IntentSpec, WriteClass},
+        };
+
+        let tenant = Uuid::now_v7();
+        let backend = crate::order_journal_store::PgJournalBackend::new(&pool, tenant);
+        let journal = Arc::new(OrderJournal::new(Arc::new(backend), &VenueId::new("test:venue")));
+        journal.gate().begin_epoch(
+            EpochView {
+                epoch_seq: 3,
+                unclean_reason: Some("no_marker"),
+            },
+            None,
+            Vec::new(),
+        );
+        // 101 uncertain intents: two pages.
+        let ledger = robson_exec::venue::SubmitAttemptLedger::new(256);
+        let operation = journal.begin_operation();
+        operation
+            .scope(async {
+                for index in 0..101 {
+                    let id = format!("x{index:03}");
+                    let intent = journal.open_intent(IntentSpec {
+                        position_id: None,
+                        kind: IntentKind::Exit,
+                        client_order_id: id.clone(),
+                        cancels_order_id: None,
+                        params: json!({}),
+                    });
+                    journal.before_send(&intent, WriteClass::Bounded).await.unwrap();
+                    let _ = ledger.begin(&id);
+                    journal.finish_failed(&intent).await;
+                }
+                // One in flight: committed, not finished.
+                let open = journal.open_intent(IntentSpec {
+                    position_id: None,
+                    kind: IntentKind::Exit,
+                    client_order_id: "in-flight".to_string(),
+                    cancels_order_id: None,
+                    params: json!({}),
+                });
+                journal.before_send(&open, WriteClass::Bounded).await.unwrap();
+            })
+            .await;
+        // A suspended stream and a leg entering, on record.
+        sqlx::query(
+            "INSERT INTO stream_suspensions (suspension_id, tenant_id, stream_key, stream_kind, \
+                 month, error, suspended_at) \
+             VALUES ($1, $2, 'system:month_boundary:2026-10', 'system', '2026-10-01', 'x', NOW())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO positions_current (position_id, tenant_id, account_id, symbol, side, \
+                 current_quantity, state, last_event_id, last_seq, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'BTCUSDT', 'long', 1, 'entering', $4, 1, NOW(), NOW())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant)
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .unwrap();
+        journal.gate().record(IncidentReason::UnlandedSend);
+        // The orphan sweep's last report (part 4).
+        let mut report = robson_exec::order_journal::WithheldReport::default();
+        for index in 0..2 {
+            report.withhold(robson_exec::order_journal::WithheldOrder {
+                symbol: "BTCUSDT".to_string(),
+                exchange_order_id: format!("{index}"),
+                client_order_id: format!("ins-{index}"),
+            });
+        }
+        journal.replace_withheld_report(report);
+
+        let app =
+            recovery_app(pool.clone(), Arc::clone(&journal), Some(LEGACY), Some(tenant)).await;
+        let get = |page: u64| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/recovery/pending?page={page}"))
+                            .header(header::AUTHORIZATION, format!("Bearer {LEGACY}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                serde_json::from_slice::<PendingResponse>(&bytes).unwrap()
+            }
+        };
+        let pending = get(0).await;
+        assert_eq!(pending.generation, journal.gate().generation());
+        assert_eq!(pending.generation, (3 << 32) | 102);
+        assert!(pending.fenced && pending.latch);
+        assert_eq!(pending.epoch.as_ref().unwrap().unclean_reason.as_deref(), Some("no_marker"));
+        let reasons: Vec<_> = pending.incidents.items.iter().map(|i| i.reason.as_str()).collect();
+        assert_eq!(reasons, ["uncertain_outcome", "unlanded_send"]);
+        assert_eq!(pending.incidents.items[0].count, 101);
+        assert_eq!(
+            (pending.uncertain_intents.total, pending.uncertain_intents.items.len()),
+            (101, 100)
+        );
+        assert_eq!(pending.uncertain_intents.items[0].uncertain_generation, (3 << 32) | 1);
+        assert_eq!(pending.in_flight.total, 1);
+        let listed = &pending.in_flight.items[0].intents;
+        assert!(listed.iter().any(|i| i.client_order_id == "in-flight" && !i.send_started));
+        assert_eq!(pending.persisting.total, 2, "both incidents' upserts");
+        assert_eq!(pending.suspended_streams.total, 1);
+        assert_eq!(pending.suspended_streams.items[0].month, NaiveDate::from_ymd_opt(2026, 10, 1));
+        assert_eq!(pending.legs_in_flight.total, 1);
+        assert_eq!(pending.legs_in_flight.items[0].state, "entering");
+        let withheld = &pending.withheld_protective_orders;
+        assert_eq!((withheld.total, withheld.truncated, withheld.items.len()), (2, false, 2));
+        assert_eq!(withheld.items[1].client_order_id, "ins-1");
+
+        let second = get(1).await;
+        assert_eq!(
+            (second.uncertain_intents.total, second.uncertain_intents.items.len()),
+            (101, 1)
+        );
+        assert_eq!(second.uncertain_intents.items[0].client_order_id, "x100");
+        // Review round 1: a page past every total, as far as the query takes
+        // it, is empty in every collection, memory and SQL alike, with the
+        // totals kept; it never overflows.
+        let past = get(u64::MAX).await;
+        assert_eq!(past.page, usize::MAX);
+        assert_eq!(past.uncertain_intents.total, 101);
+        assert_eq!(past.incidents.total, 2);
+        assert_eq!(past.in_flight.total, 1);
+        assert!(past.uncertain_intents.items.is_empty());
+        assert!(past.incidents.items.is_empty() && past.in_flight.items.is_empty());
+        assert!(past.persisting.items.is_empty() && past.legs_in_flight.items.is_empty());
+        let withheld = &past.withheld_protective_orders;
+        assert_eq!((withheld.total, withheld.items.len()), (2, 0), "the report pages the same");
+        drop(operation);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(Request::builder().uri("/recovery/pending").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Review round 1: the pending list requires an identity itself. With
+    /// neither Google auth nor the legacy token configured the router lets a
+    /// request through unauthenticated, and the list answers 401, as release
+    /// and disposition do.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn the_pending_list_requires_an_identity_even_with_auth_unconfigured() {
+        let journal = Arc::new(OrderJournal::unpersisted());
+        let app = recovery_app(unreachable_pool(), journal, None, Some(Uuid::now_v7())).await;
+        let response = app
+            .oneshot(Request::builder().uri("/recovery/pending").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// One offset, saturated, for every memory collection: past the end is
+    /// empty, never an overflow.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn a_pending_page_past_its_end_is_empty() {
+        let page = PendingPage::of(vec![1, 2, 3], usize::MAX);
+        assert_eq!((page.total, page.items.len()), (3, 0));
+        let page = PendingPage::of((0..250).collect::<Vec<_>>(), 200);
+        assert_eq!((page.total, page.items), (250, (200..250).collect::<Vec<_>>()));
+    }
+
     // =========================================================================
     // Reconcile Close API Tests (Slice 5B1)
     // =========================================================================
@@ -6068,7 +7250,7 @@ mod tests {
                 funding: FundingConfig::default(),
                 funding_route_mode: FundingRouteMode::Selected,
                 venue_feed: VenueFeedView::default(),
-                order_journal: Arc::new(OrderJournal::unpersisted()),
+                order_journal: position_manager.read().await.order_journal(),
             });
 
             (create_router(state), event_bus, position_manager)
@@ -6204,5 +7386,412 @@ mod tests {
         let resp_body = response.into_body().collect().await.unwrap().to_bytes();
         let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
         assert_eq!(resp["error"], "unsupported_evidence");
+    }
+
+    // ---- Operation permits (ADR-0056 step 7, PR S) ---------------------
+
+    /// The app, its manager and stub, and the journal whose gate the handlers
+    /// and the stub share.
+    async fn gated_app() -> (
+        Router,
+        Arc<RwLock<PositionManager<StubExchange, MemoryStore>>>,
+        Arc<StubExchange>,
+        Arc<OrderJournal>,
+    ) {
+        let (app, _, position_manager, exchange) = create_test_app_with_event_bus_and_exchange(
+            100,
+            Arc::new(StubExchange::new(dec!(95000))),
+        )
+        .await;
+        let journal = position_manager.read().await.order_journal();
+        (app, position_manager, exchange, journal)
+    }
+
+    fn api_request(method: &str, uri: &str, body: Option<serde_json::Value>) -> Request<Body> {
+        let builder = Request::builder().method(method).uri(uri);
+        match body {
+            Some(body) => builder
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        }
+    }
+
+    async fn error_of(response: axum::response::Response) -> String {
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        body["error"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// Every venue mutation the stub saw ran under `kind`, with that permit the
+    /// only one held and one slot of its class taken: nothing nested took a
+    /// second slot or another class.
+    fn assert_every_mutation_under(exchange: &StubExchange, kind: OperationKind) {
+        assert_every_mutation_under_beside(exchange, kind, 0);
+    }
+
+    /// The same, with `others` permits of another class held meanwhile.
+    fn assert_every_mutation_under_beside(
+        exchange: &StubExchange,
+        kind: OperationKind,
+        others: u32,
+    ) {
+        let mutations = exchange.mutations();
+        assert!(!mutations.is_empty(), "the operation reached the venue");
+        for mutation in mutations {
+            assert_eq!(mutation.permit, Some(kind), "{mutation:?}");
+            let gate = mutation.gate.expect("the stub passes the gate");
+            let taken = match kind.class() {
+                SlotClass::Ordinary => gate.ordinary,
+                SlotClass::Protective => gate.protective,
+                SlotClass::Internal(_) => gate.internal,
+            };
+            assert_eq!((gate.permits, taken, gate.unpermitted), (1 + others, 1, 0), "{mutation:?}");
+        }
+    }
+
+    async fn save_closed_loss(store: &MemoryStore, realized_pnl: Decimal) -> Position {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = Position::new(Uuid::now_v7(), symbol, Side::Long);
+        position.entry_price = Some(Price::new(dec!(95000)).unwrap());
+        position.quantity = Quantity::new(dec!(0.1)).unwrap();
+        position.realized_pnl = realized_pnl;
+        position.closed_at = Some(Utc::now());
+        position.state = PositionState::Closed {
+            exit_price: Price::new(dec!(95000) + realized_pnl).unwrap(),
+            realized_pnl,
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+        store.positions().save(&position).await.unwrap();
+        position
+    }
+
+    /// A full class answers 503 `busy` at once with nothing done, and only its
+    /// own routes: the ordinary class full leaves every protective route its
+    /// slots, and the protective class full refuses only those.
+    #[tokio::test]
+    async fn a_full_class_refuses_only_its_own_routes_with_nothing_done() {
+        let (app, position_manager, exchange, journal) = gated_app().await;
+        let leg = save_active_position_for_api(
+            &position_manager,
+            "BTCUSDT",
+            Side::Long,
+            dec!(95000),
+            dec!(0.01),
+        )
+        .await;
+        let arm = serde_json::json!({ "symbol": "BTCUSDT", "side": "long" });
+        let signal = serde_json::json!({ "position_id": leg.id, "entry_price": "95000", "stop_loss": "86000" });
+        let recover = serde_json::json!({
+            "asset": "USDT", "amount": "1", "dry_run": false, "execute": true,
+            "confirm": "TRANSFER_SPOT_USDT_TO_FUTURES",
+        });
+        let mut ordinary = vec![
+            api_request("POST", "/positions", Some(arm)),
+            api_request("POST", &format!("/positions/{}/signal", leg.id), Some(signal)),
+            api_request("POST", &format!("/queries/{}/approve", Uuid::now_v7()), None),
+            api_request("POST", "/funding/recover-spot-usdt-to-futures", Some(recover)),
+        ];
+        #[cfg(feature = "postgres")]
+        ordinary.push(
+            Request::builder()
+                .method("POST")
+                .uri("/funding/execute")
+                .header(CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "k")
+                .body(Body::from(serde_json::json!({ "quote_id": Uuid::now_v7() }).to_string()))
+                .unwrap(),
+        );
+        let protective = || {
+            vec![
+                api_request("POST", "/panic", None),
+                api_request("POST", "/monthly-halt", Some(serde_json::json!({ "reason": "test" }))),
+                api_request(
+                    "POST",
+                    "/reconcile-close",
+                    Some(serde_json::json!({
+                        "position_id": Uuid::now_v7(),
+                        "evidence": make_order_fill_evidence_json("90", "1"),
+                    })),
+                ),
+                api_request("DELETE", &format!("/positions/{}", leg.id), None),
+            ]
+        };
+
+        let held: Vec<_> = (0..robson_exec::gate::ORDINARY_API_SLOTS)
+            .map(|_| journal.acquire(OperationKind::Arm).unwrap())
+            .collect();
+        let routes = ordinary.len() as u64;
+        for request in ordinary {
+            let uri = request.uri().to_string();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert_eq!(error_of(response).await, "busy", "{uri}");
+        }
+        assert!(exchange.mutations().is_empty(), "nothing reached the venue");
+        assert_eq!(exchange.transfer_call_count(), 0);
+        assert_eq!(position_manager.read().await.get_open_positions().await.unwrap().len(), 1);
+        assert_eq!(journal.gate().snapshot().busy_ordinary, routes);
+
+        // With every ordinary slot taken, the protective class has its own.
+        let protective_slots = robson_exec::gate::PROTECTIVE_API_SLOTS;
+        let full: Vec<_> = (0..protective_slots)
+            .map(|_| journal.acquire(OperationKind::Panic).unwrap())
+            .collect();
+        for request in protective() {
+            let uri = request.uri().to_string();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert_eq!(error_of(response).await, "busy", "{uri}");
+        }
+        assert!(exchange.mutations().is_empty());
+        let still = position_manager.read().await.get_position(leg.id).await.unwrap().unwrap();
+        assert!(matches!(still.state, PositionState::Active { .. }), "{:?}", still.state);
+        assert!(!position_manager.read().await.circuit_breaker().blocks_new_entries().await);
+        assert_eq!(journal.gate().snapshot().busy_protective, 4);
+        full.into_iter().for_each(Permit::complete);
+
+        // Ordinary still full: the real close goes through, and /panic closes
+        // the other leg.
+        let other = save_active_position_for_api(
+            &position_manager,
+            "ETHUSDT",
+            Side::Long,
+            dec!(95000),
+            dec!(0.01),
+        )
+        .await;
+        let response = app
+            .clone()
+            .oneshot(api_request("DELETE", &format!("/positions/{}", leg.id), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let others = robson_exec::gate::ORDINARY_API_SLOTS;
+        assert_every_mutation_under_beside(&exchange, OperationKind::CancelOrClose, others);
+        let before = exchange.mutations().len();
+        let response = app.clone().oneshot(api_request("POST", "/panic", None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let panic: Vec<_> = exchange.mutations().into_iter().skip(before).collect();
+        assert!(!panic.is_empty(), "/panic reached the venue");
+        for mutation in panic {
+            assert_eq!(mutation.permit, Some(OperationKind::Panic), "{mutation:?}");
+            let gate = mutation.gate.expect("the stub passes the gate");
+            assert_eq!((gate.permits, gate.protective, gate.unpermitted), (1 + others, 1, 0));
+        }
+        let closed = position_manager.read().await.get_position(other.id).await.unwrap().unwrap();
+        assert!(matches!(closed.state, PositionState::Closed { .. }), "{:?}", closed.state);
+        assert!(position_manager.read().await.get_open_positions().await.unwrap().is_empty());
+        held.into_iter().for_each(Permit::complete);
+        assert_eq!(journal.gate().snapshot().permits, 0);
+    }
+
+    /// Draining refuses the ordinary class and lets the protective one
+    /// through; Closing refuses both. A refusal while stopping is not `busy`.
+    #[tokio::test]
+    async fn draining_refuses_ordinary_requests_and_closing_refuses_every_one() {
+        let (app, position_manager, exchange, journal) = gated_app().await;
+        let leg = save_active_position_for_api(
+            &position_manager,
+            "BTCUSDT",
+            Side::Long,
+            dec!(95000),
+            dec!(0.01),
+        )
+        .await;
+        journal.gate().begin_draining();
+        let arm = serde_json::json!({ "symbol": "BTCUSDT", "side": "long" });
+        let response =
+            app.clone().oneshot(api_request("POST", "/positions", Some(arm))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_of(response).await, "stopping");
+
+        let response = app
+            .clone()
+            .oneshot(api_request("DELETE", &format!("/positions/{}", leg.id), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_every_mutation_under(&exchange, OperationKind::CancelOrClose);
+
+        journal.gate().begin_closing();
+        let response = app.clone().oneshot(api_request("POST", "/panic", None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_of(response).await, "stopping");
+        let gate = journal.gate().snapshot();
+        assert_eq!((gate.busy_ordinary, gate.busy_protective, gate.permits), (0, 0, 0));
+    }
+
+    /// `/reconcile-close` whose close exhausts the month: MonthlyHalt fires
+    /// and closes every other leg through `panic_close_all`, all under the
+    /// request's one protective permit.
+    #[tokio::test]
+    async fn reconcile_close_into_monthly_halt_closes_everything_under_its_one_permit() {
+        let (app, position_manager, exchange, journal) = gated_app().await;
+        let reconciled = save_active_position_for_api(
+            &position_manager,
+            "BTCUSDT",
+            Side::Long,
+            dec!(100),
+            dec!(1),
+        )
+        .await;
+        let other = save_active_position_for_api(
+            &position_manager,
+            "ETHUSDT",
+            Side::Long,
+            dec!(95000),
+            dec!(0.01),
+        )
+        .await;
+        let store = position_manager.read().await.store();
+        save_closed_loss(&store, dec!(-400)).await;
+
+        let response = app
+            .clone()
+            .oneshot(api_request(
+                "POST",
+                "/reconcile-close",
+                Some(serde_json::json!({
+                    "position_id": reconciled.id,
+                    "evidence": make_order_fill_evidence_json("90", "1"),
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(position_manager.read().await.circuit_breaker().blocks_new_entries().await);
+        let other = position_manager.read().await.get_position(other.id).await.unwrap().unwrap();
+        assert!(!matches!(other.state, PositionState::Active { .. }), "{:?}", other.state);
+        assert!(exchange.market_order_call_count() > 0, "the halt closed the other leg");
+        assert_every_mutation_under(&exchange, OperationKind::ReconcileClose);
+        assert_eq!(journal.gate().snapshot().permits, 0);
+    }
+
+    /// The injected signal enters and places the entry's stop under the
+    /// request's ordinary permit: one operation, one slot.
+    #[tokio::test]
+    async fn an_injected_signal_enters_and_protects_under_its_one_permit() {
+        let (app, position_manager, exchange, journal) = gated_app().await;
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let position = position_manager
+            .write()
+            .await
+            .arm_position_with_policy(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                RiskConfig::new(dec!(10000)).unwrap(),
+                Some(TechnicalStopDistance::from_entry_and_stop(entry, stop)),
+                Uuid::now_v7(),
+                EntryPolicyConfig::new(
+                    EntryPolicy::ConfirmedTrend,
+                    DomainApprovalPolicy::Automatic,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let signal = serde_json::json!({ "position_id": position.id, "entry_price": "95000", "stop_loss": "86000" });
+        let response = app
+            .oneshot(api_request(
+                "POST",
+                &format!("/positions/{}/signal", position.id),
+                Some(signal),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let what: Vec<_> = exchange.mutations().iter().map(|m| m.what).collect();
+        assert!(what.contains(&"POST /fapi/v1/order"), "{what:?}");
+        assert!(what.contains(&"POST /fapi/v1/algoOrder"), "the stop: {what:?}");
+        assert_every_mutation_under(&exchange, OperationKind::Signal);
+        assert_eq!(journal.operation_statements_max(), 18, "entry and stop, one operation");
+    }
+
+    /// A request dropped while its operation is in flight, as when the client
+    /// disconnects: the operation runs on in its own task, which owns the
+    /// permit, and completes. Nothing is aborted and the latch stays clear.
+    #[tokio::test]
+    async fn a_request_dropped_mid_operation_runs_on_to_completion() {
+        let (app, position_manager, exchange, journal) = gated_app().await;
+        let leg = save_active_position_for_api(
+            &position_manager,
+            "BTCUSDT",
+            Side::Long,
+            dec!(95000),
+            dec!(0.01),
+        )
+        .await;
+        let hold = exchange.hold_next_mutation();
+        let close = app.oneshot(api_request("DELETE", &format!("/positions/{}", leg.id), None));
+        assert!(tokio::time::timeout(Duration::from_millis(300), close).await.is_err());
+        assert_eq!(exchange.mutations().len(), 1, "it is held at the venue");
+        assert_eq!(journal.gate().snapshot().permits, 1, "with its permit");
+
+        hold.notify_one();
+        let done = async {
+            while journal.gate().snapshot().permits > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), done)
+            .await
+            .expect("the close completes");
+        let gate = journal.gate().snapshot();
+        assert_eq!((gate.aborted, gate.protective), (0, 0));
+        assert!(!journal.latch_set());
+        let closed = position_manager.read().await.get_position(leg.id).await.unwrap().unwrap();
+        assert!(matches!(closed.state, PositionState::Closed { .. }), "{:?}", closed.state);
+    }
+
+    /// An operation that panics answers 500. Its permit, dropped unfinished by
+    /// the unwind, is aborted and sets the latch, and its slot is released.
+    #[tokio::test]
+    async fn an_operation_that_panics_answers_500_and_aborts_its_permit() {
+        let (exchange, _) = WalletBalanceCacheExchange::new(dec!(1));
+        let state = wallet_cache_test_state(exchange).await;
+        fn failing() -> StatusCode {
+            panic!("the operation failed")
+        }
+        let response = permitted(&state, OperationKind::Panic, async { failing() }).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let gate = state.order_journal.gate().snapshot();
+        assert_eq!((gate.aborted, gate.permits, gate.protective), (1, 0, 0));
+        assert!(state.order_journal.latch_set());
+    }
+
+    /// A venue mutation outside any permit is counted and latched while the
+    /// daemon is open, and refused with nothing sent once it is stopping.
+    #[tokio::test]
+    async fn an_unpermitted_mutation_is_counted_while_open_and_refused_once_stopping() {
+        let (_app, position_manager, exchange, journal) = gated_app().await;
+        let first = save_active_position_for_api(
+            &position_manager,
+            "BTCUSDT",
+            Side::Long,
+            dec!(95000),
+            dec!(0.01),
+        )
+        .await;
+        position_manager.read().await.close_position(first.id).await.unwrap();
+        assert!(journal.gate().snapshot().unpermitted > 0);
+        assert!(journal.latch_set());
+        let sent = exchange.mutations().len();
+        assert_eq!(exchange.market_order_call_count(), 1);
+
+        let second = save_active_position_for_api(
+            &position_manager,
+            "ETHUSDT",
+            Side::Long,
+            dec!(95000),
+            dec!(0.01),
+        )
+        .await;
+        journal.gate().begin_draining();
+        assert!(position_manager.read().await.close_position(second.id).await.is_err());
+        assert_eq!(exchange.mutations().len(), sent, "nothing refused was sent");
+        assert_eq!(exchange.market_order_call_count(), 1);
     }
 }

@@ -22,6 +22,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol, SymbolTradingRules};
 use robson_exec::{
+    gate::OperationGate,
+    order_journal::OrderJournal,
     ports::{
         ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord, IncomeType,
         OpenOrderRecord, SpotBalance, SpotOrder, SpotOrderQuantity, SpotOrderRequest,
@@ -126,6 +128,7 @@ fn fill_evidence(response: BinanceOrderResponse) -> Result<Option<OrderResult>, 
         fee,
         fee_asset,
         filled_at,
+        evidence: None,
     }))
 }
 
@@ -513,6 +516,8 @@ impl BinanceExchangeAdapter {
                 ExecError::Timeout("Binance request timed out".to_string())
             },
             BinanceRestError::InvalidParameter(msg) => ExecError::OrderRejected(msg.clone()),
+            // Nothing was sent (ADR-0056 step 7).
+            BinanceRestError::Refused(msg) => ExecError::SendRefused(msg.clone()),
             _ => ExecError::Exchange(error.to_string()),
         }
     }
@@ -623,6 +628,7 @@ impl BinanceExchangeAdapter {
             fee,
             fee_asset,
             filled_at,
+            evidence: None,
         }))
     }
 }
@@ -925,6 +931,7 @@ impl TradingPort for BinanceExchangeAdapter {
             fee,
             fee_asset,
             filled_at,
+            evidence: None,
         })
     }
 
@@ -1005,6 +1012,7 @@ impl TradingPort for BinanceExchangeAdapter {
                 fee: Decimal::ZERO,
                 fee_asset: "USDT".to_string(),
                 filled_at: placed_at,
+                evidence: None,
             },
         })
     }
@@ -1070,9 +1078,8 @@ impl TradingPort for BinanceExchangeAdapter {
         }
         match self.client.query_algo_order_by_client_id(client_order_id).await {
             Ok(detail) => self.algo_order_lookup(symbol, &detail).await,
-            Err(BinanceRestError::ApiError { code: -2013, .. }) => {
-                Ok(USDM_FINALITY.classify_not_found(self.submit_attempts.evidence(client_order_id)))
-            },
+            Err(BinanceRestError::ApiError { code: -2013, .. }) => Ok(USDM_FINALITY
+                .classify_not_found(self.submit_attempts.final_evidence(client_order_id).await)),
             Err(error) => Err(Self::map_error(error)),
         }
     }
@@ -1465,11 +1472,22 @@ impl AccountPort for BinanceExchangeAdapter {
             replacement: ReplacementProtocol::PlaceThenCancel,
             has_funding: true,
             order_finality: USDM_FINALITY,
+            one_attempt_per_client_id: false,
         }
     }
 }
 
 impl Venue for BinanceExchangeAdapter {
+    fn attach_order_journal(&self, journal: Arc<OrderJournal>) {
+        self.submit_attempts.attach_journal(journal);
+    }
+
+    /// Every signed mutation goes through the REST client's `post_signed` or
+    /// `delete_signed`, which pass the gate.
+    fn attach_gate(&self, gate: Arc<OperationGate>) {
+        self.client.attach_gate(gate);
+    }
+
     fn id(&self) -> &VenueId {
         &self.venue_id
     }
@@ -1800,6 +1818,7 @@ mod submit_attempt_evidence {
             BinanceRestError::InvalidParameter("x".to_string()),
             BinanceRestError::SignatureError("x".to_string()),
             BinanceRestError::PositionNotFound("x".to_string()),
+            BinanceRestError::Refused("x".to_string()),
         ] {
             assert!(!is_authoritative_rejection(&error), "{error}");
         }
@@ -1966,6 +1985,69 @@ mod submit_attempt_evidence {
         *failures.get_mut("BTCUSDT").unwrap() = Instant::now().checked_sub(by).unwrap();
     }
 
+    /// The send start (ADR-0056 step 7) in the real transport path: once the
+    /// daemon is stopping, an entry is refused there, a typed no-send that
+    /// polls nothing and leaves no ticket, while a reduction under the same
+    /// permit still goes out with its ticket.
+    #[tokio::test]
+    async fn the_send_start_refuses_an_entry_once_stopping_and_nothing_reaches_the_venue() {
+        use robson_exec::{
+            gate::OperationKind,
+            order_journal::{IntentKind, IntentSpec, StubJournalBackend, WriteClass},
+        };
+
+        let (venue, _info, orders) =
+            metadata_venue(Some((200, BTC_RULES.to_string())), Some((200, FILLED.to_string())))
+                .await;
+        let journal = Arc::new(OrderJournal::new(
+            Arc::new(StubJournalBackend::default()),
+            &VenueId::new("test:venue"),
+        ));
+        venue.attach_order_journal(Arc::clone(&journal));
+        venue.attach_gate(Arc::clone(journal.gate()));
+        let spec = |id: &str, kind| IntentSpec {
+            position_id: None,
+            kind,
+            client_order_id: id.to_string(),
+            cancels_order_id: None,
+            params: serde_json::Value::Null,
+        };
+
+        let permit = journal.acquire(OperationKind::MainLoop).unwrap();
+        permit
+            .scope(async {
+                let entry = journal.open_intent(spec("e1", IntentKind::Entry));
+                journal.before_send(&entry, WriteClass::Strict).await.unwrap();
+                journal.gate().begin_draining();
+                let refused = TradingPort::place_market_order(
+                    &*venue,
+                    &btcusdt(),
+                    OrderSide::Buy,
+                    Quantity::new(dec!(0.01)).unwrap(),
+                    "e1",
+                    EntryOrReduce::Entry,
+                )
+                .await;
+                assert!(matches!(refused, Err(ExecError::SendRefused(_))), "{refused:?}");
+                assert!(!journal.ticket_issued(&entry), "a refused send has no ticket");
+                assert_eq!(venue.submit_attempts.evidence("e1"), AttemptEvidence::NoRecord);
+                assert_eq!(orders.load(Ordering::SeqCst), 0, "nothing reached the venue");
+
+                let exit = journal.open_intent(spec("x1", IntentKind::Exit));
+                journal.before_send(&exit, WriteClass::Bounded).await.unwrap();
+                reduce(&venue, "x1").await.unwrap();
+                assert!(journal.ticket_issued(&exit));
+                assert_eq!(orders.load(Ordering::SeqCst), 1);
+                journal.finish_failed(&entry).await;
+            })
+            .await;
+        permit.complete();
+
+        let gate = journal.gate().snapshot();
+        assert_eq!(gate.sends_started, 1, "only the reduction started its send");
+        assert_eq!(gate.unpermitted, 0);
+    }
+
     async fn reduce(venue: &BinanceExchangeAdapter, id: &str) -> Result<OrderResult, ExecError> {
         TradingPort::place_market_order(
             venue,
@@ -2034,7 +2116,7 @@ mod submit_attempt_evidence {
             Quantity::new(dec!(0.0015)).unwrap(),
             None,
             quantize::METADATA_WAIT_BOUND,
-            |submitted, _| {
+            |submitted, _, _| {
                 TradingPort::place_market_order(
                     &*venue,
                     &symbol,
@@ -2075,7 +2157,7 @@ mod submit_attempt_evidence {
             Quantity::new(dec!(0.0005)).unwrap(),
             Some(&held),
             quantize::METADATA_WAIT_BOUND,
-            |submitted, _| {
+            |submitted, _, _| {
                 assert_eq!(submitted.as_decimal(), dec!(0.0005), "raw, not refused locally");
                 TradingPort::place_market_order(
                     &*venue,
@@ -2140,6 +2222,36 @@ mod submit_attempt_evidence {
             let (venue, _, _) = metadata_venue(None, Some((200, order(status)))).await;
             assert!(reduce(&venue, "exit-2").await.is_err(), "{status}");
         }
+    }
+
+    /// ADR-0056 step 8 (PR 8c): USD-M results carry no per-trade evidence and
+    /// no record, whatever the answer holds, so their serialized form and
+    /// meaning are unchanged.
+    #[tokio::test]
+    async fn usdm_results_carry_no_fills() {
+        let body = r#"{"symbol":"BTCUSDT","orderId":7,"clientOrderId":"c1",
+            "updateTime":1700000000000,"price":"0","avgPrice":"90000","origQty":"0.4",
+            "executedQty":"0.4","cumQuote":"36000","status":"FILLED","side":"SELL",
+            "type":"MARKET","fills":[{"price":"90000","qty":"0.4","commission":"0.1",
+            "commissionAsset":"USDT"}]}"#;
+        let (venue, _, _) = metadata_venue(None, Some((200, body.to_string()))).await;
+        let result = TradingPort::place_market_order(
+            &*venue,
+            &btcusdt(),
+            OrderSide::Sell,
+            Quantity::new(dec!(0.4)).unwrap(),
+            "exit-1",
+            EntryOrReduce::Reduce,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.fee, dec!(0.1));
+        assert!(result.evidence.is_none());
+        assert!(result.fills().is_empty());
+        assert!(result.record().is_none());
+        assert_eq!(result.fee_evidence(), robson_exec::ports::FeeEvidence::AsReported);
+        // USD-M allows a resubmission under the same id (ADR-0056 §5).
+        assert!(!venue.capabilities().one_attempt_per_client_id);
     }
 
     /// A later attempt on a persistent rejection does not refresh again within
@@ -2436,6 +2548,39 @@ mod submit_attempt_evidence {
 
     async fn replace(venue: &BinanceExchangeAdapter) -> ReplaceOutcome {
         replace_with(venue, dec!(0.01), "ins-2").await
+    }
+
+    /// ADR-0056 step 7: USD-M does no lookup on a cancel, so its code and text
+    /// detection only chooses between two uncertain classes. Only an accepted
+    /// cancel is definite here.
+    #[tokio::test]
+    async fn only_an_accepted_cancel_is_definite_on_usdm() {
+        let text = |message: &str| format!(r#"{{"code":-1000,"msg":"{message}"}}"#);
+        for (reply, label) in [
+            (Some((200, STOP_CANCELLED.to_string())), "cancelled"),
+            (Some((400, api_error(-2011))), "gone_unresolved"),
+            (Some((400, api_error(-2013))), "gone_unresolved"),
+            (Some((400, text("Unknown order sent."))), "gone_unresolved"),
+            (Some((400, text("Order does not exist."))), "gone_unresolved"),
+            (Some((400, text("already cancelled"))), "gone_unresolved"),
+            (Some((400, api_error(-1000))), "error"),
+            (Some((400, api_error(-2015))), "error"),
+            (Some((500, String::new())), "error"),
+        ] {
+            let (listener, venue) = bound_venue().await;
+            let answer = reply.clone();
+            serve(listener, move |request| match request {
+                "DELETE /fapi/v1/algoOrder" => answer.clone(),
+                _ => not_found(request),
+            });
+            let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+            let result =
+                robson_exec::ExchangePort::cancel_stop_market_order(&*venue, &symbol, "77").await;
+
+            let class = robson_exec::cancel::classify_cancel(result);
+            assert_eq!(class.label(), label, "{reply:?}: {class:?}");
+        }
     }
 
     #[tokio::test]

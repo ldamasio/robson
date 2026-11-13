@@ -141,6 +141,18 @@ pub struct Position {
 }
 
 impl Position {
+    /// Whether this leg holds ADR-0052 admission evidence: an earlier admission
+    /// got far enough to write its immutable ruler, so no second admission may
+    /// derive another.
+    pub fn carries_admission_evidence(&self) -> bool {
+        self.stop_policy == StopPolicy::ExecutableSpan
+            && (self.stop_plan_entry_reference.is_some()
+                || self.initial_executable_stop.is_some()
+                || self.executable_span.is_some()
+                || self.cap_basis_distance.is_some()
+                || self.tick_size_at_admission.is_some())
+    }
+
     /// Create a new armed position with the legacy stop policy.
     ///
     /// This constructor never selects a new-position policy: it always

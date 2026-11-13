@@ -11,6 +11,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -30,6 +31,8 @@ pub const FAKE_SYMBOL: &str = "BTCUSDT";
 pub const FAKE_MARK: Decimal = Decimal::from_parts(100, 0, 0, false, 0);
 const WALLET_BALANCE: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 const CANDLES_MS: i64 = 15 * 60 * 1_000;
+/// How often a held order looks for its release.
+const HOLD_POLL: Duration = Duration::from_millis(10);
 
 /// Everything the venue did, as counted by the venue.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -62,6 +65,12 @@ struct Book {
     open_algos: HashMap<i64, Value>,
     next_id: i64,
     unserved: Vec<String>,
+    /// Every request received, served or not.
+    requests: u64,
+    /// Market orders are read and held unanswered until released.
+    hold_orders: bool,
+    /// Market orders read and held so far.
+    held: u64,
 }
 
 type Shared = Arc<Mutex<Book>>;
@@ -120,6 +129,28 @@ impl FakeVenue {
     pub fn unserved_requests(&self) -> Vec<String> {
         self.book().unserved.clone()
     }
+
+    /// Every request received so far, served or not.
+    pub fn requests(&self) -> u64 {
+        self.book().requests
+    }
+
+    /// From now on, read market orders and hold them unanswered until
+    /// [`FakeVenue::release_orders`]; the client's own bound may end one first,
+    /// as an outcome it cannot know.
+    pub fn hold_orders(&self) {
+        self.book().hold_orders = true;
+    }
+
+    /// Answer the held market orders, and every later one at once.
+    pub fn release_orders(&self) {
+        self.book().hold_orders = false;
+    }
+
+    /// Market orders read and held so far.
+    pub fn held_orders(&self) -> u64 {
+        self.book().held
+    }
 }
 
 async fn serve(
@@ -128,7 +159,20 @@ async fn serve(
     uri: Uri,
     Query(params): Query<HashMap<String, String>>,
 ) -> (StatusCode, String) {
-    let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
+    let lock = || book.lock().unwrap_or_else(|e| e.into_inner());
+    let held = {
+        let mut book = lock();
+        book.requests += 1;
+        let held = book.hold_orders && method == Method::POST && uri.path() == "/fapi/v1/order";
+        book.held += u64::from(held);
+        held
+    };
+    if held {
+        while lock().hold_orders {
+            tokio::time::sleep(HOLD_POLL).await;
+        }
+    }
+    let mut book = lock();
     match respond(&mut book, &method, uri.path(), &params) {
         Ok(body) => (StatusCode::OK, body.to_string()),
         Err((status, code, msg)) => (status, json!({ "code": code, "msg": msg }).to_string()),

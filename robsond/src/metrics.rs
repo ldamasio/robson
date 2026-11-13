@@ -23,6 +23,8 @@
 //!   or 1)
 //! - `robsond_monthly_budget_basis_last_read_timestamp_seconds` — last time
 //!   that alarm read the persisted basis
+//! - `robsond_month_boundary_pending` — the current month's reset has not
+//!   landed (0 or 1)
 //! - `robsond_budget_model_shadow_slots_delta` — dormant ADR-0051 NFS slots
 //!   minus HWM slots
 //! - `robsond_market_data_ws_failures_total` — failed WS attempts by endpoint
@@ -32,12 +34,37 @@
 //! - `robsond_sse_events_total` — public SSE events sent, labelled by event
 //!   type
 //! - `robsond_sse_disconnects_total` — SSE stream terminations on `/events`
+//! - `robsond_unpermitted_mutations_total` — venue mutations without an
+//!   operation permit (ADR-0056 step 7)
+//! - `robsond_aborted_operations_total` — operations dropped before completing
+//! - `robsond_api_slot_busy_total` — API requests refused on a full slot class,
+//!   labelled by class
+//! - `robsond_graceful_stop_total` — stops, labelled by result
+//! - `robsond_unclean_start` — why this process's start counts as unclean
+//! - `robsond_streams_suspended` — event-log streams refusing appends, by kind
+//! - `robsond_query_audit_failures_after_venue_work_total` — query audit writes
+//!   that failed after their venue work, the outcome kept
+//! - `robsond_admission_fence_closed` — the admission fence is closed, labelled
+//!   by the reason of each open incident (ADR-0056 step 7, PR F)
+//! - `robsond_recovery_incidents_open` — open incidents, by reason
+//! - `robsond_orphan_cancel_withheld_total` — orphan `ins-` cancels the veto
+//!   withheld
+//! - `robsond_orphan_cancel_withheld_overflow_total` — of those, the ones past
+//!   the report's 500 entries
+//! - `robsond_orphan_cancel_owned_total` — `ins-` orders outside the scan's
+//!   covered set that the sweep left alone because a live operation or a leg
+//!   owns them (ADR-0056 step 7, PR O)
+//! - `robsond_untracked_close_deferred_total` — UNTRACKED closes deferred to
+//!   the next scan because a live entry held their symbol and side (PR O)
+//! - `robsond_entry_refused_ownership_total` — entries refused at their send
+//!   because a sweep's close held their symbol and side (PR O)
 
 use std::sync::LazyLock;
 
 use prometheus::{
     self, register_counter, register_counter_vec, register_gauge, register_gauge_vec,
-    register_int_gauge, Counter, CounterVec, Gauge, GaugeVec, IntGauge,
+    register_int_gauge, register_int_gauge_vec, Counter, CounterVec, Gauge, GaugeVec, IntGauge,
+    IntGaugeVec,
 };
 
 /// Total completed engine cycles (each market tick processed).
@@ -91,10 +118,10 @@ pub fn init_detector_rearms_after_failure() {
     }
 }
 
-/// 1 once a bounded send went out without its journal row or journal history
-/// was discarded (ADR-0056 step 7). Stays until restart. Nothing acts on it
-/// yet: later PRs of step 7 close admissions on it. The journal gauges are
-/// defined here and published by the daemon once the journal is wired in.
+/// 1 once a bounded send went out without its journal row, journal history
+/// was discarded, an operation was aborted, a venue mutation ran without a
+/// permit or an event-log stream was suspended (ADR-0056 step 7). Stays until
+/// restart, and from PR P admissions stay closed while it is set.
 pub static JOURNAL_LATCH: LazyLock<Gauge> = LazyLock::new(|| {
     register_gauge!(
         "robsond_journal_latch",
@@ -152,6 +179,215 @@ pub static JOURNAL_OPERATIONS_OVER_STATEMENT_BOUND: LazyLock<Gauge> = LazyLock::
     )
     .expect("failed to register robsond_journal_operations_over_statement_bound")
 });
+
+/// Venue mutations that reached the choke point without an operation permit
+/// while the daemon was open (ADR-0056 step 7). Each sets the journal latch;
+/// once the daemon is stopping such a mutation is refused, not counted.
+pub static UNPERMITTED_MUTATIONS: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_unpermitted_mutations_total",
+        "Venue mutations sent without an operation permit"
+    )
+    .expect("failed to register robsond_unpermitted_mutations_total")
+});
+
+/// Operations whose permit was dropped before they completed: cancelled or
+/// panicked mid-flight. Each sets the journal latch.
+pub static ABORTED_OPERATIONS: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!("robsond_aborted_operations_total", "Operations dropped before completing")
+        .expect("failed to register robsond_aborted_operations_total")
+});
+
+/// API requests answered 503 `busy` because their slot class was full, by
+/// class: `ordinary` or `protective`.
+pub static API_SLOT_BUSY: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        "robsond_api_slot_busy_total",
+        "API requests refused because their slot class was full",
+        &["class"]
+    )
+    .expect("failed to register robsond_api_slot_busy_total")
+});
+
+/// Stops, by result: `clean`, or why it was not. Counted as the process exits,
+/// so a scrape may never see it; the durable record is the epoch's marker and
+/// the next start's [`UNCLEAN_START`].
+pub static GRACEFUL_STOP: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!("robsond_graceful_stop_total", "Graceful stops by result", &["result"])
+        .expect("failed to register robsond_graceful_stop_total")
+});
+
+/// 1 for the reason this process's start counts as unclean: `no_predecessor`,
+/// `no_marker`, or `marker_version` (a predecessor that marked below version
+/// 2, which binaries before the fence PR write). From PR F an unclean start
+/// opens `unclean_start` and starts fenced.
+pub static UNCLEAN_START: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
+        "robsond_unclean_start",
+        "Why this process's start counts as unclean (1 for the reason)",
+        &["reason"]
+    )
+    .expect("failed to register robsond_unclean_start")
+});
+
+/// Query audit writes that failed after their venue work, the outcome kept
+/// (ADR-0056 step 7, PR P): a tick's or `/panic`'s other legs still ran.
+pub static QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_query_audit_failures_after_venue_work_total",
+        "Query audit writes that failed after their venue work; the venue outcome was kept"
+    )
+    .expect("failed to register robsond_query_audit_failures_after_venue_work_total")
+});
+
+/// Event-log streams that refuse appends, by `kind` (`position`, `system`):
+/// suspended in this process, or loaded at start and not repaired (ADR-0056
+/// step 7, PR P). A suspended system stream makes its month's accounting
+/// invalid, current or history (PR F).
+pub static STREAMS_SUSPENDED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "robsond_streams_suspended",
+        "Event-log streams refusing appends, by kind",
+        &["kind"]
+    )
+    .expect("failed to register robsond_streams_suspended")
+});
+
+/// Publish how many streams of each kind are suspended; both kinds export,
+/// at 0 from startup.
+pub fn observe_streams_suspended(positions: usize, systems: usize) {
+    let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    STREAMS_SUSPENDED.with_label_values(&["position"]).set(count(positions));
+    STREAMS_SUSPENDED.with_label_values(&["system"]).set(count(systems));
+}
+
+/// 1 for each reason the admission fence is closed by: the reason of an open
+/// incident, or `unknown` for a fence closed with none on record here (ADR-0056
+/// step 7, PR F). Every label exports from startup, at 0 while the fence is
+/// open, so an absent series means a missing daemon, not an open fence.
+pub static ADMISSION_FENCE_CLOSED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "robsond_admission_fence_closed",
+        "The admission fence is closed, by the reason of each open incident",
+        &["reason"]
+    )
+    .expect("failed to register robsond_admission_fence_closed")
+});
+
+/// Open incidents, by reason: 0 or 1, one open incident per reason at most.
+pub static RECOVERY_INCIDENTS_OPEN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "robsond_recovery_incidents_open",
+        "Open recovery incidents, by reason",
+        &["reason"]
+    )
+    .expect("failed to register robsond_recovery_incidents_open")
+});
+
+/// Orphan `ins-` orders the sweep's veto withheld, once per order and scan
+/// (ADR-0056 step 7, PR F, design §2.9).
+pub static ORPHAN_CANCEL_WITHHELD: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_orphan_cancel_withheld_total",
+        "Orphan insurance-stop cancels withheld while an incident is open or the latch set"
+    )
+    .expect("failed to register robsond_orphan_cancel_withheld_total")
+});
+
+/// Withheld orders past the report's 500 entries: withheld all the same.
+pub static ORPHAN_CANCEL_WITHHELD_OVERFLOW: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_orphan_cancel_withheld_overflow_total",
+        "Withheld orphan cancels past the report's capacity; the veto still applied"
+    )
+    .expect("failed to register robsond_orphan_cancel_withheld_overflow_total")
+});
+
+/// `ins-` orders outside the scan's covered set that the orphan sweep did not
+/// cancel because ownership revalidation found them owned: registered to a
+/// live operation, or recorded on a leg since the scan read the legs
+/// (ADR-0056 step 7, PR O). Once per order and scan.
+pub static ORPHAN_CANCEL_OWNED: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_orphan_cancel_owned_total",
+        "Insurance-stop orders outside the covered set that the sweep kept because they are owned"
+    )
+    .expect("failed to register robsond_orphan_cancel_owned_total")
+});
+
+/// UNTRACKED closes the sweep deferred to its next scan because a live entry
+/// held their symbol and side (ADR-0056 step 7, PR O). Once per position and
+/// scan.
+pub static UNTRACKED_CLOSE_DEFERRED: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_untracked_close_deferred_total",
+        "UNTRACKED closes deferred because a live entry held their symbol and side"
+    )
+    .expect("failed to register robsond_untracked_close_deferred_total")
+});
+
+/// Entries refused at their send, a typed no-send, because a sweep's close
+/// held their symbol and side (ADR-0056 step 7, PR O).
+pub static ENTRY_REFUSED_OWNERSHIP: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_entry_refused_ownership_total",
+        "Entries refused at their send because a sweep close held their symbol and side"
+    )
+    .expect("failed to register robsond_entry_refused_ownership_total")
+});
+
+/// Publish the fence and the open incidents; every reason exports.
+pub fn observe_fence(journal: &robson_exec::order_journal::OrderJournal) {
+    let gate = journal.gate();
+    let fenced = gate.fenced();
+    let open = gate.open_incidents();
+    for reason in robson_exec::gate::IncidentReason::ALL {
+        let is_open = open.iter().any(|incident| incident.reason == reason);
+        let label = reason.as_str();
+        RECOVERY_INCIDENTS_OPEN.with_label_values(&[label]).set(i64::from(is_open));
+        ADMISSION_FENCE_CLOSED
+            .with_label_values(&[label])
+            .set(i64::from(fenced && is_open));
+    }
+    ADMISSION_FENCE_CLOSED
+        .with_label_values(&["unknown"])
+        .set(i64::from(fenced && open.is_empty()));
+}
+
+/// Zero series for the gate's metrics, so they export from startup.
+pub fn init_operation_gate_metrics() {
+    LazyLock::force(&UNPERMITTED_MUTATIONS);
+    LazyLock::force(&QUERY_AUDIT_FAILURES_AFTER_VENUE_WORK);
+    LazyLock::force(&ABORTED_OPERATIONS);
+    // Absent until a stop is first behind its plan, which an alert must not
+    // read as healthy: 0 from startup, when nothing is behind yet.
+    LazyLock::force(&INSURANCE_STOP_STALE_POSITIONS);
+    LazyLock::force(&ORPHAN_CANCEL_WITHHELD);
+    LazyLock::force(&ORPHAN_CANCEL_WITHHELD_OVERFLOW);
+    LazyLock::force(&ORPHAN_CANCEL_OWNED);
+    LazyLock::force(&UNTRACKED_CLOSE_DEFERRED);
+    LazyLock::force(&ENTRY_REFUSED_OWNERSHIP);
+    for class in ["ordinary", "protective"] {
+        API_SLOT_BUSY.with_label_values(&[class]);
+    }
+}
+
+/// Counts what the operation gate reports.
+pub struct GateMetrics;
+
+impl robson_exec::gate::GateObserver for GateMetrics {
+    fn unpermitted_mutation(&self) {
+        UNPERMITTED_MUTATIONS.inc();
+    }
+
+    fn operation_aborted(&self, _kind: robson_exec::gate::OperationKind) {
+        ABORTED_OPERATIONS.inc();
+    }
+
+    fn entry_refused_ownership(&self) {
+        ENTRY_REFUSED_OWNERSHIP.inc();
+    }
+}
 
 /// Publish the journal's latch, retry-set depth and statement counts.
 pub fn observe_order_journal(journal: &robson_exec::order_journal::OrderJournal) {
@@ -406,6 +642,20 @@ pub static MONTHLY_BUDGET_BASIS_LAST_READ_TIMESTAMP_SECONDS: LazyLock<Gauge> =
         .expect("failed to register robsond_monthly_budget_basis_last_read_timestamp_seconds")
     });
 
+/// The current month's `MonthBoundaryReset` has not landed: the boundary poll
+/// found none and could not append one, for instance because the wallet read
+/// failed. Set when each attempt returns, so it normally rises about a minute
+/// after 00:00 UTC, later if an attempt is slow, and returns to 0 once the
+/// reset lands or is found. 0 from startup. For visibility only: admissions
+/// read the reset evidence in `monthly_state` themselves.
+pub static MONTH_BOUNDARY_PENDING: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_month_boundary_pending",
+        "Whether the current month's MonthBoundaryReset has not landed yet (0 or 1)"
+    )
+    .expect("failed to register robsond_month_boundary_pending")
+});
+
 /// Dormant ADR-0051 shadow comparison: net-from-start slots minus HWM slots.
 pub static BUDGET_MODEL_SHADOW_SLOTS_DELTA: LazyLock<Gauge> = LazyLock::new(|| {
     register_gauge!(
@@ -553,6 +803,13 @@ mod tests {
     }
 
     #[test]
+    fn the_month_boundary_gauge_is_exported() {
+        LazyLock::force(&MONTH_BOUNDARY_PENDING);
+
+        assert!(render().contains("robsond_month_boundary_pending "));
+    }
+
+    #[test]
     fn the_journal_gauges_are_exported() {
         observe_order_journal(&robson_exec::order_journal::OrderJournal::unpersisted());
 
@@ -566,6 +823,42 @@ mod tests {
             rendered.contains("robsond_journal_operations_over_statement_bound "),
             "{rendered}"
         );
+    }
+
+    /// The fence's gauges export every reason from the first observation, so
+    /// an alert on absence means a missing daemon (ADR-0056 step 7, PR F); and
+    /// the stale-stop gauge and the ownership counters export from startup.
+    #[test]
+    fn the_fence_gauges_export_every_reason() {
+        init_operation_gate_metrics();
+        observe_fence(&robson_exec::order_journal::OrderJournal::unpersisted());
+
+        let rendered = render();
+        for reason in robson_exec::gate::IncidentReason::ALL {
+            let label = format!("{{reason=\"{}\"}}", reason.as_str());
+            for metric in [
+                "robsond_admission_fence_closed",
+                "robsond_recovery_incidents_open",
+            ] {
+                assert!(rendered.contains(&format!("{metric}{label}")), "{metric}{label}");
+            }
+        }
+        assert!(rendered.contains("robsond_admission_fence_closed{reason=\"unknown\"}"));
+        assert!(rendered.contains("robsond_insurance_stop_stale_positions "), "{rendered}");
+        assert!(rendered.contains("robsond_orphan_cancel_owned_total "), "{rendered}");
+        assert!(rendered.contains("robsond_untracked_close_deferred_total "), "{rendered}");
+        assert!(rendered.contains("robsond_entry_refused_ownership_total "), "{rendered}");
+    }
+
+    #[test]
+    fn the_suspended_stream_gauge_exports_both_kinds() {
+        // Other tests' managers publish to the same gauge, so only the series
+        // are asserted here, not their values.
+        observe_streams_suspended(0, 0);
+
+        let rendered = render();
+        assert!(rendered.contains("robsond_streams_suspended{kind=\"position\"} "), "{rendered}");
+        assert!(rendered.contains("robsond_streams_suspended{kind=\"system\"} "), "{rendered}");
     }
 
     #[test]

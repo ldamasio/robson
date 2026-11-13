@@ -1,0 +1,18 @@
+{
+  "reads": [
+    {"read": "symbol_rules", "request": "GET /api/v3/exchangeInfo?symbol=BTCUSDT", "signed": false, "weight": 20, "doc": "rest-api.md#L884-L889"},
+    {"read": "account", "request": "GET /api/v3/account", "signed": true, "weight": 20, "doc": "rest-api.md#L4278-L4283"},
+    {"read": "open_orders", "request": "GET /api/v3/openOrders?symbol=LTCBTC", "signed": true, "weight": 6, "doc": "rest-api.md#L4411-L4416"},
+    {"read": "all_open_orders", "request": "GET /api/v3/openOrders", "signed": true, "weight": 80, "doc": "rest-api.md#L4411-L4416"},
+    {"read": "open_order_list_count", "request": "GET /api/v3/openOrderList", "signed": true, "weight": 6, "doc": "rest-api.md#L4680-L4684"},
+    {"read": "order_by_id", "request": "GET /api/v3/order?orderId=1&symbol=LTCBTC", "signed": true, "weight": 4, "doc": "rest-api.md#L4341-L4346"},
+    {"read": "order_by_client_id", "request": "GET /api/v3/order?origClientOrderId=myOrder1&symbol=LTCBTC", "signed": true, "weight": 4, "doc": "rest-api.md#L4341-L4346"},
+    {"read": "trades_by_order", "request": "GET /api/v3/myTrades?fromId=0&limit=1000&orderId=100234&symbol=BNBBTC", "signed": true, "weight": 5, "doc": "rest-api.md#L4728-L4736"},
+    {"read": "trades_by_order_from", "request": "GET /api/v3/myTrades?fromId=28457&limit=1000&orderId=100234&symbol=BNBBTC", "signed": true, "weight": 5, "doc": "rest-api.md#L4728-L4736"},
+    {"read": "trades_from_id", "request": "GET /api/v3/myTrades?fromId=28457&limit=1000&symbol=BNBBTC", "signed": true, "weight": 20, "doc": "rest-api.md#L4728-L4736"},
+    {"read": "commission", "request": "GET /api/v3/account/commission?symbol=BTCUSDT", "signed": true, "weight": 20, "doc": "rest-api.md#L4954-L4959"},
+    {"read": "ping", "request": "GET /api/v3/ping", "signed": false, "weight": 1, "doc": "rest-api.md#L836-L852"},
+    {"read": "ticker_price", "request": "GET /api/v3/ticker/price?symbol=LTCBTC", "signed": false, "weight": 2, "doc": "rest-api.md#L1750-L1782"},
+    {"read": "trades_page", "request": "GET /api/v3/myTrades?fromId=28457&limit=1000&orderId=100234&symbol=BNBBTC", "signed": true, "weight": 5, "doc": "rest-api.md#L4728-L4736"}
+  ]
+}

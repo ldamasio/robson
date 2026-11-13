@@ -46,9 +46,13 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 async-stream = "0.3"
 prometheus = { workspace = true }
+# `_exit` for the stop's hard bound (ADR-0056 step 7).
+libc = "0.2"
 
 [dev-dependencies]
 proptest = "1"
+# Paused time for the stop's timing tests (ADR-0056 step 7).
+tokio = { workspace = true, features = ["test-util"] }
 rust_decimal_macros = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
 http-body-util = "0.1"

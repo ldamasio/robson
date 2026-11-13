@@ -1,6 +1,7 @@
 //! A real `robsond` child process for crash tests (ADR-0056 step 7).
 //!
-//! Spawned with a cleared environment, its logs in a file. Two independent
+//! Spawned with a cleared environment, its logs in a file or, for a test that
+//! needs its log writes to block, on a pipe it controls. Two independent
 //! watchdogs keep a stuck child from hanging the run:
 //! - a thread in the test process SIGKILLs it at a hard deadline, even when the
 //!   test's async runtime is stuck;
@@ -8,6 +9,7 @@
 //!   deadline, so it also dies when the test process itself was killed.
 
 use std::{
+    io::{PipeReader, PipeWriter},
     net::{SocketAddr, TcpListener},
     os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
@@ -63,13 +65,37 @@ pub struct DaemonProcess {
 }
 
 impl DaemonProcess {
-    /// Spawn the daemon described by `spec`.
+    /// Spawn the daemon described by `spec`, its output to a log file.
     pub fn spawn(spec: &DaemonSpec) -> Result<Self> {
-        let api = free_loopback_addr()?;
-        let run_id = Uuid::now_v7();
-        let log_path = spec.work_dir.join(format!("robsond-{run_id}.log"));
-        let marker_path = spec.work_dir.join(format!("crash-marker-{run_id}"));
+        let log_path = spec.work_dir.join(format!("robsond-{}.log", Uuid::now_v7()));
         let log = std::fs::File::create(&log_path).context("daemon log file")?;
+        Self::spawn_with_output(spec, log.try_clone()?.into(), log.into(), log_path)
+    }
+
+    /// Spawn the daemon described by `spec` with its stdout and stderr on one
+    /// pipe, returned unread with a writer of its own: the test decides when
+    /// the daemon's log writes start to block. [`DaemonProcess::log`] is empty.
+    pub fn spawn_into_pipe(spec: &DaemonSpec) -> Result<(Self, PipeReader, PipeWriter)> {
+        let (reader, writer) = std::io::pipe().context("daemon output pipe")?;
+        let log_path = spec.work_dir.join(format!("robsond-{}.log", Uuid::now_v7()));
+        std::fs::File::create(&log_path).context("daemon log file")?;
+        let process = Self::spawn_with_output(
+            spec,
+            writer.try_clone()?.into(),
+            writer.try_clone()?.into(),
+            log_path,
+        )?;
+        Ok((process, reader, writer))
+    }
+
+    fn spawn_with_output(
+        spec: &DaemonSpec,
+        stdout: Stdio,
+        stderr: Stdio,
+        log_path: PathBuf,
+    ) -> Result<Self> {
+        let api = free_loopback_addr()?;
+        let marker_path = spec.work_dir.join(format!("crash-marker-{}", Uuid::now_v7()));
         std::fs::write(spec.work_dir.join(".env"), &spec.dotenv).context("daemon .env")?;
 
         let mut command = Command::new(&spec.binary);
@@ -77,8 +103,8 @@ impl DaemonProcess {
             .env_clear()
             .current_dir(&spec.work_dir)
             .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log)
+            .stdout(stdout)
+            .stderr(stderr)
             .env("RUST_LOG", "robsond=info,robson_exec=info")
             .env("ROBSON_ENV", "test")
             .env("ROBSON_API_HOST", "127.0.0.1")
@@ -153,6 +179,24 @@ impl DaemonProcess {
         });
     }
 
+    /// Send `signal` (a name such as `TERM` or `INT`) to the daemon.
+    pub fn send_signal(&self, signal: &str) -> Result<()> {
+        let pid = self.child.lock().unwrap_or_else(|e| e.into_inner()).id();
+        let status = Command::new("kill")
+            .args(["-s", signal, &pid.to_string()])
+            .status()
+            .context("run kill")?;
+        if !status.success() {
+            bail!("kill -s {signal} {pid} failed: {status}");
+        }
+        Ok(())
+    }
+
+    /// The daemon's log so far.
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+
     /// The daemon's API base URL.
     pub fn api_url(&self) -> String {
         format!("http://{}", self.api)
@@ -224,6 +268,24 @@ impl DaemonProcess {
             bail!("died at {marker}, expected {point}\n{}", self.log_tail());
         }
         Ok(())
+    }
+
+    /// Wait until the daemon, armed to stall at `point`, has reached it, as
+    /// named by its marker file, and is still running.
+    pub async fn wait_stalled_at(&self, point: &str, within: Duration) -> Result<()> {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.try_wait()? {
+                bail!("daemon exited before stalling at {point}: {status}\n{}", self.log_tail());
+            }
+            if std::fs::read_to_string(&self.marker_path).is_ok_and(|marker| marker == point) {
+                return Ok(());
+            }
+            if started.elapsed() >= within {
+                bail!("daemon did not stall at {point} within {within:?}\n{}", self.log_tail());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// The end of the daemon's log, for failure messages.

@@ -5,7 +5,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
 
@@ -13,9 +13,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use robson_domain::{Candle, OrderSide, Price, Quantity, RiskConfig, Symbol};
 use rust_decimal::Decimal;
+use tokio::sync::Notify;
 
 use crate::{
     error::ExecError,
+    gate::{GateSnapshot, OperationGate, OperationKind},
+    order_journal,
     ports::{
         CandleInterval, ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord,
         MarketDataPort, OhlcvPort, OpenOrderRecord, OrderResult, PriceUpdate, SpotBalance,
@@ -59,6 +62,17 @@ pub struct StubStopOrder {
 /// Bound on each stub order history and on its submit-attempt evidence. The
 /// stub also backs the daemon's stub runtime, which can run indefinitely.
 const STUB_HISTORY_CAPACITY: usize = 4096;
+
+/// A venue mutation that passed the stub's choke point (ADR-0056 step 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StubMutation {
+    /// The request, as the real transport would send it.
+    pub what: &'static str,
+    /// The permit the calling task held.
+    pub permit: Option<OperationKind>,
+    /// The gate at that moment, when one is attached.
+    pub gate: Option<GateSnapshot>,
+}
 
 /// Insertion-ordered map of at most `capacity` entries; the oldest is dropped
 /// when full. A lookup whose record was dropped falls through to the attempt
@@ -164,6 +178,10 @@ pub struct StubExchange {
     short_fill_next: RwLock<Option<Decimal>>,
     /// The next protective stop cancel fails.
     cancel_fails_next: RwLock<bool>,
+    /// The next protective stop cancel answers this and changes nothing else.
+    stop_cancel_outcome_next: Mutex<Option<Result<StopCancelOutcome, ExecError>>>,
+    /// Requests that reached `cancel_protection`, whatever they answered.
+    stop_cancel_calls: RwLock<u64>,
     /// Runs once, right after the next protective stop is accepted: whatever
     /// happened on the leg while the placement was on its way.
     after_next_stop_accepted: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -185,6 +203,7 @@ pub struct StubExchange {
     /// When set, the next market order or protective stop is authoritatively
     /// rejected by the simulated venue.
     reject_order_next: RwLock<bool>,
+    refuse_before_send_next: RwLock<bool>,
     /// Futures market orders attempted via `place_market_order`, rejected or
     /// not, so tests can assert how many exit attempts reached the exchange.
     market_order_calls: RwLock<u64>,
@@ -216,7 +235,35 @@ pub struct StubExchange {
     /// Per-symbol `trading_rules` calls so tests can enforce constant-count
     /// metadata resolution instead of per-position exchange I/O.
     trading_rules_calls: RwLock<HashMap<String, u64>>,
+    /// The permit gate every mutation passes, as the real transport's
+    /// (ADR-0056 step 7). None: nothing is checked.
+    gate: OnceLock<Arc<OperationGate>>,
+    /// Mutations that passed the choke point, oldest first. Bounded.
+    mutations: Mutex<VecDeque<StubMutation>>,
+    /// The next mutation past the choke point waits for this before it acts.
+    mutation_hold: Mutex<Option<Arc<Notify>>>,
+    /// The next open-orders read, its answer fixed, waits for this before it
+    /// returns.
+    open_orders_hold: Mutex<Option<Arc<Notify>>>,
+    /// Opt-in: an entry's fill adds to the simulated position and a market
+    /// reduction takes from it, as a close always does.
+    tracks_inventory: RwLock<bool>,
+    /// Told of every market order and close that passed the choke point.
+    dispatch_observer: Mutex<Option<DispatchObserver>>,
 }
+
+/// What reached the choke point: an entry, a market reduction or a close, on
+/// one symbol and position side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StubDispatchKind {
+    Entry,
+    Reduce,
+    Close,
+}
+
+/// A test's view of each order the stub dispatches, as it leaves.
+pub type DispatchObserver =
+    Arc<dyn Fn(StubDispatchKind, &Symbol, robson_domain::Side) + Send + Sync>;
 
 impl StubExchange {
     /// Create a new stub exchange with default price and balance.
@@ -258,6 +305,8 @@ impl StubExchange {
             reduce_only_rejections_next: RwLock::new(0),
             short_fill_next: RwLock::new(None),
             cancel_fails_next: RwLock::new(false),
+            stop_cancel_outcome_next: Mutex::new(None),
+            stop_cancel_calls: RwLock::new(0),
             after_next_stop_accepted: Mutex::new(None),
             after_next_stop_cancel: Mutex::new(None),
             after_next_open_orders_read: Mutex::new(None),
@@ -267,6 +316,7 @@ impl StubExchange {
             open_orders_fail: RwLock::new(false),
             market_order_client_ids: RwLock::new(Vec::new()),
             reject_order_next: RwLock::new(false),
+            refuse_before_send_next: RwLock::new(false),
             market_order_calls: RwLock::new(0),
             trading_rules: RwLock::new(HashMap::new()),
             venue_rules: RwLock::new(HashMap::new()),
@@ -279,7 +329,115 @@ impl StubExchange {
             protection_calls: RwLock::new(0),
             position_close_calls: RwLock::new(0),
             trading_rules_calls: RwLock::new(HashMap::new()),
+            gate: OnceLock::new(),
+            mutations: Mutex::new(VecDeque::new()),
+            mutation_hold: Mutex::new(None),
+            open_orders_hold: Mutex::new(None),
+            tracks_inventory: RwLock::new(false),
+            dispatch_observer: Mutex::new(None),
         }
+    }
+
+    /// The mutations that passed the choke point, oldest first.
+    pub fn mutations(&self) -> Vec<StubMutation> {
+        self.mutations.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Hold the next mutation past the choke point until the returned handle
+    /// is notified, with its permit held.
+    pub fn hold_next_mutation(&self) -> Arc<Notify> {
+        let hold = Arc::new(Notify::new());
+        *self.mutation_hold.lock().unwrap() = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// Keep the simulated positions from the orders: an entry's fill adds to
+    /// its symbol and side, a market reduction takes from it.
+    pub fn set_tracks_inventory(&self, tracks: bool) {
+        *self.tracks_inventory.write().unwrap() = tracks;
+    }
+
+    /// The quantity held on `symbol` and `side`, zero when flat.
+    pub fn held_quantity(&self, symbol: &Symbol, side: robson_domain::Side) -> Decimal {
+        self.open_positions
+            .read()
+            .unwrap()
+            .get(&Self::position_key(symbol, side))
+            .map_or(Decimal::ZERO, |position| position.quantity.as_decimal())
+    }
+
+    /// Call `observer` with each market order and close past the choke point.
+    pub fn set_dispatch_observer(&self, observer: DispatchObserver) {
+        *self.dispatch_observer.lock().unwrap() = Some(observer);
+    }
+
+    fn observe_dispatch(&self, kind: StubDispatchKind, symbol: &Symbol, side: robson_domain::Side) {
+        let observer = self.dispatch_observer.lock().unwrap().clone();
+        if let Some(observer) = observer {
+            observer(kind, symbol, side);
+        }
+    }
+
+    /// Apply a market order's fill to the simulated position, when tracked.
+    fn track_fill(
+        &self,
+        symbol: &Symbol,
+        side: robson_domain::Side,
+        delta: Decimal,
+        price: Decimal,
+    ) {
+        if !*self.tracks_inventory.read().unwrap() {
+            return;
+        }
+        let key = Self::position_key(symbol, side);
+        let mut positions = self.open_positions.write().unwrap();
+        let held = positions.get(&key).map_or(Decimal::ZERO, |p| p.quantity.as_decimal());
+        let now = (held + delta).max(Decimal::ZERO);
+        if now.is_zero() {
+            positions.remove(&key);
+        } else {
+            positions.insert(key, ExchangePosition {
+                symbol: symbol.clone(),
+                side,
+                quantity: Quantity::new(now).unwrap(),
+                entry_price: Price::new(price).unwrap(),
+            });
+        }
+    }
+
+    /// Hold the next open-orders read, once its answer is fixed, until the
+    /// returned handle is notified: what a slow venue answer looks like to a
+    /// caller that acts on it afterwards.
+    pub fn hold_next_open_orders_read(&self) -> Arc<Notify> {
+        let hold = Arc::new(Notify::new());
+        *self.open_orders_hold.lock().unwrap() = Some(Arc::clone(&hold));
+        hold
+    }
+
+    /// What the real transport does before every signed mutation: the gate's
+    /// choke point. A refusal sends nothing.
+    async fn mutate(&self, what: &'static str) -> Result<(), ExecError> {
+        let gate = self.gate.get();
+        if let Some(gate) = gate {
+            gate.mutation(what)
+                .map_err(|refused| ExecError::SendRefused(refused.to_string()))?;
+        }
+        {
+            let mut mutations = self.mutations.lock().unwrap();
+            if mutations.len() >= STUB_HISTORY_CAPACITY {
+                mutations.pop_front();
+            }
+            mutations.push_back(StubMutation {
+                what,
+                permit: order_journal::held_permit(),
+                gate: gate.map(|gate| gate.snapshot()),
+            });
+        }
+        let hold = self.mutation_hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            hold.notified().await;
+        }
+        Ok(())
     }
 
     /// Drop the optional funding surface: `funding()` is `None`, as on a venue
@@ -297,6 +455,12 @@ impl StubExchange {
     /// Number of simulated trading-rules resolutions for one symbol.
     pub fn set_venue_rules(&self, rules: robson_domain::SymbolTradingRules) {
         self.venue_rules.write().unwrap().insert(rules.symbol().as_pair(), rules);
+    }
+
+    /// The next market order fails inside the adapter, before any request: what
+    /// a real adapter does on an entry with no fresh metadata.
+    pub fn set_refuse_before_send_next(&self, refuse: bool) {
+        *self.refuse_before_send_next.write().unwrap() = refuse;
     }
 
     /// Refuse the next `count` placements with `ExecError::RulesRejected`.
@@ -431,6 +595,17 @@ impl StubExchange {
         *self.cancel_fails_next.write().unwrap() = fails;
     }
 
+    /// Script what the next protective stop cancel answers, any variant of the
+    /// venue contract included. The stop itself stays as it is.
+    pub fn set_stop_cancel_outcome_next(&self, outcome: Result<StopCancelOutcome, ExecError>) {
+        *self.stop_cancel_outcome_next.lock().unwrap() = Some(outcome);
+    }
+
+    /// Stop cancel requests that reached the stub, whatever they answered.
+    pub fn stop_cancel_call_count(&self) -> u64 {
+        *self.stop_cancel_calls.read().unwrap()
+    }
+
     pub fn market_order_client_ids(&self) -> Vec<String> {
         self.market_order_client_ids.read().unwrap().clone()
     }
@@ -440,7 +615,8 @@ impl StubExchange {
         *self.after_next_stop_accepted.lock().unwrap() = Some(Box::new(hook));
     }
 
-    /// Run `hook` once, right after the next stop cancel takes effect.
+    /// Run `hook` once, at the next stop cancel: after it takes effect, or just
+    /// before a scripted answer returns, which changes no order state.
     pub fn set_after_next_stop_cancel(&self, hook: impl FnOnce() + Send + 'static) {
         *self.after_next_stop_cancel.lock().unwrap() = Some(Box::new(hook));
     }
@@ -658,6 +834,7 @@ impl StubExchange {
             fee,
             fee_asset: "USDT".to_string(),
             filled_at,
+            evidence: None,
         };
         self.filled_stop_orders
             .write()
@@ -742,14 +919,29 @@ impl venue::TradingPort for StubExchange {
     async fn place_market_order(
         &self,
         symbol: &Symbol,
-        _side: OrderSide,
+        side: OrderSide,
         quantity: Quantity,
         client_order_id: &str,
         intent: EntryOrReduce,
     ) -> Result<OrderResult, ExecError> {
+        if std::mem::take(&mut *self.refuse_before_send_next.write().unwrap()) {
+            return Err(ExecError::Exchange("Simulated refusal before the send".to_string()));
+        }
+        let attempt = self.submit_attempts.begin_send(client_order_id)?;
+        self.mutate("POST /fapi/v1/order").await?;
+        // One-way: a buy entry opens a long, a sell reduction reduces it.
+        let position_side = match (side, intent.is_reduce()) {
+            (OrderSide::Buy, false) | (OrderSide::Sell, true) => robson_domain::Side::Long,
+            (OrderSide::Sell, false) | (OrderSide::Buy, true) => robson_domain::Side::Short,
+        };
+        let kind = if intent.is_reduce() {
+            StubDispatchKind::Reduce
+        } else {
+            StubDispatchKind::Entry
+        };
+        self.observe_dispatch(kind, symbol, position_side);
         *self.market_order_calls.write().unwrap() += 1;
         self.market_order_client_ids.write().unwrap().push(client_order_id.to_string());
-        let attempt = self.submit_attempts.begin(client_order_id);
 
         // Check if we should simulate a failure
         if self.should_fail() || self.should_fail_order() {
@@ -804,7 +996,14 @@ impl venue::TradingPort for StubExchange {
             fee,
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
+            evidence: None,
         };
+        let delta = if intent.is_reduce() {
+            -quantity.as_decimal()
+        } else {
+            quantity.as_decimal()
+        };
+        self.track_fill(symbol, position_side, delta, price);
         self.client_orders
             .write()
             .unwrap()
@@ -820,8 +1019,9 @@ impl venue::TradingPort for StubExchange {
         stop_price: Price,
         client_order_id: &str,
     ) -> Result<PlacedStop, ExecError> {
+        let attempt = self.submit_attempts.begin_send(client_order_id)?;
+        self.mutate("POST /fapi/v1/algoOrder").await?;
         *self.protection_calls.write().unwrap() += 1;
-        let attempt = self.submit_attempts.begin(client_order_id);
         // Simulate placement failure when configured (mirrors market order path).
         if self.should_fail() || self.should_fail_order() {
             return Err(ExecError::Exchange("Simulated stop order failure".to_string()));
@@ -876,11 +1076,13 @@ impl venue::TradingPort for StubExchange {
                 fee: Decimal::ZERO,
                 fee_asset: "USDT".to_string(),
                 filled_at: placed_at,
+                evidence: None,
             },
         })
     }
 
     async fn cancel_order(&self, _symbol: &Symbol, order_id: &str) -> Result<(), ExecError> {
+        self.mutate("DELETE /fapi/v1/order").await?;
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated cancel failure".to_string()));
         }
@@ -900,11 +1102,19 @@ impl venue::TradingPort for StubExchange {
         _symbol: &Symbol,
         stop: &StopRef,
     ) -> Result<StopCancelOutcome, ExecError> {
+        self.mutate("DELETE /fapi/v1/algoOrder").await?;
+        *self.stop_cancel_calls.write().unwrap() += 1;
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated stop cancel failure".to_string()));
         }
         if std::mem::take(&mut *self.cancel_fails_next.write().unwrap()) {
             return Err(ExecError::Timeout("Simulated stop cancel timeout".to_string()));
+        }
+        if let Some(outcome) = self.stop_cancel_outcome_next.lock().unwrap().take() {
+            if let Some(hook) = self.after_next_stop_cancel.lock().unwrap().take() {
+                hook();
+            }
+            return outcome;
         }
 
         let algo_id = stop.exchange_order_id.as_str();
@@ -995,7 +1205,8 @@ impl venue::TradingPort for StubExchange {
                 fills: None,
             });
         }
-        Ok(STUB_FINALITY.classify_not_found(self.submit_attempts.evidence(client_order_id)))
+        Ok(STUB_FINALITY
+            .classify_not_found(self.submit_attempts.final_evidence(client_order_id).await))
     }
 
     async fn open_protective_orders(
@@ -1027,6 +1238,10 @@ impl venue::TradingPort for StubExchange {
 
         if let Some(hook) = self.after_next_open_orders_read.lock().unwrap().take() {
             hook();
+        }
+        let hold = self.open_orders_hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            hold.notified().await;
         }
         Ok(orders)
     }
@@ -1139,7 +1354,8 @@ impl venue::FundingPort for StubExchange {
         request: SpotOrderRequest,
     ) -> Result<SpotOrder, ExecError> {
         // Never resolves as rejected: lookups do not query the spot namespace.
-        self.submit_attempts.begin(&request.client_order_id);
+        self.submit_attempts.begin_send(&request.client_order_id)?;
+        self.mutate("POST /api/v3/order").await?;
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated spot order failure".to_string()));
         }
@@ -1231,6 +1447,7 @@ impl venue::FundingPort for StubExchange {
         transfer_type: UniversalTransferType,
         client_tran_key: &str,
     ) -> Result<TransferId, ExecError> {
+        self.mutate("POST /sapi/v1/asset/transfer").await?;
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated universal transfer failure".to_string()));
         }
@@ -1285,6 +1502,8 @@ impl venue::PositionAccountPort for StubExchange {
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated futures check failure".to_string()));
         }
+        // The real adapter sets the leverage here, a signed mutation.
+        self.mutate("POST /fapi/v1/leverage").await?;
 
         let (position_mode, leverage) = {
             let settings = self.futures_settings.read().unwrap();
@@ -1348,8 +1567,10 @@ impl venue::PositionAccountPort for StubExchange {
         quantity: Quantity,
         client_order_id: &str,
     ) -> Result<OrderResult, ExecError> {
+        let attempt = self.submit_attempts.begin_send(client_order_id)?;
+        self.mutate("POST /fapi/v1/order").await?;
+        self.observe_dispatch(StubDispatchKind::Close, symbol, side);
         *self.position_close_calls.write().unwrap() += 1;
-        let attempt = self.submit_attempts.begin(client_order_id);
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated reconciliation close failure".to_string()));
         }
@@ -1393,6 +1614,7 @@ impl venue::PositionAccountPort for StubExchange {
             fee,
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
+            evidence: None,
         };
         self.client_orders
             .write()
@@ -1479,11 +1701,20 @@ impl venue::AccountPort for StubExchange {
             replacement: ReplacementProtocol::PlaceThenCancel,
             has_funding: self.has_funding,
             order_finality: STUB_FINALITY,
+            one_attempt_per_client_id: false,
         }
     }
 }
 
 impl venue::Venue for StubExchange {
+    fn attach_order_journal(&self, journal: std::sync::Arc<crate::order_journal::OrderJournal>) {
+        self.submit_attempts.attach_journal(journal);
+    }
+
+    fn attach_gate(&self, gate: Arc<OperationGate>) {
+        let _ = self.gate.set(gate);
+    }
+
     fn id(&self) -> &VenueId {
         &self.venue_id
     }
@@ -1920,6 +2151,7 @@ mod tests {
             fee: dec!(9.5),
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
+            evidence: None,
         };
 
         exchange.set_order_result("12345", order_result.clone());

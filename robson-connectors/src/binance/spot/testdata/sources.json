@@ -1,0 +1,107 @@
+{
+  "about": "Where every fixture in this directory comes from. Doc links are pinned to commit 995f6eb3 of binance/binance-spot-api-docs, the source of developers.binance.com/docs/binance-spot-api-docs. No fixture came from a signed or account endpoint.",
+  "fixtures": {
+    "exchange_info_btcusdt.json": {
+      "source": "https://api.binance.com/api/v3/exchangeInfo?symbol=BTCUSDT",
+      "accessed": "2026-11-10",
+      "how": "The public, unauthenticated response fetched at 2026-11-10T23:35:13Z, unmodified (sha256 8d459563efe940b63c89b9dda5791db955e2b93ff3844de937ece99dd9f4ed83). Format: https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L884-L1010 and https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/filters.md"
+    },
+    "account.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L4297-L4332",
+      "accessed": "2026-11-10",
+      "how": "The documented response of GET /api/v3/account, comments removed"
+    },
+    "order.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L4366-L4400",
+      "accessed": "2026-11-10",
+      "how": "The documented response of GET /api/v3/order, comments removed"
+    },
+    "open_orders.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L4432-L4468",
+      "accessed": "2026-11-10",
+      "how": "The documented response of GET /api/v3/openOrders, comments removed"
+    },
+    "open_order_list.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L4697-L4719",
+      "accessed": "2026-11-10",
+      "how": "The documented response of GET /api/v3/openOrderList"
+    },
+    "my_trades.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L4767-L4783",
+      "accessed": "2026-11-10",
+      "how": "The documented response of GET /api/v3/myTrades. Paging tests derive further trades from this record, changing only id, orderId and time"
+    },
+    "commission.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L4972-L5002",
+      "accessed": "2026-11-10",
+      "how": "The documented response of GET /api/v3/account/commission, comments removed"
+    },
+    "errors.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/errors.md",
+      "accessed": "2026-11-10",
+      "how": "Error bodies in Binance's documented shape (https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L145-L155): -2013 errors.md#L435 (body as in CHANGELOG.md#L2164-L2167), -2026 errors.md#L451 (body as in CHANGELOG.md#L2173-L2176), -1007 errors.md#L39, -1000 errors.md#L15, -1121 errors.md#L177, -1003 errors.md#L27 with the template filled from the live REQUEST_WEIGHT limit. html_page is constructed: Binance documents no body for a non-JSON answer. Binance does not pair codes with HTTP statuses beyond rest-api.md#L132-L143, so each test chooses the status and says so. Order placement (ADR-0056 step 8c-3): -2010 errors.md#L427 with the messages of errors.md#L485 (\"Duplicate order sent.\"), #L487 (insufficient balance) and #L500 (\"Order would trigger immediately.\"); -1013 errors.md#L47 with the filter failure of errors.md#L546; -1006 errors.md#L35. Cancel (8c-3b): -2011 errors.md#L431 with the message of errors.md#L484 (\"Unknown order sent.\")"
+    },
+    "reads.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md",
+      "accessed": "2026-11-10",
+      "how": "Golden table of every read: method, path and parameters (timestamp and signature removed, sorted), whether it is signed, and its documented weight at the cited lines"
+    },
+    "agg_trade.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L279-L293",
+      "accessed": "2026-11-11",
+      "how": "The documented payload of the <symbol>@aggTrade stream (stream name at https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L274), comments removed. It carries \"M\" (\"Ignore\"), for which the shared wire type AggTradeEvent has no field"
+    },
+    "server_shutdown.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L89-L96",
+      "accessed": "2026-11-11",
+      "how": "The documented serverShutdown event on a raw stream, comments removed"
+    },
+    "klines.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1319-L1337",
+      "accessed": "2026-11-11",
+      "how": "The documented response of GET /api/v3/klines, comments removed"
+    },
+    "klines_btcusdt_1m.json": {
+      "source": "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=3",
+      "accessed": "2026-11-11",
+      "how": "The public, unauthenticated response fetched at 2026-11-11T22:28:55Z, unmodified (sha256 b9c9e4c956ef8fe32f4761984d6432b5f3b04c1d7d54bf49157ddf30e4b71b63): three 1-minute klines, oldest first. Format: https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1273-L1337"
+    },
+    "ticker_price.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1776-L1782",
+      "accessed": "2026-11-13",
+      "how": "The documented single-symbol response of GET /api/v3/ticker/price"
+    },
+    "order_result.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L2225-L2242",
+      "accessed": "2026-11-13",
+      "how": "The documented RESULT response of POST /api/v3/order, comments removed. Tests derive each placement answer from it, changing only the fields the case names; such a derived answer is constructed, not a venue answer"
+    },
+    "order_full.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L2248-L2302",
+      "accessed": "2026-11-13",
+      "how": "The documented FULL response of POST /api/v3/order, comments removed. It is incoherent: cummulativeQuoteQty is 10 while its fills' price x qty sum to 39983, so as given it is only a parse fixture and the conflicting case (8c plan §5). Coherent answers are constructed from it: cummulativeQuoteQty set to the fills' sum, and the request's symbol, side, quantity, client id and STP mode echoed"
+    },
+    "cancel_order.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L2421-L2453",
+      "accessed": "2026-11-13",
+      "how": "The documented response of DELETE /api/v3/order, comments removed, every conditional field included as documented (rest-api.md#L170-L196). Tests derive each cancel answer from it, changing only the fields the case names; such a derived answer is constructed"
+    }
+  },
+  "facts": {
+    "about": "Venue facts the spot trade feed and klines (ADR-0056 step 8b) rely on, read 2026-11-11 at the same commit",
+    "stream_base": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L41: wss://stream.binance.com:9443, or port 443",
+    "raw_stream_path": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L42-L47: a raw stream at /ws/<streamName>; a combined stream at /stream?streams=... wraps each event as {stream, data}",
+    "lowercase_symbols": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L48",
+    "agg_trade_stream_name": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L274: <symbol>@aggTrade",
+    "agg_trade_payload": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L279-L293",
+    "connection_lifetime": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L49-L50: one connection is valid for 24 hours",
+    "server_shutdown": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L51-L53, #L85-L110: a serverShutdown event precedes a disconnection",
+    "ping_pong": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/web-socket-streams.md#L54-L59: a ping every 20 seconds; no pong within a minute disconnects; the pong copies the ping's payload",
+    "klines_request": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1273-L1292: GET /api/v3/klines, weight 2; symbol and interval mandatory; limit default 500, maximum 1000",
+    "klines_security": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L263-L268, #L280-L282: no security type, so NONE, public and unsigned",
+    "kline_intervals": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1298-L1307",
+    "klines_most_recent": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1311, #L98-L99: without startTime or endTime, the most recent klines, in chronological order",
+    "klines_response": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1319-L1337",
+    "rest_base": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L87-L88: https://api.binance.com"
+  }
+}
