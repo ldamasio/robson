@@ -10,7 +10,7 @@ use std::{
 use robson_domain::{OrderSide, Price, Quantity, Symbol, SymbolTradingRules};
 use robson_exec::{
     order_journal::{IntentKind, IntentSpec, OrderJournal, StubJournalBackend, WriteClass},
-    ports::FeeEvidence,
+    ports::{FeeEvidence, FeeGap},
     venue::{
         capability_mismatches, AccountKind, AccountPort, AttemptEvidence, CancelAnswer,
         EntryOrReduce, InventoryPort, MarketKind, OrderLookup, OrderObservation, OrderPhase,
@@ -47,8 +47,16 @@ fn price(s: &str) -> Price {
 /// BTCUSDT at 100 with BTC 1 and USDT 1000, fee 0.001, the spot rules, and a
 /// one-attempt journal attached.
 fn stub() -> (BalanceStub, Arc<OrderJournal>) {
-    let book = SpotBook::new(vec![BookRules::btcusdt()], d("0.001"));
-    book.set_price("BTCUSDT", d("100"));
+    stub_with(vec![BookRules::btcusdt()])
+}
+
+/// As [`stub`], with more symbols on the book (each at 100, none seeded).
+fn stub_with(rules: Vec<BookRules>) -> (BalanceStub, Arc<OrderJournal>) {
+    let symbols: Vec<String> = rules.iter().map(|r| r.symbol.clone()).collect();
+    let book = SpotBook::new(rules, d("0.001"));
+    for symbol in &symbols {
+        book.set_price(symbol, d("100"));
+    }
     book.set_balance("BTC", d("1"));
     book.set_balance("USDT", d("1000"));
     let stub = BalanceStub::new(Arc::new(book));
@@ -620,4 +628,145 @@ async fn account_reads_and_what_spot_refuses() {
         Err(ExecError::Config(_))
     ));
     assert!(stub.health().await.is_ok());
+}
+
+/// P2-1 (8d-1b round 1), MARKET: a fill the adapter's rules reject (an empty
+/// commission asset) leaves the result with no fills and no fee total; the
+/// order's record and price stand.
+#[tokio::test]
+async fn unusable_market_fills_are_withheld() {
+    let (stub, journal) = stub();
+    stub.book().script_next(Script::Commission {
+        asset: String::new(),
+        amount: Decimal::ZERO,
+    });
+    let result = buy(&stub, &journal, "e", "0.5").await.unwrap();
+    assert_eq!(result.fee_evidence(), FeeEvidence::Unavailable(FeeGap::Conflicting));
+    assert!(result.fills().is_empty());
+    assert_eq!(result.fee_total(), None);
+    assert_eq!((result.fee, result.fee_asset.as_str()), (Decimal::ZERO, ""));
+    assert_eq!(result.record().unwrap().status, "FILLED");
+    assert_eq!(
+        (result.fill_price.as_decimal(), result.filled_quantity.as_decimal()),
+        (d("100"), d("0.5"))
+    );
+}
+
+/// P2-1, composites: trades the adapter's rules reject give no fills;
+/// terminality and execution are kept, and a fill lookup fails.
+#[tokio::test]
+async fn unusable_composite_fills_are_withheld() {
+    let (stub, journal) = stub();
+    let stop = protect(&stub, &journal, "s", "0.5", "90").await.unwrap().stop;
+    stub.book().script_next(Script::Commission {
+        asset: String::new(),
+        amount: Decimal::ZERO,
+    });
+    stub.book().cross(stop.exchange_order_id.parse().unwrap(), d("0.5")).unwrap();
+    let gone = stub.cancel_protection(btc(), &stop).await.unwrap();
+    assert!(
+        matches!(
+            gone,
+            StopCancelOutcome::AlreadyGone {
+                final_state: OrderLookup::Terminal { filled_qty, fills: None, .. }
+            } if filled_qty == d("0.5")
+        ),
+        "{gone:?}"
+    );
+    assert!(stub.protection_fill(btc(), &stop).await.is_err());
+    assert!(stub.order_by_exchange_id(btc(), &stop.exchange_order_id).await.is_err());
+}
+
+/// Valid trades in two commission assets are complete fills with no fee
+/// total (`MixedAssets`), as on the adapter.
+#[tokio::test]
+async fn composite_fills_in_two_assets_have_no_fee_total() {
+    let (stub, journal) = stub();
+    stub.book().set_balance("BNB", d("1"));
+    let stop = protect(&stub, &journal, "s", "0.5", "90").await.unwrap().stop;
+    let id = stop.exchange_order_id.parse().unwrap();
+    stub.book()
+        .script_next(Script::Commission { asset: "BNB".into(), amount: d("0.01") });
+    stub.book().cross(id, d("0.2")).unwrap();
+    stub.book().cross(id, d("0.3")).unwrap();
+    let fill = stub.protection_fill(btc(), &stop).await.unwrap().unwrap();
+    assert_eq!(fill.fills().len(), 2);
+    assert_eq!(fill.fee_evidence(), FeeEvidence::Unavailable(FeeGap::MixedAssets));
+    assert_eq!(fill.fee_total(), None);
+}
+
+/// A composite reads trade pages as the adapter does: it stops as soon as
+/// the trades read cover the execution, even after a full page.
+#[tokio::test]
+async fn a_composite_stops_reading_once_the_execution_is_covered() {
+    let (stub, journal) = stub();
+    let stop = protect(&stub, &journal, "s", "0.5", "90").await.unwrap().stop;
+    let id = stop.exchange_order_id.parse().unwrap();
+    stub.book().cross(id, d("0.2")).unwrap();
+    stub.book().cross(id, d("0.3")).unwrap();
+    stub.set_trades_page_limit(1);
+    let before = stub.pages_read();
+    let fill = stub.protection_fill(btc(), &stop).await.unwrap().unwrap();
+    assert_eq!(fill.filled_quantity.as_decimal(), d("0.5"));
+    assert_eq!(stub.pages_read() - before, 2, "the second page is full but covers it");
+}
+
+/// P2-2 (8d-1b round 1): a symbol that is not one value is refused before
+/// the ledger, for placements and cancels, as the adapter refuses it: nothing
+/// recorded, the grant kept, nothing sent. Non-ASCII characters pass.
+#[tokio::test]
+async fn a_malformed_symbol_is_refused_before_the_ledger() {
+    let rules = vec![
+        BookRules::btcusdt(),
+        BookRules::new("A&BUSDT", "A&B", "USDT"),
+        BookRules::new("币USDT", "币", "USDT"),
+    ];
+    let (stub, journal) = stub_with(rules);
+    stub.book().set_balance("A&B", d("1"));
+    stub.book().set_balance("币", d("1"));
+    let bad = Symbol::from_pair("A&BUSDT").unwrap();
+    let events = stub.book().events_total();
+    let (refused, kept) = granted_with(
+        &journal,
+        "s",
+        async {
+            let refused =
+                stub.place_protection(&bad, OrderSide::Sell, qty("0.1"), price("90"), "s").await;
+            let kept = stub
+                .place_protection(btc(), OrderSide::Sell, qty("0.1"), price("90"), "s")
+                .await;
+            (refused, kept)
+        },
+        |(_, kept)| kept.is_ok(),
+    )
+    .await;
+    assert!(matches!(refused, Err(ExecError::Config(_))), "{refused:?}");
+    assert!(kept.is_ok(), "the grant was not consumed by the refusal: {kept:?}");
+    assert_eq!(stub.sends(), 1, "only the valid placement reached the book");
+    let reduce = stub
+        .place_market_order(&bad, OrderSide::Sell, qty("0.1"), "r", EntryOrReduce::Reduce)
+        .await;
+    assert!(matches!(reduce, Err(ExecError::Config(_))), "{reduce:?}");
+    assert_eq!(stub.ledger().evidence("r"), AttemptEvidence::NoRecord);
+    assert!(matches!(stub.cancel_order_once(&bad, "1").await, Err(ExecError::Config(_))));
+    assert_eq!(stub.book().all_orders().len(), 1);
+    assert_eq!(stub.book().events_total(), events + 1, "only the valid stop's placement");
+
+    let wide = Symbol::from_pair("币USDT").unwrap();
+    let placed = protect_on(&stub, &journal, &wide, "w").await;
+    assert!(placed.is_ok(), "{placed:?}");
+}
+
+async fn protect_on(
+    stub: &BalanceStub,
+    journal: &Arc<OrderJournal>,
+    symbol: &Symbol,
+    id: &str,
+) -> Result<robson_exec::venue::PlacedStop, ExecError> {
+    granted(
+        journal,
+        id,
+        stub.place_protection(symbol, OrderSide::Sell, qty("0.1"), price("90"), id),
+    )
+    .await
 }

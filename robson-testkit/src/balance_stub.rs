@@ -5,6 +5,10 @@
 //! - **Capabilities** are exactly the spot adapter's: `Spot`, `BalanceAccount`,
 //!   no short, no reduce-only flag, `MarketOnTrigger`, `CancelThenPlace`, no
 //!   funding, `EveryAttemptRejected`, one attempt per client id.
+//! - **Malformed values** are refused first, as the adapter refuses them, with
+//!   nothing recorded, no grant taken and nothing sent: a symbol that is not
+//!   one value (ASCII only as letters and digits), for placements and cancels,
+//!   and a client id outside `^[a-zA-Z0-9-_]{1,36}$`.
 //! - **Placements** pass the one-attempt ledger
 //!   ([`SubmitAttemptLedger::one_attempt`]): its send start takes the grant the
 //!   attached journal gave the order, so nothing reaches the book without a
@@ -17,11 +21,15 @@
 //! - **Cancels** take no grant and pass the gate. `-2011` is
 //!   [`CancelAnswer::NotFound`], a delayed cancel's lost answer
 //!   [`CancelAnswer::Unknown`].
-//! - **Evidence** is 8c's: every result carries the book's record of the order,
-//!   fills with one commission asset are a fee `Total`, a lookup's not-found is
-//!   classified only by the finality rule over the ledger's evidence, and a
-//!   terminal order's fills come from its trade pages, which must sum to its
-//!   execution (withheld trades give none).
+//! - **Evidence** is 8c's, under the adapter's own rules
+//!   ([`crate::spot_evidence`]): every result carries the book's record of the
+//!   order; a MARKET answer's fills are checked one by one and as a set, and
+//!   unusable fills leave the result with no fills and no fee total; a
+//!   composite's trades, read as the adapter reads them (at most five pages,
+//!   stopping once they cover the execution), give fills only when each is
+//!   valid and together they are exactly the execution, never undoing the
+//!   record's terminality; a lookup's not-found is classified only by the
+//!   finality rule over the ledger's evidence.
 //! - **Refused like spot**, with nothing sent: trades by time, governed
 //!   inventory, costs and settlement ([`ExecError::Config`]).
 //!
@@ -41,7 +49,7 @@ use robson_domain::{OrderSide, Price, Quantity, Symbol, SymbolTradingRules};
 use robson_exec::{
     gate::OperationGate,
     order_journal::OrderJournal,
-    ports::{FeeEvidence, FeeGap, OpenOrderRecord, OrderEvidence, TradeFill, UserTradeRecord},
+    ports::{FeeEvidence, OpenOrderRecord, OrderEvidence, TradeFill, UserTradeRecord},
     quantize,
     venue::{
         replace_cancel_then_place, AccountKind, AccountOpenOrder, AccountPort, CancelAnswer, Cash,
@@ -56,9 +64,12 @@ use robson_exec::{
 };
 use rust_decimal::Decimal;
 
-use crate::spot_book::{
-    BookError, BookOrder, BookStatus, BookTrade, OrderKind, OrderRef as BookRef, Placement,
-    Side as BookSide, SpotBook,
+use crate::{
+    spot_book::{
+        BookError, BookOrder, BookStatus, BookTrade, OrderKind, OrderRef as BookRef, Placement,
+        Side as BookSide, SpotBook,
+    },
+    spot_evidence::{market_evidence, terminal_result, MarketFill},
 };
 
 /// The stub's venue id.
@@ -96,6 +107,8 @@ pub struct BalanceStub {
     sends: AtomicU64,
     rules: Mutex<HashMap<String, SymbolTradingRules>>,
     page_limit: AtomicUsize,
+    /// Trade pages served, each one request on the adapter.
+    pages_read: AtomicU64,
 }
 
 /// Which answer a record comes from: each carries the times the venue's
@@ -151,9 +164,8 @@ fn time(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).expect("the book's clock starts in 2026")
 }
 
-/// A trade as fill evidence: a page's carries its time, a placement's
-/// answer none.
-fn trade_fill(trade: &BookTrade, with_time: bool) -> TradeFill {
+/// A page's trade as fill evidence, with its time.
+fn trade_fill(trade: &BookTrade) -> TradeFill {
     TradeFill {
         trade_id: trade.id.to_string(),
         price: trade.price,
@@ -161,24 +173,7 @@ fn trade_fill(trade: &BookTrade, with_time: bool) -> TradeFill {
         quote_qty: trade.quote_qty,
         commission: trade.commission,
         commission_asset: trade.commission_asset.clone(),
-        time: with_time.then(|| time(trade.time_ms)),
-    }
-}
-
-/// The commissions of fills in one asset as a `Total`, else unavailable.
-fn fee_of(fills: &[TradeFill]) -> (Decimal, String, FeeEvidence) {
-    let Some(first) = fills.first() else {
-        return (Decimal::ZERO, String::new(), FeeEvidence::Unavailable(FeeGap::NoFills));
-    };
-    if fills.iter().any(|fill| fill.commission_asset != first.commission_asset) {
-        return (Decimal::ZERO, String::new(), FeeEvidence::Unavailable(FeeGap::MixedAssets));
-    }
-    let total = fills
-        .iter()
-        .try_fold(Decimal::ZERO, |sum, fill| sum.checked_add(fill.commission));
-    match total {
-        Some(total) => (total, first.commission_asset.clone(), FeeEvidence::Total),
-        None => (Decimal::ZERO, String::new(), FeeEvidence::Unavailable(FeeGap::Overflow)),
+        time: Some(time(trade.time_ms)),
     }
 }
 
@@ -206,7 +201,8 @@ fn placement_error(error: BookError) -> ExecError {
 }
 
 /// A MARKET order's answer (8c plan §4): `FILLED`, or `EXPIRED` with
-/// execution, is the result of its execution; an expiry with nothing
+/// execution, is the result of its execution, its fills and fee under the
+/// adapter's evidence rules ([`market_evidence`]); an expiry with nothing
 /// executed is [`ExecError::ExpiredUnfilled`].
 fn market_result(placement: Placement) -> Result<OrderResult, ExecError> {
     let order = &placement.order;
@@ -217,21 +213,31 @@ fn market_result(placement: Placement) -> Result<OrderResult, ExecError> {
         BookStatus::Expired => return Err(ExecError::ExpiredUnfilled(Box::new(record))),
         status => return Err(uncertain(format!("MARKET order {} is {status:?}", order.id))),
     }
-    let price = order.quote_qty.checked_div(executed).ok_or_else(|| uncertain("no price"))?;
-    let fills: Vec<TradeFill> = placement.fills.iter().map(|t| trade_fill(t, false)).collect();
-    let (fee, fee_asset, fee_evidence) = fee_of(&fills);
+    let fills: Vec<MarketFill> = placement
+        .fills
+        .iter()
+        .map(|trade| MarketFill {
+            price: trade.price,
+            qty: trade.qty,
+            commission: trade.commission,
+            commission_asset: trade.commission_asset.clone(),
+            trade_id: trade.id,
+        })
+        .collect();
+    let evidence = market_evidence(record.cumulative_quote_qty, Some(&fills), executed, None)
+        .map_err(|why| uncertain(format!("MARKET order {}: {why}", order.id)))?;
     Ok(OrderResult {
         exchange_order_id: record.exchange_order_id.clone(),
         client_order_id: record.client_order_id.clone(),
-        fill_price: Price::new(price)?,
+        fill_price: Price::new(evidence.price)?,
         filled_quantity: Quantity::new(executed)?,
-        fee,
-        fee_asset,
+        fee: evidence.fee,
+        fee_asset: evidence.fee_asset,
         filled_at: time(order.update_ms),
         evidence: Some(Box::new(OrderEvidence {
-            fills,
+            fills: evidence.fills,
             record: Some(record),
-            fee_evidence,
+            fee_evidence: evidence.fee_evidence,
         })),
     })
 }
@@ -304,6 +310,26 @@ fn valid_client_order_id(id: &str) -> bool {
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Whether `pair` can go as one symbol value, as the adapter checks it: not
+/// empty, and ASCII only as letters and digits (non-ASCII characters pass:
+/// Binance documents them in symbol names and the transport encodes them).
+fn valid_symbol(pair: &str) -> bool {
+    !pair.is_empty() && pair.chars().all(|c| !c.is_ascii() || c.is_ascii_alphanumeric())
+}
+
+/// A request value the adapter refuses before anything is recorded or sent
+/// (its `malformed`): a symbol that is not one value, then a client id
+/// outside Binance's pattern.
+fn malformed(symbol: &Symbol, client_order_id: Option<&str>) -> Option<ExecError> {
+    let pair = symbol.as_pair();
+    if !valid_symbol(&pair) {
+        return Some(refused(format!("symbol {pair:?} is not one value")));
+    }
+    let id = client_order_id?;
+    (!valid_client_order_id(id))
+        .then(|| refused(format!("client order id {id:?} is not ^[a-zA-Z0-9-_]{{1,36}}$")))
+}
+
 fn refused(what: String) -> ExecError {
     ExecError::Config(format!("{BALANCE_STUB_VENUE} {what}; nothing was sent"))
 }
@@ -320,6 +346,7 @@ impl BalanceStub {
             sends: AtomicU64::new(0),
             rules: Mutex::new(HashMap::new()),
             page_limit: AtomicUsize::new(TRADES_PAGE_LIMIT),
+            pages_read: AtomicU64::new(0),
         }
     }
 
@@ -334,6 +361,11 @@ impl BalanceStub {
     /// Placements that reached the book.
     pub fn sends(&self) -> u64 {
         self.sends.load(Ordering::SeqCst)
+    }
+
+    /// Trade pages served, by `order_trades_page` and the composites.
+    pub fn pages_read(&self) -> u64 {
+        self.pages_read.load(Ordering::SeqCst)
     }
 
     /// The rules every rules read serves for `rules.symbol()`.
@@ -367,20 +399,20 @@ impl BalanceStub {
         }
     }
 
-    /// One placement: the client id's pattern, then the ledger (the grant),
-    /// the gate, the book and `read`, which types the answer inside the
-    /// ledger, as the adapter's does: only the answer's final rejections are
-    /// the attempt's.
+    /// One placement: the symbol and the client id refused when malformed,
+    /// with nothing recorded and no grant taken; then the ledger (the
+    /// grant), the gate, the book and `read`, which types the answer inside
+    /// the ledger, as the adapter's does: only the answer's final rejections
+    /// are the attempt's.
     async fn send<T>(
         &self,
+        symbol: &Symbol,
         client_order_id: &str,
         place: impl FnOnce() -> Result<Placement, BookError> + Send,
         read: impl FnOnce(Placement) -> Result<T, ExecError> + Send,
     ) -> Result<T, ExecError> {
-        if !valid_client_order_id(client_order_id) {
-            return Err(refused(format!(
-                "client order id {client_order_id:?} is not ^[a-zA-Z0-9-_]{{1,36}}$"
-            )));
+        if let Some(refusal) = malformed(symbol, Some(client_order_id)) {
+            return Err(refusal);
         }
         self.ledger
             .submit(client_order_id, is_final_rejection, async {
@@ -391,8 +423,11 @@ impl BalanceStub {
             .await
     }
 
-    /// The fills rule (8c plan §4) over at most five trade pages: the result
-    /// of a terminal order with execution whose trades sum exactly to it.
+    /// The fills rule (8c plan §4) over at most five trade pages from id 0,
+    /// as the adapter reads them: reading stops as soon as the trades read
+    /// cover the execution, a full page or not, and [`terminal_result`]
+    /// decides. `None` with no read when it is not terminal or nothing
+    /// executed, and when a read fails or five pages fall short.
     async fn terminal_fills(
         &self,
         symbol: &Symbol,
@@ -402,40 +437,21 @@ impl BalanceStub {
             return None;
         }
         let mut trades = Vec::new();
+        let mut covered = Decimal::ZERO;
         let mut from_id = 0;
         for _ in 0..COMPOSITE_TRADE_PAGES {
-            let page = self.order_trades_page(symbol, &record.exchange_order_id, from_id).await;
-            let page = page.ok()?;
+            let page =
+                self.order_trades_page(symbol, &record.exchange_order_id, from_id).await.ok()?;
+            for trade in &page.trades {
+                covered = covered.checked_add(trade.qty)?;
+            }
             trades.extend(page.trades);
             match page.next_from_id {
-                Some(next) => from_id = next,
-                None => break,
+                Some(next) if covered < record.executed_qty => from_id = next,
+                _ => return terminal_result(record, trades, None),
             }
         }
-        let executed = trades.iter().try_fold(Decimal::ZERO, |sum, t| sum.checked_add(t.qty))?;
-        if executed != record.executed_qty {
-            return None;
-        }
-        let price = record.cumulative_quote_qty?.checked_div(executed)?;
-        let filled_at = trades.iter().filter_map(|trade| trade.time).max()?;
-        let (fee, fee_asset, fee_evidence) = fee_of(&trades);
-        Some(OrderResult {
-            exchange_order_id: record.exchange_order_id.clone(),
-            client_order_id: record
-                .orig_client_order_id
-                .clone()
-                .unwrap_or_else(|| record.client_order_id.clone()),
-            fill_price: Price::new(price).ok()?,
-            filled_quantity: Quantity::new(executed).ok()?,
-            fee,
-            fee_asset,
-            filled_at,
-            evidence: Some(Box::new(OrderEvidence {
-                fills: trades,
-                record: Some(record.clone()),
-                fee_evidence,
-            })),
-        })
+        None
     }
 
     /// One lookup by exchange id, then the fills rule (the adapter's
@@ -508,7 +524,7 @@ impl TradingPort for BalanceStub {
         };
         let (pair, qty) = (symbol.as_pair(), quantity.as_decimal());
         let place = || self.book.place_market(&pair, book_side, qty, client_order_id);
-        self.send(client_order_id, place, market_result).await
+        self.send(symbol, client_order_id, place, market_result).await
     }
 
     /// One `STOP_LOSS` SELL through the ledger. `Ok` whatever its status: the
@@ -528,7 +544,7 @@ impl TradingPort for BalanceStub {
         let (qty, stop) = (quantity.as_decimal(), trigger.as_decimal());
         let place = || self.book.place_stop(&pair, qty, stop, client_order_id);
         let read = |placed| Ok(stop_result(placed, symbol, trigger));
-        self.send(client_order_id, place, read).await
+        self.send(symbol, client_order_id, place, read).await
     }
 
     /// The adapter's composite: one cancel; after a not-found, one lookup;
@@ -732,6 +748,9 @@ impl InventoryPort for BalanceStub {
         order_id_text: &str,
     ) -> Result<CancelAnswer, ExecError> {
         let id = order_id(order_id_text)?;
+        if let Some(refusal) = malformed(symbol, None) {
+            return Err(refusal);
+        }
         self.mutate("DELETE /api/v3/order")?;
         Ok(match self.book.cancel(&symbol.as_pair(), id) {
             Ok(order) => CancelAnswer::Cancelled(Box::new(record(&order, Answer::Cancel))),
@@ -772,6 +791,7 @@ impl InventoryPort for BalanceStub {
         from_id: u64,
     ) -> Result<TradePage, ExecError> {
         let id = order_id(order_id_text)?;
+        self.pages_read.fetch_add(1, Ordering::SeqCst);
         let limit = self.page_limit.load(Ordering::SeqCst);
         let trades = self.book.trades(&symbol.as_pair(), Some(id), Some(from_id), limit);
         let next_from_id = match trades.last() {
@@ -779,7 +799,7 @@ impl InventoryPort for BalanceStub {
             _ => None,
         };
         Ok(TradePage {
-            trades: trades.iter().map(|trade| trade_fill(trade, true)).collect(),
+            trades: trades.iter().map(trade_fill).collect(),
             next_from_id,
         })
     }

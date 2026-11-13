@@ -23,6 +23,7 @@ pub mod spot_book;
 mod spot_book_model_tests;
 #[cfg(test)]
 mod spot_book_tests;
+mod spot_evidence;
 
 use anyhow::Result;
 pub use helpers::{
