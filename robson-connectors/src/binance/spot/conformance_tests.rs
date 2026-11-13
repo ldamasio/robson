@@ -16,7 +16,10 @@ use reqwest::Method;
 use robson_domain::{OrderSide, Price, Quantity, Symbol};
 use robson_exec::{
     order_journal::{IntentKind, IntentSpec, OrderJournal, StubJournalBackend, WriteClass},
-    venue::{AccountPort, EntryOrReduce, StopRef, TradingPort, Venue, VenueId},
+    venue::{
+        AccountPort, CancelAnswer, EntryOrReduce, InventoryPort, StopRef, TradingPort, Venue,
+        VenueId,
+    },
     ExecError,
 };
 use robson_testkit::{
@@ -26,7 +29,7 @@ use robson_testkit::{
         scenarios::{self, BalanceHarness},
         Boxed, Coverage,
         Coverage::{NotApplicable, Verified},
-        Expected, Harness, Outcome, Property,
+        Event, Expected, Harness, Outcome, Property,
         Property::*,
         Verdict,
     },
@@ -105,9 +108,9 @@ impl Venues {
                 problems.push("a harness outlived its scenario".to_string());
                 continue;
             };
-            let unserved = venue.unserved_requests();
-            if !unserved.is_empty() {
-                problems.push(format!("requests the fake does not serve: {unserved:?}"));
+            if venue.unserved_total() != 0 {
+                let (total, kept) = (venue.unserved_total(), venue.unserved_requests());
+                problems.push(format!("{total} requests the fake does not serve: {kept:?}"));
             }
             if let Err(error) = venue.shutdown().await {
                 problems.push(format!("shutdown: {error}"));
@@ -264,11 +267,53 @@ async fn on_s(s: &S, property: Property) -> Outcome {
         A3 => scenarios::a3_balance(s).await,
         A4 => scenarios::a4_balance(s).await,
         B1 => scenarios::b1(s).await,
-        B2 => scenarios::b2(s).await,
+        B2 => {
+            let mut outcome = scenarios::b2(s).await;
+            b2_cancel_codes(s, &mut outcome).await;
+            outcome
+        },
         B3 => scenarios::b3(s).await,
         B4 => scenarios::b4(s).await,
         B5 => scenarios::b5(s).await,
         other => Outcome::no_scenario(other),
+    }
+}
+
+/// B2's two not-found codes on S (Codex 8d-2a round 1, P3): the fake
+/// answers an unknown cancel `-2011`, as Binance does (errors.md L484); a
+/// scripted HTTP 400 `-2013` cancel is `NotFound { -2013 }` too.
+async fn b2_cancel_codes(s: &S, outcome: &mut Outcome) {
+    let mut problems = Vec::new();
+    let symbol = btc();
+    let unknown = s.adapter.cancel_order_once(&symbol, "999998").await;
+    outcome.trace.0.push(Event::Answered {
+        call: "cancel_order_once 999998 (unknown)".to_string(),
+        answer: format!("{unknown:?}"),
+    });
+    if !matches!(unknown, Ok(CancelAnswer::NotFound { code: -2011 })) {
+        problems.push(format!("an unknown cancel is NotFound {{ -2011 }}, not {unknown:?}"));
+    }
+    let body = "{\"code\":-2013,\"msg\":\"Order does not exist.\"}";
+    s.venue.script_wire_next(Method::DELETE, "/api/v3/order", 400, body);
+    outcome.trace.0.push(Event::Market {
+        action: "the next cancel answers HTTP 400 -2013 (scripted)".to_string(),
+    });
+    let scripted = s.adapter.cancel_order_once(&symbol, "999997").await;
+    outcome.trace.0.push(Event::Answered {
+        call: "cancel_order_once 999997 (scripted -2013)".to_string(),
+        answer: format!("{scripted:?}"),
+    });
+    if !matches!(scripted, Ok(CancelAnswer::NotFound { code: -2013 })) {
+        problems.push(format!("a -2013 cancel is NotFound {{ -2013 }}, not {scripted:?}"));
+    }
+    if !problems.is_empty() {
+        outcome.verdict = match std::mem::replace(&mut outcome.verdict, Verdict::NotRun) {
+            Verdict::Fail(mut why) => {
+                why.extend(problems);
+                Verdict::Fail(why)
+            },
+            _ => Verdict::Fail(problems),
+        };
     }
 }
 
@@ -442,7 +487,7 @@ async fn a_held_request_ends_in_the_clients_timeout() {
     assert!(started.elapsed() < Duration::from_secs(5));
     let held = venue.requests();
     assert_eq!(held.len(), 1, "the held request reached the venue");
-    assert!(venue.unserved_requests().is_empty());
+    assert_eq!(venue.unserved_total(), 0);
     venue.shutdown().await.unwrap();
 }
 
