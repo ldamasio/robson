@@ -17,9 +17,9 @@
 //! node, an edge to `robson-testkit` with no
 //! `dep_kinds`, a declared dev edge the resolved graph does not show),
 //! `robson-testkit` not a workspace member, or no workspace package reaching
-//! it by a `dev` edge (the real workspace has two, `robsond` and
-//! `robson-projector`). So a failed or truncated `cargo metadata` can never
-//! pass as "no violation".
+//! it by a `dev` edge (the real workspace has three, `robsond`,
+//! `robson-projector` and `robson-connectors`). So a failed or truncated
+//! `cargo metadata` can never pass as "no violation".
 
 use std::collections::BTreeSet;
 

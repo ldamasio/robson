@@ -2103,6 +2103,7 @@ dependencies = [
  "reqwest",
  "robson-domain",
  "robson-exec",
+ "robson-testkit",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",

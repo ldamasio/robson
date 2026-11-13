@@ -539,10 +539,15 @@ pub async fn a4_balance<H: BalanceHarness>(h: &H) -> Outcome {
 
 /// A5b: across R2, A2, A3 and A4, nothing is placed after an indefinite
 /// cancel or an executed old stop, and the stale successor is refused, the
-/// flatten sold exactly. Each case on a fresh harness from `make`.
-pub async fn a5b<H: BalanceHarness>(make: impl Fn() -> H) -> Outcome {
+/// flatten sold exactly. Each case on a fresh harness from `make`, which
+/// may start a venue.
+pub async fn a5b<H, F>(make: impl Fn() -> F) -> Outcome
+where
+    H: BalanceHarness,
+    F: std::future::Future<Output = H>,
+{
     let mut run = Run::new(A5b, Coverage::Verified);
-    let h = make();
+    let h = make().await;
     seeded(&h, &mut run);
     if let Some(old) = stop(&h, &mut run, "a5-r2", "0.5", "90").await {
         let placed = h.placements();
@@ -552,7 +557,7 @@ pub async fn a5b<H: BalanceHarness>(make: impl Fn() -> H) -> Outcome {
         run.expect(h.placements() == placed, "R2: nothing placed after the indefinite cancel");
     }
     for (case, e) in [("a5-a2", "0.2"), ("a5-a3", "0.5")] {
-        let h = make();
+        let h = make().await;
         if let Some(old) = executed_old(&h, &mut run, case, e).await {
             let placed = h.placements();
             let outcome = replace(&h, &mut run, &old, &format!("{case}-new"), "0.3", "80").await;
@@ -566,7 +571,7 @@ pub async fn a5b<H: BalanceHarness>(make: impl Fn() -> H) -> Outcome {
             );
         }
     }
-    let h = make();
+    let h = make().await;
     stale_successor(&h, &mut run).await;
     run.finish()
 }
