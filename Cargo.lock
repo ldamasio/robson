@@ -2264,13 +2264,17 @@ name = "robson-testkit"
 version = "2.5.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "reqwest",
+ "robson-domain",
  "robson-eventlog",
+ "robson-exec",
  "robson-projector",
  "rust_decimal",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "uuid",
