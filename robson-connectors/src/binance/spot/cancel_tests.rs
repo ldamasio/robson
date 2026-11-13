@@ -32,6 +32,7 @@ use super::{
 use crate::binance_rest::BinanceRestClient;
 
 const CANCEL_ORDER: &str = include_str!("testdata/cancel_order.json");
+const EXCHANGE_INFO: &str = include_str!("testdata/exchange_info_btcusdt.json");
 const ORDER: &str = include_str!("testdata/order.json");
 const MY_TRADES: &str = include_str!("testdata/my_trades.json");
 
@@ -137,6 +138,7 @@ async fn scripted(answers: Answers) -> (BinanceSpotAdapter, Seens) {
             ("DELETE", "/api/v3/order") => answers.cancel.clone(),
             ("GET", "/api/v3/order") => answers.lookup.clone(),
             ("GET", "/api/v3/myTrades") => (200, page(&answers.trades, request)),
+            ("GET", "/api/v3/exchangeInfo") => (200, EXCHANGE_INFO.to_string()),
             ("POST", "/api/v3/order") => (200, result(request, |_| {})),
             other => panic!("unexpected request {other:?}"),
         })
@@ -522,20 +524,59 @@ fn the_fills_rule_refuses_trades_that_conflict() {
         fill(1, dec!(0.001)),
         fill(2, dec!(0.001)),
     ];
-    let result = terminal_result(&record, twice).unwrap();
+    let result = terminal_result(&record, twice, None).unwrap();
     assert_eq!(result.fills().len(), 2);
     let conflicting = vec![
         fill(1, dec!(0.001)),
         fill(1, dec!(0.002)),
         fill(2, dec!(0.001)),
     ];
-    assert!(terminal_result(&record, conflicting).is_none());
+    assert!(terminal_result(&record, conflicting, None).is_none());
+    // §5's evidence rules, trade by trade and against the record's quote: a
+    // zero or negative quantity (summing out), a zero price, a negative
+    // commission, no asset, a zero record quote with execution, a quote the
+    // trades disagree with. Each gives no result; two valid halves give one.
+    assert!(
+        terminal_result(&record, vec![fill(1, dec!(0.001)), fill(2, dec!(0.001))], None).is_some()
+    );
+    let invalid: [fn(&mut TradeFill); 5] = [
+        |trade| trade.qty = Decimal::ZERO,
+        |trade| trade.qty = dec!(-0.5),
+        |trade| trade.price = Decimal::ZERO,
+        |trade| trade.commission = dec!(-1),
+        |trade| trade.commission_asset = String::new(),
+    ];
+    for edit in invalid {
+        let mut bad = fill(1, dec!(0.001));
+        edit(&mut bad);
+        let rest = TradeFill {
+            qty: dec!(1) - bad.qty,
+            ..fill(2, dec!(0.001))
+        };
+        assert!(terminal_result(&record, vec![bad, rest], None).is_none());
+    }
+    let with_quote = |quote: Option<Decimal>| VenueOrderRecord {
+        cumulative_quote_qty: quote,
+        ..record.clone()
+    };
+    let halves = || vec![fill(1, dec!(0.001)), fill(2, dec!(0.001))];
+    assert!(terminal_result(&with_quote(Some(Decimal::ZERO)), halves(), None).is_none());
+    assert!(terminal_result(&with_quote(Some(dec!(0.11))), halves(), None).is_none());
+    // Within R3's tolerance from the cached precision, one unit per trade;
+    // with none cached, exactly.
+    let near = with_quote(Some(dec!(0.10000002)));
+    assert!(terminal_result(&near, halves(), Some(8)).is_some());
+    assert!(terminal_result(&near, halves(), None).is_none());
+    let priced = terminal_result(&with_quote(None), halves(), None).unwrap();
+    assert_eq!(priced.fill_price.as_decimal(), dec!(0.1), "the trades' price");
     // Not terminal, or nothing executed: no result, whatever the trades.
     let live = VenueOrderRecord {
         phase: OrderPhase::Live,
         ..record.clone()
     };
-    assert!(terminal_result(&live, vec![fill(1, dec!(0.001)), fill(2, dec!(0.001))]).is_none());
+    assert!(
+        terminal_result(&live, vec![fill(1, dec!(0.001)), fill(2, dec!(0.001))], None).is_none()
+    );
 }
 
 // =============================================================================
@@ -548,12 +589,12 @@ fn the_fills_rule_refuses_trades_that_conflict() {
 #[tokio::test]
 async fn a_lookup_by_exchange_id_is_the_fill_of_a_terminal_executed_order() {
     let answers = Answers::cancel(500, String::new())
-        .lookup(200, looked_up("FILLED", "1", "0.11"))
+        .lookup(200, looked_up("FILLED", "1", "0.1"))
         .trades(trades(1, 4, dec!(0.25)));
     let (venue, seen) = scripted(answers).await;
     let result: OrderResult = venue.order_by_exchange_id(ltc(), "4").await.unwrap().unwrap();
     assert_eq!(result.filled_quantity.as_decimal(), dec!(1));
-    assert_eq!(result.fill_price.as_decimal(), dec!(0.11), "the record's price first");
+    assert_eq!(result.fill_price.as_decimal(), dec!(0.1));
     assert_eq!(result.fee_evidence(), FeeEvidence::Total);
     assert_eq!(result.fee_total(), Some((dec!(0.004), "BNB")));
     assert!(result.fills().iter().all(|fill| fill.time.is_some()));
@@ -627,12 +668,14 @@ async fn a_protection_fill_is_a_stop_s_and_nothing_else() {
 // replace_protection, cancel_order
 // =============================================================================
 
-fn successor() -> StopParams {
+/// The successor stop under `id`: each test grants exactly this id, so a
+/// placement that suppression failed to stop would go out.
+fn successor(id: &str) -> StopParams {
     StopParams {
         close_side: OrderSide::Sell,
         quantity: Quantity::new(dec!(1)).unwrap(),
         trigger: Price::new(dec!(0.09)).unwrap(),
-        client_order_id: "ins-2".to_string(),
+        client_order_id: id.to_string(),
     }
 }
 
@@ -645,7 +688,7 @@ async fn a_replacement_cancels_first_and_places_only_after_a_definite_cancel() {
     let old = stop_4();
     let (venue, seen) = scripted(Answers::cancel(200, cancelled(|_| {}))).await;
     venue.attach_order_journal(Arc::clone(&journal));
-    let replace = venue.replace_protection(ltc(), &old, successor());
+    let replace = venue.replace_protection(ltc(), &old, successor("ins-2"));
     let outcome = granted(&journal, "ins-2", IntentKind::Protection, replace).await.unwrap();
     assert!(matches!(outcome, ReplaceOutcome::Replaced { old_filled, .. } if old_filled.is_zero()));
     let identities = requests(&seen);
@@ -655,7 +698,7 @@ async fn a_replacement_cancels_first_and_places_only_after_a_definite_cancel() {
 
     let (venue, seen) = scripted(Answers::cancel(503, error_body("unknown"))).await;
     venue.attach_order_journal(Arc::clone(&journal));
-    let replace = venue.replace_protection(ltc(), &old, successor());
+    let replace = venue.replace_protection(ltc(), &old, successor("ins-3"));
     let outcome = granted(&journal, "ins-3", IntentKind::Protection, replace).await.unwrap();
     assert!(matches!(outcome, ReplaceOutcome::Unknown { new: None }));
     assert_eq!(requests(&seen), [DELETE_4]);
@@ -667,7 +710,7 @@ async fn a_replacement_cancels_first_and_places_only_after_a_definite_cancel() {
     let (venue, seen) =
         scripted(Answers::cancel(200, executed).trades(trades(10, 2, dec!(0.2)))).await;
     venue.attach_order_journal(Arc::clone(&journal));
-    let replace = venue.replace_protection(ltc(), &old, successor());
+    let replace = venue.replace_protection(ltc(), &old, successor("ins-4"));
     let outcome = granted(&journal, "ins-4", IntentKind::Protection, replace).await.unwrap();
     assert!(
         matches!(outcome, ReplaceOutcome::OldExecuted { old_filled } if old_filled == dec!(0.4))
@@ -688,4 +731,149 @@ async fn the_legacy_cancel_is_ok_only_for_a_definite_cancel() {
     let live = cancelled(|answer| answer["status"] = json!("NEW"));
     let (venue, _) = scripted(Answers::cancel(200, live)).await;
     assert!(matches!(venue.cancel_order(ltc(), "4").await, Err(ExecError::Exchange(_))));
+}
+
+// =============================================================================
+// Round 1 of the code review: evidence rules, completeness, one request
+// =============================================================================
+
+/// Completeness is the trades' sum reaching `executedQty`, a full page or
+/// not (v16 §3.7): exactly 1,000 and exactly 5,000 trades are complete, with
+/// no page read past them; 6,000 are not, within five pages.
+#[tokio::test]
+async fn trades_are_complete_when_they_cover_the_execution_within_five_pages() {
+    for (count, pages) in [(1000, 1), (5000, 5)] {
+        let quote = (Decimal::from(count) * dec!(0.1)).to_string();
+        let answers = Answers::cancel(500, String::new())
+            .lookup(200, looked_up("FILLED", &count.to_string(), &quote))
+            .trades(trades(1, count, dec!(1)));
+        let (venue, seen) = scripted(answers).await;
+        let result = venue.order_by_exchange_id(ltc(), "4").await.unwrap().unwrap();
+        assert_eq!(result.fills().len(), count as usize);
+        assert_eq!(result.filled_quantity.as_decimal(), Decimal::from(count));
+        let mut expected = vec![GET_4.to_string()];
+        expected.extend([0, 1001, 2001, 3001, 4001].into_iter().take(pages).map(trades_from));
+        assert_eq!(requests(&seen), expected, "{count}");
+    }
+}
+
+/// The fills rule applies §5's evidence rules to trades: a trade with a
+/// zero or negative quantity (even one that makes the sum come out), a zero
+/// price, a negative commission or no asset, a zero record quote with
+/// execution, or a record quote the trades disagree with gives no fills,
+/// and terminality and the executed quantity stand.
+#[tokio::test]
+async fn trades_that_break_the_evidence_rules_give_no_fills() {
+    let edited = |edit: fn(&mut Vec<Value>)| {
+        let mut trades = trades(1, 4, dec!(0.25));
+        edit(&mut trades);
+        trades
+    };
+    let cases: [(&str, &str, Vec<Value>); 7] = [
+        (
+            "a zero quantity",
+            "0.1",
+            edited(|trades| {
+                trades[0]["qty"] = json!("0");
+                trades[1]["qty"] = json!("0.5");
+            }),
+        ),
+        (
+            "a negative quantity summing out",
+            "0.1",
+            edited(|trades| {
+                trades[0]["qty"] = json!("-0.25");
+                trades[1]["qty"] = json!("0.75");
+            }),
+        ),
+        ("a zero price", "0.1", edited(|trades| trades[0]["price"] = json!("0"))),
+        (
+            "a negative commission",
+            "0.1",
+            edited(|trades| trades[0]["commission"] = json!("-1")),
+        ),
+        (
+            "no commission asset",
+            "0.1",
+            edited(|trades| trades[0]["commissionAsset"] = json!("")),
+        ),
+        ("a zero record quote", "0", trades(1, 4, dec!(0.25))),
+        ("a record quote the trades disagree with", "0.11", trades(1, 4, dec!(0.25))),
+    ];
+    for (case, quote, trades) in cases {
+        let gone = Answers::cancel(400, error_body("cancel_rejected"))
+            .lookup(200, looked_up("FILLED", "1", quote))
+            .trades(trades.clone());
+        let (venue, _) = scripted(gone).await;
+        let outcome = venue.cancel_protection(ltc(), &stop_4()).await.unwrap();
+        assert!(
+            matches!(outcome, StopCancelOutcome::AlreadyGone {
+                final_state: OrderLookup::Terminal { filled_qty, fills: None, .. }
+            } if filled_qty == dec!(1)),
+            "{case}: {outcome:?}"
+        );
+        let lookup = Answers::cancel(500, String::new())
+            .lookup(200, looked_up("FILLED", "1", quote))
+            .trades(trades);
+        let (venue, _) = scripted(lookup).await;
+        assert!(venue.order_by_exchange_id(ltc(), "4").await.is_err(), "{case}");
+    }
+}
+
+/// A cancel answered with a redirect is `Unknown`: one DELETE, nothing sent
+/// where `Location` points. A symbol that is not one value is refused with
+/// nothing sent.
+#[tokio::test]
+async fn a_cancel_follows_no_redirect_and_refuses_a_malformed_symbol() {
+    for status in [301, 302, 303, 307, 308] {
+        let (sink, sink_seen) = stand_in::listening(|_| (200, cancelled(|_| {}))).await;
+        let (client, seen) = stand_in::redirecting(status, format!("{sink}/api/v3/order")).await;
+        let venue = BinanceSpotAdapter::new(client).unwrap();
+        let answer = venue.cancel_order_once(ltc(), "4").await.unwrap();
+        assert!(matches!(answer, CancelAnswer::Unknown { .. }), "{status}: {answer:?}");
+        assert_eq!(requests(&seen), [DELETE_4], "{status}");
+        assert_eq!(requests(&sink_seen), Vec::<String>::new(), "{status}: nothing followed");
+    }
+    let (venue, seen) = scripted(Answers::cancel(200, cancelled(|_| {}))).await;
+    let odd = Symbol::new("LTC&orderId=5".to_string(), "BTC".to_string()).unwrap();
+    let refused = venue.cancel_order_once(&odd, "4").await;
+    assert!(matches!(refused, Err(ExecError::Config(_))), "{refused:?}");
+    assert_eq!(requests(&seen), Vec::<String>::new());
+}
+
+/// R3's tolerance in the composites comes from the rules already cached
+/// (BTCUSDT's quoteAssetPrecision 8: one unit per trade), and is 0 with
+/// none cached; no request is made for it.
+#[tokio::test]
+async fn the_cached_precision_sets_the_composite_tolerance() {
+    let btc = Symbol::from_pair("BTCUSDT").unwrap();
+    let lookup = looked_up("FILLED", "1", "0.10000004").replace("LTCBTC", "BTCUSDT");
+    let on_btc: Vec<Value> = trades(1, 4, dec!(0.25))
+        .into_iter()
+        .map(|mut trade| {
+            trade["symbol"] = json!("BTCUSDT");
+            trade
+        })
+        .collect();
+    let answers = || {
+        Answers::cancel(500, String::new())
+            .lookup(200, lookup.clone())
+            .trades(on_btc.clone())
+    };
+    let (venue, _) = scripted(answers()).await;
+    assert!(venue.order_by_exchange_id(&btc, "4").await.is_err(), "no rules cached: exact");
+    let (venue, seen) = scripted(answers()).await;
+    venue.trading_rules(&btc).await.unwrap();
+    let result = venue.order_by_exchange_id(&btc, "4").await.unwrap().unwrap();
+    assert_eq!(result.fills().len(), 4);
+    assert_eq!(result.fill_price.as_decimal(), dec!(0.10000004));
+    let reads: Vec<String> = requests(&seen);
+    assert_eq!(reads.iter().filter(|read| read.contains("exchangeInfo")).count(), 1);
+    // One unit more than four trades allow: withheld.
+    let over = looked_up("FILLED", "1", "0.10000005").replace("LTCBTC", "BTCUSDT");
+    let (venue, _) =
+        scripted(Answers::cancel(500, String::new()).lookup(200, over).trades(on_btc.clone()))
+            .await;
+    venue.trading_rules(&btc).await.unwrap();
+    assert!(venue.order_by_exchange_id(&btc, "4").await.is_err());
 }

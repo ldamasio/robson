@@ -122,11 +122,14 @@ impl BinanceSpotAdapter {
     }
 
     /// The fills rule (8c plan §4) over at most five trade pages from id 0:
-    /// the order's result when it is terminal with execution and its
-    /// distinct-id trades sum exactly to `executedQty`. `None` with no read
-    /// when it is not terminal or nothing executed; `None` when a read fails,
-    /// the pages run out, or the trades do not sum. Never more than five
-    /// requests.
+    /// the order's result when it is terminal with execution and its valid,
+    /// distinct trades sum exactly to `executedQty`
+    /// ([`trading::terminal_result`]). Reading stops as soon as the trades
+    /// read cover the execution, a full page or not: completeness is that
+    /// sum, not a short page (v16 §3.7). `None` with no read when it is not
+    /// terminal or nothing executed; `None` when a read fails, five pages
+    /// fall short, or the trades fail the evidence rules. Never more than
+    /// five requests.
     async fn terminal_fills(
         &self,
         symbol: &Symbol,
@@ -135,15 +138,20 @@ impl BinanceSpotAdapter {
         if record.phase != OrderPhase::Terminal || record.executed_qty <= Decimal::ZERO {
             return None;
         }
+        let quote_precision = self.rules.spot_rules(symbol).map(|spot| spot.quote_asset_precision);
         let mut trades = Vec::new();
+        let mut covered = Decimal::ZERO;
         let mut from_id = 0;
         for _ in 0..COMPOSITE_TRADE_PAGES {
             let page =
                 self.order_trades_page(symbol, &record.exchange_order_id, from_id).await.ok()?;
+            for trade in &page.trades {
+                covered = covered.checked_add(trade.qty)?;
+            }
             trades.extend(page.trades);
             match page.next_from_id {
-                Some(next) => from_id = next,
-                None => return trading::terminal_result(record, trades),
+                Some(next) if covered < record.executed_qty => from_id = next,
+                _ => return trading::terminal_result(record, trades, quote_precision),
             }
         }
         None
@@ -723,10 +731,12 @@ impl InventoryPort for BinanceSpotAdapter {
     /// One `DELETE /api/v3/order` by `orderId` (weight 1), through
     /// `trading.rs`: no grant, no retry. `Cancelled` only on HTTP 200 whose
     /// own record is this order's, terminal and consistent; `NotFound` on
-    /// HTTP 400 with -2011 or -2013, which proves nothing about execution;
-    /// `Unknown` for everything else that was sent, a timeout and a failed
-    /// transport included. `Err` is a proven no-send: the gate refused, or
-    /// the id is not a number.
+    /// HTTP 400 with -2011 or -2013, which proves nothing about execution
+    /// (-2011 is a generic cancel rejection, not proof of absence: an exact
+    /// lookup decides); `Unknown` for everything else that was sent, a
+    /// timeout, a failed transport and a redirect included. `Err` is a proven
+    /// no-send: the gate refused, the symbol is not one value, or the id is
+    /// not a number.
     async fn cancel_order_once(
         &self,
         symbol: &Symbol,
