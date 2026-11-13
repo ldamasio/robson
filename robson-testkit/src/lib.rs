@@ -9,6 +9,8 @@ pub mod fake_venue;
 mod helpers;
 pub mod spot_book;
 #[cfg(test)]
+mod spot_book_model_tests;
+#[cfg(test)]
 mod spot_book_tests;
 
 use anyhow::Result;
