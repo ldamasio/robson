@@ -29,7 +29,7 @@ use robson_exec::{
 };
 use rust_decimal::Decimal;
 
-/// One fill of a `FULL` answer (`SpotFill`).
+/// One fill of a `FULL` answer, as the adapter parses it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MarketFill {
     pub price: Decimal,
