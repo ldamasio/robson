@@ -9,14 +9,15 @@
 //!
 //! For the conformance run U (ADR-0056 step 8, 8d plan §4 notes ¹ and ⁴) it
 //! also answers `GET /fapi/v1/order` and `GET /fapi/v1/algoOrder` (`-2013`
-//! for an id it never accepted), and takes four controls:
-//! [`FakeVenue::reject_next_algo`], [`FakeVenue::trigger_algo`],
-//! [`FakeVenue::on_next_algo_accepted`] and the reads
-//! [`FakeVenue::open_algo_ids`] and [`FakeVenue::placement_requests`]. The
-//! routes it answered before answer as they did.
+//! for an id it never accepted, or one past the last [`RECORDS`] it keeps),
+//! and has three controls, [`FakeVenue::reject_next_algo`],
+//! [`FakeVenue::trigger_algo`] and [`FakeVenue::on_next_algo_accepted`],
+//! and two reads, [`FakeVenue::open_algo_ids`] and
+//! [`FakeVenue::placement_requests`]. The routes it answered before answer
+//! as they did.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, VecDeque},
     net::SocketAddr,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
@@ -41,6 +42,10 @@ const WALLET_BALANCE: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 const CANDLES_MS: i64 = 15 * 60 * 1_000;
 /// How often a held order looks for its release.
 const HOLD_POLL: Duration = Duration::from_millis(10);
+
+/// Order records kept for the lookups, market and conditional each; the
+/// oldest is dropped past it.
+pub const RECORDS: usize = 4_096;
 
 /// A hook run as the next conditional order is accepted, with the open
 /// algo ids, the new one included.
@@ -85,14 +90,24 @@ struct Book {
     held: u64,
     /// `POST /fapi/v1/order` and `POST /fapi/v1/algoOrder` received.
     placements: u64,
-    /// Every market order filled, as `GET /fapi/v1/order` gives it.
-    market_records: Vec<Value>,
-    /// Every conditional order accepted, as `GET /fapi/v1/algoOrder` gives
-    /// it, by algo id.
-    algo_records: HashMap<i64, Value>,
+    /// The last [`RECORDS`] market orders, as `GET /fapi/v1/order` gives
+    /// them.
+    market_records: VecDeque<Value>,
+    /// The last [`RECORDS`] conditional orders accepted, as `GET
+    /// /fapi/v1/algoOrder` gives them, by algo id.
+    algo_records: BTreeMap<i64, Value>,
     /// The next conditional order is refused (`-2010` at HTTP 400).
     reject_next_algo: bool,
     algo_accepted: Option<AlgoAcceptedHook>,
+}
+
+impl Book {
+    fn keep_market_record(&mut self, record: Value) {
+        if self.market_records.len() == RECORDS {
+            self.market_records.pop_front();
+        }
+        self.market_records.push_back(record);
+    }
 }
 
 type Shared = Arc<Mutex<Book>>;
@@ -231,7 +246,7 @@ impl FakeVenue {
         } else {
             "EXPIRED"
         };
-        book.market_records.push(json!({
+        book.keep_market_record(json!({
             "symbol": symbol,
             "orderId": order_id,
             "clientOrderId": format!("triggered-{id}"),
@@ -477,7 +492,7 @@ fn place_market(book: &mut Book, params: &HashMap<String, String>) -> Result<Val
         "side": side,
         "type": "MARKET",
     });
-    book.market_records.push(answer.clone());
+    book.keep_market_record(answer.clone());
     Ok(answer)
 }
 
@@ -505,6 +520,9 @@ fn place_algo(book: &mut Book, params: &HashMap<String, String>) -> Result<Value
     });
     book.open_algos.insert(book.next_id, order.clone());
     book.algo_records.insert(book.next_id, order.clone());
+    while book.algo_records.len() > RECORDS {
+        book.algo_records.pop_first();
+    }
     if let Some(hook) = book.algo_accepted.take() {
         let mut open: Vec<i64> = book.open_algos.keys().copied().collect();
         open.sort_unstable();
@@ -595,6 +613,27 @@ mod tests {
     async fn get(url: String) -> (StatusCode, Value) {
         let answer = reqwest::Client::new().get(url).send().await.unwrap();
         (answer.status(), answer.json().await.unwrap())
+    }
+
+    /// The lookups' records are bounded: the oldest is dropped.
+    #[test]
+    fn records_are_bounded() {
+        let mut book = Book::default();
+        for n in 0..=RECORDS {
+            book.keep_market_record(json!({ "orderId": n }));
+            let params = HashMap::from([
+                ("symbol".to_string(), FAKE_SYMBOL.to_string()),
+                ("side".to_string(), "SELL".to_string()),
+                ("quantity".to_string(), "1".to_string()),
+                ("triggerPrice".to_string(), "90".to_string()),
+                ("clientAlgoId".to_string(), format!("bound-{n}")),
+            ]);
+            place_algo(&mut book, &params).unwrap();
+        }
+        assert_eq!(book.market_records.len(), RECORDS);
+        assert_eq!(book.market_records[0]["orderId"], 1);
+        assert_eq!(book.algo_records.len(), RECORDS);
+        assert!(book.algo_records.values().all(|r| r["clientAlgoId"] != "bound-0"));
     }
 
     /// Run U's lookups and controls (8d plan §4 notes ¹ and ⁴).
