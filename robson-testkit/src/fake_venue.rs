@@ -6,6 +6,14 @@
 //! cancelled. A request it cannot serve is recorded in
 //! [`FakeVenue::unserved_requests`], so a test can assert it never received
 //! anything it did not understand.
+//!
+//! For the conformance run U (ADR-0056 step 8, 8d plan §4 notes ¹ and ⁴) it
+//! also answers `GET /fapi/v1/order` and `GET /fapi/v1/algoOrder` (`-2013`
+//! for an id it never accepted), and takes four controls:
+//! [`FakeVenue::reject_next_algo`], [`FakeVenue::trigger_algo`],
+//! [`FakeVenue::on_next_algo_accepted`] and the reads
+//! [`FakeVenue::open_algo_ids`] and [`FakeVenue::placement_requests`]. The
+//! routes it answered before answer as they did.
 
 use std::{
     collections::HashMap,
@@ -33,6 +41,10 @@ const WALLET_BALANCE: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 const CANDLES_MS: i64 = 15 * 60 * 1_000;
 /// How often a held order looks for its release.
 const HOLD_POLL: Duration = Duration::from_millis(10);
+
+/// A hook run as the next conditional order is accepted, with the open
+/// algo ids, the new one included.
+pub type AlgoAcceptedHook = Box<dyn FnOnce(Vec<String>) + Send>;
 
 /// Everything the venue did, as counted by the venue.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -71,6 +83,16 @@ struct Book {
     hold_orders: bool,
     /// Market orders read and held so far.
     held: u64,
+    /// `POST /fapi/v1/order` and `POST /fapi/v1/algoOrder` received.
+    placements: u64,
+    /// Every market order filled, as `GET /fapi/v1/order` gives it.
+    market_records: Vec<Value>,
+    /// Every conditional order accepted, as `GET /fapi/v1/algoOrder` gives
+    /// it, by algo id.
+    algo_records: HashMap<i64, Value>,
+    /// The next conditional order is refused (`-2010` at HTTP 400).
+    reject_next_algo: bool,
+    algo_accepted: Option<AlgoAcceptedHook>,
 }
 
 type Shared = Arc<Mutex<Book>>;
@@ -151,6 +173,89 @@ impl FakeVenue {
     pub fn held_orders(&self) -> u64 {
         self.book().held
     }
+
+    /// Order placements received (`POST /fapi/v1/order` and `POST
+    /// /fapi/v1/algoOrder`), accepted, refused or held.
+    pub fn placement_requests(&self) -> u64 {
+        self.book().placements
+    }
+
+    /// The open conditional orders' algo ids, ascending.
+    pub fn open_algo_ids(&self) -> Vec<String> {
+        let mut ids: Vec<i64> = self.book().open_algos.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter().map(|id| id.to_string()).collect()
+    }
+
+    /// Refuse the next conditional order with HTTP 400 `-2010`
+    /// (`NEW_ORDER_REJECTED`, an authoritative rejection on USD-M), nothing
+    /// accepted.
+    pub fn reject_next_algo(&self) {
+        self.book().reject_next_algo = true;
+    }
+
+    /// Run `hook` as the next conditional order is accepted, with the open
+    /// algo ids, the new one included. It runs under the venue's lock: it
+    /// must not call the venue.
+    pub fn on_next_algo_accepted(&self, hook: AlgoAcceptedHook) {
+        self.book().algo_accepted = Some(hook);
+    }
+
+    /// The open conditional order `algo_id` triggers and its market order
+    /// executes `executed` of its quantity: the algo leaves the open list,
+    /// its record names the triggered order, whose `GET /fapi/v1/order`
+    /// record carries `executedQty = executed` (`FILLED` when whole,
+    /// `EXPIRED` otherwise), and the position moves by what executed.
+    /// `false`, with nothing changed, for an algo that is not open or an
+    /// execution outside `0..=quantity`.
+    pub fn trigger_algo(&self, algo_id: &str, executed: Decimal) -> bool {
+        let mut book = self.book();
+        let Some(id) = algo_id.parse::<i64>().ok().filter(|id| book.open_algos.contains_key(id))
+        else {
+            return false;
+        };
+        let algo = book.open_algos[&id].clone();
+        let quantity: Decimal =
+            algo["quantity"].as_str().and_then(|q| q.parse().ok()).unwrap_or_default();
+        if executed < Decimal::ZERO || executed > quantity {
+            return false;
+        }
+        book.open_algos.remove(&id);
+        book.next_id += 1;
+        let order_id = book.next_id;
+        let side = algo["side"].as_str().unwrap_or_default().to_string();
+        let symbol = algo["symbol"].as_str().unwrap_or_default().to_string();
+        let now = Utc::now().timestamp_millis();
+        let status = if executed == quantity {
+            "FILLED"
+        } else {
+            "EXPIRED"
+        };
+        book.market_records.push(json!({
+            "symbol": symbol,
+            "orderId": order_id,
+            "clientOrderId": format!("triggered-{id}"),
+            "updateTime": now,
+            "price": "0",
+            "avgPrice": FAKE_MARK.to_string(),
+            "origQty": quantity.to_string(),
+            "executedQty": executed.to_string(),
+            "cumQuote": (executed * FAKE_MARK).to_string(),
+            "status": status,
+            "side": side,
+            "type": "MARKET",
+        }));
+        let signed = if side == "BUY" { executed } else { -executed };
+        *book.positions.entry(symbol).or_default() += signed;
+        if let Some(record) = book.algo_records.get_mut(&id) {
+            record["algoStatus"] = json!("FINISHED");
+            record["actualOrderId"] = json!(order_id.to_string());
+            record["actualQty"] = json!(executed.to_string());
+            record["triggerTime"] = json!(now);
+            record["updateTime"] = json!(now);
+        }
+        true
+    }
 }
 
 async fn serve(
@@ -163,6 +268,9 @@ async fn serve(
     let held = {
         let mut book = lock();
         book.requests += 1;
+        let placement =
+            method == Method::POST && matches!(uri.path(), "/fapi/v1/order" | "/fapi/v1/algoOrder");
+        book.placements += u64::from(placement);
         let held = book.hold_orders && method == Method::POST && uri.path() == "/fapi/v1/order";
         book.held += u64::from(held);
         held
@@ -210,11 +318,38 @@ fn respond(
         ("GET", "/fapi/v1/openAlgoOrders") => {
             Ok(Value::Array(book.open_algos.values().cloned().collect()))
         },
+        ("GET", "/fapi/v1/order") => order_record(book, params),
+        ("GET", "/fapi/v1/algoOrder") => algo_record(book, params),
         _ => {
             book.unserved.push(format!("{method} {path}"));
             Err((StatusCode::NOT_FOUND, -1, format!("fake venue cannot serve {path}")))
         },
     }
+}
+
+/// `-2013` "Order does not exist." for an id the venue never accepted.
+fn no_such_order() -> Refusal {
+    (StatusCode::BAD_REQUEST, -2013, "Order does not exist.".to_string())
+}
+
+/// `GET /fapi/v1/order` by `orderId` or `origClientOrderId`.
+fn order_record(book: &Book, params: &HashMap<String, String>) -> Result<Value, Refusal> {
+    let found = match (params.get("orderId"), params.get("origClientOrderId")) {
+        (Some(id), _) => book.market_records.iter().find(|r| r["orderId"].to_string() == *id),
+        (None, Some(client)) => book.market_records.iter().find(|r| r["clientOrderId"] == **client),
+        (None, None) => None,
+    };
+    found.cloned().ok_or_else(no_such_order)
+}
+
+/// `GET /fapi/v1/algoOrder` by `algoId` or `clientAlgoId`.
+fn algo_record(book: &Book, params: &HashMap<String, String>) -> Result<Value, Refusal> {
+    let found = match (params.get("algoId"), params.get("clientAlgoId")) {
+        (Some(id), _) => id.parse().ok().and_then(|id: i64| book.algo_records.get(&id)),
+        (None, Some(client)) => book.algo_records.values().find(|r| r["clientAlgoId"] == **client),
+        (None, None) => None,
+    };
+    found.cloned().ok_or_else(no_such_order)
 }
 
 fn exchange_info() -> Value {
@@ -328,7 +463,7 @@ fn place_market(book: &mut Book, params: &HashMap<String, String>) -> Result<Val
     book.counts.fills += 1;
     book.next_id += 1;
     let notional = quantity * FAKE_MARK;
-    Ok(json!({
+    let answer = json!({
         "symbol": symbol,
         "orderId": book.next_id,
         "clientOrderId": client_id,
@@ -341,10 +476,15 @@ fn place_market(book: &mut Book, params: &HashMap<String, String>) -> Result<Val
         "status": "FILLED",
         "side": side,
         "type": "MARKET",
-    }))
+    });
+    book.market_records.push(answer.clone());
+    Ok(answer)
 }
 
 fn place_algo(book: &mut Book, params: &HashMap<String, String>) -> Result<Value, Refusal> {
+    if std::mem::take(&mut book.reject_next_algo) {
+        return Err((StatusCode::BAD_REQUEST, -2010, "Order was rejected.".to_string()));
+    }
     let client_id = required(params, "clientAlgoId")?.to_string();
     let (side, quantity, reduce_only) = accept(book, params, &client_id, true)?;
     book.next_id += 1;
@@ -364,6 +504,12 @@ fn place_algo(book: &mut Book, params: &HashMap<String, String>) -> Result<Value
         "updateTime": now,
     });
     book.open_algos.insert(book.next_id, order.clone());
+    book.algo_records.insert(book.next_id, order.clone());
+    if let Some(hook) = book.algo_accepted.take() {
+        let mut open: Vec<i64> = book.open_algos.keys().copied().collect();
+        open.sort_unstable();
+        hook(open.into_iter().map(|id| id.to_string()).collect());
+    }
     Ok(order)
 }
 
@@ -375,6 +521,9 @@ fn cancel_algo(book: &mut Book, params: &HashMap<String, String>) -> Result<Valu
         return Err((StatusCode::BAD_REQUEST, -2011, "Unknown order sent".to_string()));
     };
     book.counts.cancels += 1;
+    if let Some(record) = book.algo_records.get_mut(&algo_id) {
+        record["algoStatus"] = json!("CANCELED");
+    }
     Ok(json!({
         "algoId": algo_id,
         "clientAlgoId": order["clientAlgoId"],
@@ -441,5 +590,88 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(10), exchange)
             .await
             .expect("the venue self-test hung");
+    }
+
+    async fn get(url: String) -> (StatusCode, Value) {
+        let answer = reqwest::Client::new().get(url).send().await.unwrap();
+        (answer.status(), answer.json().await.unwrap())
+    }
+
+    /// Run U's lookups and controls (8d plan §4 notes ¹ and ⁴).
+    #[tokio::test]
+    async fn lookups_and_controls_for_run_u() {
+        let venue = FakeVenue::start().await.unwrap();
+        let base = venue.url();
+        let algo = |id: &str| {
+            format!(
+                "{base}/fapi/v1/algoOrder?symbol={FAKE_SYMBOL}&side=SELL&quantity=1&triggerPrice=90\
+                 &reduceOnly=true&clientAlgoId={id}"
+            )
+        };
+        let market = format!(
+            "{base}/fapi/v1/order?symbol={FAKE_SYMBOL}&side=BUY&type=MARKET&quantity=1\
+             &newClientOrderId=m1&reduceOnly=false"
+        );
+        let filled: Value = post(market).await.json().await.unwrap();
+        let (status, record) = get(format!("{base}/fapi/v1/order?origClientOrderId=m1")).await;
+        assert_eq!((status, record), (StatusCode::OK, filled.clone()));
+        let id = filled["orderId"].as_i64().unwrap();
+        let (status, record) = get(format!("{base}/fapi/v1/order?orderId={id}")).await;
+        assert_eq!((status, record["clientOrderId"].as_str()), (StatusCode::OK, Some("m1")));
+        for unknown in [
+            "/fapi/v1/order?origClientOrderId=never",
+            "/fapi/v1/algoOrder?clientAlgoId=never",
+        ] {
+            let (status, body) = get(format!("{base}{unknown}")).await;
+            assert_eq!((status, body["code"].as_i64()), (StatusCode::BAD_REQUEST, Some(-2013)));
+        }
+
+        // A refused conditional order: counted as a placement, nothing accepted.
+        venue.reject_next_algo();
+        let refused = post(algo("rej")).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refused.json::<Value>().await.unwrap()["code"], -2010);
+        assert_eq!(venue.placement_requests(), 2);
+        assert_eq!(venue.counts().accepted_orders, 1);
+        let (status, _) = get(format!("{base}/fapi/v1/algoOrder?clientAlgoId=rej")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // The hook sees the open algos as the next one is accepted.
+        let seen = Arc::new(Mutex::new(None));
+        let saw = Arc::clone(&seen);
+        venue.on_next_algo_accepted(Box::new(move |open| *saw.lock().unwrap() = Some(open)));
+        let first: Value = post(algo("a1")).await.json().await.unwrap();
+        let first_id = first["algoId"].to_string();
+        assert_eq!(seen.lock().unwrap().clone(), Some(vec![first_id.clone()]));
+        let second: Value = post(algo("a2")).await.json().await.unwrap();
+        let second_id = second["algoId"].to_string();
+        assert_eq!(venue.open_algo_ids(), [first_id.clone(), second_id.clone()]);
+
+        // A partial trigger: the algo leaves the open list, its record names
+        // the triggered order, which carries the execution.
+        assert!(!venue.trigger_algo(&first_id, Decimal::from(2)), "more than its quantity");
+        assert!(venue.trigger_algo(&first_id, Decimal::new(3, 1)));
+        assert!(!venue.trigger_algo(&first_id, Decimal::ZERO), "no longer open");
+        assert_eq!(venue.open_algo_ids(), [second_id]);
+        let (_, record) = get(format!("{base}/fapi/v1/algoOrder?clientAlgoId=a1")).await;
+        assert_eq!(record["algoStatus"], "FINISHED");
+        let triggered = record["actualOrderId"].as_str().unwrap().to_string();
+        let (status, order) = get(format!("{base}/fapi/v1/order?orderId={triggered}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            (order["executedQty"].as_str(), order["status"].as_str()),
+            (Some("0.3"), Some("EXPIRED"))
+        );
+        assert_eq!(venue.position(FAKE_SYMBOL), Decimal::new(7, 1));
+        // The old algo's cancel is refused as before (-2011).
+        let cancel = reqwest::Client::new()
+            .delete(format!("{base}/fapi/v1/algoOrder?algoId={first_id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cancel.json::<Value>().await.unwrap()["code"], -2011);
+        let (_, by_id) = get(format!("{base}/fapi/v1/algoOrder?algoId={first_id}")).await;
+        assert_eq!(by_id["clientAlgoId"], "a1");
+        assert!(venue.unserved_requests().is_empty());
     }
 }
