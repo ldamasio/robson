@@ -458,6 +458,81 @@ fn retention_evicts_the_oldest_terminal_order() {
     assert!(book.events_total() > MAX_EVENTS as u64);
 }
 
+/// With retention full, a placement refused by an overflow evicts nothing:
+/// the oldest order keeps its trades, its client-id entry and its queued
+/// cancel.
+#[test]
+fn a_refused_placement_with_retention_full_evicts_nothing() {
+    let book = SpotBook::new(vec![BookRules::new("BTCUSDT", "BTC", "USDT")], Decimal::ZERO);
+    book.set_price("BTCUSDT", d("2"));
+    book.set_balance("BTC", d("1"));
+    book.set_balance("USDT", d("2"));
+    let oldest = stop(&book, "1", "1", "oldest");
+    book.delay_cancels(true);
+    assert_eq!(book.cancel("BTCUSDT", oldest), Err(BookError::Lost));
+    book.cross(oldest, d("1")).unwrap();
+    for i in 1..MAX_RETAINED_ORDERS {
+        book.script_next(Script::ExpireUnfilled);
+        book.place_market("BTCUSDT", Side::Buy, d("1"), &format!("u{i}")).unwrap();
+    }
+    assert_eq!(book.all_orders().len(), MAX_RETAINED_ORDERS);
+    // Admission passes (4 USDT for a notional of 2); receiving 1 BTC overflows.
+    book.set_balance("BTC", Decimal::MAX);
+    let before = (state(&book), book.queued_cancels());
+    let refused = book.place_market("BTCUSDT", Side::Buy, d("1"), "over");
+    assert_eq!(refused.map(|p| p.order.id), Err(rejected(-1013, "Filter failure: NOTIONAL")));
+    assert_eq!((state(&book), book.queued_cancels()), before);
+    assert_eq!(book.queued_cancels(), [oldest]);
+    assert_eq!(book.order("BTCUSDT", OrderRef::Client("oldest")).unwrap().id, oldest);
+    assert_eq!(book.trades("BTCUSDT", Some(oldest), Some(0), 10).len(), 1);
+    assert!(!book.events().iter().any(|e| matches!(e, BookEvent::Evicted { .. })));
+}
+
+/// An execution whose turnover would overflow is refused before any part of
+/// it applies (zero fee, price 1: each transfer fits, the third sale's
+/// `sold` total does not).
+#[test]
+fn a_turnover_overflow_refuses_the_whole_fill() {
+    let book = SpotBook::new(vec![BookRules::new("BTCUSDT", "BTC", "USDT")], Decimal::ZERO);
+    book.set_price("BTCUSDT", Decimal::ONE);
+    book.set_balance("BTC", Decimal::MAX);
+    book.place_market("BTCUSDT", Side::Sell, Decimal::MAX, "s1").unwrap();
+    book.place_market("BTCUSDT", Side::Buy, Decimal::MAX, "b1").unwrap();
+    let before = state(&book);
+    let refused = book.place_market("BTCUSDT", Side::Sell, Decimal::MAX, "s2");
+    assert_eq!(refused.map(|p| p.order.id), Err(rejected(-1013, "Filter failure: NOTIONAL")));
+    assert_eq!(state(&book), before, "no part of the fill applied");
+    assert_eq!((book.sold("BTCUSDT"), book.bought("BTCUSDT")), (Decimal::MAX, Decimal::MAX));
+    assert_eq!(book.order("BTCUSDT", OrderRef::Client("s2")), Err(BookError::NoSuchOrder));
+}
+
+/// A cross whose order's cumulative quote would overflow is refused with
+/// nothing changed, though its balance transfer alone would fit.
+#[test]
+fn a_cumulative_quote_overflow_refuses_the_cross() {
+    let eth = BookRules::new("ETHUSDT", "ETH", "USDT");
+    let book = SpotBook::new(vec![BookRules::new("BTCUSDT", "BTC", "USDT"), eth], Decimal::ZERO);
+    book.set_price("BTCUSDT", d("2"));
+    book.set_price("ETHUSDT", Decimal::ONE);
+    book.set_balance("BTC", d("2"));
+    let id = stop(&book, "2", "1", "s");
+    // The price then rises: each execution's notional fits, their sum does not.
+    let high = Decimal::MAX * d("0.6");
+    book.set_price("BTCUSDT", high);
+    book.cross(id, d("1")).unwrap();
+    // Spend the quote received, so the next transfer fits.
+    book.place_market("ETHUSDT", Side::Buy, high, "spend").unwrap();
+    let before = state(&book);
+    assert_eq!(book.cross(id, d("1")), Err(CrossRefused::Overflow));
+    assert_eq!(state(&book), before);
+    let order = book.order("BTCUSDT", OrderRef::Id(id)).unwrap();
+    assert_eq!(
+        (order.executed_qty, order.quote_qty, order.status),
+        (d("1"), high, BookStatus::PartiallyFilled)
+    );
+    assert_eq!(book.sold("BTCUSDT"), d("1"));
+}
+
 #[test]
 #[should_panic(expected = "retention bound, all 4096 retained orders are live")]
 fn retention_with_every_order_live_is_a_test_resource_error() {

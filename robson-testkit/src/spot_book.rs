@@ -373,6 +373,18 @@ impl Order {
         matches!(self.kind, OrderKind::StopLoss { .. })
     }
 
+    fn executing(&self) -> Executing<'_> {
+        Executing {
+            order_id: self.id,
+            symbol: &self.symbol,
+            side: self.side,
+            from_locked: self.is_stop(),
+            executed: self.executed,
+            quote_qty: self.quote_qty,
+            locked: self.locked,
+        }
+    }
+
     fn view(&self) -> BookOrder {
         BookOrder {
             id: self.id,
@@ -424,6 +436,34 @@ impl Delta {
 enum CommitError {
     Overflow,
     Negative,
+}
+
+/// A delta's new values, per asset: the account's balance, the market and
+/// the fees. Writing them cannot fail.
+type Staged = Vec<(String, Balance, Decimal, Decimal)>;
+
+/// An order as one execution sees it; for a MARKET order, before it is
+/// stored.
+struct Executing<'a> {
+    order_id: u64,
+    symbol: &'a str,
+    side: Side,
+    /// A stop sells from its lock.
+    from_locked: bool,
+    executed: Decimal,
+    quote_qty: Decimal,
+    locked: Decimal,
+}
+
+/// One execution, computed in full before anything changes.
+struct Execution {
+    staged: Staged,
+    trade: BookTrade,
+    executed: Decimal,
+    quote_qty: Decimal,
+    locked: Decimal,
+    /// The symbol's bought or sold total after the execution.
+    tally: Decimal,
 }
 
 /// A placement as the venue receives it.
@@ -736,7 +776,9 @@ impl SpotBook {
             return Err(CrossRefused::TradeBound);
         }
         let price = book.prices[&order.symbol];
-        let trade = book.execute(order_id, qty, price).map_err(|()| CrossRefused::Overflow)?;
+        let execution =
+            book.prepare(&order.executing(), qty, price).ok_or(CrossRefused::Overflow)?;
+        let trade = book.execute(execution);
         if book.orders[&order_id].executed == book.orders[&order_id].orig {
             book.end(order_id, BookStatus::Filled);
         }
@@ -890,9 +932,11 @@ impl Inner {
         self.events_total += 1;
     }
 
-    /// Apply a delta all together, or nothing: `Overflow` if a sum
-    /// overflows, `Negative` if a `free` or `locked` would go below zero.
-    fn commit(&mut self, delta: &Delta) -> Result<(), CommitError> {
+    /// A delta's new values, changing nothing: `Overflow` if a sum
+    /// overflows (an asset's `free + locked` included, so releasing a lock
+    /// never overflows), `Negative` if a `free` or `locked` would go below
+    /// zero.
+    fn stage(&self, delta: &Delta) -> Result<Staged, CommitError> {
         let mut staged = Vec::with_capacity(delta.0.len());
         for (asset, d) in &delta.0 {
             let balance = self.balances.get(asset).copied().unwrap_or_default();
@@ -904,15 +948,26 @@ impl Inner {
             if free < Decimal::ZERO || locked < Decimal::ZERO {
                 return Err(CommitError::Negative);
             }
+            sum(free, locked)?;
             let market = sum(market, d[Slot::Market as usize])?;
             let fees = sum(fees, d[Slot::Fees as usize])?;
             staged.push((asset.clone(), Balance { free, locked }, market, fees));
         }
+        Ok(staged)
+    }
+
+    fn write(&mut self, staged: Staged) {
         for (asset, balance, market, fees) in staged {
             self.balances.insert(asset.clone(), balance);
             self.market.insert(asset.clone(), market);
             self.fees.insert(asset, fees);
         }
+    }
+
+    /// Apply a delta all together, or nothing.
+    fn commit(&mut self, delta: &Delta) -> Result<(), CommitError> {
+        let staged = self.stage(delta)?;
+        self.write(staged);
         Ok(())
     }
 
@@ -1028,7 +1083,9 @@ impl Inner {
     }
 
     /// Store an accepted order and act on it: lock a stop's base, or execute
-    /// a MARKET order (all of it, or what a script says) and end it.
+    /// a MARKET order (all of it, or what a script says) and end it. Every
+    /// fallible step is computed first: an overflow refuses the placement
+    /// before anything changes, an eviction included.
     fn apply(
         &mut self,
         req: &Request<'_>,
@@ -1036,23 +1093,39 @@ impl Inner {
         executes: Option<Decimal>,
     ) -> Result<Placement, BookError> {
         let Request { symbol, side, kind, qty, client_id } = *req;
-        if !req.is_stop() && self.trades.len() >= MAX_TRADES {
-            panic!("SpotBook test-resource error: {MAX_TRADES} trades retained");
-        }
-        self.make_room();
+        let overflow = || rejected(-1013, "Filter failure: NOTIONAL");
+        let id = self.next_order;
+        let executes = executes.unwrap_or(qty);
+        let mut lock = None;
+        let mut execution = None;
         if req.is_stop() {
-            let base = self.rules[symbol].base.clone();
+            let base = &self.rules[symbol].base;
             let mut delta = Delta::default();
-            let locked = delta
-                .add(&base, Slot::Free, -qty)
-                .and_then(|()| delta.add(&base, Slot::Locked, qty));
-            match locked.map(|()| self.commit(&delta)) {
-                Some(Ok(())) => {},
-                Some(Err(CommitError::Negative)) => return Err(rejected(-2010, INSUFFICIENT)),
-                _ => return Err(rejected(-1013, "Filter failure: NOTIONAL")),
+            delta.add(base, Slot::Free, -qty).ok_or_else(overflow)?;
+            delta.add(base, Slot::Locked, qty).ok_or_else(overflow)?;
+            lock = Some(self.stage(&delta).map_err(|refused| match refused {
+                CommitError::Negative => rejected(-2010, INSUFFICIENT),
+                CommitError::Overflow => overflow(),
+            })?);
+        } else {
+            if self.trades.len() >= MAX_TRADES {
+                panic!("SpotBook test-resource error: {MAX_TRADES} trades retained");
+            }
+            if executes > Decimal::ZERO {
+                let fresh = Executing {
+                    order_id: id,
+                    symbol,
+                    side,
+                    from_locked: false,
+                    executed: Decimal::ZERO,
+                    quote_qty: Decimal::ZERO,
+                    locked: Decimal::ZERO,
+                };
+                execution = Some(self.prepare(&fresh, executes, price).ok_or_else(overflow)?);
             }
         }
-        let id = self.next_order;
+        // Nothing below can fail.
+        self.make_room();
         self.next_order += 1;
         let order = Order {
             id,
@@ -1073,13 +1146,13 @@ impl Inner {
             update_ms: self.now_ms,
         };
         self.orders.insert(id, order);
-        let key = (symbol.to_string(), client_id.to_string());
-        let previous = self.by_client.insert(key.clone(), id);
+        self.by_client.insert((symbol.to_string(), client_id.to_string()), id);
         self.record(BookEvent::Placed {
             order_id: id,
             client_id: client_id.to_string(),
         });
-        if req.is_stop() {
+        if let Some(staged) = lock {
+            self.write(staged);
             let open = self.open.entry(symbol.to_string()).or_default();
             open.orders += 1;
             open.stops += 1;
@@ -1088,22 +1161,7 @@ impl Inner {
                 fills: Vec::new(),
             });
         }
-        let executes = executes.unwrap_or(qty);
-        let mut fills = Vec::new();
-        if executes > Decimal::ZERO {
-            match self.execute(id, executes, price) {
-                Ok(trade) => fills.push(trade),
-                Err(()) => {
-                    // The execution overflowed: the order never acted.
-                    self.orders.remove(&id);
-                    match previous {
-                        Some(previous) => self.by_client.insert(key, previous),
-                        None => self.by_client.remove(&key),
-                    };
-                    return Err(rejected(-1013, "Filter failure: NOTIONAL"));
-                },
-            }
-        }
+        let fills: Vec<BookTrade> = execution.map(|e| self.execute(e)).into_iter().collect();
         let end = if executes == qty {
             BookStatus::Filled
         } else {
@@ -1135,49 +1193,60 @@ impl Inner {
         self.record(BookEvent::Evicted { order_id: oldest });
     }
 
-    /// Execute `qty` of an order at `price`: balances, commission, trade,
-    /// executed and quote quantities. A stop sells from its lock. `Err`,
-    /// with nothing changed, when a sum overflows.
-    fn execute(&mut self, order_id: u64, qty: Decimal, price: Decimal) -> Result<BookTrade, ()> {
-        let order = &self.orders[&order_id];
-        let (side, symbol, from_locked) = (order.side, order.symbol.clone(), order.is_stop());
-        let rules = self.rules[&symbol].clone();
-        let notional = qty.checked_mul(price).ok_or(())?;
-        let default = match side {
-            Side::Buy => (rules.base.clone(), qty.checked_mul(self.fee_rate).ok_or(())?),
-            Side::Sell => (rules.quote.clone(), notional.checked_mul(self.fee_rate).ok_or(())?),
+    /// Compute an execution of `qty` at `price`, changing nothing: the
+    /// balances with the commission (the next commission script's, when its
+    /// asset covers it, else the default), the trade, the order's executed,
+    /// quote and locked quantities, and the symbol's bought or sold total.
+    /// `None` when any of them overflows.
+    fn prepare(&self, at: &Executing<'_>, qty: Decimal, price: Decimal) -> Option<Execution> {
+        let rules = &self.rules[at.symbol];
+        let notional = qty.checked_mul(price)?;
+        let executed = at.executed.checked_add(qty)?;
+        let quote_qty = at.quote_qty.checked_add(notional)?;
+        let locked = if at.from_locked {
+            at.locked.checked_sub(qty)?
+        } else {
+            at.locked
         };
-        let mut commission = default.clone();
-        let mut committed = false;
-        if let Some(scripted) = self.commission_scripts.front().cloned() {
-            let delta = fill_delta(&rules, side, from_locked, qty, notional, &scripted).ok_or(())?;
-            match self.commit(&delta) {
-                Ok(()) => {
-                    commission = scripted;
-                    committed = true;
-                },
+        let tallies = match at.side {
+            Side::Buy => &self.bought,
+            Side::Sell => &self.sold,
+        };
+        let tally = tallies.get(at.symbol).copied().unwrap_or_default().checked_add(qty)?;
+        let default = match at.side {
+            Side::Buy => (rules.base.clone(), qty.checked_mul(self.fee_rate)?),
+            Side::Sell => (rules.quote.clone(), notional.checked_mul(self.fee_rate)?),
+        };
+        let fill = |commission: &(String, Decimal)| {
+            let delta = fill_delta(rules, at.side, at.from_locked, qty, notional, commission)
+                .ok_or(CommitError::Overflow)?;
+            self.stage(&delta)
+        };
+        let scripted = match self.commission_scripts.front() {
+            Some(script) => match fill(script) {
+                Ok(staged) => Some((script.clone(), staged)),
                 // Not covered: the default commission applies.
-                Err(CommitError::Negative) => {},
-                Err(CommitError::Overflow) => return Err(()),
-            }
-        }
-        if !committed {
-            let delta = fill_delta(&rules, side, from_locked, qty, notional, &default).ok_or(())?;
-            match self.commit(&delta) {
-                Ok(()) => {},
-                Err(CommitError::Overflow) => return Err(()),
+                Err(CommitError::Negative) => None,
+                Err(CommitError::Overflow) => return None,
+            },
+            None => None,
+        };
+        let (commission, staged) = match scripted {
+            Some(chosen) => chosen,
+            None => match fill(&default) {
+                Ok(staged) => (default, staged),
+                Err(CommitError::Overflow) => return None,
                 Err(CommitError::Negative) => panic!(
-                    "SpotBook invariant broken: order {order_id}'s execution of {qty} found its funds short"
+                    "SpotBook invariant broken: order {}'s execution of {qty} found its funds short",
+                    at.order_id
                 ),
-            }
-        }
-        // The fill used the next commission script, or fell back from it.
-        self.commission_scripts.pop_front();
+            },
+        };
         let trade = BookTrade {
             id: self.next_trade,
-            order_id,
-            symbol: symbol.clone(),
-            side,
+            order_id: at.order_id,
+            symbol: at.symbol.to_string(),
+            side: at.side,
             price,
             qty,
             quote_qty: notional,
@@ -1185,24 +1254,50 @@ impl Inner {
             commission_asset: commission.0,
             time_ms: self.now_ms,
         };
+        Some(Execution {
+            staged,
+            trade,
+            executed,
+            quote_qty,
+            locked,
+            tally,
+        })
+    }
+
+    /// Apply a prepared execution to its stored order; cannot fail.
+    fn execute(&mut self, execution: Execution) -> BookTrade {
+        let Execution {
+            staged,
+            trade,
+            executed,
+            quote_qty,
+            locked,
+            tally,
+        } = execution;
+        self.write(staged);
+        // The fill used the next commission script, or fell back from it.
+        self.commission_scripts.pop_front();
         self.next_trade += 1;
         self.trades.insert(trade.id, trade.clone());
         let now = self.now_ms;
-        let order = self.orders.get_mut(&order_id).expect("present");
-        order.executed += qty;
-        order.quote_qty += notional;
-        if from_locked {
-            order.locked -= qty;
-        }
+        let order = self.orders.get_mut(&trade.order_id).expect("stored");
+        order.executed = executed;
+        order.quote_qty = quote_qty;
+        order.locked = locked;
         order.trades.push(trade.id);
         order.update_ms = now;
-        let tally = match side {
+        let tallies = match trade.side {
             Side::Buy => &mut self.bought,
             Side::Sell => &mut self.sold,
         };
-        *tally.entry(symbol).or_default() += qty;
-        self.record(BookEvent::Executed { order_id, trade_id: trade.id, qty, price });
-        Ok(trade)
+        tallies.insert(trade.symbol.clone(), tally);
+        self.record(BookEvent::Executed {
+            order_id: trade.order_id,
+            trade_id: trade.id,
+            qty: trade.qty,
+            price: trade.price,
+        });
+        trade
     }
 
     /// The order's one terminal transition: release what a stop still
