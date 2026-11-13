@@ -118,6 +118,15 @@ fn rules_of_another_symbol_are_inconsistent_and_the_stp_modes_are_required() {
         rules_of(EXCHANGE_INFO).trading_rules(&Symbol::new("BTCU".into(), "SDT".into()).unwrap()),
         Err(SpotReadError::Inconsistent(_))
     ));
+    // The venue's own symbol must be the one asked for, even when its assets
+    // match.
+    let renamed = edited(|entry| entry["symbol"] = "BTCUSDTX".into());
+    assert!(matches!(
+        parse_symbol_rules(&renamed, "BTCUSDTX")
+            .unwrap()
+            .trading_rules(&symbol("BTCUSDT")),
+        Err(SpotReadError::Inconsistent(_))
+    ));
     let no_modes = edited(|entry| {
         entry.as_object_mut().unwrap().remove("allowedSelfTradePreventionModes");
     });
