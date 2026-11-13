@@ -368,6 +368,39 @@ impl BinanceRestClient {
             .await
     }
 
+    /// A signed POST whose answer comes back whatever its HTTP status: a venue
+    /// mutation for a caller that types the venue's answers itself (the spot
+    /// order path, ADR-0056 step 8c-3). It passes the gate first, as
+    /// [`Self::post_signed`] does, and keeps the status: what a status or a
+    /// code proves is the caller's.
+    pub(crate) async fn post_signed_answer(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<RestAnswer, BinanceRestError> {
+        self.pass_gate("POST", endpoint)?;
+        let query = self.build_signed_query(params)?;
+        let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
+
+        self.answer(self.client.post(&url).header("X-MBX-APIKEY", &self.api_key)).await
+    }
+
+    /// [`Self::post_signed_answer`] for DELETE: gated, signed, the status kept.
+    // The spot cancel (8c-3b) uses it; until then only its tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn delete_signed_answer(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<RestAnswer, BinanceRestError> {
+        self.pass_gate("DELETE", endpoint)?;
+        let query = self.build_signed_query(params)?;
+        let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
+
+        self.answer(self.client.delete(&url).header("X-MBX-APIKEY", &self.api_key))
+            .await
+    }
+
     // =========================================================================
     // Futures Position API
     // =========================================================================
@@ -1576,7 +1609,10 @@ fn harness_origin(base_url: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
 
     use robson_exec::{gate::OperationKind, order_journal::OrderJournal};
     use rust_decimal_macros::dec;
@@ -1697,6 +1733,154 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 2, "nothing refused reached the venue");
         assert_eq!(journal.gate().snapshot().unpermitted, 1);
     }
+
+    /// A venue answering every request with `status` and `body`, recording
+    /// each request's first line and whether it carried the API key.
+    async fn answering(status: u16, body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let first = head.lines().next().unwrap_or_default().to_string();
+                let keyed = head.contains("\r\nx-mbx-apikey: key");
+                recorded.lock().unwrap().push(format!("{first} key={keyed}"));
+                let answer = format!(
+                    "HTTP/1.1 {status} Answer\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(answer.as_bytes()).await;
+            }
+        });
+        (url, seen)
+    }
+
+    /// The answer helpers (ADR-0056 step 8c-3) send one signed request each,
+    /// with the key, and return every status as given: a 201 is not folded
+    /// into success, a 400 or a 503 not into an error. What each means is
+    /// the caller's.
+    #[tokio::test]
+    async fn the_answer_helpers_keep_every_status() {
+        let error =
+            r#"{"code":-2010,"msg":"Account has insufficient balance for requested action."}"#;
+        for (status, body) in [
+            (200, "{}"),
+            (201, "{}"),
+            (204, ""),
+            (400, error),
+            (503, "busy"),
+        ] {
+            let (url, seen) = answering(status, body).await;
+            let client = BinanceRestClient::with_local_base_url(url);
+            let posted =
+                client.post_signed_answer("/api/v3/order", vec![("symbol", "BTCUSDT".into())]);
+            let posted = posted.await.unwrap();
+            assert_eq!((posted.status.as_u16(), posted.body.as_str()), (status, body));
+            let deleted =
+                client.delete_signed_answer("/api/v3/order", vec![("orderId", "7".into())]);
+            let deleted = deleted.await.unwrap();
+            assert_eq!((deleted.status.as_u16(), deleted.body.as_str()), (status, body));
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert!(
+                seen[0].starts_with("post /api/v3/order?symbol=btcusdt&timestamp="),
+                "{seen:?}"
+            );
+            assert!(seen[1].starts_with("delete /api/v3/order?orderid=7&timestamp="), "{seen:?}");
+            for request in &seen {
+                assert!(request.contains("&signature=") && request.ends_with("key=true"));
+            }
+        }
+    }
+
+    /// The answer helpers pass the gate as the existing mutations do: refused
+    /// before anything is sent once the daemon is stopping.
+    #[tokio::test]
+    async fn the_answer_helpers_pass_the_gate() {
+        let (url, seen) = answering(200, "{}").await;
+        let client = BinanceRestClient::with_local_base_url(url);
+        let journal = Arc::new(OrderJournal::unpersisted());
+        client.attach_gate(Arc::clone(journal.gate()));
+        journal.gate().begin_draining();
+        let posted = client.post_signed_answer("/api/v3/order", vec![]).await;
+        assert!(matches!(posted, Err(BinanceRestError::Refused(_))), "{:?}", posted.is_ok());
+        let deleted = client.delete_signed_answer("/api/v3/order", vec![]).await;
+        assert!(matches!(deleted, Err(BinanceRestError::Refused(_))), "{:?}", deleted.is_ok());
+        assert!(seen.lock().unwrap().is_empty(), "nothing refused reached the venue");
+    }
+
+    /// The text of `signature`'s function in this file's code: from the
+    /// signature to the end of its body.
+    fn function_text(signature: &str) -> &'static str {
+        let source = include_str!("binance_rest.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        assert_eq!(code.matches(signature).count(), 1, "{signature}");
+        let start = code.find(signature).unwrap();
+        let end = start + code[start..].find("\n    }\n").unwrap() + "\n    }\n".len();
+        &code[start..end]
+    }
+
+    /// ADR-0056 step 8c-3: the existing signed path and every mutation that
+    /// rides on it stay as they were on main (`804d9f77`), byte for byte. The
+    /// spot order path has its own helpers; nothing here changed for it.
+    #[test]
+    fn the_existing_mutation_paths_are_byte_identical() {
+        use sha2::{Digest, Sha256};
+        let goldens = [
+            ("    fn build_signed_query(", BUILD_SIGNED_QUERY),
+            ("    async fn answer(&self, request: RequestBuilder)", ANSWER),
+            ("    async fn exchange(&self, request: RequestBuilder)", EXCHANGE),
+            ("    fn pass_gate(&self, method: &str, endpoint: &str)", PASS_GATE),
+            ("    async fn post_signed(", POST_SIGNED),
+            ("    async fn delete_signed(", DELETE_SIGNED),
+            ("    pub async fn place_market_order(", PLACE_MARKET_ORDER),
+            ("    pub async fn place_stop_market_order(", PLACE_STOP_MARKET_ORDER),
+            ("    pub async fn cancel_algo_order(", CANCEL_ALGO_ORDER),
+            ("    pub async fn cancel_order(", CANCEL_ORDER),
+            ("    pub async fn set_leverage(", SET_LEVERAGE),
+            ("    pub async fn place_spot_market_order(", PLACE_SPOT_MARKET_ORDER),
+            ("    pub async fn universal_transfer(", UNIVERSAL_TRANSFER),
+            ("    pub(crate) fn into_body(self)", INTO_BODY),
+        ];
+        for (signature, golden) in goldens {
+            let digest = hex::encode(Sha256::digest(function_text(signature).as_bytes()));
+            assert_eq!(digest, golden, "{signature} changed");
+        }
+    }
+
+    // SHA-256 of each function's text on main `804d9f77`.
+    const BUILD_SIGNED_QUERY: &str =
+        "a24ec84cf42cb1efc538b51ac641ce87a442a73a172c13c17d63233a7f8c0e49";
+    const ANSWER: &str = "e729aa32488feb26eb5806e0904e1919770b428ded1932cf129a1cdd0be5b395";
+    const EXCHANGE: &str = "2e8a9e5b5006973f68e81cc00229ec7530efeec2a09ce8ebee1a8ac7d8a0f1de";
+    const PASS_GATE: &str = "2ea2a680e732990eca8d3b5996733712da5ed39b7d2cfdbe6123242b476cb255";
+    const POST_SIGNED: &str = "b9486f707447e82c75eae5adb5ac352a8627dab8a74d09e00a63195cd186f663";
+    const DELETE_SIGNED: &str = "b7c35696d974ef3b56f81e338ba92fc4e1ac3dcb28cbd63b1c6a16938bd9c0e1";
+    const PLACE_MARKET_ORDER: &str =
+        "2ea266ab2a74cc8a069b0d32e94e8d28ea80183845d722df89af93d31544cf2a";
+    const PLACE_STOP_MARKET_ORDER: &str =
+        "f50a83b9cd80708e4def55f48dad5e61ef58fa3abd30ef48089672b5ef8df6c4";
+    const CANCEL_ALGO_ORDER: &str =
+        "9b0e2a8dc8f6210f34764f06c436822f79009a58cb7b95bbae27ef9f2f0e650e";
+    const CANCEL_ORDER: &str = "3e4d5ca8aaa56a369b7aec9f9e25c0a15bfb3a3cdd6454b978c15793c0fd147c";
+    const SET_LEVERAGE: &str = "7a0dbf578c571d0366c02ba6c059d86721a010e820f4f95f2376dc814dcd0a47";
+    const PLACE_SPOT_MARKET_ORDER: &str =
+        "78761690131b24103112698a9d622f8a5b95a3fc40b65ddecf30926ecfb762de";
+    const UNIVERSAL_TRANSFER: &str =
+        "5e8306a0edce2399f164bf6c54cf740e119326055e79765012a288e1c3f0f8af";
+    const INTO_BODY: &str = "f1cadf8028c136cfaa20dbd6ef1e6331c54faba2ce28eabc28ebe8fd0e47b4a0";
 
     /// With a permit a mutation goes out in every phase, uncounted.
     #[tokio::test]
