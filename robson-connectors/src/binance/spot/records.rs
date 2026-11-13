@@ -76,6 +76,10 @@ pub struct SpotOrderRecord {
     pub stop_price: Option<Decimal>,
     pub time: i64,
     pub update_time: i64,
+    /// When the order went onto the book; documented on lookups and listings
+    /// (L4385), kept when given.
+    #[serde(default)]
+    pub working_time: Option<i64>,
     pub self_trade_prevention_mode: String,
     /// Shown once the order has expired (F3a).
     #[serde(default)]

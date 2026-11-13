@@ -456,7 +456,10 @@ fn every_fixture_states_its_source_and_access_date() {
             "{name}: {url}"
         );
         let accessed = source["accessed"].as_str().unwrap();
-        assert!(["2026-11-10", "2026-11-11"].contains(&accessed), "{name}: {accessed}");
+        assert!(
+            ["2026-11-10", "2026-11-11", "2026-11-13"].contains(&accessed),
+            "{name}: {accessed}"
+        );
         let how = source["how"].as_str().unwrap();
         assert!(!how.is_empty(), "{name}");
         if live.contains(&url) {
