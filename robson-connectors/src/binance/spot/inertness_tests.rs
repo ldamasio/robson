@@ -135,12 +135,106 @@ fn code_only(text: &str) -> String {
         .join("\n")
 }
 
-/// The `robson_exec` items each 8b adapter takes: the existing port it
-/// implements, with that port's own types. No other spot file takes any.
-const PORT_ITEMS: [(&str, &[&str]); 2] = [
+/// The `robson_exec` items each adapter takes, by path: 8b's feed and klines
+/// the existing port each implements, with that port's own types; 8c's venue
+/// exactly the venue contracts it implements and the types they carry. No
+/// other spot file takes any.
+const PORT_ITEMS: [(&str, &[&str]); 3] = [
     ("market_data.rs", &["TradeFeedMessage", "TradeFeedPort", "TradeStream"]),
     ("ohlcv.rs", &["CandleInterval", "ExecError", "OhlcvPort"]),
+    ("exchange.rs", &[
+        "ExecError",
+        "OrderResult",
+        "gate::OperationGate",
+        "order_journal::OrderJournal",
+        "ports::OpenOrderRecord",
+        "ports::TradeFill",
+        "ports::UserTradeRecord",
+        "venue::AccountKind",
+        "venue::AccountOpenOrder",
+        "venue::AccountPort",
+        "venue::CancelAnswer",
+        "venue::Cash",
+        "venue::EntryOrReduce",
+        "venue::ExecutionCostEnvelope",
+        "venue::FundingPort",
+        "venue::GovernedInventory",
+        "venue::Holding",
+        "venue::InventoryObservation",
+        "venue::InventoryPort",
+        "venue::Mark",
+        "venue::MarketKind",
+        "venue::OrderLookup",
+        "venue::OrderObservation",
+        "venue::OrderPhase",
+        "venue::OrderRef",
+        "venue::PlacedStop",
+        "venue::PositionAccountPort",
+        "venue::ProtectionKind",
+        "venue::ReplaceOutcome",
+        "venue::ReplacementProtocol",
+        "venue::SettlementPort",
+        "venue::SettlementRecord",
+        "venue::StopCancelOutcome",
+        "venue::StopParams",
+        "venue::StopRef",
+        "venue::SubmitAttemptLedger",
+        "venue::TradePage",
+        "venue::TradingPort",
+        "venue::Venue",
+        "venue::VenueCapabilities",
+        "venue::VenueFinalityRule",
+        "venue::VenueId",
+        "venue::VenueOrderRecord",
+    ]),
 ];
+
+/// The paths a `use` group names, nested groups flattened: `{A, b::{C, D}}`
+/// is `A`, `b::C` and `b::D`. `group` is what lies inside the outer braces.
+fn flatten_group(group: &str, prefix: &str, out: &mut Vec<String>) {
+    let (mut depth, mut start) = (0, 0);
+    let mut parts = Vec::new();
+    for (at, c) in group.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&group[start..at]);
+                start = at + 1;
+            },
+            _ => {},
+        }
+    }
+    parts.push(&group[start..]);
+    for part in parts.into_iter().map(str::trim).filter(|part| !part.is_empty()) {
+        match (part.find('{'), part.rfind('}')) {
+            (Some(open), Some(close)) => {
+                let head = part[..open].trim().trim_end_matches("::");
+                flatten_group(&part[open + 1..close], &format!("{prefix}{head}::"), out);
+            },
+            _ => out.push(format!("{prefix}{part}")),
+        }
+    }
+}
+
+/// The paths of `code`'s `use robson_exec::{...};`, when it has one.
+fn robson_exec_imports(code: &str) -> Option<Vec<String>> {
+    let at = code.find("use robson_exec::{")?;
+    let body = &code[at + "use robson_exec::{".len()..];
+    let mut depth = 1;
+    let close = body.char_indices().find_map(|(at, c)| {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {},
+        }
+        (depth == 0).then_some(at)
+    })?;
+    let mut items = Vec::new();
+    flatten_group(&body[..close], "", &mut items);
+    items.sort();
+    Some(items)
+}
 
 /// Contracts a spot file may name only when its allow-list holds them.
 const CONTRACTS: [&str; 15] = [
@@ -183,23 +277,17 @@ fn port_contract_violations(file: &str, code: &str) -> Vec<String> {
             violations.push("takes from robson_exec".to_string());
         }
     } else {
-        let imported = code.find("use robson_exec::{").map(|at| {
-            let rest = &code[at + "use robson_exec::{".len()..];
-            let mut items: Vec<&str> = rest[..rest.find("};").unwrap_or(rest.len())]
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .collect();
-            items.sort_unstable();
-            items
-        });
-        let mut expected = allowed.to_vec();
-        expected.sort_unstable();
+        let imported = robson_exec_imports(code);
+        let mut expected: Vec<String> = allowed.iter().map(|item| item.to_string()).collect();
+        expected.sort();
         if uses != 1 || imported.as_ref() != Some(&expected) {
             violations.push(format!("takes {imported:?} from robson_exec, not {expected:?}"));
         }
     }
-    for contract in CONTRACTS.iter().filter(|contract| !allowed.contains(contract)) {
+    // A contract is allowed by its own name, whatever path the import took.
+    let names: Vec<&str> =
+        allowed.iter().map(|item| item.rsplit("::").next().unwrap_or(item)).collect();
+    for contract in CONTRACTS.iter().filter(|contract| !names.contains(contract)) {
         if has_word(code, contract) {
             violations.push(format!("names {contract}"));
         }
