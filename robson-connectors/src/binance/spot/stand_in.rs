@@ -49,6 +49,42 @@ pub(super) type Seens = Arc<Mutex<Vec<Seen>>>;
 pub(super) async fn serve(
     reply: impl Fn(&Seen) -> (u16, String) + Send + Sync + 'static,
 ) -> (Arc<BinanceRestClient>, Seens) {
+    serve_with_headers(move |request| {
+        let (status, body) = reply(request);
+        (status, String::new(), body)
+    })
+    .await
+}
+
+/// A stand-in answering every request with `status` and a `Location` of
+/// `location`: a redirect.
+pub(super) async fn redirecting(status: u16, location: String) -> (Arc<BinanceRestClient>, Seens) {
+    serve_with_headers(move |_| (status, format!("Location: {location}\r\n"), String::new())).await
+}
+
+/// [`serve`] without a client: the stand-in's own URL, for a test that
+/// points something else at it.
+pub(super) async fn listening(
+    reply: impl Fn(&Seen) -> (u16, String) + Send + Sync + 'static,
+) -> (String, Seens) {
+    listen(move |request| {
+        let (status, body) = reply(request);
+        (status, String::new(), body)
+    })
+    .await
+}
+
+/// [`serve`], with `reply` giving header lines too, each ending in CRLF.
+async fn serve_with_headers(
+    reply: impl Fn(&Seen) -> (u16, String, String) + Send + Sync + 'static,
+) -> (Arc<BinanceRestClient>, Seens) {
+    let (url, seen) = listen(reply).await;
+    (Arc::new(BinanceRestClient::with_local_base_url(url)), seen)
+}
+
+async fn listen(
+    reply: impl Fn(&Seen) -> (u16, String, String) + Send + Sync + 'static,
+) -> (String, Seens) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -86,16 +122,16 @@ pub(super) async fn serve(
             };
             recorded.lock().unwrap().push(request.clone());
 
-            let (status, body) = reply(&request);
+            let (status, headers, body) = reply(&request);
             let response = format!(
-                "HTTP/1.1 {status} Answer\r\nContent-Type: application/json\r\n\
+                "HTTP/1.1 {status} Answer\r\nContent-Type: application/json\r\n{headers}\
                  Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes()).await;
         }
     });
-    (Arc::new(BinanceRestClient::with_local_base_url(url)), seen)
+    (url, seen)
 }
 
 /// A venue that takes each connection and closes it unanswered: a request to

@@ -879,3 +879,108 @@ async fn a_stop_s_contradiction_is_uncertain_and_its_rejection_final() {
         assert!(rejected(&venue, "ins-1"));
     }
 }
+
+// =============================================================================
+// One request on the wire, one identity (8c-3 code review round 1)
+// =============================================================================
+
+/// A redirect is the answer, never followed: the order goes to one place
+/// once, the outcome is uncertain and the attempt stays unresolved.
+#[tokio::test]
+async fn a_redirect_is_never_followed_and_proves_nothing() {
+    for status in [301, 302, 303, 307, 308] {
+        let (sink, sink_seen) = stand_in::listening(|request| (200, full(request, |_| {}))).await;
+        let (client, seen) = stand_in::redirecting(status, format!("{sink}/api/v3/order")).await;
+        let venue = BinanceSpotAdapter::new(client).unwrap();
+        let journal = spot_journal();
+        venue.attach_order_journal(Arc::clone(&journal));
+        let outcome = reduction(&venue, &journal, "x-1", dec!(10)).await;
+        assert!(matches!(outcome, Err(ExecError::Exchange(_))), "{status}: {outcome:?}");
+        assert!(unresolved(&venue, "x-1"), "{status}");
+        assert_eq!(posts(&seen), 1, "{status}");
+        assert_eq!(requests(&sink_seen), Vec::<String>::new(), "{status}: nothing followed");
+    }
+}
+
+/// A client id outside Binance's pattern, or a symbol that is not one
+/// value, is refused before the ledger records anything: no request, no
+/// attempt, so no order under another identity. `&`, `=`, `%`, `+`, space,
+/// `#`, non-ASCII, `.`, `/`, empty and 37 characters alike.
+#[tokio::test]
+async fn a_malformed_id_or_symbol_is_refused_before_the_ledger() {
+    let (venue, seen, journal) = answering_full(|_| {}).await;
+    let long = "a".repeat(37);
+    for id in [
+        "x&recvWindow=5000",
+        "a=b",
+        "50%",
+        "a+b",
+        "a b",
+        "a#b",
+        "ação",
+        "a.b",
+        "a/b",
+        "",
+        long.as_str(),
+    ] {
+        let outcome = reduction(&venue, &journal, id, dec!(10)).await;
+        assert!(matches!(outcome, Err(ExecError::Config(_))), "{id:?}: {outcome:?}");
+        assert_eq!(venue.ledger().evidence(id), AttemptEvidence::NoRecord, "{id:?}");
+    }
+    let trigger = Price::new(dec!(80000)).unwrap();
+    let bases = ["X&recvWindow=5000", "A B", "A=B", "A%", "A+B", "A#B", "A.B"];
+    for (n, base) in bases.into_iter().enumerate() {
+        let odd = Symbol::new(base.to_string(), "USDT".to_string()).unwrap();
+        let id = format!("x-s{n}");
+        let place = venue.place_market_order(
+            &odd,
+            OrderSide::Sell,
+            qty(dec!(1)),
+            &id,
+            EntryOrReduce::Reduce,
+        );
+        let outcome = granted(&journal, &id, IntentKind::Exit, place).await;
+        assert!(matches!(outcome, Err(ExecError::Config(_))), "{base:?}: {outcome:?}");
+        assert_eq!(venue.ledger().evidence(&id), AttemptEvidence::NoRecord, "{base:?}");
+        let place = venue.place_protection(&odd, OrderSide::Sell, qty(dec!(1)), trigger, "s-2");
+        assert!(matches!(place.await, Err(ExecError::Config(_))), "{base:?}");
+    }
+    assert_eq!(requests(&seen), Vec::<String>::new());
+    // The longest valid id goes out as it is.
+    let valid = "ins-0123456789abcdef0123456789abcdef";
+    assert_eq!(valid.len(), 36);
+    reduction(&venue, &journal, valid, dec!(10)).await.unwrap();
+    assert_eq!(posts(&seen), 1);
+}
+
+/// A non-ASCII symbol, which Binance documents, goes percent-encoded as one
+/// value (rest-api.md L375-L417): the request carries exactly its own
+/// parameters.
+#[tokio::test]
+async fn a_non_ascii_symbol_goes_encoded_as_one_value() {
+    let (venue, seen, journal) = answering_full(|_| {}).await;
+    let named = Symbol::new("１２３".to_string(), "USDT".to_string()).unwrap();
+    let place = venue.place_market_order(
+        &named,
+        OrderSide::Sell,
+        qty(dec!(1)),
+        "x-1",
+        EntryOrReduce::Reduce,
+    );
+    let _ = granted(&journal, "x-1", IntentKind::Exit, place).await;
+    let request = seen.lock().unwrap()[0].clone();
+    assert_eq!(request.param("symbol"), Some("%EF%BC%91%EF%BC%92%EF%BC%93USDT"));
+    let mut names: Vec<&str> = request.params.iter().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, [
+        "newClientOrderId",
+        "newOrderRespType",
+        "quantity",
+        "selfTradePreventionMode",
+        "side",
+        "signature",
+        "symbol",
+        "timestamp",
+        "type"
+    ]);
+}

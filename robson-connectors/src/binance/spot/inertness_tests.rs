@@ -15,7 +15,9 @@
 //!   types those carry, by path;
 //! - an order leaves only through `trading.rs`: one `post_signed_answer` call,
 //!   inside `SubmitAttemptLedger::submit` on a one-attempt ledger, so it takes
-//!   the journal's grant (8c-1) and the client's gate. No spot file calls the
+//!   the journal's grant (8c-1) and the client's gate. This is a lexical
+//!   regression check, not a proof: an eager block inside `submit`'s arguments
+//!   would pass it; review establishes the lazy path. No spot file calls the
 //!   non-answer forms (`.post(`, `post_signed(`, `delete_signed(`), names the
 //!   gate, or holds an HTTP client; cancelling waits for 8c-3b;
 //! - they read no configuration and name no testnet host.
@@ -699,7 +701,10 @@ fn mutation_violations(file: &str, text: &str) -> Vec<String> {
 }
 
 /// The checker refuses each way around the ledger, and admits the one way
-/// through it.
+/// through it. It is a lexical regression check, not a proof over Rust: an
+/// eagerly evaluated block inside `submit`'s argument list, sending before
+/// `submit` starts, would pass it. Review of the call (a lazy `async` block)
+/// is what establishes the path.
 #[test]
 fn the_mutation_checker_refuses_every_way_around_the_ledger() {
     let through =

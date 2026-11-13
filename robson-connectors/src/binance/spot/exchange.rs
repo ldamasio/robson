@@ -298,7 +298,9 @@ impl TradingPort for BinanceSpotAdapter {
     /// Spot holds no short: an entry buys and a reduction sells; the other
     /// two are refused with nothing sent. An entry is checked against fresh
     /// rules ([`quantize::market_quantity`]) and refused when the symbol does
-    /// not allow `EXPIRE_MAKER`; a reduction goes out as given.
+    /// not allow `EXPIRE_MAKER`; a reduction goes out as given. An entry can
+    /// therefore make two requests, an `exchangeInfo` refresh (weight 20)
+    /// before the order (weight 1): weight 21 (8c plan §13, item 11).
     ///
     /// `Ok` is `FILLED`, or `EXPIRED` with execution, as the result of
     /// `executedQty`, with the record, the fills and typed fee evidence. An

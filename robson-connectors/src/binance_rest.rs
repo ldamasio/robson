@@ -1070,11 +1070,11 @@ fn single_shot() -> Result<Client, BinanceRestError> {
         })
 }
 
-/// `value` percent-encoded outside RFC 3986's unreserved set (`A-Z a-z 0-9
-/// - . _ ~`), byte by byte of its UTF-8. Binance signs and reads the encoded
-/// query (spot `rest-api.md` L344-L345, L388-L417): `&`, `=`, `%`, `+`,
-/// space, `#` or a non-ASCII character in a value stay inside that value.
-/// Unreserved values, every value Robson sends today, are unchanged.
+/// `value` percent-encoded, byte by byte of its UTF-8, outside RFC 3986's
+/// unreserved set: ASCII letters, digits and `-._~`. Binance signs and reads
+/// the encoded query (spot `rest-api.md` L344-L345, L388-L417): `&`, `=`,
+/// `%`, `+`, space, `#` or a non-ASCII character in a value stay inside that
+/// value. Unreserved values, every value Robson sends today, are unchanged.
 fn percent_encoded(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {

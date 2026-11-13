@@ -24,6 +24,12 @@
 //! (rest-api.md L141-L143), a 403, 418 or 429, a timeout, an unreadable
 //! answer. A gate refusal is a proven no-send.
 //!
+//! **One request on the wire.** The client's answer helpers send each request
+//! once on a transport that follows no redirect and retries nothing, and
+//! percent-encode every value before signing. A symbol or client id that is
+//! not one documented value is refused here, before the ledger records
+//! anything.
+//!
 //! Line numbers are in `binance-spot-api-docs` at `995f6eb3`.
 
 use chrono::DateTime;
@@ -215,8 +221,46 @@ fn order_answer(answer: Result<RestAnswer, BinanceRestError>) -> Result<String, 
     })
 }
 
-/// Send `order` through `ledger`: the one call of `post_signed_answer`. The
-/// ledger's send start takes the order's grant before the request can be
+/// Whether `id` is a client order id Binance documents:
+/// `^[a-zA-Z0-9-_]{1,36}$` (fix-api.md L462, the only pattern the docs give;
+/// the REST parameter, rest-api.md L2160, states none). Robson's are
+/// `ins-` with a simple UUID, 36 characters.
+pub(super) fn valid_client_order_id(id: &str) -> bool {
+    (1..=36).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// Whether `pair` can go as one symbol value: not empty, and ASCII only as
+/// letters and digits. Other characters are non-ASCII, which Binance
+/// documents in symbol names and the transport percent-encodes (rest-api.md
+/// L125-L128, L344-L345).
+pub(super) fn valid_symbol(pair: &str) -> bool {
+    !pair.is_empty() && pair.chars().all(|c| !c.is_ascii() || c.is_ascii_alphanumeric())
+}
+
+/// A request value refused before anything is sent: a client id outside
+/// Binance's pattern, or a symbol that is not one value. Nothing is recorded
+/// in the ledger, nothing is sent.
+pub(super) fn malformed(symbol: &Symbol, client_order_id: Option<&str>) -> Option<ExecError> {
+    let pair = symbol.as_pair();
+    if !valid_symbol(&pair) {
+        return Some(ExecError::Config(format!(
+            "binance:spot symbol {pair:?} is not one value; nothing was sent"
+        )));
+    }
+    let id = client_order_id?;
+    (!valid_client_order_id(id)).then(|| {
+        ExecError::Config(format!(
+            "binance:spot client order id {id:?} is not ^[a-zA-Z0-9-_]{{1,36}}$; nothing was sent"
+        ))
+    })
+}
+
+/// Send `order` through `ledger`: the one call of `post_signed_answer`. A
+/// malformed symbol or client id is refused first, with nothing recorded.
+/// The ledger's send start takes the order's grant before the request can be
 /// polled; `read` types an exact 200's body. Every error other than the two
 /// final rejections leaves the attempt unresolved.
 async fn send_new_order<T>(
@@ -225,6 +269,9 @@ async fn send_new_order<T>(
     order: &NewOrder<'_>,
     read: impl FnOnce(&str) -> Result<T, ExecError>,
 ) -> Result<T, ExecError> {
+    if let Some(refusal) = malformed(order.symbol, Some(order.client_order_id)) {
+        return Err(refusal);
+    }
     let params = order.params();
     let result = ledger
         .submit(order.client_order_id, is_final_rejection, async {
@@ -249,7 +296,9 @@ async fn send_new_order<T>(
 /// The answer, and the record it gives, when it echoes what was sent: the
 /// symbol, client id, side, type, quantity, STP mode and trigger, outside any
 /// order list, with `0 ≤ executedQty ≤ origQty`. Anything else established
-/// nothing.
+/// nothing: this is stricter than the ids alone, so a malformed echo
+/// discards the answer's immediate evidence, the attempt stays unresolved,
+/// and only a later lookup can establish the order.
 fn read_answer(
     body: &str,
     order: &NewOrder<'_>,
