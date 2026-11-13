@@ -569,6 +569,26 @@ fn the_fills_rule_refuses_trades_that_conflict() {
     assert!(terminal_result(&near, halves(), None).is_none());
     let priced = terminal_result(&with_quote(None), halves(), None).unwrap();
     assert_eq!(priced.fill_price.as_decimal(), dec!(0.1), "the trades' price");
+    // Quote amounts that offset, -0.05 and 0.15 against the record's 0.1: a
+    // negative quote is no evidence, whatever the sum. A zero one stays
+    // valid (a dust trade's rounding), and R3 reconciles the sum.
+    let offsetting = vec![
+        TradeFill {
+            quote_qty: dec!(-0.05),
+            ..fill(1, dec!(0.001))
+        },
+        TradeFill {
+            quote_qty: dec!(0.15),
+            ..fill(2, dec!(0.001))
+        },
+    ];
+    assert!(terminal_result(&record, offsetting, None).is_none());
+    let dust = vec![fill(1, dec!(0.001)), TradeFill {
+        quote_qty: Decimal::ZERO,
+        ..fill(2, dec!(0.001))
+    }];
+    let priced = terminal_result(&with_quote(None), dust, None).unwrap();
+    assert_eq!(priced.fill_price.as_decimal(), dec!(0.05));
     // Not terminal, or nothing executed: no result, whatever the trades.
     let live = VenueOrderRecord {
         phase: OrderPhase::Live,
@@ -876,4 +896,41 @@ async fn the_cached_precision_sets_the_composite_tolerance() {
             .await;
     venue.trading_rules(&btc).await.unwrap();
     assert!(venue.order_by_exchange_id(&btc, "4").await.is_err());
+}
+
+/// A trade page whose quote amounts offset, -1 and 2 against an order that
+/// executed 2 for a quote of 1, is no evidence: the page is an error, the
+/// composites withhold the fills and keep terminality and the executed
+/// quantity. A zero quote amount on its own is a valid page.
+#[tokio::test]
+async fn a_negative_trade_quote_is_no_evidence() {
+    let mut offsetting = trades(1, 2, dec!(1));
+    for (trade, quote) in offsetting.iter_mut().zip(["-1", "2"]) {
+        trade["price"] = json!("0.5");
+        trade["quoteQty"] = json!(quote);
+    }
+    let (venue, _) = scripted(Answers::cancel(500, String::new()).trades(offsetting.clone())).await;
+    assert!(venue.order_trades_page(ltc(), "4", 0).await.is_err(), "the page itself");
+    let gone = Answers::cancel(400, error_body("cancel_rejected"))
+        .lookup(200, looked_up("FILLED", "2", "1"))
+        .trades(offsetting.clone());
+    let (venue, _) = scripted(gone).await;
+    let outcome = venue.cancel_protection(ltc(), &stop_4()).await.unwrap();
+    assert!(
+        matches!(outcome, StopCancelOutcome::AlreadyGone {
+            final_state: OrderLookup::Terminal { filled_qty, fills: None, .. }
+        } if filled_qty == dec!(2)),
+        "{outcome:?}"
+    );
+    let lookup = Answers::cancel(500, String::new())
+        .lookup(200, looked_up("FILLED", "2", "1"))
+        .trades(offsetting);
+    let (venue, _) = scripted(lookup).await;
+    assert!(venue.order_by_exchange_id(ltc(), "4").await.is_err());
+
+    let mut dust = trades(1, 2, dec!(1));
+    dust[1]["quoteQty"] = json!("0");
+    let (venue, _) = scripted(Answers::cancel(500, String::new()).trades(dust)).await;
+    let page = venue.order_trades_page(ltc(), "4", 0).await.unwrap();
+    assert_eq!(page.trades[1].quote_qty, Decimal::ZERO);
 }

@@ -17,7 +17,10 @@
 //! (a cancel, one lookup after a not-found, at most five trade pages: at most
 //! 7 requests, weight 30), `order_by_exchange_id` and `protection_fill` (one
 //! lookup and at most five pages: weight 29), `replace_protection` (the
-//! cancel wrapper and one placement) and the legacy `cancel_order`.
+//! cancel wrapper and one placement) and the legacy `cancel_order`. Every
+//! spot request, read or mutation, is one request on the wire (the client's
+//! single-shot helpers follow no redirect and retry nothing), so these are
+//! wire bounds.
 //!
 //! Not built here: ledger, costs and settlement are later steps' (8e, 8g, 8l)
 //! and refuse with [`ExecError::Config`] and nothing sent.
@@ -307,8 +310,16 @@ fn holding(asset: &str, free: Decimal, locked: Decimal) -> Result<Holding, ExecE
     Ok(Holding { free, locked })
 }
 
-/// One trade of an order, with its time.
+/// One trade of an order, with its time. Its quote amount is the venue's
+/// figure, kept as given for its rounding, and is never negative: a negative
+/// one makes the answer no evidence.
 fn trade_fill(trade: SpotTrade) -> Result<TradeFill, ExecError> {
+    if trade.quote_qty < Decimal::ZERO {
+        return Err(ExecError::Exchange(format!(
+            "spot trade {} has quoteQty {}: a quote amount is never negative",
+            trade.id, trade.quote_qty
+        )));
+    }
     let time = DateTime::from_timestamp_millis(trade.time).ok_or_else(|| {
         ExecError::Exchange(format!("spot trade {} has time {}", trade.id, trade.time))
     })?;
@@ -526,15 +537,18 @@ impl TradingPort for BinanceSpotAdapter {
     }
 
     /// The legacy cancel: one cancel request. `Ok` only when the venue's own
-    /// answer shows the order cancelled and terminal. Not open (HTTP 400
-    /// -2011 or -2013) is `OrderRejected`, proving nothing about execution;
-    /// anything else is an uncertain `Err`. 8k uses
-    /// [`InventoryPort::cancel_order_once`] and an exact lookup (Q18).
+    /// answer shows the order cancelled and terminal. A rejected cancel (HTTP
+    /// 400 -2011 or -2013) is `OrderRejected`: the cancel was refused, and the
+    /// order's lifecycle is not established, -2011 being a generic rejection
+    /// that proves neither absence nor execution. Anything else is an
+    /// uncertain `Err`. 8k uses [`InventoryPort::cancel_order_once`] and an
+    /// exact lookup (Q18).
     async fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<(), ExecError> {
         match self.cancel_order_once(symbol, order_id).await? {
             CancelAnswer::Cancelled(_) => Ok(()),
             CancelAnswer::NotFound { code } => Err(ExecError::OrderRejected(format!(
-                "binance:spot order {order_id} is not open (Binance {code})"
+                "binance:spot cancel of {order_id} rejected (Binance {code}); the order's \
+                 lifecycle is not established"
             ))),
             CancelAnswer::Unknown { reason } => Err(ExecError::Exchange(format!(
                 "binance:spot cancel of {order_id} uncertain: {reason}"
@@ -777,7 +791,8 @@ impl InventoryPort for BinanceSpotAdapter {
     }
 
     /// One `myTrades` page by order from `from_id` (weight 5), each trade with
-    /// its time; the cursor checks are the reader's.
+    /// its time; the cursor checks are the reader's. A trade with a negative
+    /// quote amount makes the page an `Err`: it is no evidence.
     async fn order_trades_page(
         &self,
         symbol: &Symbol,

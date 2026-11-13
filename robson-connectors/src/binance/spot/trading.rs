@@ -402,6 +402,17 @@ fn valid_fill(price: Decimal, qty: Decimal, commission: Decimal, asset: &str) ->
     qty > Decimal::ZERO && price > Decimal::ZERO && commission >= Decimal::ZERO && !asset.is_empty()
 }
 
+/// A venue trade under the evidence rules: rule 3 as for a fill, and a quote
+/// amount that is never negative. The quote is the venue's figure, kept as
+/// given for its rounding. Zero stays valid: the docs show the figure only as
+/// `price × qty` (rest-api.md L4773-L4775) with no positivity rule, and a dust
+/// trade's product can fall below one unit of `quoteAssetPrecision` (L961);
+/// R3 then reconciles the sum against the order's own quote.
+fn valid_trade(trade: &TradeFill) -> bool {
+    valid_fill(trade.price, trade.qty, trade.commission, &trade.commission_asset)
+        && trade.quote_qty >= Decimal::ZERO
+}
+
 /// The fills of an order that executed `executed`: each with a trade id,
 /// `qty > 0`, `price > 0`, `commission ≥ 0` and an asset; an identical
 /// duplicate counts once, a different one under the same id is a conflict;
@@ -796,17 +807,17 @@ fn cancel_answer(
 
 /// The fills rule (8c plan §4) over an order's own record and the trades read
 /// for it, with §5's evidence rules: a result only for a terminal order whose
-/// trades are each valid (rule 3), distinct by id, and sum exactly to its
-/// `executedQty` (v16 §3.7), and whose quote, when the record gives one,
-/// agrees with theirs within R3's tolerance (rule 5, `quote_precision` from
-/// the cached rules, 0 without). Every sum and quotient is checked (rule 6).
-/// A zero record quote with execution is inconsistent (rule 2), and a
-/// conflict lets the record stand: either way the fills are withheld. `None`
-/// never undoes the record's terminality or quantity: the caller keeps them.
-/// The price is the record's quote over `executedQty`, else the trades'; the
-/// time the last trade's; the fee a `Total` in one asset, else unavailable.
-/// The client id is the one the order was placed under when the record names
-/// it apart (a cancel's answer).
+/// trades are each valid (rule 3, and no negative quote amount), distinct by
+/// id, and sum exactly to its `executedQty` (v16 §3.7), and whose quote, when
+/// the record gives one, agrees with theirs within R3's tolerance (rule 5,
+/// `quote_precision` from the cached rules, 0 without). Every sum and quotient
+/// is checked (rule 6). A zero record quote with execution is inconsistent
+/// (rule 2), and a conflict lets the record stand: either way the fills are
+/// withheld. `None` never undoes the record's terminality or quantity: the
+/// caller keeps them. The price is the record's quote over `executedQty`, else
+/// the trades'; the time the last trade's; the fee a `Total` in one asset, else
+/// unavailable. The client id is the one the order was placed under when the
+/// record names it apart (a cancel's answer).
 pub(super) fn terminal_result(
     record: &VenueOrderRecord,
     trades: Vec<TradeFill>,
@@ -821,7 +832,7 @@ pub(super) fn terminal_result(
     }
     let mut distinct: Vec<TradeFill> = Vec::with_capacity(trades.len());
     for trade in trades {
-        if !valid_fill(trade.price, trade.qty, trade.commission, &trade.commission_asset) {
+        if !valid_trade(&trade) {
             return None;
         }
         match distinct.iter().find(|seen| seen.trade_id == trade.trade_id) {
