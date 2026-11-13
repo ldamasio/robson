@@ -6,6 +6,10 @@ use std::sync::Arc;
 use chrono::{TimeZone, Utc};
 use robson_domain::{OrderSide, Price, Quantity, Symbol};
 use robson_exec::{
+    order_journal::{
+        AttemptRow, IntentKind, IntentRow, JournalBackend, JournalBatch, OrderJournal,
+        StubJournalBackend, DEFAULT_ACCOUNT_SCOPE,
+    },
     venue::{
         capability_mismatches, AccountKind, AccountPort, EntryOrReduce, InventoryPort, MarketKind,
         OrderLookup, OrderObservation, OrderPhase, OrderRef, ProtectionKind, ReplacementProtocol,
@@ -13,6 +17,7 @@ use robson_exec::{
     },
     ExecError,
 };
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::{json, Value};
 
@@ -331,29 +336,95 @@ async fn a_client_id_lookup_reads_every_status_and_refuses_impossible_quantities
     assert!(venue.order_by_client_id(&ltc(), "myOrder1").await.is_err());
 }
 
+/// What the journal holds for client id `e-1`: no row, one attempt the venue
+/// rejected, one still unresolved, or a backend that cannot be read.
+#[derive(Debug, Clone, Copy)]
+enum Evidence {
+    Missing,
+    AllRejected,
+    Unresolved,
+    Unreadable,
+}
+
+/// The venue answering every lookup with `status` and `body`, its ledger
+/// answered by a journal holding `evidence` for `e-1`. Only lookups are sent.
+async fn journaled(status: u16, body: String, evidence: Evidence) -> (BinanceSpotAdapter, Seens) {
+    let (venue, seen) = answering(status, body).await;
+    let backend = Arc::new(StubJournalBackend::default());
+    let rejected = match evidence {
+        Evidence::AllRejected => Some(true),
+        Evidence::Unresolved => Some(false),
+        Evidence::Missing | Evidence::Unreadable => None,
+    };
+    if let Some(rejected) = rejected {
+        let now = Utc::now();
+        let batch = JournalBatch {
+            intent: IntentRow {
+                intent_id: Default::default(),
+                venue_id: VenueId::BINANCE_SPOT.to_string(),
+                account_scope: DEFAULT_ACCOUNT_SCOPE.to_string(),
+                client_order_id: "e-1".to_string(),
+                position_id: None,
+                kind: IntentKind::Entry,
+                cancels_order_id: None,
+                params: Value::Null,
+                created_at: now,
+            },
+            attempts: vec![AttemptRow {
+                attempt_id: Default::default(),
+                created_at: now,
+                rejected_at: rejected.then_some(now),
+            }],
+            outcome: None,
+        };
+        backend.commit(&batch).await.unwrap();
+    }
+    backend.set_read_fails(matches!(evidence, Evidence::Unreadable));
+    let journal = OrderJournal::new(backend, &VenueId::new(VenueId::BINANCE_SPOT))
+        .with_one_attempt_per_client_id(true);
+    venue.attach_order_journal(Arc::new(journal));
+    (venue, seen)
+}
+
+fn lookup_name(result: &Result<OrderLookup, ExecError>) -> String {
+    match result {
+        Ok(OrderLookup::Absent { .. }) => "Absent".to_string(),
+        Ok(OrderLookup::Unknown) => "Unknown".to_string(),
+        Ok(other) => format!("{other:?}"),
+        Err(_) => "Err".to_string(),
+    }
+}
+
+/// A not-found is `Absent` only at HTTP 400 with -2013, and only when every
+/// attempt under the id was rejected. -2013 at any other status is the
+/// request's error; -2026 is never `Absent`, whatever the evidence.
 #[tokio::test]
 async fn a_not_found_is_absent_only_under_the_finality_rule_and_never_at_another_status() {
-    // -2013 at 400: the finality rule over the attempts recorded for the id.
-    // None were (no journal, no send), so it stays Unknown.
-    for (status, name) in [
-        (400, "no_such_order"),
-        (500, "no_such_order"),
-        (503, "no_such_order"),
-        (400, "order_archived"),
-        (503, "order_archived"),
-    ] {
-        let (venue, _) = answering(status, error_body(name)).await;
-        assert!(
-            matches!(venue.order_by_client_id(&ltc(), "e-1").await, Ok(OrderLookup::Unknown)),
-            "{status} {name}"
-        );
+    use Evidence::*;
+    let mut cases = vec![
+        (400, "no_such_order", AllRejected, "Absent"),
+        (400, "no_such_order", Missing, "Unknown"),
+        (400, "no_such_order", Unresolved, "Unknown"),
+        (400, "no_such_order", Unreadable, "Unknown"),
+        (400, "order_archived", AllRejected, "Unknown"),
+        (503, "order_archived", AllRejected, "Unknown"),
+        (400, "order_archived", Missing, "Unknown"),
+    ];
+    for status in [401, 403, 404, 418, 429, 500, 503] {
+        cases.push((status, "no_such_order", AllRejected, "Err"));
+    }
+    for (status, name, evidence, expected) in cases {
+        let (venue, seen) = journaled(status, error_body(name), evidence).await;
+        let found = venue.order_by_client_id(&ltc(), "e-1").await;
+        assert_eq!(lookup_name(&found), expected, "{status} {name} {evidence:?}");
+        assert_eq!(requests(&seen), ["GET /api/v3/order?origClientOrderId=e-1&symbol=LTCBTC"]);
     }
     for (status, name) in [
         (429, "too_many_requests"),
         (400, "bad_symbol"),
         (500, "unknown"),
     ] {
-        let (venue, _) = answering(status, error_body(name)).await;
+        let (venue, _) = journaled(status, error_body(name), AllRejected).await;
         assert!(venue.order_by_client_id(&ltc(), "e-1").await.is_err(), "{status} {name}");
     }
 }
@@ -475,6 +546,58 @@ async fn cash_and_the_account_observation_read_the_account_as_given() {
         ("354937868", true, "SPOT")
     );
     assert_eq!(observed.permissions, ["SPOT"]);
+}
+
+/// The account answering with BTC's balance as `free` and `locked`.
+async fn balances(free: &str, locked: &str) -> BinanceSpotAdapter {
+    let account = ACCOUNT.replace(
+        r#""free": "4723846.89208129",
+            "locked": "0.00000000""#,
+        &format!(
+            r#""free": "{free}",
+            "locked": "{locked}""#
+        ),
+    );
+    assert_ne!(account, ACCOUNT, "the fixture's BTC balance moved");
+    let (venue, _) = venue(move |request| match request.path.as_str() {
+        "/api/v3/account" => (200, account.clone()),
+        "/api/v3/openOrders" | "/api/v3/openOrderList" => (200, "[]".to_string()),
+        other => panic!("unexpected request {other}"),
+    })
+    .await;
+    venue
+}
+
+/// Balances are never added: the largest decimal plus one is a holding, not
+/// a panic.
+#[tokio::test]
+async fn the_largest_balances_are_kept_as_given_and_never_added() {
+    let max = Decimal::MAX.to_string();
+    let venue = balances(&max, "1").await;
+    let observed = venue.account_observation().await.unwrap();
+    let (_, btc) = observed.holdings.iter().find(|(asset, _)| asset == "BTC").unwrap();
+    assert_eq!((btc.free, btc.locked), (Decimal::MAX, dec!(1)));
+    let cash = venue.cash("BTC").await.unwrap();
+    assert_eq!((cash.free, cash.locked), (Decimal::MAX, dec!(1)));
+}
+
+/// A negative component is no evidence, even when the two would sum to zero.
+#[tokio::test]
+async fn a_negative_balance_component_is_an_error_naming_its_asset() {
+    for (free, locked) in [("-1", "1"), ("1", "-1"), ("-0.5", "0")] {
+        let venue = balances(free, locked).await;
+        match venue.account_observation().await {
+            Err(ExecError::Exchange(why)) => assert!(why.contains("BTC"), "{why}"),
+            other => panic!("{free} {locked}: expected an error, got {other:?}"),
+        }
+        assert!(venue.cash("BTC").await.is_err(), "{free} {locked}");
+    }
+    // Locked only is a holding.
+    let observed = balances("0", "2").await.account_observation().await.unwrap();
+    assert!(observed
+        .holdings
+        .iter()
+        .any(|(asset, held)| asset == "BTC" && held.locked == dec!(2)));
 }
 
 #[tokio::test]

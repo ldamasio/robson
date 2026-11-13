@@ -210,6 +210,19 @@ fn open_order(record: &VenueOrderRecord) -> Result<OpenOrderRecord, ExecError> {
     })
 }
 
+/// One asset's balance, as a holding: each component as given and never
+/// negative, or the answer is no evidence. Nothing is added, so no value the
+/// venue sends can overflow here.
+fn holding(asset: &str, free: Decimal, locked: Decimal) -> Result<Holding, ExecError> {
+    if free < Decimal::ZERO || locked < Decimal::ZERO {
+        return Err(ExecError::Exchange(format!(
+            "binance:spot account lists {asset} with free {free} and locked {locked}: a balance is \
+             never negative"
+        )));
+    }
+    Ok(Holding { free, locked })
+}
+
 /// One trade of an order, with its time.
 fn trade_fill(trade: SpotTrade) -> Result<TradeFill, ExecError> {
     let time = DateTime::from_timestamp_millis(trade.time).ok_or_else(|| {
@@ -313,9 +326,9 @@ impl TradingPort for BinanceSpotAdapter {
 
     /// One `GET /api/v3/order` by `origClientOrderId` (weight 4); no fills.
     /// HTTP 400 with -2013 is a raw not-found, read through [`SPOT_FINALITY`]
-    /// over the attempts recorded for the id, read after the answer. -2013 at
-    /// another status, and -2026 (archived) at any, establish nothing:
-    /// `Unknown`.
+    /// over the attempts recorded for the id, read after the answer. -2026
+    /// (archived) is `Unknown`, never `Absent`. Every other failure, -2013 at
+    /// another status included, is the request's `Err`.
     async fn order_by_client_id(
         &self,
         symbol: &Symbol,
@@ -326,9 +339,7 @@ impl TradingPort for BinanceSpotAdapter {
             Ok(order) => Ok(order_lookup(&venue_record(order)?)),
             Err(SpotReadError::NoSuchOrder { http_status: 400, .. }) => Ok(SPOT_FINALITY
                 .classify_not_found(self.submit_attempts.final_evidence(client_order_id).await)),
-            Err(SpotReadError::NoSuchOrder { .. } | SpotReadError::OrderArchived { .. }) => {
-                Ok(OrderLookup::Unknown)
-            },
+            Err(SpotReadError::OrderArchived { .. }) => Ok(OrderLookup::Unknown),
             Err(error) => Err(read_error(error)),
         }
     }
@@ -397,12 +408,16 @@ impl TradingPort for BinanceSpotAdapter {
 #[async_trait]
 impl AccountPort for BinanceSpotAdapter {
     /// One `account` read (weight 20). An asset the account does not list
-    /// holds nothing.
+    /// holds nothing; a negative component is an error.
     async fn cash(&self, asset: &str) -> Result<Cash, ExecError> {
         let account = self.reader.account().await.map_err(read_error)?;
-        let (free, locked) = account
-            .balance(asset)
-            .map_or((Decimal::ZERO, Decimal::ZERO), |balance| (balance.free, balance.locked));
+        let Holding { free, locked } = match account.balance(asset) {
+            Some(balance) => holding(asset, balance.free, balance.locked)?,
+            None => Holding {
+                free: Decimal::ZERO,
+                locked: Decimal::ZERO,
+            },
+        };
         Ok(Cash { free, locked, as_of: Utc::now() })
     }
 
@@ -440,24 +455,25 @@ impl AccountPort for BinanceSpotAdapter {
 #[async_trait]
 impl InventoryPort for BinanceSpotAdapter {
     /// `account` (20), every `openOrders` (80) and `openOrderList` (6): three
-    /// requests, weight 106, not one atomic snapshot. Every nonzero holding,
-    /// every open order with its full record, and the account's identity as
-    /// given.
+    /// requests, weight 106, not one atomic snapshot. Every holding with a
+    /// nonzero component (a negative one is an error), every open order with
+    /// its full record, and the account's identity as given.
+    ///
+    /// An open order on a pair `Symbol::from_pair` cannot name fails the
+    /// whole observation: fail-closed, never dropped. How reconciliation
+    /// treats such an order is 8k's to decide before activation (8c plan §13,
+    /// item 10).
     async fn account_observation(&self) -> Result<InventoryObservation, ExecError> {
         let account = self.reader.account().await.map_err(read_error)?;
         let orders = self.reader.all_open_orders().await.map_err(read_error)?;
         let open_order_lists = self.reader.open_order_list_count().await.map_err(read_error)?;
-        let holdings = account
-            .balances
-            .iter()
-            .filter(|balance| !(balance.free + balance.locked).is_zero())
-            .map(|balance| {
-                (balance.asset.clone(), Holding {
-                    free: balance.free,
-                    locked: balance.locked,
-                })
-            })
-            .collect();
+        let mut holdings = Vec::new();
+        for balance in &account.balances {
+            let held = holding(&balance.asset, balance.free, balance.locked)?;
+            if !held.free.is_zero() || !held.locked.is_zero() {
+                holdings.push((balance.asset.clone(), held));
+            }
+        }
         let mut open_orders = Vec::with_capacity(orders.len());
         for order in orders {
             let record = venue_record(order)?;
@@ -499,6 +515,12 @@ impl InventoryPort for BinanceSpotAdapter {
     /// and symbol checked and its quantities consistent. HTTP 400 with -2013
     /// is `NotFound` and with -2026 `Archived`; anything else that failed
     /// established nothing (`Err`).
+    ///
+    /// By client id, the record keeps the identity the venue returned: a
+    /// cancel renames an order's client id (F12), so the record's id is not
+    /// compared with the one asked for. This raw observation proves no
+    /// ownership; known exchange ids and durable conflict checks are 8e's and
+    /// 8j's.
     async fn observe_order(
         &self,
         symbol: &Symbol,
