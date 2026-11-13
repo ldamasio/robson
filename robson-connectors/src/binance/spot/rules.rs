@@ -115,10 +115,13 @@ impl SpotSymbolRules {
     /// `minPrice` off the `tickSize` grid (filters.md L52); no LOT_SIZE, or
     /// steps that do not nest ([`Self::market_lot`]); no NOTIONAL; anything
     /// `SymbolTradingRules::new` refuses. Carried: the tick and `minPrice`,
-    /// the market lot's step and bounds, `minNotional` whatever
-    /// `applyMinToMarket` says, and the asset precisions as the domain's
-    /// informational precisions. Not carried: `maxPrice`, `maxNotional`, the
-    /// order counts and the symbol status.
+    /// and the market lot's step and bounds, which are authoritative; and
+    /// `minNotional`, carried conservatively whatever `applyMinToMarket`
+    /// says: when it is false Binance need not enforce it on a MARKET order,
+    /// and Robson holds itself to it anyway. The asset precisions become the
+    /// domain's informational precisions: they are not the executable grid,
+    /// which the tick and step are. Not carried: `maxPrice`, `maxNotional`,
+    /// the order counts and the symbol status.
     pub fn trading_rules(&self, symbol: &Symbol) -> Result<SymbolTradingRules, SpotReadError> {
         if self.symbol != symbol.as_pair()
             || self.base_asset != symbol.base()

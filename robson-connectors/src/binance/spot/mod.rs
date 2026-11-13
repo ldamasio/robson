@@ -1,5 +1,6 @@
 //! Binance spot (`binance:spot`), ADR-0056 step 8: the REST read side (8a),
-//! the trade feed and the klines (8b).
+//! the trade feed and the klines (8b), and the rules projection, the rules
+//! cache and the single trades page of 8c-2a.
 //!
 //! Read-only. The REST read side reads a symbol's `exchangeInfo` rules, the
 //! account, open orders and order lists, one order, `myTrades` pages and
@@ -8,14 +9,18 @@
 //! implements no venue port: the trading surface (8c) maps these records and
 //! errors onto the port contracts, and decides what a not-found means. The
 //! trade feed and the klines implement the existing `TradeFeedPort` and
-//! `OhlcvPort`, as their USD-M counterparts do. No production path constructs
-//! [`SpotRestReader`], [`BinanceSpotTradeFeed`] or [`BinanceSpotOhlcv`] yet
-//! (SD12; `inertness_tests.rs`).
+//! `OhlcvPort`, as their USD-M counterparts do. The rules projection and the
+//! rules cache (8c-2a) take nothing from the port contracts either; the venue
+//! that uses them is 8c-2b's. No production path constructs [`SpotRestReader`],
+//! [`BinanceSpotTradeFeed`] or [`BinanceSpotOhlcv`] yet (SD12;
+//! `inertness_tests.rs`).
 //!
 //! Venue facts are from Binance's spot API documentation at commit
-//! `995f6eb3` of `binance/binance-spot-api-docs`, read 2026-11-10 and
-//! 2026-11-11 (design note v16 §2, F13–F17, F22, F23, F25).
+//! `995f6eb3` of `binance/binance-spot-api-docs`, read 2026-11-10, 2026-11-11
+//! and 2026-11-13 (design note v16 §2, F13–F17, F22, F23, F25).
 
+// Used by the venue (8c-2b); until then only by its tests.
+#[cfg_attr(not(test), allow(dead_code))]
 mod cache;
 mod market_data;
 mod ohlcv;

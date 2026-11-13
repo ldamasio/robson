@@ -3,14 +3,15 @@
 //! Nothing reaches the network.
 
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
 
-use robson_domain::Symbol;
+use robson_domain::{Symbol, SymbolTradingRules};
 use rust_decimal_macros::dec;
 use serde_json::Value;
 
@@ -290,34 +291,227 @@ async fn the_cache_and_its_failures_stay_within_sixty_four_symbols() {
     assert_eq!(requests(&asked), 130);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refresh_in_flight_is_single_and_never_holds_up_the_last_rules() {
-    let asked = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&asked);
-    let (client, _) = stand_in::serve(move |_| {
-        counter.fetch_add(1, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(400));
+/// A stand-in whose exchangeInfo answers, after the first, wait until it is
+/// opened; it counts every request. The wait moves the stand-in's worker out
+/// of the runtime (`block_in_place`), so no other task is held behind it.
+#[derive(Default)]
+struct Held {
+    asked: AtomicUsize,
+    open: (Mutex<bool>, Condvar),
+}
+
+impl Held {
+    fn answer(&self) -> (u16, String) {
+        if self.asked.fetch_add(1, Ordering::SeqCst) > 0 {
+            tokio::task::block_in_place(|| {
+                let (lock, opened) = &self.open;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = opened.wait(open).unwrap();
+                }
+            });
+        }
         (200, EXCHANGE_INFO.to_string())
-    })
-    .await;
+    }
+
+    fn release(&self) {
+        *self.open.0.lock().unwrap() = true;
+        self.open.1.notify_all();
+    }
+
+    fn asked(&self) -> usize {
+        self.asked.load(Ordering::SeqCst)
+    }
+}
+
+/// Opens the stand-in when dropped, so a failing test never leaves it waiting.
+struct OpenOnDrop(Arc<Held>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// Rules loaded through a held stand-in, then aged past their TTL.
+async fn held_cache() -> (Arc<Held>, Arc<SpotRestReader>, Arc<SpotRulesCache>, SymbolTradingRules) {
+    let held = Arc::new(Held::default());
+    let answering = Arc::clone(&held);
+    let (client, _) = stand_in::serve(move |_| answering.answer()).await;
     let reader = Arc::new(SpotRestReader::new(client));
     let cache = Arc::new(SpotRulesCache::new());
-    let btc = symbol("BTCUSDT");
-    let stale = cache.within_ttl(&reader, &btc).await.unwrap();
+    let stale = cache.within_ttl(&reader, &symbol("BTCUSDT")).await.unwrap();
     cache.age_entry("BTCUSDT", Duration::from_secs(6 * 60 * 60));
+    (held, reader, cache, stale)
+}
 
-    let refreshes: Vec<_> = (0..2)
-        .map(|_| {
-            let (cache, reader, btc) = (Arc::clone(&cache), Arc::clone(&reader), btc.clone());
-            tokio::spawn(async move { cache.within_ttl(&reader, &btc).await })
-        })
-        .collect();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let started = Instant::now();
-    assert_eq!(cache.last_validated(&btc), Some(stale));
-    assert!(started.elapsed() < Duration::from_millis(100), "{:?}", started.elapsed());
-    for refresh in refreshes {
-        refresh.await.unwrap().unwrap();
+/// Wait, at most five seconds, until `ready`: an arrival, not a sleep.
+async fn until(what: &str, ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready() {
+        assert!(Instant::now() < deadline, "never reached: {what}");
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    assert_eq!(asked.load(Ordering::SeqCst), 2, "one load, then one refresh for both");
+}
+
+fn refresh(
+    cache: &Arc<SpotRulesCache>,
+    reader: &Arc<SpotRestReader>,
+) -> tokio::task::JoinHandle<Result<SymbolTradingRules, SpotRulesError>> {
+    let (cache, reader) = (Arc::clone(cache), Arc::clone(reader));
+    tokio::spawn(async move { cache.within_ttl(&reader, &symbol("BTCUSDT")).await })
+}
+
+/// Two callers find the rules past their TTL: one refreshes, the other waits
+/// at the gate, and while the refresh's answer is held the last rules are
+/// served at once. One request then serves both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_in_flight_is_single_and_never_holds_up_the_last_rules() {
+    let (held, reader, cache, stale) = held_cache().await;
+    let _open = OpenOnDrop(Arc::clone(&held));
+    let btc = symbol("BTCUSDT");
+    let callers = [refresh(&cache, &reader), refresh(&cache, &reader)];
+    until("one refresh at the venue and one caller at the gate", || {
+        held.asked() == 2 && cache.probe().gate_waiters.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(cache.last_validated(&btc), Some(stale), "served while the answer is held");
+    assert_eq!(held.asked(), 2, "the waiting caller sent nothing");
+    held.release();
+    for caller in callers {
+        caller.await.unwrap().unwrap();
+    }
+    assert_eq!(held.asked(), 2, "one refresh served both callers");
+    assert_eq!(cache.probe().max_in_flight.load(Ordering::SeqCst), 1);
+}
+
+/// A refresh cancelled with its request at the venue frees the gate, counts
+/// against the five-minute floor as a failure would, and leaves the stale
+/// rules to reductions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_refresh_frees_the_gate_and_counts_against_the_floor() {
+    let (held, reader, cache, stale) = held_cache().await;
+    let _open = OpenOnDrop(Arc::clone(&held));
+    let btc = symbol("BTCUSDT");
+    let cancelled = refresh(&cache, &reader);
+    until("the refresh at the venue", || held.asked() == 2).await;
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    until("the gate free", || cache.probe().gate_waiters.load(Ordering::SeqCst) == 0).await;
+    match cache.within_ttl(&reader, &btc).await {
+        Err(SpotRulesError::RecentFailure { floor, .. }) => assert_eq!(floor.as_secs(), 300),
+        other => panic!("expected RecentFailure, got {other:?}"),
+    }
+    assert_eq!(cache.cached(&reader, &btc).await.unwrap(), stale);
+    assert_eq!(held.asked(), 2, "nothing more was sent");
+    held.release();
+    cache.age_failure("BTCUSDT", Duration::from_secs(5 * 60));
+    cache.within_ttl(&reader, &btc).await.unwrap();
+    assert_eq!(held.asked(), 3, "retried after the floor");
+}
+
+/// xorshift64: the generated interleavings need no dependency.
+fn next(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+const SEEDS: u64 = 30;
+
+/// Seeded interleavings: four tasks run random cache operations on three
+/// symbols while the stand-in fails a quarter of its answers at random. At
+/// most one gated fetch is ever in flight; each symbol is fetched at most once
+/// more than the times its rules or its failure were aged, so waiting callers
+/// never stampede; the cache stays bounded; whatever is served is the symbol's
+/// projection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn random_interleavings_keep_one_refresh_at_a_time() {
+    let pairs = ["BTCUSDT", "ETHUSDT", "X1USDT"];
+    for seed in 1..=SEEDS {
+        let mut venue_rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let venue_rng = Arc::new(Mutex::new({
+            next(&mut venue_rng);
+            venue_rng
+        }));
+        let (client, _) = stand_in::serve(move |request| {
+            if next(&mut venue_rng.lock().unwrap()).is_multiple_of(4) {
+                return (500, "{\"code\":-1001,\"msg\":\"Internal error.\"}".to_string());
+            }
+            let pair = request.param("symbol").unwrap().to_string();
+            let base = pair.strip_suffix("USDT").unwrap().to_string();
+            (
+                200,
+                edited(|entry| {
+                    entry["symbol"] = pair.into();
+                    entry["baseAsset"] = base.into();
+                }),
+            )
+        })
+        .await;
+        let reader = Arc::new(SpotRestReader::new(client));
+        let cache = Arc::new(SpotRulesCache::new());
+        let aged: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+        let tasks: Vec<_> = (0..4u64)
+            .map(|task| {
+                let (reader, cache, aged) =
+                    (Arc::clone(&reader), Arc::clone(&cache), Arc::clone(&aged));
+                tokio::spawn(async move {
+                    let mut rng = (seed << 8 | task).wrapping_mul(0xD1B5_4A32_D192_ED03) | 1;
+                    for _ in 0..25 {
+                        let pair = pairs[(next(&mut rng) % 3) as usize];
+                        let at = symbol(pair);
+                        for _ in 0..next(&mut rng) % 3 {
+                            tokio::task::yield_now().await;
+                        }
+                        match next(&mut rng) % 7 {
+                            0 => drop(cache.within_ttl(&reader, &at).await),
+                            1 => drop(cache.cached(&reader, &at).await),
+                            2 => drop(cache.refresh_after_rejection(&reader, &at).await),
+                            3 => drop(cache.preview(&reader, &at).await),
+                            4 => {
+                                if let Some(rules) = cache.last_validated(&at) {
+                                    assert_eq!(rules.symbol(), &at);
+                                }
+                            },
+                            5 => {
+                                if cache.try_age_entry(pair, Duration::from_secs(6 * 60 * 60)) {
+                                    *aged.lock().unwrap().entry(pair.to_string()).or_default() += 1;
+                                }
+                            },
+                            _ => {
+                                if cache.try_age_failure(pair, Duration::from_secs(5 * 60)) {
+                                    *aged.lock().unwrap().entry(pair.to_string()).or_default() += 1;
+                                }
+                            },
+                        }
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let probe = cache.probe();
+        assert!(
+            probe.max_in_flight.load(Ordering::SeqCst) <= 1,
+            "seed {seed}: two fetches at once"
+        );
+        let aged = aged.lock().unwrap();
+        for (pair, fetches) in probe.fetches.lock().unwrap().iter() {
+            let allowed = 1 + aged.get(pair).copied().unwrap_or(0);
+            assert!(
+                *fetches <= allowed,
+                "seed {seed}: {pair} fetched {fetches} times, {allowed} allowed"
+            );
+        }
+        assert!(cache.sizes().0 <= 3 && cache.sizes().1 <= 3, "seed {seed}");
+        for pair in pairs {
+            if let Some(rules) = cache.last_validated(&symbol(pair)) {
+                assert_eq!(rules.symbol(), &symbol(pair), "seed {seed}");
+                assert_eq!(rules.tick_size(), dec!(0.01), "seed {seed}");
+            }
+        }
+    }
 }

@@ -4,7 +4,9 @@
 //!
 //! - A bounded TTL cache of 64 symbols, least recently used out.
 //! - One refresh at a time (single-flight), the cache lock never held across a
-//!   request, so a reduction reads it while a refresh is in flight.
+//!   request. [`SpotRulesCache::last_validated`] takes only the cache lock, so
+//!   it never waits for a refresh in flight; [`SpotRulesCache::cached`] can
+//!   wait for one before it falls back to stale rules.
 //! - A failed refresh keeps the last validated rules: admission
 //!   ([`SpotRulesCache::within_ttl`]) fails closed, risk reduction is served
 //!   stale ([`SpotRulesCache::cached`], [`SpotRulesCache::last_validated`]).
@@ -71,6 +73,39 @@ pub(super) struct SpotRulesCache {
     refresh_gate: tokio::sync::Mutex<()>,
     /// When the last refresh that has not succeeded began, per symbol.
     failed_at: Mutex<HashMap<String, Instant>>,
+    /// Callers waiting for the refresh gate, fetches in flight and the most
+    /// ever in flight at once, for the concurrency tests.
+    #[cfg(test)]
+    probe: Probe,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct Probe {
+    pub(super) gate_waiters: std::sync::atomic::AtomicUsize,
+    in_flight: std::sync::atomic::AtomicUsize,
+    pub(super) max_in_flight: std::sync::atomic::AtomicUsize,
+    /// Gated fetches begun, per symbol.
+    pub(super) fetches: Mutex<HashMap<String, usize>>,
+}
+
+/// Counts a waiter or a fetch for as long as it lives, cancellation included.
+#[cfg(test)]
+struct Counted<'a>(&'a std::sync::atomic::AtomicUsize);
+
+#[cfg(test)]
+impl<'a> Counted<'a> {
+    fn new(counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+#[cfg(test)]
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl SpotRulesCache {
@@ -79,7 +114,16 @@ impl SpotRulesCache {
             entries: Mutex::new(HashMap::new()),
             refresh_gate: tokio::sync::Mutex::new(()),
             failed_at: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            probe: Probe::default(),
         }
+    }
+
+    /// Take the refresh gate: one refresh at a time.
+    async fn gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        #[cfg(test)]
+        let _waiting = Counted::new(&self.probe.gate_waiters);
+        self.refresh_gate.lock().await
     }
 
     fn entries(&self) -> MutexGuard<'_, HashMap<String, CachedRules>> {
@@ -130,6 +174,14 @@ impl SpotRulesCache {
     ) -> Result<SymbolTradingRules, SpotRulesError> {
         let pair = symbol.as_pair();
         self.record_attempt(&pair);
+        #[cfg(test)]
+        let _fetching = {
+            let fetching = Counted::new(&self.probe.in_flight);
+            let now = self.probe.in_flight.load(std::sync::atomic::Ordering::SeqCst);
+            self.probe.max_in_flight.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            *self.probe.fetches.lock().unwrap().entry(pair.clone()).or_default() += 1;
+            fetching
+        };
         let spot = reader.symbol_rules(symbol).await?;
         let rules = spot.trading_rules(symbol)?;
         self.failures().remove(&pair);
@@ -162,7 +214,7 @@ impl SpotRulesCache {
         if let Some(rules) = self.within(&pair, TRADING_RULES_TTL) {
             return Ok(rules);
         }
-        let _gate = self.refresh_gate.lock().await;
+        let _gate = self.gate().await;
         if let Some(rules) = self.within(&pair, TRADING_RULES_TTL) {
             return Ok(rules);
         }
@@ -234,7 +286,7 @@ impl SpotRulesCache {
         symbol: &Symbol,
     ) -> Result<SymbolTradingRules, SpotRulesError> {
         let pair = symbol.as_pair();
-        let _gate = self.refresh_gate.lock().await;
+        let _gate = self.gate().await;
         if let Some(rules) = self.within(&pair, RULES_REJECTION_REFRESH_MIN_INTERVAL) {
             return Ok(rules);
         }
@@ -253,10 +305,38 @@ impl SpotRulesCache {
         self.entries().get_mut(pair).unwrap().fetched_at = Instant::now().checked_sub(by).unwrap();
     }
 
+    /// Age the entry of `pair` by `by` when there is one.
+    #[cfg(test)]
+    pub(super) fn try_age_entry(&self, pair: &str, by: Duration) -> bool {
+        let mut entries = self.entries();
+        let Some(cached) = entries.get_mut(pair) else {
+            return false;
+        };
+        cached.fetched_at = Instant::now().checked_sub(by).unwrap();
+        true
+    }
+
+    /// Age the failure of `pair` by `by` when there is one.
+    #[cfg(test)]
+    pub(super) fn try_age_failure(&self, pair: &str, by: Duration) -> bool {
+        let mut failures = self.failures();
+        let Some(at) = failures.get_mut(pair) else {
+            return false;
+        };
+        *at = Instant::now().checked_sub(by).unwrap();
+        true
+    }
+
     /// Age the failure of `pair` by `by`, for the floor tests.
     #[cfg(test)]
     pub(super) fn age_failure(&self, pair: &str, by: Duration) {
         *self.failures().get_mut(pair).unwrap() = Instant::now().checked_sub(by).unwrap();
+    }
+
+    /// The concurrency counters.
+    #[cfg(test)]
+    pub(super) fn probe(&self) -> &Probe {
+        &self.probe
     }
 
     /// How many symbols are cached and how many failures are remembered.
