@@ -345,8 +345,9 @@ async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> Result<T, St
 
 /// One cycle of the quiescence protocol (8d plan §7.4) on the current
 /// runtime: a held request and an idle keep-alive connection present, then
-/// shutdown, the test's side released, and everything back at `baseline`.
-/// Returns the drain's duration.
+/// shutdown, which returns with the venue's side drained (no connection, no
+/// handler, the book's other references gone), the test's side released,
+/// and everything back at `baseline`. Returns the drain's duration.
 async fn cycle(book: &Arc<SpotBook>, baseline: usize) -> Result<Duration, String> {
     let venue = FakeSpotVenue::start(Arc::clone(book), TestCredentials::FIXED)
         .await
@@ -375,6 +376,12 @@ async fn cycle(book: &Arc<SpotBook>, baseline: usize) -> Result<Duration, String
     let started = Instant::now();
     venue.shutdown().await.map_err(|e| e.to_string())?;
     let drain = started.elapsed();
+    // `Ok` means drained: on this one thread, every connection task and the
+    // server's own future have ended before `shutdown` returns.
+    if counters.live() != (0, 0) || Arc::strong_count(book) != 1 {
+        let (live, references) = (counters.live(), Arc::strong_count(book));
+        return Err(format!("shutdown returned with live {live:?}, book references {references}"));
+    }
     drop(idle);
     let answered = bounded("the held request's sender", sender).await?;
     if !matches!(answered, Ok(Ok(503))) {
