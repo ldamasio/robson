@@ -6,12 +6,14 @@
 //! L986), so each is an `Option` here. Every value is runtime metadata, never
 //! a constant (AGENTS.md invariant 9).
 //!
-//! The projection onto the domain's `SymbolTradingRules` belongs to 8c. It
-//! must refuse a `minPrice`/`tickSize` pair whose grid differs from Binance's:
-//! spot's price rule is `price % tickSize == 0` (filters.md L52), while the
-//! domain anchors its grid at `min_price`, so `minPrice` 0.015 with
-//! `tickSize` 0.01 would round a trigger onto a price Binance refuses.
+//! [`SpotSymbolRules::trading_rules`] projects them onto the domain's
+//! `SymbolTradingRules` (8c). It refuses a `minPrice`/`tickSize` pair whose
+//! grid differs from Binance's: spot's price rule is `price % tickSize == 0`
+//! (filters.md L52), while the domain anchors its grid at `min_price`, so
+//! `minPrice` 0.015 with `tickSize` 0.01 would round a trigger onto a price
+//! Binance refuses.
 
+use robson_domain::{Symbol, SymbolTradingRules};
 use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
@@ -75,6 +77,10 @@ pub struct SpotSymbolRules {
     /// Open `STOP_LOSS`, `STOP_LOSS_LIMIT`, `TAKE_PROFIT` and
     /// `TAKE_PROFIT_LIMIT` orders allowed on the symbol (F8).
     pub max_num_algo_orders: Option<u32>,
+    /// The self-trade prevention modes an order on the symbol may name
+    /// (`allowedSelfTradePreventionModes`, `rest-api.md` L996; enums.md
+    /// L172-L183), kept raw.
+    pub allowed_stp_modes: Vec<String>,
 }
 
 impl SpotSymbolRules {
@@ -102,6 +108,61 @@ impl SpotSymbolRules {
             max_qty: lot.max_qty.min(market.max_qty),
             step_size,
         })
+    }
+
+    /// The domain's trading rules for `symbol` (8c). Refused, as
+    /// [`SpotReadError::InvalidRules`]: no PRICE_FILTER or a zero tick; a
+    /// `minPrice` off the `tickSize` grid (filters.md L52); no LOT_SIZE, or
+    /// steps that do not nest ([`Self::market_lot`]); no NOTIONAL; anything
+    /// `SymbolTradingRules::new` refuses. Carried: the tick and `minPrice`,
+    /// and the market lot's step and bounds, which are authoritative; and
+    /// `minNotional`, carried conservatively whatever `applyMinToMarket`
+    /// says: when it is false Binance need not enforce it on a MARKET order,
+    /// and Robson holds itself to it anyway. The asset precisions become the
+    /// domain's informational precisions: they are not the executable grid,
+    /// which the tick and step are. Not carried: `maxPrice`, `maxNotional`,
+    /// the order counts and the symbol status.
+    pub fn trading_rules(&self, symbol: &Symbol) -> Result<SymbolTradingRules, SpotReadError> {
+        if self.symbol != symbol.as_pair()
+            || self.base_asset != symbol.base()
+            || self.quote_asset != symbol.quote()
+        {
+            return Err(SpotReadError::Inconsistent(format!(
+                "rules of {} ({}/{}) asked for {}/{}",
+                self.symbol,
+                self.base_asset,
+                self.quote_asset,
+                symbol.base(),
+                symbol.quote()
+            )));
+        }
+        let price = self.price_filter.as_ref().ok_or_else(|| self.missing("PRICE_FILTER"))?;
+        if price.tick_size <= Decimal::ZERO {
+            return Err(SpotReadError::InvalidRules(format!(
+                "{}: tick size {} gives no price grid",
+                self.symbol, price.tick_size
+            )));
+        }
+        if !(price.min_price % price.tick_size).is_zero() {
+            return Err(SpotReadError::InvalidRules(format!(
+                "{}: minPrice {} is off the tickSize {} grid",
+                self.symbol, price.min_price, price.tick_size
+            )));
+        }
+        let lot = self.market_lot()?;
+        let notional = self.notional.as_ref().ok_or_else(|| self.missing("NOTIONAL"))?;
+        SymbolTradingRules::new(
+            symbol.clone(),
+            price.tick_size,
+            price.min_price,
+            lot.step_size,
+            lot.min_qty,
+            lot.max_qty,
+            notional.min_notional,
+            self.quote_asset_precision,
+            self.base_asset_precision,
+        )
+        .map_err(|e| SpotReadError::InvalidRules(format!("{}: {e}", self.symbol)))
     }
 
     fn missing(&self, filter: &str) -> SpotReadError {
@@ -139,6 +200,7 @@ struct SymbolWire {
     order_types: Vec<String>,
     permission_sets: Vec<Vec<String>>,
     filters: Vec<Value>,
+    allowed_self_trade_prevention_modes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -172,6 +234,7 @@ pub(super) fn parse_symbol_rules(body: &str, pair: &str) -> Result<SpotSymbolRul
         market_lot_size: None,
         notional: None,
         max_num_algo_orders: None,
+        allowed_stp_modes: entry.allowed_self_trade_prevention_modes,
     };
     for filter in entry.filters {
         let kind = filter.get("filterType").and_then(Value::as_str).map(str::to_owned);

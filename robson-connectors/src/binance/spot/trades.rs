@@ -111,6 +111,80 @@ pub struct SpotTradesRead {
     pub weight: u32,
 }
 
+/// One page of an order's trades, as one request established it (8c, design
+/// §3.5.1): what the leg owner reads, one page per run, its cursor stored
+/// durably by the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpotTradePage {
+    /// Distinct trades, ascending by id.
+    pub trades: Vec<SpotTrade>,
+    /// Where the next page starts, `highest id + 1`, only when this page was
+    /// full; `None` when the venue had no more.
+    pub next_from_id: Option<u64>,
+}
+
+/// One page answered to `orderId = order_id, fromId = from_id`. Each trade
+/// is on `pair`, of the order, with an id at or above `from_id`; an id read
+/// twice must carry the same record, and counts once. A full page's cursor
+/// must exist and move past `from_id`. Anything else is
+/// [`SpotReadError::Inconsistent`].
+pub(super) fn parse_page(
+    pair: &str,
+    order_id: u64,
+    from_id: u64,
+    body: &str,
+) -> Result<SpotTradePage, SpotReadError> {
+    let page: Vec<SpotTrade> = parse_json("trades", body)?;
+    let full = page.len() >= usize::from(MY_TRADES_PAGE_LIMIT);
+    let mut trades = BTreeMap::new();
+    for trade in page {
+        let defect = if trade.symbol != pair {
+            Some(format!("is on {}", trade.symbol))
+        } else if trade.order_id != order_id {
+            Some(format!("is of order {}", trade.order_id))
+        } else if trade.id < from_id {
+            Some(format!("is below fromId {from_id}"))
+        } else {
+            None
+        };
+        if let Some(defect) = defect {
+            return Err(SpotReadError::Inconsistent(format!(
+                "trade {} on a page of order {order_id} on {pair} {defect}",
+                trade.id
+            )));
+        }
+        match trades.entry(trade.id) {
+            Entry::Vacant(slot) => {
+                slot.insert(trade);
+            },
+            Entry::Occupied(seen) if *seen.get() == trade => {},
+            Entry::Occupied(_) => {
+                return Err(SpotReadError::Inconsistent(format!(
+                    "trade {} on {pair} read twice with different records",
+                    trade.id
+                )));
+            },
+        }
+    }
+    let next_from_id = if full {
+        let next = trades.keys().next_back().and_then(|highest| highest.checked_add(1));
+        match next {
+            Some(next) if next > from_id => Some(next),
+            _ => {
+                return Err(SpotReadError::Inconsistent(format!(
+                    "a full page of order {order_id} on {pair} from {from_id} has no next cursor"
+                )))
+            },
+        }
+    } else {
+        None
+    };
+    Ok(SpotTradePage {
+        trades: trades.into_values().collect(),
+        next_from_id,
+    })
+}
+
 /// Trades collected across the pages of one read, deduplicated by id.
 pub(super) struct SpotTradeSet {
     pair: String,

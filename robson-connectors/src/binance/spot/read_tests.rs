@@ -4,20 +4,15 @@
 //! in for Binance, so these tests see the requests Robson sends and the
 //! errors it types. Nothing reaches the network.
 
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use robson_domain::Symbol;
 use rust_decimal_macros::dec;
 use serde_json::{json, Value};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-};
+use tokio::net::TcpListener;
 
 use super::{
+    stand_in::{self, Seen, Seens},
     SpotOrderRef, SpotRead, SpotReadError, SpotRestReader, SpotTradesQuery, MY_TRADES_MAX_PAGES,
 };
 use crate::binance_rest::BinanceRestClient;
@@ -31,91 +26,13 @@ const MY_TRADES: &str = include_str!("testdata/my_trades.json");
 const COMMISSION: &str = include_str!("testdata/commission.json");
 const ERRORS: &str = include_str!("testdata/errors.json");
 const READS: &str = include_str!("testdata/reads.json");
-
-/// One request as the stand-in venue saw it.
-#[derive(Debug, Clone)]
-struct Seen {
-    method: String,
-    path: String,
-    params: Vec<(String, String)>,
-    api_key: bool,
-}
-
-impl Seen {
-    fn param(&self, name: &str) -> Option<&str> {
-        self.params.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
-    }
-
-    /// Method, path and parameters without the signature's, sorted.
-    fn identity(&self) -> String {
-        let mut params: Vec<String> = self
-            .params
-            .iter()
-            .filter(|(k, _)| k != "timestamp" && k != "signature")
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
-        params.sort();
-        if params.is_empty() {
-            format!("{} {}", self.method, self.path)
-        } else {
-            format!("{} {}?{}", self.method, self.path, params.join("&"))
-        }
-    }
-}
-
-type Seens = Arc<Mutex<Vec<Seen>>>;
+const TICKER_PRICE: &str = include_str!("testdata/ticker_price.json");
 
 /// A stand-in venue answering each request with `reply`'s status and body.
 async fn venue(
     reply: impl Fn(&Seen) -> (u16, String) + Send + Sync + 'static,
 ) -> (SpotRestReader, Seens) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&seen);
-    let reply = Arc::new(reply);
-    tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut head = Vec::new();
-            let mut buf = [0u8; 4096];
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match stream.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&buf[..n]),
-                }
-            }
-            let head = String::from_utf8_lossy(&head).into_owned();
-            let mut lines = head.lines();
-            let mut first = lines.next().unwrap_or_default().split_whitespace();
-            let (method, target) =
-                (first.next().unwrap_or_default(), first.next().unwrap_or_default());
-            let (path, query) = target.split_once('?').unwrap_or((target, ""));
-            let request = Seen {
-                method: method.to_string(),
-                path: path.to_string(),
-                params: query
-                    .split('&')
-                    .filter(|part| !part.is_empty())
-                    .map(|part| {
-                        let (k, v) = part.split_once('=').unwrap_or((part, ""));
-                        (k.to_string(), v.to_string())
-                    })
-                    .collect(),
-                api_key: lines.any(|line| line.to_ascii_lowercase().starts_with("x-mbx-apikey:")),
-            };
-            recorded.lock().unwrap().push(request.clone());
-
-            let (status, body) = reply(&request);
-            let response = format!(
-                "HTTP/1.1 {status} Answer\r\nContent-Type: application/json\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
-    });
-    let client = Arc::new(BinanceRestClient::with_local_base_url(url));
+    let (client, seen) = stand_in::serve(reply).await;
     (SpotRestReader::new(client), seen)
 }
 
@@ -147,6 +64,8 @@ async fn every_read_is_a_get_with_its_documented_weight() {
             "/api/v3/order" => ORDER,
             "/api/v3/myTrades" => MY_TRADES,
             "/api/v3/account/commission" => COMMISSION,
+            "/api/v3/ping" => "{}",
+            "/api/v3/ticker/price" => TICKER_PRICE,
             other => panic!("unexpected read {other}"),
         };
         (200, body.to_string())
@@ -175,6 +94,10 @@ async fn every_read_is_a_get_with_its_documented_weight() {
         weights.push(read.weight);
     }
     reader.commission(&btc).await.unwrap();
+    reader.ping().await.unwrap();
+    assert_eq!(reader.ticker_price(&ltc).await.unwrap(), dec!(4.00000200));
+    let page = reader.trades_page(&bnb, 100234, 28457).await.unwrap();
+    assert_eq!((page.trades.len(), page.next_from_id), (1, None));
 
     let golden: Value = serde_json::from_str(READS).unwrap();
     let golden = golden["reads"].as_array().unwrap();
@@ -617,4 +540,112 @@ async fn a_failed_page_fails_the_read() {
         reader.trades(&symbol("BNBBTC"), query).await,
         Err(SpotReadError::ServerError { http_status: 503, .. })
     ));
+}
+
+// =============================================================================
+// 8c: one trades page, the ticker and the ping
+// =============================================================================
+
+/// 5,500 trades of one order, read page by page through the cursor each page
+/// returns: six requests, each from where the last ended, never from 0 again.
+#[tokio::test]
+async fn trade_pages_continue_past_five_thousand_fills_cursor_by_cursor() {
+    let (reader, seen) = venue(my_trades(history(5_500), false)).await;
+    let bnb = symbol("BNBBTC");
+    let (mut from_id, mut ids) = (0, Vec::new());
+    let mut cursors = Vec::new();
+    loop {
+        let page = reader.trades_page(&bnb, 9, from_id).await.unwrap();
+        ids.extend(page.trades.iter().map(|t| t.id));
+        match page.next_from_id {
+            Some(next) => {
+                cursors.push(next);
+                from_id = next;
+            },
+            None => break,
+        }
+    }
+    assert_eq!(ids, (1..=5_500).collect::<Vec<u64>>());
+    assert_eq!(cursors, [1_001, 2_001, 3_001, 4_001, 5_001]);
+    let sent: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.param("fromId").unwrap().to_string())
+        .collect();
+    assert_eq!(sent, ["0", "1001", "2001", "3001", "4001", "5001"]);
+    assert!(reader.sent().iter().all(|read| *read == SpotRead::MY_TRADES_BY_ORDER));
+}
+
+/// The body of one page: `trades` as given.
+async fn page(trades: Vec<Value>, from_id: u64) -> Result<super::SpotTradePage, SpotReadError> {
+    let body = serde_json::to_string(&trades).unwrap();
+    let (reader, _) = answering(200, &body).await;
+    reader.trades_page(&symbol("BNBBTC"), 9, from_id).await
+}
+
+fn inconsistent(result: Result<super::SpotTradePage, SpotReadError>) -> String {
+    match result {
+        Err(SpotReadError::Inconsistent(why)) => why,
+        other => panic!("expected Inconsistent, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_page_keeps_distinct_trades_and_its_cursor_only_when_full() {
+    let short = page(
+        vec![
+            trade(5, 9, BASE_TIME),
+            trade(5, 9, BASE_TIME),
+            trade(6, 9, BASE_TIME),
+        ],
+        5,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (short.trades.iter().map(|t| t.id).collect::<Vec<_>>(), short.next_from_id),
+        (vec![5, 6], None)
+    );
+    assert_eq!(page(vec![], 0).await.unwrap().next_from_id, None);
+    let full: Vec<Value> = (10..1_010).map(|id| trade(id, 9, BASE_TIME)).collect();
+    assert_eq!(page(full, 10).await.unwrap().next_from_id, Some(1_010));
+}
+
+#[tokio::test]
+async fn a_page_with_a_foreign_low_or_conflicting_trade_is_inconsistent() {
+    let mut other = trade(7, 9, BASE_TIME);
+    other["price"] = json!("4.5");
+    assert!(inconsistent(page(vec![trade(7, 9, BASE_TIME), other], 0).await)
+        .contains("different records"));
+    assert!(inconsistent(page(vec![trade(7, 8, BASE_TIME)], 0).await).contains("of order 8"));
+    let mut elsewhere = trade(7, 9, BASE_TIME);
+    elsewhere["symbol"] = json!("ETHBTC");
+    assert!(inconsistent(page(vec![elsewhere], 0).await).contains("is on ETHBTC"));
+    assert!(inconsistent(page(vec![trade(6, 9, BASE_TIME)], 7).await).contains("below fromId 7"));
+}
+
+#[tokio::test]
+async fn a_full_page_whose_cursor_would_overflow_is_inconsistent() {
+    let top: Vec<Value> = (u64::MAX - 999..=u64::MAX).map(|id| trade(id, 9, BASE_TIME)).collect();
+    assert!(inconsistent(page(top, u64::MAX - 999).await).contains("no next cursor"));
+}
+
+#[tokio::test]
+async fn a_ticker_on_another_symbol_or_without_a_positive_price_is_inconsistent() {
+    for body in [
+        r#"{"symbol": "ETHBTC", "price": "4.00000200"}"#,
+        r#"{"symbol": "LTCBTC", "price": "0"}"#,
+    ] {
+        let (reader, _) = answering(200, body).await;
+        assert!(
+            matches!(
+                reader.ticker_price(&symbol("LTCBTC")).await,
+                Err(SpotReadError::Inconsistent(_))
+            ),
+            "{body}"
+        );
+    }
+    let (reader, _) = answering(200, "[]").await;
+    assert!(matches!(reader.ping().await, Err(SpotReadError::Parse(_))));
 }

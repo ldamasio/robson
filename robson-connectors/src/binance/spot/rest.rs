@@ -13,13 +13,16 @@
 use std::sync::Arc;
 
 use robson_domain::Symbol;
+use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize};
 use thiserror::Error;
 
 use super::{
     records::{self, SpotAccount, SpotCommission, SpotOrderRecord},
     rules::{self, SpotSymbolRules},
-    trades::{SpotTradeSet, SpotTradesQuery, SpotTradesRead, MY_TRADES_MAX_PAGES},
+    trades::{
+        self, SpotTradePage, SpotTradeSet, SpotTradesQuery, SpotTradesRead, MY_TRADES_MAX_PAGES,
+    },
 };
 use crate::binance_rest::{BinanceRestClient, BinanceRestError};
 
@@ -62,6 +65,11 @@ impl SpotRead {
     /// `GET /api/v3/klines`, weight 2, public (F25; L1273-L1281). Sent by
     /// `BinanceSpotOhlcv` (8b), not by this reader.
     pub const KLINES: Self = Self::public("/api/v3/klines", 2);
+    /// `GET /api/v3/ping`, weight 1, public (L836-L852).
+    pub const PING: Self = Self::public("/api/v3/ping", 1);
+    /// `GET /api/v3/ticker/price` for one symbol, weight 2, public
+    /// (L1750-L1782).
+    pub const TICKER_PRICE: Self = Self::public("/api/v3/ticker/price", 2);
 
     const fn public(path: &'static str, weight: u32) -> Self {
         Self { path, weight, signed: false }
@@ -137,6 +145,13 @@ pub enum SpotReadError {
     /// Rules that parsed but give no usable market lot.
     #[error("Unusable spot rules: {0}")]
     InvalidRules(String),
+}
+
+/// `GET /api/v3/ticker/price` for one symbol (L1776-L1782).
+#[derive(Deserialize)]
+struct TickerPrice {
+    symbol: String,
+    price: Decimal,
 }
 
 /// Binance's error body: `{"code": -1121, "msg": "Invalid symbol."}`.
@@ -341,6 +356,49 @@ impl SpotRestReader {
                 next => return Ok(collected.finish(next, pages, weight)),
             }
         }
+    }
+
+    /// One page of `order_id`'s trades on `symbol`, ids from `from_id` on
+    /// ([`SpotRead::MY_TRADES_BY_ORDER`]): one request, never a retry. The
+    /// page's checks are [`trades::parse_page`]'s.
+    pub async fn trades_page(
+        &self,
+        symbol: &Symbol,
+        order_id: u64,
+        from_id: u64,
+    ) -> Result<SpotTradePage, SpotReadError> {
+        let pair = symbol.as_pair();
+        let (read, params) = SpotTradesQuery::Order { order_id, from_id }.page_request(&pair);
+        let body = self.read(read, params).await?;
+        trades::parse_page(&pair, order_id, from_id, &body)
+    }
+
+    /// Whether the REST API answers ([`SpotRead::PING`]): `{}`.
+    pub async fn ping(&self) -> Result<(), SpotReadError> {
+        let body = self.read(SpotRead::PING, vec![]).await?;
+        let _: serde_json::Map<String, serde_json::Value> = parse_json("ping", &body)?;
+        Ok(())
+    }
+
+    /// The latest price of `symbol` ([`SpotRead::TICKER_PRICE`]): on the
+    /// symbol asked for, and positive.
+    pub async fn ticker_price(&self, symbol: &Symbol) -> Result<Decimal, SpotReadError> {
+        let pair = symbol.as_pair();
+        let body = self.read(SpotRead::TICKER_PRICE, vec![("symbol", pair.clone())]).await?;
+        let ticker: TickerPrice = parse_json("ticker price", &body)?;
+        if ticker.symbol != pair {
+            return Err(SpotReadError::Inconsistent(format!(
+                "ticker price for {pair} answered {}",
+                ticker.symbol
+            )));
+        }
+        if ticker.price <= Decimal::ZERO {
+            return Err(SpotReadError::Inconsistent(format!(
+                "ticker price {} for {pair} is not positive",
+                ticker.price
+            )));
+        }
+        Ok(ticker.price)
     }
 
     /// The account's commission rates on `symbol` ([`SpotRead::COMMISSION`]).

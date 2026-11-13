@@ -1,13 +1,15 @@
-//! ADR-0056 steps 8a and 8b merge inert (SD12, design note v16 §12.2).
+//! ADR-0056 steps 8a, 8b and 8c-2a merge inert (SD12, design note v16 §12.2).
 //!
-//! Grep-based, over the workspace's Rust sources as they are on disk:
+//! Lexical regression checks over the workspace's Rust sources as they are on
+//! disk, backed by a review of each part's diff and call paths:
 //! - nothing outside `binance/spot/` reaches this module, names a type it
 //!   defines or names a spot endpoint, so no production path, factory included,
-//!   can construct its reader, feed or klines;
-//! - 8a's readers import no `robson_exec` contract and implement no port. 8b's
-//!   feed and klines import exactly the existing items of the port each
-//!   implements (`TradeFeedPort`, `OhlcvPort`) and nothing else, so no spot
-//!   source uses anything 8c or a later step introduces there;
+//!   can construct its reader, feed, klines or rules cache;
+//! - 8a's readers, 8c-2a's rules projection and rules cache import no
+//!   `robson_exec` contract and implement no port. 8b's feed and klines import
+//!   exactly the existing items of the port each implements (`TradeFeedPort`,
+//!   `OhlcvPort`) and nothing else, so no spot source uses anything 8c-2b or a
+//!   later step introduces there;
 //! - they send no mutation, read no configuration and name no testnet host.
 //!
 //! `robsond`'s venue tests check the other half: the factory still refuses
@@ -263,6 +265,9 @@ fn the_matchers_find_what_they_look_for() {
         "SpotTradeSet",
         "SpotCommission",
         "MY_TRADES_MAX_PAGES",
+        "SpotTradePage",
+        "SpotRulesCache",
+        "SpotRulesError",
     ] {
         assert!(names.iter().any(|name| name == expected), "{expected} in {names:?}");
     }

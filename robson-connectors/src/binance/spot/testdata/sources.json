@@ -65,6 +65,11 @@
       "source": "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=3",
       "accessed": "2026-11-11",
       "how": "The public, unauthenticated response fetched at 2026-11-11T22:28:55Z, unmodified (sha256 b9c9e4c956ef8fe32f4761984d6432b5f3b04c1d7d54bf49157ddf30e4b71b63): three 1-minute klines, oldest first. Format: https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1273-L1337"
+    },
+    "ticker_price.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1776-L1782",
+      "accessed": "2026-11-13",
+      "how": "The documented single-symbol response of GET /api/v3/ticker/price"
     }
   },
   "facts": {
