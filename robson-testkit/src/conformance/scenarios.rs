@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex};
 use robson_domain::{OrderSide, Price, Quantity};
 use robson_exec::{
     venue::{
-        capability_mismatches, AccountKind, AccountPort, CancelAnswer, EntryOrReduce, OrderLookup,
-        OrderPhase, PlacedStop, ProtectionKind, ReplaceOutcome, ReplacementProtocol,
-        StopCancelOutcome, StopParams, StopRef, TradingPort, Venue,
+        capability_mismatches, AccountKind, AccountPort, CancelAnswer, EntryOrReduce,
+        InventoryPort, OrderLookup, OrderPhase, PlacedStop, ProtectionKind, ReplaceOutcome,
+        ReplacementProtocol, StopCancelOutcome, StopParams, StopRef, TradingPort, Venue,
     },
     ExecError, OrderResult,
 };
@@ -262,6 +262,14 @@ fn live_stop(book: &SpotBook, id: &str) -> Option<(BookStatus, Decimal)> {
 
 fn order_id(stop: &StopRef) -> u64 {
     stop.exchange_order_id.parse().expect("a book order id")
+}
+
+/// The venue's inventory port, a failure when it has none (F1's subject: a
+/// balance account without one fails the run, never panics it).
+fn inventory<'a, H: Harness>(h: &'a H, run: &mut Run) -> Option<&'a dyn InventoryPort> {
+    let inventory = h.venue().inventory();
+    run.expect(inventory.is_some(), "a balance account exposes its inventory");
+    inventory
 }
 
 /// The seeded holding a balance scenario starts from.
@@ -592,7 +600,9 @@ pub async fn b2<H: BalanceHarness>(h: &H) -> Outcome {
     let Some(open) = stop(h, &mut run, "b2-a", "0.5", "90").await else {
         return run.finish();
     };
-    let inventory = h.venue().inventory().expect("a balance account's inventory");
+    let Some(inventory) = inventory(h, &mut run) else {
+        return run.finish();
+    };
     let id = open.exchange_order_id.clone();
     run.sent(format!("cancel_order_once {id}"));
     let cancelled =
@@ -682,7 +692,9 @@ pub async fn b4<H: BalanceHarness>(h: &H) -> Outcome {
     // order's trades still read by page.
     h.book().hide_order(order_id(&old));
     run.market("the venue hides the order, its trades visible");
-    let inventory = h.venue().inventory().expect("a balance account's inventory");
+    let Some(inventory) = inventory(h, &mut run) else {
+        return run.finish();
+    };
     let page = inventory.order_trades_page(&symbol, &old.exchange_order_id, 0).await;
     let page = run.answered("order_trades_page", page);
     run.expect(
@@ -694,7 +706,9 @@ pub async fn b4<H: BalanceHarness>(h: &H) -> Outcome {
 
 /// The account observation's holdings, as (asset, free, locked).
 async fn holdings<H: Harness>(h: &H) -> Vec<(String, Decimal, Decimal)> {
-    let inventory = h.venue().inventory().expect("a balance account's inventory");
+    let Some(inventory) = h.venue().inventory() else {
+        return Vec::new();
+    };
     match inventory.account_observation().await {
         Ok(observation) => observation
             .holdings
@@ -760,7 +774,9 @@ pub async fn b5<H: BalanceHarness>(h: &H) -> Outcome {
     }
     if let Some(delayed) = stop(h, &mut run, "b5-s3", "0.3", "80").await {
         h.book().delay_cancels(true);
-        let inventory = h.venue().inventory().expect("a balance account's inventory");
+        let Some(inventory) = inventory(h, &mut run) else {
+            return run.finish();
+        };
         run.sent("cancel_order_once b5-s3 (delayed)");
         let id = delayed.exchange_order_id;
         let answer =
@@ -780,7 +796,9 @@ pub async fn b5<H: BalanceHarness>(h: &H) -> Outcome {
     let held = stop(h, &mut run, "b5-held", "0.5", "80").await;
     let stale = stop(h, &mut run, "b5-s4", "0.2", "80").await;
     if let (Some(_), Some(twice)) = (held, stale) {
-        let inventory = h.venue().inventory().expect("a balance account's inventory");
+        let Some(inventory) = inventory(h, &mut run) else {
+            return run.finish();
+        };
         let id = twice.exchange_order_id;
         run.sent("cancel_order_once b5-s4 (delayed, then immediate)");
         let queued = inventory.cancel_order_once(&symbol, &id).await;
