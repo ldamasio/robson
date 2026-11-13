@@ -368,6 +368,46 @@ impl BinanceRestClient {
             .await
     }
 
+    /// A signed spot read whose answer comes back whatever its HTTP status
+    /// (ADR-0056 step 8c-3), for 8a's reader. Like the answer helpers below:
+    /// every value percent-encoded before signing ([`percent_encoded`]), so
+    /// the signature covers the query as sent (spot `rest-api.md`
+    /// L344-L345, L388-L417), and one request on the [`single_shot`]
+    /// transport, with no redirect followed and nothing retried. A read: it
+    /// does not pass the mutation gate. [`Self::get_signed_answer`], which
+    /// signs raw values and follows redirects, stays as it is for USD-M.
+    pub(crate) async fn get_signed_spot_answer(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<RestAnswer, BinanceRestError> {
+        let transport = single_shot()?;
+        let query = self.build_signed_query(encoded(params))?;
+        let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
+
+        self.answer(transport.get(&url).header("X-MBX-APIKEY", &self.api_key)).await
+    }
+
+    /// [`Self::get_signed_spot_answer`] for a public spot read: values
+    /// encoded, no key, one request on the [`single_shot`] transport.
+    /// [`Self::get_public_answer`] stays as it is for USD-M.
+    pub(crate) async fn get_public_spot_answer(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<RestAnswer, BinanceRestError> {
+        let transport = single_shot()?;
+        let query: Vec<String> =
+            encoded(params).iter().map(|(name, value)| format!("{name}={value}")).collect();
+        let url = if query.is_empty() {
+            format!("{}{}", self.endpoint_base_url(endpoint), endpoint)
+        } else {
+            format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query.join("&"))
+        };
+
+        self.answer(transport.get(&url)).await
+    }
+
     /// A signed POST whose answer comes back whatever its HTTP status: a venue
     /// mutation for a caller that types the venue's answers itself (the spot
     /// order path, ADR-0056 step 8c-3). It passes the gate first, as
@@ -1939,6 +1979,45 @@ mod tests {
         }
     }
 
+    /// The spot read helpers follow no redirect either: a 3xx is the answer,
+    /// one request, and nothing (the key included) reaches the place
+    /// `Location` points to. Their values are encoded as the answer helpers'.
+    #[tokio::test]
+    async fn the_spot_read_helpers_follow_no_redirect_and_encode_their_values() {
+        for status in [301, 302, 303, 307, 308] {
+            let (elsewhere, followed) = counting(200, None).await;
+            let location = format!("{elsewhere}/api/v3/order?symbol=BTCUSDT");
+            let (url, requests) = counting(status, Some(location)).await;
+            let client = BinanceRestClient::with_local_base_url(url);
+            let signed = client.get_signed_spot_answer("/api/v3/order", vec![]).await.unwrap();
+            assert_eq!(signed.status.as_u16(), status);
+            let public = client.get_public_spot_answer("/api/v3/ping", vec![]).await.unwrap();
+            assert_eq!(public.status.as_u16(), status);
+            assert_eq!(requests.load(Ordering::SeqCst), 2, "{status}: one request each");
+            assert_eq!(followed.load(Ordering::SeqCst), 0, "{status}: nothing followed");
+        }
+        let (url, seen) = answering(200, "{}").await;
+        let client = BinanceRestClient::with_local_base_url(url);
+        let params = vec![("symbol", "１２３USDT&a=b".to_string())];
+        client.get_signed_spot_answer("/api/v3/order", params.clone()).await.unwrap();
+        client.get_public_spot_answer("/api/v3/exchangeInfo", params).await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen[0].starts_with(
+                "get /api/v3/order?symbol=%ef%bc%91%ef%bc%92%ef%bc%93usdt%26a%3db&timestamp="
+            ),
+            "{seen:?}"
+        );
+        assert!(seen[0].contains("&signature=") && seen[0].ends_with("key=true"), "{seen:?}");
+        assert!(
+            seen[1].starts_with(
+                "get /api/v3/exchangeinfo?symbol=%ef%bc%91%ef%bc%92%ef%bc%93usdt%26a%3db http"
+            ),
+            "{seen:?}"
+        );
+        assert!(seen[1].ends_with("key=false"), "a public read carries no key: {seen:?}");
+    }
+
     /// A connection closed after the request was read, with no answer: the
     /// request is not sent again, and the failure is the caller's to type
     /// (uncertain).
@@ -2021,8 +2100,9 @@ mod tests {
     }
 
     /// A regression pin on what no test request can show: the answer helpers
-    /// build the single-shot transport for each request, with redirects and
-    /// retries off, and encode their values; neither uses the legacy client.
+    /// and the spot read helpers build the single-shot transport for each
+    /// request, with redirects and retries off, and encode their values; none
+    /// uses the legacy client.
     #[test]
     fn the_answer_helpers_keep_their_single_shot_transport() {
         let transport =
@@ -2036,12 +2116,17 @@ mod tests {
         for helper in [
             "    pub(crate) async fn post_signed_answer(",
             "    pub(crate) async fn delete_signed_answer(",
+            "    pub(crate) async fn get_signed_spot_answer(",
         ] {
             let text = function_text(helper);
             assert!(text.contains("let transport = single_shot()?;"), "{helper}");
             assert!(text.contains("self.build_signed_query(encoded(params))?"), "{helper}");
             assert!(!text.contains("self.client."), "{helper} uses the legacy client");
         }
+        let public = function_text("    pub(crate) async fn get_public_spot_answer(");
+        assert!(public.contains("let transport = single_shot()?;"));
+        assert!(public.contains("encoded(params)"));
+        assert!(!public.contains("self.client."), "the public spot read uses the legacy client");
     }
 
     /// The text of `signature`'s function in this file's code: from the
@@ -2076,6 +2161,10 @@ mod tests {
             ("    pub async fn place_spot_market_order(", PLACE_SPOT_MARKET_ORDER),
             ("    pub async fn universal_transfer(", UNIVERSAL_TRANSFER),
             ("    pub(crate) fn into_body(self)", INTO_BODY),
+            ("    async fn get_public(", GET_PUBLIC),
+            ("    pub(crate) async fn get_public_answer(", GET_PUBLIC_ANSWER),
+            ("    async fn get_signed(", GET_SIGNED),
+            ("    pub(crate) async fn get_signed_answer(", GET_SIGNED_ANSWER),
         ];
         for (signature, golden) in goldens {
             let digest = hex::encode(Sha256::digest(function_text(signature).as_bytes()));
@@ -2103,6 +2192,12 @@ mod tests {
         "78761690131b24103112698a9d622f8a5b95a3fc40b65ddecf30926ecfb762de";
     const UNIVERSAL_TRANSFER: &str =
         "5e8306a0edce2399f164bf6c54cf740e119326055e79765012a288e1c3f0f8af";
+    const GET_PUBLIC: &str = "5ecce25fc3d98046918702a9c677d71e99515b0a5ef43f8c8d6b1e00bb23e6f6";
+    const GET_PUBLIC_ANSWER: &str =
+        "fd42ba9918652d0305bb9151c06cb19046eb6a884f7377779aa412472b5e54d3";
+    const GET_SIGNED: &str = "9c9ee73e354ad47e56bb7daf99f400bf052f40edd39c6de9ccbe7636361f85c0";
+    const GET_SIGNED_ANSWER: &str =
+        "0f254014d2dfb05879b1da44d6fd026a92ec6fd32b1e6a2fface66097b4094ef";
     const INTO_BODY: &str = "f1cadf8028c136cfaa20dbd6ef1e6331c54faba2ce28eabc28ebe8fd0e47b4a0";
 
     /// With a permit a mutation goes out in every phase, uncounted.
