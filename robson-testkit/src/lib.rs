@@ -2,15 +2,22 @@
 //!
 //! Provides seeding helpers for tenant/account, event appending, and projection
 //! state; [`spot_book`], an in-memory spot balance account for venue tests;
-//! and [`balance_stub`], the spot venue's port contracts over it.
+//! [`balance_stub`], the spot venue's port contracts over it; and
+//! [`dependency_check`], which proves from `cargo metadata` that only
+//! dev-dependency edges reach this crate.
 
 pub mod balance_stub;
 #[cfg(test)]
 mod balance_stub_tests;
 pub mod daemon_process;
 pub mod db_proxy;
+pub mod dependency_check;
+#[cfg(test)]
+mod dependency_check_tests;
 pub mod fake_venue;
 mod helpers;
+#[cfg(test)]
+mod sd12_tests;
 pub mod spot_book;
 #[cfg(test)]
 mod spot_book_model_tests;

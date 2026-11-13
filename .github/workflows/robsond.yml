@@ -164,6 +164,19 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/robson_migration_ci
         run: cargo test -p robsond --features postgres,crash-points --test crash_harness --no-fail-fast -- --include-ignored --test-threads=2
 
+      # robson-testkit (fakes, stubs, the conformance suite) is test support:
+      # only dev-dependency edges may reach it, under any target or feature
+      # (ADR-0056 step 8, 8d plan §5.4). The earlier steps run cargo unlocked,
+      # so the lockfile is first compared with the commit; every target's
+      # packages are then fetched, because an unfiltered cargo metadata
+      # resolves them all; check-dev-only refuses empty or malformed input.
+      - name: Assert robson-testkit is reached by dev-dependencies only
+        run: |
+          set -euo pipefail
+          git diff --exit-code HEAD -- Cargo.lock
+          cargo fetch --locked
+          cargo metadata --offline --locked --format-version 1 | cargo run --locked -p robson-testkit --bin check-dev-only
+
       # Pinned, not rolling. rustfmt.toml enables unstable options
       # (wrap_comments, comment_width, normalize_comments,
       # format_code_in_doc_comments, imports_granularity, group_imports), whose
