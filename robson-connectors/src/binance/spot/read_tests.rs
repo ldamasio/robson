@@ -212,9 +212,7 @@ async fn an_unanswered_read_is_a_timeout_and_a_refused_connection_is_transport()
         Err(SpotReadError::Timeout)
     );
 
-    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
+    let url = stand_in::closing().await;
     let reader = SpotRestReader::new(Arc::new(BinanceRestClient::with_local_base_url(url)));
     assert!(matches!(reader.account().await, Err(SpotReadError::Transport(_))));
 }

@@ -422,7 +422,7 @@ async fn a_filled_market_order_is_its_record_fills_and_fee_total() {
     assert_eq!(back.evidence, result.evidence);
 }
 
-/// Every MARKET status (enums.md L45-L57; market orders FAQ L13-L19): only
+/// Every MARKET status (enums.md L45-L57; market orders FAQ L15-L19): only
 /// `FILLED` or `EXPIRED` with execution are results; `EXPIRED` with nothing
 /// executed is `ExpiredUnfilled`, never a rejection; everything else is
 /// uncertain. One request each, and the attempt stays unresolved.
@@ -587,11 +587,7 @@ async fn a_timeout_or_a_failed_transport_is_uncertain() {
     assert!(matches!(outcome, Err(ExecError::Timeout(_))), "{outcome:?}");
     assert!(unresolved(&venue, "x-1"));
 
-    // Nothing listens there any more.
-    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
-    let client = Arc::new(BinanceRestClient::with_local_base_url(url));
+    let client = Arc::new(BinanceRestClient::with_local_base_url(stand_in::closing().await));
     let venue = BinanceSpotAdapter::new(client).unwrap();
     let journal = spot_journal();
     venue.attach_order_journal(Arc::clone(&journal));

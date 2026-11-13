@@ -97,3 +97,19 @@ pub(super) async fn serve(
     });
     (Arc::new(BinanceRestClient::with_local_base_url(url)), seen)
 }
+
+/// A venue that takes each connection and closes it unanswered: a request to
+/// it fails in transport. It stays bound for the whole test, so no other
+/// test's stand-in can be given its port, as a dropped listener's port can
+/// be in a parallel test binary.
+pub(super) async fn closing() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        }
+    });
+    url
+}

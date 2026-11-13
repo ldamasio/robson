@@ -23,7 +23,7 @@ use tokio::{
     net::TcpListener,
 };
 
-use super::{BinanceSpotOhlcv, SpotRead};
+use super::{stand_in, BinanceSpotOhlcv, SpotRead};
 use crate::{binance::usdm::BinanceOhlcvAdapter, binance_rest::BinanceRestClient};
 
 const KLINES: &str = include_str!("testdata/klines.json");
@@ -309,11 +309,10 @@ async fn errors_map_as_the_usdm_klines_map_them() {
     assert_eq!(spot, usdm);
     assert!(spot.starts_with("Err(Config("), "{spot}");
 
-    // Nothing listens: the request fails before any answer. The messages name
-    // each adapter's own URL, so only the mapping is compared.
-    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
+    // The connection closes unanswered: the request fails before any answer.
+    // The messages name each adapter's own URL, so only the mapping is
+    // compared.
+    let url = stand_in::closing().await;
     let client = || Arc::new(BinanceRestClient::with_local_base_url(url.clone()));
     let interval = CandleInterval::OneHour;
     let spot_error = adapter(client()).fetch_candles(&btcusdt(), interval, 10).await.unwrap_err();

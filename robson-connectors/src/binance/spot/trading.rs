@@ -124,7 +124,7 @@ impl NewOrder<'_> {
     }
 }
 
-/// One fill of a `FULL` answer (rest-api.md L2265-L2300).
+/// One fill of a `FULL` answer (rest-api.md L2265-L2301).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SpotFill {
@@ -137,7 +137,7 @@ pub(super) struct SpotFill {
 
 /// A `RESULT` or `FULL` answer to `POST /api/v3/order` (rest-api.md
 /// L2222-L2302). A field both always show is required; `stopPrice` and
-/// `expiryReason` are conditional (L170-L196), `fills` is `FULL`'s.
+/// `expiryReason` are conditional (L170-L197), `fills` is `FULL`'s.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SpotOrderAnswer {
@@ -493,7 +493,7 @@ fn market_evidence(
 }
 
 /// A MARKET order's `FULL` answer (8c plan §4): `FILLED`, or `EXPIRED` with
-/// execution (market orders FAQ L13-L19), is the result of `executedQty`;
+/// execution (market orders FAQ L15-L19), is the result of `executedQty`;
 /// `EXPIRED` with nothing executed is [`ExecError::ExpiredUnfilled`]; every
 /// other status, `CANCELED`, `REJECTED` and `EXPIRED_IN_MATCH` included, is
 /// uncertain, for the caller's later lookup to resolve.
