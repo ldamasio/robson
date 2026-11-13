@@ -187,6 +187,17 @@ struct Answers {
     /// The command was refused: nothing may change.
     refused: bool,
     fills: Vec<BookTrade>,
+    /// The cases reached, each named only after its post-state was
+    /// asserted; credited once every other check has passed.
+    cases: Vec<&'static str>,
+}
+
+/// The order as the book holds it now, whatever its visibility.
+fn order_now(book: &SpotBook, id: u64) -> BookOrder {
+    book.all_orders()
+        .into_iter()
+        .find(|o| o.id == id)
+        .unwrap_or_else(|| panic!("order {id} is not retained"))
 }
 
 fn steps_of(m: &Market, steps: u64) -> Decimal {
@@ -336,7 +347,7 @@ fn run(
     match command.clone() {
         Command::Place { m, side, qty, trigger, script } => {
             let symbol = MARKETS[m].symbol;
-            if let Some(script) = script {
+            if let Some(script) = script.clone() {
                 book.script_next(script);
             }
             let placed = match trigger {
@@ -347,6 +358,8 @@ fn run(
                 Ok(placement) => {
                     let order = &placement.order;
                     assert_eq!(order.orig_qty, qty);
+                    assert_eq!(&order_now(book, order.id), order, "the answer is the stored order");
+                    assert!(!before.orders.contains_key(&order.id), "a new order");
                     let (orders, stops) = before.live(symbol);
                     assert!(orders < MARKETS[m].max_orders, "accepted under the order limit");
                     assert!(
@@ -355,27 +368,49 @@ fn run(
                     );
                     let filled: Decimal = placement.fills.iter().map(|f| f.qty).sum();
                     assert_eq!(filled, order.executed_qty, "the fills are the execution");
-                    model.hit(match (trigger, order.status) {
-                        (Some(_), _) => "stop placed",
-                        (None, BookStatus::Filled) => "market filled",
-                        (None, _) => "market expired by script",
-                    });
+                    let state = (order.status, order.executed_qty);
                     if let Some(trigger) = trigger {
-                        assert_eq!(order.status, BookStatus::New);
+                        assert_eq!(state, (BookStatus::New, Decimal::ZERO));
                         assert!(trigger < before.prices[m], "a stop rests only below the price");
+                        answers.cases.push("stop placed");
                     } else {
-                        assert!(order.status.is_terminal(), "a MARKET order ends at once");
-                        assert_eq!(order.status == BookStatus::Filled, order.executed_qty == qty);
+                        match script {
+                            Some(Script::ExpireUnfilled) => {
+                                assert_eq!(state, (BookStatus::Expired, Decimal::ZERO));
+                                answers.cases.push("market expired by script");
+                            },
+                            Some(Script::ExpirePartial(part)) => {
+                                assert_eq!(state, (BookStatus::Expired, part));
+                                answers.cases.push("market expired by script");
+                            },
+                            _ => {
+                                assert_eq!(state, (BookStatus::Filled, qty));
+                                answers.cases.push("market filled");
+                            },
+                        }
                     }
                     answers.fills = placement.fills;
                 },
                 Err(BookError::Lost) => {
+                    assert_eq!(script, Some(Script::Lost), "lost only when scripted");
                     // The book acted, or refused: whatever it did is read back.
-                    if let Ok(order) = book.order(symbol, OrderRef::Client(&client_id)) {
-                        answers.fills = book.trades(symbol, Some(order.id), Some(0), 1_000);
-                        model.hit("lost, applied");
-                    } else {
-                        model.hit("lost, refused");
+                    match book.order(symbol, OrderRef::Client(&client_id)) {
+                        Ok(order) => {
+                            assert!(!before.orders.contains_key(&order.id), "a new order");
+                            let state = (order.status, order.executed_qty);
+                            if trigger.is_some() {
+                                assert_eq!(state, (BookStatus::New, Decimal::ZERO));
+                            } else {
+                                assert_eq!(state, (BookStatus::Filled, qty));
+                            }
+                            answers.fills = book.trades(symbol, Some(order.id), Some(0), 1_000);
+                            answers.cases.push("lost, applied");
+                        },
+                        Err(BookError::NoSuchOrder) => {
+                            answers.refused = true;
+                            answers.cases.push("lost, refused");
+                        },
+                        Err(other) => panic!("a fresh order looked up as {other:?}"),
                     }
                 },
                 Err(BookError::Rejected { msg, .. }) => {
@@ -387,7 +422,7 @@ fn run(
                     if msg.contains("MAX_NUM_ALGO_ORDERS") {
                         assert_eq!(stops, MARKETS[m].max_stops, "refused only at the limit");
                     }
-                    model.hit(match msg.as_str() {
+                    answers.cases.push(match msg.as_str() {
                         "Account has insufficient balance for requested action." => {
                             "refused: insufficient balance"
                         },
@@ -405,27 +440,32 @@ fn run(
             Ok(trade) => {
                 assert!(qty > Decimal::ZERO, "a cross of {qty} was accepted");
                 assert_eq!(trade.qty, qty);
-                let rest = before.orders[&id].orig_qty - before.orders[&id].executed_qty;
-                model.hit(if qty == rest {
-                    "cross: filling"
+                let symbol = MARKETS.iter().position(|m| m.symbol == trade.symbol).unwrap();
+                assert_eq!(trade.price, before.prices[symbol]);
+                let (old, now) = (&before.orders[&id], order_now(book, id));
+                assert_eq!(now.executed_qty, old.executed_qty + qty);
+                assert_eq!(now.quote_qty, old.quote_qty + trade.quote_qty);
+                if qty == old.orig_qty - old.executed_qty {
+                    assert_eq!(now.status, BookStatus::Filled, "a cross of the rest fills");
+                    answers.cases.push("cross: filling");
                 } else {
-                    "cross: partial"
-                });
-                assert_eq!(
-                    trade.price,
-                    before.prices[MARKETS.iter().position(|m| m.symbol == trade.symbol).unwrap()]
-                );
+                    assert_eq!(now.status, BookStatus::PartiallyFilled);
+                    answers.cases.push("cross: partial");
+                }
                 answers.fills.push(trade);
             },
             Err(_) => {
-                model.hit("cross refused");
                 answers.refused = true;
+                answers.cases.push("cross refused");
             },
         },
         Command::Expire { id } => {
             answers.refused = !book.expire(id);
             if !answers.refused {
-                model.hit("expired");
+                let (old, now) = (&before.orders[&id], order_now(book, id));
+                assert!(!old.status.is_terminal());
+                assert_eq!((now.status, now.executed_qty), (BookStatus::Expired, old.executed_qty));
+                answers.cases.push("expired");
             }
         },
         Command::Cancel { m, id, delayed } => {
@@ -438,34 +478,47 @@ fn run(
             match book.cancel(symbol, id) {
                 Ok(order) => {
                     assert!(open && !delayed);
-                    assert_eq!(order.status, BookStatus::Canceled);
+                    let now = order_now(book, id);
+                    assert_eq!(order, now, "the answer is the stored order");
+                    let executed = before.orders[&id].executed_qty;
+                    assert_eq!((now.status, now.executed_qty), (BookStatus::Canceled, executed));
                     model.cancelled.insert(id);
-                    model.hit("cancel: immediate");
+                    answers.cases.push("cancel: immediate");
                 },
                 Err(BookError::Lost) => {
                     assert!(open && delayed);
+                    assert!(book.queued_cancels().contains(&id), "queued");
                     answers.refused = true;
-                    model.hit("cancel: queued");
+                    answers.cases.push("cancel: queued");
                 },
                 Err(BookError::NotOpen) => {
                     assert!(!open);
                     answers.refused = true;
-                    model.hit("cancel: not open");
+                    answers.cases.push("cancel: not open");
                 },
                 Err(other) => panic!("a cancel answered {other:?}"),
             }
         },
         Command::ApplyDelayed => {
-            for id in &before.queued {
-                let terminal = before.orders[id].status.is_terminal();
-                model.hit(if terminal {
-                    "delayed cancel overtaken"
-                } else {
-                    "delayed cancel applied"
-                });
-            }
-            book.apply_delayed_cancels();
+            let cancelled = book.apply_delayed_cancels();
             assert!(book.queued_cancels().is_empty());
+            let mut live = 0;
+            for (id, old) in &before.orders {
+                let now = order_now(book, *id);
+                let state = |o: &BookOrder| (o.status, o.executed_qty);
+                if !before.queued.contains(id) || old.status.is_terminal() {
+                    assert_eq!(state(&now), state(old), "order {id} untouched");
+                    if before.queued.contains(id) {
+                        answers.cases.push("delayed cancel overtaken");
+                    }
+                } else {
+                    let cancelled = (BookStatus::Canceled, old.executed_qty);
+                    assert_eq!(state(&now), cancelled, "queued order {id} cancelled");
+                    live += 1;
+                    answers.cases.push("delayed cancel applied");
+                }
+            }
+            assert_eq!(cancelled, live, "the count is the live orders cancelled");
         },
         Command::Price { m, price } => book.set_price(MARKETS[m].symbol, price),
         Command::Hide { id, hidden } => {
@@ -487,7 +540,21 @@ fn run(
         Command::Archive { id } => {
             answers.refused = !book.archive(id);
             if !answers.refused {
-                model.hit("archived");
+                let (old, now) = (&before.orders[&id], order_now(book, id));
+                assert!(matches!(old.status, BookStatus::Canceled | BookStatus::Expired));
+                assert!(old.executed_qty == Decimal::ZERO && !old.archived && now.archived);
+                let symbol = now.symbol.as_str();
+                let lookup = book.order(symbol, OrderRef::Id(id));
+                let hidden = !now.order_visible;
+                assert_eq!(
+                    lookup,
+                    Err(if hidden {
+                        BookError::NoSuchOrder
+                    } else {
+                        BookError::Archived
+                    })
+                );
+                answers.cases.push("archived");
             }
         },
         Command::Commission { amount } => {
@@ -508,6 +575,7 @@ fn check(
     after: &Snapshot,
     answers: &Answers,
 ) {
+    let mut credits = answers.cases.clone();
     // Balances: non-negative, locks exactly the live stops' rest, conserved.
     let mut locks: BTreeMap<&str, Decimal> = BTreeMap::new();
     for order in after.orders.values() {
@@ -517,7 +585,10 @@ fn check(
         );
         match order.status {
             BookStatus::New => assert_eq!(order.executed_qty, Decimal::ZERO),
-            BookStatus::PartiallyFilled => assert!(order.executed_qty > Decimal::ZERO),
+            BookStatus::PartiallyFilled => assert!(
+                order.executed_qty > Decimal::ZERO && order.executed_qty < order.orig_qty,
+                "{order:?}"
+            ),
             BookStatus::Filled => assert_eq!(order.executed_qty, order.orig_qty),
             BookStatus::Canceled | BookStatus::Expired => {},
         }
@@ -590,7 +661,7 @@ fn check(
                 };
                 assert_eq!(*unlocked, rest, "order {order_id} released {unlocked}, not its rest");
                 if rest > Decimal::ZERO && order.executed_qty > Decimal::ZERO {
-                    model.hit("release of a partial stop");
+                    credits.push("release of a partial stop");
                 }
                 if *status == BookStatus::Canceled {
                     model.cancelled.insert(*order_id);
@@ -628,18 +699,31 @@ fn check(
             Side::Sell => (QUOTE.to_string(), fill.quote_qty * FEE),
         };
         let charged = (fill.commission_asset.clone(), fill.commission);
+        let from_lock = matches!(after.orders[&fill.order_id].kind, OrderKind::StopLoss { .. });
         match model.commissions.pop_front() {
             Some(scripted) => {
-                assert!(charged == scripted || charged == default, "{charged:?}");
-                model.hit(if charged == scripted {
-                    "commission: scripted"
+                // The script applies when its asset's free, after this
+                // fill's own transfers, covers it.
+                let asset = scripted.0.as_str();
+                let own = match fill.side {
+                    _ if asset != m.base && asset != QUOTE => Decimal::ZERO,
+                    Side::Buy if asset == QUOTE => -fill.quote_qty,
+                    Side::Buy => fill.qty,
+                    Side::Sell if asset == QUOTE => fill.quote_qty,
+                    Side::Sell if from_lock => Decimal::ZERO,
+                    Side::Sell => -fill.qty,
+                };
+                let covered = before.balances[asset].0 + own >= scripted.1;
+                if covered {
+                    assert_eq!(charged, scripted, "the scripted commission, covered");
+                    credits.push("commission: scripted");
                 } else {
-                    "commission: fallen back"
-                });
+                    assert_eq!(charged, default, "the default commission, not covered");
+                    credits.push("commission: fallen back");
+                }
             },
             None => assert_eq!(charged, default, "the default commission"),
         }
-        let from_lock = matches!(after.orders[&fill.order_id].kind, OrderKind::StopLoss { .. });
         match fill.side {
             Side::Buy => {
                 entry(QUOTE, -fill.quote_qty, Decimal::ZERO);
@@ -665,6 +749,10 @@ fn check(
             (df, dl),
             "{asset} moved by exactly the fills, locks and releases"
         );
+    }
+    // Every check passed: the cases count as reached.
+    for case in credits {
+        model.hit(case);
     }
 }
 
