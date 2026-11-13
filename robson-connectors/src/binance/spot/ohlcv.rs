@@ -2,10 +2,11 @@
 //!
 //! The spot counterpart of `usdm::ohlcv`: one public, unsigned
 //! [`SpotRead::KLINES`] through the shared REST client, whose path rule sends
-//! `/api/v3/` to the spot host. The spot response has the futures layout at
-//! the indices the shared kline parser reads, so the rows go through it, and
-//! errors map as `BinanceOhlcvAdapter` maps them. No production path
-//! constructs [`BinanceSpotOhlcv`] yet (SD12; `inertness_tests.rs`).
+//! `/api/v3/` to the spot host; since 8c-3 on its spot read helper, values
+//! encoded and one request with no redirect or retry. The spot response has the
+//! futures layout at the indices the shared kline parser reads, so the rows go
+//! through it, and errors map as `BinanceOhlcvAdapter` maps them. No production
+//! path constructs [`BinanceSpotOhlcv`] yet (SD12; `inertness_tests.rs`).
 //!
 //! Venue facts, `rest-api.md` at `995f6eb3` (F25):
 //! - `GET /api/v3/klines`, weight 2 (L1273-L1281), with no security type, so
@@ -98,7 +99,7 @@ impl OhlcvPort for BinanceSpotOhlcv {
         ];
         let klines = self
             .client
-            .get_public_answer(SpotRead::KLINES.path, params)
+            .get_public_spot_answer(SpotRead::KLINES.path, params)
             .await
             .and_then(|answer| answer.into_body())
             .and_then(|body| parse_futures_klines(&body))

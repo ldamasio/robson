@@ -86,8 +86,9 @@ pub struct SpotOrderRecord {
     pub expiry_reason: Option<String>,
 }
 
-/// `cummulativeQuoteQty`, required, with a negative value read as unknown.
-fn known_quote_qty<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+/// `cummulativeQuoteQty`, required, with a negative value read as unknown
+/// (here and in an order's placement answer, 8c-3).
+pub(super) fn known_quote_qty<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
 where
     D: Deserializer<'de>,
 {

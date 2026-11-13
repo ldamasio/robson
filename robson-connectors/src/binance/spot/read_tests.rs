@@ -212,9 +212,7 @@ async fn an_unanswered_read_is_a_timeout_and_a_refused_connection_is_transport()
         Err(SpotReadError::Timeout)
     );
 
-    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
+    let url = stand_in::closing().await;
     let reader = SpotRestReader::new(Arc::new(BinanceRestClient::with_local_base_url(url)));
     assert!(matches!(reader.account().await, Err(SpotReadError::Transport(_))));
 }
@@ -344,6 +342,8 @@ fn without_from_id_or_a_time_the_venue_answers_the_most_recent_trades() {
         path: "/api/v3/myTrades".to_string(),
         params: params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         api_key: true,
+        query: String::new(),
+        signature_valid: true,
     };
     let first_and_last = |params: &[(&str, &str)]| {
         let page: Vec<Value> = serde_json::from_str(&answer(&request(params)).1).unwrap();

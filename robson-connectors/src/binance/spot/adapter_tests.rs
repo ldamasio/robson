@@ -11,8 +11,8 @@ use robson_exec::{
         StubJournalBackend, DEFAULT_ACCOUNT_SCOPE,
     },
     venue::{
-        capability_mismatches, AccountKind, AccountPort, EntryOrReduce, InventoryPort, MarketKind,
-        OrderLookup, OrderObservation, OrderPhase, OrderRef, ProtectionKind, ReplacementProtocol,
+        capability_mismatches, AccountKind, AccountPort, InventoryPort, MarketKind, OrderLookup,
+        OrderObservation, OrderPhase, OrderRef, ProtectionKind, ReplacementProtocol,
         SettlementPort, StopParams, StopRef, TradingPort, Venue, VenueId,
     },
     ExecError,
@@ -96,10 +96,11 @@ fn a_testnet_client_is_refused() {
     assert!(matches!(BinanceSpotAdapter::new(client), Err(ExecError::Config(_))));
 }
 
-/// Every order-sending method, and every read a later step owns, refuses
-/// with `Config` and sends nothing.
+/// Every method that cancels or replaces an order (8c-3b), and every read a
+/// later step owns, refuses with `Config` and sends nothing. Placement is
+/// `trading_tests.rs`'.
 #[tokio::test]
-async fn every_mutation_and_every_later_read_is_refused_with_no_request() {
+async fn every_cancel_and_every_later_read_is_refused_with_no_request() {
     let (venue, seen) = answering(200, "{}").await;
     let btc = symbol("BTCUSDT");
     let qty = Quantity::new(dec!(0.001)).unwrap();
@@ -112,20 +113,6 @@ async fn every_mutation_and_every_later_read_is_refused_with_no_request() {
         client_order_id: "ins-1".to_string(),
     };
     let mut refusals: Vec<(&str, ExecError)> = vec![
-        (
-            "place_market_order",
-            venue
-                .place_market_order(&btc, OrderSide::Buy, qty, "e-1", EntryOrReduce::Entry)
-                .await
-                .unwrap_err(),
-        ),
-        (
-            "place_protection",
-            venue
-                .place_protection(&btc, OrderSide::Sell, qty, price, "ins-1")
-                .await
-                .unwrap_err(),
-        ),
         ("cancel_protection", venue.cancel_protection(&btc, &stop).await.unwrap_err()),
         (
             "replace_protection",

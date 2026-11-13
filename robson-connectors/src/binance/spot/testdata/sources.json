@@ -39,7 +39,7 @@
     "errors.json": {
       "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/errors.md",
       "accessed": "2026-11-10",
-      "how": "Error bodies in Binance's documented shape (https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L145-L155): -2013 errors.md#L435 (body as in CHANGELOG.md#L2164-L2167), -2026 errors.md#L451 (body as in CHANGELOG.md#L2173-L2176), -1007 errors.md#L39, -1000 errors.md#L15, -1121 errors.md#L177, -1003 errors.md#L27 with the template filled from the live REQUEST_WEIGHT limit. html_page is constructed: Binance documents no body for a non-JSON answer. Binance does not pair codes with HTTP statuses beyond rest-api.md#L132-L143, so each test chooses the status and says so"
+      "how": "Error bodies in Binance's documented shape (https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L145-L155): -2013 errors.md#L435 (body as in CHANGELOG.md#L2164-L2167), -2026 errors.md#L451 (body as in CHANGELOG.md#L2173-L2176), -1007 errors.md#L39, -1000 errors.md#L15, -1121 errors.md#L177, -1003 errors.md#L27 with the template filled from the live REQUEST_WEIGHT limit. html_page is constructed: Binance documents no body for a non-JSON answer. Binance does not pair codes with HTTP statuses beyond rest-api.md#L132-L143, so each test chooses the status and says so. Order placement (ADR-0056 step 8c-3): -2010 errors.md#L427 with the messages of errors.md#L485 (\"Duplicate order sent.\"), #L487 (insufficient balance) and #L500 (\"Order would trigger immediately.\"); -1013 errors.md#L47 with the filter failure of errors.md#L546; -1006 errors.md#L35"
     },
     "reads.json": {
       "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md",
@@ -70,6 +70,16 @@
       "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L1776-L1782",
       "accessed": "2026-11-13",
       "how": "The documented single-symbol response of GET /api/v3/ticker/price"
+    },
+    "order_result.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L2225-L2242",
+      "accessed": "2026-11-13",
+      "how": "The documented RESULT response of POST /api/v3/order, comments removed. Tests derive each placement answer from it, changing only the fields the case names; such a derived answer is constructed, not a venue answer"
+    },
+    "order_full.json": {
+      "source": "https://github.com/binance/binance-spot-api-docs/blob/995f6eb39dda0ccba328247ed7087fa7e5b9c5dd/rest-api.md#L2248-L2302",
+      "accessed": "2026-11-13",
+      "how": "The documented FULL response of POST /api/v3/order, comments removed. It is incoherent: cummulativeQuoteQty is 10 while its fills' price x qty sum to 39983, so as given it is only a parse fixture and the conflicting case (8c plan §5). Coherent answers are constructed from it: cummulativeQuoteQty set to the fills' sum, and the request's symbol, side, quantity, client id and STP mode echoed"
     }
   },
   "facts": {

@@ -368,6 +368,86 @@ impl BinanceRestClient {
             .await
     }
 
+    /// A signed spot read whose answer comes back whatever its HTTP status
+    /// (ADR-0056 step 8c-3), for 8a's reader. Like the answer helpers below:
+    /// every value percent-encoded before signing ([`percent_encoded`]), so
+    /// the signature covers the query as sent (spot `rest-api.md`
+    /// L344-L345, L388-L417), and one request on the [`single_shot`]
+    /// transport, with no redirect followed and nothing retried. A read: it
+    /// does not pass the mutation gate. [`Self::get_signed_answer`], which
+    /// signs raw values and follows redirects, stays as it is for USD-M.
+    pub(crate) async fn get_signed_spot_answer(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<RestAnswer, BinanceRestError> {
+        let transport = single_shot()?;
+        let query = self.build_signed_query(encoded(params))?;
+        let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
+
+        self.answer(transport.get(&url).header("X-MBX-APIKEY", &self.api_key)).await
+    }
+
+    /// [`Self::get_signed_spot_answer`] for a public spot read: values
+    /// encoded, no key, one request on the [`single_shot`] transport.
+    /// [`Self::get_public_answer`] stays as it is for USD-M.
+    pub(crate) async fn get_public_spot_answer(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<RestAnswer, BinanceRestError> {
+        let transport = single_shot()?;
+        let query: Vec<String> =
+            encoded(params).iter().map(|(name, value)| format!("{name}={value}")).collect();
+        let url = if query.is_empty() {
+            format!("{}{}", self.endpoint_base_url(endpoint), endpoint)
+        } else {
+            format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query.join("&"))
+        };
+
+        self.answer(transport.get(&url)).await
+    }
+
+    /// A signed POST whose answer comes back whatever its HTTP status: a venue
+    /// mutation for a caller that types the venue's answers itself (the spot
+    /// order path, ADR-0056 step 8c-3). It passes the gate first, as
+    /// [`Self::post_signed`] does, and keeps the status: what a status or a
+    /// code proves is the caller's.
+    ///
+    /// Exactly one HTTP request leaves, on its own connection: the
+    /// [`single_shot`] transport follows no redirect and retries nothing, so a
+    /// 3xx is the answer. Every parameter value is percent-encoded before
+    /// signing ([`percent_encoded`]), so no value can add a parameter.
+    pub(crate) async fn post_signed_answer(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<RestAnswer, BinanceRestError> {
+        let transport = single_shot()?;
+        self.pass_gate("POST", endpoint)?;
+        let query = self.build_signed_query(encoded(params))?;
+        let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
+
+        self.answer(transport.post(&url).header("X-MBX-APIKEY", &self.api_key)).await
+    }
+
+    /// [`Self::post_signed_answer`] for DELETE: gated, signed with encoded
+    /// values, the status kept, one request on the [`single_shot`] transport.
+    // The spot cancel (8c-3b) uses it; until then only its tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn delete_signed_answer(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<RestAnswer, BinanceRestError> {
+        let transport = single_shot()?;
+        self.pass_gate("DELETE", endpoint)?;
+        let query = self.build_signed_query(encoded(params))?;
+        let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
+
+        self.answer(transport.delete(&url).header("X-MBX-APIKEY", &self.api_key)).await
+    }
+
     // =========================================================================
     // Futures Position API
     // =========================================================================
@@ -994,6 +1074,67 @@ impl BinanceRestClient {
 }
 
 // =============================================================================
+// The answer helpers' transport and encoding (ADR-0056 step 8c-3)
+// =============================================================================
+
+/// The transport of the answer helpers, a fresh client for each request: one
+/// request on the wire, never repeated beneath the caller's ledger and gate.
+///
+/// The legacy client, `Client::new()`, keeps reqwest 0.12.28's defaults
+/// (vendored source, `async_impl/client.rs` L2482-L2484), which a mutation
+/// cannot have:
+/// - redirects followed, up to ten (`redirect.rs` L160-L165). On a 307 or 308
+///   tower-http 0.6.8 sends the same method again to `Location`
+///   (`follow_redirect/mod.rs` L272-L292, L315-L327); a 301 or 302 turns a POST
+///   into a GET and a 303 anything into a GET. The headers go along,
+///   `X-MBX-APIKEY` included even to another host (`redirect.rs` L239-L251
+///   strips only `Authorization`, cookies and proxy credentials), and the
+///   caller sees only the last answer's status;
+/// - protocol NACKs retried, up to twice (`retry.rs` L192-L200, L270-L315: an
+///   HTTP/2 GOAWAY or REFUSED_STREAM).
+///
+/// Here no redirect is followed (`redirect::Policy::none()`, `redirect.rs`
+/// L57-L62; `async_impl/client.rs` L1383-L1386) and nothing is retried
+/// (`retry::never()`, `retry.rs` L81-L87; `async_impl/client.rs`
+/// L1402-L1405). hyper-util 0.1.19 resends a request only when it never
+/// started on a reused connection (`client/legacy/client.rs` L249-L273); a
+/// client built for one request has no connection to reuse. A client that
+/// cannot be built sends nothing: `Refused`.
+fn single_shot() -> Result<Client, BinanceRestError> {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+        .map_err(|error| {
+            BinanceRestError::Refused(format!("no single-shot transport, nothing sent: {error}"))
+        })
+}
+
+/// `value` percent-encoded, byte by byte of its UTF-8, outside RFC 3986's
+/// unreserved set: ASCII letters, digits and `-._~`. Binance signs and reads
+/// the encoded query (spot `rest-api.md` L344-L345, L388-L417): `&`, `=`,
+/// `%`, `+`, space, `#` or a non-ASCII character in a value stay inside that
+/// value. Unreserved values, every value Robson sends today, are unchanged.
+fn percent_encoded(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn encoded(params: Vec<(&str, String)>) -> Vec<(&str, String)> {
+    params
+        .into_iter()
+        .map(|(name, value)| (name, percent_encoded(&value)))
+        .collect()
+}
+
+// =============================================================================
 // Binance Types (from API responses)
 // =============================================================================
 
@@ -1576,7 +1717,10 @@ fn harness_origin(base_url: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
 
     use robson_exec::{gate::OperationKind, order_journal::OrderJournal};
     use rust_decimal_macros::dec;
@@ -1697,6 +1841,364 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 2, "nothing refused reached the venue");
         assert_eq!(journal.gate().snapshot().unpermitted, 1);
     }
+
+    /// A venue answering every request with `status` and `body`, recording
+    /// each request's first line and whether it carried the API key.
+    async fn answering(status: u16, body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let first = head.lines().next().unwrap_or_default().to_string();
+                let keyed = head.contains("\r\nx-mbx-apikey: key");
+                recorded.lock().unwrap().push(format!("{first} key={keyed}"));
+                let answer = format!(
+                    "HTTP/1.1 {status} Answer\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(answer.as_bytes()).await;
+            }
+        });
+        (url, seen)
+    }
+
+    /// The answer helpers (ADR-0056 step 8c-3) send one signed request each,
+    /// with the key, and return every status as given: a 201 is not folded
+    /// into success, a 400 or a 503 not into an error. What each means is
+    /// the caller's.
+    #[tokio::test]
+    async fn the_answer_helpers_keep_every_status() {
+        let error =
+            r#"{"code":-2010,"msg":"Account has insufficient balance for requested action."}"#;
+        for (status, body) in [
+            (200, "{}"),
+            (201, "{}"),
+            (204, ""),
+            (400, error),
+            (503, "busy"),
+        ] {
+            let (url, seen) = answering(status, body).await;
+            let client = BinanceRestClient::with_local_base_url(url);
+            let posted =
+                client.post_signed_answer("/api/v3/order", vec![("symbol", "BTCUSDT".into())]);
+            let posted = posted.await.unwrap();
+            assert_eq!((posted.status.as_u16(), posted.body.as_str()), (status, body));
+            let deleted =
+                client.delete_signed_answer("/api/v3/order", vec![("orderId", "7".into())]);
+            let deleted = deleted.await.unwrap();
+            assert_eq!((deleted.status.as_u16(), deleted.body.as_str()), (status, body));
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert!(
+                seen[0].starts_with("post /api/v3/order?symbol=btcusdt&timestamp="),
+                "{seen:?}"
+            );
+            assert!(seen[1].starts_with("delete /api/v3/order?orderid=7&timestamp="), "{seen:?}");
+            for request in &seen {
+                assert!(request.contains("&signature=") && request.ends_with("key=true"));
+            }
+        }
+    }
+
+    /// The answer helpers pass the gate as the existing mutations do: refused
+    /// before anything is sent once the daemon is stopping.
+    #[tokio::test]
+    async fn the_answer_helpers_pass_the_gate() {
+        let (url, seen) = answering(200, "{}").await;
+        let client = BinanceRestClient::with_local_base_url(url);
+        let journal = Arc::new(OrderJournal::unpersisted());
+        client.attach_gate(Arc::clone(journal.gate()));
+        journal.gate().begin_draining();
+        let posted = client.post_signed_answer("/api/v3/order", vec![]).await;
+        assert!(matches!(posted, Err(BinanceRestError::Refused(_))), "{:?}", posted.is_ok());
+        let deleted = client.delete_signed_answer("/api/v3/order", vec![]).await;
+        assert!(matches!(deleted, Err(BinanceRestError::Refused(_))), "{:?}", deleted.is_ok());
+        assert!(seen.lock().unwrap().is_empty(), "nothing refused reached the venue");
+    }
+
+    /// A listener counting the requests it reads, answering each with
+    /// `status` and, when given, a `Location`.
+    async fn counting(status: u16, location: Option<String>) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                let location =
+                    location.as_ref().map(|to| format!("Location: {to}\r\n")).unwrap_or_default();
+                let answer = format!(
+                    "HTTP/1.1 {status} Answer\r\n{location}Content-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(answer.as_bytes()).await;
+            }
+        });
+        (url, requests)
+    }
+
+    /// No redirect is followed: a 301, 302, 303, 307 or 308 with a real
+    /// `Location` is the answer, as given, and nothing reaches the place it
+    /// points to. One request, POST and DELETE alike.
+    #[tokio::test]
+    async fn the_answer_helpers_follow_no_redirect() {
+        for status in [301, 302, 303, 307, 308] {
+            let (elsewhere, followed) = counting(200, None).await;
+            let location = format!("{elsewhere}/api/v3/order?symbol=BTCUSDT");
+            let (url, requests) = counting(status, Some(location)).await;
+            let client = BinanceRestClient::with_local_base_url(url);
+            let posted = client.post_signed_answer("/api/v3/order", vec![]).await.unwrap();
+            assert_eq!(posted.status.as_u16(), status);
+            let deleted = client.delete_signed_answer("/api/v3/order", vec![]).await.unwrap();
+            assert_eq!(deleted.status.as_u16(), status);
+            assert_eq!(requests.load(Ordering::SeqCst), 2, "{status}: one request each");
+            assert_eq!(followed.load(Ordering::SeqCst), 0, "{status}: nothing followed");
+        }
+    }
+
+    /// The spot read helpers follow no redirect either: a 3xx is the answer,
+    /// one request, and nothing (the key included) reaches the place
+    /// `Location` points to. Their values are encoded as the answer helpers'.
+    #[tokio::test]
+    async fn the_spot_read_helpers_follow_no_redirect_and_encode_their_values() {
+        for status in [301, 302, 303, 307, 308] {
+            let (elsewhere, followed) = counting(200, None).await;
+            let location = format!("{elsewhere}/api/v3/order?symbol=BTCUSDT");
+            let (url, requests) = counting(status, Some(location)).await;
+            let client = BinanceRestClient::with_local_base_url(url);
+            let signed = client.get_signed_spot_answer("/api/v3/order", vec![]).await.unwrap();
+            assert_eq!(signed.status.as_u16(), status);
+            let public = client.get_public_spot_answer("/api/v3/ping", vec![]).await.unwrap();
+            assert_eq!(public.status.as_u16(), status);
+            assert_eq!(requests.load(Ordering::SeqCst), 2, "{status}: one request each");
+            assert_eq!(followed.load(Ordering::SeqCst), 0, "{status}: nothing followed");
+        }
+        let (url, seen) = answering(200, "{}").await;
+        let client = BinanceRestClient::with_local_base_url(url);
+        let params = vec![("symbol", "１２３USDT&a=b".to_string())];
+        client.get_signed_spot_answer("/api/v3/order", params.clone()).await.unwrap();
+        client.get_public_spot_answer("/api/v3/exchangeInfo", params).await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen[0].starts_with(
+                "get /api/v3/order?symbol=%ef%bc%91%ef%bc%92%ef%bc%93usdt%26a%3db&timestamp="
+            ),
+            "{seen:?}"
+        );
+        assert!(seen[0].contains("&signature=") && seen[0].ends_with("key=true"), "{seen:?}");
+        assert!(
+            seen[1].starts_with(
+                "get /api/v3/exchangeinfo?symbol=%ef%bc%91%ef%bc%92%ef%bc%93usdt%26a%3db http"
+            ),
+            "{seen:?}"
+        );
+        assert!(seen[1].ends_with("key=false"), "a public read carries no key: {seen:?}");
+    }
+
+    /// A connection closed after the request was read, with no answer: the
+    /// request is not sent again, and the failure is the caller's to type
+    /// (uncertain).
+    #[tokio::test]
+    async fn the_answer_helpers_send_nothing_again_after_a_reset() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let client = BinanceRestClient::with_local_base_url(url);
+        let posted = client.post_signed_answer("/api/v3/order", vec![]).await;
+        assert!(matches!(posted, Err(BinanceRestError::RequestFailed(_))), "{:?}", posted.err());
+        let deleted = client.delete_signed_answer("/api/v3/order", vec![]).await;
+        assert!(
+            matches!(deleted, Err(BinanceRestError::RequestFailed(_))),
+            "{:?}",
+            deleted.err()
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "one request each, none sent again");
+    }
+
+    /// Every value is percent-encoded before signing: a reserved character
+    /// stays inside its value and adds no parameter; unreserved values go as
+    /// they are.
+    #[tokio::test]
+    async fn the_answer_helpers_encode_every_value() {
+        assert_eq!(percent_encoded("ins-0189_ABC.z~9"), "ins-0189_ABC.z~9");
+        assert_eq!(percent_encoded("x&recvWindow=5000"), "x%26recvWindow%3D5000");
+        assert_eq!(percent_encoded("50% +#"), "50%25%20%2B%23");
+        assert_eq!(percent_encoded("１"), "%EF%BC%91");
+        let (url, seen) = answering(200, "{}").await;
+        let client = BinanceRestClient::with_local_base_url(url);
+        let params = vec![("newClientOrderId", "x&recvWindow=5000".to_string())];
+        client.post_signed_answer("/api/v3/order", params).await.unwrap();
+        let params = vec![("symbol", "１２３USDT&a=b".to_string())];
+        client.delete_signed_answer("/api/v3/order", params).await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen[0].starts_with(
+                "post /api/v3/order?newclientorderid=x%26recvwindow%3d5000&timestamp="
+            ),
+            "{seen:?}"
+        );
+        assert!(
+            seen[1].starts_with(
+                "delete /api/v3/order?symbol=%ef%bc%91%ef%bc%92%ef%bc%93usdt%26a%3db&timestamp="
+            ),
+            "{seen:?}"
+        );
+        for request in &seen {
+            let query = request.split_once('?').unwrap().1.split_once(' ').unwrap().0;
+            assert_eq!(query.matches('&').count(), 2, "three parameters only: {request}");
+        }
+    }
+
+    /// The text of a free function of this file, from its signature to the
+    /// end of its body.
+    fn free_function_text(signature: &str) -> &'static str {
+        let source = include_str!("binance_rest.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        assert_eq!(code.matches(signature).count(), 1, "{signature}");
+        let start = code.find(signature).unwrap();
+        let end = start + code[start..].find("\n}\n").unwrap() + "\n}\n".len();
+        &code[start..end]
+    }
+
+    /// A regression pin on what no test request can show: the answer helpers
+    /// and the spot read helpers build the single-shot transport for each
+    /// request, with redirects and retries off, and encode their values; none
+    /// uses the legacy client.
+    #[test]
+    fn the_answer_helpers_keep_their_single_shot_transport() {
+        let transport =
+            free_function_text("fn single_shot() -> Result<Client, BinanceRestError> {");
+        for setting in [
+            ".redirect(reqwest::redirect::Policy::none())",
+            ".retry(reqwest::retry::never())",
+        ] {
+            assert!(transport.contains(setting), "{setting}");
+        }
+        for helper in [
+            "    pub(crate) async fn post_signed_answer(",
+            "    pub(crate) async fn delete_signed_answer(",
+            "    pub(crate) async fn get_signed_spot_answer(",
+        ] {
+            let text = function_text(helper);
+            assert!(text.contains("let transport = single_shot()?;"), "{helper}");
+            assert!(text.contains("self.build_signed_query(encoded(params))?"), "{helper}");
+            assert!(!text.contains("self.client."), "{helper} uses the legacy client");
+        }
+        let public = function_text("    pub(crate) async fn get_public_spot_answer(");
+        assert!(public.contains("let transport = single_shot()?;"));
+        assert!(public.contains("encoded(params)"));
+        assert!(!public.contains("self.client."), "the public spot read uses the legacy client");
+    }
+
+    /// The text of `signature`'s function in this file's code: from the
+    /// signature to the end of its body.
+    fn function_text(signature: &str) -> &'static str {
+        let source = include_str!("binance_rest.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        assert_eq!(code.matches(signature).count(), 1, "{signature}");
+        let start = code.find(signature).unwrap();
+        let end = start + code[start..].find("\n    }\n").unwrap() + "\n    }\n".len();
+        &code[start..end]
+    }
+
+    /// ADR-0056 step 8c-3: the existing signed path and every mutation that
+    /// rides on it stay as they were on main (`804d9f77`), byte for byte. The
+    /// spot order path has its own helpers; nothing here changed for it.
+    #[test]
+    fn the_existing_mutation_paths_are_byte_identical() {
+        use sha2::{Digest, Sha256};
+        let goldens = [
+            ("    fn build_signed_query(", BUILD_SIGNED_QUERY),
+            ("    async fn answer(&self, request: RequestBuilder)", ANSWER),
+            ("    async fn exchange(&self, request: RequestBuilder)", EXCHANGE),
+            ("    fn pass_gate(&self, method: &str, endpoint: &str)", PASS_GATE),
+            ("    async fn post_signed(", POST_SIGNED),
+            ("    async fn delete_signed(", DELETE_SIGNED),
+            ("    pub async fn place_market_order(", PLACE_MARKET_ORDER),
+            ("    pub async fn place_stop_market_order(", PLACE_STOP_MARKET_ORDER),
+            ("    pub async fn cancel_algo_order(", CANCEL_ALGO_ORDER),
+            ("    pub async fn cancel_order(", CANCEL_ORDER),
+            ("    pub async fn set_leverage(", SET_LEVERAGE),
+            ("    pub async fn place_spot_market_order(", PLACE_SPOT_MARKET_ORDER),
+            ("    pub async fn universal_transfer(", UNIVERSAL_TRANSFER),
+            ("    pub(crate) fn into_body(self)", INTO_BODY),
+            ("    async fn get_public(", GET_PUBLIC),
+            ("    pub(crate) async fn get_public_answer(", GET_PUBLIC_ANSWER),
+            ("    async fn get_signed(", GET_SIGNED),
+            ("    pub(crate) async fn get_signed_answer(", GET_SIGNED_ANSWER),
+        ];
+        for (signature, golden) in goldens {
+            let digest = hex::encode(Sha256::digest(function_text(signature).as_bytes()));
+            assert_eq!(digest, golden, "{signature} changed");
+        }
+    }
+
+    // SHA-256 of each function's text on main `804d9f77`.
+    const BUILD_SIGNED_QUERY: &str =
+        "a24ec84cf42cb1efc538b51ac641ce87a442a73a172c13c17d63233a7f8c0e49";
+    const ANSWER: &str = "e729aa32488feb26eb5806e0904e1919770b428ded1932cf129a1cdd0be5b395";
+    const EXCHANGE: &str = "2e8a9e5b5006973f68e81cc00229ec7530efeec2a09ce8ebee1a8ac7d8a0f1de";
+    const PASS_GATE: &str = "2ea2a680e732990eca8d3b5996733712da5ed39b7d2cfdbe6123242b476cb255";
+    const POST_SIGNED: &str = "b9486f707447e82c75eae5adb5ac352a8627dab8a74d09e00a63195cd186f663";
+    const DELETE_SIGNED: &str = "b7c35696d974ef3b56f81e338ba92fc4e1ac3dcb28cbd63b1c6a16938bd9c0e1";
+    const PLACE_MARKET_ORDER: &str =
+        "2ea266ab2a74cc8a069b0d32e94e8d28ea80183845d722df89af93d31544cf2a";
+    const PLACE_STOP_MARKET_ORDER: &str =
+        "f50a83b9cd80708e4def55f48dad5e61ef58fa3abd30ef48089672b5ef8df6c4";
+    const CANCEL_ALGO_ORDER: &str =
+        "9b0e2a8dc8f6210f34764f06c436822f79009a58cb7b95bbae27ef9f2f0e650e";
+    const CANCEL_ORDER: &str = "3e4d5ca8aaa56a369b7aec9f9e25c0a15bfb3a3cdd6454b978c15793c0fd147c";
+    const SET_LEVERAGE: &str = "7a0dbf578c571d0366c02ba6c059d86721a010e820f4f95f2376dc814dcd0a47";
+    const PLACE_SPOT_MARKET_ORDER: &str =
+        "78761690131b24103112698a9d622f8a5b95a3fc40b65ddecf30926ecfb762de";
+    const UNIVERSAL_TRANSFER: &str =
+        "5e8306a0edce2399f164bf6c54cf740e119326055e79765012a288e1c3f0f8af";
+    const GET_PUBLIC: &str = "5ecce25fc3d98046918702a9c677d71e99515b0a5ef43f8c8d6b1e00bb23e6f6";
+    const GET_PUBLIC_ANSWER: &str =
+        "fd42ba9918652d0305bb9151c06cb19046eb6a884f7377779aa412472b5e54d3";
+    const GET_SIGNED: &str = "9c9ee73e354ad47e56bb7daf99f400bf052f40edd39c6de9ccbe7636361f85c0";
+    const GET_SIGNED_ANSWER: &str =
+        "0f254014d2dfb05879b1da44d6fd026a92ec6fd32b1e6a2fface66097b4094ef";
+    const INTO_BODY: &str = "f1cadf8028c136cfaa20dbd6ef1e6331c54faba2ce28eabc28ebe8fd0e47b4a0";
 
     /// With a permit a mutation goes out in every phase, uncounted.
     #[tokio::test]
