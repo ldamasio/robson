@@ -360,7 +360,12 @@ async fn cycle(book: &Arc<SpotBook>, baseline: usize) -> Result<Duration, String
     if served.status() != 200 {
         return Err(format!("the ping answered {}", served.status()));
     }
-    drop(served);
+    // The body read whole, so the connection is idle in the pool, not
+    // closing on an unread body.
+    let body = bounded("the ping's body", served.text()).await?.map_err(|e| e.to_string())?;
+    if body != "{}" {
+        return Err(format!("the ping's body is {body}"));
+    }
     venue.hold_next(Method::GET, "/api/v3/ping");
     let held = client();
     let target = format!("{url}/api/v3/ping");
@@ -447,4 +452,161 @@ fn cleanup_profile_200_cycles() {
         assert_eq!(Handle::current().metrics().num_alive_tasks(), baseline);
         assert_eq!(Arc::strong_count(&book), 1);
     });
+}
+
+fn market_query(extra: &str, id: &str) -> String {
+    format!("newClientOrderId={id}&quantity=0.1&symbol=BTCUSDT&timestamp=1&type=MARKET{extra}")
+}
+
+/// P2-1 (Codex 8d-2a round 1): a placement is validated before anything
+/// acts, answered in the shape it asked for, its STP mode echoed.
+#[tokio::test]
+async fn placements_are_validated_and_answered_as_asked() {
+    let venue = venue().await;
+    let hooked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw = Arc::clone(&hooked);
+    venue.on_next_placement(Box::new(move |_: &SpotBook| {
+        saw.store(true, std::sync::atomic::Ordering::SeqCst)
+    }));
+    let refusals = [
+        (market_query("", "v1"), -1102, "no side"),
+        (market_query("&side=HOLD", "v2"), -1117, "an invalid side"),
+        (market_query("&side=BUY&newOrderRespType=NONE", "v3"), -1100, "a response type"),
+        (
+            market_query("&side=BUY&selfTradePreventionMode=NONE", "v4"),
+            -1100,
+            "an STP mode",
+        ),
+        (market_query("&side=BUY&stopPrice=90", "v5"), -1106, "a MARKET stopPrice"),
+        (
+            "newClientOrderId=v6&quantity=0.1&side=SELL&symbol=BTCUSDT&timestamp=1&type=STOP_LOSS"
+                .to_string(),
+            -1102,
+            "no stopPrice",
+        ),
+        (
+            "newClientOrderId=v7&quantity=0.1&side=SELL&symbol=BTCUSDT&timestamp=1&type=OCO"
+                .to_string(),
+            -1116,
+            "an unknown type",
+        ),
+        (
+            "newClientOrderId=v8&side=BUY&symbol=BTCUSDT&timestamp=1&type=MARKET".to_string(),
+            -1102,
+            "no quantity",
+        ),
+    ];
+    for (query, expected, what) in refusals {
+        let (status, body) = post(&venue, &query).await;
+        assert_eq!((status, code(&body)), (400, expected), "{what}: {body}");
+    }
+    assert!(venue.book().all_orders().is_empty(), "nothing acted");
+    assert!(
+        !hooked.load(std::sync::atomic::Ordering::SeqCst),
+        "the hook waits for a valid placement"
+    );
+    assert_eq!(venue.unserved_total(), 0);
+
+    // What the fake does not model is unserved.
+    for query in [
+        "newClientOrderId=u1&price=90&quantity=0.1&side=BUY&symbol=BTCUSDT&timeInForce=GTC&timestamp=1&type=LIMIT".to_string(),
+        "newClientOrderId=u2&quantity=0.1&side=BUY&stopPrice=110&symbol=BTCUSDT&timestamp=1&type=STOP_LOSS".to_string(),
+        "quantity=0.1&side=BUY&symbol=BTCUSDT&timestamp=1&type=MARKET".to_string(),
+    ] {
+        let (status, _) = post(&venue, &query).await;
+        assert_eq!(status, 400);
+    }
+    assert_eq!(venue.unserved_total(), 3);
+    assert!(venue.book().all_orders().is_empty());
+
+    // A STOP_LOSS without a response type is answered ACK.
+    let (status, ack) = post(&venue, "newClientOrderId=s1&quantity=0.5&side=SELL&stopPrice=90&symbol=BTCUSDT&timestamp=1&type=STOP_LOSS").await;
+    assert_eq!(status, 200);
+    let mut keys: Vec<&str> = ack.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, [
+        "clientOrderId",
+        "orderId",
+        "orderListId",
+        "symbol",
+        "transactTime"
+    ]);
+    assert!(
+        hooked.load(std::sync::atomic::Ordering::SeqCst),
+        "the hook ran for the valid one"
+    );
+    // A MARKET order without one is FULL; RESULT has no fills.
+    let (_, full) = post(&venue, &market_query("&side=BUY", "m1")).await;
+    assert!(full["fills"].is_array() && full["status"] == "FILLED");
+    let (_, result) = post(&venue, &market_query("&side=BUY&newOrderRespType=RESULT", "m2")).await;
+    assert!(result.get("fills").is_none() && result["status"] == "FILLED");
+    assert!(result.get("stopPrice").is_none(), "stopPrice appears for stops only");
+    // The STP mode requested is echoed, then carried by the order's record.
+    let (_, taker) = post(
+        &venue,
+        &market_query(
+            "&side=BUY&newOrderRespType=RESULT&selfTradePreventionMode=EXPIRE_TAKER",
+            "m3",
+        ),
+    )
+    .await;
+    assert_eq!(taker["selfTradePreventionMode"], "EXPIRE_TAKER");
+    let id = taker["orderId"].as_u64().unwrap();
+    let (_, record) =
+        get(&venue, "/api/v3/order", &format!("orderId={id}&symbol=BTCUSDT&timestamp=1")).await;
+    assert_eq!(record["selfTradePreventionMode"], "EXPIRE_TAKER");
+    assert_eq!(full["selfTradePreventionMode"], "EXPIRE_MAKER", "the symbol's default");
+    venue.shutdown().await.unwrap();
+}
+
+/// P3 (Codex 8d-2a round 1): unserved routes are refused before any
+/// control, bounded, and always counted; controls cannot target them.
+#[tokio::test]
+async fn unserved_requests_are_bounded_and_counted() {
+    let venue = venue().await;
+    for n in 0..70 {
+        let (status, _) =
+            call(&venue, reqwest::Method::GET, &format!("/api/v3/avgPrice?n={n}"), None).await;
+        assert_eq!(status, 400);
+    }
+    assert_eq!(venue.unserved_requests().len(), crate::fake_spot_venue::UNSERVED_KEPT);
+    assert_eq!(venue.unserved_total(), 70);
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        venue.hold_next(Method::GET, "/api/v3/avgPrice");
+    }));
+    assert!(refused.is_err(), "no hold on a route the fake does not serve");
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        venue.script_wire_next(Method::GET, "/api/v3/avgPrice", 200, "{}");
+    }));
+    assert!(refused.is_err(), "no script on a route the fake does not serve");
+    venue.shutdown().await.unwrap();
+}
+
+/// P3 (Codex 8d-2a round 1): a limit the book does not apply is not
+/// advertised.
+#[tokio::test]
+async fn exchange_info_advertises_only_the_books_limits() {
+    let book = SpotBook::new(
+        vec![
+            BookRules::new("ETHUSDT", "ETH", "USDT"),
+            BookRules::btcusdt(),
+        ],
+        d("0.001"),
+    );
+    let venue = FakeSpotVenue::start(Arc::new(book), TestCredentials::FIXED).await.unwrap();
+    let limits = |info: &Value| -> Vec<String> {
+        let filters = info["symbols"][0]["filters"].as_array().unwrap();
+        let named = filters.iter().filter_map(|f| f["filterType"].as_str());
+        named
+            .filter(|f| matches!(*f, "MAX_NUM_ORDERS" | "MAX_NUM_ALGO_ORDERS"))
+            .map(str::to_string)
+            .collect()
+    };
+    let (_, unlimited) =
+        call(&venue, reqwest::Method::GET, "/api/v3/exchangeInfo?symbol=ETHUSDT", None).await;
+    assert!(limits(&unlimited).is_empty());
+    let (_, limited) =
+        call(&venue, reqwest::Method::GET, "/api/v3/exchangeInfo?symbol=BTCUSDT", None).await;
+    assert_eq!(limits(&limited), ["MAX_NUM_ORDERS", "MAX_NUM_ALGO_ORDERS"]);
+    venue.shutdown().await.unwrap();
 }

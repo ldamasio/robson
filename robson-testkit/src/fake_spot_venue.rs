@@ -4,9 +4,20 @@
 //!
 //! - **Routes**, Binance spot's shapes at `995f6eb3`: `ping`, `exchangeInfo`,
 //!   `ticker/price` (public); `account`, `openOrders`, `openOrderList`, `GET
-//!   order`, `myTrades`, `POST order` (MARKET `FULL`, STOP_LOSS `RESULT`) and
-//!   `DELETE order` (signed). Anything else is answered HTTP 400 and recorded
-//!   in [`FakeSpotVenue::unserved_requests`].
+//!   order`, `myTrades`, `POST order` and `DELETE order` (signed). Any other
+//!   route is answered HTTP 400 and recorded in
+//!   [`FakeSpotVenue::unserved_requests`] before anything else happens to it;
+//!   holds and scripts are refused for it.
+//! - **Placements** are validated before anything acts: `side`, `type`,
+//!   `quantity` and a STOP_LOSS's `stopPrice` are mandatory (`-1102`); an
+//!   invalid side is `-1117`, an unknown type `-1116`, a `stopPrice` on a
+//!   MARKET order `-1106`, a response type or STP mode outside the allowed ones
+//!   `-1100` (the pairings with HTTP 400 are synthetic). What the fake does not
+//!   model (other order types, a BUY stop, `quoteOrderQty`, `trailingDelta`, no
+//!   `newClientOrderId`) is unserved. The answer follows `newOrderRespType`
+//!   (MARKET defaults to `FULL`, STOP_LOSS to `ACK`, rest-api.md L2166) and
+//!   echoes the STP mode requested (the symbol's default `EXPIRE_MAKER` when
+//!   none was), which later records of the order carry too.
 //! - **Authentication** on signed routes: no `X-MBX-APIKEY` is `-2014`
 //!   (synthetic: the docs give no answer for it), a value that is not a key's
 //!   format `-2014` (errors.md L439-L441), a well-formed foreign key `-2015`
@@ -29,7 +40,7 @@
 //! Test support: no production crate depends on this crate.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     convert::Infallible,
     future::{ready, Ready},
     io,
@@ -68,6 +79,19 @@ pub const SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
 pub const REQUEST_LOG: usize = 4_096;
 /// Wire scripts queued at once.
 pub const WIRE_SCRIPTS: usize = 64;
+/// Holds queued at once.
+pub const HOLDS: usize = 64;
+/// Unserved requests kept; [`FakeSpotVenue::unserved_total`] counts all.
+pub const UNSERVED_KEPT: usize = 64;
+/// The symbols' self-trade prevention modes: BTCUSDT's at `995f6eb3`, the
+/// first its default (`exchange_info_btcusdt.json`).
+pub const STP_MODES: [&str; 5] = [
+    "EXPIRE_MAKER",
+    "EXPIRE_TAKER",
+    "EXPIRE_BOTH",
+    "DECREMENT",
+    "TRANSFER",
+];
 
 /// The venue's API key and secret: test values, 64 alphanumerics each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +178,10 @@ struct Wire {
     total: u64,
     weight: u32,
     unserved: Vec<String>,
+    unserved_total: u64,
+    /// The STP mode each order was placed with, by order id; the oldest
+    /// dropped past the book's retention.
+    stp: BTreeMap<u64, String>,
     holds: VecDeque<(Method, String)>,
     scripts: VecDeque<(Method, String, u16, String)>,
     next_placement: Option<PlacementHook>,
@@ -254,20 +282,39 @@ impl FakeSpotVenue {
         self.shared.wire().weight
     }
 
+    /// The first [`UNSERVED_KEPT`] requests the fake did not serve.
     pub fn unserved_requests(&self) -> Vec<String> {
         self.shared.wire().unserved.clone()
     }
 
+    /// Every request the fake did not serve: zero means none ever was.
+    pub fn unserved_total(&self) -> u64 {
+        self.shared.wire().unserved_total
+    }
+
     /// Read the next `method` `path` request and answer it only at shutdown.
+    ///
+    /// # Panics
+    /// For a route the fake does not serve, or past [`HOLDS`] queued.
     pub fn hold_next(&self, method: Method, path: &str) {
-        self.shared.wire().holds.push_back((method, path.to_string()));
+        assert!(
+            served(&method, path),
+            "fake spot venue: {method} {path} is not a route it serves"
+        );
+        let mut wire = self.shared.wire();
+        assert!(wire.holds.len() < HOLDS, "fake spot venue: {HOLDS} holds queued");
+        wire.holds.push_back((method, path.to_string()));
     }
 
     /// Answer the next `method` `path` request with `status` and `body`.
     ///
     /// # Panics
-    /// Past [`WIRE_SCRIPTS`] queued.
+    /// For a route the fake does not serve, or past [`WIRE_SCRIPTS`] queued.
     pub fn script_wire_next(&self, method: Method, path: &str, status: u16, body: &str) {
+        assert!(
+            served(&method, path),
+            "fake spot venue: {method} {path} is not a route it serves"
+        );
         let mut wire = self.shared.wire();
         assert!(
             wire.scripts.len() < WIRE_SCRIPTS,
@@ -352,6 +399,21 @@ fn weight(method: &Method, path: &str, params: &[(String, String)]) -> Option<(u
         _ => return None,
     };
     Some(route)
+}
+
+/// Whether the fake serves `method` `path` at all.
+fn served(method: &Method, path: &str) -> bool {
+    weight(method, path, &[]).is_some()
+}
+
+/// Record an unserved request, keeping the first [`UNSERVED_KEPT`].
+fn unserved(shared: &Shared, what: String) -> Answer {
+    let mut wire = shared.wire();
+    wire.unserved_total += 1;
+    if wire.unserved.len() < UNSERVED_KEPT {
+        wire.unserved.push(what);
+    }
+    error(400, -1100, "unserved by the fake spot venue")
 }
 
 fn decode(value: &str) -> String {
@@ -442,26 +504,22 @@ async fn serve(shared: &Shared, method: Method, uri: Uri, headers: HeaderMap) ->
     let query = uri.query().unwrap_or_default().to_string();
     let key = headers.get("X-MBX-APIKEY").and_then(|v| v.to_str().ok()).map(str::to_string);
     let params = params(&query);
-    let route = weight(&method, &path, &params);
-    let signature = match route {
-        Some((_, true)) => match authenticate(shared, &query, key.as_deref()) {
+    let Some((weight, signed)) = weight(&method, &path, &params) else {
+        record(shared, &method, &path, &query, key.is_some(), SignatureVerdict::Unsigned, 0);
+        return unserved(shared, format!("{method} {path}?{query}"));
+    };
+    let signature = if signed {
+        match authenticate(shared, &query, key.as_deref()) {
             Ok(()) => SignatureVerdict::Valid,
             Err((answer, verdict)) => {
                 record(shared, &method, &path, &query, key.is_some(), verdict, 0);
                 return answer;
             },
-        },
-        _ => SignatureVerdict::Unsigned,
+        }
+    } else {
+        SignatureVerdict::Unsigned
     };
-    record(
-        shared,
-        &method,
-        &path,
-        &query,
-        key.is_some(),
-        signature,
-        route.map_or(0, |r| r.0),
-    );
+    record(shared, &method, &path, &query, key.is_some(), signature, weight);
     // A hold reads, authenticates and records the request, then answers
     // only on the stop signal.
     let held = {
@@ -482,10 +540,6 @@ async fn serve(shared: &Shared, method: Method, uri: Uri, headers: HeaderMap) ->
     };
     if let Some((_, _, status, body)) = scripted {
         return (StatusCode::from_u16(status).unwrap_or(StatusCode::OK), body);
-    }
-    if route.is_none() {
-        shared.wire().unserved.push(format!("{method} {path}?{query}"));
-        return error(400, -1100, "unserved by the fake spot venue");
     }
     respond(shared, &method, &path, &params)
 }
@@ -529,22 +583,43 @@ fn side(side: Side) -> &'static str {
     }
 }
 
-/// An order as `GET order` and `openOrders` give it.
-fn order_json(order: &BookOrder) -> Value {
-    let (order_type, stop) = match order.kind {
-        OrderKind::Market => ("MARKET", "0".to_string()),
-        OrderKind::StopLoss { trigger } => ("STOP_LOSS", dec(trigger)),
+/// The STP mode `order_id` was placed with: the symbol's default for an
+/// order that never came over the wire (a hook's).
+fn stp_of(shared: &Shared, order_id: u64) -> String {
+    let wire = shared.wire();
+    wire.stp.get(&order_id).cloned().unwrap_or_else(|| STP_MODES[0].to_string())
+}
+
+/// An order's record as a `RESULT` answer gives it (rest-api.md
+/// L2222-L2242), `stopPrice` only for a stop (conditional fields, L186).
+fn record_json(order: &BookOrder, stp: &str) -> Value {
+    let order_type = match order.kind {
+        OrderKind::Market => "MARKET",
+        OrderKind::StopLoss { .. } => "STOP_LOSS",
     };
-    json!({
+    let mut record = json!({
         "symbol": order.symbol, "orderId": order.id, "orderListId": -1,
         "clientOrderId": order.client_id, "price": "0", "origQty": dec(order.orig_qty),
         "executedQty": dec(order.executed_qty), "origQuoteOrderQty": "0",
         "cummulativeQuoteQty": dec(order.quote_qty), "status": order.status.as_str(),
-        "timeInForce": "GTC", "type": order_type, "side": side(order.side), "stopPrice": stop,
-        "icebergQty": "0", "time": order.time_ms, "updateTime": order.update_ms,
-        "isWorking": !order.status.is_terminal(), "workingTime": order.time_ms,
-        "selfTradePreventionMode": "EXPIRE_MAKER",
-    })
+        "timeInForce": "GTC", "type": order_type, "side": side(order.side),
+        "workingTime": order.time_ms, "selfTradePreventionMode": stp,
+    });
+    if let OrderKind::StopLoss { trigger } = order.kind {
+        record["stopPrice"] = json!(dec(trigger));
+    }
+    record
+}
+
+/// An order as `GET order` and `openOrders` give it: its record with its
+/// times.
+fn order_json(shared: &Shared, order: &BookOrder) -> Value {
+    let mut record = record_json(order, &stp_of(shared, order.id));
+    record["icebergQty"] = json!("0");
+    record["time"] = json!(order.time_ms);
+    record["updateTime"] = json!(order.update_ms);
+    record["isWorking"] = json!(!order.status.is_terminal());
+    record
 }
 
 fn trade_json(trade: &BookTrade) -> Value {
@@ -573,7 +648,8 @@ fn book_error(error_: BookError) -> Answer {
 
 /// `exchangeInfo` for one symbol: the spot adapter's
 /// `exchange_info_btcusdt.json` fixture with the symbol, its assets and its
-/// order limits (unset: the fixture's 200 and 5) from the rules.
+/// order limits from the rules; a limit the book does not apply is not
+/// advertised.
 fn exchange_info(rules: &BookRules) -> Value {
     let filters = json!([
         {"filterType": "PRICE_FILTER", "minPrice": "0.01000000", "maxPrice": "1000000.00000000", "tickSize": "0.01000000"},
@@ -583,11 +659,16 @@ fn exchange_info(rules: &BookRules) -> Value {
         {"filterType": "TRAILING_DELTA", "minTrailingAboveDelta": 10, "maxTrailingAboveDelta": 2000, "minTrailingBelowDelta": 10, "maxTrailingBelowDelta": 2000},
         {"filterType": "PERCENT_PRICE_BY_SIDE", "bidMultiplierUp": "1.2", "bidMultiplierDown": "0.5", "askMultiplierUp": "2", "askMultiplierDown": "0.8", "avgPriceMins": 5},
         {"filterType": "NOTIONAL", "minNotional": "5.00000000", "applyMinToMarket": true, "maxNotional": "9000000.00000000", "applyMaxToMarket": false, "avgPriceMins": 5},
-        {"filterType": "MAX_NUM_ORDERS", "maxNumOrders": rules.max_num_orders.unwrap_or(200)},
         {"filterType": "MAX_NUM_ORDER_LISTS", "maxNumOrderLists": 20},
-        {"filterType": "MAX_NUM_ALGO_ORDERS", "maxNumAlgoOrders": rules.max_num_algo_orders.unwrap_or(5)},
         {"filterType": "MAX_NUM_ORDER_AMENDS", "maxNumOrderAmends": 10},
     ]);
+    let mut filters = filters.as_array().cloned().unwrap_or_default();
+    if let Some(max) = rules.max_num_orders {
+        filters.push(json!({"filterType": "MAX_NUM_ORDERS", "maxNumOrders": max}));
+    }
+    if let Some(max) = rules.max_num_algo_orders {
+        filters.push(json!({"filterType": "MAX_NUM_ALGO_ORDERS", "maxNumAlgoOrders": max}));
+    }
     json!({
         "timezone": "UTC", "serverTime": 1_767_225_600_000_i64, "rateLimits": [], "exchangeFilters": [],
         "symbols": [{
@@ -599,8 +680,8 @@ fn exchange_info(rules: &BookRules) -> Value {
             "quoteOrderQtyMarketAllowed": true, "allowTrailingStop": true, "cancelReplaceAllowed": true,
             "amendAllowed": true, "pegInstructionsAllowed": true, "isSpotTradingAllowed": true,
             "isMarginTradingAllowed": true, "filters": filters, "permissions": [], "permissionSets": [["SPOT"]],
-            "defaultSelfTradePreventionMode": "EXPIRE_MAKER",
-            "allowedSelfTradePreventionModes": ["EXPIRE_TAKER", "EXPIRE_MAKER", "EXPIRE_BOTH", "DECREMENT", "TRANSFER"],
+            "defaultSelfTradePreventionMode": STP_MODES[0],
+            "allowedSelfTradePreventionModes": STP_MODES,
         }],
     })
 }
@@ -634,7 +715,8 @@ fn respond(shared: &Shared, method: &Method, path: &str, params: &[(String, Stri
         },
         ("GET", "/api/v3/openOrders") => {
             let on = param(params, "symbol");
-            ok(Value::Array(book.open_orders(on).iter().map(order_json).collect()))
+            let orders = book.open_orders(on);
+            ok(Value::Array(orders.iter().map(|o| order_json(shared, o)).collect()))
         },
         ("GET", "/api/v3/openOrderList") => ok(json!([])),
         ("GET", "/api/v3/order") => {
@@ -644,7 +726,7 @@ fn respond(shared: &Shared, method: &Method, path: &str, params: &[(String, Stri
                 (None, None) => None,
             };
             match by.map(|by| book.order(&symbol, by)) {
-                Some(Ok(order)) => ok(order_json(&order)),
+                Some(Ok(order)) => ok(order_json(shared, &order)),
                 Some(Err(e)) => book_error(e),
                 None => error(400, -1102, "Mandatory parameter 'orderId' was not sent."),
             }
@@ -663,42 +745,149 @@ fn respond(shared: &Shared, method: &Method, path: &str, params: &[(String, Stri
     }
 }
 
-/// `POST /api/v3/order`: a MARKET order answered `FULL`, a `STOP_LOSS`
-/// answered `RESULT`.
+/// The answer a placement asked for (`newOrderRespType`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Ack,
+    Result,
+    Full,
+}
+
+/// A placement the fake supports, validated.
+struct NewOrder<'a> {
+    side: Side,
+    kind: OrderKind,
+    qty: Decimal,
+    client_id: &'a str,
+    shape: Shape,
+    stp: &'static str,
+}
+
+/// Why a placement is not acted on.
+enum Refused {
+    /// Binance's answer to it.
+    Answer(Answer),
+    /// Something the fake does not model: unserved.
+    Unsupported(&'static str),
+}
+
+fn mandatory(name: &str) -> Refused {
+    let msg = format!("Mandatory parameter '{name}' was not sent, was empty/null, or malformed.");
+    Refused::Answer(error(400, -1102, &msg))
+}
+
+/// The placement's request, validated before anything acts (module
+/// documentation).
+fn new_order(params: &[(String, String)]) -> Result<NewOrder<'_>, Refused> {
+    for name in [
+        "quoteOrderQty",
+        "trailingDelta",
+        "price",
+        "icebergQty",
+        "timeInForce",
+    ] {
+        if param(params, name).is_some() {
+            return Err(Refused::Unsupported("a parameter the fake does not model"));
+        }
+    }
+    let side = match param(params, "side") {
+        None | Some("") => return Err(mandatory("side")),
+        Some("BUY") => Side::Buy,
+        Some("SELL") => Side::Sell,
+        Some(_) => return Err(Refused::Answer(error(400, -1117, "Invalid side."))),
+    };
+    let stop_price = param(params, "stopPrice");
+    let kind = match param(params, "type") {
+        None | Some("") => return Err(mandatory("type")),
+        Some("MARKET") if stop_price.is_some() => {
+            let msg = "Parameter 'stopPrice' sent when not required.";
+            return Err(Refused::Answer(error(400, -1106, msg)));
+        },
+        Some("MARKET") => OrderKind::Market,
+        Some("STOP_LOSS") if side == Side::Buy => {
+            return Err(Refused::Unsupported("a BUY STOP_LOSS"));
+        },
+        Some("STOP_LOSS") => match stop_price.and_then(|p| p.parse().ok()) {
+            Some(trigger) => OrderKind::StopLoss { trigger },
+            None => return Err(mandatory("stopPrice")),
+        },
+        Some("LIMIT" | "LIMIT_MAKER" | "STOP_LOSS_LIMIT" | "TAKE_PROFIT" | "TAKE_PROFIT_LIMIT") => {
+            return Err(Refused::Unsupported("an order type the fake does not model"));
+        },
+        Some(_) => return Err(Refused::Answer(error(400, -1116, "Invalid orderType."))),
+    };
+    let Some(qty) = param(params, "quantity").and_then(|q| q.parse().ok()) else {
+        return Err(mandatory("quantity"));
+    };
+    let Some(client_id) = param(params, "newClientOrderId").filter(|id| !id.is_empty()) else {
+        return Err(Refused::Unsupported("no newClientOrderId"));
+    };
+    let shape = match (param(params, "newOrderRespType"), kind) {
+        (None, OrderKind::Market) | (Some("FULL"), _) => Shape::Full,
+        (None, OrderKind::StopLoss { .. }) | (Some("ACK"), _) => Shape::Ack,
+        (Some("RESULT"), _) => Shape::Result,
+        (Some(_), _) => {
+            let msg = "Illegal characters found in parameter 'newOrderRespType'; legal range is \
+                       'ACK, RESULT, FULL'.";
+            return Err(Refused::Answer(error(400, -1100, msg)));
+        },
+    };
+    let stp = match param(params, "selfTradePreventionMode") {
+        None => STP_MODES[0],
+        Some(mode) => match STP_MODES.iter().find(|allowed| **allowed == mode) {
+            Some(allowed) => allowed,
+            None => {
+                let msg = "Illegal characters found in parameter 'selfTradePreventionMode'.";
+                return Err(Refused::Answer(error(400, -1100, msg)));
+            },
+        },
+    };
+    Ok(NewOrder { side, kind, qty, client_id, shape, stp })
+}
+
+/// `POST /api/v3/order`: a MARKET order or a SELL `STOP_LOSS`, validated
+/// first, answered in the shape it asked for, its STP mode echoed.
 fn place(shared: &Shared, symbol: &str, params: &[(String, String)]) -> Answer {
+    let order = match new_order(params) {
+        Ok(order) => order,
+        Err(Refused::Answer(answer)) => return answer,
+        Err(Refused::Unsupported(what)) => {
+            let query: Vec<String> = params.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            return unserved(shared, format!("POST /api/v3/order ({what}) {}", query.join("&")));
+        },
+    };
     let hook = shared.wire().next_placement.take();
     if let Some(hook) = hook {
         hook(&shared.book);
     }
     let book = &shared.book;
-    let qty: Decimal = match param(params, "quantity").and_then(|q| q.parse().ok()) {
-        Some(qty) => qty,
-        None => return error(400, -1102, "Mandatory parameter 'quantity' was not sent."),
-    };
-    let client_id = param(params, "newClientOrderId").unwrap_or_default();
-    let order_side = if param(params, "side") == Some("BUY") {
-        Side::Buy
-    } else {
-        Side::Sell
-    };
-    let placed = match param(params, "type") {
-        Some("MARKET") => book.place_market(symbol, order_side, qty, client_id),
-        Some("STOP_LOSS") => match param(params, "stopPrice").and_then(|p| p.parse().ok()) {
-            Some(trigger) if order_side == Side::Sell => {
-                book.place_stop(symbol, qty, trigger, client_id)
-            },
-            _ => return error(400, -1013, "Filter failure: PRICE_FILTER"),
+    let placed = match order.kind {
+        OrderKind::Market => book.place_market(symbol, order.side, order.qty, order.client_id),
+        OrderKind::StopLoss { trigger } => {
+            book.place_stop(symbol, order.qty, trigger, order.client_id)
         },
-        _ => return error(400, -1116, "Invalid orderType."),
     };
     let placement = match placed {
         Ok(placement) => placement,
         Err(e) => return book_error(e),
     };
-    let order = &placement.order;
-    let mut answer = order_json(order);
-    answer["transactTime"] = json!(order.update_ms);
-    if matches!(order.kind, OrderKind::Market) {
+    let placed = &placement.order;
+    {
+        let mut wire = shared.wire();
+        wire.stp.insert(placed.id, order.stp.to_string());
+        while wire.stp.len() > REQUEST_LOG {
+            wire.stp.pop_first();
+        }
+    }
+    if order.shape == Shape::Ack {
+        return ok(json!({
+            "symbol": placed.symbol, "orderId": placed.id, "orderListId": -1,
+            "clientOrderId": placed.client_id, "transactTime": placed.update_ms,
+        }));
+    }
+    let mut answer = record_json(placed, order.stp);
+    answer["transactTime"] = json!(placed.update_ms);
+    if order.shape == Shape::Full {
         let fills: Vec<Value> = placement
             .fills
             .iter()
@@ -727,7 +916,7 @@ fn cancel(shared: &Shared, symbol: &str, params: &[(String, String)]) -> Answer 
                 wire.cancels += 1;
                 wire.cancels
             };
-            let mut answer = order_json(&order);
+            let mut answer = record_json(&order, &stp_of(shared, order.id));
             answer["origClientOrderId"] = json!(order.client_id);
             answer["clientOrderId"] = json!(format!("cancel{sequence}"));
             answer["transactTime"] = json!(order.update_ms);
