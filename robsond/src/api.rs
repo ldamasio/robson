@@ -868,10 +868,6 @@ fn build_cors_layer() -> CorsLayer {
         ])
 }
 
-/// Prometheus metrics endpoint.
-///
-/// Returns all registered metrics in the Prometheus exposition format.
-/// Unauthenticated (read-only).
 // =============================================================================
 // Recovery (ADR-0056 step 7)
 // =============================================================================
@@ -1588,6 +1584,10 @@ where
     }))
 }
 
+/// Prometheus metrics endpoint.
+///
+/// Returns all registered metrics in the Prometheus exposition format.
+/// Unauthenticated (read-only).
 async fn metrics_handler() -> impl IntoResponse {
     let body = crate::metrics::render();
     (

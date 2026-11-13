@@ -30,8 +30,6 @@
 //! }
 //! ```
 
-#![warn(clippy::all)]
-
 // Modules
 mod credential_store;
 mod error;

@@ -3,8 +3,6 @@
 //! Adapters for exchange APIs (REST + WebSocket).
 //! Normalizes exchange-specific types to domain types.
 
-#![warn(clippy::all)]
-
 // Public modules
 pub mod binance;
 pub mod binance_rest;

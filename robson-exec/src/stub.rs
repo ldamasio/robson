@@ -1772,8 +1772,8 @@ impl StubMarketData {
         }
 
         // Notify subscribers
-        let subscriptions = self.subscriptions.read().unwrap();
-        if let Some(sender) = subscriptions.get(&symbol.as_pair()) {
+        let sender = self.subscriptions.read().unwrap().get(&symbol.as_pair()).cloned();
+        if let Some(sender) = sender {
             let update = PriceUpdate {
                 symbol: symbol.clone(),
                 price: Price::new(price).unwrap(),
@@ -1794,8 +1794,8 @@ impl StubMarketData {
         }
 
         // Notify subscribers
-        let subscriptions = self.subscriptions.read().unwrap();
-        if let Some(sender) = subscriptions.get(&update.symbol.as_pair()) {
+        let sender = self.subscriptions.read().unwrap().get(&update.symbol.as_pair()).cloned();
+        if let Some(sender) = sender {
             let _ = sender.send(update).await;
         }
     }

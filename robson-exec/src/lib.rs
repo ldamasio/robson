@@ -34,8 +34,6 @@
 //! let results = executor.execute(actions).await?;
 //! ```
 
-#![warn(clippy::all)]
-
 pub mod cancel;
 mod compat;
 #[cfg(feature = "crash-points")]

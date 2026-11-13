@@ -4,7 +4,6 @@
 //! Contains entities, value objects, domain events, and domain rules.
 
 #![warn(missing_docs)]
-#![warn(clippy::all)]
 
 // Public modules
 pub mod context;
