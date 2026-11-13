@@ -163,8 +163,11 @@ fn an_incomplete_graph_is_refused() {
     ghost_member["workspace_members"].as_array_mut().unwrap().push(json!(GHOST));
     refused(&ghost_member, &format!("workspace member {GHOST} is not in `packages`"));
 
+    // The member's node gone, and with it the one edge to it.
     let mut unresolved_member = workspace();
-    unresolved_member["resolve"]["nodes"].as_array_mut().unwrap().remove(1);
+    let nodes = unresolved_member["resolve"]["nodes"].as_array_mut().unwrap();
+    nodes.remove(1);
+    nodes[1]["deps"].as_array_mut().unwrap().retain(|dep| dep["pkg"] != PROJECTOR);
     refused(
         &unresolved_member,
         &format!("workspace member {PROJECTOR} is not in `resolve.nodes`"),
@@ -181,4 +184,32 @@ fn an_incomplete_graph_is_refused() {
         &unshown,
         &format!("the declared dev edge from {ROBSOND} to robson-testkit is not in"),
     );
+}
+
+/// Round 2: a resolved edge must reach a resolved node. A package with no
+/// node, even outside the workspace, leaves the graph dangling; a leaf node
+/// outside the workspace (a path or registry dependency with no deps of its
+/// own) is complete and passes.
+#[test]
+fn every_resolved_edge_reaches_a_node() {
+    let mut dangling = workspace();
+    dangling["workspace_members"] = json!([ROBSOND, PROJECTOR, TESTKIT]);
+    dangling["resolve"]["nodes"].as_array_mut().unwrap().remove(3);
+    refused(
+        &dangling,
+        &format!("{ROBSOND} has an edge to {EXEC}, which has no resolved node"),
+    );
+
+    const LEAF: &str = "registry+https://github.com/rust-lang/crates.io-index#leaf@1.0.0";
+    let mut leaf = workspace();
+    leaf["packages"].as_array_mut().unwrap().push(package("leaf", LEAF, vec![]));
+    deps(&mut leaf, 2).push(edge("leaf", Value::Null));
+    let nodes = leaf["resolve"]["nodes"].as_array_mut().unwrap();
+    nodes[2]["deps"]
+        .as_array_mut()
+        .unwrap()
+        .push(resolved(LEAF, "leaf", Value::Null));
+    nodes.insert(0, json!({ "id": LEAF, "deps": [] }));
+    let summary = check(&leaf.to_string()).unwrap();
+    assert_eq!(summary.dev_dependents, ["robson-projector", "robsond"]);
 }

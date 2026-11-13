@@ -13,7 +13,8 @@
 //! JSON, a `version` other than 1, no `packages`, `workspace_members` or
 //! `resolve`, an incomplete graph (a workspace member missing from
 //! `packages` or from `resolve.nodes`, no nodes, a node or an edge naming a
-//! package `packages` does not list, an edge to `robson-testkit` with no
+//! package `packages` does not list, an edge to a package with no resolved
+//! node, an edge to `robson-testkit` with no
 //! `dep_kinds`, a declared dev edge the resolved graph does not show),
 //! `robson-testkit` not a workspace member, or no workspace package reaching
 //! it by a `dev` edge (the real workspace has two, `robsond` and
@@ -152,8 +153,8 @@ fn describe(package: &str, kind: &str, dependency: &Value) -> String {
 }
 
 /// The graph's references hold together: every workspace member is a listed
-/// package and a resolved node; there are nodes; every node and every edge
-/// names a listed package.
+/// package and a resolved node; there are nodes; every node names a listed
+/// package, and every edge a listed package that has a node.
 fn references(metadata: &Value) -> Result<(), String> {
     let mut packages = BTreeSet::new();
     for package in array(metadata, "packages")? {
@@ -170,10 +171,18 @@ fn references(metadata: &Value) -> Result<(), String> {
             return Err(format!("resolved node {id} is not in `packages`"));
         }
         resolved.insert(id);
+    }
+    // Every node is known before any edge is read, so nodes may come in
+    // any order.
+    for node in nodes {
+        let id = text(node, "id")?;
         for dep in array(node, "deps")? {
             let pkg = text(dep, "pkg")?;
             if !packages.contains(pkg) {
                 return Err(format!("{id} has an edge to {pkg}, which is not in `packages`"));
+            }
+            if !resolved.contains(pkg) {
+                return Err(format!("{id} has an edge to {pkg}, which has no resolved node"));
             }
         }
     }
