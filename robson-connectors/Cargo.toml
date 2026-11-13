@@ -26,7 +26,7 @@ futures-util = "0.3"
 chrono = { workspace = true }
 # Binance API authentication
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.21"
 hex = "0.4"
 
