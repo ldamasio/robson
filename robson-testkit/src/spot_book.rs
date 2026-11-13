@@ -588,6 +588,13 @@ impl SpotBook {
         self.lock().balances.get(asset).copied().unwrap_or_default()
     }
 
+    /// Every asset with a nonzero `free` or `locked`, by name.
+    pub fn balances(&self) -> Vec<(String, Balance)> {
+        let book = self.lock();
+        let held = book.balances.iter().filter(|(_, b)| !b.free.is_zero() || !b.locked.is_zero());
+        held.map(|(asset, balance)| (asset.clone(), *balance)).collect()
+    }
+
     /// The asset's whole ledger, for conservation checks.
     pub fn ledger(&self, asset: &str) -> AssetLedger {
         let book = self.lock();

@@ -15,9 +15,12 @@ serde_json = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
 rust_decimal = { workspace = true }
+async-trait = { workspace = true }
 
 # Local dependencies
+robson-domain = { path = "../robson-domain" }
 robson-eventlog = { path = "../robson-eventlog" }
+robson-exec = { path = "../robson-exec" }
 robson-projector = { path = "../robson-projector" }
 
 [dev-dependencies]
