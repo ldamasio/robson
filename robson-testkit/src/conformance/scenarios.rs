@@ -307,6 +307,18 @@ pub async fn r2<H: BalanceHarness>(h: &H) -> Outcome {
     run.state(format!("placements {placed} -> {}, open {:?}", h.placements(), h.open_stops()));
     run.expect(h.placements() == placed, "no placement reached the venue");
     run.expect(h.open_stops() == [old.exchange_order_id.clone()], "the old stop is still live");
+    // While its cancel is queued the old stop executes; the cancel, applied
+    // later, leaves it Filled (terminal precedence).
+    h.book().set_price(&h.symbol().as_pair(), d("85"));
+    let crossed = h.book().cross(order_id(&old), d("0.5"));
+    run.market("the old stop executes 0.5 at 85 while its cancel is queued");
+    run.expect(crossed.is_ok(), "the cross applied");
+    h.book().apply_delayed_cancels();
+    run.market("the venue applies the queued cancel");
+    let state = live_stop(h.book(), &old.exchange_order_id);
+    run.state(format!("old stop {state:?}"));
+    run.expect(state == Some((BookStatus::Filled, d("0.5"))), "the old stop stays Filled");
+    run.expect(h.book().sold(&h.symbol().as_pair()) == d("0.5"), "sold exactly what executed");
     run.finish()
 }
 
@@ -666,6 +678,17 @@ pub async fn b4<H: BalanceHarness>(h: &H) -> Outcome {
         matches!(fill, Ok(Some(ref r)) if r.filled_quantity.as_decimal() == d("0.5")),
         "with the trades visible the fills are established",
     );
+    // The order's visibility and its trades' are independent: hidden, the
+    // order's trades still read by page.
+    h.book().hide_order(order_id(&old));
+    run.market("the venue hides the order, its trades visible");
+    let inventory = h.venue().inventory().expect("a balance account's inventory");
+    let page = inventory.order_trades_page(&symbol, &old.exchange_order_id, 0).await;
+    let page = run.answered("order_trades_page", page);
+    run.expect(
+        matches!(page, Ok(ref page) if page.trades.len() == 1),
+        "a hidden order's trades still read",
+    );
     run.finish()
 }
 
@@ -751,6 +774,31 @@ pub async fn b5<H: BalanceHarness>(h: &H) -> Outcome {
         h.book().apply_delayed_cancels();
         run.market("the venue applies the delayed cancel");
         balances_are(h, &mut run, "after it applies", ("1.499", "0"), ("942.4575", "0")).await;
+    }
+    // A queued cancel whose order was cancelled meanwhile releases nothing
+    // more when it applies, with another stop's lock there to take from.
+    let held = stop(h, &mut run, "b5-held", "0.5", "80").await;
+    let stale = stop(h, &mut run, "b5-s4", "0.2", "80").await;
+    if let (Some(_), Some(twice)) = (held, stale) {
+        let inventory = h.venue().inventory().expect("a balance account's inventory");
+        let id = twice.exchange_order_id;
+        run.sent("cancel_order_once b5-s4 (delayed, then immediate)");
+        let queued = inventory.cancel_order_once(&symbol, &id).await;
+        run.expect(
+            matches!(queued, Ok(CancelAnswer::Unknown { .. })),
+            "the first cancel is queued",
+        );
+        h.book().delay_cancels(false);
+        let now =
+            run.answered("cancel_order_once", inventory.cancel_order_once(&symbol, &id).await);
+        run.expect(
+            matches!(now, Ok(CancelAnswer::Cancelled(_))),
+            "the second cancel applies at once",
+        );
+        h.book().apply_delayed_cancels();
+        run.market("the venue applies the stale queued cancel");
+        balances_are(h, &mut run, "after the stale cancel", ("0.999", "0.5"), ("942.4575", "0"))
+            .await;
     }
     run.finish()
 }
