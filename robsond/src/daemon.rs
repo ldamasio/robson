@@ -834,12 +834,11 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         // The startup phase holds the startup slot's permit throughout; the
         // startup scan and startup recovery run under it. Then the API, the
         // workers and the main loop. Neither is waited for once the stop has
-        // its result. Both halves are boxed: their futures are large.
+        // its result. Both halves are boxed, their futures being large: the
+        // startup half by its permit's `run`, the serving half here.
         let mut workers = Vec::new();
         let started = match journal.acquire(OperationKind::Startup) {
-            Ok(permit) => {
-                unless_stopped(permit.run(Box::pin(self.start_up(&shutdown))), &mut stopping).await
-            },
+            Ok(permit) => unless_stopped(permit.run(self.start_up(&shutdown)), &mut stopping).await,
             // The stop is already closing: nothing starts.
             Err(PermitRefusal::Stopping(_)) => Ok(Ok(())),
             Err(refusal) => return Err(refusal.into()),
@@ -1162,7 +1161,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     /// One main-loop event, under the main loop's permit (ADR-0056 step 7).
     async fn handle_event_permitted(&self, journal: &Arc<OrderJournal>, event: DaemonEvent) {
         let handled = match journal.acquire(OperationKind::MainLoop) {
-            Ok(permit) => permit.run(Box::pin(self.handle_event(event))).await,
+            Ok(permit) => permit.run(self.handle_event(event)).await,
             Err(refusal) => {
                 warn!(%refusal, "Main loop event not handled");
                 return;
