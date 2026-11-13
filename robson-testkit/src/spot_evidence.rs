@@ -17,8 +17,16 @@
 //!   quote agrees with its record's (R3); anything else withholds the fills,
 //!   never the record's terminality or execution.
 //!
-//! R3's tolerance is `fills × 10^-quoteAssetPrecision`; with no precision,
-//! as the stub has none, it is zero, as on the adapter with none cached.
+//! R3's tolerance is `fills × 10^-quoteAssetPrecision`. **The stub always
+//! passes no precision**, so its tolerance is zero: the mirror is equivalent
+//! to the adapter only when the adapter has no cached precision; with a
+//! cached `quoteAssetPrecision` the adapter tolerates quote differences the
+//! stub refuses.
+//!
+//! `spot_mirror_tests.rs` pins a SHA-256 of each adapter function mirrored
+//! here and in `balance_stub.rs` (the symbol and client id refusals, the
+//! composite paging loop); a change to one fails it until the mirror is
+//! re-certified and the hash updated.
 
 use chrono::{DateTime, Utc};
 use robson_domain::{Price, Quantity};

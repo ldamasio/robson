@@ -29,7 +29,9 @@
 //!   stopping once they cover the execution), give fills only when each is
 //!   valid and together they are exactly the execution, never undoing the
 //!   record's terminality; a lookup's not-found is classified only by the
-//!   finality rule over the ledger's evidence.
+//!   finality rule over the ledger's evidence. The stub has no
+//!   `quoteAssetPrecision`, so R3 tolerates nothing: it matches the adapter
+//!   with no cached precision only.
 //! - **Refused like spot**, with nothing sent: trades by time, governed
 //!   inventory, costs and settlement ([`ExecError::Config`]).
 //!

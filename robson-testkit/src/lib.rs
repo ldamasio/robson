@@ -26,6 +26,8 @@ mod spot_book_tests;
 mod spot_evidence;
 #[cfg(test)]
 mod spot_evidence_tests;
+#[cfg(test)]
+mod spot_mirror_tests;
 
 use anyhow::Result;
 pub use helpers::{
