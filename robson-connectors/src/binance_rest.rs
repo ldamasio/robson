@@ -431,10 +431,9 @@ impl BinanceRestClient {
         self.answer(transport.post(&url).header("X-MBX-APIKEY", &self.api_key)).await
     }
 
-    /// [`Self::post_signed_answer`] for DELETE: gated, signed with encoded
-    /// values, the status kept, one request on the [`single_shot`] transport.
-    // The spot cancel (8c-3b) uses it; until then only its tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// [`Self::post_signed_answer`] for DELETE (the spot cancel, ADR-0056 step
+    /// 8c-3b): gated, signed with encoded values, the status kept, one request
+    /// on the [`single_shot`] transport.
     pub(crate) async fn delete_signed_answer(
         &self,
         endpoint: &str,

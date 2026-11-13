@@ -10,5 +10,6 @@
   "duplicate_order": "{\"code\":-2010,\"msg\":\"Duplicate order sent.\"}",
   "would_trigger": "{\"code\":-2010,\"msg\":\"Order would trigger immediately.\"}",
   "filter_failure": "{\"code\":-1013,\"msg\":\"Filter failure: LOT_SIZE\"}",
-  "unexpected_resp": "{\"code\":-1006,\"msg\":\"An unexpected response was received from the message bus. Execution status unknown.\"}"
+  "unexpected_resp": "{\"code\":-1006,\"msg\":\"An unexpected response was received from the message bus. Execution status unknown.\"}",
+  "cancel_rejected": "{\"code\":-2011,\"msg\":\"Unknown order sent.\"}"
 }

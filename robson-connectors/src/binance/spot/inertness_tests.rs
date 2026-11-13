@@ -201,6 +201,7 @@ const PORT_ITEMS: [(&str, &[&str]); 4] = [
         "venue::VenueFinalityRule",
         "venue::VenueId",
         "venue::VenueOrderRecord",
+        "venue::replace_cancel_then_place",
     ]),
     ("trading.rs", &[
         "ExecError",
@@ -209,6 +210,8 @@ const PORT_ITEMS: [(&str, &[&str]); 4] = [
         "ports::FeeGap",
         "ports::OrderEvidence",
         "ports::TradeFill",
+        "venue::CancelAnswer",
+        "venue::OrderPhase",
         "venue::PlacedStop",
         "venue::ProtectionKind",
         "venue::StopRef",
@@ -675,23 +678,20 @@ fn mutation_violations(file: &str, text: &str) -> Vec<String> {
             violations.push(format!("contains {form}"));
         }
     }
-    for name in [
-        "post_signed",
-        "delete_signed",
-        "pass_gate",
-        "delete_signed_answer",
-    ] {
+    for name in ["post_signed", "delete_signed", "pass_gate"] {
         if has_word(text, name) {
             violations.push(format!("names {name}"));
         }
     }
-    let helper = "post_signed_answer";
     if file != "trading.rs" {
-        if has_word(text, helper) {
-            violations.push(format!("names {helper} outside trading.rs"));
+        for helper in ["post_signed_answer", "delete_signed_answer"] {
+            if has_word(text, helper) {
+                violations.push(format!("names {helper} outside trading.rs"));
+            }
         }
         return violations;
     }
+    let helper = "post_signed_answer";
     let code = code_only(text);
     for (at, _) in code.match_indices(helper) {
         let word = !code[..at].chars().next_back().is_some_and(is_ident)

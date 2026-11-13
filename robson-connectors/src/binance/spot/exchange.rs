@@ -1,20 +1,26 @@
-//! The Binance spot venue, `binance:spot` (ADR-0056 step 8, PRs 8c-2 and
-//! 8c-3a): the adapter over the shared REST client, its rules cache, the read
-//! side of the venue ports and order placement.
+//! The Binance spot venue, `binance:spot` (ADR-0056 step 8, PRs 8c-2, 8c-3a
+//! and 8c-3b): the adapter over the shared REST client, its rules cache, the
+//! read side of the venue ports, order placement and cancels.
 //!
 //! Built here: trading rules through [`SpotRulesCache`]; the venue's order
 //! records ([`VenueOrderRecord`], phase from status alone); account and
 //! inventory reads; `order_by_client_id`, `open_protective_orders`, and the
-//! single-request `observe_order` and `order_trades_page` the leg owner uses
-//! (8c plan, C1). Every read is one of 8a's [`SpotRestReader`] reads at its
-//! documented weight, one request, no retry. `place_market_order` and
-//! `place_protection` send one order each through `trading.rs`, under the
-//! one-attempt ledger (8c-3a).
+//! single-request `observe_order`, `order_trades_page` and
+//! `cancel_order_once` the leg owner uses (8c plan, C1). Every read is one of
+//! 8a's [`SpotRestReader`] reads at its documented weight, one request, no
+//! retry. `place_market_order` and `place_protection` send one order each
+//! through `trading.rs`, under the one-attempt ledger (8c-3a); a cancel goes
+//! through `trading.rs` too, with no grant (8c-3b).
 //!
-//! Not built here: cancelling and replacing an order, and the composite
-//! lookups beside them, are 8c-3b's. Until then each returns
-//! [`ExecError::Config`] and sends nothing. Ledger, costs and settlement are
-//! later steps' (8e, 8g, 8l) and refuse the same way.
+//! The composite wrappers keep the legacy `TradingPort` contract within
+//! documented bounds, and no owner path may use them (C3): `cancel_protection`
+//! (a cancel, one lookup after a not-found, at most five trade pages: at most
+//! 7 requests, weight 30), `order_by_exchange_id` and `protection_fill` (one
+//! lookup and at most five pages: weight 29), `replace_protection` (the
+//! cancel wrapper and one placement) and the legacy `cancel_order`.
+//!
+//! Not built here: ledger, costs and settlement are later steps' (8e, 8g, 8l)
+//! and refuse with [`ExecError::Config`] and nothing sent.
 //!
 //! No production path constructs [`BinanceSpotAdapter`]: the factory refuses
 //! `binance_spot` until step 8's activation (SD12; `inertness_tests.rs`).
@@ -31,17 +37,18 @@ use robson_exec::{
     ports::{OpenOrderRecord, TradeFill, UserTradeRecord},
     quantize,
     venue::{
-        AccountKind, AccountOpenOrder, AccountPort, CancelAnswer, Cash, EntryOrReduce,
-        ExecutionCostEnvelope, FundingPort, GovernedInventory, Holding, InventoryObservation,
-        InventoryPort, Mark, MarketKind, OrderLookup, OrderObservation, OrderPhase, OrderRef,
-        PlacedStop, PositionAccountPort, ProtectionKind, ReplaceOutcome, ReplacementProtocol,
-        SettlementPort, SettlementRecord, StopCancelOutcome, StopParams, StopRef,
-        SubmitAttemptLedger, TradePage, TradingPort, Venue, VenueCapabilities, VenueFinalityRule,
-        VenueId, VenueOrderRecord,
+        replace_cancel_then_place, AccountKind, AccountOpenOrder, AccountPort, CancelAnswer, Cash,
+        EntryOrReduce, ExecutionCostEnvelope, FundingPort, GovernedInventory, Holding,
+        InventoryObservation, InventoryPort, Mark, MarketKind, OrderLookup, OrderObservation,
+        OrderPhase, OrderRef, PlacedStop, PositionAccountPort, ProtectionKind, ReplaceOutcome,
+        ReplacementProtocol, SettlementPort, SettlementRecord, StopCancelOutcome, StopParams,
+        StopRef, SubmitAttemptLedger, TradePage, TradingPort, Venue, VenueCapabilities,
+        VenueFinalityRule, VenueId, VenueOrderRecord,
     },
     ExecError, OrderResult,
 };
 use rust_decimal::Decimal;
+use tracing::warn;
 
 use super::{
     cache::{SpotRulesCache, SpotRulesError},
@@ -60,6 +67,9 @@ pub const SPOT_FINALITY: VenueFinalityRule = VenueFinalityRule::EveryAttemptReje
 
 /// Client ids the attempt ledger tracks, as on USD-M.
 const SUBMIT_ATTEMPTS_CAPACITY: usize = 4096;
+
+/// The most trade pages a composite wrapper reads for one order (C3).
+const COMPOSITE_TRADE_PAGES: usize = 5;
 
 /// The Binance spot venue.
 pub struct BinanceSpotAdapter {
@@ -110,14 +120,70 @@ impl BinanceSpotAdapter {
     pub(super) fn ledger(&self) -> &SubmitAttemptLedger {
         &self.submit_attempts
     }
-}
 
-/// What a method that cancels or replaces an order answers before 8c-3b: a
-/// proven no-send.
-fn not_yet(what: &str) -> ExecError {
-    ExecError::Config(format!(
-        "binance:spot {what} arrives with ADR-0056 step 8, PR 8c-3b; nothing was sent"
-    ))
+    /// The fills rule (8c plan §4) over at most five trade pages from id 0:
+    /// the order's result when it is terminal with execution and its
+    /// distinct-id trades sum exactly to `executedQty`. `None` with no read
+    /// when it is not terminal or nothing executed; `None` when a read fails,
+    /// the pages run out, or the trades do not sum. Never more than five
+    /// requests.
+    async fn terminal_fills(
+        &self,
+        symbol: &Symbol,
+        record: &VenueOrderRecord,
+    ) -> Option<OrderResult> {
+        if record.phase != OrderPhase::Terminal || record.executed_qty <= Decimal::ZERO {
+            return None;
+        }
+        let mut trades = Vec::new();
+        let mut from_id = 0;
+        for _ in 0..COMPOSITE_TRADE_PAGES {
+            let page =
+                self.order_trades_page(symbol, &record.exchange_order_id, from_id).await.ok()?;
+            trades.extend(page.trades);
+            match page.next_from_id {
+                Some(next) => from_id = next,
+                None => return trading::terminal_result(record, trades),
+            }
+        }
+        None
+    }
+
+    /// One lookup by exchange id, then the fills rule: the result of a
+    /// terminal order with execution. `None` when it has not executed or is
+    /// not terminal, when the venue does not know it (HTTP 400 -2013) and
+    /// when it is archived (HTTP 400 -2026, nothing executed). `Err` when the
+    /// read fails, and when it executed and its trades could not be
+    /// established. `protective` refuses an order that is not a stop.
+    async fn executed_order(
+        &self,
+        symbol: &Symbol,
+        order_id: &str,
+        protective: bool,
+    ) -> Result<Option<OrderResult>, ExecError> {
+        let by = OrderRef::ExchangeId(order_id.to_string());
+        let record = match self.observe_order(symbol, &by).await? {
+            OrderObservation::Found(record) => record,
+            OrderObservation::NotFound | OrderObservation::Archived => return Ok(None),
+        };
+        if protective && record.protection_kind.is_none() {
+            return Err(ExecError::Exchange(format!(
+                "binance:spot order {order_id} on {} is a {}, not a protective stop",
+                record.symbol, record.order_type
+            )));
+        }
+        if record.phase != OrderPhase::Terminal || record.executed_qty <= Decimal::ZERO {
+            return Ok(None);
+        }
+        match self.terminal_fills(symbol, &record).await {
+            Some(result) => Ok(Some(result)),
+            None => Err(ExecError::Exchange(format!(
+                "binance:spot order {order_id} executed {} but its trades were not established \
+                 within {COMPOSITE_TRADE_PAGES} pages",
+                record.executed_qty
+            ))),
+        }
+    }
 }
 
 /// A failed read: a timeout stays a timeout, the rest keeps its typed text.
@@ -389,25 +455,83 @@ impl TradingPort for BinanceSpotAdapter {
         .await
     }
 
+    /// Composite (C3), for conformance and legacy callers only: one cancel
+    /// ([`InventoryPort::cancel_order_once`]); after HTTP 400 -2011 or -2013,
+    /// one lookup by exchange id; then at most five trade pages. At most 7
+    /// requests, weight 30.
+    ///
+    /// `Cancelled` only when the cancel's own answer is terminal and
+    /// consistent, its execution as `filled_before_cancel`. After a
+    /// not-found, `AlreadyGone` with what the lookup establishes; a further
+    /// not-found, an archive or a failed lookup proves nothing (`Unknown`).
+    /// `Terminal.fills` follows the fills rule. Anything else is `Unknown`.
     async fn cancel_protection(
         &self,
-        _symbol: &Symbol,
-        _stop: &StopRef,
+        symbol: &Symbol,
+        stop: &StopRef,
     ) -> Result<StopCancelOutcome, ExecError> {
-        Err(not_yet("cancel_protection"))
+        match self.cancel_order_once(symbol, &stop.exchange_order_id).await? {
+            CancelAnswer::Cancelled(record) => Ok(StopCancelOutcome::Cancelled {
+                filled_before_cancel: record.executed_qty,
+                fills: self.terminal_fills(symbol, &record).await,
+            }),
+            CancelAnswer::NotFound { .. } => {
+                let by = OrderRef::ExchangeId(stop.exchange_order_id.clone());
+                let final_state = match self.observe_order(symbol, &by).await {
+                    Ok(OrderObservation::Found(record)) => match order_lookup(&record) {
+                        OrderLookup::Terminal { filled_qty, cancelled_qty, .. } => {
+                            OrderLookup::Terminal {
+                                filled_qty,
+                                cancelled_qty,
+                                fills: self.terminal_fills(symbol, &record).await,
+                            }
+                        },
+                        other => other,
+                    },
+                    _ => OrderLookup::Unknown,
+                };
+                Ok(StopCancelOutcome::AlreadyGone { final_state })
+            },
+            CancelAnswer::Unknown { reason } => {
+                warn!(
+                    symbol = %symbol.as_pair(),
+                    order_id = %stop.exchange_order_id,
+                    %reason,
+                    "Binance spot stop cancel uncertain"
+                );
+                Ok(StopCancelOutcome::Unknown)
+            },
+        }
     }
 
+    /// Cancel-then-place (C6) through [`replace_cancel_then_place`]: the
+    /// cancel wrapper, then, only after a definite cancel of an unexecuted
+    /// stop, one placement under the successor's grant. `Replaced` certifies
+    /// no protection.
     async fn replace_protection(
         &self,
-        _symbol: &Symbol,
-        _old: &StopRef,
-        _new: StopParams,
+        symbol: &Symbol,
+        old: &StopRef,
+        new: StopParams,
     ) -> Result<ReplaceOutcome, ExecError> {
-        Err(not_yet("replace_protection"))
+        replace_cancel_then_place(self, &self.submit_attempts, symbol, old, new).await
     }
 
-    async fn cancel_order(&self, _symbol: &Symbol, _order_id: &str) -> Result<(), ExecError> {
-        Err(not_yet("cancel_order"))
+    /// The legacy cancel: one cancel request. `Ok` only when the venue's own
+    /// answer shows the order cancelled and terminal. Not open (HTTP 400
+    /// -2011 or -2013) is `OrderRejected`, proving nothing about execution;
+    /// anything else is an uncertain `Err`. 8k uses
+    /// [`InventoryPort::cancel_order_once`] and an exact lookup (Q18).
+    async fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<(), ExecError> {
+        match self.cancel_order_once(symbol, order_id).await? {
+            CancelAnswer::Cancelled(_) => Ok(()),
+            CancelAnswer::NotFound { code } => Err(ExecError::OrderRejected(format!(
+                "binance:spot order {order_id} is not open (Binance {code})"
+            ))),
+            CancelAnswer::Unknown { reason } => Err(ExecError::Exchange(format!(
+                "binance:spot cancel of {order_id} uncertain: {reason}"
+            ))),
+        }
     }
 
     /// One `GET /api/v3/order` by `origClientOrderId` (weight 4); no fills.
@@ -430,20 +554,27 @@ impl TradingPort for BinanceSpotAdapter {
         }
     }
 
+    /// Composite (C3): one lookup by exchange id and at most five trade
+    /// pages, weight at most 29. The result of a terminal order with
+    /// execution, with its record and its trades as fills; `None` when it
+    /// has not executed or is not terminal, unknown to the venue or
+    /// archived.
     async fn order_by_exchange_id(
         &self,
-        _symbol: &Symbol,
-        _order_id: &str,
+        symbol: &Symbol,
+        order_id: &str,
     ) -> Result<Option<OrderResult>, ExecError> {
-        Err(not_yet("order_by_exchange_id"))
+        self.executed_order(symbol, order_id, false).await
     }
 
+    /// Composite (C3): [`TradingPort::order_by_exchange_id`] for a stop,
+    /// refusing an order that is not one. `None` until it executes and ends.
     async fn protection_fill(
         &self,
-        _symbol: &Symbol,
-        _stop: &StopRef,
+        symbol: &Symbol,
+        stop: &StopRef,
     ) -> Result<Option<OrderResult>, ExecError> {
-        Err(not_yet("protection_fill"))
+        self.executed_order(symbol, &stop.exchange_order_id, true).await
     }
 
     /// The symbol's open `STOP_LOSS` SELL orders, from one `openOrders`
@@ -589,12 +720,19 @@ impl InventoryPort for BinanceSpotAdapter {
         )))
     }
 
+    /// One `DELETE /api/v3/order` by `orderId` (weight 1), through
+    /// `trading.rs`: no grant, no retry. `Cancelled` only on HTTP 200 whose
+    /// own record is this order's, terminal and consistent; `NotFound` on
+    /// HTTP 400 with -2011 or -2013, which proves nothing about execution;
+    /// `Unknown` for everything else that was sent, a timeout and a failed
+    /// transport included. `Err` is a proven no-send: the gate refused, or
+    /// the id is not a number.
     async fn cancel_order_once(
         &self,
-        _symbol: &Symbol,
-        _order_id: &str,
+        symbol: &Symbol,
+        order_id_text: &str,
     ) -> Result<CancelAnswer, ExecError> {
-        Err(not_yet("cancel_order_once"))
+        trading::cancel_once(&self.client, symbol, order_id(order_id_text)?).await
     }
 
     /// One `GET /api/v3/order` (weight 4): the order's own record, its ids
