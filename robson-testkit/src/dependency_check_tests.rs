@@ -145,3 +145,40 @@ fn metadata_that_is_not_this_workspace_is_refused() {
     deps(&mut no_dev, 1).clear();
     refused(&no_dev, "no workspace package reaches robson-testkit by a dev edge");
 }
+
+/// P2-3 (8d-1b round 1): an incomplete graph proves nothing, whatever its
+/// declared edges say.
+#[test]
+fn an_incomplete_graph_is_refused() {
+    const GHOST: &str = "path+file:///w/ghost#0.1.0";
+    let mut no_nodes = workspace();
+    no_nodes["resolve"]["nodes"] = json!([]);
+    refused(&no_nodes, "`resolve.nodes` is empty");
+
+    let mut no_kinds = workspace();
+    no_kinds["resolve"]["nodes"][0]["deps"][1]["dep_kinds"] = json!([]);
+    refused(&no_kinds, "edge to robson-testkit has no `dep_kinds`");
+
+    let mut ghost_member = workspace();
+    ghost_member["workspace_members"].as_array_mut().unwrap().push(json!(GHOST));
+    refused(&ghost_member, &format!("workspace member {GHOST} is not in `packages`"));
+
+    let mut unresolved_member = workspace();
+    unresolved_member["resolve"]["nodes"].as_array_mut().unwrap().remove(1);
+    refused(
+        &unresolved_member,
+        &format!("workspace member {PROJECTOR} is not in `resolve.nodes`"),
+    );
+
+    let mut ghost_edge = workspace();
+    let deps = ghost_edge["resolve"]["nodes"][3]["deps"].as_array_mut().unwrap();
+    deps.push(resolved(GHOST, "ghost", Value::Null));
+    refused(&ghost_edge, &format!("has an edge to {GHOST}, which is not in `packages`"));
+
+    let mut unshown = workspace();
+    unshown["resolve"]["nodes"][0]["deps"].as_array_mut().unwrap().remove(1);
+    refused(
+        &unshown,
+        &format!("the declared dev edge from {ROBSOND} to robson-testkit is not in"),
+    );
+}

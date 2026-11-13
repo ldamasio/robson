@@ -11,10 +11,16 @@
 //!
 //! **Input that proves nothing is refused:** empty input, input that is not
 //! JSON, a `version` other than 1, no `packages`, `workspace_members` or
-//! `resolve`, `robson-testkit` not a workspace member, or no workspace
-//! package reaching it by a `dev` edge (the real workspace has two, `robsond`
-//! and `robson-projector`). So a failed or truncated `cargo metadata` can
-//! never pass as "no violation".
+//! `resolve`, an incomplete graph (a workspace member missing from
+//! `packages` or from `resolve.nodes`, no nodes, a node or an edge naming a
+//! package `packages` does not list, an edge to `robson-testkit` with no
+//! `dep_kinds`, a declared dev edge the resolved graph does not show),
+//! `robson-testkit` not a workspace member, or no workspace package reaching
+//! it by a `dev` edge (the real workspace has two, `robsond` and
+//! `robson-projector`). So a failed or truncated `cargo metadata` can never
+//! pass as "no violation".
+
+use std::collections::BTreeSet;
 
 use serde_json::Value;
 
@@ -62,8 +68,10 @@ pub fn check(metadata: &str) -> Result<Summary, Vec<String>> {
     let metadata: Value = serde_json::from_str(metadata)
         .map_err(|error| vec![format!("input is not cargo metadata's JSON: {error}")])?;
     shape(&metadata).map_err(|why| vec![format!("input is not cargo metadata: {why}")])?;
+    references(&metadata).map_err(|why| vec![format!("incomplete metadata: {why}")])?;
     let mut violations = Vec::new();
     let mut dev_dependents = Vec::new();
+    let mut declared_dev = BTreeSet::new();
     let members = array(&metadata, "workspace_members").map_err(|e| vec![e])?;
     let member = |id: &str| members.iter().any(|m| m.as_str() == Some(id));
     let mut testkit = None;
@@ -82,7 +90,10 @@ pub fn check(metadata: &str) -> Result<Summary, Vec<String>> {
                 continue;
             }
             match kind(dependency).map_err(|e| vec![format!("{name}: {e}")])? {
-                "dev" if member(id) => dev_dependents.push(name.to_string()),
+                "dev" if member(id) => {
+                    dev_dependents.push(name.to_string());
+                    declared_dev.insert(id);
+                },
                 "dev" => {},
                 kind => violations.push(describe(name, kind, dependency)),
             }
@@ -93,7 +104,14 @@ pub fn check(metadata: &str) -> Result<Summary, Vec<String>> {
             "{TESTKIT} is not a workspace member: not this workspace"
         )]);
     };
-    resolved(&metadata, testkit, &mut violations).map_err(|why| vec![why])?;
+    let resolved_dev = resolved(&metadata, testkit, &mut violations)
+        .map_err(|why| vec![format!("incomplete metadata: {why}")])?;
+    if let Some(missing) = declared_dev.iter().find(|id| !resolved_dev.contains(**id)) {
+        return Err(vec![format!(
+            "incomplete metadata: the declared dev edge from {missing} to {TESTKIT} is not in the \
+             resolved graph"
+        )]);
+    }
     if !violations.is_empty() {
         return Err(violations);
     }
@@ -133,17 +151,68 @@ fn describe(package: &str, kind: &str, dependency: &Value) -> String {
     how
 }
 
-/// Every resolved edge to `testkit`'s package id must be `dev` only.
-fn resolved(metadata: &Value, testkit: &str, violations: &mut Vec<String>) -> Result<(), String> {
+/// The graph's references hold together: every workspace member is a listed
+/// package and a resolved node; there are nodes; every node and every edge
+/// names a listed package.
+fn references(metadata: &Value) -> Result<(), String> {
+    let mut packages = BTreeSet::new();
+    for package in array(metadata, "packages")? {
+        packages.insert(text(package, "id")?);
+    }
+    let nodes = array(field(metadata, "resolve")?, "nodes")?;
+    if nodes.is_empty() {
+        return Err("`resolve.nodes` is empty".to_string());
+    }
+    let mut resolved = BTreeSet::new();
+    for node in nodes {
+        let id = text(node, "id")?;
+        if !packages.contains(id) {
+            return Err(format!("resolved node {id} is not in `packages`"));
+        }
+        resolved.insert(id);
+        for dep in array(node, "deps")? {
+            let pkg = text(dep, "pkg")?;
+            if !packages.contains(pkg) {
+                return Err(format!("{id} has an edge to {pkg}, which is not in `packages`"));
+            }
+        }
+    }
+    for member in array(metadata, "workspace_members")? {
+        let member = member.as_str().ok_or("a workspace member that is not a string")?;
+        if !packages.contains(member) {
+            return Err(format!("workspace member {member} is not in `packages`"));
+        }
+        if !resolved.contains(member) {
+            return Err(format!("workspace member {member} is not in `resolve.nodes`"));
+        }
+    }
+    Ok(())
+}
+
+/// Every resolved edge to `testkit`'s package id must be `dev` only, and
+/// say so: an edge with no `dep_kinds` proves nothing. Returns the packages
+/// with a resolved dev edge to it.
+fn resolved<'a>(
+    metadata: &'a Value,
+    testkit: &str,
+    violations: &mut Vec<String>,
+) -> Result<BTreeSet<&'a str>, String> {
+    let mut dev = BTreeSet::new();
     for node in array(field(metadata, "resolve")?, "nodes")? {
         let from = text(node, "id")?;
         for dep in array(node, "deps")? {
             if text(dep, "pkg")? != testkit {
                 continue;
             }
-            for dep_kind in array(dep, "dep_kinds")? {
+            let dep_kinds = array(dep, "dep_kinds")?;
+            if dep_kinds.is_empty() {
+                return Err(format!("{from}'s edge to {TESTKIT} has no `dep_kinds`"));
+            }
+            for dep_kind in dep_kinds {
                 match kind(dep_kind)? {
-                    "dev" => {},
+                    "dev" => {
+                        dev.insert(from);
+                    },
                     kind => violations.push(format!(
                         "resolved: {from} reaches {TESTKIT} by a {kind} edge{}",
                         dep_kind
@@ -156,5 +225,5 @@ fn resolved(metadata: &Value, testkit: &str, violations: &mut Vec<String>) -> Re
             }
         }
     }
-    Ok(())
+    Ok(dev)
 }
