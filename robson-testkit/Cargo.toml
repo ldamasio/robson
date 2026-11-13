@@ -26,4 +26,4 @@ robson-projector = { path = "../robson-projector" }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 # The drift guard of the spot-adapter mirror (spot_mirror_tests.rs).
-sha2 = "0.10"
+sha2 = "0.11"
