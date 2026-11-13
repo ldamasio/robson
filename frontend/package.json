@@ -18,9 +18,9 @@
     "lint": "prettier --check . && eslint ."
   },
   "devDependencies": {
-    "@playwright/test": "^1.64.1",
-    "@sveltejs/adapter-static": "^3.0.10",
-    "@sveltejs/kit": "^2.70.3",
+    "@playwright/test": "^1.65.0",
+    "@sveltejs/adapter-static": "^3.0.11",
+    "@sveltejs/kit": "^2.70.4",
     "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@types/node": "^20.19.43",
     "eslint": "^10.14.0",
