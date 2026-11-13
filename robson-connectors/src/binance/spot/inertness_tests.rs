@@ -1,19 +1,24 @@
-//! ADR-0056 steps 8a, 8b and 8c-2a merge inert (SD12, design note v16 §12.2).
+//! ADR-0056 steps 8a, 8b, 8c-2a and 8c-2b merge inert (SD12, design note v16
+//! §12.2).
 //!
 //! Lexical regression checks over the workspace's Rust sources as they are on
-//! disk, backed by a review of each part's diff and call paths:
+//! disk, backed by a review of each part's diff and call paths (a name split
+//! across lines, generated code or a file these filters skip can escape them):
 //! - nothing outside `binance/spot/` reaches this module, names a type it
 //!   defines or names a spot endpoint, so no production path, factory included,
-//!   can construct its reader, feed, klines or rules cache;
+//!   can construct its reader, feed, klines, rules cache or venue;
 //! - 8a's readers, 8c-2a's rules projection and rules cache import no
-//!   `robson_exec` contract and implement no port. 8b's feed and klines import
+//!   `robson_exec` item and implement no port. 8b's feed and klines import
 //!   exactly the existing items of the port each implements (`TradeFeedPort`,
-//!   `OhlcvPort`) and nothing else, so no spot source uses anything 8c-2b or a
-//!   later step introduces there;
-//! - they send no mutation, read no configuration and name no testnet host.
+//!   `OhlcvPort`). 8c-2b's venue, `exchange.rs`, imports exactly the venue
+//!   contracts it implements and the types they carry, by path;
+//! - they send no mutation, read no configuration and name no testnet host. The
+//!   venue's order-sending methods refuse with nothing sent until 8c-3
+//!   (`adapter_tests.rs`).
 //!
 //! `robsond`'s venue tests check the other half: the factory still refuses
-//! `binance_spot`, and builds no feed on the spot stream base.
+//! `binance_spot`, builds no spot venue, and builds no feed on the spot stream
+//! base.
 
 use std::{
     fs,
@@ -135,12 +140,106 @@ fn code_only(text: &str) -> String {
         .join("\n")
 }
 
-/// The `robson_exec` items each 8b adapter takes: the existing port it
-/// implements, with that port's own types. No other spot file takes any.
-const PORT_ITEMS: [(&str, &[&str]); 2] = [
+/// The `robson_exec` items each adapter takes, by path: 8b's feed and klines
+/// the existing port each implements, with that port's own types; 8c's venue
+/// exactly the venue contracts it implements and the types they carry. No
+/// other spot file takes any.
+const PORT_ITEMS: [(&str, &[&str]); 3] = [
     ("market_data.rs", &["TradeFeedMessage", "TradeFeedPort", "TradeStream"]),
     ("ohlcv.rs", &["CandleInterval", "ExecError", "OhlcvPort"]),
+    ("exchange.rs", &[
+        "ExecError",
+        "OrderResult",
+        "gate::OperationGate",
+        "order_journal::OrderJournal",
+        "ports::OpenOrderRecord",
+        "ports::TradeFill",
+        "ports::UserTradeRecord",
+        "venue::AccountKind",
+        "venue::AccountOpenOrder",
+        "venue::AccountPort",
+        "venue::CancelAnswer",
+        "venue::Cash",
+        "venue::EntryOrReduce",
+        "venue::ExecutionCostEnvelope",
+        "venue::FundingPort",
+        "venue::GovernedInventory",
+        "venue::Holding",
+        "venue::InventoryObservation",
+        "venue::InventoryPort",
+        "venue::Mark",
+        "venue::MarketKind",
+        "venue::OrderLookup",
+        "venue::OrderObservation",
+        "venue::OrderPhase",
+        "venue::OrderRef",
+        "venue::PlacedStop",
+        "venue::PositionAccountPort",
+        "venue::ProtectionKind",
+        "venue::ReplaceOutcome",
+        "venue::ReplacementProtocol",
+        "venue::SettlementPort",
+        "venue::SettlementRecord",
+        "venue::StopCancelOutcome",
+        "venue::StopParams",
+        "venue::StopRef",
+        "venue::SubmitAttemptLedger",
+        "venue::TradePage",
+        "venue::TradingPort",
+        "venue::Venue",
+        "venue::VenueCapabilities",
+        "venue::VenueFinalityRule",
+        "venue::VenueId",
+        "venue::VenueOrderRecord",
+    ]),
 ];
+
+/// The paths a `use` group names, nested groups flattened: `{A, b::{C, D}}`
+/// is `A`, `b::C` and `b::D`. `group` is what lies inside the outer braces.
+fn flatten_group(group: &str, prefix: &str, out: &mut Vec<String>) {
+    let (mut depth, mut start) = (0, 0);
+    let mut parts = Vec::new();
+    for (at, c) in group.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&group[start..at]);
+                start = at + 1;
+            },
+            _ => {},
+        }
+    }
+    parts.push(&group[start..]);
+    for part in parts.into_iter().map(str::trim).filter(|part| !part.is_empty()) {
+        match (part.find('{'), part.rfind('}')) {
+            (Some(open), Some(close)) => {
+                let head = part[..open].trim().trim_end_matches("::");
+                flatten_group(&part[open + 1..close], &format!("{prefix}{head}::"), out);
+            },
+            _ => out.push(format!("{prefix}{part}")),
+        }
+    }
+}
+
+/// The paths of `code`'s `use robson_exec::{...};`, when it has one.
+fn robson_exec_imports(code: &str) -> Option<Vec<String>> {
+    let at = code.find("use robson_exec::{")?;
+    let body = &code[at + "use robson_exec::{".len()..];
+    let mut depth = 1;
+    let close = body.char_indices().find_map(|(at, c)| {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {},
+        }
+        (depth == 0).then_some(at)
+    })?;
+    let mut items = Vec::new();
+    flatten_group(&body[..close], "", &mut items);
+    items.sort();
+    Some(items)
+}
 
 /// Contracts a spot file may name only when its allow-list holds them.
 const CONTRACTS: [&str; 15] = [
@@ -183,23 +282,17 @@ fn port_contract_violations(file: &str, code: &str) -> Vec<String> {
             violations.push("takes from robson_exec".to_string());
         }
     } else {
-        let imported = code.find("use robson_exec::{").map(|at| {
-            let rest = &code[at + "use robson_exec::{".len()..];
-            let mut items: Vec<&str> = rest[..rest.find("};").unwrap_or(rest.len())]
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .collect();
-            items.sort_unstable();
-            items
-        });
-        let mut expected = allowed.to_vec();
-        expected.sort_unstable();
+        let imported = robson_exec_imports(code);
+        let mut expected: Vec<String> = allowed.iter().map(|item| item.to_string()).collect();
+        expected.sort();
         if uses != 1 || imported.as_ref() != Some(&expected) {
             violations.push(format!("takes {imported:?} from robson_exec, not {expected:?}"));
         }
     }
-    for contract in CONTRACTS.iter().filter(|contract| !allowed.contains(contract)) {
+    // A contract is allowed by its own name, whatever path the import took.
+    let names: Vec<&str> =
+        allowed.iter().map(|item| item.rsplit("::").next().unwrap_or(item)).collect();
+    for contract in CONTRACTS.iter().filter(|contract| !names.contains(contract)) {
         if has_word(code, contract) {
             violations.push(format!("names {contract}"));
         }
@@ -265,11 +358,64 @@ fn the_matchers_find_what_they_look_for() {
         "SpotTradeSet",
         "SpotCommission",
         "MY_TRADES_MAX_PAGES",
+        "BinanceSpotAdapter",
+        "SPOT_FINALITY",
         "SpotTradePage",
         "SpotRulesCache",
         "SpotRulesError",
     ] {
         assert!(names.iter().any(|name| name == expected), "{expected} in {names:?}");
+    }
+}
+
+/// Nested `use` groups flatten to paths, whatever their layout.
+#[test]
+fn a_use_group_flattens_to_its_paths() {
+    let code = "use robson_exec::{\n    gate::OperationGate,\n    venue::{\n        TradingPort, \
+                Venue,\n    },\n    ExecError,\n};\nfn f() {}";
+    assert_eq!(
+        robson_exec_imports(code),
+        Some(vec![
+            "ExecError".to_string(),
+            "gate::OperationGate".to_string(),
+            "venue::TradingPort".to_string(),
+            "venue::Venue".to_string(),
+        ])
+    );
+    assert_eq!(robson_exec_imports("use robson_exec::*;"), None);
+}
+
+/// 8c-2's venue takes its exact list: nothing missing, nothing more, no glob,
+/// no inline path, and no feed or klines contract.
+#[test]
+fn the_venue_takes_exactly_its_own_items() {
+    let (_, items) = PORT_ITEMS.iter().find(|(file, _)| *file == "exchange.rs").unwrap();
+    let group = |items: &[&str]| format!("use robson_exec::{{{}}};", items.join(", "));
+    assert_eq!(port_contract_violations("exchange.rs", &group(items)), Vec::<String>::new());
+    let fewer = &items[1..];
+    let more: Vec<&str> = items.iter().copied().chain(["venue::observe_account"]).collect();
+    let mut crossing = vec![
+        group(fewer),
+        group(&more),
+        "use robson_exec::*;".to_string(),
+        format!("{}\nfn f(_: robson_exec::gate::OperationGate) {{}}", group(items)),
+    ];
+    for contract in [
+        "TradeFeedPort",
+        "TradeStream",
+        "TradeFeedMessage",
+        "OhlcvPort",
+        "MarketDataPort",
+    ] {
+        crossing.push(format!("{}\nfn f(_: &dyn {contract}) {{}}", group(items)));
+    }
+    for code in crossing {
+        assert!(!port_contract_violations("exchange.rs", &code).is_empty(), "admits {code}");
+    }
+    // Its items are nobody else's: 8a's readers, the projection and the cache
+    // take nothing.
+    for file in ["rest.rs", "rules.rs", "cache.rs", "records.rs", "trades.rs"] {
+        assert!(!port_contract_violations(file, &group(items)).is_empty(), "{file}");
     }
 }
 
@@ -381,9 +527,10 @@ fn the_port_allow_list_admits_only_each_adapter_s_own_items() {
     }
 }
 
-/// SD12 point 1: 8a's readers take nothing from `robson_exec`, where the
-/// port contracts and 8c's additions live, and 8b's feed and klines take only
-/// the existing port each implements. No spot source uses a later contract.
+/// SD12 point 1: 8a's readers, the rules projection and the cache take nothing
+/// from `robson_exec`, where the port contracts and 8c's additions live; 8b's
+/// feed and klines take only the existing port each implements, and 8c-2's
+/// venue only its exact list. No spot source uses another contract.
 #[test]
 fn the_spot_module_uses_no_port_contract_beyond_8b_s_ports() {
     let sources = spot_production_sources();
