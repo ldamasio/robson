@@ -14,8 +14,8 @@ use robson_exec::{
     order_journal::{IntentKind, IntentSpec, OrderJournal, StubJournalBackend, WriteClass},
     ports::{FeeEvidence, FeeGap},
     venue::{
-        AttemptEvidence, EntryOrReduce, OrderPhase, PlacedStop, ProtectionKind, TradingPort, Venue,
-        VenueId,
+        AttemptEvidence, EntryOrReduce, InventoryPort, OrderObservation, OrderPhase, OrderRef,
+        PlacedStop, ProtectionKind, TradingPort, Venue, VenueId,
     },
     ExecError, OrderResult,
 };
@@ -34,6 +34,8 @@ const EXCHANGE_INFO: &str = include_str!("testdata/exchange_info_btcusdt.json");
 const ORDER_FULL: &str = include_str!("testdata/order_full.json");
 const ORDER_RESULT: &str = include_str!("testdata/order_result.json");
 const ERRORS: &str = include_str!("testdata/errors.json");
+const ORDER: &str = include_str!("testdata/order.json");
+const MY_TRADES: &str = include_str!("testdata/my_trades.json");
 
 /// The fills' quote in the documented `FULL` answer: Σ price × qty.
 const FILLS_QUOTE: Decimal = dec!(39983);
@@ -983,4 +985,96 @@ async fn a_non_ascii_symbol_goes_encoded_as_one_value() {
         "timestamp",
         "type"
     ]);
+}
+
+/// `value` with its percent-escapes decoded, as Binance reads a query value.
+fn decoded(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' && at + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[at + 1..at + 3]).unwrap();
+            out.push(u8::from_str_radix(hex, 16).unwrap());
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).unwrap()
+}
+
+/// A MARKET order on a symbol with non-ASCII characters, then its recovery
+/// reads: the lookup by exchange id and a trade page. The stand-in checks
+/// each signature over the query exactly as it arrived on the wire and
+/// refuses a mismatch with -1022, as Binance would; every request passes,
+/// and each answer, keyed by the decoded symbol, reads back whole.
+#[tokio::test]
+async fn a_non_ascii_symbol_is_placed_and_recovered_with_valid_signatures() {
+    let (client, seen) = stand_in::serve(|request| {
+        let symbol = decoded(request.param("symbol").unwrap());
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/api/v3/order") => {
+                (200, full(request, |answer| answer["symbol"] = json!(symbol)))
+            },
+            ("GET", "/api/v3/order") => {
+                let mut order: Value = serde_json::from_str(ORDER).unwrap();
+                order["symbol"] = json!(symbol);
+                order["orderId"] = json!(28);
+                (200, order.to_string())
+            },
+            ("GET", "/api/v3/myTrades") => {
+                let mut trades: Value = serde_json::from_str(MY_TRADES).unwrap();
+                trades[0]["symbol"] = json!(symbol);
+                trades[0]["orderId"] = json!(28);
+                (200, trades.to_string())
+            },
+            other => panic!("unexpected request {other:?}"),
+        }
+    })
+    .await;
+    let venue = BinanceSpotAdapter::new(client).unwrap();
+    let journal = spot_journal();
+    venue.attach_order_journal(Arc::clone(&journal));
+    let named = Symbol::new("１２３".to_string(), "USDT".to_string()).unwrap();
+    let place = venue.place_market_order(
+        &named,
+        OrderSide::Sell,
+        qty(dec!(10)),
+        "x-1",
+        EntryOrReduce::Reduce,
+    );
+    let placed = granted(&journal, "x-1", IntentKind::Exit, place).await.unwrap();
+    assert_eq!(placed.record().unwrap().symbol, "１２３USDT");
+    let by = OrderRef::ExchangeId(placed.exchange_order_id.clone());
+    let observed = venue.observe_order(&named, &by).await.unwrap();
+    assert!(matches!(&observed, OrderObservation::Found(record) if record.symbol == "１２３USDT"));
+    let page = venue.order_trades_page(&named, "28", 0).await.unwrap();
+    assert_eq!(page.trades.len(), 1);
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 3);
+    for request in &seen {
+        assert!(request.signature_valid, "{} {}?{}", request.method, request.path, request.query);
+        assert!(request.query.contains("symbol=%EF%BC%91%EF%BC%92%EF%BC%93USDT"), "{request:?}");
+    }
+}
+
+/// A redirect on a read is its answer: one request, the original status,
+/// nothing (the key included) sent where `Location` points.
+#[tokio::test]
+async fn a_read_follows_no_redirect() {
+    for status in [301, 302, 303, 307, 308] {
+        let (sink, sink_seen) = stand_in::listening(|_| (200, "{}".to_string())).await;
+        let (client, seen) = stand_in::redirecting(status, format!("{sink}/api/v3/order")).await;
+        let venue = BinanceSpotAdapter::new(client).unwrap();
+        let observed = venue.observe_order(btc(), &OrderRef::ExchangeId("28".to_string())).await;
+        let Err(ExecError::Exchange(why)) = observed else {
+            panic!("{status}: {observed:?}");
+        };
+        assert!(why.contains(&format!("HTTP {status}")), "{status}: {why}");
+        assert!(venue.price(btc()).await.is_err(), "{status}: a public read");
+        assert_eq!(seen.lock().unwrap().len(), 2, "{status}: one request each");
+        assert_eq!(requests(&sink_seen), Vec::<String>::new(), "{status}: nothing followed");
+    }
 }

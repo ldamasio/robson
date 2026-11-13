@@ -342,6 +342,8 @@ fn without_from_id_or_a_time_the_venue_answers_the_most_recent_trades() {
         path: "/api/v3/myTrades".to_string(),
         params: params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         api_key: true,
+        query: String::new(),
+        signature_valid: true,
     };
     let first_and_last = |params: &[(&str, &str)]| {
         let page: Vec<Value> = serde_json::from_str(&answer(&request(params)).1).unwrap();

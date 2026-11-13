@@ -4,6 +4,11 @@
 //! (`build_signed_query`) and its one request bound, on the host its path
 //! rule picks for `/api/v3/` (the spot host; `Endpoints::base_url` is not a
 //! host table, ADR §4). None passes the mutation gate: none is a mutation.
+//! Since 8c-3 every read uses the client's spot read helpers: each value
+//! percent-encoded before signing, so a non-ASCII symbol's signature covers
+//! the query as sent, and one request on a transport that follows no
+//! redirect and retries nothing (`get_signed_spot_answer`,
+//! `get_public_spot_answer`).
 //!
 //! Errors stay raw and typed. `-2013`, `-2026`, `-1007`, a 5XX and a
 //! client-side timeout are each their own variant, with the HTTP status kept,
@@ -244,9 +249,9 @@ impl SpotRestReader {
         #[cfg(test)]
         self.sent.lock().unwrap().push(read);
         let answer = if read.signed {
-            self.client.get_signed_answer(read.path, params).await?
+            self.client.get_signed_spot_answer(read.path, params).await?
         } else {
-            self.client.get_public_answer(read.path, params).await?
+            self.client.get_public_spot_answer(read.path, params).await?
         };
         if answer.status.is_success() {
             Ok(answer.body)

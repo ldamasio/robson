@@ -20,6 +20,9 @@
 //!   would pass it; review establishes the lazy path. No spot file calls the
 //!   non-answer forms (`.post(`, `post_signed(`, `delete_signed(`), names the
 //!   gate, or holds an HTTP client; cancelling waits for 8c-3b;
+//! - every read goes through the client's spot read helpers, encoded and
+//!   single-shot, from the reader (`rest.rs`) and the klines (`ohlcv.rs`,
+//!   public only); no spot file names a legacy GET helper (8c-3, round 2);
 //! - they read no configuration and name no testnet host.
 //!
 //! `robsond`'s venue tests check the other half: the factory still refuses
@@ -588,7 +591,7 @@ fn the_feed_and_the_klines_read_public_market_data_only() {
         code_only(text)
     };
     let ohlcv = code("ohlcv.rs");
-    assert!(ohlcv.contains("get_public_answer"));
+    assert!(ohlcv.contains("get_public_spot_answer"));
     for signed in ["get_signed", "build_signed_query", "api_key"] {
         assert!(!ohlcv.contains(signed), "ohlcv.rs contains {signed}");
     }
@@ -698,6 +701,74 @@ fn mutation_violations(file: &str, text: &str) -> Vec<String> {
         }
     }
     violations
+}
+
+/// How `text`, the spot production file `file`, could read other than
+/// through the client's spot read helpers (encoded, single-shot): a legacy
+/// GET helper by name, which signs raw values and follows redirects, or a
+/// spot read helper outside the reader (`rest.rs`, both) and the klines
+/// (`ohlcv.rs`, the public one).
+fn read_violations(file: &str, text: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    for legacy in [
+        "get_signed_answer",
+        "get_public_answer",
+        "get_signed",
+        "get_public",
+    ] {
+        if has_word(text, legacy) {
+            violations.push(format!("names the legacy {legacy}"));
+        }
+    }
+    let allowed: &[&str] = match file {
+        "rest.rs" => &["get_signed_spot_answer", "get_public_spot_answer"],
+        "ohlcv.rs" => &["get_public_spot_answer"],
+        _ => &[],
+    };
+    for helper in ["get_signed_spot_answer", "get_public_spot_answer"] {
+        if !allowed.contains(&helper) && has_word(text, helper) {
+            violations.push(format!("names {helper} outside its reader"));
+        }
+    }
+    violations
+}
+
+/// The read checker refuses the legacy GET helpers anywhere and the spot
+/// read helpers outside their readers, and admits each reader's own.
+#[test]
+fn the_read_checker_refuses_every_legacy_or_stray_read() {
+    let reader = "let a = self.client.get_signed_spot_answer(p, q).await?;\n\
+                  let b = self.client.get_public_spot_answer(p, q).await?;";
+    assert_eq!(read_violations("rest.rs", reader), Vec::<String>::new());
+    let klines = "self.client.get_public_spot_answer(SpotRead::KLINES.path, params)";
+    assert_eq!(read_violations("ohlcv.rs", klines), Vec::<String>::new());
+    for (file, code) in [
+        ("rest.rs", "self.client.get_signed_answer(read.path, params)"),
+        ("rest.rs", "self.client.get_public_answer(read.path, params)"),
+        ("rest.rs", "self.client.get_signed(read.path, params)"),
+        ("ohlcv.rs", "self.client.get_public_answer(SpotRead::KLINES.path, params)"),
+        ("ohlcv.rs", "self.client.get_signed_spot_answer(SpotRead::KLINES.path, params)"),
+        ("exchange.rs", "self.client.get_signed_spot_answer(p, q)"),
+        ("trading.rs", "client.get_public_spot_answer(p, q)"),
+    ] {
+        assert!(!read_violations(file, code).is_empty(), "{file} admits {code}");
+    }
+}
+
+/// Every spot read goes through the spot read helpers, from the reader and
+/// the klines only, and the reader uses both.
+#[test]
+fn the_spot_module_reads_only_through_the_spot_read_helpers() {
+    let sources = spot_production_sources();
+    for (path, text) in &sources {
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        let violations = read_violations(&file, &code_only(text));
+        assert!(violations.is_empty(), "{}: {violations:?}", path.display());
+    }
+    let (_, rest) = sources.iter().find(|(path, _)| path.ends_with("rest.rs")).unwrap();
+    for helper in ["get_signed_spot_answer", "get_public_spot_answer"] {
+        assert!(has_word(&code_only(rest), helper), "rest.rs reads through {helper}");
+    }
 }
 
 /// The checker refuses each way around the ledger, and admits the one way
