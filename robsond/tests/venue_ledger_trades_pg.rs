@@ -356,7 +356,12 @@ async fn trade_pre_read_has_a_bounded_deadline_and_retires_connection(pool: PgPo
     proxy.set_mode(ProxyMode::Blackhole);
     let started = Instant::now();
     assert!(matches!(
-        ledger.record_trades(&key, &page(1, dec!(1)), at()).await,
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            ledger.record_trades(&key, &page(1, dec!(1)), at())
+        )
+        .await
+        .expect("trade pre-read exceeded its outer deadline"),
         Err(LedgerError::Backend(_))
     ));
     assert!(started.elapsed() < Duration::from_secs(3));
@@ -426,7 +431,12 @@ async fn a_touch_timeout_is_uncertain_and_retires_its_connection(pool: PgPool) {
     proxy.set_mode(ProxyMode::Blackhole);
     let started = Instant::now();
     assert!(matches!(
-        ledger.touch_checked(&key, at() + chrono::Duration::seconds(1)).await,
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            ledger.touch_checked(&key, at() + chrono::Duration::seconds(1))
+        )
+        .await
+        .expect("touch exceeded its outer deadline"),
         Err(LedgerError::Uncertain(_))
     ));
     assert!(started.elapsed() < Duration::from_secs(3));
