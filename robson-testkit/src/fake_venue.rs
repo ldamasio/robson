@@ -363,22 +363,41 @@ fn neither(id: &str, client: &str) -> Refusal {
     (StatusCode::BAD_REQUEST, -1102, msg)
 }
 
+/// The new lookup routes validate values without changing the legacy
+/// placement/cancellation parameter helpers.
+fn lookup_value<'a>(value: &'a str, name: &str) -> Result<&'a str, Refusal> {
+    if value.trim().is_empty() {
+        return Err(malformed_lookup(name));
+    }
+    Ok(value)
+}
+
+fn malformed_lookup(name: &str) -> Refusal {
+    let msg = format!("Mandatory parameter '{name}' was not sent, was empty/null, or malformed.");
+    (StatusCode::BAD_REQUEST, -1102, msg)
+}
+
+fn lookup_id(value: &str, name: &str) -> Result<i64, Refusal> {
+    lookup_value(value, name)?.parse().map_err(|_| malformed_lookup(name))
+}
+
 /// `GET /fapi/v1/order`: `symbol` and `orderId` or `origClientOrderId`
 /// (Query Order), a market order on that symbol.
 fn order_record(book: &Book, params: &HashMap<String, String>) -> Result<Value, Refusal> {
-    let symbol = required(params, "symbol")?;
+    let symbol = lookup_value(required(params, "symbol")?, "symbol")?;
     let on_symbol = |r: &&Value| r["symbol"] == *symbol;
     let found = match (params.get("orderId"), params.get("origClientOrderId")) {
-        (Some(id), _) => book
-            .market_records
-            .iter()
-            .filter(on_symbol)
-            .find(|r| r["orderId"].to_string() == *id),
-        (None, Some(client)) => book
-            .market_records
-            .iter()
-            .filter(on_symbol)
-            .find(|r| r["clientOrderId"] == **client),
+        (Some(id), _) => {
+            let id = lookup_id(id, "orderId")?;
+            book.market_records.iter().filter(on_symbol).find(|r| r["orderId"] == id)
+        },
+        (None, Some(client)) => {
+            let client = lookup_value(client, "origClientOrderId")?;
+            book.market_records
+                .iter()
+                .filter(on_symbol)
+                .find(|r| r["clientOrderId"] == client)
+        },
         (None, None) => return Err(neither("orderId", "origClientOrderId")),
     };
     found.cloned().ok_or_else(no_such_order)
@@ -390,14 +409,13 @@ fn algo_record(book: &Book, params: &HashMap<String, String>) -> Result<Value, R
     let mut all = book.open_algos.values().chain(book.algo_history.iter());
     let found = match (params.get("algoId"), params.get("clientAlgoId")) {
         (Some(id), _) => {
-            let id: i64 = id.parse().map_err(|_| {
-                let msg =
-                    "Mandatory parameter 'algoId' was not sent, was empty/null, or malformed.";
-                (StatusCode::BAD_REQUEST, -1102, msg.to_string())
-            })?;
+            let id = lookup_id(id, "algoId")?;
             all.find(|r| r["algoId"] == id)
         },
-        (None, Some(client)) => all.find(|r| r["clientAlgoId"] == **client),
+        (None, Some(client)) => {
+            let client = lookup_value(client, "clientAlgoId")?;
+            all.find(|r| r["clientAlgoId"] == client)
+        },
         (None, None) => return Err(neither("algoId", "clientAlgoId")),
     };
     found.cloned().ok_or_else(no_such_order)
@@ -744,6 +762,64 @@ mod tests {
         let (status, _) =
             get(format!("{base}/fapi/v1/order?symbol=BTCUSDT&origClientOrderId=m1")).await;
         assert_eq!(status, StatusCode::OK);
+        assert!(venue.unserved_requests().is_empty());
+    }
+
+    /// Codex 8d-2b round 2: an empty parameter is an invalid request,
+    /// never evidence that an order was not accepted.
+    #[tokio::test]
+    async fn lookups_reject_empty_values() {
+        let venue = FakeVenue::start().await.unwrap();
+        let base = venue.url();
+        let cases = [
+            "/fapi/v1/order?symbol=&origClientOrderId=m1",
+            "/fapi/v1/order?symbol=%20&origClientOrderId=m1",
+            "/fapi/v1/order?symbol=BTCUSDT&origClientOrderId=",
+            "/fapi/v1/order?symbol=BTCUSDT&origClientOrderId=%20",
+            "/fapi/v1/order?symbol=BTCUSDT&orderId=",
+            "/fapi/v1/algoOrder?clientAlgoId=",
+            "/fapi/v1/algoOrder?clientAlgoId=%20",
+            "/fapi/v1/algoOrder?algoId=",
+        ];
+        for target in cases {
+            let (status, body) = get(format!("{base}{target}")).await;
+            assert_eq!(
+                (status, body["code"].as_i64()),
+                (StatusCode::BAD_REQUEST, Some(-1102)),
+                "{target}"
+            );
+        }
+        assert!(venue.unserved_requests().is_empty());
+    }
+
+    /// A LONG-valued order ID must parse before the fake can establish
+    /// absence; a valid, unknown ID still has the ordinary not-found answer.
+    #[tokio::test]
+    async fn market_lookup_rejects_malformed_order_ids() {
+        let venue = FakeVenue::start().await.unwrap();
+        let base = venue.url();
+        for id in ["x", "1.0", "9223372036854775808"] {
+            let (status, body) =
+                get(format!("{base}/fapi/v1/order?symbol={FAKE_SYMBOL}&orderId={id}")).await;
+            assert_eq!(
+                (status, body["code"].as_i64()),
+                (StatusCode::BAD_REQUEST, Some(-1102)),
+                "malformed orderId {id}"
+            );
+        }
+        for target in [
+            "/fapi/v1/order?symbol=BTCUSDT&orderId=999",
+            "/fapi/v1/order?symbol=BTCUSDT&origClientOrderId=never",
+            "/fapi/v1/algoOrder?algoId=999",
+            "/fapi/v1/algoOrder?clientAlgoId=never",
+        ] {
+            let (status, body) = get(format!("{base}{target}")).await;
+            assert_eq!(
+                (status, body["code"].as_i64()),
+                (StatusCode::BAD_REQUEST, Some(-2013)),
+                "valid absent lookup {target}"
+            );
+        }
         assert!(venue.unserved_requests().is_empty());
     }
 
