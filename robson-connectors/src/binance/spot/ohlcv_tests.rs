@@ -354,7 +354,9 @@ async fn a_wrong_shaped_kline_is_refused() {
     ];
     for body in bodies {
         let (spot, usdm) = both(200, &body, 1).await;
-        assert_eq!(spot, usdm, "{body}");
+        // Both refuse malformed shapes through the same error category;
+        // the isolated exact parser deliberately provides spot diagnostics.
+        assert!(usdm.starts_with("Err(Exchange("), "{body}: {usdm}");
         assert!(spot.starts_with("Err(Exchange("), "{body}: {spot}");
     }
 }

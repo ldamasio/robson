@@ -7,12 +7,12 @@
 //! - nothing outside `binance/spot/` reaches this module, names a type it
 //!   defines or names a spot endpoint, so no production path, factory included,
 //!   can construct its reader, feed, klines, rules cache or venue;
-//! - 8a's readers, 8c-2a's rules projection and rules cache import no
-//!   `robson_exec` item and implement no port. 8b's feed and klines import
-//!   exactly the existing items of the port each implements (`TradeFeedPort`,
-//!   `OhlcvPort`). 8c-2b's venue, `exchange.rs`, and 8c-3a's order path,
-//!   `trading.rs`, import exactly the contracts they implement or fill and the
-//!   types those carry, by path;
+//! - readers, rules projection and cache implement no port. The exact named
+//!   input boundaries may import 8g1a's pure scalar parser; the cache may not.
+//!   8b's feed and klines additionally import exactly the existing items of the
+//!   port each implements (`TradeFeedPort`, `OhlcvPort`). 8c-2b's venue,
+//!   `exchange.rs`, and 8c-3a's order path, `trading.rs`, import exactly the
+//!   contracts they implement or fill and the types those carry, by path;
 //! - an order leaves only through `trading.rs`: one `post_signed_answer` call,
 //!   inside `SubmitAttemptLedger::submit` on a one-attempt ledger, so it takes
 //!   the journal's grant (8c-1) and the client's gate. A cancel leaves only
@@ -252,6 +252,11 @@ fn flatten_group(group: &str, prefix: &str, out: &mut Vec<String>) {
 
 /// The paths of `code`'s `use robson_exec::{...};`, when it has one.
 fn robson_exec_imports(code: &str) -> Option<Vec<String>> {
+    for helper in ["balance_costs::exact", "balance_costs::exact::ExactDecimal"] {
+        if code.contains(&format!("use robson_exec::{helper};")) {
+            return Some(vec![helper.to_string()]);
+        }
+    }
     let at = code.find("use robson_exec::{")?;
     let body = &code[at + "use robson_exec::{".len()..];
     let mut depth = 1;
@@ -305,17 +310,29 @@ fn port_contract_violations(file: &str, code: &str) -> Vec<String> {
                 && !code[at + found.len()..].chars().next().is_some_and(is_ident)
         })
         .count();
-    if allowed.is_empty() {
-        if uses > 0 {
-            violations.push("takes from robson_exec".to_string());
-        }
-    } else {
-        let imported = robson_exec_imports(code);
-        let mut expected: Vec<String> = allowed.iter().map(|item| item.to_string()).collect();
-        expected.sort();
-        if uses != 1 || imported.as_ref() != Some(&expected) {
-            violations.push(format!("takes {imported:?} from robson_exec, not {expected:?}"));
-        }
+    // 8g's bounded pure scalar parser is not a port or an activation seam.
+    // Allow only these exact helper imports, only in their input boundaries.
+    let pure = match file {
+        "records.rs" | "rest.rs" | "rules.rs" => Some("balance_costs::exact"),
+        "market_data.rs" | "ohlcv.rs" => Some("balance_costs::exact::ExactDecimal"),
+        _ => None,
+    };
+    let imported = robson_exec_imports(code);
+    let ports = imported.as_ref().map(|items| {
+        items
+            .iter()
+            .filter(|item| Some(item.as_str()) != pure)
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let mut expected: Vec<String> = allowed.iter().map(|item| item.to_string()).collect();
+    expected.sort();
+    if allowed.is_empty() && uses == 0 {
+        // A reader may have no exec import at all.
+    } else if uses != 1 || ports.as_ref() != Some(&expected) {
+        violations.push(format!(
+            "takes {imported:?} from robson_exec, not {expected:?} plus its exact scalar helper"
+        ));
     }
     // A contract is allowed by its own name, whatever path the import took.
     let names: Vec<&str> =
@@ -566,10 +583,27 @@ fn the_port_allow_list_admits_only_each_adapter_s_own_items() {
     }
 }
 
-/// SD12 point 1: 8a's readers, the rules projection and the cache take nothing
-/// from `robson_exec`, where the port contracts and 8c's additions live; 8b's
-/// feed and klines take only the existing port each implements, and 8c-2's
-/// venue only its exact list. No spot source uses another contract.
+/// SD12 point 1 is retained: 8g1a permits only the pure exact scalar helper
+/// at named input boundaries, without adding a port, runtime caller or factory
+/// reachability. All adapters retain their existing exact port lists.
+#[test]
+fn exact_scalar_imports_do_not_open_any_extra_port_or_runtime_path() {
+    for file in ["records.rs", "rules.rs", "rest.rs"] {
+        let helper = "use robson_exec::balance_costs::exact;";
+        assert!(port_contract_violations(file, helper).is_empty());
+        for extra in [
+            "use robson_exec::gate::OperationGate;",
+            "fn f(_: &dyn AccountPort) {}",
+        ] {
+            assert!(!port_contract_violations(file, &format!("{helper} {extra}")).is_empty());
+        }
+        assert!(!port_contract_violations(file, "use robson_exec::balance_costs::*;").is_empty());
+    }
+    assert!(
+        !port_contract_violations("cache.rs", "use robson_exec::balance_costs::exact;").is_empty()
+    );
+}
+
 #[test]
 fn the_spot_module_uses_no_port_contract_beyond_8b_s_ports() {
     let sources = spot_production_sources();

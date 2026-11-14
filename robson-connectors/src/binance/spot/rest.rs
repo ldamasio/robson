@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use robson_domain::Symbol;
+use robson_exec::balance_costs::exact;
 use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize};
 use thiserror::Error;
@@ -156,6 +157,7 @@ pub enum SpotReadError {
 #[derive(Deserialize)]
 struct TickerPrice {
     symbol: String,
+    #[serde(deserialize_with = "exact::nonnegative")]
     price: Decimal,
 }
 
