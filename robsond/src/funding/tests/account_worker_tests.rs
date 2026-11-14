@@ -217,12 +217,16 @@ async fn balance_funding_preserves_liabilities_with_bounded_physical_reads(pool:
         }
     }
     proxied.close().await;
-    // A fresh connection after renaming the table cannot reuse prepared plans
-    // for its old name. Both resume and gauge must still be attempted on error.
+    // A volatile view function fails during Execute, not Parse. A missing
+    // relation would fail before Execute and is correctly absent from the
+    // proxy's executed-statement count. Both reads must reach the server even
+    // after resume fails. Preserve the real rows behind the temporary view.
     sqlx::query("ALTER TABLE funding_sagas RENAME TO funding_sagas_fixture_hidden")
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::raw_sql("CREATE FUNCTION funding_poll_read_fault(r funding_sagas_fixture_hidden) RETURNS funding_sagas_fixture_hidden LANGUAGE plpgsql VOLATILE AS $$ BEGIN RAISE EXCEPTION 'funding poll execute fixture fault' USING ERRCODE='XX000'; END $$; CREATE VIEW funding_sagas AS SELECT (funding_poll_read_fault(r)).* FROM funding_sagas_fixture_hidden r")
+        .execute(&pool).await.unwrap();
     let (fault_proxy, fault_pool) = crate::capability::worker_venue::counted_pool(&pool).await;
     let exchange = Arc::new(WorkerVenue::new(AccountKind::BalanceAccount, true));
     let service = FundingService::new(
@@ -242,6 +246,8 @@ async fn balance_funding_preserves_liabilities_with_bounded_physical_reads(pool:
     assert_eq!(crate::metrics::FUNDING_SAGAS_BLOCKED.get(), gauge_before);
     assert_eq!(exchange.requests(), 0);
     drop(ready);
+    sqlx::raw_sql("DROP VIEW funding_sagas; DROP FUNCTION funding_poll_read_fault(funding_sagas_fixture_hidden)")
+        .execute(&pool).await.unwrap();
     sqlx::query("ALTER TABLE funding_sagas_fixture_hidden RENAME TO funding_sagas")
         .execute(&pool)
         .await

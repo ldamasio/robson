@@ -168,6 +168,11 @@ async fn balance_funding_http_routes_send_zero_physical_sql(pool: sqlx::PgPool) 
     Arc::get_mut(&mut state).unwrap().pg_pool = Some(Arc::new(proxied.clone()));
     state.order_journal.gate().begin_closing();
     let app = create_router(state.clone());
+    // Router construction inspects the optional funding surface once to
+    // register its routes. That pure construction access precedes this batch
+    // of HTTP operations; none of their guards may inspect the surface.
+    let funding_accesses_before = state.exchange.funding_accesses();
+    assert_eq!(funding_accesses_before, 1);
     let held = state.position_manager.write().await;
     let before_capital = held.configured_capital();
     proxy.enable_query_trace(16);
@@ -206,7 +211,7 @@ async fn balance_funding_http_routes_send_zero_physical_sql(pool: sqlx::PgPool) 
     assert_eq!(proxy.stats().statements - before, 0);
     assert!(proxy.query_trace().is_empty());
     assert_eq!(state.exchange.requests(), 0);
-    assert_eq!(state.exchange.funding_accesses(), 0);
+    assert_eq!(state.exchange.funding_accesses(), funding_accesses_before);
     assert_eq!(held.configured_capital(), before_capital);
     assert_eq!(state.order_journal.gate().snapshot().permits, 0);
     drop(ready);
