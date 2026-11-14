@@ -137,12 +137,11 @@ async fn expired_zero_entry_is_settled_and_cancel_lookup_replay_converges(pool: 
     assert!(row.get::<bool, _>("terminal"));
     assert!(row.get::<bool, _>("fills_complete"));
     assert_eq!(f.consumed(&pool).await, Decimal::ZERO);
-    assert_eq!(
+    assert!(
         sqlx::query_scalar::<_, bool>("SELECT cohort_month=decided_month FROM balance_legs")
             .fetch_one(&pool)
             .await
-            .unwrap(),
-        true
+            .unwrap()
     );
     let mut r = record();
     r.exchange_order_id = "8".into();
