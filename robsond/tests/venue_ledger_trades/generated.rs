@@ -47,6 +47,83 @@ impl Write {
     }
 }
 
+async fn prepared_journal(pool: &PgPool, tenant: Uuid) -> Arc<PgJournalBackend> {
+    let backend = Arc::new(PgJournalBackend::new(pool, tenant));
+    backend.check_ready().await.unwrap();
+    backend
+}
+
+async fn prepared_ledger_pool(pool: &PgPool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut held = Vec::new();
+        let mut backends = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            let mut connection = pool.acquire().await.unwrap();
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+            assert!(backends.insert(pid), "setup must hold eight distinct ready connections");
+            held.push(connection);
+        }
+        // Keep every connection checked out until all eight are established.
+        drop(held);
+    })
+    .await
+    .expect("generated ledger pool did not become ready before the schedule");
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn cold_journal_startup_precedes_the_generated_operation_budget(pool: PgPool) {
+    let fixture = Fixture::new(&pool).await;
+    let baseline = fixture.version(&pool).await;
+    let (proxy, proxied) = through_proxy(&pool, 8).await;
+    let connections = proxy.stats().connections;
+    let mut result = fixture.entry.clone();
+    result.outcome = Some(OutcomeRow {
+        venue_outcome: Some(VenueOutcome::Success),
+        ..OutcomeRow::default()
+    });
+    result.balance.as_mut().unwrap().handed_off = true;
+    proxy.set_mode(ProxyMode::Blackhole);
+    let worker_pool = proxied.clone();
+    let tenant = fixture.tenant;
+    let task = tokio::spawn(async move {
+        let backend = prepared_journal(&worker_pool, tenant).await;
+        Write::Journal(backend, result).apply().await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while proxy.stats().connections == connections {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cold journal connection never reached the startup fault");
+    // Setup is intentionally slower than the unchanged 500ms commit bound.
+    // A real startup probe may retry; the generated operation itself may not.
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    proxy.set_mode(ProxyMode::Pass);
+    let outcome = tokio::time::timeout(Duration::from_secs(11), task)
+        .await
+        .expect("journal startup exceeded its existing readiness bound")
+        .unwrap();
+    assert!(
+        matches!(outcome, Ok(true)),
+        "cold setup must finish before the generated commit budget: {outcome:?}"
+    );
+    assert_eq!(proxy.stats().commits, 1, "the operation must commit exactly once");
+    assert_eq!(fixture.version(&pool).await, baseline + 1);
+    let landed: Option<String> =
+        sqlx::query_scalar("SELECT venue_outcome FROM order_intents WHERE intent_id=$1")
+            .bind(fixture.entry.intent.intent_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(landed.as_deref(), Some("success"));
+    proxied.close().await;
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn ledger_invariants_hold_under_concurrent_writers(pool: PgPool) {
@@ -77,11 +154,12 @@ async fn schedules(pool: PgPool) {
         let second = Fixture::for_tenant_scope(&pool, tenant, Some(first.scope.clone())).await;
         let fixtures = [first, second];
         let (proxy, proxied) = through_proxy(&pool, 8).await;
+        prepared_ledger_pool(&proxied).await;
         let ledger = Arc::new(fixtures[0].ledger(&proxied));
         let mut operations = Vec::new();
         let mut model = Vec::new();
         for (leg_index, f) in fixtures.iter().enumerate() {
-            let backend = Arc::new(PgJournalBackend::new(&proxied, tenant));
+            let backend = prepared_journal(&proxied, tenant).await;
             let mut result = f.entry.clone();
             result.outcome = Some(OutcomeRow {
                 venue_outcome: Some(VenueOutcome::Success),
@@ -169,9 +247,12 @@ async fn schedules(pool: PgPool) {
             _ => ProxyMode::DropCommitAckOf("order_intents"),
         });
         let mut tasks = Vec::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(operations.len() + 1));
         for (n, (operation, invalid)) in operations.into_iter().enumerate() {
             let delay = delays[n % delays.len()];
+            let barrier = barrier.clone();
             tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 let started = Instant::now();
                 let result = operation.apply().await;
@@ -179,6 +260,7 @@ async fn schedules(pool: PgPool) {
                 (operation, invalid, result)
             }));
         }
+        barrier.wait().await;
         let mut ok_changed = 0i64;
         let mut uncertain = Vec::new();
         for task in tasks {
