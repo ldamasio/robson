@@ -73,6 +73,248 @@ async fn prepared_ledger_pool(pool: &PgPool) {
     .expect("generated ledger pool did not become ready before the schedule");
 }
 
+// The runtime worker count does not bound concurrent database transactions.
+// Keep harness queue time separate from the unchanged production operation
+// bound.
+async fn scheduled_write(
+    operation: &Write,
+    slots: &tokio::sync::Semaphore,
+) -> (Result<bool, LedgerError>, Duration, Duration) {
+    let queued = Instant::now();
+    let _permit = tokio::time::timeout(Duration::from_secs(10), slots.acquire())
+        .await
+        .expect("generated harness queue exceeded its bound")
+        .unwrap();
+    let queue_time = queued.elapsed();
+    let started = Instant::now();
+    let result = operation.apply().await;
+    let operation_time = started.elapsed();
+    assert!(operation_time < Duration::from_secs(3), "operation exceeded deadline");
+    assert!(queued.elapsed() < Duration::from_secs(13), "harness end-to-end bound exceeded");
+    (result, queue_time, operation_time)
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn bounded_workload_preserves_warmed_journal_progress(pool: PgPool) {
+    let fixture = Fixture::new(&pool).await;
+    let baseline = fixture.version(&pool).await;
+    let (proxy, proxied) = through_proxy(&pool, 8).await;
+    let mut result = fixture.entry.clone();
+    result.outcome = Some(OutcomeRow {
+        venue_outcome: Some(VenueOutcome::Success),
+        ..OutcomeRow::default()
+    });
+    result.balance.as_mut().unwrap().handed_off = true;
+    let mut operations = Vec::new();
+    for _ in 0..8 {
+        operations
+            .push(Write::Journal(prepared_journal(&proxied, fixture.tenant).await, result.clone()));
+    }
+    // A deterministic service cost while holding the shared accounting row.
+    // Eight simultaneous callers exceed its unchanged 300ms lock/statement
+    // budget; four in flight retain real contention with <=180ms queued work.
+    sqlx::query("CREATE FUNCTION generated_row_service() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.060); RETURN NEW; END $$")
+        .execute(&pool).await.unwrap();
+    sqlx::query("CREATE TRIGGER generated_row_service AFTER UPDATE ON accounting_state FOR EACH ROW EXECUTE FUNCTION generated_row_service()")
+        .execute(&pool).await.unwrap();
+    let slots = Arc::new(tokio::sync::Semaphore::new(4));
+    let barrier = Arc::new(tokio::sync::Barrier::new(9));
+    let mut tasks = Vec::new();
+    for operation in operations {
+        let slots = slots.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            scheduled_write(&operation, &slots).await
+        }));
+    }
+    barrier.wait().await;
+    // Observe real PostgreSQL tuple/transaction lock competition, not merely
+    // spawned tasks. This also rejects a scheduler accidentally made serial.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let waiters: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'UPDATE accounting_state SET version%'")
+                .fetch_one(&pool).await.unwrap();
+            if waiters >= 2 { break; }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }).await.expect("warmed workload never had simultaneous accounting-row waiters");
+    let mut outcomes = Vec::new();
+    for task in tasks {
+        outcomes.push(task.await.unwrap());
+    }
+    for (result, queue, operation) in &outcomes {
+        assert!(matches!(result, Ok(true)), "bounded warmed workload refused a valid write: {result:?}; harness_queue={queue:?}, operation={operation:?}");
+    }
+    assert!(
+        outcomes.iter().any(|(_, queue, _)| *queue >= Duration::from_millis(50)),
+        "backlog never waited outside the operation budget"
+    );
+    assert_eq!(proxy.stats().commits, 8, "each generated J must commit once");
+    assert_eq!(fixture.version(&pool).await, baseline + 8);
+    proxied.close().await;
+}
+
+async fn journal_and_ledger_snapshot(pool: &PgPool) -> Vec<Vec<String>> {
+    let mut rows = snapshot(pool).await;
+    for table in [
+        "order_intents",
+        "submit_attempts",
+        "spot_intent_clock",
+        "balance_leg_admissions",
+    ] {
+        rows.push(
+            sqlx::query_scalar(&format!(
+                "SELECT row_to_json(t)::text FROM {table} t ORDER BY row_to_json(t)::text"
+            ))
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+        );
+    }
+    rows
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn admission_evidence_snapshot_detects_corruption(pool: PgPool) {
+    let fixture = Fixture::new(&pool).await;
+    let before = journal_and_ledger_snapshot(&pool).await;
+    // Fault injection in this sqlx-created database only. Temporarily bypass
+    // the immutable-admission trigger in one transaction, leaving all FK and
+    // CHECK constraints intact, then restore the trigger before committing.
+    let mut fault = pool.begin().await.unwrap();
+    sqlx::query("ALTER TABLE balance_leg_admissions DISABLE TRIGGER balance_leg_admissions_once")
+        .execute(&mut *fault)
+        .await
+        .unwrap();
+    let changed = sqlx::query("UPDATE balance_leg_admissions SET envelope_hash='injected-corruption' WHERE entry_intent_id=$1")
+        .bind(fixture.entry.intent.intent_id).execute(&mut *fault).await.unwrap();
+    assert_eq!(changed.rows_affected(), 1, "fault must alter one real admission");
+    sqlx::query("ALTER TABLE balance_leg_admissions ENABLE TRIGGER balance_leg_admissions_once")
+        .execute(&mut *fault)
+        .await
+        .unwrap();
+    fault.commit().await.unwrap();
+    let actual: String = sqlx::query_scalar(
+        "SELECT envelope_hash FROM balance_leg_admissions WHERE entry_intent_id=$1",
+    )
+    .bind(fixture.entry.intent.intent_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(actual, "injected-corruption", "fault must be durable before snapshot");
+    assert_ne!(
+        journal_and_ledger_snapshot(&pool).await,
+        before,
+        "full journal/ledger snapshot missed corrupted admission evidence"
+    );
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn overloaded_warmed_journal_refuses_without_partial_effects(pool: PgPool) {
+    let fixture = Fixture::new(&pool).await;
+    let (proxy, proxied) = through_proxy(&pool, 8).await;
+    let backend = prepared_journal(&proxied, fixture.tenant).await;
+    let mut result = fixture.entry.clone();
+    result.outcome = Some(OutcomeRow {
+        venue_outcome: Some(VenueOutcome::Success),
+        ..OutcomeRow::default()
+    });
+    result.balance.as_mut().unwrap().handed_off = true;
+    let before = journal_and_ledger_snapshot(&pool).await;
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("SELECT version FROM accounting_state WHERE tenant_id=$1 FOR UPDATE")
+        .bind(fixture.tenant)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let started = Instant::now();
+    let task = tokio::spawn(async move { Write::Journal(backend, result).apply().await });
+    let pid = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let pid: Option<i32> = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'UPDATE accounting_state SET version = version + 1%'")
+                .fetch_optional(&pool).await.unwrap();
+            if let Some(pid) = pid { break pid; }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }).await.expect("J never contended on the locked accounting row");
+    // Keep the lock until the real production bound refuses the operation.
+    let result = task.await.unwrap();
+    assert!(
+        matches!(&result, Err(LedgerError::Backend(message)) if message.contains("Known") && (message.contains("statement timeout") || message.contains("lock timeout"))),
+        "expected a precise known lock-budget refusal: {result:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(1), "bounded overload did not return");
+    blocker.rollback().await.unwrap();
+    wait_for_backend_exit(&pool, pid).await;
+    assert_eq!(
+        journal_and_ledger_snapshot(&pool).await,
+        before,
+        "known refusal left partial durable effects"
+    );
+    assert_eq!(proxy.stats().commits, 0, "refused J must never reach COMMIT");
+    // PgJournalBackend is a persistence-only boundary: no exchange/send port
+    // exists in this fixture, and the success/handoff outcome never lands.
+    proxied.close().await;
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn bounded_scheduler_keeps_journal_and_two_legs_in_real_contention(pool: PgPool) {
+    let first = Fixture::new(&pool).await;
+    let second = Fixture::for_tenant_scope(&pool, first.tenant, Some(first.scope.clone())).await;
+    let first_key = first.seed_order(&pool, 1, dec!(1), OrderPhase::Terminal).await;
+    let second_key = second.seed_order(&pool, 2, dec!(1), OrderPhase::Terminal).await;
+    let baseline = first.version(&pool).await;
+    let (proxy, proxied) = through_proxy(&pool, 8).await;
+    prepared_ledger_pool(&proxied).await;
+    let backend = prepared_journal(&proxied, first.tenant).await;
+    let mut result = first.entry.clone();
+    result.outcome = Some(OutcomeRow {
+        venue_outcome: Some(VenueOutcome::Success),
+        ..OutcomeRow::default()
+    });
+    result.balance.as_mut().unwrap().handed_off = true;
+    let ledger = Arc::new(first.ledger(&proxied));
+    let operations = [
+        Write::Journal(backend, result),
+        Write::Trades(ledger.clone(), first_key, Arc::new(page(101, dec!(1)))),
+        Write::Trades(ledger, second_key, Arc::new(page(102, dec!(1)))),
+    ];
+    let slots = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("SELECT version FROM accounting_state WHERE tenant_id=$1 FOR UPDATE")
+        .bind(first.tenant)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let mut tasks = Vec::new();
+    for operation in operations {
+        let slots = slots.clone();
+        tasks.push(tokio::spawn(async move { scheduled_write(&operation, &slots).await }));
+    }
+    tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            let (journal, trades): (i64,i64) = sqlx::query_as("SELECT count(*) FILTER (WHERE query LIKE 'UPDATE accounting_state SET version = version + 1%'), count(*) FILTER (WHERE query LIKE 'UPDATE accounting_state SET version=version+1%') FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'")
+                .fetch_one(&pool).await.unwrap();
+            if journal == 1 && trades == 2 { break; }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }).await.expect("scheduler serialized or omitted the J/two-leg race");
+    blocker.rollback().await.unwrap();
+    for task in tasks {
+        assert!(matches!(task.await.unwrap().0, Ok(true)));
+    }
+    assert_eq!(first.version(&pool).await, baseline + 3);
+    assert_eq!(first.consumed(&pool).await, dec!(1));
+    assert_eq!(second.consumed(&pool).await, dec!(1));
+    assert_eq!(proxy.stats().commits, 3);
+    proxied.close().await;
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn cold_journal_startup_precedes_the_generated_operation_budget(pool: PgPool) {
@@ -246,25 +488,31 @@ async fn schedules(pool: PgPool) {
             2 => ProxyMode::DropCommitAckOf("venue_orders"),
             _ => ProxyMode::DropCommitAckOf("order_intents"),
         });
+        let slots = Arc::new(tokio::sync::Semaphore::new(4));
         let mut tasks = Vec::new();
         let barrier = Arc::new(tokio::sync::Barrier::new(operations.len() + 1));
         for (n, (operation, invalid)) in operations.into_iter().enumerate() {
             let delay = delays[n % delays.len()];
             let barrier = barrier.clone();
+            let slots = slots.clone();
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
                 tokio::time::sleep(Duration::from_millis(delay)).await;
-                let started = Instant::now();
-                let result = operation.apply().await;
-                assert!(started.elapsed() < Duration::from_secs(3), "operation exceeded deadline");
-                (operation, invalid, result)
+                let (result, queue, elapsed) = scheduled_write(&operation, &slots).await;
+                (operation, invalid, result, queue, elapsed)
             }));
         }
         barrier.wait().await;
         let mut ok_changed = 0i64;
         let mut uncertain = Vec::new();
+        let mut max_queue = Duration::ZERO;
+        let mut max_operation = Duration::ZERO;
+        let mut max_total = Duration::ZERO;
         for task in tasks {
-            let (operation, invalid, result) = task.await.unwrap();
+            let (operation, invalid, result, queue, elapsed) = task.await.unwrap();
+            max_queue = max_queue.max(queue);
+            max_operation = max_operation.max(elapsed);
+            max_total = max_total.max(queue + elapsed);
             if invalid {
                 assert!(
                     matches!(result, Err(LedgerError::InvalidEvidence(_))),
@@ -279,6 +527,7 @@ async fn schedules(pool: PgPool) {
                 }
             }
         }
+        eprintln!("case {case}: max_harness_queue={max_queue:?}, max_operation={max_operation:?}, max_end_to_end={max_total:?}");
         assert_eq!(
             proxy.stats().commit_acks_dropped,
             u64::from(fault != 0),
