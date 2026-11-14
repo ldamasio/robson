@@ -156,6 +156,21 @@ async fn bounded_workload_preserves_warmed_journal_progress(pool: PgPool) {
     proxied.close().await;
 }
 
+async fn journal_and_ledger_snapshot(pool: &PgPool) -> Vec<Vec<String>> {
+    let mut rows = snapshot(pool).await;
+    for table in ["order_intents", "submit_attempts", "spot_intent_clock"] {
+        rows.push(
+            sqlx::query_scalar(&format!(
+                "SELECT row_to_json(t)::text FROM {table} t ORDER BY row_to_json(t)::text"
+            ))
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+        );
+    }
+    rows
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn overloaded_warmed_journal_refuses_without_partial_effects(pool: PgPool) {
@@ -168,7 +183,7 @@ async fn overloaded_warmed_journal_refuses_without_partial_effects(pool: PgPool)
         ..OutcomeRow::default()
     });
     result.balance.as_mut().unwrap().handed_off = true;
-    let before = snapshot(&pool).await;
+    let before = journal_and_ledger_snapshot(&pool).await;
     let mut blocker = pool.begin().await.unwrap();
     sqlx::query("SELECT version FROM accounting_state WHERE tenant_id=$1 FOR UPDATE")
         .bind(fixture.tenant)
@@ -194,7 +209,11 @@ async fn overloaded_warmed_journal_refuses_without_partial_effects(pool: PgPool)
     assert!(started.elapsed() < Duration::from_secs(1), "bounded overload did not return");
     blocker.rollback().await.unwrap();
     wait_for_backend_exit(&pool, pid).await;
-    assert_eq!(snapshot(&pool).await, before, "known refusal left partial durable effects");
+    assert_eq!(
+        journal_and_ledger_snapshot(&pool).await,
+        before,
+        "known refusal left partial durable effects"
+    );
     assert_eq!(proxy.stats().commits, 0, "refused J must never reach COMMIT");
     // PgJournalBackend is a persistence-only boundary: no exchange/send port
     // exists in this fixture, and the success/handoff outcome never lands.
