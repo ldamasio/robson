@@ -158,7 +158,12 @@ async fn bounded_workload_preserves_warmed_journal_progress(pool: PgPool) {
 
 async fn journal_and_ledger_snapshot(pool: &PgPool) -> Vec<Vec<String>> {
     let mut rows = snapshot(pool).await;
-    for table in ["order_intents", "submit_attempts", "spot_intent_clock"] {
+    for table in [
+        "order_intents",
+        "submit_attempts",
+        "spot_intent_clock",
+        "balance_leg_admissions",
+    ] {
         rows.push(
             sqlx::query_scalar(&format!(
                 "SELECT row_to_json(t)::text FROM {table} t ORDER BY row_to_json(t)::text"
