@@ -214,11 +214,24 @@ async fn schedules(pool: PgPool) {
         assert!(ok_changed <= version_delta);
         assert!(version_delta <= ok_changed + uncertain.len() as i64 + replay_changed);
         for (key, owner, is_entry, total, trades) in &model {
-            let row=sqlx::query("SELECT owner,intent_id,position_id,kind,executed_cum,fills_qty,fills_complete,trades_cursor,phase,status,live_seen_at,terminal_seen_at,last_checked_at FROM venue_orders WHERE venue_id=$1 AND account_scope=$2 AND symbol=$3 AND exchange_order_id=$4")
+            let row=sqlx::query("SELECT * FROM venue_orders WHERE venue_id=$1 AND account_scope=$2 AND symbol=$3 AND exchange_order_id=$4")
                 .bind(key.venue.as_str()).bind(&key.account_scope).bind(&key.symbol).bind(key.exchange_order_id.to_string()).fetch_one(&pool).await.unwrap();
             let OrderOwner::Leg { intent_id, position_id, kind } = &owner.owner else {
                 unreachable!()
             };
+            assert_eq!(
+                row.get::<String, _>("client_order_id"),
+                format!("order-{}", key.exchange_order_id)
+            );
+            assert_eq!(
+                row.get::<String, _>("last_client_order_id"),
+                format!("order-{}", key.exchange_order_id)
+            );
+            assert_eq!(row.get::<String, _>("side"), if *is_entry { "BUY" } else { "SELL" });
+            assert_eq!(row.get::<String, _>("order_type"), "MARKET");
+            assert_eq!(row.get::<Decimal, _>("orig_qty"), dec!(10000));
+            assert_eq!(row.get::<Option<Decimal>, _>("stop_price"), None);
+            assert_eq!(row.get::<Option<Decimal>, _>("cumulative_quote"), None);
             assert_eq!(row.get::<String, _>("owner"), "leg");
             assert_eq!(row.get::<Uuid, _>("intent_id"), *intent_id);
             assert_eq!(row.get::<Uuid, _>("position_id"), *position_id);
@@ -255,6 +268,18 @@ async fn schedules(pool: PgPool) {
         for f in &fixtures {
             let expected=model.iter().filter(|(_,owner,is_entry,_,_)|!is_entry && matches!(owner.owner,OrderOwner::Leg{position_id,..} if position_id==f.position)).map(|(_,_,_,qty,_)|*qty).sum::<Decimal>();
             assert_eq!(f.consumed(&pool).await, expected);
+            let (admission,decided,cohort,gross,closed):(Uuid,chrono::NaiveDate,Option<chrono::NaiveDate>,Option<Decimal>,Option<chrono::DateTime<chrono::Utc>>)=sqlx::query_as("SELECT admission_intent_id,decided_month,cohort_month,gross_qty,closed_at FROM balance_legs WHERE position_id=$1")
+                .bind(f.position).fetch_one(&pool).await.unwrap();
+            assert_eq!(admission, f.entry.intent.intent_id);
+            assert_eq!(cohort, Some(decided));
+            assert_eq!((gross, closed), (None, None));
+            let (outcome,not_sent,position):(Option<String>,bool,Option<Uuid>)=sqlx::query_as("SELECT venue_outcome,not_sent,position_id FROM order_intents WHERE intent_id=$1")
+                .bind(f.entry.intent.intent_id).fetch_one(&pool).await.unwrap();
+            assert_eq!(
+                (outcome, not_sent, position),
+                (Some("success".into()), false, Some(f.position))
+            );
+
             assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM order_fills WHERE tenant_id=$1 AND trade_id::numeric>=9000").bind(tenant).fetch_one(&pool).await.unwrap(),0,"refused calls left a trace");
         }
         proxied.close().await;
