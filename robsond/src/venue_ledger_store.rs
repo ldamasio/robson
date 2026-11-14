@@ -100,7 +100,7 @@ impl PgVenueLedger {
                 budget_model: stored_model, created_at: row.get("created_at") };
             self.statement();
             committing.store(true, Ordering::Relaxed);
-            tx.commit().await.map_err(|error| LedgerError::Uncertain(error.to_string()))?;
+            tx.commit().await.map_err(commit_error)?;
             write.finished = true;
             Ok(stored)
         }, &committing).await
@@ -135,7 +135,7 @@ impl PgVenueLedger {
             }
             self.statement();
             committing.store(true, Ordering::Relaxed);
-            tx.commit().await.map_err(|error| LedgerError::Uncertain(error.to_string()))?;
+            tx.commit().await.map_err(commit_error)?;
             write.finished = true;
             Ok(())
         }, &committing).await
@@ -149,4 +149,14 @@ fn backend(error: sqlx::Error) -> LedgerError {
         }
     }
     LedgerError::Backend(error.to_string())
+}
+
+/// A server ErrorResponse to COMMIT proves rollback; a transport/protocol
+/// failure supplies no answer and cannot establish whether it landed.
+fn commit_error(error: sqlx::Error) -> LedgerError {
+    if matches!(error, sqlx::Error::Database(_)) {
+        LedgerError::Backend(error.to_string())
+    } else {
+        LedgerError::Uncertain(error.to_string())
+    }
 }
