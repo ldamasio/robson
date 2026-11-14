@@ -1,12 +1,12 @@
-# Venue capability gates — ADR-0056 step 8f, part 1
+# Venue capability gates — ADR-0056 step 8f, parts 1–3
 
 Status: repository implementation; operational rollout pending. This document
-covers direction gating only. The legacy balance-batch barrier and account-specific
-worker/funding gates are separate pending parts of 8f; balance execution, accounting
-and factory activation still require their later owners. USD-M execution/validation
+covers direction gating, the legacy balance-batch barrier and account-specific
+worker/funding refusals. Balance execution, accounting and factory activation
+still require their later owners. USD-M execution/validation
 and the existing position-account stub keep their previous paths.
 
-`ExchangePort: AccountPort` exposes the existing canonical contract. No capability
+`ExchangePort: AccountPort` exposes the existing canonical contract. No side support
 is inferred from a venue id, symbol, market kind or account kind. The three manual
 legacy test mocks explicitly forward cash, valuation, costs and capabilities to
 configured canonical stub delegates while retaining their deliberate legacy faults.
@@ -67,3 +67,105 @@ empty Armed work with unresolved J, direct/API guards and canonical mock forward
 SQL tests use isolated sqlx test databases and a bounded wire trace. Preserve the
 existing USD-M/stub suites and factory refusal; deliberate mutants must fail runtime
 assertions. Full operational profiling and activation remain separate evidence.
+
+
+## Legacy balance batch boundary
+
+`Executor::validate_legacy_batch` is a synchronous O(n) scan with O(1) retained
+space. Only canonical `account_kind` selects this boundary. On BalanceAccount,
+a batch containing PlaceEntryOrder, PlaceExitOrder, PlaceInsuranceStop,
+ReplaceInsuranceStop or CancelInsuranceStop returns typed `BalanceOwnerRequired`.
+UpdateTrailingStop, TriggerExit and EmitEvent remain allowed when the entire batch
+contains no trading action. New EngineAction variants require explicit classification.
+
+The manager checks the original slice before entry fragmentation or persistence;
+governed dispatch checks before Acting, its audit and run_admission; direct
+Executor checks before opening a journal operation, including ambient calls.
+Earlier event/state actions in a refused mixed batch never run. No settings read,
+venue request, journal statement, booking or domain event occurs inside that batch.
+PositionAccount entry/exit continue through the existing futures-settings checks.
+
+Full signal and approval wrappers preserve their truthful AdmissionReach and
+exclude this typed error from failure rearm, including Long. They emit a bounded
+`balance_owner_required` public rejection without exhaustion, retry, backoff or
+detector creation. The error is neither SendRefused nor a reduce-only/rules rejection.
+Earlier preparation remains separate: the legacy Long fixture makes two reads
+(balance and rules) and three snapshots (Accepted, Processing, RiskChecked) for a
+signal, or one rules read and one Authorized snapshot on approval resume. The
+boundary adds no Acting/Failed append. Those fixtures do not certify every earlier
+balance preparation path or authorize its use in production.
+
+Close, ordinary tick failure and each Active panic leg retain their existing one
+Failed query snapshot. Close/tick return the owner error after a successful audit,
+or the audit error if that append fails. Panic retains log-and-continue behavior,
+never lists the refused id as closed, and never changes its financial facts.
+
+| Full caller reaching the refused batch | SQL including transaction controls/cleanup |
+|---|---|
+| Close / one Active panic leg | Accepted + Processing + Acting + Failed: 24 normal, at most 25 if the final COMMIT fails. |
+| Tick with one refused trading leg | Routine snapshots are nondurable; Failed: 6 normal, at most 7. |
+| Mixed tick with one earlier monitor-only leg, then a refused trading leg | Earlier domain append/read: 7; refusal: 6 normal / 7 after failed COMMIT; whole caller: 13 / 14. The earlier event remains durable. |
+| N Active panic legs | 24N normal, at most 25N on final-audit failure per leg. |
+| Earlier failed Accepted / Processing / Acting append in close or panic | Existing failure paths: at most 7 / 20 / 26 respectively. These do not reach the batch refusal and are not covered by the 25 bound. |
+
+The 30 PostgreSQL scenarios observe whole callers through single-slot pool
+reacquisition, including queued rollback, and configure both query and domain
+writers. Mixed-tick counts include the earlier leg without resetting the counter;
+the refused leg adds no domain event. Final sequence/idempotency/event/stream failures cost 3/4/5/6 statements
+on top of earlier snapshots; deferred COMMIT costs 7. Lost final acknowledgement
+can leave the Failed audit durable. Error/cancellation retains the leg, and no
+fallback reads the venue. Generated original-batch permutations and concurrent
+approval schedules exercise final financial/rearm invariants. USD-M settings
+refusal remains covered for both entry and exit.
+
+No database or venue availability fallback, deadline, migration, financial policy,
+factory selection or configuration is changed by this barrier. The dedicated balance owner remains pending. Activation requires
+the coordinator's current 15 prerequisites, including event-bus remediation and
+N5 restart evidence; this implementation grants no SD12 exception or rollout.
+
+
+## Account-specific workers (part 3)
+
+The daemon constructs the legacy income worker only for PositionAccount. Direct
+`run` and `poll_and_match` also refuse BalanceAccount before timer creation,
+checkpoint SQL, income reads or accounting writes. The pure-financial-drift alarm
+and manual recalibration helper skip balance accounts before any manager/store
+or futures-wallet read. This does not make the full legacy reconciliation scan
+succeed: a balance venue without a position port still reports its unsupported
+operation. Coherent balance observations and accounting remain with 8k/8l.
+
+Funding route selection checks account kind before the selected funding surface
+or an injected recovery route. Recovery construction refuses balance accounts
+before credential resolution. The service derives its effective route from
+canonical capabilities: BalanceAccount is always Blocked, while PositionAccount
+retains its configured mode. No second capability field is stored. Read-only
+saga views retain liabilities and derive their blocking reason on every read.
+Direct quote, execute and capital refresh refuse balance accounts before storage,
+venue access or engine mutation, including when constructed in Selected/Recovery
+mode. PositionAccount is not newly prohibited merely by configured Blocked mode.
+
+API funding handlers and direct manual spot-to-futures recovery, including dry
+runs, refuse before acquiring a permit or accessing the venue. Only the new pure
+account refusal maps to HTTP 400; existing supported-account errors keep their
+response shapes and statuses. The separate capital-refresh API/helper has the
+same boundary. Daemon capital initialization retains its existing best-effort
+warning/placeholder behavior, which does not certify balance startup or capital.
+
+| Balance-account boundary | Physical work |
+|---|---|
+| Income construction/run/poll and the two legacy drift branches | 0 SQL, 0 venue reads, 0 accounting writes; no income timer. |
+| Funding route/recovery construction | 0 SQL/HTTP; no recovery credential resolution. |
+| Funding quote/execute/refresh and API/manual recovery, including dry-run | 0 SQL/HTTP, 0 permit, 0 engine/saga writes. |
+| Separate capital-refresh helper/API/daemon initialization | 0 SQL/HTTP, 0 manager lock or engine writes. |
+| Existing blocked funding runtime poll | 2 SELECTs: at most 20 nonterminal sagas plus the liability gauge; no per-saga query, mutation or HTTP. |
+| Read-only saga list/get | 1 SELECT LIMIT100 / 2 SELECTs. Existing get-history row volume remains unchanged. |
+
+The funding timer calls the same extracted poll body exercised by count fixtures:
+resume errors are logged, then the blocked-gauge query is still attempted. Its
+five-second cadence, permit scope, cancellation behavior and existing logging are
+unchanged. A database failure remains visible and does not create a fallback or
+rewrite liabilities. No queue, cache, timer, migration, dependency or configuration
+key is added. The temporary cost is disabled legacy balance functionality until
+its dedicated owners are accepted; this is not balance reconciliation or activation.
+The capability-focused fixtures include usable futures/funding delegates,
+0/1/20-saga physical counts, the real runtime timer path and USD-M preservation.

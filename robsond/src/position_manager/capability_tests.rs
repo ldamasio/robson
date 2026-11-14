@@ -1,5 +1,7 @@
 //! Capability denial exercises complete manager consumers, not only the
 //! predicate.
+mod batch_guard_tests;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
