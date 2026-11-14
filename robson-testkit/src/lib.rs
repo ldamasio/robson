@@ -4,7 +4,8 @@
 //! state; [`spot_book`], an in-memory spot balance account for venue tests;
 //! [`balance_stub`], the spot venue's port contracts over it;
 //! [`conformance`], the venue conformance suite's inventory, coverage,
-//! `check` and scenarios; and [`dependency_check`], which proves from
+//! `check` and scenarios; [`fake_spot_venue`], Binance spot's REST API over
+//! a book, on loopback; and [`dependency_check`], which proves from
 //! `cargo metadata` that only dev-dependency edges reach this crate.
 
 pub mod balance_stub;
@@ -18,6 +19,9 @@ pub mod db_proxy;
 pub mod dependency_check;
 #[cfg(test)]
 mod dependency_check_tests;
+pub mod fake_spot_venue;
+#[cfg(test)]
+mod fake_spot_venue_tests;
 pub mod fake_venue;
 mod helpers;
 #[cfg(test)]
