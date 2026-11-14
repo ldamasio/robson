@@ -164,6 +164,9 @@ pub struct BookOrder {
     pub archived: bool,
     pub time_ms: i64,
     pub update_ms: i64,
+    /// The label its placement carried ([`SpotBook::place_tagged`]), kept
+    /// with the order for as long as the book retains it.
+    pub tag: Option<String>,
 }
 
 /// One execution.
@@ -354,6 +357,7 @@ struct Order {
     trades: Vec<u64>,
     time_ms: i64,
     update_ms: i64,
+    tag: Option<String>,
 }
 
 impl Order {
@@ -401,6 +405,7 @@ impl Order {
             archived: self.archived,
             time_ms: self.time_ms,
             update_ms: self.update_ms,
+            tag: self.tag.clone(),
         }
     }
 }
@@ -473,6 +478,7 @@ struct Request<'a> {
     kind: OrderKind,
     qty: Decimal,
     client_id: &'a str,
+    tag: Option<&'a str>,
 }
 
 impl Request<'_> {
@@ -653,6 +659,7 @@ impl SpotBook {
             kind: OrderKind::Market,
             qty,
             client_id,
+            tag: None,
         })
     }
 
@@ -671,6 +678,38 @@ impl SpotBook {
             kind,
             qty,
             client_id,
+            tag: None,
+        })
+    }
+
+    /// [`Self::place_market`] or [`Self::place_stop`] whose order, if the
+    /// book accepts it, carries `tag`: set in the same critical section as
+    /// the acceptance, so it is that order's even when the answer is lost
+    /// and whatever other placements do meanwhile (the fake venue's STP
+    /// mode).
+    ///
+    /// # Panics
+    /// A BUY stop: a stop is a SELL.
+    pub fn place_tagged(
+        &self,
+        symbol: &str,
+        side: Side,
+        kind: OrderKind,
+        qty: Decimal,
+        client_id: &str,
+        tag: &str,
+    ) -> Result<Placement, BookError> {
+        assert!(
+            side == Side::Sell || kind == OrderKind::Market,
+            "SpotBook test error: a stop is a SELL"
+        );
+        self.lock().place(&Request {
+            symbol,
+            side,
+            kind,
+            qty,
+            client_id,
+            tag: Some(tag),
         })
     }
 
@@ -1044,7 +1083,7 @@ impl Inner {
     /// price, the notional, and the balance. Changes nothing; gives the
     /// price the order executes at.
     fn check(&self, req: &Request<'_>) -> Result<Decimal, BookError> {
-        let Request { symbol, side, kind, qty, client_id } = *req;
+        let Request { symbol, side, kind, qty, client_id, .. } = *req;
         // errors.md L177-L179.
         let rules = self.rules.get(symbol).ok_or_else(|| rejected(-1121, "Invalid symbol."))?;
         // errors.md L546 and L543.
@@ -1109,7 +1148,7 @@ impl Inner {
         price: Decimal,
         executes: Option<Decimal>,
     ) -> Result<Placement, BookError> {
-        let Request { symbol, side, kind, qty, client_id } = *req;
+        let Request { symbol, side, kind, qty, client_id, tag } = *req;
         let overflow = || rejected(-1013, "Filter failure: NOTIONAL");
         let id = self.next_order;
         let executes = executes.unwrap_or(qty);
@@ -1161,6 +1200,7 @@ impl Inner {
             trades: Vec::new(),
             time_ms: self.now_ms,
             update_ms: self.now_ms,
+            tag: tag.map(str::to_string),
         };
         self.orders.insert(id, order);
         self.by_client.insert((symbol.to_string(), client_id.to_string()), id);
