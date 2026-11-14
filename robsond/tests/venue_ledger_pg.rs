@@ -57,20 +57,27 @@ async fn order_and_contribution_are_atomic_and_replay_is_one_read(pool: PgPool) 
 #[ignore = "requires DATABASE_URL"]
 async fn definite_commit_rejection_rolls_back_every_effect(pool: PgPool) {
     let f = Fixture::new(&pool).await;
+    let (proxy, proxied) = through_proxy_limit(&pool, 1).await;
+    let ledger = PgVenueLedger::new(&proxied, f.tenant);
+    let connections = proxy.stats().connections;
     let before = snapshot(&pool).await;
     execute(&pool,"CREATE FUNCTION reject_order_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture deferred rejection' USING ERRCODE='23514'; END $$; CREATE CONSTRAINT TRIGGER reject_order_commit AFTER INSERT OR UPDATE ON venue_orders DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_order_commit()").await;
     assert!(matches!(
-        f.ledger.record_order(&record(), &f.link(LegOrderKind::Sell), seen(1)).await,
+        ledger.record_order(&record(), &f.link(LegOrderKind::Sell), seen(1)).await,
         Err(LedgerError::Backend(_))
     ));
     assert_eq!(snapshot(&pool).await, before);
     execute(&pool, "DROP TRIGGER reject_order_commit ON venue_orders").await;
     assert!(
-        f.ledger
+        ledger
             .record_order(&record(), &f.link(LegOrderKind::Sell), seen(2))
             .await
             .unwrap()
             .changed
+    );
+    assert!(
+        proxy.stats().connections > connections,
+        "a failed ledger transaction must retire even a healthy connection"
     );
 }
 

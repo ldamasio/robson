@@ -130,6 +130,12 @@ pub async fn execute(pool: &PgPool, sql: &str) {
     sqlx::raw_sql(sql).execute(pool).await.unwrap();
 }
 pub async fn through_proxy(pool: &PgPool) -> (robson_testkit::db_proxy::DbProxy, PgPool) {
+    through_proxy_limit(pool, 2).await
+}
+pub async fn through_proxy_limit(
+    pool: &PgPool,
+    limit: u32,
+) -> (robson_testkit::db_proxy::DbProxy, PgPool) {
     let options = pool.connect_options();
     let upstream = tokio::net::lookup_host((options.get_host(), options.get_port()))
         .await
@@ -144,7 +150,7 @@ pub async fn through_proxy(pool: &PgPool) -> (robson_testkit::db_proxy::DbProxy,
     )
     .unwrap();
     let proxied = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(limit)
         .connect(&url)
         .await
         .unwrap();
