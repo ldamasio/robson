@@ -29,3 +29,4 @@ libc = { version = "0.2", optional = true }
 anyhow = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+proptest = "1"
