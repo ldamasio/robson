@@ -881,11 +881,13 @@ async fn a_factory_stub_creates_no_saga(pool: PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The only test that writes the process-wide gauge, so parallel DB tests
-/// cannot disturb it: they call `resume_non_terminal`, which does not touch it.
+static BLOCKED_GAUGE_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Serialize the two fixtures that write the process-wide gauge.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "Requires DATABASE_URL"]
 async fn blocked_gauge_counts_held_sagas_and_returns_to_zero(pool: PgPool) -> anyhow::Result<()> {
+    let _gauge = BLOCKED_GAUGE_TEST.lock().await;
     let gauge = || crate::metrics::FUNDING_SAGAS_BLOCKED.get();
     let original = configured_exchange();
     let (tenant_id, saga_id) = unfinished_saga_on(pool.clone(), Arc::clone(&original)).await?;
@@ -922,3 +924,5 @@ async fn blocked_gauge_counts_held_sagas_and_returns_to_zero(pool: PgPool) -> an
 
     Ok(())
 }
+
+mod account_worker_tests;

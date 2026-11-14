@@ -82,7 +82,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
         self
     }
 
+    fn effective_route_mode(&self) -> FundingRouteMode {
+        if self.exchange.capabilities().account_kind
+            == robson_exec::venue::AccountKind::BalanceAccount
+        {
+            FundingRouteMode::Blocked
+        } else {
+            self.route_mode
+        }
+    }
+
     pub async fn quote(&self) -> DaemonResult<FundingQuote> {
+        crate::capability::require_position_account(&self.exchange.capabilities(), "funding")?;
         let quote_id = Uuid::new_v4();
         let balances = self.exchange.get_spot_account_balances().await?;
         let expires_at = Utc::now() + Duration::seconds(self.config.quote_ttl_secs as i64);
@@ -145,6 +156,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
         quote_id: Uuid,
         idempotency_key: &str,
     ) -> DaemonResult<ExecuteFundingResponse> {
+        crate::capability::require_position_account(&self.exchange.capabilities(), "funding")?;
         let mut view = self.load_saga(quote_id).await?;
         if view.state == FundingState::Refreshed.as_str() {
             return Ok(ExecuteFundingResponse { saga_id: quote_id, state: view.state });
@@ -316,6 +328,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
     }
 
     pub async fn refresh_capital(&self) -> DaemonResult<Decimal> {
+        crate::capability::require_position_account(&self.exchange.capabilities(), "funding")?;
         let balance = self.exchange.get_futures_balance().await?;
         let capital = balance.wallet_balance;
         if capital <= Decimal::ZERO {
@@ -325,7 +338,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
         }
         // On a recovery route the balance belongs to the saga's original
         // account, not to the venue the engine trades on.
-        if self.route_mode == FundingRouteMode::Selected {
+        if self.effective_route_mode() == FundingRouteMode::Selected {
             let manager = self.position_manager.read().await;
             manager.update_engine_capital(capital);
         }
@@ -337,6 +350,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
     }
 
     pub async fn list(&self) -> DaemonResult<Vec<FundingSagaSummary>> {
+        let route_mode = self.effective_route_mode();
         let rows = sqlx::query(
             r#"
             SELECT saga_id, state, estimated_usdt, created_at
@@ -356,7 +370,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
                 let state: String = row.get("state");
                 FundingSagaSummary {
                     saga_id: row.get("saga_id"),
-                    blocked_reason: self.route_mode.blocking_reason(&state).map(str::to_string),
+                    blocked_reason: route_mode.blocking_reason(&state).map(str::to_string),
                     state,
                     estimated_usdt: row.get("estimated_usdt"),
                     created_at: row.get("created_at"),
@@ -366,6 +380,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
     }
 
     pub async fn resume_non_terminal(&self) -> DaemonResult<usize> {
+        let route_mode = self.effective_route_mode();
         let rows = sqlx::query(
             r#"
             SELECT saga_id, state
@@ -380,7 +395,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
         .fetch_all(&*self.pool)
         .await?;
 
-        if !rows.is_empty() && self.route_mode != FundingRouteMode::Blocked {
+        if !rows.is_empty() && route_mode != FundingRouteMode::Blocked {
             tracing::info!(count = rows.len(), "Funding worker found non-terminal sagas");
         }
 
@@ -388,10 +403,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
         for row in &rows {
             let saga_id: Uuid = row.get("saga_id");
             let state: String = row.get("state");
-            match self.route_mode {
+            match route_mode {
                 // Nothing is sent or written: the saga stays as it is.
                 FundingRouteMode::Blocked => {
-                    if let Some(reason) = self.route_mode.blocking_reason(&state) {
+                    if let Some(reason) = route_mode.blocking_reason(&state) {
                         self.log_blocked_once(saga_id, &state, reason);
                     }
                     continue;
@@ -421,6 +436,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
     fn log_blocked_once(&self, saga_id: Uuid, state: &str, reason: &str) {
         let first = self.blocked_logged.lock().unwrap_or_else(|e| e.into_inner()).insert(saga_id);
         if first {
+            if self.exchange.capabilities().account_kind
+                == robson_exec::venue::AccountKind::BalanceAccount
+            {
+                tracing::error!(%saga_id, %state, %reason,
+                    "Funding saga blocked on balance account; liabilities retained");
+                return;
+            }
             tracing::error!(
                 %saga_id,
                 %state,
@@ -435,7 +457,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
     /// sagas, so any other route reports zero without a query. Counted apart
     /// from the resume scan, whose page size would otherwise cap it.
     pub async fn refresh_blocked_gauge(&self) -> DaemonResult<()> {
-        let blocked = if self.route_mode == FundingRouteMode::Blocked {
+        let blocked = if self.effective_route_mode() == FundingRouteMode::Blocked {
             sqlx::query_scalar::<_, i64>(
                 r#"
                 SELECT COUNT(*)
@@ -551,7 +573,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
         let state: String = row.get("state");
         Ok(FundingSagaView {
             saga_id,
-            blocked_reason: self.route_mode.blocking_reason(&state).map(str::to_string),
+            blocked_reason: self.effective_route_mode().blocking_reason(&state).map(str::to_string),
             state,
             items: quote.items,
             events,

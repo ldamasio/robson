@@ -40,6 +40,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingWorker<E, S> {
         }
     }
 
+    /// The exact runtime poll body; failures of resume do not hide the
+    /// independent blocked-liability gauge refresh.
+    pub(crate) async fn poll(&self) {
+        match self.resume().await {
+            Ok(count) if count > 0 => info!(count, "Funding worker resumed sagas"),
+            Ok(_) => {},
+            Err(error) => error!(%error, "Funding worker poll failed"),
+        }
+        if let Err(error) = self.service.refresh_blocked_gauge().await {
+            error!(%error, "Funding worker blocked-saga count failed");
+        }
+    }
+
     pub async fn run(self, shutdown: tokio_util::sync::CancellationToken) -> DaemonResult<()> {
         info!("Funding worker started");
         let mut ticker = interval(self.poll_interval);
@@ -52,14 +65,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingWorker<E, S> {
                     break;
                 }
                 _ = ticker.tick() => {
-                    match self.resume().await {
-                        Ok(count) if count > 0 => info!(count, "Funding worker resumed sagas"),
-                        Ok(_) => {},
-                        Err(error) => error!(%error, "Funding worker poll failed"),
-                    }
-                    if let Err(error) = self.service.refresh_blocked_gauge().await {
-                        error!(%error, "Funding worker blocked-saga count failed");
-                    }
+                    self.poll().await;
                 }
             }
         }

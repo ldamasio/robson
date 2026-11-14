@@ -13,7 +13,7 @@ pub enum FundingRouteMode {
     /// original route. Started sagas finish there, an unstarted quote only
     /// expires, and the selected venue's engine capital is left alone.
     Recovery,
-    /// No route has a funding surface (the original credentials are missing):
+    /// The account kind forbids funding, or no route has a funding surface:
     /// nothing is sent and nothing is written. Started sagas stay non-terminal
     /// with their liabilities retained, and the reason is recomputed from the
     /// route on every start; an unstarted quote waits for a route to expire it.
