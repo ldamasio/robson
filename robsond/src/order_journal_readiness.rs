@@ -17,7 +17,7 @@ const INDEX_NAME: &str = "idx_submit_attempts_one_per_spot_client_id";
 const CATALOG: &str = r#"
 WITH needed(name) AS (VALUES ('accounting_state'), ('venue_accounts'), ('leg_routes'),
     ('balance_leg_admissions'), ('balance_legs'), ('venue_orders'), ('order_fills'), ('spot_intent_clock'))
-SELECT t.oid::bigint AS target_oid, ns.nspname AS target_schema, t.relname AS target_name,
+SELECT t.oid::bigint AS target_oid, ix.oid::bigint AS index_oid, ns.nspname AS target_schema, t.relname AS target_name,
        current_setting('server_version_num')::integer >= 120000 AS supported,
        (SELECT bool_and(c.oid IS NOT NULL AND c.relkind IN ('r', 'p')
                         AND has_table_privilege(c.oid, 'SELECT'))
@@ -29,12 +29,14 @@ SELECT t.oid::bigint AS target_oid, ns.nspname AS target_schema, t.relname AS ta
                      JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum ORDER BY k.n)
                = ARRAY['venue_id','account_scope','client_order_id']::text[], false) AS index_ready,
        pg_get_expr(i.indpred, i.indrelid, false) AS actual_predicate,
-       (SELECT pg_get_expr(e.indpred, e.indrelid, false) FROM pg_index e
-        WHERE e.indexrelid = to_regclass($2)) AS expected_predicate
+       pg_get_expr(e.indpred, e.indrelid, false) AS expected_predicate,
+       COALESCE(i.indclass = e.indclass AND i.indcollation = e.indcollation
+                AND i.indoption = e.indoption, false) AS same_key_semantics
 FROM pg_class t JOIN pg_namespace ns ON ns.oid = t.relnamespace
 LEFT JOIN pg_class ix ON ix.relnamespace = t.relnamespace AND ix.relname = $1
 LEFT JOIN pg_index i ON i.indexrelid = ix.oid
 LEFT JOIN pg_am am ON am.oid = ix.relam
+LEFT JOIN pg_index e ON e.indexrelid = to_regclass($2)
 WHERE t.oid = to_regclass('submit_attempts') AND t.relkind IN ('r', 'p')
 "#;
 
@@ -74,7 +76,7 @@ impl PgJournalBackend {
         let connection = self.pool.acquire().await.map_err(error)?;
         let mut read = RetiringConnection { connection, finished: false };
         let mut tx = read.connection.begin().await.map_err(error)?;
-        sqlx::query("SELECT set_config('lock_timeout', '300ms', true), set_config('statement_timeout', '1s', true)")
+        sqlx::query("SELECT set_config('lock_timeout', '300ms', true), set_config('statement_timeout', '1s', true), set_config('idle_in_transaction_session_timeout', '1s', true)")
             .execute(&mut *tx).await.map_err(error)?;
         let actual = sqlx::query(CATALOG)
             .bind(INDEX_NAME)
@@ -109,6 +111,9 @@ impl PgJournalBackend {
             matches = checked.as_ref().is_some_and(|row| {
                 validate(row, true).is_ok()
                     && row.get::<i64, _>("target_oid") == actual.get::<i64, _>("target_oid")
+                    && row.get::<Option<i64>, _>("index_oid")
+                        == actual.get::<Option<i64>, _>("index_oid")
+                    && row.get::<bool, _>("same_key_semantics")
                     && row.get::<Option<String>, _>("expected_predicate").is_some()
                     && row.get::<Option<String>, _>("actual_predicate")
                         == row.get::<Option<String>, _>("expected_predicate")

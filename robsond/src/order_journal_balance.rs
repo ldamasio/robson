@@ -33,7 +33,7 @@ impl PgJournalBackend {
         };
         let timeout =
             format!("{}ms", statement_budget(balance.commit_bound, started.elapsed())?.as_millis());
-        sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true)")
+        sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true), set_config('idle_in_transaction_session_timeout', '1s', true)")
             .bind(timeout).execute(&mut **tx).await.map_err(known)?;
         let version = sqlx::query_scalar::<_, i64>(
             "UPDATE accounting_state SET version = version + 1 WHERE tenant_id = $1 AND venue_id = $2 RETURNING version",
