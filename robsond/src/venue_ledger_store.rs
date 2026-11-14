@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::order_journal_store::RetiringConnection;
 
 mod orders;
+mod trades;
 
 const WRITE_BOUND: Duration = Duration::from_secs(2);
 
