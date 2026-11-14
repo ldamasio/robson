@@ -126,6 +126,8 @@ pub enum LedgerError {
     IdentityConflict,
     #[error("trade identity conflict")]
     TradeConflict,
+    #[error("leg route conflict")]
+    RouteConflict,
     #[error("invalid evidence: {0}")]
     InvalidEvidence(String),
     #[error("decimal result is not exactly representable")]

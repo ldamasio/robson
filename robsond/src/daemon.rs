@@ -194,7 +194,12 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     // ADR-0056 step 8: the capability is fixed before the journal is shared.
     let one_attempt = venue.capabilities().one_attempt_per_client_id;
     let journal = Arc::new(
-        OrderJournal::new(backend, venue.id()).with_one_attempt_per_client_id(one_attempt),
+        OrderJournal::new(backend, venue.id())
+            .with_one_attempt_per_client_id(one_attempt)
+            .with_balance_account(
+                venue.capabilities().account_kind
+                    == robson_exec::venue::AccountKind::BalanceAccount,
+            ),
     );
     venue.attach_order_journal(Arc::clone(&journal));
     executor.with_order_journal(journal)

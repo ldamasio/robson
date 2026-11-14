@@ -73,6 +73,8 @@ pub mod income_ledger;
 pub mod order_journal_store;
 #[cfg(feature = "postgres")]
 pub mod process_epoch;
+#[cfg(feature = "postgres")]
+pub mod venue_ledger_store;
 
 #[cfg(feature = "postgres")]
 pub mod projection_worker;
