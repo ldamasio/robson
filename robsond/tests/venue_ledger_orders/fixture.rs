@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use robson_domain::{MonthlyBudgetModel, OrderSide};
 use robson_exec::{
     venue::{OrderPhase, VenueId, VenueOrderRecord},
@@ -54,7 +54,9 @@ pub struct Fixture {
 }
 impl Fixture {
     pub async fn new(pool: &PgPool) -> Self {
-        let tenant = Uuid::now_v7();
+        Self::for_tenant(pool, Uuid::now_v7()).await
+    }
+    pub async fn for_tenant(pool: &PgPool, tenant: Uuid) -> Self {
         let position = Uuid::now_v7();
         let admission = Uuid::now_v7();
         let ledger = PgVenueLedger::new(pool, tenant);

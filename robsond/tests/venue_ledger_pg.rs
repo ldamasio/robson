@@ -274,7 +274,7 @@ async fn adoption_after_trade_evidence_counts_the_entire_stored_execution(pool: 
         .execute(&mut *tx)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO order_fills VALUES ('binance:spot','scope','BTCUSDT','7','11',$1,100,3,300,0,'USDT',$2,$2)").bind(f.tenant).bind(seen(2).at).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO order_fills(venue_id,account_scope,symbol,exchange_order_id,trade_id,tenant_id,price,qty,quote_qty,commission,commission_asset,trade_time,recorded_at) VALUES ('binance:spot','scope','BTCUSDT','7','11',$1,100,3,300,0,'USDT',$2,$2)").bind(f.tenant).bind(seen(2).at).execute(&mut *tx).await.unwrap();
     sqlx::query("UPDATE venue_orders SET executed_cum=3,fills_qty=3,trades_cursor=12")
         .execute(&mut *tx)
         .await
@@ -493,4 +493,178 @@ async fn cancellation_during_leg_update_rolls_back_and_retires_connection(pool: 
             .unwrap()
             .changed
     );
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn racing_adoptions_to_real_different_legs_have_one_winner(pool: PgPool) {
+    let a = Fixture::new(&pool).await;
+    let b = Fixture::for_tenant(&pool, a.tenant).await;
+    let r = record();
+    a.ledger.record_order(&r, &unowned(), seen(1)).await.unwrap();
+    let version = a.version(&pool).await;
+    let al = a.link(LegOrderKind::Sell);
+    let bl = b.link(LegOrderKind::Sell);
+    let (ar, br) = tokio::join!(
+        a.ledger.record_order(&r, &al, seen(2)),
+        b.ledger.record_order(&r, &bl, seen(2))
+    );
+    assert!(matches!(
+        (&ar, &br),
+        (Ok(_), Err(LedgerError::IdentityConflict)) | (Err(LedgerError::IdentityConflict), Ok(_))
+    ));
+    assert_eq!(a.version(&pool).await, version + 1);
+    let ac = a.consumed(&pool).await;
+    let bc = b.consumed(&pool).await;
+    assert_eq!(ac + bc, Decimal::from(2));
+    assert!(ac == Decimal::ZERO || bc == Decimal::ZERO);
+    let before = snapshot(&pool).await;
+    let (winner, loser) = if ar.is_ok() { (&al, &bl) } else { (&bl, &al) };
+    assert!(!a.ledger.record_order(&r, winner, seen(3)).await.unwrap().changed);
+    assert_eq!(
+        a.ledger.record_order(&r, loser, seen(3)).await,
+        Err(LedgerError::IdentityConflict)
+    );
+    assert_eq!(snapshot(&pool).await, before);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn unresolved_admission_gains_cohort_only_when_real_entry_record_arrives(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    // Admission committed with handed_off=false models the durable state after a
+    // lost strict-journal ACK: the later venue record, not uncertainty, sets
+    // cohort.
+    assert!(sqlx::query_scalar::<_, Option<chrono::NaiveDate>>(
+        "SELECT cohort_month FROM balance_legs"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .is_none());
+    let before = snapshot(&pool).await;
+    let observations = [OrderObservation::NotFound, OrderObservation::Archived];
+    for observation in observations {
+        assert!(!matches!(observation, OrderObservation::Found(_)));
+    }
+    let answers = [
+        CancelAnswer::Unknown { reason: "fixture timeout".into() },
+        CancelAnswer::NotFound { code: -2011 },
+    ];
+    for answer in answers {
+        assert!(!matches!(answer, CancelAnswer::Cancelled(_)));
+    }
+    assert_eq!(snapshot(&pool).await, before);
+    let mut r = record();
+    r.side = OrderSide::Buy;
+    r.executed_qty = Decimal::ZERO;
+    r.cumulative_quote_qty = Some(Decimal::ZERO);
+    r.status = "NEW".into();
+    let link = f.link(LegOrderKind::Entry);
+    let version = f.version(&pool).await;
+    f.ledger.record_order(&r, &link, seen(1)).await.unwrap();
+    assert_eq!(f.version(&pool).await, version + 1);
+    assert_eq!(f.consumed(&pool).await, Decimal::ZERO);
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT cohort_month=decided_month FROM balance_legs")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    );
+    let before = snapshot(&pool).await;
+    assert!(!f.ledger.record_order(&r, &link, seen(2)).await.unwrap().changed);
+    assert_eq!(snapshot(&pool).await, before);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn stalled_leg_write_is_bounded_atomic_and_pool_remains_usable(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let before = snapshot(&pool).await;
+    execute(&pool,"CREATE FUNCTION stall_leg_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(10); RETURN NEW; END $$; CREATE TRIGGER stall_leg_write BEFORE UPDATE ON balance_legs FOR EACH ROW EXECUTE FUNCTION stall_leg_write()").await;
+    let start = Instant::now();
+    assert!(matches!(
+        f.ledger.record_order(&record(), &f.link(LegOrderKind::Sell), seen(1)).await,
+        Err(LedgerError::Backend(_))
+    ));
+    assert!(start.elapsed() < Duration::from_millis(2500));
+    assert_eq!(snapshot(&pool).await, before);
+    execute(&pool, "DROP TRIGGER stall_leg_write ON balance_legs").await;
+    f.ledger
+        .record_order(&record(), &f.link(LegOrderKind::Sell), seen(2))
+        .await
+        .unwrap();
+    assert_eq!(f.consumed(&pool).await, Decimal::from(2));
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn wire_statement_counts_match_the_counter_and_replay_contract(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let link = f.link(LegOrderKind::Sell);
+    let (proxy, proxied) = through_proxy(&pool).await;
+    let ledger = PgVenueLedger::new(&proxied, f.tenant);
+    let mut r = record();
+    for (seen_at, expected) in [(1, 8), (2, 1), (3, 7)] {
+        if seen_at == 3 {
+            r.update_time_ms = Some(123);
+        }
+        let counter = ledger.statements_total();
+        let wire = proxy.stats().statements;
+        ledger.record_order(&r, &link, seen(seen_at)).await.unwrap();
+        assert_eq!(ledger.statements_total() - counter, expected);
+        assert_eq!(proxy.stats().statements - wire, expected);
+    }
+}
+
+#[test]
+fn order_ledger_has_no_production_callers() {
+    fn visit(path: &std::path::Path) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().unwrap() != "venue_ledger_store" {
+                    visit(&path);
+                }
+                continue;
+            }
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                let production = source.split("#[cfg(test)]").next().unwrap();
+                assert!(
+                    !production.contains(".record_order("),
+                    "ledger order writer activated in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    visit(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn other_tenant_and_closed_leg_cannot_adopt_an_order(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let other = Fixture::new(&pool).await;
+    let r = record();
+    f.ledger.record_order(&r, &unowned(), seen(1)).await.unwrap();
+    let before = snapshot(&pool).await;
+    assert_eq!(
+        other.ledger.record_order(&r, &other.link(LegOrderKind::Sell), seen(2)).await,
+        Err(LedgerError::IdentityConflict)
+    );
+    assert_eq!(snapshot(&pool).await, before);
+    sqlx::query("UPDATE balance_legs SET closed_at=$1 WHERE position_id=$2")
+        .bind(seen(3).at)
+        .bind(f.position)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before = snapshot(&pool).await;
+    assert_eq!(
+        f.ledger.record_order(&r, &f.link(LegOrderKind::Sell), seen(4)).await,
+        Err(LedgerError::IdentityConflict)
+    );
+    assert_eq!(snapshot(&pool).await, before);
 }
