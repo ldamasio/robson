@@ -15,8 +15,7 @@ use rust_decimal::Decimal;
 use sqlx::{postgres::PgRow, Connection, PgConnection, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
-use super::{backend, commit_error, PgVenueLedger};
-use crate::order_journal_store::RetiringConnection;
+use super::{backend, commit_error, LedgerConnection, PgVenueLedger};
 
 pub(super) struct OrderContext {
     pub(super) order: Option<StoredOrder>,
@@ -39,15 +38,15 @@ impl PgVenueLedger {
             let key = OrderKey::from_record(record,link)?;
             let position = match link.owner { OrderOwner::Leg {position_id,..} => Some(position_id), _ => None };
             let connection = self.pool.acquire().await.map_err(backend)?;
-            let mut held = RetiringConnection {connection, finished:false};
-            let before = self.read_order_context(&mut held.connection,&key,position,false).await?;
+            let mut held = LedgerConnection::new(connection);
+            let before = self.read_order_context(held.connection(),&key,position,false).await?;
             let proposed = merge_order(before.order.as_ref(),record,link,&seen,before.leg.as_ref())?;
             if !proposed.changed {
                 held.finished=true;
                 return Ok(OrderWriteResult {changed:false,anomalies:proposed.anomalies});
             }
             self.statement();
-            let mut tx = held.connection.begin().await.map_err(backend)?;
+            let mut tx = held.connection().begin().await.map_err(backend)?;
             self.timeouts(&mut tx).await?;
             self.statement();
             let bumped=sqlx::query("UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id=$2")
