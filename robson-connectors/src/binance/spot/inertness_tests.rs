@@ -315,8 +315,8 @@ fn port_contract_violations(file: &str, code: &str) -> Vec<String> {
                 && !code[at + found.len()..].chars().next().is_some_and(is_ident)
         })
         .count();
-    // 8g's bounded pure scalar parser is not a port or an activation seam.
-    // Allow only these exact helper imports, only in their input boundaries.
+    // 8g's pure scalar and metadata boundaries are not ports or activation seams.
+    // Allow only these exact imports in their designated input boundaries.
     let pure: &[&str] = match file {
         "records.rs" | "rest.rs" | "rules.rs" => &["balance_costs::exact"],
         "market_data.rs" | "ohlcv.rs" => &["balance_costs::exact::ExactDecimal"],

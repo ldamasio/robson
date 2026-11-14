@@ -156,7 +156,9 @@ pub struct SizedAmounts {
 /// Immutable, unqualified data; no admission, send or current-age capability.
 /// ```compile_fail
 /// use robson_exec::balance_sizing::SizingCalculation;
-/// let forged = SizingCalculation { attempts: 1 };
+/// fn overwrite_attempts(mut result: SizingCalculation) {
+///     result.attempts = 1;
+/// }
 /// ```
 #[derive(Debug, Clone)]
 pub struct SizingCalculation {
