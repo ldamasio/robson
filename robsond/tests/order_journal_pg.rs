@@ -1381,6 +1381,51 @@ async fn racing_full_spot_transactions_land_exactly_one(pool: PgPool) {
     spot_attempt_race(&pool, false).await;
 }
 
+// A concurrency schedule starts after connection establishment, as daemon
+// startup does. Keep the production 250 ms acquisition bound unchanged: cold
+// CI connections must not substitute for the index race being tested.
+async fn prepare_spot_race_workers(pool: &PgPool, count: usize) -> Vec<PgJournalBackend> {
+    let mut workers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let backend = PgJournalBackend::new(pool, Uuid::now_v7());
+        backend.check_ready().await.unwrap();
+        workers.push(backend);
+    }
+    workers
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn spot_race_setup_waits_for_delayed_connections(pool: PgPool) {
+    let (proxy, proxied) = through_proxy(&pool).await;
+    let before = proxy.stats().connections;
+    proxy.set_mode(ProxyMode::Blackhole);
+    let preparing = tokio::spawn(async move { prepare_spot_race_workers(&proxied, 2).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while proxy.stats().connections == before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cold worker connection reached the proxy");
+    // Deliberately exceed the unchanged production acquisition bound.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!preparing.is_finished(), "unready workers escaped race preparation");
+    proxy.set_mode(ProxyMode::Pass);
+    let workers = tokio::time::timeout(Duration::from_secs(10), preparing)
+        .await
+        .expect("worker readiness recovered")
+        .unwrap();
+    for (index, worker) in workers.iter().enumerate() {
+        worker.commit(&spot_batch(&format!("prepared-{index}"))).await.unwrap();
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM submit_attempts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
 async fn spot_attempt_race(pool: &PgPool, preseed: bool) {
     let schedules = proptest::collection::vec(0u64..5, 2..7);
     let mut runner = TestRunner::deterministic();
@@ -1394,20 +1439,25 @@ async fn spot_attempt_race(pool: &PgPool, preseed: bool) {
         if preseed {
             let mut intent_only = first.clone();
             intent_only.attempts.clear();
-            PgJournalBackend::new(pool, Uuid::now_v7()).commit(&intent_only).await.unwrap();
+            let seed = prepare_spot_race_workers(pool, 1).await.pop().unwrap();
+            seed.commit(&intent_only).await.unwrap();
         }
 
+        let workers = prepare_spot_race_workers(pool, delays.len()).await;
+        let start = Arc::new(tokio::sync::Barrier::new(workers.len() + 1));
         let mut tasks = Vec::new();
-        for delay in &delays {
-            let backend = PgJournalBackend::new(pool, Uuid::now_v7());
+        for (backend, delay) in workers.into_iter().zip(&delays) {
+            let start = Arc::clone(&start);
             let mut batch = first.clone();
             batch.attempts = vec![attempt_row(false)];
             let delay = *delay;
             tasks.push(tokio::spawn(async move {
+                start.wait().await;
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 backend.commit(&batch).await
             }));
         }
+        start.wait().await;
         let mut landed = 0;
         for task in tasks {
             match task.await.unwrap() {
