@@ -41,7 +41,7 @@
 //! Test support: no production crate depends on this crate.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     convert::Infallible,
     future::{ready, Ready},
     io,
@@ -71,10 +71,7 @@ use tower_service::Service;
 
 use crate::{
     balance_stub::PlacementHook,
-    spot_book::{
-        BookError, BookOrder, BookRules, BookTrade, OrderKind, OrderRef, Side, SpotBook,
-        MAX_RETAINED_ORDERS,
-    },
+    spot_book::{BookError, BookOrder, BookRules, BookTrade, OrderKind, OrderRef, Side, SpotBook},
 };
 
 /// How long a shutdown waits for the drain.
@@ -193,12 +190,10 @@ struct Wire {
     weight: u32,
     unserved: Vec<String>,
     unserved_total: u64,
-    /// The STP mode each order was placed with, by order id, kept while
-    /// the book retains the order.
-    stp: BTreeMap<u64, String>,
     holds: VecDeque<(Method, String)>,
     scripts: VecDeque<(Method, String, u16, String)>,
     next_placement: Option<PlacementHook>,
+    after_placement: Option<PlacementHook>,
     cancels: u64,
 }
 
@@ -341,6 +336,13 @@ impl FakeSpotVenue {
     /// before the book acts.
     pub fn on_next_placement(&self, hook: PlacementHook) {
         self.shared.wire().next_placement = Some(hook);
+    }
+
+    /// Run `hook` once, right after the book acted on the next placement
+    /// and before the fake answers it: what another request does in
+    /// between, on any runtime (a test seam).
+    pub fn after_next_placement(&self, hook: PlacementHook) {
+        self.shared.wire().after_placement = Some(hook);
     }
 
     /// Open connections and running handlers.
@@ -597,11 +599,10 @@ fn side(side: Side) -> &'static str {
     }
 }
 
-/// The STP mode `order_id` was placed with: the symbol's default for an
-/// order that never came over the wire (a hook's).
-fn stp_of(shared: &Shared, order_id: u64) -> String {
-    let wire = shared.wire();
-    wire.stp.get(&order_id).cloned().unwrap_or_else(|| STP_MODES[0].to_string())
+/// The STP mode `order` was placed with, which the book keeps with it: the
+/// symbol's default for an order that never came over the wire (a hook's).
+fn stp_of(order: &BookOrder) -> &str {
+    order.tag.as_deref().unwrap_or(STP_MODES[0])
 }
 
 /// An order's record as a `RESULT` answer gives it (rest-api.md
@@ -627,8 +628,8 @@ fn record_json(order: &BookOrder, stp: &str) -> Value {
 
 /// An order as `GET order` and `openOrders` give it: its record with its
 /// times.
-fn order_json(shared: &Shared, order: &BookOrder) -> Value {
-    let mut record = record_json(order, &stp_of(shared, order.id));
+fn order_json(order: &BookOrder) -> Value {
+    let mut record = record_json(order, stp_of(order));
     record["icebergQty"] = json!("0");
     record["time"] = json!(order.time_ms);
     record["updateTime"] = json!(order.update_ms);
@@ -730,7 +731,7 @@ fn respond(shared: &Shared, method: &Method, path: &str, params: &[(String, Stri
         ("GET", "/api/v3/openOrders") => {
             let on = param(params, "symbol");
             let orders = book.open_orders(on);
-            ok(Value::Array(orders.iter().map(|o| order_json(shared, o)).collect()))
+            ok(Value::Array(orders.iter().map(order_json).collect()))
         },
         ("GET", "/api/v3/openOrderList") => ok(json!([])),
         ("GET", "/api/v3/order") => {
@@ -740,7 +741,7 @@ fn respond(shared: &Shared, method: &Method, path: &str, params: &[(String, Stri
                 (None, None) => None,
             };
             match by.map(|by| book.order(&symbol, by)) {
-                Some(Ok(order)) => ok(order_json(shared, &order)),
+                Some(Ok(order)) => ok(order_json(&order)),
                 Some(Err(e)) => book_error(e),
                 None => error(400, -1102, "Mandatory parameter 'orderId' was not sent."),
             }
@@ -863,28 +864,6 @@ fn new_order(params: &[(String, String)]) -> Result<NewOrder<'_>, Refused> {
     Ok(NewOrder { side, kind, qty, client_id, shape, stp })
 }
 
-/// Keep `order_id`'s STP mode while the book retains the order: past the
-/// book's retention, the entries of orders it evicted go, oldest first, and
-/// every retained order keeps its mode.
-fn keep_stp(shared: &Shared, order_id: u64, stp: &str) {
-    let mut wire = shared.wire();
-    wire.stp.insert(order_id, stp.to_string());
-    if wire.stp.len() <= MAX_RETAINED_ORDERS {
-        return;
-    }
-    let excess = wire.stp.len() - MAX_RETAINED_ORDERS;
-    let evicted: Vec<u64> = wire
-        .stp
-        .keys()
-        .copied()
-        .filter(|id| !shared.book.retains(*id))
-        .take(excess)
-        .collect();
-    for id in evicted {
-        wire.stp.remove(&id);
-    }
-}
-
 /// `POST /api/v3/order`: a MARKET order or a SELL `STOP_LOSS`, validated
 /// first, answered in the shape it asked for, its STP mode echoed.
 fn place(shared: &Shared, symbol: &str, params: &[(String, String)]) -> Answer {
@@ -900,28 +879,21 @@ fn place(shared: &Shared, symbol: &str, params: &[(String, String)]) -> Answer {
     if let Some(hook) = hook {
         hook(&shared.book);
     }
+    // The order carries its STP mode from the book's own critical section:
+    // a lost answer's accepted order keeps it, and no other request's
+    // placement can take it.
     let book = &shared.book;
-    let latest = |book: &SpotBook| book.order(symbol, OrderRef::Client(order.client_id)).ok();
-    let before = latest(book).map(|o| o.id);
-    let placed = match order.kind {
-        OrderKind::Market => book.place_market(symbol, order.side, order.qty, order.client_id),
-        OrderKind::StopLoss { trigger } => {
-            book.place_stop(symbol, order.qty, trigger, order.client_id)
-        },
-    };
+    let placed =
+        book.place_tagged(symbol, order.side, order.kind, order.qty, order.client_id, order.stp);
+    let after = shared.wire().after_placement.take();
+    if let Some(after) = after {
+        after(book);
+    }
     let placement = match placed {
         Ok(placement) => placement,
-        Err(BookError::Lost) => {
-            // The book may have accepted it: its records carry its mode.
-            if let Some(accepted) = latest(book).filter(|o| Some(o.id) != before) {
-                keep_stp(shared, accepted.id, order.stp);
-            }
-            return book_error(BookError::Lost);
-        },
         Err(e) => return book_error(e),
     };
     let placed = &placement.order;
-    keep_stp(shared, placed.id, order.stp);
     if order.shape == Shape::Ack {
         return ok(json!({
             "symbol": placed.symbol, "orderId": placed.id, "orderListId": -1,
@@ -959,7 +931,7 @@ fn cancel(shared: &Shared, symbol: &str, params: &[(String, String)]) -> Answer 
                 wire.cancels += 1;
                 wire.cancels
             };
-            let mut answer = record_json(&order, &stp_of(shared, order.id));
+            let mut answer = record_json(&order, stp_of(&order));
             answer["origClientOrderId"] = json!(order.client_id);
             answer["clientOrderId"] = json!(format!("cancel{sequence}"));
             answer["transactTime"] = json!(order.update_ms);

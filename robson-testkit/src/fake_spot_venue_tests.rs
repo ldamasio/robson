@@ -19,7 +19,7 @@ use tokio::runtime::{Builder, Handle};
 
 use crate::{
     fake_spot_venue::{FakeSpotVenue, SignatureVerdict, TestCredentials, SHUTDOWN_BOUND},
-    spot_book::{BookRules, Script, SpotBook},
+    spot_book::{BookRules, OrderKind, Script, Side, SpotBook},
 };
 
 const KEY: &str = TestCredentials::FIXED.api_key;
@@ -684,5 +684,68 @@ async fn stp_modes_follow_the_books_retention() {
         (status, record["selfTradePreventionMode"].as_str()),
         (200, Some("EXPIRE_TAKER"))
     );
+    venue.shutdown().await.unwrap();
+}
+
+/// Codex 8d-2a round 3, P3: a lost placement and another request reusing
+/// its client id, interleaved right after the book acted on the first
+/// (`after_next_placement`, the same interleaving on any runtime), each
+/// keep their own STP mode; a lost refusal gives no other order its mode.
+#[tokio::test]
+async fn interleaved_placements_keep_their_own_modes() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let venue = venue().await;
+    let accepted = Arc::new(AtomicBool::new(false));
+
+    // A lost acceptance: A (EXPIRE_TAKER) fills, its answer lost; B then
+    // reuses the client id with EXPIRE_BOTH.
+    venue.book().script_next(Script::Lost);
+    let b = Arc::clone(&accepted);
+    venue.after_next_placement(Box::new(move |book: &SpotBook| {
+        let placed = book.place_tagged(
+            "BTCUSDT",
+            Side::Buy,
+            OrderKind::Market,
+            d("0.1"),
+            "x",
+            "EXPIRE_BOTH",
+        );
+        b.store(placed.is_ok(), SeqCst);
+    }));
+    let query =
+        market_query("&side=BUY&newOrderRespType=RESULT&selfTradePreventionMode=EXPIRE_TAKER", "x");
+    let (status, _) = post(&venue, &query).await;
+    assert_eq!(status, 503);
+    assert!(accepted.load(SeqCst), "B was accepted");
+    let orders = venue.book().all_orders();
+    let ids: Vec<u64> = orders.iter().filter(|o| o.client_id == "x").map(|o| o.id).collect();
+    assert_eq!(ids.len(), 2, "A's order and B's");
+    for (id, mode) in ids.iter().zip(["EXPIRE_TAKER", "EXPIRE_BOTH"]) {
+        let (_, record) =
+            get(&venue, "/api/v3/order", &format!("orderId={id}&symbol=BTCUSDT&timestamp=1")).await;
+        assert_eq!(record["selfTradePreventionMode"], mode, "order {id}");
+    }
+
+    // A lost refusal: A's stop at the price is refused, its answer lost; B
+    // places a stop under the same client id with EXPIRE_BOTH.
+    accepted.store(false, SeqCst);
+    venue.book().script_next(Script::Lost);
+    let b = Arc::clone(&accepted);
+    venue.after_next_placement(Box::new(move |book: &SpotBook| {
+        let stop = OrderKind::StopLoss { trigger: d("90") };
+        let placed = book.place_tagged("BTCUSDT", Side::Sell, stop, d("0.5"), "y", "EXPIRE_BOTH");
+        b.store(placed.is_ok(), SeqCst);
+    }));
+    let query = "newClientOrderId=y&newOrderRespType=RESULT&quantity=0.5&\
+                 selfTradePreventionMode=EXPIRE_TAKER&side=SELL&stopPrice=100&symbol=BTCUSDT&\
+                 timestamp=1&type=STOP_LOSS";
+    let (status, _) = post(&venue, query).await;
+    assert_eq!(status, 503);
+    assert!(accepted.load(SeqCst), "B was accepted");
+    let orders = venue.book().all_orders();
+    assert_eq!(orders.iter().filter(|o| o.client_id == "y").count(), 1, "A's stop was refused");
+    let (_, record) =
+        get(&venue, "/api/v3/order", "origClientOrderId=y&symbol=BTCUSDT&timestamp=1").await;
+    assert_eq!(record["selfTradePreventionMode"], "EXPIRE_BOTH");
     venue.shutdown().await.unwrap();
 }
