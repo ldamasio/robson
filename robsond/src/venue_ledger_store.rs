@@ -49,9 +49,12 @@ impl PgVenueLedger {
         self.statements.fetch_add(1, Ordering::Relaxed);
     }
 
+    // Server cleanup is bounded once this statement ran, before any ledger
+    // write. A partition immediately after bare BEGIN can leave an empty
+    // remote session; it holds no business locks/objects and is never reused.
     async fn timeouts(&self, tx: &mut Transaction<'_, Postgres>) -> Result<(), LedgerError> {
         self.statement();
-        sqlx::query("SELECT set_config('lock_timeout', '300ms', true), set_config('statement_timeout', '1s', true)")
+        sqlx::query("SELECT set_config('lock_timeout', '300ms', true), set_config('statement_timeout', '1s', true), set_config('idle_in_transaction_session_timeout', '1s', true)")
             .execute(&mut **tx).await.map_err(backend)?;
         Ok(())
     }
