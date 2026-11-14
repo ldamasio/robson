@@ -34,3 +34,5 @@ hex = "0.4"
 anyhow = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tokio = { workspace = true }
+# Conformance run S: the spot adapter against the fake spot venue.
+robson-testkit = { path = "../robson-testkit" }

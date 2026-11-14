@@ -2103,6 +2103,7 @@ dependencies = [
  "reqwest",
  "robson-domain",
  "robson-exec",
+ "robson-testkit",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
@@ -2267,6 +2268,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "hmac",
  "reqwest",
  "robson-domain",
  "robson-eventlog",
@@ -2277,6 +2279,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "tokio",
+ "tower-service",
  "uuid",
 ]
 

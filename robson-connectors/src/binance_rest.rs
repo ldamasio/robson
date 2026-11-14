@@ -173,6 +173,21 @@ impl BinanceRestClient {
         }
     }
 
+    /// [`Self::with_local_base_url`] with its own key and secret, for a local
+    /// venue that checks a key's format (ADR-0056 step 8, 8d-2: the fake spot
+    /// venue answers the fixed `"key"` -2014).
+    #[cfg(test)]
+    pub(crate) fn with_local_base_url_and_credentials(
+        base_url: String,
+        api_key: &str,
+        api_secret: &str,
+    ) -> Self {
+        Self {
+            local_base_url: Some(base_url),
+            ..Self::new(api_key.to_string(), api_secret.to_string())
+        }
+    }
+
     /// Crash harness: every request goes to the fake venue at `base_url`.
     /// Exists only with the `crash-points` feature.
     ///
