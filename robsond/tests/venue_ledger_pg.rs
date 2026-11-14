@@ -469,7 +469,9 @@ async fn cancellation_during_leg_update_rolls_back_and_retires_connection(pool: 
     let f = Fixture::new(&pool).await;
     let before = snapshot(&pool).await;
     execute(&pool,"CREATE FUNCTION sleep_leg_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(10); RETURN NEW; END $$; CREATE TRIGGER sleep_leg_write BEFORE UPDATE ON balance_legs FOR EACH ROW EXECUTE FUNCTION sleep_leg_write()").await;
-    let ledger = Arc::new(PgVenueLedger::new(&pool, f.tenant));
+    let (proxy, proxied) = through_proxy(&pool).await;
+    let ledger = Arc::new(PgVenueLedger::new(&proxied, f.tenant));
+    let connections = proxy.stats().connections;
     let link = f.link(LegOrderKind::Sell);
     let copy = ledger.clone();
     let task = tokio::spawn(async move { copy.record_order(&record(), &link, seen(1)).await });
@@ -503,6 +505,10 @@ async fn cancellation_during_leg_update_rolls_back_and_retires_connection(pool: 
             .await
             .unwrap()
             .changed
+    );
+    assert!(
+        proxy.stats().connections > connections,
+        "cancelled connection must be retired, not returned to the pool"
     );
 }
 
