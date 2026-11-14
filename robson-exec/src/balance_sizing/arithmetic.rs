@@ -35,6 +35,8 @@ impl Rational {
     }
 
     pub(super) fn decimal(value: Decimal) -> Result<Self, MathError> {
+        #[cfg(test)]
+        trace("import", 1);
         if value < Decimal::ZERO {
             return Err(MathError::Negative);
         }
@@ -123,6 +125,8 @@ impl Arithmetic {
         // Only the two fixed wrappers call this; never a caller-supplied exponent.
         let factor = BigUint::from(10_u8).pow(scale);
         let scaled = product(&value.numerator, &factor)?;
+        #[cfg(test)]
+        trace("integer_div", 1);
         Rational::new(scaled / &value.denominator, factor)
     }
 
@@ -219,6 +223,8 @@ fn sum(a: &BigUint, b: &BigUint) -> Result<BigUint, MathError> {
 fn quotient_remainder(numerator: &BigUint, denominator: &BigUint) -> (BigUint, BigUint) {
     // All callers proved denominator>0 and inputs<=4096bits. q*d<=n, so
     // reconstructing the remainder cannot grow beyond the numerator's bound.
+    #[cfg(test)]
+    trace("integer_div", 1);
     let quotient = numerator / denominator;
     let remainder = numerator - &quotient * denominator;
     (quotient, remainder)
