@@ -242,3 +242,24 @@ pub async fn wait_for_query(pool: &PgPool, fragment: &str) {
         }
     }).await.expect("writer never reached injected wait");
 }
+
+/// Count through asynchronous retirement: a return from the writer alone does
+/// not prove SQLx has finished flushing/dropping the old physical connection.
+pub async fn wait_for_backend_exit(pool: &PgPool, pid: i32) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1)")
+                    .bind(pid)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            if !exists {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("retired backend did not exit within its deadline");
+}

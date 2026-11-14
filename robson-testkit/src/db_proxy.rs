@@ -436,8 +436,17 @@ async fn backend_to_frontend(
         let (tag, body) = read_message(&mut server).await?;
         let pending = commit_ack_pending.load(Ordering::SeqCst);
         if pending == 3 {
-            // Parse/Bind/ErrorResponse still pass. Hold only successful command
-            // completion until idle ReadyForQuery proves the autocommit ended.
+            // CommandComplete can precede a deferred-constraint ErrorResponse
+            // at implicit commit. Preserve that failed exchange byte-for-byte;
+            // only an error-free idle completion proves the write committed.
+            if tag == b'E' {
+                if let Some(complete) = autocommit_complete.take() {
+                    write_message(&mut client, b'C', &complete).await?;
+                }
+                commit_ack_pending.store(0, Ordering::SeqCst);
+                write_message(&mut client, tag, &body).await?;
+                continue;
+            }
             if tag == b'C' {
                 autocommit_complete = Some(body);
                 continue;
@@ -795,11 +804,25 @@ mod tests {
     }
     #[tokio::test]
     async fn failed_autocommit_is_forwarded_without_claiming_a_landed_ack() {
+        assert_failed_autocommit_is_forwarded(false).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_autocommit_error_after_command_complete_is_forwarded() {
+        assert_failed_autocommit_is_forwarded(true).await;
+    }
+
+    async fn assert_failed_autocommit_is_forwarded(command_completed: bool) {
         bounded(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let error = message(b'E', b"SERROR\0C23514\0Mfixture failure\0\0");
-            let mut expected = error.clone();
+            let mut expected = if command_completed {
+                message(b'C', b"UPDATE 1\0")
+            } else {
+                vec![]
+            };
+            expected.extend(error);
             expected.extend(message(b'Z', b"I"));
             let reply = expected.clone();
             let server = tokio::spawn(async move {
@@ -822,7 +845,8 @@ mod tests {
                 .await
                 .unwrap();
             let mut received = vec![0u8; expected.len()];
-            client.read_exact(&mut received).await.unwrap();
+            let result = client.read_exact(&mut received).await;
+            assert!(result.is_ok(), "failed autocommit completion was suppressed: {result:?}");
             assert_eq!(received, expected);
             assert_eq!(proxy.autocommit_acks_dropped(), 0);
             server.await.unwrap();

@@ -200,10 +200,23 @@ async fn a_failed_trades_commit_rolls_back_the_cursor(pool: PgPool) {
     let key = f.seed_order(&pool, 1, Decimal::ZERO, OrderPhase::Live).await;
     sqlx::raw_sql("CREATE FUNCTION refuse_fill_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refuses commit' USING ERRCODE='23514'; END $$; CREATE CONSTRAINT TRIGGER refuse_fill_commit AFTER INSERT ON order_fills DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse_fill_commit()").execute(&pool).await.unwrap();
     let before = snapshot(&pool).await;
+    let (proxy, proxied) = through_proxy(&pool, 1).await;
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&proxied).await.unwrap();
+    proxy.enable_query_trace(32);
+    let wire = proxy.stats().statements;
+    let ledger = f.ledger(&proxied);
     assert!(matches!(
-        f.ledger(&pool).record_trades(&key, &page(1, dec!(2)), at()).await,
+        ledger.record_trades(&key, &page(1, dec!(2)), at()).await,
         Err(LedgerError::Backend(_))
     ));
+    wait_for_backend_exit(&pool, pid).await;
+    assert_eq!(
+        proxy.stats().statements - wire,
+        10,
+        "failed COMMIT must not flush a hidden ROLLBACK: {:?}",
+        proxy.query_trace()
+    );
+    assert_eq!(ledger.statements_total(), 10);
     assert_eq!(snapshot(&pool).await, before);
 }
 
@@ -214,7 +227,10 @@ async fn a_cancelled_record_trades_between_its_aggregate_statements_lands_nothin
     let key = f.seed_order(&pool, 1, Decimal::ZERO, OrderPhase::Live).await;
     sqlx::raw_sql("CREATE FUNCTION sleep_leg_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(20); RETURN NEW; END $$; CREATE TRIGGER sleep_leg_write BEFORE UPDATE ON balance_legs FOR EACH ROW EXECUTE FUNCTION sleep_leg_write()").execute(&pool).await.unwrap();
     let before = snapshot(&pool).await;
-    let (_proxy, proxied) = through_proxy(&pool, 1).await;
+    let (proxy, proxied) = through_proxy(&pool, 1).await;
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&proxied).await.unwrap();
+    proxy.enable_query_trace(32);
+    let wire = proxy.stats().statements;
     let ledger = Arc::new(f.ledger(&proxied));
     let task_ledger = ledger.clone();
     let task_key = key.clone();
@@ -225,6 +241,14 @@ async fn a_cancelled_record_trades_between_its_aggregate_statements_lands_nothin
     wait_for_query(&pool, "UPDATE balance_legs SET consumed_cum").await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
+    wait_for_backend_exit(&pool, pid).await;
+    assert_eq!(
+        proxy.stats().statements - wire,
+        9,
+        "cancelled transaction must not flush hidden SQL: {:?}",
+        proxy.query_trace()
+    );
+    assert_eq!(ledger.statements_total(), 9);
     tokio::time::timeout(Duration::from_secs(3),async {
         loop {
             let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND query LIKE '%UPDATE balance_legs SET consumed_cum%' AND state='active')").fetch_one(&pool).await.unwrap();
@@ -529,6 +553,50 @@ async fn trade_raised_execution_never_freezes_an_old_quote_subtotal(pool: PgPool
             .await
             .unwrap();
     assert_eq!((executed, quote, phase), (dec!(3), None, "terminal".into()));
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_deferred_autocommit_failure_is_not_a_landed_touch_ack(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let key = f.seed_order(&pool, 1, dec!(1), OrderPhase::Terminal).await;
+    sqlx::raw_sql("CREATE FUNCTION refuse_touch_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rejects implicit commit' USING ERRCODE='23514'; END $$; CREATE CONSTRAINT TRIGGER refuse_touch_commit AFTER UPDATE ON venue_orders DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse_touch_commit()")
+        .execute(&pool).await.unwrap();
+    let (proxy, proxied) = through_proxy(&pool, 1).await;
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&proxied).await.unwrap();
+    let ledger = f.ledger(&proxied);
+    let before = snapshot(&pool).await;
+    let wire = proxy.stats().statements;
+    let later = at() + chrono::Duration::seconds(5);
+    proxy.set_mode(ProxyMode::DropAutocommitAckOf("UPDATE venue_orders SET last_checked_at"));
+    assert!(matches!(ledger.touch_checked(&key, later).await, Err(LedgerError::Backend(_))));
+    wait_for_backend_exit(&pool, pid).await;
+    assert_eq!(
+        proxy.autocommit_acks_dropped(),
+        0,
+        "rolled-back autocommit has no landed acknowledgement"
+    );
+    assert_eq!(proxy.stats().statements - wire, 1);
+    assert_eq!(ledger.statements_total(), 1);
+    assert_eq!(snapshot(&pool).await, before);
+    sqlx::query("DROP TRIGGER refuse_touch_commit ON venue_orders")
+        .execute(&pool)
+        .await
+        .unwrap();
+    proxy.set_mode(ProxyMode::DropAutocommitAckOf("UPDATE venue_orders SET last_checked_at"));
+    assert!(matches!(
+        ledger.touch_checked(&key, later).await,
+        Err(LedgerError::Uncertain(_))
+    ));
+    assert_eq!(
+        proxy.autocommit_acks_dropped(),
+        1,
+        "only the successful retry may drop completion"
+    );
+    let landed = snapshot(&pool).await;
+    assert_ne!(landed, before);
+    ledger.touch_checked(&key, later).await.unwrap();
+    assert_eq!(snapshot(&pool).await, landed);
 }
 
 #[path = "venue_ledger_trades/generated.rs"]
