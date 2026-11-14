@@ -45,7 +45,7 @@ fn override_body() -> serde_json::Value {
     json!({"version":1,"tenant_id":Uuid::from_u128(1),"venue":"binance:spot","scope":"scope-one","uid":7,"symbol":"BTCUSDT","maker_bps":"8","taker_bps":"10","as_of":"2026-11-14T12:00:00Z","note":"dated operator terms"})
 }
 fn dated() -> CostCandidate {
-    parse_dated_override(&override_body().to_string()).unwrap()
+    parse_dated_override(&override_body().to_string(), &identity()).unwrap()
 }
 
 // Only this cfg(test) implementation can supply synthetic age evidence. There
@@ -135,12 +135,15 @@ fn invalid_or_unrepresentable_components_never_panic_or_round() {
     let mut raw = override_body();
     raw["taker_bps"] = json!("0.0000000000000000000000000001");
     assert!(matches!(
-        parse_dated_override(&raw.to_string()),
+        parse_dated_override(&raw.to_string(), &identity()),
         Err(CostError::Unrepresentable)
     ));
     let mut raw = override_body();
     raw["taker_bps"] = json!("100");
-    assert!(matches!(parse_dated_override(&raw.to_string()), Err(CostError::Rate)));
+    assert!(matches!(
+        parse_dated_override(&raw.to_string(), &identity()),
+        Err(CostError::Rate)
+    ));
 }
 
 #[test]
@@ -259,7 +262,7 @@ fn canonical_hash_normalizes_values_but_keeps_identity_source_date_gap_and_note(
     body["taker_bps"] = json!("10.000");
     assert_eq!(
         original.evidence().hash(),
-        parse_dated_override(&body.to_string()).unwrap().evidence().hash()
+        parse_dated_override(&body.to_string(), &identity()).unwrap().evidence().hash()
     );
     for (field, value) in [
         ("scope", json!("scope-two")),
@@ -270,9 +273,18 @@ fn canonical_hash_normalizes_values_but_keeps_identity_source_date_gap_and_note(
     ] {
         let mut body = override_body();
         body[field] = value;
+        let configured = CostIdentity::new(
+            identity().tenant(),
+            identity().venue().clone(),
+            body["scope"].as_str().unwrap().into(),
+            body["uid"].as_u64().unwrap(),
+            Symbol::new(if field == "symbol" { "ETH" } else { "BTC" }.into(), "USDT".into())
+                .unwrap(),
+        )
+        .unwrap();
         assert_ne!(
             original.evidence().hash(),
-            parse_dated_override(&body.to_string()).unwrap().evidence().hash(),
+            parse_dated_override(&body.to_string(), &configured).unwrap().evidence().hash(),
             "{field}"
         );
     }
@@ -325,9 +337,9 @@ fn injected_config_is_bounded_exact_and_never_reads_legacy_fees() {
     ] {
         let mut body = override_body();
         body[field] = value;
-        assert!(parse_dated_override(&body.to_string()).is_err(), "{field}");
+        assert!(parse_dated_override(&body.to_string(), &identity()).is_err(), "{field}");
     }
-    assert!(parse_dated_override(&" ".repeat(MAX_OVERRIDE_BYTES + 1)).is_err());
+    assert!(parse_dated_override(&" ".repeat(MAX_OVERRIDE_BYTES + 1), &identity()).is_err());
 }
 
 proptest! {
@@ -403,7 +415,7 @@ fn native_scale_twenty_eight_survives_aggregation_and_fraction_round_trip() {
     let mut body = override_body();
     body["taker_bps"] = json!("0.000000000000000000000001");
     assert_eq!(
-        parse_dated_override(&body.to_string()).unwrap().taker_bps(),
+        parse_dated_override(&body.to_string(), &identity()).unwrap().taker_bps(),
         Decimal::from_parts(1, 0, 0, false, 24)
     );
 }
@@ -422,6 +434,64 @@ fn overflow_is_an_exact_arithmetic_refusal_not_a_saturated_rate() {
 fn override_body_limit_rejects_an_otherwise_valid_oversize_document() {
     let body = override_body().to_string();
     let at_limit = format!("{body}{}", " ".repeat(MAX_OVERRIDE_BYTES - body.len()));
-    assert!(parse_dated_override(&at_limit).is_ok());
-    assert!(matches!(parse_dated_override(&(at_limit + " ")), Err(CostError::Config)));
+    assert!(parse_dated_override(&at_limit, &identity()).is_ok());
+    assert!(matches!(
+        parse_dated_override(&(at_limit + " "), &identity()),
+        Err(CostError::Config)
+    ));
+}
+
+#[test]
+fn configured_override_supports_quotes_without_suffix_guessing() {
+    // These are configured canonical symbols, not a new tradability/metadata
+    // decision. No fixed quote list is consulted by the override interface.
+    for (base, quote) in [("SOL", "USDC"), ("BTC", "USDC"), ("BTC", "EUR")] {
+        let symbol = Symbol::new(base.into(), quote.into()).unwrap();
+        let configured = CostIdentity::new(
+            identity().tenant(),
+            identity().venue().clone(),
+            identity().scope().into(),
+            identity().uid(),
+            symbol.clone(),
+        )
+        .unwrap();
+        let mut body = override_body();
+        body["symbol"] = json!(symbol.as_pair());
+        let candidate = parse_dated_override(&body.to_string(), &configured).unwrap();
+        assert_eq!(candidate.evidence().account().symbol(), &symbol);
+        let authority = Authority {
+            absence: Some(Ok(())),
+            ..Authority::default().with(&candidate, 1)
+        };
+        let terms = select_costs(
+            &authority,
+            &configured,
+            VenueCostEvidence::Unavailable,
+            DatedOverrideEvidence::Available(&candidate),
+            exact("10"),
+        )
+        .unwrap();
+        assert_eq!(terms.evidence().account(), &configured);
+    }
+}
+
+#[test]
+fn configured_override_rejects_every_explicit_identity_mismatch() {
+    for (field, value) in [
+        ("tenant_id", json!(Uuid::from_u128(2))),
+        ("venue", json!("binance:usdm")),
+        ("scope", json!("other-scope")),
+        ("uid", json!(8)),
+        ("symbol", json!("ETHUSDT")),
+    ] {
+        let mut body = override_body();
+        body[field] = value;
+        assert!(
+            matches!(
+                parse_dated_override(&body.to_string(), &identity()),
+                Err(CostError::Identity)
+            ),
+            "{field}"
+        );
+    }
 }

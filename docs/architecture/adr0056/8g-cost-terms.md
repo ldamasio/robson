@@ -41,7 +41,7 @@ uses approved200bps; margin is nonnegative and below10,000bps. A configured cap
 must be positive. This parses units only; it performs no sizing or policy fallback.
 The existing daemon USD-M configuration and `ROBSON_TAKER_FEE_RATE` are untouched.
 
-`parse_dated_override` accepts at most4096 bytes, denies duplicate/unknown fields,
+`parse_dated_override(body, &configured_identity)` accepts at most4096 bytes, denies duplicate/unknown fields,
 and requires this explicit version1 JSON shape (example identity and values only):
 
 ```json
@@ -58,6 +58,14 @@ and requires this explicit version1 JSON shape (example identity and values only
   "note": "original dated operator terms"
 }
 ```
+
+The explicit tenant/venue/scope/UID/symbol must equal the already configured
+identity. The parser clones its canonical base/quote symbol; it does not guess
+quote suffixes or use the legacy fixed quote list. Configured USDC and other
+quote assets therefore retain the same fallback. Venue metadata/tradability and
+unknown-symbol handling remain their existing owners, including later8k; this
+parser adds no discovery or fallback for an unknown symbol. The version1 JSON
+shape is unchanged.
 
 Rates must be strings, not JSON numbers. Note is at most256 bytes, scope128,
 venue64 and each symbol asset32; blank/control-character identities/provenance

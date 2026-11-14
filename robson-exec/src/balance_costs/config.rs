@@ -1,7 +1,6 @@
 //! Injected text only: no process environment reads or legacy fee fallback.
 
 use chrono::{DateTime, Utc};
-use robson_domain::Symbol;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -59,8 +58,13 @@ impl CostPolicy {
 /// note. Date validity/freshness is NOT inferred here: the sealed receipt-age
 /// authority must qualify the original date at selection. Unknown JSON fields,
 /// duplicate fields, numeric rates and oversize bodies are configuration
-/// errors.
-pub fn parse_dated_override(body: &str) -> Result<CostCandidate, CostError> {
+/// errors. The supplied identity already contains the configured canonical
+/// symbol; this parser checks its explicit fields and never guesses quote
+/// suffixes or determines whether an unknown venue symbol is tradable.
+pub fn parse_dated_override(
+    body: &str,
+    configured: &CostIdentity,
+) -> Result<CostCandidate, CostError> {
     if body.len() > MAX_OVERRIDE_BYTES {
         return Err(CostError::Config);
     }
@@ -79,14 +83,19 @@ pub fn parse_dated_override(body: &str) -> Result<CostCandidate, CostError> {
         note: String,
     }
     let raw: Raw = serde_json::from_str(body).map_err(|_| CostError::Config)?;
-    if raw.version != 1 || raw.venue != VenueId::BINANCE_SPOT || raw.symbol.len() > 64 {
+    if raw.version != 1 || configured.venue().as_str() != VenueId::BINANCE_SPOT {
         return Err(CostError::Config);
     }
-    let symbol = Symbol::from_pair(&raw.symbol).map_err(|_| CostError::Config)?;
-    let identity =
-        CostIdentity::new(raw.tenant_id, VenueId::new(raw.venue), raw.scope, raw.uid, symbol)?;
+    if raw.tenant_id != configured.tenant()
+        || raw.venue != configured.venue().as_str()
+        || raw.scope != configured.scope()
+        || raw.uid != configured.uid()
+        || raw.symbol != configured.symbol().as_pair()
+    {
+        return Err(CostError::Identity);
+    }
     CostCandidate::dated(
-        identity,
+        configured.clone(),
         raw.as_of,
         raw.maker_bps.value(),
         raw.taker_bps.value(),
