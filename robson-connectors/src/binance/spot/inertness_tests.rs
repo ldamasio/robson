@@ -9,11 +9,10 @@
 //!   can construct its reader, feed, klines, rules cache or venue;
 //! - readers, rules projection and cache implement no port. The exact named
 //!   input boundaries may import 8g1a's pure scalar parser; the cache may not.
-//!   8b's feed and klines additionally import exactly the existing items of
-//!   the port each implements (`TradeFeedPort`,
-//!   `OhlcvPort`). 8c-2b's venue, `exchange.rs`, and 8c-3a's order path,
-//!   `trading.rs`, import exactly the contracts they implement or fill and the
-//!   types those carry, by path;
+//!   8b's feed and klines additionally import exactly the existing items of the
+//!   port each implements (`TradeFeedPort`, `OhlcvPort`). 8c-2b's venue,
+//!   `exchange.rs`, and 8c-3a's order path, `trading.rs`, import exactly the
+//!   contracts they implement or fill and the types those carry, by path;
 //! - an order leaves only through `trading.rs`: one `post_signed_answer` call,
 //!   inside `SubmitAttemptLedger::submit` on a one-attempt ledger, so it takes
 //!   the journal's grant (8c-1) and the client's gate. A cancel leaves only
