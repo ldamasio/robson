@@ -148,6 +148,7 @@ async fn through_proxy(pool: &PgPool) -> (DbProxy, PgPool) {
 async fn an_intent_and_its_attempt_land_in_one_transaction_and_replays_converge(pool: PgPool) {
     let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
     let batch = JournalBatch {
+        balance: None,
         intent: intent_row("a"),
         attempts: vec![attempt_row(false)],
         outcome: None,
@@ -185,6 +186,7 @@ async fn a_failing_attempt_rolls_its_intent_back(pool: PgPool) {
     .unwrap();
     let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
     let batch = JournalBatch {
+        balance: None,
         intent: intent_row("a"),
         attempts: vec![attempt_row(false)],
         outcome: None,
@@ -396,6 +398,7 @@ async fn boundary_b_lists_exactly_the_outstanding_intents_with_no_disposition(po
     let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
     let write = |id: &'static str, outcome: Option<OutcomeRow>| {
         let batch = JournalBatch {
+            balance: None,
             intent: intent_row(id),
             attempts: vec![attempt_row(false)],
             outcome,
@@ -521,6 +524,7 @@ async fn the_schema_refuses_an_empty_account_observation_as_terminal_evidence(po
     let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
     backend
         .commit(&JournalBatch {
+            balance: None,
             intent: intent_row("a"),
             attempts: vec![attempt_row(false)],
             outcome: None,
@@ -1276,6 +1280,7 @@ fn spot_batch(id: &str) -> JournalBatch {
     let mut intent = intent_row(id);
     intent.venue_id = "binance:spot".into();
     JournalBatch {
+        balance: None,
         intent,
         attempts: vec![attempt_row(false)],
         outcome: None,
