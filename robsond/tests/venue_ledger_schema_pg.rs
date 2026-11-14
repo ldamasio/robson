@@ -665,12 +665,7 @@ async fn tenant_relationships_and_trade_identity_cannot_be_crossed(pool: PgPool)
     let other = Uuid::now_v7();
     sqlx::query("INSERT INTO accounting_state (tenant_id,venue_id,budget_model) VALUES ($1,$2,'net_from_start_non_expanding_v1')")
         .bind(other).bind(VENUE).execute(&pool).await.unwrap();
-    for table in [
-        "balance_leg_admissions",
-        "balance_legs",
-        "venue_orders",
-        "order_fills",
-    ] {
+    for table in ["balance_leg_admissions", "venue_orders", "order_fills"] {
         let mut data = row(&pool, table).await;
         data["tenant_id"] = json!(other);
         match table {
@@ -680,10 +675,6 @@ async fn tenant_relationships_and_trade_identity_cannot_be_crossed(pool: PgPool)
                 // check.
                 data["superseded_at"] = json!("2026-11-15T00:00:00Z");
                 data["superseded_by"] = json!(f.intent);
-            },
-            "balance_legs" => {
-                data["position_id"] = json!(Uuid::now_v7());
-                data["admission_intent_id"] = json!(Uuid::now_v7());
             },
             "venue_orders" => {
                 data["exchange_order_id"] = json!("2");
@@ -696,6 +687,28 @@ async fn tenant_relationships_and_trade_identity_cannot_be_crossed(pool: PgPool)
         }
         constraint(&insert_row(&pool, table, data).await.unwrap_err(), "23503", None);
     }
+    // A real tenant-A admission with no leg yet isolates tenant enforcement:
+    // every relationship ID exists, and tenant B has its own accounting row.
+    let position = Uuid::now_v7();
+    let intent = Uuid::now_v7();
+    let mut route = row(&pool, "leg_routes").await;
+    route["position_id"] = json!(position);
+    let mut admission = row(&pool, "balance_leg_admissions").await;
+    admission["position_id"] = json!(position);
+    admission["entry_intent_id"] = json!(intent);
+    let mut leg = row(&pool, "balance_legs").await;
+    leg["position_id"] = json!(position);
+    leg["admission_intent_id"] = json!(intent);
+    leg["tenant_id"] = json!(other);
+    let mut tx = pool.begin().await.unwrap();
+    insert_value(&mut tx, "leg_routes", route).await.unwrap();
+    insert_value(&mut tx, "balance_leg_admissions", admission).await.unwrap();
+    constraint(
+        &insert_value(&mut tx, "balance_legs", leg).await.unwrap_err(),
+        "23503",
+        Some("balance_legs_admission"),
+    );
+    tx.rollback().await.unwrap();
     // Same economic trade cannot be claimed by another, otherwise valid order.
     let mut order = row(&pool, "venue_orders").await;
     order["exchange_order_id"] = json!("2");
