@@ -6,7 +6,8 @@ use robson_exec::venue::VenueId;
 use sqlx::{Connection, Row};
 use uuid::Uuid;
 
-use super::{PgJournalBackend, RetiringConnection};
+use super::PgJournalBackend;
+use crate::ledger_connection::LedgerConnection;
 
 const READY_BOUND: Duration = Duration::from_secs(2);
 const INDEX_NAME: &str = "idx_submit_attempts_one_per_spot_client_id";
@@ -74,8 +75,8 @@ impl PgJournalBackend {
     async fn balance_schema_transaction(&self, one_attempt: bool) -> Result<(), String> {
         let error = |e: sqlx::Error| e.to_string();
         let connection = self.pool.acquire().await.map_err(error)?;
-        let mut read = RetiringConnection { connection, finished: false };
-        let mut tx = read.connection.begin().await.map_err(error)?;
+        let mut read = LedgerConnection::new(connection);
+        let mut tx = read.connection().begin().await.map_err(error)?;
         sqlx::query("SELECT set_config('lock_timeout', '300ms', true), set_config('statement_timeout', '1s', true), set_config('idle_in_transaction_session_timeout', '1s', true)")
             .execute(&mut *tx).await.map_err(error)?;
         let actual = sqlx::query(CATALOG)

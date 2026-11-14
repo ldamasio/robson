@@ -13,7 +13,7 @@ use robson_exec::{venue::VenueId, venue_ledger::LedgerError};
 use sqlx::{Connection, PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use crate::order_journal_store::RetiringConnection;
+use crate::ledger_connection::LedgerConnection;
 
 mod orders;
 
@@ -86,9 +86,9 @@ impl PgVenueLedger {
         let committing = AtomicBool::new(false);
         self.bounded(async {
             let connection = self.pool.acquire().await.map_err(backend)?;
-            let mut write = RetiringConnection { connection, finished: false };
+            let mut write = LedgerConnection::new(connection);
             self.statement();
-            let mut tx = write.connection.begin().await.map_err(backend)?;
+            let mut tx = write.connection().begin().await.map_err(backend)?;
             self.timeouts(&mut tx).await?;
             self.statement();
             sqlx::query("INSERT INTO accounting_state (tenant_id, venue_id, budget_model) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
@@ -123,9 +123,9 @@ impl PgVenueLedger {
         let committing = AtomicBool::new(false);
         self.bounded(async {
             let connection = self.pool.acquire().await.map_err(backend)?;
-            let mut write = RetiringConnection { connection, finished: false };
+            let mut write = LedgerConnection::new(connection);
             self.statement();
-            let mut tx = write.connection.begin().await.map_err(backend)?;
+            let mut tx = write.connection().begin().await.map_err(backend)?;
             self.timeouts(&mut tx).await?;
             self.statement();
             sqlx::query("INSERT INTO leg_routes (position_id, tenant_id, venue_id, account_scope, routed_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
