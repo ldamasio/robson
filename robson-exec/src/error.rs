@@ -72,6 +72,11 @@ pub enum ExecError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    /// Balance-account trading requires its dedicated typed accounting owner.
+    /// This is a local routing refusal, never a venue response or retry signal.
+    #[error("Configuration error: balance-account trading requires the balance execution owner")]
+    BalanceOwnerRequired,
+
     /// Timeout waiting for operation
     #[error("Timeout: {0}")]
     Timeout(String),

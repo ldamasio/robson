@@ -310,7 +310,7 @@ impl VenueFactory {
                 build_stub(Arc::new(StubTradeFeed::new()))
             },
         };
-        parts.funding_recovery = funding_recovery_route(&parts.venue, config);
+        parts.funding_recovery = funding_recovery_route(parts.venue.as_ref(), config);
         Ok(parts)
     }
 }
@@ -396,10 +396,13 @@ fn build_stub(market_data: Arc<dyn TradeFeedPort>) -> VenueParts {
 /// funding surface, and when those credentials are missing, in which case the
 /// saga stays visibly blocked with its liabilities retained. Building the
 /// route sends nothing to the venue.
-pub(crate) fn funding_recovery_route(
-    venue: &VenueRuntime,
+pub(crate) fn funding_recovery_route<V: Venue + ?Sized>(
+    venue: &V,
     config: &Config,
 ) -> Option<Arc<VenueRuntime>> {
+    if venue.capabilities().account_kind == robson_exec::venue::AccountKind::BalanceAccount {
+        return None;
+    }
     if venue.funding().is_some() {
         return None;
     }
@@ -679,6 +682,25 @@ mod tests {
         assert_eq!(usdm.id().as_str(), VenueId::BINANCE_USDM);
         assert!(usdm.funding().is_some());
         assert!(capability_mismatches(usdm.as_ref()).is_empty());
+    }
+
+    #[test]
+    fn balance_recovery_constructor_refuses_before_usable_surfaces_or_credentials() {
+        use crate::capability::worker_venue::WorkerVenue;
+        let config = config(VenueSelection::Unset, true, false, Environment::Production);
+        for funding in [false, true] {
+            let balance = WorkerVenue::new(AccountKind::BalanceAccount, funding);
+            assert!(funding_recovery_route(&balance, &config).is_none());
+            assert_eq!(balance.funding_accesses(), 0);
+            assert_eq!(balance.requests(), 0);
+            let position = WorkerVenue::new(AccountKind::PositionAccount, funding);
+            let route = funding_recovery_route(&position, &config);
+            assert_eq!(route.is_some(), !funding);
+            if let Some(route) = route {
+                assert_eq!(route.id().as_str(), VenueId::BINANCE_USDM);
+            }
+            assert_eq!(position.requests(), 0);
+        }
     }
 
     #[test]
