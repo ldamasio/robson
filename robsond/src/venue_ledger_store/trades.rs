@@ -16,9 +16,8 @@ use sqlx::{postgres::PgRow, Connection, PgConnection, Postgres, Row, Transaction
 use super::{
     backend, commit_error,
     orders::{decode_order, order_error},
-    PgVenueLedger,
+    LedgerConnection, PgVenueLedger,
 };
-use crate::order_journal_store::RetiringConnection;
 
 const FILL_COLUMNS: &str = "f.trade_id AS fill_trade_id,f.exchange_order_id AS fill_order_id,
     f.tenant_id AS fill_tenant_id,f.price AS fill_price,f.qty AS fill_qty,
@@ -41,15 +40,15 @@ impl PgVenueLedger {
             }
             let ids: Vec<String>=page.trades.iter().map(|fill| fill.trade_id.parse::<VenueIntId>().map(|id| id.to_string())).collect::<Result<_,_>>()?;
             let connection=self.pool.acquire().await.map_err(backend)?;
-            let mut held=RetiringConnection {connection,finished:false};
-            let (before,existing)=self.read_trade_context(&mut held.connection,key,&ids).await?;
+            let mut held=LedgerConnection::new(connection);
+            let (before,existing)=self.read_trade_context(held.connection(),key,&ids).await?;
             let proposed=plan_trades(&before,self.tenant_id,page,&existing,recorded_at)?;
             if !proposed.changed {
                 held.finished=true;
                 return Ok(TradeWriteResult {changed:false});
             }
             self.statement();
-            let mut tx=held.connection.begin().await.map_err(backend)?;
+            let mut tx=held.connection().begin().await.map_err(backend)?;
             self.timeouts(&mut tx).await?;
             self.statement();
             let bump=sqlx::query("UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id=$2")
@@ -105,14 +104,14 @@ impl PgVenueLedger {
         let committing = AtomicBool::new(false);
         self.bounded(async {
             let connection=self.pool.acquire().await.map_err(backend)?;
-            let mut held=RetiringConnection {connection,finished:false};
+            let mut held=LedgerConnection::new(connection);
             self.statement();
             committing.store(true,Ordering::Relaxed);
             let updated=sqlx::query("UPDATE venue_orders SET last_checked_at=GREATEST(last_checked_at,$1)
                 WHERE venue_id=$2 AND account_scope=$3 AND symbol=$4 AND exchange_order_id=$5 AND tenant_id=$6")
                 .bind(at).bind(key.venue.as_str()).bind(&key.account_scope).bind(&key.symbol)
                 .bind(key.exchange_order_id.to_string()).bind(self.tenant_id)
-                .execute(&mut *held.connection).await.map_err(commit_error)?;
+                .execute(held.connection()).await.map_err(commit_error)?;
             held.finished=true;
             if updated.rows_affected()!=1 {return Err(LedgerError::UnknownOrder);}
             Ok(())
