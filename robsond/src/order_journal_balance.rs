@@ -2,9 +2,10 @@
 use std::time::{Duration, Instant};
 
 use robson_exec::order_journal::{CommitFailure, JournalBatch};
-use sqlx::{Postgres, Transaction};
+use sqlx::{Connection, Postgres, Transaction};
 
 use super::PgJournalBackend;
+use crate::ledger_connection::LedgerConnection;
 
 fn known(error: sqlx::Error) -> CommitFailure {
     CommitFailure::Known(error.to_string())
@@ -22,6 +23,22 @@ fn statement_budget(bound: Duration, elapsed: Duration) -> Result<Duration, Comm
 }
 
 impl PgJournalBackend {
+    pub(super) async fn commit_balance(
+        &self,
+        batch: &JournalBatch,
+        started: Instant,
+    ) -> Result<(), CommitFailure> {
+        let connection = self.pool.acquire().await.map_err(known)?;
+        let mut write = LedgerConnection::new(connection);
+        let mut tx = write.connection().begin().await.map_err(known)?;
+        Box::pin(self.prepare_balance(batch, &mut tx, started)).await?;
+        self.write(batch, &mut tx).await?;
+        // Preserve J's existing conservative COMMIT classification.
+        tx.commit().await.map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
+        write.finished = true;
+        Ok(())
+    }
+
     pub(super) async fn prepare_balance(
         &self,
         batch: &JournalBatch,

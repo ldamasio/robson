@@ -228,13 +228,13 @@ impl PgJournalBackend {
 impl JournalBackend for PgJournalBackend {
     async fn commit(&self, batch: &JournalBatch) -> Result<(), CommitFailure> {
         let started = Instant::now();
+        if batch.balance.is_some() {
+            return Box::pin(self.commit_balance(batch, started)).await;
+        }
         let known = |e: sqlx::Error| CommitFailure::Known(e.to_string());
         let connection = self.pool.acquire().await.map_err(known)?;
         let mut write = RetiringConnection { connection, finished: false };
         let mut tx = write.connection.begin().await.map_err(known)?;
-        if batch.balance.is_some() {
-            Box::pin(self.prepare_balance(batch, &mut tx, started)).await?;
-        }
         self.write(batch, &mut tx).await?;
         // Sent and not answered: the row may exist.
         tx.commit().await.map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
