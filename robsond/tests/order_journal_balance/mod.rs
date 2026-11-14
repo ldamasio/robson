@@ -151,10 +151,16 @@ async fn every_spot_commit_bumps_the_version_once(pool: PgPool) {
 #[ignore = "requires DATABASE_URL"]
 async fn a_spot_commit_without_its_accounting_row_lands_nothing(pool: PgPool) {
     let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
-    assert!(matches!(
-        backend.commit(&balance_batch("missing", IntentKind::Exit)).await,
-        Err(CommitFailure::Known(_))
-    ));
+    // Also exercise a result-like batch without attempts or admission: no
+    // downstream ledger FK can substitute for refusing the zero-row bump.
+    for has_attempt in [true, false] {
+        let mut batch = balance_batch("missing", IntentKind::Exit);
+        if !has_attempt {
+            batch.attempts.clear();
+        }
+        assert!(batch.balance.as_ref().unwrap().admission.is_none());
+        assert!(matches!(backend.commit(&batch).await, Err(CommitFailure::Known(_))));
+    }
     for table in [
         "order_intents",
         "submit_attempts",
