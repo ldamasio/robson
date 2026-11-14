@@ -7,9 +7,10 @@
 //! - nothing outside `binance/spot/` reaches this module, names a type it
 //!   defines or names a spot endpoint, so no production path, factory included,
 //!   can construct its reader, feed, klines, rules cache or venue;
-//! - 8a's readers, 8c-2a's rules projection and rules cache import no
-//!   `robson_exec` item and implement no port. 8b's feed and klines import
-//!   exactly the existing items of the port each implements (`TradeFeedPort`,
+//! - readers, rules projection and cache implement no port. The exact named
+//!   input boundaries may import 8g1a's pure scalar parser; the cache may not.
+//!   8b's feed and klines additionally import exactly the existing items of
+//!   the port each implements (`TradeFeedPort`,
 //!   `OhlcvPort`). 8c-2b's venue, `exchange.rs`, and 8c-3a's order path,
 //!   `trading.rs`, import exactly the contracts they implement or fill and the
 //!   types those carry, by path;
@@ -583,10 +584,9 @@ fn the_port_allow_list_admits_only_each_adapter_s_own_items() {
     }
 }
 
-/// SD12 point 1: 8a's readers, the rules projection and the cache take nothing
-/// from `robson_exec`, where the port contracts and 8c's additions live; 8b's
-/// feed and klines take only the existing port each implements, and 8c-2's
-/// venue only its exact list. No spot source uses another contract.
+/// SD12 point 1 is retained: 8g1a permits only the pure exact scalar helper
+/// at named input boundaries, without adding a port, runtime caller or factory
+/// reachability. All adapters retain their existing exact port lists.
 #[test]
 fn exact_scalar_imports_do_not_open_any_extra_port_or_runtime_path() {
     for file in ["records.rs", "rules.rs", "rest.rs"] {
