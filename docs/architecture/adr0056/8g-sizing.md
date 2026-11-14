@@ -113,3 +113,55 @@ local code but make exact boundaries auditable. They do not repair the shared
 legacy arithmetic or expand its supported domain. Dependency pins/lock remain
 unchanged. Format, Clippy and security/secret/dependency CI gates still apply;
 no frontend, stream, infrastructure or production change is part of this slice.
+
+## Private geometry staging (8g2b-1)
+
+The crate-private `balance_sizing` module now contains raw fixed-shape
+observations and exact geometry verification. This is implemented pure data
+validation, not a public sizing entry point, a current receipt, or a capital
+certificate. Candidate sizing and the connector projection remain pending in
+8g2b-2. No production caller, SQL, HTTP, task or send capability is added.
+
+`validate` checks full binding and scalar domains, reconstructing RiskConfig
+with the supplied basis and selected per-leg costs while retaining operator
+headroom/buffer/distance bounds. It does not establish currentness. Explicit
+cash.free is distinct from locked cash; reference P is distinct from the
+required applicable filter valuation. A matching raw V_filter descriptor is
+not an exchange observation certificate. Its actual producer, sealed8h2 age
+authority and certified8l basis remain later caller blockers.
+
+`lot` and `geometry` share a caller-owned Arithmetic frame. Their worst-case
+prefix is32 charged calls: nesting2, minPrice-grid2, derivation12, final-grid2,
+three distance checks/thresholds14. Maximum preflight is492bits including exact
+export scaling; four native exports try at most29 scales each. Legacy omits
+unused Dcap/span exports because its option fields must be None. Only required
+exact outputs are narrowed; no intermediate rounding or unchecked Decimal
+product/division is used. The final sizing consumer must continue this SAME
+preparation frame for the remaining25 calls (57 total), then at most four
+37-call candidate frames. This private slice does not claim to implement that
+later financial graph or its872bit/774division full bound.
+
+Geometry preserves the analyzer's second support on the15m chart, the long
+adverse guard, policy buffer cap and adverse tick rounding. All supplied plan
+fields must match, including exact cap_basis_distance even when nonbinding,
+and policy-specific Some/None. Three distance stages use exact cross products.
+Because long guard/buffer/tick order chart >= basis >= trigger, the middle
+stage's acceptance inequality is logically implied by the two endpoints;
+its explicit required evaluation is additionally covered by the32-call trace.
+Tests must not claim a distinct financial counterexample for deleting only
+that redundant middle check. A trace mutant enforces the declared stage/work
+contract; independent endpoint mutants enforce financial refusal.
+
+Controls use an independent bounded-i128 geometry oracle, safe-domain
+comparison with the existing canonical builder, and Python Fraction extreme
+goldens (max96bit/scale28 and policy-specific unrepresentability). Arithmetic
+tracing is cfg(test) only. Test-only terms still pass through the existing
+sealed fixture authority; there is no public proof constructor. Zero I/O and
+no durable effects mean cancellation/crash discards only transient data.
+Missing/stale external evidence must still be refused by later admission.
+
+The staged module and bridge remain private. A narrow dead-code allowance
+marks this inert boundary and must be removed by the reviewed consuming slice.
+This split trades an extra private bridge for smaller independent reviews;
+it changes neither policy nor the128-per-frame computational budget. Typed
+TechnicalWorkLimit is a proof-invariant failure, never a financial cap.

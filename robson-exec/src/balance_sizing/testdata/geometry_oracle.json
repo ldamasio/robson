@@ -1,0 +1,148 @@
+[
+  {
+    "price": "100",
+    "chart": "50",
+    "guard": null,
+    "buffer": "0",
+    "tick": "0.1",
+    "policy": "span",
+    "expected": {
+      "basis": "50",
+      "effective_buffer": "0",
+      "trigger": "50",
+      "guard_bound": false,
+      "cap_basis": "50",
+      "span": "50"
+    }
+  },
+  {
+    "price": "100",
+    "chart": "50",
+    "guard": "49.73",
+    "buffer": "100",
+    "tick": "0.1",
+    "policy": "span",
+    "expected": {
+      "basis": "49.73",
+      "effective_buffer": "0.4973",
+      "trigger": "49.2",
+      "guard_bound": true,
+      "cap_basis": "50.27",
+      "span": "50.8"
+    }
+  },
+  {
+    "price": "100",
+    "chart": "50",
+    "guard": "55",
+    "buffer": "100",
+    "tick": "0.1",
+    "policy": "legacy",
+    "expected": {
+      "basis": "50",
+      "effective_buffer": "0.5",
+      "trigger": "49.5",
+      "guard_bound": false,
+      "cap_basis": null,
+      "span": null
+    }
+  },
+  {
+    "price": "100",
+    "chart": "99.5",
+    "guard": null,
+    "buffer": "100",
+    "tick": "0.1",
+    "policy": "span",
+    "expected": {
+      "basis": "99.5",
+      "effective_buffer": "0.125",
+      "trigger": "99.3",
+      "guard_bound": false,
+      "cap_basis": "0.5",
+      "span": "0.7"
+    }
+  },
+  {
+    "price": "73284.01",
+    "chart": "65955.60",
+    "guard": null,
+    "buffer": "0",
+    "tick": "0.01",
+    "policy": "span",
+    "expected": {
+      "basis": "65955.6",
+      "effective_buffer": "0",
+      "trigger": "65955.6",
+      "guard_bound": false,
+      "cap_basis": "7328.41",
+      "span": "7328.41"
+    }
+  },
+  {
+    "price": "900000000000000000000000000",
+    "chart": "700000000000000000000000000",
+    "guard": null,
+    "buffer": "100",
+    "tick": "1",
+    "policy": "span",
+    "expected": {
+      "basis": "700000000000000000000000000",
+      "effective_buffer": "7000000000000000000000000",
+      "trigger": "693000000000000000000000000",
+      "guard_bound": false,
+      "cap_basis": "200000000000000000000000000",
+      "span": "207000000000000000000000000"
+    }
+  },
+  {
+    "price": "79228162514264337593543950335",
+    "chart": "0.1",
+    "guard": null,
+    "buffer": "0",
+    "tick": "0.1",
+    "policy": "span",
+    "error": "Unrepresentable"
+  },
+  {
+    "price": "79228162514264337593543950335",
+    "chart": "0.1",
+    "guard": null,
+    "buffer": "0",
+    "tick": "0.1",
+    "policy": "legacy",
+    "expected": {
+      "basis": "0.1",
+      "effective_buffer": "0",
+      "trigger": "0.1",
+      "guard_bound": false,
+      "cap_basis": null,
+      "span": null
+    }
+  },
+  {
+    "price": "1",
+    "chart": "0.5000000000000000000000000001",
+    "guard": null,
+    "buffer": "1",
+    "tick": "0.0000000000000000000000000001",
+    "policy": "span",
+    "error": "Unrepresentable"
+  },
+  {
+    "price": "0.0000000000000000000000000100",
+    "chart": "0.0000000000000000000000000050",
+    "guard": null,
+    "buffer": "0",
+    "tick": "0.0000000000000000000000000001",
+    "policy": "span",
+    "expected": {
+      "basis": "0.000000000000000000000000005",
+      "effective_buffer": "0",
+      "trigger": "0.000000000000000000000000005",
+      "guard_bound": false,
+      "cap_basis": "0.000000000000000000000000005",
+      "span": "0.000000000000000000000000005"
+    }
+  }
+]
