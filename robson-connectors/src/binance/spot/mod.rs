@@ -20,6 +20,7 @@
 //! 2026-11-11 and 2026-11-13 (design note v16 §2, F13–F17, F22, F23, F25).
 
 mod cache;
+mod costs;
 mod exchange;
 mod market_data;
 mod ohlcv;

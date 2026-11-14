@@ -273,7 +273,7 @@ async fn open_orders_may_be_empty_and_stay_on_their_symbol() {
 async fn commission_is_read_for_its_symbol() {
     let (reader, _) = answering(200, COMMISSION).await;
     let commission = reader.commission(&symbol("BTCUSDT")).await.unwrap();
-    assert_eq!(commission.standard.taker, dec!(0.0000002));
+    assert_eq!(commission.standard.taker.value(), dec!(0.0000002));
     assert!(matches!(
         reader.commission(&symbol("ETHUSDT")).await,
         Err(SpotReadError::Inconsistent(_))

@@ -121,14 +121,14 @@ where
 /// The commission rates of one kind (F17).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SpotCommissionRates {
-    #[serde(deserialize_with = "exact::nonnegative")]
-    pub maker: Decimal,
-    #[serde(deserialize_with = "exact::nonnegative")]
-    pub taker: Decimal,
-    #[serde(deserialize_with = "exact::nonnegative")]
-    pub buyer: Decimal,
-    #[serde(deserialize_with = "exact::nonnegative")]
-    pub seller: Decimal,
+    #[serde(deserialize_with = "exact::nonnegative_exact")]
+    pub maker: exact::ExactDecimal,
+    #[serde(deserialize_with = "exact::nonnegative_exact")]
+    pub taker: exact::ExactDecimal,
+    #[serde(deserialize_with = "exact::nonnegative_exact")]
+    pub buyer: exact::ExactDecimal,
+    #[serde(deserialize_with = "exact::nonnegative_exact")]
+    pub seller: exact::ExactDecimal,
 }
 
 /// The BNB discount block of the commission answer (F17).
@@ -139,8 +139,8 @@ pub struct SpotCommissionDiscount {
     pub enabled_for_symbol: bool,
     pub discount_asset: String,
     /// Multiplier on the standard commission when BNB pays it.
-    #[serde(deserialize_with = "exact::nonnegative")]
-    pub discount: Decimal,
+    #[serde(deserialize_with = "exact::nonnegative_exact")]
+    pub discount: exact::ExactDecimal,
 }
 
 /// `GET /api/v3/account/commission` for one symbol (F17; L4954-L5002).

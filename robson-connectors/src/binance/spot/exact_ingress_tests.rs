@@ -138,3 +138,42 @@ async fn ticker_exact_ingress_preserves_one_physical_read() {
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }
+
+#[test]
+fn exact_commission_record_builds_only_a_matching_scoped_candidate() {
+    use chrono::{TimeZone, Utc};
+    use robson_exec::{balance_costs::CostIdentity, venue::VenueId};
+    let record = parse_commission(COMMISSION, "BTCUSDT").unwrap();
+    let identity = |pair| {
+        CostIdentity::new(
+            "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+            VenueId::new(VenueId::BINANCE_SPOT),
+            "scope-one".into(),
+            7,
+            robson_domain::Symbol::from_pair(pair).unwrap(),
+        )
+        .unwrap()
+    };
+    let at = Utc.with_ymd_and_hms(2026, 11, 14, 12, 0, 0).unwrap();
+    // This fixture enables BNB for account+symbol and must refuse even though
+    // its original decimal components are exact.
+    assert!(record.cost_candidate(identity("BTCUSDT"), at).is_err());
+    let mut enabled = record;
+    enabled.discount.enabled_for_symbol = false;
+    assert!(
+        matches!(
+            enabled.cost_candidate(identity("BTCUSDT"), at),
+            Err(robson_exec::balance_costs::CostError::Rate)
+        ),
+        "published illustrative special rates exceed the approved taker limit"
+    );
+    let mut body: Value = serde_json::from_str(COMMISSION).unwrap();
+    body["discount"]["enabledForSymbol"] = json!(false);
+    for field in ["maker", "taker", "buyer", "seller"] {
+        body["specialCommission"][field] = json!("0.000001");
+    }
+    let enabled = parse_commission(&body.to_string(), "BTCUSDT").unwrap();
+    let candidate = enabled.cost_candidate(identity("BTCUSDT"), at).unwrap();
+    assert_eq!(candidate.evidence().account().symbol().as_pair(), "BTCUSDT");
+    assert!(enabled.cost_candidate(identity("ETHUSDT"), at).is_err());
+}
