@@ -172,7 +172,20 @@ impl PgJournalBackend {
             .bind(&rejected)
             .execute(&mut **tx)
             .await
-            .map_err(known)?;
+            .map_err(|error| {
+                // Only the spot one-attempt constraint proves that this id
+                // was spent. Other unique violations keep their known-error
+                // classification; USD-M never matches this partial index.
+                if let sqlx::Error::Database(database) = &error {
+                    if database.code().as_deref() == Some("23505")
+                        && database.constraint()
+                            == Some("idx_submit_attempts_one_per_spot_client_id")
+                    {
+                        return CommitFailure::IdSpent;
+                    }
+                }
+                known(error)
+            })?;
         }
 
         if let Some(outcome) = &batch.outcome {

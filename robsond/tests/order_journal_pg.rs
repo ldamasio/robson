@@ -1267,3 +1267,328 @@ async fn concurrent_orders_retries_and_lookups_survive_cancellation(pool: PgPool
         }
     }
 }
+
+// Step 8e-1: the durable spot one-attempt invariant. Production still refuses
+// spot.
+const SPOT_INDEX: &str = "idx_submit_attempts_one_per_spot_client_id";
+
+fn spot_batch(id: &str) -> JournalBatch {
+    let mut intent = intent_row(id);
+    intent.venue_id = "binance:spot".into();
+    JournalBatch {
+        intent,
+        attempts: vec![attempt_row(false)],
+        outcome: None,
+    }
+}
+
+#[test]
+fn the_index_migration_is_one_concurrent_statement() {
+    let sql = include_str!("../../migrations/20240101000037_spot_one_attempt_index.sql");
+    assert_eq!(sql.lines().next(), Some("-- no-transaction"));
+    let statement = sql
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(statement.matches(';').count(), 1);
+    assert!(statement.contains("CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS"));
+    assert!(statement.contains("WHERE venue_id = 'binance:spot'"));
+}
+
+async fn assert_spot_index(pool: &PgPool) {
+    let mut tx = pool.begin().await.unwrap();
+    // Deparse both predicates on this server, with the same column
+    // types/collations.
+    sqlx::raw_sql("CREATE TEMP TABLE expected_attempts (LIKE submit_attempts) ON COMMIT DROP; CREATE UNIQUE INDEX expected_spot ON expected_attempts (venue_id, account_scope, client_order_id) WHERE venue_id='binance:spot'")
+        .execute(&mut *tx).await.unwrap();
+    let correct: bool = sqlx::query_scalar(
+        "SELECT i.indisunique AND i.indisvalid AND i.indisready AND i.indimmediate
+         AND i.indrelid='submit_attempts'::regclass AND am.amname='btree'
+         AND i.indnkeyatts=3 AND i.indnatts=3 AND i.indexprs IS NULL
+         AND ic.relnamespace=t.relnamespace
+         AND (SELECT array_agg(a.attname::text ORDER BY k.n) FROM unnest(i.indkey) WITH ORDINALITY k(att,n) JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.att)=ARRAY['venue_id','account_scope','client_order_id']
+         AND pg_get_expr(i.indpred,i.indrelid,false)=(SELECT pg_get_expr(e.indpred,e.indrelid,false) FROM pg_index e WHERE e.indexrelid='pg_temp.expected_spot'::regclass)
+         FROM pg_index i JOIN pg_class ic ON ic.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid JOIN pg_am am ON am.oid=ic.relam WHERE ic.oid=$1::regclass",
+    ).bind(SPOT_INDEX).fetch_one(&mut *tx).await.unwrap();
+    assert!(correct, "spot index must enforce exactly the reviewed identity");
+    tx.rollback().await.unwrap();
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn the_one_attempt_index_has_its_full_definition(pool: PgPool) {
+    assert_spot_index(&pool).await;
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_second_spot_attempt_is_an_id_spent_and_lands_nothing(pool: PgPool) {
+    let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
+    let first = spot_batch("spent");
+    backend.commit(&first).await.unwrap();
+    let mut second = first.clone();
+    second.attempts = vec![attempt_row(false)];
+    assert_eq!(backend.commit(&second).await, Err(CommitFailure::IdSpent));
+    assert_eq!(attempt_states_of(&pool, "spent").await, ["started"]);
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT attempt_id FROM submit_attempts")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ids, [first.attempts[0].attempt_id]);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn two_attempts_in_one_spot_batch_land_nothing(pool: PgPool) {
+    let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
+    let mut batch = spot_batch("two");
+    batch.attempts.push(attempt_row(false));
+    assert_eq!(backend.commit(&batch).await, Err(CommitFailure::IdSpent));
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM order_intents),(SELECT count(*) FROM submit_attempts)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (0, 0));
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_spot_replay_converges_under_the_index(pool: PgPool) {
+    let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
+    let mut batch = spot_batch("replay");
+    backend.commit(&batch).await.unwrap();
+    backend.commit(&batch).await.unwrap();
+    batch.attempts[0].rejected_at = Some(Utc::now());
+    backend.commit(&batch).await.unwrap();
+    let mut stale = batch.clone();
+    stale.attempts[0].rejected_at = None;
+    backend.commit(&stale).await.unwrap();
+    assert_eq!(attempt_states_of(&pool, "replay").await, ["rejected"]);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn racing_spot_attempts_land_exactly_one(pool: PgPool) {
+    spot_attempt_race(&pool, true).await;
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn racing_full_spot_transactions_land_exactly_one(pool: PgPool) {
+    spot_attempt_race(&pool, false).await;
+}
+
+// A concurrency schedule starts after connection establishment, as daemon
+// startup does. Keep the production 250 ms acquisition bound unchanged: cold
+// CI connections must not substitute for the index race being tested.
+async fn prepare_spot_race_workers(pool: &PgPool, count: usize) -> Vec<PgJournalBackend> {
+    let mut workers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let backend = PgJournalBackend::new(pool, Uuid::now_v7());
+        backend.check_ready().await.unwrap();
+        workers.push(backend);
+    }
+    workers
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn spot_race_setup_waits_for_delayed_connections(pool: PgPool) {
+    let (proxy, proxied) = through_proxy(&pool).await;
+    let before = proxy.stats().connections;
+    proxy.set_mode(ProxyMode::Blackhole);
+    let preparing = tokio::spawn(async move { prepare_spot_race_workers(&proxied, 2).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while proxy.stats().connections == before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cold worker connection reached the proxy");
+    // Deliberately exceed the unchanged production acquisition bound.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!preparing.is_finished(), "unready workers escaped race preparation");
+    proxy.set_mode(ProxyMode::Pass);
+    let workers = tokio::time::timeout(Duration::from_secs(10), preparing)
+        .await
+        .expect("worker readiness recovered")
+        .unwrap();
+    for (index, worker) in workers.iter().enumerate() {
+        worker.commit(&spot_batch(&format!("prepared-{index}"))).await.unwrap();
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM submit_attempts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+async fn spot_attempt_race(pool: &PgPool, preseed: bool) {
+    let schedules = proptest::collection::vec(0u64..5, 2..7);
+    let mut runner = TestRunner::deterministic();
+    for case in 0..24 {
+        let delays = schedules.new_tree(&mut runner).unwrap().current();
+        let id = format!("spot-race-{case}");
+        let first = spot_batch(&id);
+        // Isolate the attempt race after the shared intent has landed. Racing
+        // inserts of that UUID can independently hit its primary key, which is
+        // deliberately still a Known error under the narrow 8e-1 mapping.
+        if preseed {
+            let mut intent_only = first.clone();
+            intent_only.attempts.clear();
+            let seed = prepare_spot_race_workers(pool, 1).await.pop().unwrap();
+            seed.commit(&intent_only).await.unwrap();
+        }
+
+        let workers = prepare_spot_race_workers(pool, delays.len()).await;
+        let start = Arc::new(tokio::sync::Barrier::new(workers.len() + 1));
+        let mut tasks = Vec::new();
+        for (backend, delay) in workers.into_iter().zip(&delays) {
+            let start = Arc::clone(&start);
+            let mut batch = first.clone();
+            batch.attempts = vec![attempt_row(false)];
+            let delay = *delay;
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                backend.commit(&batch).await
+            }));
+        }
+        start.wait().await;
+        let mut landed = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(()) => landed += 1,
+                Err(CommitFailure::IdSpent) => {},
+                // PostgreSQL can report the concurrently inserted UUID's PK
+                // before the ON CONFLICT composite arbiter. This pre-existing
+                // classification stays Known; no other Known error is accepted.
+                Err(CommitFailure::Known(message)) if !preseed => assert_eq!(message,
+                    "error returned from database: duplicate key value violates unique constraint \"order_intents_pkey\""),
+                other => panic!("case {case}, delays {delays:?}: {other:?}"),
+            }
+        }
+        assert_eq!(landed, 1, "case {case}, delays {delays:?}");
+        assert_eq!(attempt_states_of(pool, &id).await, ["started"]);
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM order_intents),(SELECT count(*) FROM submit_attempts)",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (case + 1, case + 1), "losing transactions leave no extra rows");
+    }
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn usdm_attempts_are_not_limited_by_the_spot_index(pool: PgPool) {
+    let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
+    let mut batch = spot_batch("usdm");
+    batch.intent.venue_id = "binance:usdm".into();
+    batch.attempts.push(attempt_row(false));
+    backend.commit(&batch).await.unwrap();
+    assert_eq!(attempt_states_of(&pool, "usdm").await, ["started", "started"]);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn another_unique_violation_stays_known(pool: PgPool) {
+    sqlx::raw_sql("CREATE FUNCTION another_unique_fault() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture' USING ERRCODE='23505', CONSTRAINT='different_unique_index'; END $$; CREATE TRIGGER another_unique_fault BEFORE INSERT ON submit_attempts FOR EACH ROW EXECUTE FUNCTION another_unique_fault()")
+        .execute(&pool).await.unwrap();
+    let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
+    let error = backend.commit(&spot_batch("other-violation")).await.unwrap_err();
+    assert!(matches!(error, CommitFailure::Known(_)), "{error:?}");
+    // The name alone is insufficient: another SQLSTATE under that name is not an id
+    // collision.
+    sqlx::raw_sql("CREATE OR REPLACE FUNCTION another_unique_fault() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture' USING ERRCODE='23514', CONSTRAINT='idx_submit_attempts_one_per_spot_client_id'; END $$")
+        .execute(&pool).await.unwrap();
+    let error = backend.commit(&spot_batch("wrong-state")).await.unwrap_err();
+    assert!(matches!(error, CommitFailure::Known(_)), "{error:?}");
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_bounded_first_send_on_a_spent_spot_id_stays_home(pool: PgPool) {
+    let backend = Arc::new(PgJournalBackend::new(&pool, Uuid::now_v7()));
+    let journal = Arc::new(
+        OrderJournal::new(backend, &VenueId::new(VenueId::BINANCE_SPOT))
+            .with_one_attempt_per_client_id(true),
+    );
+    journal.check_ready().await.unwrap();
+    let (operation, intent) = opened(&journal, "spent", IntentKind::Protection).await;
+    // Matching the intent UUID makes the attempt index, not intent ownership,
+    // reject the new attempt and exposes a wrong Known fallback.
+    sqlx::query("INSERT INTO order_intents (intent_id,tenant_id,venue_id,account_scope,client_order_id,kind,params,created_at) VALUES ($1,$2,'binance:spot',$3,'spent','protection','{}',now())")
+        .bind(intent.intent_id()).bind(Uuid::now_v7()).bind(DEFAULT_ACCOUNT_SCOPE).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO submit_attempts (attempt_id,venue_id,account_scope,client_order_id,state,created_at) VALUES ($1,'binance:spot',$2,'spent','started',now())")
+        .bind(Uuid::now_v7()).bind(DEFAULT_ACCOUNT_SCOPE).execute(&pool).await.unwrap();
+
+    let mut sends = 0;
+    let outcome = operation.scope(journal.before_send(&intent, WriteClass::Bounded)).await;
+    if outcome.is_ok() {
+        sends += 1;
+    }
+    assert_eq!(
+        sends, 0,
+        "a bounded known-error fallback must not send an id spent in the database"
+    );
+    assert!(outcome.is_err());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM order_intents")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn the_runbook_repair_restores_a_valid_index(pool: PgPool) {
+    sqlx::raw_sql("DROP INDEX CONCURRENTLY idx_submit_attempts_one_per_spot_client_id")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO order_intents (intent_id,tenant_id,venue_id,account_scope,client_order_id,kind,params,created_at) VALUES ($1,$2,'binance:spot','scope','duplicate','exit','{}',now())")
+        .bind(Uuid::now_v7()).bind(Uuid::now_v7()).execute(&pool).await.unwrap();
+    let one = Uuid::now_v7();
+    let two = Uuid::now_v7();
+    sqlx::query("INSERT INTO submit_attempts (attempt_id,venue_id,account_scope,client_order_id,state,created_at) SELECT id,'binance:spot','scope','duplicate','started',now() FROM unnest($1::uuid[]) id")
+        .bind([one,two].as_slice()).execute(&pool).await.unwrap();
+    let migration = include_str!("../../migrations/20240101000037_spot_one_attempt_index.sql");
+    let error = sqlx::raw_sql(migration).execute(&pool).await.unwrap_err();
+    assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("23505"));
+    let valid: bool =
+        sqlx::query_scalar("SELECT indisvalid FROM pg_index WHERE indexrelid=$1::regclass")
+            .bind(SPOT_INDEX)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!valid);
+    // IF NOT EXISTS does not fix an invalid index: the runbook must inspect it.
+    sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+    let valid: bool =
+        sqlx::query_scalar("SELECT indisvalid FROM pg_index WHERE indexrelid=$1::regclass")
+            .bind(SPOT_INDEX)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!valid);
+    let duplicates:i64=sqlx::query_scalar("SELECT count(*) FROM (SELECT venue_id,account_scope,client_order_id FROM submit_attempts WHERE venue_id='binance:spot' GROUP BY 1,2,3 HAVING count(*)>1) d").fetch_one(&pool).await.unwrap();
+    assert_eq!(duplicates, 1);
+    // Test-only resolution of deliberately injected conflicting data. The runbook
+    // never deletes durable attempts or treats this fixture as production approval.
+    sqlx::query("DELETE FROM submit_attempts WHERE attempt_id=$1")
+        .bind(two)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("DROP INDEX CONCURRENTLY IF EXISTS idx_submit_attempts_one_per_spot_client_id")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+    assert_spot_index(&pool).await;
+}
