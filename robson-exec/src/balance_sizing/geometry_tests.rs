@@ -250,6 +250,10 @@ fn python_fraction_geometry_extremes_and_policy_specific_exports() {
         i.rules.price.tick = number("tick");
         i.rules.price.max = D::MAX;
         i.risk = i.risk.with_stop_buffer(number("buffer")).unwrap();
+        if let Some(gap) = row["gap"].as_str() {
+            i.terms = crate::balance_costs::sizing_terms(&i.binding.account, "0", gap);
+            i.policy = CostPolicy::parse(gap, Some("0"), None).unwrap();
+        }
         let plan = &mut i.chart.plan;
         plan.policy = if row["policy"] == "span" {
             StopPolicy::ExecutableSpan
