@@ -74,29 +74,62 @@ async fn prepared_ledger_pool(pool: &PgPool) {
 }
 
 // The runtime worker count does not bound concurrent database transactions.
-// Keep harness queue time separate from the unchanged production operation
-// bound.
+// A capacity bound does not promise FIFO row locks or a maximum service time.
+#[derive(Debug)]
+struct WorkloadTiming {
+    admission: Duration,
+    gate: Duration,
+    operation: Duration,
+    total: Duration,
+}
+
 async fn scheduled_write(
     operation: &Write,
     slots: &tokio::sync::Semaphore,
 ) -> (Result<bool, LedgerError>, Duration, Duration) {
+    let (result, timing) =
+        scheduled_write_with_gate(operation, slots, std::future::ready(())).await;
+    (result, timing.admission + timing.gate, timing.operation)
+}
+
+// The gate is a fixture seam only. Normal schedules pass an immediately-ready
+// future; the capacity regression can observe admission before any J SQL
+// starts.
+async fn scheduled_write_with_gate(
+    operation: &Write,
+    slots: &tokio::sync::Semaphore,
+    gate: impl std::future::Future<Output = ()>,
+) -> (Result<bool, LedgerError>, WorkloadTiming) {
     let queued = Instant::now();
-    let _permit = tokio::time::timeout(Duration::from_secs(10), slots.acquire())
+    let queue_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let _permit = tokio::time::timeout_at(queue_deadline, slots.acquire())
         .await
-        .expect("generated harness queue exceeded its bound")
+        .expect("generated harness admission exceeded its bound")
         .unwrap();
-    let queue_time = queued.elapsed();
+    let admission = queued.elapsed();
+    let gated = Instant::now();
+    tokio::time::timeout_at(queue_deadline, gate)
+        .await
+        .expect("generated harness gate exceeded the shared queue bound");
+    let gate = gated.elapsed();
     let started = Instant::now();
     let result = operation.apply().await;
-    let operation_time = started.elapsed();
-    assert!(operation_time < Duration::from_secs(3), "operation exceeded deadline");
-    assert!(queued.elapsed() < Duration::from_secs(13), "harness end-to-end bound exceeded");
-    (result, queue_time, operation_time)
+    let operation = started.elapsed();
+    let total = queued.elapsed();
+    assert!(operation < Duration::from_secs(3), "operation exceeded deadline");
+    assert!(total < Duration::from_secs(13), "harness end-to-end bound exceeded");
+    (result, WorkloadTiming { admission, gate, operation, total })
 }
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn bounded_workload_preserves_warmed_journal_progress(pool: PgPool) {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::Poll,
+    };
+
     let fixture = Fixture::new(&pool).await;
     let baseline = fixture.version(&pool).await;
     let (proxy, proxied) = through_proxy(&pool, 8).await;
@@ -111,46 +144,70 @@ async fn bounded_workload_preserves_warmed_journal_progress(pool: PgPool) {
         operations
             .push(Write::Journal(prepared_journal(&proxied, fixture.tenant).await, result.clone()));
     }
-    // A deterministic service cost while holding the shared accounting row.
-    // Eight simultaneous callers exceed its unchanged 300ms lock/statement
-    // budget; four in flight retain real contention with <=180ms queued work.
-    sqlx::query("CREATE FUNCTION generated_row_service() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.060); RETURN NEW; END $$")
-        .execute(&pool).await.unwrap();
-    sqlx::query("CREATE TRIGGER generated_row_service AFTER UPDATE ON accounting_state FOR EACH ROW EXECUTE FUNCTION generated_row_service()")
-        .execute(&pool).await.unwrap();
+    proxy.enable_query_trace(256);
+    let statements_before = proxy.stats().statements;
     let slots = Arc::new(tokio::sync::Semaphore::new(4));
-    let barrier = Arc::new(tokio::sync::Barrier::new(9));
-    let mut tasks = Vec::new();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let admitted = Arc::new(AtomicUsize::new(0));
+    let mut futures = Vec::new();
     for operation in operations {
         let slots = slots.clone();
-        let barrier = barrier.clone();
-        tasks.push(tokio::spawn(async move {
-            barrier.wait().await;
-            scheduled_write(&operation, &slots).await
+        let release = release.clone();
+        let admitted = admitted.clone();
+        futures.push(Box::pin(async move {
+            scheduled_write_with_gate(&operation, &slots, async move {
+                admitted.fetch_add(1, Ordering::SeqCst);
+                let _gate = release.acquire().await.unwrap();
+            })
+            .await
         }));
     }
-    barrier.wait().await;
-    // Observe real PostgreSQL tuple/transaction lock competition, not merely
-    // spawned tasks. This also rejects a scheduler accidentally made serial.
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let waiters: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'UPDATE accounting_state SET version%'")
-                .fetch_one(&pool).await.unwrap();
-            if waiters >= 2 { break; }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+    // Poll each owned future once before spawning it. All eight requests have
+    // reached admission; exactly four may reach the closed gate. No timing or
+    // executor/SQL lock fairness assumption is needed for this observation.
+    std::future::poll_fn(|cx| {
+        for future in &mut futures {
+            assert!(future.as_mut().poll(cx).is_pending(), "a closed gate completed a write");
         }
-    }).await.expect("warmed workload never had simultaneous accounting-row waiters");
-    let mut outcomes = Vec::new();
-    for task in tasks {
-        outcomes.push(task.await.unwrap());
-    }
-    for (result, queue, operation) in &outcomes {
-        assert!(matches!(result, Ok(true)), "bounded warmed workload refused a valid write: {result:?}; harness_queue={queue:?}, operation={operation:?}");
-    }
-    assert!(
-        outcomes.iter().any(|(_, queue, _)| *queue >= Duration::from_millis(50)),
-        "backlog never waited outside the operation budget"
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(
+        admitted.load(Ordering::SeqCst),
+        4,
+        "eight requests must admit exactly four operations"
     );
+    // Longer than J's unchanged 500ms bound. This is fixture queue/gate time,
+    // not time spent inside a database operation or a fabricated service SLA.
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    assert_eq!(proxy.query_trace_dropped(), 0);
+    assert!(
+        proxy.query_trace().is_empty(),
+        "J sent SQL before the operation gate: {:?}",
+        proxy.query_trace()
+    );
+    assert_eq!(
+        proxy.stats().statements,
+        statements_before,
+        "J BEGIN/UPDATE/COMMIT must not precede the operation clock"
+    );
+    assert_eq!(proxy.stats().commits, 0);
+    release.add_permits(8);
+    let tasks: Vec<_> = futures.into_iter().map(tokio::spawn).collect();
+    for task in tasks {
+        let (result, timing) = task.await.unwrap();
+        assert!(
+            timing.admission + timing.gate > Duration::from_millis(500),
+            "harness wait did not precede the J budget: {timing:?}"
+        );
+        assert!(
+            matches!(result, Ok(true)),
+            "warmed workload refused a valid write: {result:?}; {timing:?}"
+        );
+        assert!(timing.total >= timing.admission + timing.gate + timing.operation);
+        eprintln!("warmed J timing: {timing:?}");
+    }
+    assert_eq!(admitted.load(Ordering::SeqCst), 8);
     assert_eq!(proxy.stats().commits, 8, "each generated J must commit once");
     assert_eq!(fixture.version(&pool).await, baseline + 8);
     proxied.close().await;
