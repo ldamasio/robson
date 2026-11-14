@@ -668,3 +668,56 @@ async fn other_tenant_and_closed_leg_cannot_adopt_an_order(pool: PgPool) {
     );
     assert_eq!(snapshot(&pool).await, before);
 }
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn randomized_concurrent_evidence_conserves_the_single_leg_contribution(pool: PgPool) {
+    use proptest::{
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+    let f = Fixture::new(&pool).await;
+    let mut runner = TestRunner::default();
+    let strategy = proptest::collection::vec((1u32..10, 0u64..12), 2..7);
+    for round in 0..16 {
+        let schedule = strategy.new_tree(&mut runner).unwrap().current();
+        let mut base = record();
+        base.exchange_order_id = (100 + round).to_string();
+        base.client_order_id = format!("race-{round}");
+        let mut plain = unowned();
+        plain.client_order_id = base.client_order_id.clone();
+        f.ledger.record_order(&base, &plain, seen(1)).await.unwrap();
+        let mut link = f.link(LegOrderKind::Sell);
+        link.client_order_id = base.client_order_id.clone();
+        let version = f.version(&pool).await;
+        let consumed = f.consumed(&pool).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(schedule.len()));
+        let ledger = Arc::new(PgVenueLedger::new(&pool, f.tenant));
+        let mut tasks = Vec::new();
+        for (qty, delay) in schedule.iter().copied() {
+            let mut r = base.clone();
+            r.executed_qty = Decimal::from(qty);
+            r.cumulative_quote_qty = Some(Decimal::from(qty * 100));
+            let link = link.clone();
+            let ledger = ledger.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                ledger.record_order(&r, &link, seen(2)).await.unwrap()
+            }));
+        }
+        let mut changed = 0;
+        for task in tasks {
+            changed += i64::from(task.await.unwrap().changed);
+        }
+        let maximum = Decimal::from(schedule.iter().map(|(qty, _)| *qty).max().unwrap().max(2));
+        assert_eq!(f.consumed(&pool).await, consumed + maximum);
+        assert_eq!(f.version(&pool).await, version + changed);
+        base.executed_qty = maximum;
+        base.cumulative_quote_qty = Some(maximum * Decimal::from(100));
+        let before = snapshot(&pool).await;
+        assert!(!f.ledger.record_order(&base, &link, seen(9)).await.unwrap().changed);
+        assert_eq!(snapshot(&pool).await, before);
+    }
+}
