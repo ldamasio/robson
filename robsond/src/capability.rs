@@ -3,15 +3,28 @@
 
 #[cfg(test)]
 pub(crate) mod test_exchange;
+#[cfg(test)]
+pub(crate) mod worker_venue;
 
 use robson_domain::Side;
-use robson_exec::venue::VenueCapabilities;
+use robson_exec::venue::{AccountKind, VenueCapabilities};
 
 use crate::error::{DaemonError, DaemonResult};
 
 pub(crate) fn require_side(capabilities: &VenueCapabilities, side: Side) -> DaemonResult<()> {
     if side == Side::Short && !capabilities.supports_short {
         return Err(DaemonError::VenueUnsupported { side });
+    }
+    Ok(())
+}
+
+/// Legacy position-account work cannot observe or mutate balance accounts.
+pub(crate) fn require_position_account(
+    capabilities: &VenueCapabilities,
+    operation: &'static str,
+) -> DaemonResult<()> {
+    if capabilities.account_kind == AccountKind::BalanceAccount {
+        return Err(DaemonError::Config(format!("{operation} requires a position account")));
     }
     Ok(())
 }
@@ -52,6 +65,23 @@ mod tests {
     use robson_exec::venue::{AccountKind, MarketKind};
 
     use super::*;
+
+    proptest::proptest! {
+        #[test]
+        fn legacy_account_work_depends_only_on_account_kind(
+            balance in proptest::bool::ANY,
+            spot in proptest::bool::ANY,
+            supports_short in proptest::bool::ANY,
+            has_funding in proptest::bool::ANY,
+        ) {
+            let mut capabilities = robson_testkit::balance_stub::spot_capabilities();
+            capabilities.account_kind = if balance { AccountKind::BalanceAccount } else { AccountKind::PositionAccount };
+            capabilities.market_kind = if spot { MarketKind::Spot } else { MarketKind::PerpUsdM };
+            capabilities.supports_short = supports_short;
+            capabilities.has_funding = has_funding;
+            proptest::prop_assert_eq!(require_position_account(&capabilities, "fixture").is_ok(), !balance);
+        }
+    }
 
     proptest::proptest! {
         #[test]

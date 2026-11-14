@@ -1323,6 +1323,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     /// while the ledger worker independently confirms or fails to confirm
     /// the same delta.
     async fn recalibrate_capital_base_after_pure_financial_drift(&self) -> DaemonResult<()> {
+        if self.exchange.capabilities().account_kind
+            == robson_exec::venue::AccountKind::BalanceAccount
+        {
+            return Ok(());
+        }
         let now = Utc::now();
         let risk_open = self.live_risk_open_positions().await?;
         let all_open = self.store.positions().find_active().await?;
@@ -1398,6 +1403,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         evidence: String,
         reconciled_positions: Option<usize>,
     ) -> DaemonResult<()> {
+        if self.exchange.capabilities().account_kind
+            == robson_exec::venue::AccountKind::BalanceAccount
+        {
+            return Ok(());
+        }
         let now = Utc::now();
         let wallet_balance = self.exchange.get_futures_balance().await?.wallet_balance;
         let monthly = {
@@ -4733,3 +4743,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod account_worker_tests;

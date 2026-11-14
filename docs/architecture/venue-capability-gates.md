@@ -1,9 +1,9 @@
-# Venue capability gates — ADR-0056 step 8f, parts 1–2
+# Venue capability gates — ADR-0056 step 8f, parts 1–3
 
 Status: repository implementation; operational rollout pending. This document
-covers direction gating and the legacy balance-batch barrier. Account-specific
-worker/funding gates remain pending part 3; balance execution, accounting and
-factory activation still require their later owners. USD-M execution/validation
+covers direction gating, the legacy balance-batch barrier and account-specific
+worker/funding refusals. Balance execution, accounting and factory activation
+still require their later owners. USD-M execution/validation
 and the existing position-account stub keep their previous paths.
 
 `ExchangePort: AccountPort` exposes the existing canonical contract. No side support
@@ -119,7 +119,53 @@ approval schedules exercise final financial/rearm invariants. USD-M settings
 refusal remains covered for both entry and exit.
 
 No database or venue availability fallback, deadline, migration, financial policy,
-factory selection or configuration is changed by this barrier. Account-specific
-worker gates and the dedicated balance owner remain pending. Activation requires
+factory selection or configuration is changed by this barrier. The dedicated balance owner remains pending. Activation requires
 the coordinator's current 15 prerequisites, including event-bus remediation and
 N5 restart evidence; this implementation grants no SD12 exception or rollout.
+
+
+## Account-specific workers (part 3)
+
+The daemon constructs the legacy income worker only for PositionAccount. Direct
+`run` and `poll_and_match` also refuse BalanceAccount before timer creation,
+checkpoint SQL, income reads or accounting writes. The pure-financial-drift alarm
+and manual recalibration helper skip balance accounts before any manager/store
+or futures-wallet read. This does not make the full legacy reconciliation scan
+succeed: a balance venue without a position port still reports its unsupported
+operation. Coherent balance observations and accounting remain with 8k/8l.
+
+Funding route selection checks account kind before the selected funding surface
+or an injected recovery route. Recovery construction refuses balance accounts
+before credential resolution. The service derives its effective route from
+canonical capabilities: BalanceAccount is always Blocked, while PositionAccount
+retains its configured mode. No second capability field is stored. Read-only
+saga views retain liabilities and derive their blocking reason on every read.
+Direct quote, execute and capital refresh refuse balance accounts before storage,
+venue access or engine mutation, including when constructed in Selected/Recovery
+mode. PositionAccount is not newly prohibited merely by configured Blocked mode.
+
+API funding handlers and direct manual spot-to-futures recovery, including dry
+runs, refuse before acquiring a permit or accessing the venue. Only the new pure
+account refusal maps to HTTP 400; existing supported-account errors keep their
+response shapes and statuses. The separate capital-refresh API/helper has the
+same boundary. Daemon capital initialization retains its existing best-effort
+warning/placeholder behavior, which does not certify balance startup or capital.
+
+| Balance-account boundary | Physical work |
+|---|---|
+| Income construction/run/poll and the two legacy drift branches | 0 SQL, 0 venue reads, 0 accounting writes; no income timer. |
+| Funding route/recovery construction | 0 SQL/HTTP; no recovery credential resolution. |
+| Funding quote/execute/refresh and API/manual recovery, including dry-run | 0 SQL/HTTP, 0 permit, 0 engine/saga writes. |
+| Separate capital-refresh helper/API/daemon initialization | 0 SQL/HTTP, 0 manager lock or engine writes. |
+| Existing blocked funding runtime poll | 2 SELECTs: at most 20 nonterminal sagas plus the liability gauge; no per-saga query, mutation or HTTP. |
+| Read-only saga list/get | 1 SELECT LIMIT100 / 2 SELECTs. Existing get-history row volume remains unchanged. |
+
+The funding timer calls the same extracted poll body exercised by count fixtures:
+resume errors are logged, then the blocked-gauge query is still attempted. Its
+five-second cadence, permit scope, cancellation behavior and existing logging are
+unchanged. A database failure remains visible and does not create a fallback or
+rewrite liabilities. No queue, cache, timer, migration, dependency or configuration
+key is added. The temporary cost is disabled legacy balance functionality until
+its dedicated owners are accepted; this is not balance reconciliation or activation.
+The capability-focused fixtures include usable futures/funding delegates,
+0/1/20-saga physical counts, the real runtime timer path and USD-M preservation.
