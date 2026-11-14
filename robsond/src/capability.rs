@@ -1,6 +1,9 @@
 //! Local capability refusal; neither venue I/O nor historical no-send
 //! inference.
 
+#[cfg(test)]
+pub(crate) mod test_exchange;
+
 use robson_domain::Side;
 use robson_exec::venue::VenueCapabilities;
 

@@ -6,13 +6,15 @@ use async_trait::async_trait;
 use robson_domain::Candle;
 use robson_exec::{ports::CandleInterval, venue::AccountPort, IntentJournal};
 use robson_store::MemoryStore;
-use robson_testkit::{balance_stub::BalanceStub, spot_book::SpotBook};
 use rust_decimal_macros::dec;
 
 use super::*;
-use crate::query_engine::{QueryRecorderError, TracingQueryRecorder};
+use crate::{
+    capability::test_exchange::RestrictedExchange,
+    query_engine::{QueryRecorderError, TracingQueryRecorder},
+};
 
-type Manager = PositionManager<BalanceStub, MemoryStore>;
+type Manager = PositionManager<RestrictedExchange, MemoryStore>;
 
 #[derive(Default)]
 struct Recorder {
@@ -80,7 +82,7 @@ fn fixture_with_journal(
     recorder: Arc<Recorder>,
     journal: Option<Arc<robson_exec::order_journal::OrderJournal>>,
 ) -> Fixture {
-    let exchange = Arc::new(BalanceStub::new(Arc::new(SpotBook::new(vec![], Decimal::ZERO))));
+    let exchange = Arc::new(RestrictedExchange::new());
     let store = Arc::new(MemoryStore::new());
     let candles = Arc::new(CountOhlcv::default());
     let executor = Executor::new(exchange, Arc::new(IntentJournal::new()), store.clone());
@@ -132,7 +134,7 @@ async fn unchanged(f: &Fixture, original: &Position) {
     assert!(f.manager.governed_rearm_counts.read().await.is_empty());
     assert!(!f.manager.is_entry_exhausted(original.id).await);
     assert_eq!(f.candles.0.load(Ordering::SeqCst), 0);
-    assert_eq!(f.manager.exchange().sends(), 0);
+    assert_eq!(f.manager.exchange().requests(), 0);
 }
 
 async fn pending(f: &Fixture, current: &Position, cached: Side, proposed_side: Side) -> Uuid {
@@ -363,7 +365,7 @@ proptest::proptest! {
             assert!(f.manager.governed_rearm_counts.read().await.is_empty());
             assert!(!f.manager.is_entry_exhausted(p.id).await);
             assert_eq!(f.candles.0.load(Ordering::SeqCst), 0);
-            assert_eq!(f.manager.exchange().sends(), 0);
+            assert_eq!(f.manager.exchange().requests(), 0);
             f.manager.shutdown_token.cancel();
         });
     }

@@ -4224,9 +4224,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_api_arm_precedes_monthly_store_access() {
-        let exchange = Arc::new(robson_testkit::balance_stub::BalanceStub::new(Arc::new(
-            robson_testkit::spot_book::SpotBook::new(vec![], Decimal::ZERO),
-        )));
+        let exchange = Arc::new(crate::capability::test_exchange::RestrictedExchange::new());
         let store = Arc::new(NoReadStore(MemoryStore::new()));
         let event_bus = Arc::new(EventBus::new(8));
         let executor = Arc::new(Executor::new(
@@ -4272,7 +4270,7 @@ mod tests {
                 assert!(error.error.contains("Venue does not support entry side Short"));
             }
         }
-        assert_eq!(exchange.sends(), 0);
+        assert_eq!(exchange.requests(), 0);
     }
 
     #[tokio::test]
