@@ -69,10 +69,10 @@ impl PgVenueLedger {
             }
             self.statement();
             let updated=sqlx::query("UPDATE venue_orders SET fills_qty=$1,executed_cum=$2,trades_cursor=$3,
-                last_checked_at=GREATEST(last_checked_at,$4) WHERE venue_id=$5 AND account_scope=$6
-                AND symbol=$7 AND exchange_order_id=$8 AND tenant_id=$9")
+                last_checked_at=GREATEST(last_checked_at,$4),cumulative_quote=$5 WHERE venue_id=$6 AND account_scope=$7
+                AND symbol=$8 AND exchange_order_id=$9 AND tenant_id=$10")
                 .bind(planned.order.fills_qty).bind(planned.order.executed_cum).bind(planned.order.trades_cursor)
-                .bind(planned.order.last_checked_at).bind(key.venue.as_str()).bind(&key.account_scope)
+                .bind(planned.order.last_checked_at).bind(planned.order.cumulative_quote).bind(key.venue.as_str()).bind(&key.account_scope)
                 .bind(&key.symbol).bind(key.exchange_order_id.to_string()).bind(self.tenant_id)
                 .execute(&mut *tx).await.map_err(backend)?;
             if updated.rows_affected()!=1 {return Err(LedgerError::Invariant("trade order disappeared".into()));}

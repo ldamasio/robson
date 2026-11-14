@@ -148,8 +148,11 @@ pub fn plan_trades(
     {
         return Err(LedgerError::TradeConflict);
     }
-    if !order.terminal() {
-        order.executed_cum = order.executed_cum.max(order.fills_qty);
+    if !order.terminal() && order.fills_qty > order.executed_cum {
+        order.executed_cum = order.fills_qty;
+        // A quote observed for the old execution is only a subtotal. This
+        // page need not contain every fill, so it cannot supply the new total.
+        order.cumulative_quote = None;
     }
     let changed = !new_fills.is_empty() || order.trades_cursor != stored.trades_cursor;
     if changed {

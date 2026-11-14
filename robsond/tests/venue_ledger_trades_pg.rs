@@ -494,5 +494,42 @@ fn trade_ledger_has_no_production_callers() {
     visit(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
 }
 
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn trade_raised_execution_never_freezes_an_old_quote_subtotal(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let ledger = f.ledger(&pool);
+    let mut record = f.record(1, dec!(2), OrderPhase::Live);
+    record.cumulative_quote_qty = Some(dec!(200));
+    let owner = f.owned(1);
+    ledger.record_order(&record, &owner, seen()).await.unwrap();
+    let key = f.key(1);
+    ledger.record_trades(&key, &page(1, dec!(1)), at()).await.unwrap();
+    let quote: Option<Decimal> = sqlx::query_scalar("SELECT cumulative_quote FROM venue_orders")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(quote, Some(dec!(200)), "unchanged execution retains a known total");
+    ledger.record_trades(&key, &page(2, dec!(2)), at()).await.unwrap();
+    let (executed, quote): (Decimal, Option<Decimal>) =
+        sqlx::query_as("SELECT executed_cum,cumulative_quote FROM venue_orders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (executed, quote),
+        (dec!(3), None),
+        "trade-raised execution invalidates the old subtotal"
+    );
+    let terminal = f.record(1, dec!(3), OrderPhase::Terminal);
+    ledger.record_order(&terminal, &owner, seen()).await.unwrap();
+    let (executed, quote, phase): (Decimal, Option<Decimal>, String) =
+        sqlx::query_as("SELECT executed_cum,cumulative_quote,phase FROM venue_orders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((executed, quote, phase), (dec!(3), None, "terminal".into()));
+}
+
 #[path = "venue_ledger_trades/generated.rs"]
 mod generated;

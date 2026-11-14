@@ -307,3 +307,17 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn trade_raised_execution_invalidates_only_the_old_quote_subtotal() {
+    let mut original = order();
+    original.executed_cum = dec!(2);
+    original.cumulative_quote = Some(dec!(200));
+    let partial = plan(&original, &page(fill("1", dec!(1))), &[]).unwrap();
+    assert_eq!(partial.order.executed_cum, dec!(2));
+    assert_eq!(partial.order.cumulative_quote, Some(dec!(200)));
+    let raised = plan(&partial.order, &page(fill("2", dec!(2))), &[]).unwrap();
+    assert_eq!(raised.order.executed_cum, dec!(3));
+    assert_eq!(raised.order.cumulative_quote, None);
+    assert_eq!(raised.consumed_delta, dec!(1));
+}
