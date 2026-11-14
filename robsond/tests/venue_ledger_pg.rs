@@ -325,6 +325,13 @@ async fn conflicts_and_invalid_evidence_leave_no_durable_effect(pool: PgPool) {
         assert!(f.ledger.record_order(&x, &link, seen(2)).await.is_err());
         assert_eq!(snapshot(&pool).await, before);
     }
+    let mut second_id = r.clone();
+    second_id.exchange_order_id = "8".into();
+    assert_eq!(
+        f.ledger.record_order(&second_id, &link, seen(2)).await,
+        Err(LedgerError::IdentityConflict)
+    );
+    assert_eq!(snapshot(&pool).await, before);
     let missing = PgVenueLedger::new(&pool, uuid::Uuid::now_v7());
     let mut x = r.clone();
     x.exchange_order_id = "99".into();
