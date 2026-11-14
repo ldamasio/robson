@@ -971,7 +971,9 @@ pub async fn a4_characterized<H: PositionHarness>(h: &H) -> Outcome {
 
 /// A1a, A2 and A3 on a position venue whose stop cancel cannot report a
 /// triggered stop's execution, `Characterized` (8d plan §4, note ⁴): the
-/// old stop of 1 triggers and executes `e`; `PlaceThenCancel` places the
+/// old stop of 1 triggers and executes `e`, which the position shows (it
+/// falls by `e`; no reduce-only bound is claimed, that is A5p's);
+/// `PlaceThenCancel` places the
 /// successor first, the old stop's cancel is refused, and the helper's
 /// existing outcome, `Unknown { new: Some(successor) }` with the execution
 /// unreported, is pinned exactly. The old stop's own lookup then reports
@@ -988,9 +990,13 @@ async fn triggered_characterized<H: PositionHarness + TriggersStop>(
     let Some(old) = stop(h, &mut run, &old_id, "1", "90").await else {
         return run.finish();
     };
+    let before = h.position();
     let triggered = h.trigger(&old, d(e));
     run.market(format!("the old stop triggers and executes {e}"));
     run.expect(triggered, "the trigger applied");
+    let after = h.position();
+    run.state(format!("position {before} -> {after}"));
+    run.expect(after == before - d(e), format!("the execution of {e} reduced the position"));
     run.expect(
         !h.open_stops().contains(&old.exchange_order_id),
         "the old stop left the open list",

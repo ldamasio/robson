@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Duration};
 
 use robson_domain::{OrderSide, Quantity, Symbol};
 use robson_exec::{
-    venue::{AccountPort, EntryOrReduce, StopRef, TradingPort},
+    venue::{AccountPort, EntryOrReduce, OrderLookup, StopRef, TradingPort},
     ExecError,
 };
 use robson_testkit::{
@@ -156,6 +156,21 @@ impl TriggersStop for U {
     }
 }
 
+/// Every clause's precondition on U, through the adapter's own lookup: the
+/// seed is a filled market order of 1. `GET /fapi/v1/order` needs the
+/// symbol (Codex 8d-2b round 1, P3), so a lookup that drops or changes it
+/// fails every clause.
+async fn seed_evidence(u: &U, outcome: &mut Outcome) {
+    let seed = u.adapter.order_by_client_id(&btc(), "u-seed").await;
+    let what = format!("the seed's lookup: {seed:?}");
+    outcome.trace.0.push(Event::State { what });
+    if !matches!(seed, Ok(OrderLookup::Terminal { filled_qty, .. }) if filled_qty == d("1")) {
+        fail_with(outcome, vec![format!(
+            "the seed's lookup is Terminal {{ 1 }}, not {seed:?}"
+        )]);
+    }
+}
+
 /// N3a's own evidence on U (note ³): the order was held, never applied.
 fn held_evidence(u: &U, outcome: &mut Outcome) {
     let held = u.venue.held_orders();
@@ -206,6 +221,7 @@ fn u_scenario(property: Property) -> Boxed<'static, Outcome> {
             A4 => scenarios::a4_characterized(&u).await,
             other => Outcome::no_scenario(other),
         };
+        seed_evidence(&u, &mut outcome).await;
         if property == N3a {
             held_evidence(&u, &mut outcome);
         }
