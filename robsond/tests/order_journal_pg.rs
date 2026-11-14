@@ -1372,6 +1372,16 @@ async fn a_spot_replay_converges_under_the_index(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn racing_spot_attempts_land_exactly_one(pool: PgPool) {
+    spot_attempt_race(&pool, true).await;
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn racing_full_spot_transactions_land_exactly_one(pool: PgPool) {
+    spot_attempt_race(&pool, false).await;
+}
+
+async fn spot_attempt_race(pool: &PgPool, preseed: bool) {
     let schedules = proptest::collection::vec(0u64..5, 2..7);
     let mut runner = TestRunner::deterministic();
     for case in 0..24 {
@@ -1381,9 +1391,11 @@ async fn racing_spot_attempts_land_exactly_one(pool: PgPool) {
         // Isolate the attempt race after the shared intent has landed. Racing
         // inserts of that UUID can independently hit its primary key, which is
         // deliberately still a Known error under the narrow 8e-1 mapping.
-        let mut intent_only = first.clone();
-        intent_only.attempts.clear();
-        PgJournalBackend::new(&pool, Uuid::now_v7()).commit(&intent_only).await.unwrap();
+        if preseed {
+            let mut intent_only = first.clone();
+            intent_only.attempts.clear();
+            PgJournalBackend::new(pool, Uuid::now_v7()).commit(&intent_only).await.unwrap();
+        }
 
         let mut tasks = Vec::new();
         for delay in &delays {
@@ -1401,11 +1413,23 @@ async fn racing_spot_attempts_land_exactly_one(pool: PgPool) {
             match task.await.unwrap() {
                 Ok(()) => landed += 1,
                 Err(CommitFailure::IdSpent) => {},
+                // PostgreSQL can report the concurrently inserted UUID's PK
+                // before the ON CONFLICT composite arbiter. This pre-existing
+                // classification stays Known; no other Known error is accepted.
+                Err(CommitFailure::Known(message)) if !preseed => assert_eq!(message,
+                    "error returned from database: duplicate key value violates unique constraint \"order_intents_pkey\""),
                 other => panic!("case {case}, delays {delays:?}: {other:?}"),
             }
         }
         assert_eq!(landed, 1, "case {case}, delays {delays:?}");
         assert_eq!(attempt_states_of(&pool, &id).await, ["started"]);
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM order_intents),(SELECT count(*) FROM submit_attempts)",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (case + 1, case + 1), "losing transactions leave no extra rows");
     }
 }
 
