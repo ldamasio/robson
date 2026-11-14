@@ -260,7 +260,7 @@ fn sums_refuse_rounding_and_overflow() {
     original.orig_qty = Decimal::MAX;
     original.fills_qty = Decimal::MAX;
     original.executed_cum = Decimal::MAX;
-    for qty in [Decimal::ONE, dec!(0.0000000000000000000000000001)] {
+    for qty in [dec!(0.0000000000000000000000000001), Decimal::ONE] {
         assert_eq!(plan(&original, &page(fill("1", qty)), &[]), Err(LedgerError::Unrepresentable));
     }
     let p = TradePage {
