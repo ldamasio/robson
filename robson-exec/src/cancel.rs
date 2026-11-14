@@ -181,6 +181,7 @@ mod tests {
             }),
             ExecError::InvalidState(text.to_string()),
             ExecError::Config(text.to_string()),
+            ExecError::BalanceOwnerRequired,
             ExecError::Timeout(text.to_string()),
             ExecError::FuturesSafetyViolation {
                 expected: text.to_string(),
@@ -222,6 +223,7 @@ mod tests {
                 | ExecError::Engine(_)
                 | ExecError::InvalidState(_)
                 | ExecError::Config(_)
+                | ExecError::BalanceOwnerRequired
                 | ExecError::Timeout(_)
                 | ExecError::FuturesSafetyViolation { .. }
                 | ExecError::ExpiredUnfilled(_) => {},
