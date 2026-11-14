@@ -17,6 +17,9 @@ pub use orders::{
     StoredOrder,
 };
 
+mod trades;
+pub use trades::{plan_trades, StoredTrade, TradePlan, TradeWriteResult};
+
 /// The orders whose execution can belong to a governed leg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegOrderKind {
