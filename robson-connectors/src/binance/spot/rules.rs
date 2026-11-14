@@ -14,6 +14,7 @@
 //! Binance refuses.
 
 use robson_domain::{Symbol, SymbolTradingRules};
+use robson_exec::balance_costs::exact;
 use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
@@ -25,8 +26,11 @@ use super::rest::{parse_json, SpotReadError};
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpotPriceFilter {
+    #[serde(deserialize_with = "exact::nonnegative")]
     pub min_price: Decimal,
+    #[serde(deserialize_with = "exact::nonnegative")]
     pub max_price: Decimal,
+    #[serde(deserialize_with = "exact::nonnegative")]
     pub tick_size: Decimal,
 }
 
@@ -34,8 +38,11 @@ pub struct SpotPriceFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpotLotFilter {
+    #[serde(deserialize_with = "exact::nonnegative")]
     pub min_qty: Decimal,
+    #[serde(deserialize_with = "exact::nonnegative")]
     pub max_qty: Decimal,
+    #[serde(deserialize_with = "exact::nonnegative")]
     pub step_size: Decimal,
 }
 
@@ -44,9 +51,11 @@ pub struct SpotLotFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpotNotionalFilter {
+    #[serde(deserialize_with = "exact::nonnegative")]
     pub min_notional: Decimal,
     /// Whether `min_notional` binds MARKET orders.
     pub apply_min_to_market: bool,
+    #[serde(deserialize_with = "exact::nonnegative")]
     pub max_notional: Decimal,
     /// Whether `max_notional` binds MARKET orders.
     pub apply_max_to_market: bool,

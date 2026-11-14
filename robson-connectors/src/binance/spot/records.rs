@@ -7,17 +7,39 @@
 
 use std::collections::HashSet;
 
+use robson_exec::balance_costs::exact;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer};
 
 use super::rest::{parse_json, SpotReadError};
 
 /// One asset of the account.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpotAccountBalance {
     pub asset: String,
     pub free: Decimal,
     pub locked: Decimal,
+}
+
+impl<'de> Deserialize<'de> for SpotAccountBalance {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            asset: String,
+            free: exact::ExactDecimal,
+            locked: exact::ExactDecimal,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let free = raw.free.value();
+        let locked = raw.locked.value();
+        if free < Decimal::ZERO || locked < Decimal::ZERO {
+            return Err(serde::de::Error::custom(format!(
+                "negative spot balance for {}",
+                raw.asset
+            )));
+        }
+        Ok(Self { asset: raw.asset, free, locked })
+    }
 }
 
 /// `GET /api/v3/account` (F23; L4278-L4332): the account's holdings and what
@@ -99,9 +121,13 @@ where
 /// The commission rates of one kind (F17).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SpotCommissionRates {
+    #[serde(deserialize_with = "exact::nonnegative")]
     pub maker: Decimal,
+    #[serde(deserialize_with = "exact::nonnegative")]
     pub taker: Decimal,
+    #[serde(deserialize_with = "exact::nonnegative")]
     pub buyer: Decimal,
+    #[serde(deserialize_with = "exact::nonnegative")]
     pub seller: Decimal,
 }
 
@@ -113,6 +139,7 @@ pub struct SpotCommissionDiscount {
     pub enabled_for_symbol: bool,
     pub discount_asset: String,
     /// Multiplier on the standard commission when BNB pays it.
+    #[serde(deserialize_with = "exact::nonnegative")]
     pub discount: Decimal,
 }
 

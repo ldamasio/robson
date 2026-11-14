@@ -51,6 +51,8 @@ mod cancel_tests;
 #[cfg(test)]
 mod conformance_tests;
 #[cfg(test)]
+mod exact_ingress_tests;
+#[cfg(test)]
 mod feed_tests;
 #[cfg(test)]
 mod inertness_tests;
