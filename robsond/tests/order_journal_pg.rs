@@ -1547,3 +1547,6 @@ async fn the_runbook_repair_restores_a_valid_index(pool: PgPool) {
     sqlx::raw_sql(migration).execute(&pool).await.unwrap();
     assert_spot_index(&pool).await;
 }
+
+#[path = "order_journal_balance/mod.rs"]
+mod balance;
