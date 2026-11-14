@@ -474,8 +474,13 @@ async fn placements_are_validated_and_answered_as_asked() {
         (market_query("&side=BUY&newOrderRespType=NONE", "v3"), -1100, "a response type"),
         (
             market_query("&side=BUY&selfTradePreventionMode=NONE", "v4"),
+            -1013,
+            "an STP mode the symbol does not allow",
+        ),
+        (
+            market_query("&side=BUY&selfTradePreventionMode=BOGUS", "v4b"),
             -1100,
-            "an STP mode",
+            "no STP mode at all",
         ),
         (market_query("&side=BUY&stopPrice=90", "v5"), -1106, "a MARKET stopPrice"),
         (
@@ -608,5 +613,76 @@ async fn exchange_info_advertises_only_the_books_limits() {
     let (_, limited) =
         call(&venue, reqwest::Method::GET, "/api/v3/exchangeInfo?symbol=BTCUSDT", None).await;
     assert_eq!(limits(&limited), ["MAX_NUM_ORDERS", "MAX_NUM_ALGO_ORDERS"]);
+    venue.shutdown().await.unwrap();
+}
+
+/// Codex 8d-2a round 2, P3: an order accepted under a lost answer keeps
+/// its STP mode in every later record.
+#[tokio::test]
+async fn a_lost_placement_keeps_its_stp_mode() {
+    let venue = venue().await;
+    venue.book().script_next(Script::Lost);
+    let query = "newClientOrderId=lost1&newOrderRespType=RESULT&quantity=0.5&\
+                 selfTradePreventionMode=EXPIRE_TAKER&side=SELL&stopPrice=90&symbol=BTCUSDT&\
+                 timestamp=1&type=STOP_LOSS";
+    let (status, lost) = post(&venue, query).await;
+    assert_eq!((status, code(&lost)), (503, -1007));
+    let (status, record) =
+        get(&venue, "/api/v3/order", "origClientOrderId=lost1&symbol=BTCUSDT&timestamp=1").await;
+    assert_eq!(
+        (status, record["selfTradePreventionMode"].as_str()),
+        (200, Some("EXPIRE_TAKER"))
+    );
+    let (_, open) = get(&venue, "/api/v3/openOrders", "symbol=BTCUSDT&timestamp=1").await;
+    assert_eq!(open[0]["selfTradePreventionMode"], "EXPIRE_TAKER");
+    let id = record["orderId"].as_u64().unwrap();
+    let (status, cancelled) =
+        delete(&venue, &format!("orderId={id}&symbol=BTCUSDT&timestamp=1")).await;
+    assert_eq!(
+        (status, cancelled["selfTradePreventionMode"].as_str()),
+        (200, Some("EXPIRE_TAKER"))
+    );
+    venue.shutdown().await.unwrap();
+}
+
+/// Codex 8d-2a round 2, P3: the modes follow the book's retention, so a
+/// retained stop keeps its mode across 4,096 later orders.
+#[tokio::test]
+async fn stp_modes_follow_the_books_retention() {
+    let book = SpotBook::new(vec![BookRules::btcusdt()], d("0.001"));
+    book.set_price("BTCUSDT", d("100"));
+    book.set_balance("BTC", d("1"));
+    book.set_balance("USDT", d("100000"));
+    let venue = FakeSpotVenue::start(Arc::new(book), TestCredentials::FIXED).await.unwrap();
+    let query = "newClientOrderId=kept&newOrderRespType=RESULT&quantity=0.5&\
+                 selfTradePreventionMode=EXPIRE_TAKER&side=SELL&stopPrice=90&symbol=BTCUSDT&\
+                 timestamp=1&type=STOP_LOSS";
+    let (status, stop) = post(&venue, query).await;
+    assert_eq!(status, 200, "{stop}");
+    let one = client();
+    let url = venue.url();
+    let mut first_market = None;
+    for n in 0..crate::spot_book::MAX_RETAINED_ORDERS {
+        let query = format!(
+            "newClientOrderId=r{n}&newOrderRespType=ACK&quantity=0.1&side=BUY&symbol=BTCUSDT&\
+             timestamp=1&type=MARKET"
+        );
+        let target = format!("{url}/api/v3/order?{}", signed(&query));
+        let answer = one.post(target).header("X-MBX-APIKEY", KEY).send().await.unwrap();
+        assert_eq!(answer.status(), 200, "market order {n}");
+        if n == 0 {
+            first_market = answer.json::<Value>().await.unwrap()["orderId"].as_u64();
+        }
+    }
+    let id = stop["orderId"].as_u64().unwrap();
+    assert!(venue.book().retains(id), "the live stop is retained");
+    let evicted = first_market.unwrap();
+    assert!(!venue.book().retains(evicted), "the oldest terminal order was evicted");
+    let (status, record) =
+        get(&venue, "/api/v3/order", &format!("orderId={id}&symbol=BTCUSDT&timestamp=1")).await;
+    assert_eq!(
+        (status, record["selfTradePreventionMode"].as_str()),
+        (200, Some("EXPIRE_TAKER"))
+    );
     venue.shutdown().await.unwrap();
 }

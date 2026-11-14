@@ -631,6 +631,11 @@ impl SpotBook {
         self.lock().rules.get(symbol).cloned()
     }
 
+    /// Whether the book still retains `order_id` (whatever its visibility).
+    pub fn retains(&self, order_id: u64) -> bool {
+        self.lock().orders.contains_key(&order_id)
+    }
+
     // What a venue does with a request.
 
     /// A MARKET order: executes at once at the current price (`Filled`), or

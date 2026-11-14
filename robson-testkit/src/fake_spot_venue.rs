@@ -11,13 +11,14 @@
 //! - **Placements** are validated before anything acts: `side`, `type`,
 //!   `quantity` and a STOP_LOSS's `stopPrice` are mandatory (`-1102`); an
 //!   invalid side is `-1117`, an unknown type `-1116`, a `stopPrice` on a
-//!   MARKET order `-1106`, a response type or STP mode outside the allowed ones
-//!   `-1100` (the pairings with HTTP 400 are synthetic). What the fake does not
-//!   model (other order types, a BUY stop, `quoteOrderQty`, `trailingDelta`, no
-//!   `newClientOrderId`) is unserved. The answer follows `newOrderRespType`
-//!   (MARKET defaults to `FULL`, STOP_LOSS to `ACK`, rest-api.md L2166) and
-//!   echoes the STP mode requested (the symbol's default `EXPIRE_MAKER` when
-//!   none was), which later records of the order carry too.
+//!   MARKET order `-1106`, a response type or STP mode that is no such value
+//!   `-1100`, an STP mode the symbol does not allow `-1013` (stp_faq.md
+//!   L170-L180; the other pairings with HTTP 400 are synthetic). What the fake
+//!   does not model (other order types, a BUY stop, `quoteOrderQty`,
+//!   `trailingDelta`, no `newClientOrderId`) is unserved. The answer follows
+//!   `newOrderRespType` (MARKET defaults to `FULL`, STOP_LOSS to `ACK`,
+//!   rest-api.md L2166) and echoes the STP mode requested (the symbol's default
+//!   `EXPIRE_MAKER` when none was), which later records of the order carry too.
 //! - **Authentication** on signed routes: no `X-MBX-APIKEY` is `-2014`
 //!   (synthetic: the docs give no answer for it), a value that is not a key's
 //!   format `-2014` (errors.md L439-L441), a well-formed foreign key `-2015`
@@ -70,7 +71,10 @@ use tower_service::Service;
 
 use crate::{
     balance_stub::PlacementHook,
-    spot_book::{BookError, BookOrder, BookRules, BookTrade, OrderKind, OrderRef, Side, SpotBook},
+    spot_book::{
+        BookError, BookOrder, BookRules, BookTrade, OrderKind, OrderRef, Side, SpotBook,
+        MAX_RETAINED_ORDERS,
+    },
 };
 
 /// How long a shutdown waits for the drain.
@@ -86,6 +90,16 @@ pub const UNSERVED_KEPT: usize = 64;
 /// The symbols' self-trade prevention modes: BTCUSDT's at `995f6eb3`, the
 /// first its default (`exchange_info_btcusdt.json`).
 pub const STP_MODES: [&str; 5] = [
+    "EXPIRE_MAKER",
+    "EXPIRE_TAKER",
+    "EXPIRE_BOTH",
+    "DECREMENT",
+    "TRANSFER",
+];
+/// Every STP mode Binance knows (enums.md L174-L184); one a symbol does not
+/// allow is `-1013` (stp_faq.md L170-L180).
+pub const STP_ENUM: [&str; 6] = [
+    "NONE",
     "EXPIRE_MAKER",
     "EXPIRE_TAKER",
     "EXPIRE_BOTH",
@@ -179,8 +193,8 @@ struct Wire {
     weight: u32,
     unserved: Vec<String>,
     unserved_total: u64,
-    /// The STP mode each order was placed with, by order id; the oldest
-    /// dropped past the book's retention.
+    /// The STP mode each order was placed with, by order id, kept while
+    /// the book retains the order.
     stp: BTreeMap<u64, String>,
     holds: VecDeque<(Method, String)>,
     scripts: VecDeque<(Method, String, u16, String)>,
@@ -836,6 +850,10 @@ fn new_order(params: &[(String, String)]) -> Result<NewOrder<'_>, Refused> {
         None => STP_MODES[0],
         Some(mode) => match STP_MODES.iter().find(|allowed| **allowed == mode) {
             Some(allowed) => allowed,
+            None if STP_ENUM.contains(&mode) => {
+                let msg = "This symbol does not allow the specified self-trade prevention mode.";
+                return Err(Refused::Answer(error(400, -1013, msg)));
+            },
             None => {
                 let msg = "Illegal characters found in parameter 'selfTradePreventionMode'.";
                 return Err(Refused::Answer(error(400, -1100, msg)));
@@ -843,6 +861,28 @@ fn new_order(params: &[(String, String)]) -> Result<NewOrder<'_>, Refused> {
         },
     };
     Ok(NewOrder { side, kind, qty, client_id, shape, stp })
+}
+
+/// Keep `order_id`'s STP mode while the book retains the order: past the
+/// book's retention, the entries of orders it evicted go, oldest first, and
+/// every retained order keeps its mode.
+fn keep_stp(shared: &Shared, order_id: u64, stp: &str) {
+    let mut wire = shared.wire();
+    wire.stp.insert(order_id, stp.to_string());
+    if wire.stp.len() <= MAX_RETAINED_ORDERS {
+        return;
+    }
+    let excess = wire.stp.len() - MAX_RETAINED_ORDERS;
+    let evicted: Vec<u64> = wire
+        .stp
+        .keys()
+        .copied()
+        .filter(|id| !shared.book.retains(*id))
+        .take(excess)
+        .collect();
+    for id in evicted {
+        wire.stp.remove(&id);
+    }
 }
 
 /// `POST /api/v3/order`: a MARKET order or a SELL `STOP_LOSS`, validated
@@ -861,6 +901,8 @@ fn place(shared: &Shared, symbol: &str, params: &[(String, String)]) -> Answer {
         hook(&shared.book);
     }
     let book = &shared.book;
+    let latest = |book: &SpotBook| book.order(symbol, OrderRef::Client(order.client_id)).ok();
+    let before = latest(book).map(|o| o.id);
     let placed = match order.kind {
         OrderKind::Market => book.place_market(symbol, order.side, order.qty, order.client_id),
         OrderKind::StopLoss { trigger } => {
@@ -869,16 +911,17 @@ fn place(shared: &Shared, symbol: &str, params: &[(String, String)]) -> Answer {
     };
     let placement = match placed {
         Ok(placement) => placement,
+        Err(BookError::Lost) => {
+            // The book may have accepted it: its records carry its mode.
+            if let Some(accepted) = latest(book).filter(|o| Some(o.id) != before) {
+                keep_stp(shared, accepted.id, order.stp);
+            }
+            return book_error(BookError::Lost);
+        },
         Err(e) => return book_error(e),
     };
     let placed = &placement.order;
-    {
-        let mut wire = shared.wire();
-        wire.stp.insert(placed.id, order.stp.to_string());
-        while wire.stp.len() > REQUEST_LOG {
-            wire.stp.pop_first();
-        }
-    }
+    keep_stp(shared, placed.id, order.stp);
     if order.shape == Shape::Ack {
         return ok(json!({
             "symbol": placed.symbol, "orderId": placed.id, "orderListId": -1,
