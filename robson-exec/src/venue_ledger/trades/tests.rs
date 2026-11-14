@@ -122,7 +122,9 @@ fn trade_identity_includes_the_order_and_tenant_but_not_local_recording_time() {
     let p = page(fill("1", dec!(1)));
     let first = plan(&order(), &p, &[]).unwrap();
     let later = at() + chrono::Duration::days(1);
-    let replay = plan_trades(&first.order, Uuid::nil(), &p, &first.new_fills, later).unwrap();
+    let replay = plan_trades(&first.order, Uuid::nil(), &p, &first.new_fills, later);
+    assert!(replay.is_ok(), "local recording time changed economic identity: {replay:?}");
+    let replay = replay.unwrap();
     assert!(!replay.changed);
     assert!(replay.new_fills.is_empty());
     assert_eq!(replay.order, first.order);
