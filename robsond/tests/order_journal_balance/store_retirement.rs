@@ -416,14 +416,16 @@ async fn journal_retirement_tracks_the_active_backend_with_an_idle_sibling(pool:
         .execute(&mut *held)
         .await
         .unwrap();
+    // Warm both connections using startup's retrying probe before imposing
+    // any operation lock timeout; cold connection startup is not the race.
     let mut tasks = Vec::new();
     for _ in 0..2 {
         let worker = backend.clone();
-        tasks.push(tokio::spawn(async move { worker.check_balance_schema(SPOT, true).await }));
+        tasks.push(tokio::spawn(async move { worker.check_ready().await }));
     }
-    let pids: Vec<i32> = tokio::time::timeout(Duration::from_secs(2), async {
+    let pids: Vec<i32> = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let pids: Vec<i32> = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND application_name=$1 AND wait_event_type='Lock' AND query LIKE '%WITH needed%'").bind(&application).fetch_all(&pool).await.unwrap();
+            let pids: Vec<i32> = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND application_name=$1 AND wait_event_type='Lock' AND query LIKE 'SELECT 1 FROM order_intents,%'").bind(&application).fetch_all(&pool).await.unwrap();
             if pids.len() == 2 { break pids; }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
