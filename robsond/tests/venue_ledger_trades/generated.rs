@@ -178,6 +178,42 @@ async fn journal_and_ledger_snapshot(pool: &PgPool) -> Vec<Vec<String>> {
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
+async fn admission_evidence_snapshot_detects_corruption(pool: PgPool) {
+    let fixture = Fixture::new(&pool).await;
+    let before = journal_and_ledger_snapshot(&pool).await;
+    // Fault injection in this sqlx-created database only. Temporarily bypass
+    // the immutable-admission trigger in one transaction, leaving all FK and
+    // CHECK constraints intact, then restore the trigger before committing.
+    let mut fault = pool.begin().await.unwrap();
+    sqlx::query("ALTER TABLE balance_leg_admissions DISABLE TRIGGER balance_leg_admissions_once")
+        .execute(&mut *fault)
+        .await
+        .unwrap();
+    let changed = sqlx::query("UPDATE balance_leg_admissions SET envelope_hash='injected-corruption' WHERE entry_intent_id=$1")
+        .bind(fixture.entry.intent.intent_id).execute(&mut *fault).await.unwrap();
+    assert_eq!(changed.rows_affected(), 1, "fault must alter one real admission");
+    sqlx::query("ALTER TABLE balance_leg_admissions ENABLE TRIGGER balance_leg_admissions_once")
+        .execute(&mut *fault)
+        .await
+        .unwrap();
+    fault.commit().await.unwrap();
+    let actual: String = sqlx::query_scalar(
+        "SELECT envelope_hash FROM balance_leg_admissions WHERE entry_intent_id=$1",
+    )
+    .bind(fixture.entry.intent.intent_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(actual, "injected-corruption", "fault must be durable before snapshot");
+    assert_ne!(
+        journal_and_ledger_snapshot(&pool).await,
+        before,
+        "full journal/ledger snapshot missed corrupted admission evidence"
+    );
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
 async fn overloaded_warmed_journal_refuses_without_partial_effects(pool: PgPool) {
     let fixture = Fixture::new(&pool).await;
     let (proxy, proxied) = through_proxy(&pool, 8).await;
