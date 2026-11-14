@@ -51,6 +51,13 @@ pub trait ScriptsStopCancel: Harness {
     fn script_next_stop_cancel(&self, outcome: StopCancelOutcome);
 }
 
+/// A venue whose market can trigger an open stop (`Characterized` on USD-M).
+pub trait TriggersStop: Harness {
+    /// The open `stop` triggers and its market order executes `executed`;
+    /// `false` when the venue did not apply it.
+    fn trigger(&self, stop: &StopRef, executed: Decimal) -> bool;
+}
+
 fn d(s: &str) -> Decimal {
     s.parse().expect("a decimal")
 }
@@ -539,10 +546,15 @@ pub async fn a4_balance<H: BalanceHarness>(h: &H) -> Outcome {
 
 /// A5b: across R2, A2, A3 and A4, nothing is placed after an indefinite
 /// cancel or an executed old stop, and the stale successor is refused, the
-/// flatten sold exactly. Each case on a fresh harness from `make`.
-pub async fn a5b<H: BalanceHarness>(make: impl Fn() -> H) -> Outcome {
+/// flatten sold exactly. Each case on a fresh harness from `make`, which
+/// may start a venue.
+pub async fn a5b<H, F>(make: impl Fn() -> F) -> Outcome
+where
+    H: BalanceHarness,
+    F: std::future::Future<Output = H>,
+{
     let mut run = Run::new(A5b, Coverage::Verified);
-    let h = make();
+    let h = make().await;
     seeded(&h, &mut run);
     if let Some(old) = stop(&h, &mut run, "a5-r2", "0.5", "90").await {
         let placed = h.placements();
@@ -552,7 +564,7 @@ pub async fn a5b<H: BalanceHarness>(make: impl Fn() -> H) -> Outcome {
         run.expect(h.placements() == placed, "R2: nothing placed after the indefinite cancel");
     }
     for (case, e) in [("a5-a2", "0.2"), ("a5-a3", "0.5")] {
-        let h = make();
+        let h = make().await;
         if let Some(old) = executed_old(&h, &mut run, case, e).await {
             let placed = h.placements();
             let outcome = replace(&h, &mut run, &old, &format!("{case}-new"), "0.3", "80").await;
@@ -566,7 +578,7 @@ pub async fn a5b<H: BalanceHarness>(make: impl Fn() -> H) -> Outcome {
             );
         }
     }
-    let h = make();
+    let h = make().await;
     stale_successor(&h, &mut run).await;
     run.finish()
 }
@@ -955,4 +967,67 @@ pub async fn a4_characterized<H: PositionHarness>(h: &H) -> Outcome {
     );
     run.expect(h.open_stops().len() == 1, "the stale successor of 1 is live");
     run.finish()
+}
+
+/// A1a, A2 and A3 on a position venue whose stop cancel cannot report a
+/// triggered stop's execution, `Characterized` (8d plan §4, note ⁴): the
+/// old stop of 1 triggers and executes `e`, which the position shows (it
+/// falls by `e`; no reduce-only bound is claimed, that is A5p's);
+/// `PlaceThenCancel` places the
+/// successor first, the old stop's cancel is refused, and the helper's
+/// existing outcome, `Unknown { new: Some(successor) }` with the execution
+/// unreported, is pinned exactly. The old stop's own lookup then reports
+/// its execution.
+async fn triggered_characterized<H: PositionHarness + TriggersStop>(
+    h: &H,
+    property: super::Property,
+    e: &str,
+) -> Outcome {
+    let mut run = Run::new(property, Coverage::Characterized);
+    run.state(format!("position {}", h.position()));
+    run.expect(h.position() >= d("1"), "a position of 1 to protect");
+    let old_id = format!("{property:?}-old");
+    let Some(old) = stop(h, &mut run, &old_id, "1", "90").await else {
+        return run.finish();
+    };
+    let before = h.position();
+    let triggered = h.trigger(&old, d(e));
+    run.market(format!("the old stop triggers and executes {e}"));
+    run.expect(triggered, "the trigger applied");
+    let after = h.position();
+    run.state(format!("position {before} -> {after}"));
+    run.expect(after == before - d(e), format!("the execution of {e} reduced the position"));
+    run.expect(
+        !h.open_stops().contains(&old.exchange_order_id),
+        "the old stop left the open list",
+    );
+    let outcome = replace(h, &mut run, &old, &format!("{property:?}-new"), "1", "92").await;
+    match &outcome {
+        Ok(ReplaceOutcome::Unknown { new: Some(new) }) => run.expect(
+            h.open_stops() == [new.stop.exchange_order_id.clone()],
+            "the successor is the only open stop",
+        ),
+        other => run.expect(false, format!("pinned: Unknown {{ new: Some }}, not {other:?}")),
+    }
+    let found = lookup(h, &mut run, &old_id).await;
+    run.expect(
+        matches!(found, Some(OrderLookup::Terminal { filled_qty, .. }) if filled_qty == d(e)),
+        format!("the old stop's lookup reports its execution of {e}"),
+    );
+    run.finish()
+}
+
+/// A1a, characterized: the old stop triggered with nothing executed.
+pub async fn a1a_triggered<H: PositionHarness + TriggersStop>(h: &H) -> Outcome {
+    triggered_characterized(h, A1a, "0").await
+}
+
+/// A2, characterized: the old stop triggered and executed in part.
+pub async fn a2_triggered<H: PositionHarness + TriggersStop>(h: &H) -> Outcome {
+    triggered_characterized(h, A2, "0.3").await
+}
+
+/// A3, characterized: the old stop triggered and executed whole.
+pub async fn a3_triggered<H: PositionHarness + TriggersStop>(h: &H) -> Outcome {
+    triggered_characterized(h, A3, "1").await
 }

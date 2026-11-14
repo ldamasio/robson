@@ -402,6 +402,8 @@ async fn the_ledger_schema_refuses_what_the_design_forbids(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn numbers_and_canonical_ids_round_trip_exactly(pool: PgPool) {
+    let fixture = Fixture::new(&pool).await;
+    fixture.all_rows(&pool).await;
     for value in [
         "0.0000000001",
         "0.0000000000000000000000000001",
@@ -420,6 +422,20 @@ async fn numbers_and_canonical_ids_round_trip_exactly(pool: PgPool) {
             .await
             .unwrap();
         assert_eq!(actual, value.parse::<Decimal>().unwrap());
+        // Also pass through actual storage: a narrowing NUMERIC typmod could
+        // round a value before its CHECK, while a literal SELECT still succeeds.
+        let mut fill = row(&pool, "order_fills").await;
+        fill["trade_id"] = json!("2");
+        fill["quote_qty"] = json!(value);
+        let mut tx = pool.begin().await.unwrap();
+        insert_value(&mut tx, "order_fills", fill).await.unwrap();
+        let stored: Decimal =
+            sqlx::query_scalar("SELECT quote_qty FROM order_fills WHERE trade_id='2'")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(stored, value.parse::<Decimal>().unwrap());
+        tx.rollback().await.unwrap();
     }
     for (id, expected) in [
         ("0", true),

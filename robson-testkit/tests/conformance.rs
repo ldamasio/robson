@@ -355,7 +355,7 @@ async fn b_scenario(property: Property) -> Outcome {
         A2 => scenarios::a2_balance(&b).await,
         A3 => scenarios::a3_balance(&b).await,
         A4 => scenarios::a4_balance(&b).await,
-        A5b => scenarios::a5b(make_b).await,
+        A5b => scenarios::a5b(|| async { make_b() }).await,
         B1 => scenarios::b1(&b).await,
         B2 => scenarios::b2(&b).await,
         B3 => scenarios::b3(&b).await,

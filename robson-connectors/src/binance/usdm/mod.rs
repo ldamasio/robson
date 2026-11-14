@@ -6,6 +6,9 @@ pub mod exchange;
 pub mod market_data;
 pub mod ohlcv;
 
+#[cfg(test)]
+mod conformance_tests;
+
 pub use exchange::BinanceExchangeAdapter;
 pub use market_data::{
     BinanceUsdmTradeFeed, MAINNET_MARKET_WS_ENDPOINT, TESTNET_MARKET_WS_ENDPOINT,

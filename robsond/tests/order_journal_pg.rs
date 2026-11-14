@@ -1399,7 +1399,7 @@ async fn spot_attempt_race(pool: &PgPool, preseed: bool) {
 
         let mut tasks = Vec::new();
         for delay in &delays {
-            let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
+            let backend = PgJournalBackend::new(pool, Uuid::now_v7());
             let mut batch = first.clone();
             batch.attempts = vec![attempt_row(false)];
             let delay = *delay;
@@ -1422,7 +1422,7 @@ async fn spot_attempt_race(pool: &PgPool, preseed: bool) {
             }
         }
         assert_eq!(landed, 1, "case {case}, delays {delays:?}");
-        assert_eq!(attempt_states_of(&pool, &id).await, ["started"]);
+        assert_eq!(attempt_states_of(pool, &id).await, ["started"]);
         let counts: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT count(*) FROM order_intents),(SELECT count(*) FROM submit_attempts)",
         )
