@@ -156,12 +156,47 @@ fn backend(error: sqlx::Error) -> LedgerError {
     LedgerError::Backend(error.to_string())
 }
 
-/// A server ErrorResponse to COMMIT proves rollback; a transport/protocol
-/// failure supplies no answer and cannot establish whether it landed.
+/// Only a nonfatal integrity-constraint rejection proves COMMIT rolled back.
+/// Unknown SQLSTATEs (including 08007/40003), FATAL and lost answers stay
+/// uncertain.
 fn commit_error(error: sqlx::Error) -> LedgerError {
-    if matches!(error, sqlx::Error::Database(_)) {
+    let rejected = match &error {
+        sqlx::Error::Database(database) => database
+            .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+            .is_some_and(|database| {
+                definite_commit_rejection(database.severity(), database.code())
+            }),
+        _ => false,
+    };
+    if rejected {
         LedgerError::Backend(error.to_string())
     } else {
         LedgerError::Uncertain(error.to_string())
+    }
+}
+
+fn definite_commit_rejection(severity: sqlx::postgres::PgSeverity, code: &str) -> bool {
+    severity == sqlx::postgres::PgSeverity::Error && code.starts_with("23")
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::postgres::PgSeverity;
+
+    use super::*;
+
+    #[test]
+    fn unknown_resolution_and_fatal_commit_errors_never_prove_rollback() {
+        assert!(definite_commit_rejection(PgSeverity::Error, "23514"));
+        for code in ["40003", "08007", "ZX999"] {
+            assert!(!definite_commit_rejection(PgSeverity::Error, code), "{code}");
+        }
+        for severity in [PgSeverity::Fatal, PgSeverity::Panic] {
+            assert!(!definite_commit_rejection(severity, "23514"));
+        }
+        assert!(matches!(
+            commit_error(sqlx::Error::Protocol("lost answer".into())),
+            LedgerError::Uncertain(_)
+        ));
     }
 }
