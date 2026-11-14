@@ -71,9 +71,12 @@ this is not a claim of an exact heap-byte or wall-time ceiling.
 
 Other targets retain the4096bit operand guards; their library limb/algorithm
 accounting must be re-audited before claiming the same limb-level cost proof.
-No architecture-specific unsafe code or system call is introduced. Tests run
-with1MiB runtime stack, including4096bit division; this is observed acceptance,
-not a proof about scheduler latency or allocation failure. Allocation failure
+No architecture-specific unsafe code or system call is introduced. Acceptance requires both process `ulimit -s 1024` and runtime-only
+`RUST_MIN_STACK=1048576` for libtest spawned threads, including4096bit division.
+The original ulimit-only record did not establish a1MiB test-thread stack and
+is superseded by separately retained corrected runs. Compiler threads are not
+constrained; explicit thread-stack overrides are not covered by this claim.
+This is not a proof about scheduler latency or allocation failure. Allocation failure
 has normal Rust process behavior, not a recoverable financial error.
 
 There are no retained caches/tasks/listeners, production state or I/O. Temporary
