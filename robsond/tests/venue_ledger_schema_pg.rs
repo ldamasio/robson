@@ -508,11 +508,11 @@ async fn the_owners_future_writes_fit_the_schema(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     f.order(&pool).await;
     execute(&pool,"UPDATE balance_legs SET gross_qty=1.01,acquisition_cost=101,base_commission=0.01,executable_qty=1").await;
-    execute(&pool,"UPDATE balance_legs SET base_commission=0.02,base_commission_final=true,executable_qty=0.99").await;
+    execute(&pool,"UPDATE balance_legs SET base_commission=0.02,base_commission_final=true,executable_qty=0.98").await;
     for sql in [
         "UPDATE balance_legs SET gross_qty=2",
         "UPDATE balance_legs SET acquisition_cost=102",
-        "UPDATE balance_legs SET executable_qty=1",
+        "UPDATE balance_legs SET executable_qty=0.99",
         "UPDATE balance_legs SET base_commission=0.01",
         "UPDATE balance_legs SET base_commission_final=false",
     ] {
