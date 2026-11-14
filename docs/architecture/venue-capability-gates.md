@@ -103,13 +103,15 @@ never lists the refused id as closed, and never changes its financial facts.
 | Full caller reaching the refused batch | SQL including transaction controls/cleanup |
 |---|---|
 | Close / one Active panic leg | Accepted + Processing + Acting + Failed: 24 normal, at most 25 if the final COMMIT fails. |
-| Ordinary tick refused trading batch | Routine snapshots are nondurable; Failed: 6 normal, at most 7. |
+| Tick with one refused trading leg | Routine snapshots are nondurable; Failed: 6 normal, at most 7. |
+| Mixed tick with one earlier monitor-only leg, then a refused trading leg | Earlier domain append/read: 7; refusal: 6 normal / 7 after failed COMMIT; whole caller: 13 / 14. The earlier event remains durable. |
 | N Active panic legs | 24N normal, at most 25N on final-audit failure per leg. |
 | Earlier failed Accepted / Processing / Acting append in close or panic | Existing failure paths: at most 7 / 20 / 26 respectively. These do not reach the batch refusal and are not covered by the 25 bound. |
 
-The 28-case PostgreSQL fixture observes whole callers through single-slot pool
-reacquisition, including queued rollback, and configures both query and domain
-writers. Final sequence/idempotency/event/stream failures cost 3/4/5/6 statements
+The 30 PostgreSQL scenarios observe whole callers through single-slot pool
+reacquisition, including queued rollback, and configure both query and domain
+writers. Mixed-tick counts include the earlier leg without resetting the counter;
+the refused leg adds no domain event. Final sequence/idempotency/event/stream failures cost 3/4/5/6 statements
 on top of earlier snapshots; deferred COMMIT costs 7. Lost final acknowledgement
 can leave the Failed audit durable. Error/cancellation retains the leg, and no
 fallback reads the venue. Generated original-batch permutations and concurrent
