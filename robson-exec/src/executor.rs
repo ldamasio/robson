@@ -142,11 +142,34 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         Arc::clone(&self.exchange)
     }
 
+    /// Refuse a legacy balance trading batch before any action, journal scope
+    /// or caller audit can run. Event/state-only batches retain their existing
+    /// path. Exhaustive classification makes new action variants review this
+    /// boundary explicitly. The scan is O(n), with O(1) retained space.
+    pub fn validate_legacy_batch(&self, actions: &[EngineAction]) -> ExecResult<()> {
+        if self.exchange.capabilities().account_kind == crate::venue::AccountKind::BalanceAccount
+            && actions.iter().any(|action| match action {
+                EngineAction::PlaceEntryOrder { .. }
+                | EngineAction::PlaceExitOrder { .. }
+                | EngineAction::PlaceInsuranceStop { .. }
+                | EngineAction::ReplaceInsuranceStop { .. }
+                | EngineAction::CancelInsuranceStop { .. } => true,
+                EngineAction::UpdateTrailingStop { .. }
+                | EngineAction::TriggerExit { .. }
+                | EngineAction::EmitEvent(_) => false,
+            })
+        {
+            return Err(ExecError::BalanceOwnerRequired);
+        }
+        Ok(())
+    }
+
     /// Execute a list of engine actions.
     ///
     /// Actions are executed in order. If one fails, subsequent actions
     /// are not executed.
     pub async fn execute(&self, actions: Vec<EngineAction>) -> ExecResult<Vec<ActionResult>> {
+        self.validate_legacy_batch(&actions)?;
         if order_journal::in_operation() {
             return self.execute_batch(actions).await;
         }

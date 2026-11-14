@@ -1847,6 +1847,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         &self,
         actions: Vec<EngineAction>,
     ) -> DaemonResult<Vec<ActionResult>> {
+        self.executor.validate_legacy_batch(&actions)?;
         let entry_admission_barrier = actions
             .iter()
             .any(|action| matches!(action, EngineAction::PlaceEntryOrder { .. }));
@@ -2896,6 +2897,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .position_id
             .ok_or_else(|| DaemonError::Config("Signal query missing position_id".to_string()))?;
 
+        let actions = governed.into_actions();
+        self.executor.validate_legacy_batch(&actions)?;
+
         if let Err(e) = query.transition(QueryState::Acting) {
             let phase = match query.state {
                 QueryState::Authorized => "authorized",
@@ -2911,7 +2915,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // From here an order may reach the exchange: an error no longer
         // re-arms the detector, unless the executor proves nothing was sent.
         *reach = AdmissionReach::Executor;
-        let actions = governed.into_actions();
         let entry_client_order_id = actions.iter().find_map(|action| match action {
             EngineAction::PlaceEntryOrder { client_order_id, .. } => Some(client_order_id.clone()),
             _ => None,
@@ -4061,7 +4064,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         record_refusal(site);
         event_bus.send(DaemonEvent::EntryRejected {
             position_id,
-            reason_code: "venue_unsupported".to_string(),
+            reason_code: if matches!(error, DaemonError::Exec(ExecError::BalanceOwnerRequired)) {
+                "balance_owner_required"
+            } else {
+                "venue_unsupported"
+            }
+            .to_string(),
             reason: error.to_string(),
             terminal: false,
             rejected_at: chrono::Utc::now(),
@@ -4139,7 +4147,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let (Err(error), AdmissionReach::DetectorSpent(position_id), Some(_)) =
             (&result, reach, &entry_flow_guard)
         {
-            self.rearm_detector_after_failed_admission(position_id, "signal", error).await;
+            if matches!(error, DaemonError::Exec(ExecError::BalanceOwnerRequired)) {
+                Self::emit_capability_rejection(&self.event_bus, position_id, error, "signal");
+            } else {
+                self.rearm_detector_after_failed_admission(position_id, "signal", error).await;
+            }
         }
         result
     }
@@ -4617,7 +4629,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let (Err(error), AdmissionReach::DetectorSpent(position_id), Some(_)) =
             (&result, reach, &entry_flow_guard)
         {
-            self.rearm_detector_after_failed_admission(position_id, "approval", error).await;
+            if matches!(error, DaemonError::Exec(ExecError::BalanceOwnerRequired)) {
+                Self::emit_capability_rejection(&self.event_bus, position_id, error, "approval");
+            } else {
+                self.rearm_detector_after_failed_admission(position_id, "approval", error).await;
+            }
         }
         result
     }
