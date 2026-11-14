@@ -97,17 +97,17 @@ async fn a_failed_balance_journal_commit_counts_through_completed_retirement(poo
     let tenant = Uuid::now_v7();
     seed_account(&pool, tenant, SPOT).await;
     sqlx::raw_sql("CREATE FUNCTION reject_journal_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'deferred journal refusal' USING ERRCODE='23514'; END $$; CREATE CONSTRAINT TRIGGER reject_journal_commit AFTER INSERT ON order_intents DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_journal_commit();").execute(&pool).await.unwrap();
-    let (proxy, initial, application) = isolated_pool(&pool).await;
-    let backend = PgJournalBackend::new(&initial, tenant);
+    let (proxy, initial, _application) = isolated_pool(&pool).await;
+    let backend = Arc::new(PgJournalBackend::new(&initial, tenant));
     initial.close().await;
     backend.check_ready().await.unwrap();
-    let pid = backend_pid(&pool, &application).await;
     proxy.enable_query_trace(32);
     let before = proxy.stats().statements;
     let batch = balance_batch("rejected-commit", IntentKind::Exit);
     assert_eq!(batch.statements(), 7);
     // J keeps its established conservative COMMIT classification.
-    assert!(matches!(backend.commit(&batch).await, Err(CommitFailure::Uncertain(_))));
+    let (pid, result) = captured_commit(&pool, &backend, &batch).await;
+    assert!(matches!(result, Err(CommitFailure::Uncertain(_))));
     retired(&pool, pid).await;
     assert_eq!(
         proxy.stats().statements - before,
@@ -260,24 +260,24 @@ async fn no_temporary_tables(pool: &PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn flagged_readiness_errors_count_through_completed_retirement(pool: PgPool) {
-    let (proxy, backend, application) = ready_backend(&pool).await;
-    let pid = backend_pid(&pool, &application).await;
+    let (proxy, backend, _application) = ready_backend(&pool).await;
     proxy.enable_query_trace(16);
     let before = proxy.stats().statements;
     proxy.set_mode(ProxyMode::DropRollbackAckOf("robson_expected_"));
-    assert!(backend.check_balance_schema(SPOT, true).await.is_err());
+    let (pid, result) = captured_schema_check(&pool, &backend).await;
+    assert!(result.is_err());
     retired(&pool, pid).await;
     wire(&proxy, before, 7);
     assert_eq!(proxy.query_trace().iter().filter(|sql| *sql == "ROLLBACK").count(), 1);
     no_temporary_tables(&pool).await;
     backend.check_balance_schema(SPOT, true).await.unwrap();
-    let pid = backend_pid(&pool, &application).await;
     sqlx::raw_sql(r#"CREATE FUNCTION refuse_expected_index() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN
         IF EXISTS(SELECT 1 FROM pg_event_trigger_ddl_commands() d JOIN pg_class c ON c.oid=d.objid WHERE c.relname LIKE 'robson_expected_idx_%') THEN RAISE EXCEPTION 'expected-index refusal'; END IF;
         END $$; CREATE EVENT TRIGGER refuse_expected_index ON ddl_command_end WHEN TAG IN ('CREATE INDEX') EXECUTE FUNCTION refuse_expected_index();"#).execute(&pool).await.unwrap();
     proxy.enable_query_trace(16);
     let before = proxy.stats().statements;
-    assert!(backend.check_balance_schema(SPOT, true).await.is_err());
+    let (pid, result) = captured_schema_check(&pool, &backend).await;
+    assert!(result.is_err());
     retired(&pool, pid).await;
     wire(&proxy, before, 5);
     no_temporary_tables(&pool).await;
@@ -286,14 +286,16 @@ async fn flagged_readiness_errors_count_through_completed_retirement(pool: PgPoo
         .await
         .unwrap();
     backend.check_balance_schema(SPOT, true).await.unwrap();
-    let pid = backend_pid(&pool, &application).await;
-    sqlx::query("DROP INDEX idx_submit_attempts_one_per_spot_client_id")
+    // Keep the index present so catalog expression deparsing takes the
+    // observed relation lock; make a required table unavailable instead.
+    sqlx::query("ALTER TABLE venue_orders RENAME TO unavailable_venue_orders")
         .execute(&pool)
         .await
         .unwrap();
     proxy.enable_query_trace(16);
     let before = proxy.stats().statements;
-    assert!(backend.check_balance_schema(SPOT, true).await.is_err());
+    let (pid, result) = captured_schema_check(&pool, &backend).await;
+    assert!(result.is_err());
     retired(&pool, pid).await;
     wire(&proxy, before, 3);
     no_temporary_tables(&pool).await;
@@ -302,8 +304,7 @@ async fn flagged_readiness_errors_count_through_completed_retirement(pool: PgPoo
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn flagged_readiness_cancellation_counts_through_completed_retirement(pool: PgPool) {
-    let (proxy, backend, application) = ready_backend(&pool).await;
-    let pid = backend_pid(&pool, &application).await;
+    let (proxy, backend, _application) = ready_backend(&pool).await;
     let mut held = pool.begin().await.unwrap();
     sqlx::query("LOCK TABLE submit_attempts IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *held)
@@ -313,7 +314,7 @@ async fn flagged_readiness_cancellation_counts_through_completed_retirement(pool
     let before = proxy.stats().statements;
     let worker = backend.clone();
     let task = tokio::spawn(async move { worker.check_balance_schema(SPOT, true).await });
-    assert_eq!(wait_for_lock(&pool, "WITH needed").await, pid);
+    let pid = wait_for_lock(&pool, "WITH needed").await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     retired(&pool, pid).await;
@@ -327,20 +328,19 @@ async fn flagged_readiness_cancellation_counts_through_completed_retirement(pool
 #[ignore = "requires DATABASE_URL"]
 async fn balance_journal_known_error_and_cancellation_count_through_retirement(pool: PgPool) {
     let tenant = Uuid::now_v7();
-    let (proxy, initial, application) = isolated_pool(&pool).await;
+    let (proxy, initial, _application) = isolated_pool(&pool).await;
     let backend = Arc::new(PgJournalBackend::new(&initial, tenant));
     initial.close().await;
     backend.check_ready().await.unwrap();
     let batch = balance_batch("cancelled-journal", IntentKind::Exit);
-    let pid = backend_pid(&pool, &application).await;
     proxy.enable_query_trace(16);
     let before = proxy.stats().statements;
-    assert!(matches!(backend.commit(&batch).await, Err(CommitFailure::Known(_))));
+    let (pid, result) = captured_commit(&pool, &backend, &batch).await;
+    assert!(matches!(result, Err(CommitFailure::Known(_))));
     retired(&pool, pid).await;
     wire(&proxy, before, 3);
     seed_account(&pool, tenant, SPOT).await;
     backend.check_ready().await.unwrap();
-    let pid = backend_pid(&pool, &application).await;
     let mut held = pool.begin().await.unwrap();
     sqlx::query("SELECT * FROM accounting_state WHERE tenant_id=$1 FOR UPDATE")
         .bind(tenant)
@@ -352,7 +352,7 @@ async fn balance_journal_known_error_and_cancellation_count_through_retirement(p
     let worker = backend.clone();
     let pending = batch.clone();
     let task = tokio::spawn(async move { worker.commit(&pending).await });
-    assert_eq!(wait_for_lock(&pool, "UPDATE accounting_state").await, pid);
+    let pid = wait_for_lock(&pool, "UPDATE accounting_state").await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     retired(&pool, pid).await;
@@ -369,4 +369,89 @@ async fn balance_journal_known_error_and_cancellation_count_through_retirement(p
     backend.commit(&batch).await.unwrap();
     assert_eq!(version(&pool, tenant, SPOT).await, 1);
     wire(&proxy, before, 10);
+}
+
+// The journal owns a separate max_connections=2 pool. Capture the actual
+// transaction while it waits, never an arbitrary idle sibling by application.
+async fn captured_commit(
+    pool: &PgPool,
+    backend: &Arc<PgJournalBackend>,
+    batch: &JournalBatch,
+) -> (i32, Result<(), CommitFailure>) {
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE accounting_state IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let worker = backend.clone();
+    let pending = batch.clone();
+    let task = tokio::spawn(async move { worker.commit(&pending).await });
+    let pid = wait_for_lock(pool, "UPDATE accounting_state").await;
+    held.rollback().await.unwrap();
+    (pid, task.await.unwrap())
+}
+
+async fn captured_schema_check(
+    pool: &PgPool,
+    backend: &Arc<PgJournalBackend>,
+) -> (i32, Result<(), String>) {
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE submit_attempts IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let worker = backend.clone();
+    let task = tokio::spawn(async move { worker.check_balance_schema(SPOT, true).await });
+    let pid = wait_for_lock(pool, "WITH needed").await;
+    held.rollback().await.unwrap();
+    (pid, task.await.unwrap())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn journal_retirement_tracks_the_active_backend_with_an_idle_sibling(pool: PgPool) {
+    let (proxy, backend, application) = ready_backend(&pool).await;
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE submit_attempts IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    // Warm both connections using startup's retrying probe before imposing
+    // any operation lock timeout; cold connection startup is not the race.
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let worker = backend.clone();
+        tasks.push(tokio::spawn(async move { worker.check_ready().await }));
+    }
+    let pids: Vec<i32> = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let pids: Vec<i32> = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND application_name=$1 AND wait_event_type='Lock' AND query LIKE 'SELECT 1 FROM order_intents,%'").bind(&application).fetch_all(&pool).await.unwrap();
+            if pids.len() == 2 { break pids; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("both journal connections must be observed in flight");
+    held.rollback().await.unwrap();
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    let before = proxy.stats().statements;
+    proxy.enable_query_trace(16);
+    let (pid, result) =
+        captured_commit(&pool, &backend, &balance_batch("two-backends", IntentKind::Exit)).await;
+    assert!(matches!(result, Err(CommitFailure::Known(_))));
+    assert!(pids.contains(&pid));
+    retired(&pool, pid).await;
+    wire(&proxy, before, 3);
+    let sibling = *pids.iter().find(|other| **other != pid).unwrap();
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND application_name=$2)"
+        )
+        .bind(sibling)
+        .bind(&application)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "retiring a failed operation must preserve the healthy sibling"
+    );
 }
