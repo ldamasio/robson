@@ -241,7 +241,13 @@ pub fn merge_order(
         } else {
             if !execution_regressed {
                 order.executed_cum = record.executed_qty;
-                order.cumulative_quote = record.cumulative_quote_qty.or(old.cumulative_quote);
+                // A quote belongs to its executed quantity. An earlier subtotal
+                // cannot become the total for newly observed execution.
+                order.cumulative_quote = if record.executed_qty > old.executed_cum {
+                    record.cumulative_quote_qty
+                } else {
+                    record.cumulative_quote_qty.or(old.cumulative_quote)
+                };
                 order.phase = record.phase;
                 order.status = record.status.clone();
                 if record.phase == OrderPhase::Terminal {

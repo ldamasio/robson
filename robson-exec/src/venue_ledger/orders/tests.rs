@@ -503,3 +503,57 @@ proptest! {
         prop_assert_eq!(total,stored.as_ref().map_or(Decimal::ZERO,contribution));
     }
 }
+
+#[test]
+fn a_quote_subtotal_never_becomes_an_unknown_larger_execution_total() {
+    for terminal_first in [false, true] {
+        let mut incoming = record();
+        let initial = unowned(&incoming);
+        // Missing quote at unchanged execution still has the same known total.
+        incoming.cumulative_quote_qty = None;
+        let unchanged =
+            merge_order(Some(&initial), &incoming, &link(OrderOwner::Discovered), &at(2), None)
+                .unwrap();
+        assert!(!unchanged.changed);
+        assert_eq!(unchanged.order.cumulative_quote, Some(dec!(200)));
+        incoming.executed_qty = dec!(3);
+        if terminal_first {
+            incoming.phase = OrderPhase::Terminal;
+            incoming.status = "CANCELED".into();
+        }
+        let advanced =
+            merge_order(Some(&initial), &incoming, &link(OrderOwner::Discovered), &at(3), None)
+                .unwrap();
+        assert!(advanced.changed);
+        assert_eq!(advanced.order.cumulative_quote, None);
+        incoming.phase = OrderPhase::Terminal;
+        incoming.status = "CANCELED".into();
+        let terminal = merge_order(
+            Some(&advanced.order),
+            &incoming,
+            &link(OrderOwner::Discovered),
+            &at(4),
+            None,
+        )
+        .unwrap()
+        .order;
+        assert_eq!(terminal.cumulative_quote, None);
+        incoming.cumulative_quote_qty = Some(dec!(300));
+        let replay =
+            merge_order(Some(&terminal), &incoming, &link(OrderOwner::Discovered), &at(5), None)
+                .unwrap();
+        assert!(!replay.changed);
+        assert_eq!(replay.order, terminal);
+        let mut leg = leg();
+        let owner = owned(&leg, LegOrderKind::Sell);
+        let adopted = merge_order(Some(&terminal), &incoming, &owner, &at(6), Some(&leg)).unwrap();
+        assert_eq!(adopted.consumed_delta, dec!(3));
+        assert_eq!(adopted.order.cumulative_quote, None);
+        leg.consumed_cum = dec!(3);
+        assert!(
+            !merge_order(Some(&adopted.order), &incoming, &owner, &at(7), Some(&leg))
+                .unwrap()
+                .changed
+        );
+    }
+}

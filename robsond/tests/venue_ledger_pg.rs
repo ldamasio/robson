@@ -783,3 +783,60 @@ async fn an_executed_entry_never_consumes_the_leg_inventory(pool: PgPool) {
     f.ledger.record_order(&r, &link, seen(2)).await.unwrap();
     assert_eq!(f.consumed(&pool).await, Decimal::ZERO);
 }
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_partial_quote_is_not_frozen_as_a_larger_terminal_total(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    for (index, terminal_first) in [false, true].into_iter().enumerate() {
+        let mut r = record();
+        r.exchange_order_id = (90 + index).to_string();
+        r.client_order_id = format!("quote-{index}");
+        let mut link = unowned();
+        link.client_order_id = r.client_order_id.clone();
+        f.ledger.record_order(&r, &link, seen(1)).await.unwrap();
+        r.cumulative_quote_qty = None;
+        let before = snapshot(&pool).await;
+        assert!(!f.ledger.record_order(&r, &link, seen(2)).await.unwrap().changed);
+        assert_eq!(snapshot(&pool).await, before);
+        r.executed_qty = Decimal::from(3);
+        if terminal_first {
+            r.phase = OrderPhase::Terminal;
+            r.status = "CANCELED".into();
+        }
+        f.ledger.record_order(&r, &link, seen(3)).await.unwrap();
+        let quote: Option<Decimal> = sqlx::query_scalar(
+            "SELECT cumulative_quote FROM venue_orders WHERE exchange_order_id=$1",
+        )
+        .bind(&r.exchange_order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(quote, None);
+        r.phase = OrderPhase::Terminal;
+        r.status = "CANCELED".into();
+        f.ledger.record_order(&r, &link, seen(4)).await.unwrap();
+        let before = snapshot(&pool).await;
+        r.cumulative_quote_qty = Some(Decimal::from(300));
+        assert!(!f.ledger.record_order(&r, &link, seen(5)).await.unwrap().changed);
+        assert_eq!(snapshot(&pool).await, before);
+        let mut owned = f.link(LegOrderKind::Sell);
+        owned.client_order_id = r.client_order_id.clone();
+        let consumed = f.consumed(&pool).await;
+        let version = f.version(&pool).await;
+        assert!(f.ledger.record_order(&r, &owned, seen(6)).await.unwrap().changed);
+        assert_eq!(f.consumed(&pool).await, consumed + Decimal::from(3));
+        assert_eq!(f.version(&pool).await, version + 1);
+        let quote: Option<Decimal> = sqlx::query_scalar(
+            "SELECT cumulative_quote FROM venue_orders WHERE exchange_order_id=$1",
+        )
+        .bind(&r.exchange_order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(quote, None);
+        let before = snapshot(&pool).await;
+        assert!(!f.ledger.record_order(&r, &owned, seen(7)).await.unwrap().changed);
+        assert_eq!(snapshot(&pool).await, before);
+    }
+}
