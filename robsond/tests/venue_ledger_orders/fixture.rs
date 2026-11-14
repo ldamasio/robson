@@ -156,3 +156,54 @@ pub async fn through_proxy_limit(
         .unwrap();
     (proxy, proxied)
 }
+
+/// Warm the one-connection proxy pool and identify the exact backend whose
+/// retirement the fault fixture will await. Setup queries are outside counts.
+pub async fn backend_pid(pool: &PgPool) -> i32 {
+    let pid = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(pool).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while pool.num_idle() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    pid
+}
+
+/// Wait for the old backend to disappear, so queued cleanup SQL has finished
+/// before the test freezes its wire count. Polls use the direct fixture pool.
+pub async fn retired(pool: &PgPool, pid: i32) {
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        loop {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1)")
+                    .bind(pid)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            if !exists {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("old ledger backend retired");
+}
+
+pub fn wire_count(
+    ledger: &PgVenueLedger,
+    proxy: &robson_testkit::db_proxy::DbProxy,
+    baseline: u64,
+    expected: u64,
+) {
+    assert_eq!(ledger.statements_total(), expected, "instrumented operation count");
+    assert_eq!(
+        proxy.stats().statements - baseline,
+        expected,
+        "wire count through completed retirement: {:?}",
+        proxy.query_trace()
+    );
+    assert_eq!(proxy.query_trace_dropped(), 0);
+}

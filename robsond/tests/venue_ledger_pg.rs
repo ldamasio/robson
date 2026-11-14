@@ -60,12 +60,17 @@ async fn definite_commit_rejection_rolls_back_every_effect(pool: PgPool) {
     let (proxy, proxied) = through_proxy_limit(&pool, 1).await;
     let ledger = PgVenueLedger::new(&proxied, f.tenant);
     let connections = proxy.stats().connections;
+    let pid = backend_pid(&proxied).await;
+    proxy.enable_query_trace(32);
+    let wire = proxy.stats().statements;
     let before = snapshot(&pool).await;
     execute(&pool,"CREATE FUNCTION reject_order_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture deferred rejection' USING ERRCODE='23514'; END $$; CREATE CONSTRAINT TRIGGER reject_order_commit AFTER INSERT OR UPDATE ON venue_orders DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_order_commit()").await;
     assert!(matches!(
         ledger.record_order(&record(), &f.link(LegOrderKind::Sell), seen(1)).await,
         Err(LedgerError::Backend(_))
     ));
+    retired(&pool, pid).await;
+    wire_count(&ledger, &proxy, wire, 8);
     assert_eq!(snapshot(&pool).await, before);
     execute(&pool, "DROP TRIGGER reject_order_commit ON venue_orders").await;
     assert!(
@@ -388,13 +393,18 @@ async fn first_clock_evidence_is_retained_even_when_later_audit_changes(pool: Pg
 async fn lost_commit_ack_is_uncertain_and_replay_does_not_bump(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let link = f.link(LegOrderKind::Sell);
-    let (proxy, proxied) = through_proxy(&pool).await;
+    let (proxy, proxied) = through_proxy_limit(&pool, 1).await;
     let ledger = PgVenueLedger::new(&proxied, f.tenant);
+    let pid = backend_pid(&proxied).await;
+    proxy.enable_query_trace(32);
+    let wire = proxy.stats().statements;
     proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE balance_legs"));
     assert!(matches!(
         ledger.record_order(&record(), &link, seen(1)).await,
         Err(LedgerError::Uncertain(_))
     ));
+    retired(&pool, pid).await;
+    wire_count(&ledger, &proxy, wire, 8);
     assert_eq!(f.consumed(&pool).await, Decimal::from(2));
     let before = snapshot(&pool).await;
     let n = ledger.statements_total();
@@ -476,15 +486,20 @@ async fn cancellation_during_leg_update_rolls_back_and_retires_connection(pool: 
     let f = Fixture::new(&pool).await;
     let before = snapshot(&pool).await;
     execute(&pool,"CREATE FUNCTION sleep_leg_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(10); RETURN NEW; END $$; CREATE TRIGGER sleep_leg_write BEFORE UPDATE ON balance_legs FOR EACH ROW EXECUTE FUNCTION sleep_leg_write()").await;
-    let (proxy, proxied) = through_proxy(&pool).await;
+    let (proxy, proxied) = through_proxy_limit(&pool, 1).await;
     let ledger = Arc::new(PgVenueLedger::new(&proxied, f.tenant));
     let connections = proxy.stats().connections;
+    let pid = backend_pid(&proxied).await;
+    proxy.enable_query_trace(32);
+    let wire = proxy.stats().statements;
     let link = f.link(LegOrderKind::Sell);
     let copy = ledger.clone();
     let task = tokio::spawn(async move { copy.record_order(&record(), &link, seen(1)).await });
     wait_for_query(&pool, "UPDATE balance_legs", "PgSleep").await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
+    retired(&pool, pid).await;
+    wire_count(&ledger, &proxy, wire, 7);
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if snapshot(&pool).await == before {
@@ -605,16 +620,23 @@ async fn unresolved_admission_gains_cohort_only_when_real_entry_record_arrives(p
 async fn stalled_leg_write_is_bounded_atomic_and_pool_remains_usable(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let before = snapshot(&pool).await;
+    let (proxy, proxied) = through_proxy_limit(&pool, 1).await;
+    let ledger = PgVenueLedger::new(&proxied, f.tenant);
+    let pid = backend_pid(&proxied).await;
+    proxy.enable_query_trace(32);
+    let wire = proxy.stats().statements;
     execute(&pool,"CREATE FUNCTION stall_leg_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(10); RETURN NEW; END $$; CREATE TRIGGER stall_leg_write BEFORE UPDATE ON balance_legs FOR EACH ROW EXECUTE FUNCTION stall_leg_write()").await;
     let start = Instant::now();
     assert!(matches!(
-        f.ledger.record_order(&record(), &f.link(LegOrderKind::Sell), seen(1)).await,
+        ledger.record_order(&record(), &f.link(LegOrderKind::Sell), seen(1)).await,
         Err(LedgerError::Backend(_))
     ));
     assert!(start.elapsed() < Duration::from_millis(2500));
+    retired(&pool, pid).await;
+    wire_count(&ledger, &proxy, wire, 7);
     assert_eq!(snapshot(&pool).await, before);
     execute(&pool, "DROP TRIGGER stall_leg_write ON balance_legs").await;
-    f.ledger
+    ledger
         .record_order(&record(), &f.link(LegOrderKind::Sell), seen(2))
         .await
         .unwrap();
@@ -837,6 +859,91 @@ async fn a_partial_quote_is_not_frozen_as_a_larger_terminal_total(pool: PgPool) 
         assert_eq!(quote, None);
         let before = snapshot(&pool).await;
         assert!(!f.ledger.record_order(&r, &owned, seen(7)).await.unwrap().changed);
+        assert_eq!(snapshot(&pool).await, before);
+    }
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn locked_noop_rollback_is_counted_once_even_when_its_ack_is_lost(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    for (index, lose_ack) in [false, true].into_iter().enumerate() {
+        let mut r = record();
+        r.exchange_order_id = (200 + index).to_string();
+        r.client_order_id = format!("recheck-{index}");
+        let mut unowned = unowned();
+        unowned.client_order_id = r.client_order_id.clone();
+        f.ledger.record_order(&r, &unowned, seen(1)).await.unwrap();
+        let mut link = f.link(LegOrderKind::Sell);
+        link.client_order_id = r.client_order_id.clone();
+        let (proxy, proxied) = through_proxy_limit(&pool, 1).await;
+        let ledger = Arc::new(PgVenueLedger::new(&proxied, f.tenant));
+        let pid = backend_pid(&proxied).await;
+        proxy.enable_query_trace(32);
+        let wire = proxy.stats().statements;
+        let mut winner = pool.begin().await.unwrap();
+        sqlx::query("SELECT * FROM accounting_state WHERE tenant_id=$1 AND venue_id=$2 FOR UPDATE")
+            .bind(f.tenant)
+            .bind(VENUE)
+            .execute(&mut *winner)
+            .await
+            .unwrap();
+        if lose_ack {
+            proxy.set_mode(ProxyMode::DropRollbackAckOf("UPDATE accounting_state"));
+        }
+        let copy = ledger.clone();
+        let incoming = r.clone();
+        let owner = link.clone();
+        let task = tokio::spawn(async move { copy.record_order(&incoming, &owner, seen(2)).await });
+        wait_for_query(&pool, "UPDATE accounting_state", "transactionid").await;
+        // Force the winner between the losing writer's pre-read and locked recheck.
+        // This fixture follows the same accounting-first atomic adoption protocol;
+        // the real concurrent-writer invariants are separately randomized above.
+        let OrderOwner::Leg { intent_id, position_id, .. } = link.owner else {
+            unreachable!()
+        };
+        sqlx::query(
+            "UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id=$2",
+        )
+        .bind(f.tenant)
+        .bind(VENUE)
+        .execute(&mut *winner)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE venue_orders SET owner='leg',intent_id=$1,position_id=$2,kind='sell',last_checked_at=$3 WHERE exchange_order_id=$4").bind(intent_id).bind(position_id).bind(seen(2).at).bind(&r.exchange_order_id).execute(&mut *winner).await.unwrap();
+        sqlx::query("UPDATE balance_legs SET consumed_cum=consumed_cum+2 WHERE position_id=$1")
+            .bind(position_id)
+            .execute(&mut *winner)
+            .await
+            .unwrap();
+        winner.commit().await.unwrap();
+        let before = snapshot(&pool).await;
+        let outcome = task.await.unwrap();
+        if lose_ack {
+            assert!(matches!(outcome, Err(LedgerError::Backend(_))));
+            retired(&pool, pid).await;
+            assert_eq!(proxy.rollback_acks_dropped(), 1);
+        } else {
+            assert!(!outcome.unwrap().changed);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while proxied.num_idle() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        wire_count(&ledger, &proxy, wire, 6);
+        assert_eq!(
+            proxy
+                .query_trace()
+                .iter()
+                .filter(|sql| sql.trim().eq_ignore_ascii_case("ROLLBACK"))
+                .count(),
+            1
+        );
+        assert_eq!(snapshot(&pool).await, before);
+        assert!(!ledger.record_order(&r, &link, seen(3)).await.unwrap().changed);
         assert_eq!(snapshot(&pool).await, before);
     }
 }
