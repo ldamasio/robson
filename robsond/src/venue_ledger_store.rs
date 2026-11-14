@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::ledger_connection::LedgerConnection;
 
 mod orders;
+mod trades;
 
 const WRITE_BOUND: Duration = Duration::from_secs(2);
 

@@ -53,6 +53,11 @@ pub enum ProxyMode {
     DropRollbackAck,
     /// As above, only after a transaction executed matching SQL text.
     DropRollbackAckOf(&'static str),
+    /// Drop completion of one matching single-statement autocommit, after the
+    /// server reports CommandComplete and idle ReadyForQuery. Parse/Bind alone
+    /// do not fire it; explicit transactions and multi-statement simple
+    /// queries are excluded. Cached extended executions remain attributable.
+    DropAutocommitAckOf(&'static str),
 }
 
 /// Connection and commit counts.
@@ -73,6 +78,7 @@ struct Counters {
     commit_acks_dropped: AtomicU64,
     statements: AtomicU64,
     rollback_acks_dropped: AtomicU64,
+    autocommit_acks_dropped: AtomicU64,
 }
 
 /// Optional test SQL only: never startup/authentication or bound parameter
@@ -109,6 +115,30 @@ impl Shared {
                 ProxyMode::DropRollbackAckOf(text) if rollback => transaction.executed(text),
                 _ => false,
             };
+            if fires {
+                *mode = ProxyMode::Pass;
+            }
+            fires
+        })
+    }
+
+    fn claim_autocommit_ack_drop(
+        &self,
+        transaction: &TransactionWatch,
+        tag: u8,
+        body: &[u8],
+    ) -> bool {
+        if transaction.in_transaction || !matches!(tag, b'Q' | b'E') {
+            return false;
+        }
+        let Some(sql) = transaction.statement_text(tag, body) else {
+            return false;
+        };
+        if tag == b'Q' && sql.contains(';') {
+            return false;
+        }
+        self.mode.send_if_modified(|mode| {
+            let fires = matches!(*mode, ProxyMode::DropAutocommitAckOf(text) if sql.contains(text));
             if fires {
                 *mode = ProxyMode::Pass;
             }
@@ -232,6 +262,11 @@ impl DbProxy {
     /// The address clients connect to.
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Successful matching autocommits whose completion was swallowed.
+    pub fn autocommit_acks_dropped(&self) -> u64 {
+        self.shared.counters.autocommit_acks_dropped.load(Ordering::Relaxed)
     }
 
     /// Change the failure mode.
@@ -378,6 +413,9 @@ async fn frontend_to_backend(
         {
             commit_ack_pending.store(2, Ordering::SeqCst);
         }
+        if shared.claim_autocommit_ack_drop(&transaction, tag, &body) {
+            commit_ack_pending.store(3, Ordering::SeqCst);
+        }
         if matches!(tag, b'Q' | b'E') {
             shared.counters.statements.fetch_add(1, Ordering::Relaxed);
             shared.trace_query(|| transaction.statement_text(tag, &body));
@@ -393,16 +431,46 @@ async fn backend_to_frontend(
     shared: &Shared,
     commit_ack_pending: &AtomicU8,
 ) -> std::io::Result<()> {
+    let mut autocommit_complete: Option<Vec<u8>> = None;
     loop {
         let (tag, body) = read_message(&mut server).await?;
         let pending = commit_ack_pending.load(Ordering::SeqCst);
+        if pending == 3 {
+            // CommandComplete can precede a deferred-constraint ErrorResponse
+            // at implicit commit. Preserve that failed exchange byte-for-byte;
+            // only an error-free idle completion proves the write committed.
+            if tag == b'E' {
+                if let Some(complete) = autocommit_complete.take() {
+                    write_message(&mut client, b'C', &complete).await?;
+                }
+                commit_ack_pending.store(0, Ordering::SeqCst);
+                write_message(&mut client, tag, &body).await?;
+                continue;
+            }
+            if tag == b'C' {
+                autocommit_complete = Some(body);
+                continue;
+            }
+            if tag == b'Z' {
+                if body.first() == Some(&b'I') && autocommit_complete.is_some() {
+                    shared.counters.autocommit_acks_dropped.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                if let Some(complete) = autocommit_complete.take() {
+                    write_message(&mut client, b'C', &complete).await?;
+                }
+                commit_ack_pending.store(0, Ordering::SeqCst);
+            }
+            write_message(&mut client, tag, &body).await?;
+            continue;
+        }
         if pending != 0 {
             // The commit's reply, up to ReadyForQuery: the server has applied
             // it. Dropped, then the connection closes without an answer.
             if tag == b'Z' {
                 if pending == 1 {
                     shared.counters.commit_acks_dropped.fetch_add(1, Ordering::Relaxed);
-                } else {
+                } else if pending == 2 {
                     shared.counters.rollback_acks_dropped.fetch_add(1, Ordering::Relaxed);
                 }
                 return Ok(());
@@ -676,6 +744,112 @@ mod tests {
             assert_eq!(proxy.rollback_acks_dropped(), 1);
             assert_eq!(proxy.stats().commit_acks_dropped, 0);
             assert_eq!(proxy.mode(), ProxyMode::Pass);
+        })
+        .await;
+    }
+    #[tokio::test]
+    async fn targeted_autocommit_waits_for_execution_and_excludes_transactions() {
+        bounded(async {
+            let (upstream, mut received) = scripted_server().await;
+            let proxy = DbProxy::start(upstream).await.unwrap();
+            let mut client = connected(&proxy).await;
+            proxy.set_mode(ProxyMode::DropAutocommitAckOf("target_touch"));
+            for (tag, body) in [
+                (b'Q', b"BEGIN\0".as_slice()),
+                (b'Q', b"UPDATE target_touch SET n=1\0".as_slice()),
+                (b'Q', b"COMMIT\0".as_slice()),
+                (b'P', b"cached\0UPDATE target_touch SET n=2\0\0\0".as_slice()),
+                (b'B', b"portal\0cached\0\0\0".as_slice()),
+            ] {
+                client.write_all(&message(tag, body)).await.unwrap();
+                assert_eq!(read_reply(&mut client).await.unwrap(), (b'C', b'Z'));
+                assert_eq!(received.recv().await.unwrap(), body);
+                assert_eq!(proxy.autocommit_acks_dropped(), 0);
+                assert_eq!(proxy.mode(), ProxyMode::DropAutocommitAckOf("target_touch"));
+            }
+            client.write_all(&message(b'E', b"portal\0\0\0\0\0")).await.unwrap();
+            assert_eq!(received.recv().await.unwrap(), b"portal\0\0\0\0\0");
+            assert!(read_reply(&mut client).await.is_err());
+            assert_eq!(proxy.autocommit_acks_dropped(), 1);
+            assert_eq!(proxy.mode(), ProxyMode::Pass);
+        })
+        .await;
+    }
+
+    #[test]
+    fn autocommit_attribution_survives_cached_bind_and_ignores_multi_statement_query() {
+        let mut watch = TransactionWatch::default();
+        watch.observe(b'P', b"cached\0UPDATE target_touch SET n=2\0\0\0");
+        watch.observe(b'B', b"portal\0cached\0\0\0");
+        watch.observe(b'E', b"portal\0\0\0\0\0");
+        watch.observe(b'B', b"other\0cached\0\0\0");
+        assert_eq!(
+            watch.statement_text(b'E', b"other\0\0\0\0\0"),
+            Some("UPDATE target_touch SET n=2".into())
+        );
+        let shared = Shared {
+            upstream: "127.0.0.1:1".parse().unwrap(),
+            mode: watch::Sender::new(ProxyMode::DropAutocommitAckOf("target_touch")),
+            counters: Counters::default(),
+            trace: Mutex::default(),
+        };
+        assert!(!shared.claim_autocommit_ack_drop(
+            &watch,
+            b'Q',
+            b"BEGIN; UPDATE target_touch SET n=1\0"
+        ));
+        assert!(!shared.claim_autocommit_ack_drop(&watch, b'P', b"target_touch\0"));
+        assert!(shared.claim_autocommit_ack_drop(&watch, b'E', b"other\0\0\0\0\0"));
+        assert_eq!(*shared.mode.borrow(), ProxyMode::Pass);
+    }
+    #[tokio::test]
+    async fn failed_autocommit_is_forwarded_without_claiming_a_landed_ack() {
+        assert_failed_autocommit_is_forwarded(false).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_autocommit_error_after_command_complete_is_forwarded() {
+        assert_failed_autocommit_is_forwarded(true).await;
+    }
+
+    async fn assert_failed_autocommit_is_forwarded(command_completed: bool) {
+        bounded(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let error = message(b'E', b"SERROR\0C23514\0Mfixture failure\0\0");
+            let mut expected = if command_completed {
+                message(b'C', b"UPDATE 1\0")
+            } else {
+                vec![]
+            };
+            expected.extend(error);
+            expected.extend(message(b'Z', b"I"));
+            let reply = expected.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut startup = [0u8; 8];
+                socket.read_exact(&mut startup).await.unwrap();
+                assert_eq!(socket.read_u8().await.unwrap(), b'Q');
+                let length = socket.read_i32().await.unwrap();
+                let mut body = vec![0u8; length as usize - 4];
+                socket.read_exact(&mut body).await.unwrap();
+                assert_eq!(body, b"UPDATE target_touch SET n=2\0");
+                socket.write_all(&reply).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            });
+            let proxy = DbProxy::start(addr).await.unwrap();
+            let mut client = connected(&proxy).await;
+            proxy.set_mode(ProxyMode::DropAutocommitAckOf("target_touch"));
+            client
+                .write_all(&message(b'Q', b"UPDATE target_touch SET n=2\0"))
+                .await
+                .unwrap();
+            let mut received = vec![0u8; expected.len()];
+            let result = client.read_exact(&mut received).await;
+            assert!(result.is_ok(), "failed autocommit completion was suppressed: {result:?}");
+            assert_eq!(received, expected);
+            assert_eq!(proxy.autocommit_acks_dropped(), 0);
+            server.await.unwrap();
         })
         .await;
     }
