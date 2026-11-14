@@ -471,5 +471,28 @@ async fn a_cancelled_touch_retires_its_connection(pool: PgPool) {
     assert!(proxy.stats().connections >= 2);
 }
 
+#[test]
+fn trade_ledger_has_no_production_callers() {
+    fn visit(path: &std::path::Path) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                let production = source.split("#[cfg(test)]").next().unwrap();
+                for method in [".record_trades(", ".touch_checked("] {
+                    assert!(
+                        !production.contains(method),
+                        "trade ledger activated in {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+    visit(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+}
+
 #[path = "venue_ledger_trades/generated.rs"]
 mod generated;
