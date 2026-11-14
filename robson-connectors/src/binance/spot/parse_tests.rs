@@ -366,22 +366,35 @@ fn commission_rates_parse_as_documented() {
     let commission = parse_commission(COMMISSION, "BTCUSDT").unwrap();
     let standard = &commission.standard;
     assert_eq!(
-        (standard.maker, standard.taker, standard.buyer, standard.seller),
+        (
+            standard.maker.value(),
+            standard.taker.value(),
+            standard.buyer.value(),
+            standard.seller.value()
+        ),
         (dec!(0.00000010), dec!(0.00000020), dec!(0.00000030), dec!(0.00000040))
     );
     let special = &commission.special;
     assert_eq!(
-        (special.maker, special.taker, special.buyer, special.seller),
+        (
+            special.maker.value(),
+            special.taker.value(),
+            special.buyer.value(),
+            special.seller.value()
+        ),
         (dec!(0.01), dec!(0.02), dec!(0.03), dec!(0.04))
     );
     let tax = &commission.tax;
     assert_eq!(
-        (tax.maker, tax.taker, tax.buyer, tax.seller),
+        (tax.maker.value(), tax.taker.value(), tax.buyer.value(), tax.seller.value()),
         (dec!(0.00000112), dec!(0.00000114), dec!(0.00000118), dec!(0.00000116))
     );
     let discount = &commission.discount;
     assert!(discount.enabled_for_account && discount.enabled_for_symbol);
-    assert_eq!((discount.discount_asset.as_str(), discount.discount), ("BNB", dec!(0.75)));
+    assert_eq!(
+        (discount.discount_asset.as_str(), discount.discount.value()),
+        ("BNB", dec!(0.75))
+    );
 
     assert!(matches!(
         parse_commission(COMMISSION, "ETHUSDT"),

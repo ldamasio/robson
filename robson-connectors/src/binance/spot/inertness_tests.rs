@@ -257,8 +257,13 @@ fn robson_exec_imports(code: &str) -> Option<Vec<String>> {
             return Some(vec![helper.to_string()]);
         }
     }
-    let at = code.find("use robson_exec::{")?;
-    let body = &code[at + "use robson_exec::{".len()..];
+    let (marker, prefix) = if code.contains("use robson_exec::balance_costs::{") {
+        ("use robson_exec::balance_costs::{", "balance_costs::")
+    } else {
+        ("use robson_exec::{", "")
+    };
+    let at = code.find(marker)?;
+    let body = &code[at + marker.len()..];
     let mut depth = 1;
     let close = body.char_indices().find_map(|(at, c)| {
         match c {
@@ -269,7 +274,7 @@ fn robson_exec_imports(code: &str) -> Option<Vec<String>> {
         (depth == 0).then_some(at)
     })?;
     let mut items = Vec::new();
-    flatten_group(&body[..close], "", &mut items);
+    flatten_group(&body[..close], prefix, &mut items);
     items.sort();
     Some(items)
 }
@@ -312,16 +317,22 @@ fn port_contract_violations(file: &str, code: &str) -> Vec<String> {
         .count();
     // 8g's bounded pure scalar parser is not a port or an activation seam.
     // Allow only these exact helper imports, only in their input boundaries.
-    let pure = match file {
-        "records.rs" | "rest.rs" | "rules.rs" => Some("balance_costs::exact"),
-        "market_data.rs" | "ohlcv.rs" => Some("balance_costs::exact::ExactDecimal"),
-        _ => None,
+    let pure: &[&str] = match file {
+        "records.rs" | "rest.rs" | "rules.rs" => &["balance_costs::exact"],
+        "market_data.rs" | "ohlcv.rs" => &["balance_costs::exact::ExactDecimal"],
+        "costs.rs" => &[
+            "balance_costs::CommissionComponents",
+            "balance_costs::CostCandidate",
+            "balance_costs::CostError",
+            "balance_costs::CostIdentity",
+        ],
+        _ => &[],
     };
     let imported = robson_exec_imports(code);
     let ports = imported.as_ref().map(|items| {
         items
             .iter()
-            .filter(|item| Some(item.as_str()) != pure)
+            .filter(|item| !pure.contains(&item.as_str()))
             .cloned()
             .collect::<Vec<_>>()
     });
@@ -603,6 +614,24 @@ fn exact_scalar_imports_do_not_open_any_extra_port_or_runtime_path() {
     assert!(
         !port_contract_violations("cache.rs", "use robson_exec::balance_costs::exact;").is_empty()
     );
+}
+
+#[test]
+fn pure_cost_handoff_imports_cannot_import_a_runtime_port() {
+    let pure = "use robson_exec::balance_costs::{CommissionComponents, CostCandidate, CostError, CostIdentity};";
+    assert!(port_contract_violations("costs.rs", pure).is_empty());
+    for wrong in [
+        "use robson_exec::balance_costs::*;",
+        "use robson_exec::{balance_costs::CostCandidate, AccountPort};",
+    ] {
+        assert!(!port_contract_violations("costs.rs", wrong).is_empty());
+    }
+    assert!(!port_contract_violations("cache.rs", pure).is_empty());
+    assert!(!port_contract_violations(
+        "costs.rs",
+        &format!("{pure} fn f(_: &dyn TradingPort) {{}}")
+    )
+    .is_empty());
 }
 
 #[test]
