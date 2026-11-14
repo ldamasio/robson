@@ -400,7 +400,12 @@ async fn blackholed_preread_is_bounded_and_connections_are_retired(pool: PgPool)
     proxy.set_mode(ProxyMode::Blackhole);
     let start = Instant::now();
     assert!(matches!(
-        ledger.record_order(&record(), &unowned(), seen(1)).await,
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            ledger.record_order(&record(), &unowned(), seen(1))
+        )
+        .await
+        .expect("outer ledger deadline must resolve a blackholed read"),
         Err(LedgerError::Backend(_))
     ));
     assert!(start.elapsed() < Duration::from_secs(3));
@@ -719,4 +724,42 @@ async fn randomized_concurrent_evidence_conserves_the_single_leg_contribution(po
         assert!(!f.ledger.record_order(&base, &link, seen(9)).await.unwrap().changed);
         assert_eq!(snapshot(&pool).await, before);
     }
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn adoption_with_a_lost_ack_converges_without_consuming_twice(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let r = record();
+    f.ledger.record_order(&r, &unowned(), seen(1)).await.unwrap();
+    let link = f.link(LegOrderKind::Sell);
+    let version = f.version(&pool).await;
+    let (proxy, proxied) = through_proxy(&pool).await;
+    let ledger = PgVenueLedger::new(&proxied, f.tenant);
+    proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE balance_legs"));
+    assert!(matches!(
+        ledger.record_order(&r, &link, seen(2)).await,
+        Err(LedgerError::Uncertain(_))
+    ));
+    assert_eq!(f.consumed(&pool).await, Decimal::from(2));
+    assert_eq!(f.version(&pool).await, version + 1);
+    let before = snapshot(&pool).await;
+    assert!(!ledger.record_order(&r, &link, seen(3)).await.unwrap().changed);
+    assert_eq!(snapshot(&pool).await, before);
+    assert_eq!(proxy.stats().commit_acks_dropped, 1);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn an_executed_entry_never_consumes_the_leg_inventory(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let mut r = record();
+    r.side = OrderSide::Buy;
+    let link = f.link(LegOrderKind::Entry);
+    f.ledger.record_order(&r, &link, seen(1)).await.unwrap();
+    assert_eq!(f.consumed(&pool).await, Decimal::ZERO);
+    r.executed_qty = Decimal::from(3);
+    r.cumulative_quote_qty = Some(Decimal::from(300));
+    f.ledger.record_order(&r, &link, seen(2)).await.unwrap();
+    assert_eq!(f.consumed(&pool).await, Decimal::ZERO);
 }
