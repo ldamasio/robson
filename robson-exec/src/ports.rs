@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::ExecError,
-    venue::{OrderLookup, VenueOrderRecord},
+    venue::{AccountPort, OrderLookup, VenueOrderRecord},
 };
 
 // =============================================================================
@@ -104,7 +104,7 @@ pub struct Transfer {
 /// - `StubExchange` - For testing (immediate fills at configured price)
 /// - `BinanceExchangeAdapter` - Real Binance USD-M Futures
 #[async_trait]
-pub trait ExchangePort: Send + Sync {
+pub trait ExchangePort: AccountPort + Send + Sync {
     /// Validate account is in One-way position mode with expected leverage.
     ///
     /// **SAFETY CHECK**: Must be called before placing any order.

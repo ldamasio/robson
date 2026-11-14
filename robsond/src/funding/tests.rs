@@ -126,6 +126,31 @@ fn configured_exchange() -> Arc<StubExchange> {
 }
 
 #[async_trait]
+impl robson_exec::venue::AccountPort for PostConvertedCrashExchange {
+    async fn cash(&self, asset: &str) -> Result<robson_exec::venue::Cash, ExecError> {
+        robson_exec::venue::AccountPort::cash(self.inner.as_ref(), asset).await
+    }
+    async fn valuation(&self, symbol: &Symbol) -> Result<robson_exec::venue::Mark, ExecError> {
+        robson_exec::venue::AccountPort::valuation(self.inner.as_ref(), symbol).await
+    }
+    async fn execution_costs(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<robson_exec::venue::ExecutionCostEnvelope, ExecError> {
+        robson_exec::venue::AccountPort::execution_costs(self.inner.as_ref(), symbol).await
+    }
+    fn capabilities(&self) -> robson_exec::venue::VenueCapabilities {
+        robson_exec::venue::AccountPort::capabilities(self.inner.as_ref())
+    }
+}
+
+#[tokio::test]
+async fn post_converted_crash_exchange_forwards_canonical_account_port() {
+    let exchange = PostConvertedCrashExchange::new(Arc::new(StubExchange::new(dec!(123))));
+    crate::capability::assert_account_forwarding(&exchange, exchange.inner.as_ref()).await;
+}
+
+#[async_trait]
 impl ExchangePort for PostConvertedCrashExchange {
     async fn validate_futures_settings(
         &self,

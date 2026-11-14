@@ -27,17 +27,46 @@ use crate::{
 };
 
 struct TimeoutExchange {
+    account: robson_exec::StubExchange,
     attempts: AtomicUsize,
 }
 
 impl TimeoutExchange {
     fn new() -> Self {
-        Self { attempts: AtomicUsize::new(0) }
+        let account = robson_exec::StubExchange::new(dec!(100));
+        account.set_futures_balance(dec!(10000));
+        Self { account, attempts: AtomicUsize::new(0) }
     }
 
     fn attempts(&self) -> usize {
         self.attempts.load(Ordering::SeqCst)
     }
+}
+
+#[async_trait]
+impl robson_exec::venue::AccountPort for TimeoutExchange {
+    async fn cash(&self, asset: &str) -> Result<robson_exec::venue::Cash, ExecError> {
+        robson_exec::venue::AccountPort::cash(&self.account, asset).await
+    }
+    async fn valuation(&self, symbol: &Symbol) -> Result<robson_exec::venue::Mark, ExecError> {
+        robson_exec::venue::AccountPort::valuation(&self.account, symbol).await
+    }
+    async fn execution_costs(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<robson_exec::venue::ExecutionCostEnvelope, ExecError> {
+        robson_exec::venue::AccountPort::execution_costs(&self.account, symbol).await
+    }
+    fn capabilities(&self) -> robson_exec::venue::VenueCapabilities {
+        robson_exec::venue::AccountPort::capabilities(&self.account)
+    }
+}
+
+#[tokio::test]
+async fn timeout_exchange_forwards_canonical_account_port() {
+    let exchange = TimeoutExchange::new();
+    crate::capability::assert_account_forwarding(&exchange, &exchange.account).await;
+    assert_eq!(exchange.attempts(), 0);
 }
 
 #[async_trait]
