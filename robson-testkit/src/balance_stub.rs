@@ -111,7 +111,13 @@ pub struct BalanceStub {
     page_limit: AtomicUsize,
     /// Trade pages served, each one request on the adapter.
     pages_read: AtomicU64,
+    /// Run once, as the next placement reaches the book, before it acts.
+    next_placement: Mutex<Option<PlacementHook>>,
 }
+
+/// What the market or the account does as a placement reaches the venue
+/// (8d plan §2.4, `on_next_send`).
+pub type PlacementHook = Box<dyn FnOnce(&SpotBook) + Send>;
 
 /// Which answer a record comes from: each carries the times the venue's
 /// does.
@@ -349,6 +355,7 @@ impl BalanceStub {
             rules: Mutex::new(HashMap::new()),
             page_limit: AtomicUsize::new(TRADES_PAGE_LIMIT),
             pages_read: AtomicU64::new(0),
+            next_placement: Mutex::new(None),
         }
     }
 
@@ -363,6 +370,13 @@ impl BalanceStub {
     /// Placements that reached the book.
     pub fn sends(&self) -> u64 {
         self.sends.load(Ordering::SeqCst)
+    }
+
+    /// Run `hook` once, as the next placement passes the gate and before the
+    /// book acts on it: what a conformance scenario uses for an event that
+    /// lands between a cancel and its successor (a partial flatten).
+    pub fn on_next_placement(&self, hook: PlacementHook) {
+        *self.next_placement.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
     }
 
     /// Trade pages served, by `order_trades_page` and the composites.
@@ -420,6 +434,10 @@ impl BalanceStub {
             .submit(client_order_id, is_final_rejection, async {
                 self.mutate("POST /api/v3/order")?;
                 self.sends.fetch_add(1, Ordering::SeqCst);
+                let hook = self.next_placement.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(hook) = hook {
+                    hook(&self.book);
+                }
                 place().map_err(placement_error).and_then(read)
             })
             .await
