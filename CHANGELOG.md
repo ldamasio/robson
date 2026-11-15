@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Release identity - v2.6 development transition
+
+- Prepare `2.6.0-alpha.1` consistently in workspace Cargo metadata, the 12 local Cargo.lock packages and the frontend package; external dependencies and pnpm resolution remain unchanged. No alpha build, tag or release is claimed.
+- Add a stdlib-only SemVer/package/tag checker and validation-only CI. `2.5.x` remains compatible maintenance; transition work follows alpha → beta → rc → `2.6.0`.
+- Correct the historical changelog attribution and archive the original GitHub release notes. Release ID `319957573` was reassociated with the existing semantic tag and verified on 2026-11-15 at 19:31:17 UTC, preserving its original publication timestamp and archived notes; no tag movement, historical retest or production acceptance is implied.
+
+### Documentation - Public v2.6 Spot-first roadmap
+
+- Clarify Robson's execution/risk identity and the transition from the v2.5 Futures path to the v2.6 Binance Spot LONG-only target. Spot is not ready for real capital and activation remains reserved to the operator after acceptance gates.
+- Add [ROADMAP.md](ROADMAP.md) with merged-component evidence, pending integration/protection/accounting gates, and future multi-exchange direction. Add [release policy](docs/RELEASING.md) defining development source snapshots and explaining historical release/tag and inherited package-version distinctions. Historical internal `v3` identifiers remain unchanged; the transition metadata below changes package versions without changing runtime source or creating release artifacts.
+
 ### Fixed - The UNTRACKED close no longer sells a live entry's fill (ADR-0056 step 7, PR O, part 2)
 
 - The reconciliation worker classified a position as UNTRACKED when no `Entering`, `Active` or `Exiting` leg tracked its symbol
@@ -413,9 +424,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boundary; it deliberately does not claim that every best-effort maintenance
   substep succeeded.
 
-## [2.5.0] - 2026-08-23
+### Historical post-tag development — unreleased attribution
 
-### Changed - v2.5 release baseline
+The entries below were previously grouped under `2.5.0` dated 2026-08-23. They postdate the verified May tag and remain development records, not contents of that release. Their original descriptions and dates are retained.
+
+### Development - version alignment recorded on 2026-08-23
 
 - Aligned every Rust workspace crate and the SvelteKit frontend package on
   version `2.5.0`.
@@ -531,6 +544,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the live developer and deployment docs to match the current layout.
 - Updated the pull request template and frontend deployment runbook to
   reference the current Rust + SvelteKit + `rbx-infra` structure.
+
+## [2.5.0] - 2026-05-09
+
+### Verified source baseline and release metadata correction
+
+- Product tag `v2.5.0` points to `5c7b39c59b112726516cbda042dcf323dc31d48c`, the [PR #59](https://github.com/ldamasio/robson/pull/59) I3 reconciliation merge for Robson-Active positions missing on the exchange. The Rust subworkspace at that tag used `2.0.0-alpha`; product and package version identities were distinct.
+- GitHub release ID `319957573` had the correct title but the wrong `Latest` tag/2023 source. The corrected [release association](https://github.com/ldamasio/robson/releases/tag/v2.5.0) was verified on 2026-11-15 at 19:31:17 UTC without moving tags or changing the original publication timestamp. [Original notes are archived](docs/releases/archive/v2.5.0-original-github-release.md) and attached to the corrected release. This records source identity, not a rebuild, retest or new production-readiness assertion.
+
+## Earlier historical development records
+
+The following entries retain their original dates and wording. They are historical records, not newly performed validation or a retrospective release manifest.
 
 ### Fixed - v2 CI/CD Pipeline (2026-04-14)
 

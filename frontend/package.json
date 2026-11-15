@@ -1,6 +1,6 @@
 {
   "name": "@robson/frontend-v2",
-  "version": "2.5.0",
+  "version": "2.6.0-alpha.1",
   "private": true,
   "type": "module",
   "engines": {
