@@ -34,7 +34,16 @@ flowchart TD
 4. Complete integrated database/conformance tests and failure/recovery checks, then the documented observation, cutover and compatible rollback procedures. Component tests alone do not satisfy these gates.
 5. Obtain the operator's explicit activation authorization for the selected account and release candidate. Documentation, merges and version labels do not authorize orders or capital allocation.
 
-Initial staged acceptance (T1–T5) precedes expansion. T6 expansion comes only after T1–T5 and the first month boundary after T1; it is not a prerequisite for the first operation and is not authorized by this roadmap.
+The initial acceptance sequence uses these public identifiers:
+
+- **T1 — Authorized pilot:** execute the first pilot Spot operation under explicit operator authorization.
+- **T2 — Fill and dust accounting:** check actual fills, the planned protected quantity, entry dust and its ledger row.
+- **T3 — Protection evidence:** check the stop's own accepted record and confirm that locked inventory matches the governed quantity.
+- **T4 — Operational checks:** confirm clear health indicators, venue eligibility, reconciled cash and no settlement hold.
+- **T5 — Governed close:** close through `DELETE /positions/{id}` and the exit transition; verify liquidation, accounting against the cash change, and cancellation of the protective stop.
+- **T6 — Reserved expansion:** raise the operating cap only after independent review of T1–T5 and a completed snapshot of the first month boundary after T1, with the reserved operator decision.
+
+T6 is not a prerequisite for the first operation and is not authorized by this roadmap. The month-boundary wait starts at the authorized T1 pilot; technical release publication is separate from these operational checks.
 
 ## Risk and control commitments
 
