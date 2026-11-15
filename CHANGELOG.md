@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation - Public v2.6 Spot-first roadmap
+
+- Clarify Robson's execution/risk identity and the transition from the v2.5 Futures path to the v2.6 Binance Spot LONG-only target. Spot is not ready for real capital and activation remains reserved to the operator after acceptance gates.
+- Add [ROADMAP.md](ROADMAP.md) with merged-component evidence, pending integration/protection/accounting gates, and future multi-exchange direction. Add [release policy](docs/RELEASING.md) defining development source snapshots and explaining historical release/tag and inherited package-version distinctions. Historical internal `v3` identifiers remain unchanged; no package versions, runtime behavior or release artifacts change here.
+
 ### Fixed - The UNTRACKED close no longer sells a live entry's fill (ADR-0056 step 7, PR O, part 2)
 
 - The reconciliation worker classified a position as UNTRACKED when no `Entering`, `Active` or `Exiting` leg tracked its symbol
