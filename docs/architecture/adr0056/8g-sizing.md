@@ -229,3 +229,28 @@ The code retains no cache/listener/task/queue; all BigUint work is transient and
 bounded. Cancellation has no durable effect. No live production memory-profile
 claim is made for an inert calculator. Whole-workspace/security/CI and future
 caller memory/atomicity acceptance remain required before activation.
+
+## Candidate journal payload (8g2c-1)
+
+`candidate_admission` copies the existing18-field AdmissionRow from an immutable
+SizingCalculation. It checks non-nil position, exact configured symbol and the
+original basis month. These are data checks, not governed-action authentication.
+The selected nested lot step is retained at successful sizing and copied without
+rerunning geometry. Original fee/gap/margin/rules, source/note/as_of/terms hash,
+S/Q/reference price/Rhat/charge/initial trigger remain exact. It never reads a
+clock, later fee cache, current config or alternate rules. The terms hash is
+encoded as64 lowercase hex characters; source and symbol remain bounded.
+
+The calculation is immutable; AdmissionRow remains existing public mutable data.
+Later8i must compare/rebuild the exact payload and requestedQ before strictJ.
+Intent/venue/scope/tenant/time still belong to J/backend. No row conversion
+creates a receipt, certified basis, capacity reservation or send authorization.
+All18 copies require0 new financial arithmetic,0 SQL/RI/HTTP/await/locks/tasks;
+hash encoding visits exactly32 bytes. A crash loses only transient values.
+
+Capacity2c-2 remains deferred until a real complete producer exists. This slice
+adds no count API, reconciliation, initialX, latent-risk or runtime caller.
+Actual8h2/8l/V_filter qualification, complete capacity deduplication and unknown
+retention, serialized reservation, persistence/restart and send equality remain
+separate acceptance. Existing USD-M and SD12/factory behavior is unchanged.
+Tests establish field copying and source immutability, not those later guarantees.

@@ -162,11 +162,22 @@ pub struct SizedAmounts {
 /// ```
 #[derive(Debug, Clone)]
 pub struct SizingCalculation {
+    pub(super) selected_lot_step: Decimal,
     pub(super) amounts: SizedAmounts,
     pub(super) inputs: SizingInputs,
     pub(super) attempts: u8,
 }
 impl SizingCalculation {
+    /// Effective nested lot step actually used by the calculation.
+    /// ```compile_fail
+    /// use robson_exec::balance_sizing::SizingCalculation;
+    /// fn overwrite_step(mut result: SizingCalculation) {
+    ///     result.selected_lot_step = Default::default();
+    /// }
+    /// ```
+    pub fn selected_lot_step(&self) -> Decimal {
+        self.selected_lot_step
+    }
     pub fn amounts(&self) -> &SizedAmounts {
         &self.amounts
     }

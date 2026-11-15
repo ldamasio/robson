@@ -17,4 +17,4 @@ pub use terms::{
 mod tests;
 
 #[cfg(test)]
-pub(crate) use tests::sizing_terms;
+pub(crate) use tests::{sizing_terms, sizing_terms_with_provenance};

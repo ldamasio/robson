@@ -177,6 +177,7 @@ pub fn calculate_balance_candidate(i: &SizingInputs) -> Result<SizingCalculation
         match candidate(i, &p, k, &mut terminal) {
             Ok(amounts) => {
                 return Ok(SizingCalculation {
+                    selected_lot_step: p.lot.step,
                     amounts,
                     inputs: i.clone(),
                     attempts: k + 1,
