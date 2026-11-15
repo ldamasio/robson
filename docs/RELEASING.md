@@ -38,7 +38,7 @@ python3 scripts/check-release-identity.py --tag v2.6.0-alpha.1
 python3 -m unittest discover -s scripts/tests -p test_release_identity.py
 ```
 
-It checks strict [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html), workspace/local lock/frontend agreement and, when supplied, the exact `v`-prefixed tag. Numeric identifiers cannot have leading zeroes: `2.5.014` is invalid while `2.5.14` is valid. The pnpm lock records dependency resolution but has no project-version field; it is not rewritten for this version change.
+It checks strict [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html), workspace/local lock/frontend agreement and, when supplied, the exact `v`-prefixed tag. Core numbers and numeric prerelease identifiers cannot have leading zeroes: `2.5.014` is invalid while `2.5.14` is valid. Build metadata permits them, for example `2.6.0-alpha.1+001`. The pnpm lock records dependency resolution but has no project-version field; it is not rewritten for this version change.
 
 The `Release Identity` workflow validates pull requests, main and version tags with read-only repository permissions. It publishes no release or image and triggers no deployment itself; existing promotion workflows are unchanged. A version label identifies source, not a tested artifact or permission to use capital. Publish only the reviewed candidate's exact source, not an earlier head.
 

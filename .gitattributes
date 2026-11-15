@@ -21,3 +21,7 @@
 *.pdf      binary
 *.db       binary
 *.bin      binary
+
+# Keep the original historical release CRLF body and final EOF bytes reproducible.
+# Whitespace checks are disabled only for this immutable audit artifact.
+docs/releases/archive/v2.5.0-original-github-release.md -text -whitespace

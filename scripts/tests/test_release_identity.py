@@ -34,6 +34,15 @@ class ReleaseIdentityTests(unittest.TestCase):
             with self.subTest(version=version), self.assertRaises(ValueError):
                 CHECK.require_semver(version)
 
+    def test_build_metadata_allows_leading_zeroes(self):
+        version = "2.6.0-alpha.1+001"
+        self.assertEqual(CHECK.require_semver(version), version)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root, version)
+            self.assertEqual(CHECK.check_release_identity(root, "v" + version),
+                             (version, 1))
+
     def test_alpha_identity_and_tag(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
