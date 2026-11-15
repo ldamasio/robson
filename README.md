@@ -12,6 +12,12 @@ Robson is concerned with what happens **after** a trading decision is made: posi
 
 The system provides a single-operator runtime with budget-metered entry capacity, deterministic execution semantics, and lifecycle audit records. Slots express remaining risk capacity rather than a fixed position-count limit.
 
+## Release identity
+
+The current development candidate is **`2.6.0-alpha.1`**, aligned across Rust workspace metadata, local lock entries and the frontend. No prerelease or alpha binary is published by this source change. Progress follows alpha → beta → rc → `2.6.0`; `2.5.x` is compatible maintenance only.
+
+The historical [`v2.5.0` source](https://github.com/ldamasio/robson/tree/v2.5.0) is the 2026-05-09 [I3 reconciliation merge](https://github.com/ldamasio/robson/pull/59), not the later July/August development entries. See the [correction record and original notes](docs/RELEASING.md#read-version-labels-carefully). Release identity does not establish operational readiness or authorize capital.
+
 ## Risk Model at a Glance
 
 - **Monthly budget**: 4% of `capital_base`, with consumption governed by the month's persisted budget model. [ADR-0051](docs/adr/ADR-0051-net-from-start-monthly-budget.md) defines the net-from-start model; historical HWM months retain their recorded model. Open-position risk remains reserved against the budget

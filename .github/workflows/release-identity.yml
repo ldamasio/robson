@@ -1,0 +1,30 @@
+name: Release Identity
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Release Identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Test version mismatch guards
+        run: python3 -m unittest discover -s scripts/tests -p test_release_identity.py
+      - name: Validate package and lock identity
+        run: python3 scripts/check-release-identity.py
+      - name: Validate release tag identity
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/check-release-identity.py --tag "$RELEASE_TAG"
