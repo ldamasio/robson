@@ -2072,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "robson-cli"
-version = "2.6.0-alpha.1"
+version = "2.6.0-alpha.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "robson-connectors"
-version = "2.6.0-alpha.1"
+version = "2.6.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2117,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "robson-db"
-version = "2.6.0-alpha.1"
+version = "2.6.0-alpha.2"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -2129,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "robson-domain"
-version = "2.6.0-alpha.1"
+version = "2.6.0-alpha.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "robson-engine"
-version = "2.6.0-alpha.1"
+version = "2.6.0-alpha.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "robson-eventlog"
-version = "2.6.0-alpha.1"
+version = "2.6.0-alpha.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2182,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "robson-exec"
-version = "2.6.0-alpha.1"
+version = "2.6.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2203,7 +2203,7 @@ dependencies = [
 
 [[package]]
 name = "robson-projector"
-version = "2.6.0-alpha.1"
+version = "2.6.0-alpha.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2224,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "robson-sim"
-version = "2.6.0-alpha.1"
+version = "2.6.0-alpha.2"
 dependencies = [
  "anyhow",
  "robson-domain",
@@ -2238,7 +2238,7 @@ dependencies = [
 
 [[package]]
 name = "robson-store"
-version = "2.6.0-alpha.1"
+version = "2.6.0-alpha.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2262,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "robson-testkit"
-version = "2.6.0-alpha.1"
+version = "2.6.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2285,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "robsond"
-version = "2.6.0-alpha.1"
+version = "2.6.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-stream",

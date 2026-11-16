@@ -233,6 +233,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// The streams `persist_event_to_log` writes: their locks and which ones
     /// refuse appends (ADR-0056 step 7, PR P).
     event_streams: EventStreams,
+    #[cfg(test)]
+    risk_inventory_pause: std::sync::Mutex<Option<Arc<crate::reconciliation_worker::TestPause>>>,
     /// Optional postgres pool for persisting domain events to robson-eventlog.
     #[cfg(feature = "postgres")]
     event_log_pool: Option<PgPool>,
@@ -508,6 +510,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// already committed in the order/execution pipeline even before fill.
     pub(crate) async fn live_risk_open_positions(&self) -> DaemonResult<Vec<Position>> {
         let open_positions = self.store.positions().find_risk_open().await?;
+        #[cfg(test)]
+        {
+            let pause = self.risk_inventory_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
         let exchange_positions = match self.exchange_open_positions().await {
             Ok(positions) => Some(positions),
             Err(error) => {
@@ -532,6 +542,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 .collect(),
             None => open_positions,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pause_before_inventory(
+        &self,
+    ) -> Arc<crate::reconciliation_worker::TestPause> {
+        let pause = Arc::new(crate::reconciliation_worker::TestPause::default());
+        *self.risk_inventory_pause.lock().unwrap() = Some(pause.clone());
+        pause
     }
 
     /// Update the engine's capital from an external source (exchange balance).
@@ -1065,6 +1084,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             shadow_slots_last: Mutex::new(None),
             latent_risk_warning_positions: RwLock::new(HashSet::new()),
             event_streams: EventStreams::default(),
+            #[cfg(test)]
+            risk_inventory_pause: std::sync::Mutex::new(None),
             #[cfg(feature = "postgres")]
             event_log_pool: None,
             #[cfg(feature = "postgres")]

@@ -1,8 +1,10 @@
 # ADR-0045 — Income-Ledger Reconciliation; Drift Demoted to Checksum
 
 **Date**: 2026-07-05
-**Status**: Decided (fully shipped — hotfix, reconciliation-anchor fix, and
-the typed income ledger); partially superseded by
+**Status**: DECIDED — the source correction removes the legacy position-scan
+basis writer. The independent financial enforcement requirements below remain
+mandatory; this scoped repair is not complete financial or Spot capital acceptance.
+Partially superseded by
 [ADR-0051](ADR-0051-net-from-start-monthly-budget.md): confirmed transfers no
 longer increase the monthly budget basis intra-month, and stale or unavailable
 authoritative accounting fails new-entry admission closed after its freshness
@@ -198,8 +200,9 @@ promise.
 
 ## Amendment (2026-07-07) — §1 typed income ledger implemented
 
-The remaining piece — item-typed reconciliation itself — shipped. New
-`IncomePort` trait (`robson-exec/src/ports.rs`), deliberately separate from
+The item-typed income-ledger worker shipped. This does not establish that every
+automatic capital-base writer was aligned; see the implementation exception below.
+New `IncomePort` trait (`robson-exec/src/ports.rs`), deliberately separate from
 `ExchangePort` rather than another flat method on it: `income_ledger.rs`'s
 worker is a money-adjacent reconciliation surface that should be
 structurally unable to place or cancel orders, and this is the contract
@@ -216,14 +219,47 @@ robsond-authored action); this is the **first-ever attribution of Binance
 perpetual funding-rate payments anywhere in robson** — a real, small,
 previously-invisible cost (confirmed live 2026-07-07: an open BTCUSDT
 position had already paid two funding charges, ~0.056 USDT, entirely
-unaccounted for before this change). `TRANSFER` is the only category that
-may auto-recalibrate `capital_base`, and only when it explains the wallet
+unaccounted for before this change). In this worker, `TRANSFER` is the only
+category eligible to auto-recalibrate `capital_base`, and only when it explains the wallet
 delta 100% with zero other unmatched items in the same window
 (`income_ledger::transfer_explains_delta`).
 `reconciliation_worker::recalibrate_capital_base_after_pure_financial_drift`
 no longer writes `capital_base` for the generic case — it alarms only; the
 `in_flight_count` guard from the 2026-07-05 hotfix stays as defense in
 depth.
+
+**Source correction — scope and remaining requirements (2026-11-16).** The isolated change
+removes `reconciliation_worker::recalibrate_capital_base_after_manual_drift` and
+its exclusively used wallet-total writer/risk helper. Every otherwise-successful
+position scan now reaches the existing guarded checksum, which can alarm or skip
+an ambiguous book but cannot author a basis adjustment. Position close evidence
+explains that close, not an unrelated positive or negative wallet residual.
+The preceding protection, journal, close-persistence failure and scan error paths
+retain their ownership; a later checksum error does not undo a completed close.
+This is a scoped source correction, not a claim of deployment or complete
+accounting enforcement. Applicable exact-source release evidence is recorded
+separately; accepting this repair does not discharge the dependencies below.
+
+The prior writer could absorb a negative residual without typed attribution.
+Its removal does not make independent income-worker checks atomic: per-call
+checks against previously loaded state still do not compare-and-set the current
+persisted basis. The static interleaving of decreases checked against one old
+basis can restore a higher basis after the lower one lands. This remains an
+implementation dependency, not a reported runtime incident or policy exception.
+
+**Additional current financial dependencies.** `transfer_explains_delta` re-sums
+matched TRANSFER rows since month start without a consumption marker or cursor;
+a matching aggregate is not independent, single-use evidence for every
+recalibration. Atomic current-state validation/serialization and transfer
+attribution that cannot be reused require correction and final-invariant
+property verification before Spot capital acceptance. Funding rows are marked
+matched, but `expected_wallet_balance` currently uses the basis plus governed
+closed-position net P&L/fees, not funding. Funding recognition is not complete
+wallet-accounting integration. Exact trade/amount/asset linkage, durable absence
+and freshness evidence, status errors distinct from clean zero, and applicable
+Spot settlement/reservations/month-boundary carry also remain required. These
+limits qualify the historical worker implementation descriptions; checks alone
+establish no universal ledger safety.
 
 **Known, disclosed matching limitation.** Binance's income items carry a
 `tradeId`/`tranId` linkage for `REALIZED_PNL`/`COMMISSION`, but robson does
@@ -235,6 +271,11 @@ unmatched and alarm, mirroring `gather_user_trade_evidence`'s discipline),
 but coarser than the exchange's own linkage. The raw `trade_id`/`tran_id` is
 preserved on every ledger row regardless, so a future, more precise matcher
 can use it without re-ingesting history.
+
+Current implementation-status qualification (2026-11-15): leaving ambiguous
+candidates unmatched is an implemented refusal rule, not proof of exact linkage,
+settlement completeness or safety of every unique candidate. The limitations
+and financial dependencies above remain acceptance work.
 
 ## Amendment (2026-08-02) - deduplicated alarms and auditable acknowledgement
 

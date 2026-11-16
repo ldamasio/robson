@@ -317,9 +317,25 @@ Startup `auto_reconcile` is implemented and production configuration was
 read-only verified as enabled on 2026-08-06. The invariant still requires real
 exchange evidence and no partial close.
 
-Current source does not preserve the documented exit-78 behavior when evidence
-gathering returns no unambiguous match. It logs a warning and continues startup
-so periodic reconciliation may resolve the stale position. In addition, Phase 2
-persists closes sequentially without a transaction spanning the batch, so a
-later apply failure cannot roll back an earlier close. These are open policy
-drifts, not approved relaxations of the invariant.
+Historical implementation observation, superseded for the missing-evidence
+branch by the 2026-11-16 source correction below: at that time, evidence
+gathering with no unambiguous match logged a warning and continued startup
+instead of preserving the documented exit-78 behavior. Phase 2 also applied
+closes sequentially without a transaction spanning the batch. Neither drift
+was an approved relaxation of the invariant.
+
+### 2026-11-16: missing-evidence refusal corrected in repository source
+
+`run_startup_auto_reconcile` now returns `StartupStaleActiveDetected` when any
+stale-Active position lacks unambiguous real evidence, before entering Phase 2.
+The existing startup error mapping is exit 78. The first phase remains
+read-only; this correction does not authorize partial closes, synthesized
+`Estimated` evidence, or a change to the manual recovery evidence requirements.
+
+This records a repository source correction, not deployment or completed
+operational validation. Phase 2 remains sequential: a later failure cannot roll
+back an earlier persisted close, and a locally closed position under fencing
+is not proof of a durable terminal event. Batch atomicity remains an open
+requirement in TD-2026-08-06-002; the missing-evidence correction and outstanding
+operational validation are tracked in TD-2026-08-06-001 of the
+[technical debt register](../technical-debt.md).

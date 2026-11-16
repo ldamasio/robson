@@ -7,9 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Current financial implementation limits - 2026-11-16
+
+The no-expansion rule is normative, not an atomic persisted-state guarantee in
+the current recalibrators. Single-use transfer attribution and funding
+wallet-accounting integration remain pending. The scan residual writer is
+removed; that narrow repair does not complete financial acceptance. See [ADR-0045](docs/adr/ADR-0045-income-ledger-reconciliation.md).
+These are implementation dependencies before Spot capital acceptance, not new
+runtime incident reports or changes to the financial policy. Dated entries below
+remain historical records, not proof those dependencies are complete.
+
+## [2.6.0-alpha.2] - 2026-11-16
+
+Source preparation for the next development snapshot; this entry does not assert publication. Actual published source, CI, artifacts and deployment observations belong in the release notes after they exist. Spot remains unready for real capital and activation remains a separate operator decision.
+
+### Fixed - Reconciliation does not explain wallet residuals by changing the basis
+
+- Remove the position scan's total-based capital-base writer and its exclusively used helpers. Every otherwise-successful scan uses the existing guarded, alarm-only checksum; a real close does not explain an unrelated wallet residual. Preserve close/protection/journal behavior and its persistence-failure fences.
+- Startup `auto_reconcile` now returns the existing stale-Active error before Phase 2 when any position lacks unambiguous real evidence. It does not estimate a fill. Phase 2 is still sequential, not a transactional batch.
+- Add focused close/error/guard/startup controls and generated schedules using actual income/month producers and PG projections. These controls have scoped assertions; complete typed financial acceptance, persisted-state CAS, non-reusable/exact/asset-linked transfer attribution, durable absence/status and Spot settlement/carry remain required. This entry asserts no exact-head test or rollout result.
+
+### Changed - Source identity
+
+- Align the workspace, 12 local lock entries and frontend with `2.6.0-alpha.2`, without changing external dependencies or pnpm resolution. Keep historical alpha.1 identities and release records below.
+
+## [2.6.0-alpha.1] - 2026-11-15
+
+Development snapshot of the Spot-first transition, published from `ccac64c39dfaa2c4c88e4a46d4925f3e469674bd`. The [release notes](https://github.com/ldamasio/robson/releases/tag/v2.6.0-alpha.1) identify the CI-built images and validation. Spot is not ready for real capital; implementation, acceptance and activation gates remain pending. The entries below include the accumulated development present in that source since the historical May v2.5.0 baseline.
+
 ### Release identity - v2.6 development transition
 
-- Prepare `2.6.0-alpha.1` consistently in workspace Cargo metadata, the 12 local Cargo.lock packages and the frontend package; external dependencies and pnpm resolution remain unchanged. No alpha build, tag or release is claimed.
+- Publish `v2.6.0-alpha.1` with consistent workspace Cargo metadata, the 12 local Cargo.lock packages and the frontend package; external dependencies and pnpm resolution remain unchanged by the release-identity increment. The annotated tag identifies the reviewed source, and its Release Identity check passed. The prerelease leaves stable Latest at the corrected `v2.5.0`.
 - Add a stdlib-only SemVer/package/tag checker and validation-only CI. `2.5.x` remains compatible maintenance; transition work follows alpha → beta → rc → `2.6.0`.
 - Correct the historical changelog attribution and archive the original GitHub release notes. Release ID `319957573` was reassociated with the existing semantic tag and verified on 2026-11-15 at 19:31:17 UTC, preserving its original publication timestamp and archived notes; no tag movement, historical retest or production acceptance is implied.
 
@@ -424,9 +452,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boundary; it deliberately does not claim that every best-effort maintenance
   substep succeeded.
 
-### Historical post-tag development — unreleased attribution
+### Historical post-tag development — included in alpha.1
 
-The entries below were previously grouped under `2.5.0` dated 2026-08-23. They postdate the verified May tag and remain development records, not contents of that release. Their original descriptions and dates are retained.
+The entries below were previously grouped under `2.5.0` dated 2026-08-23. They postdate the verified May tag and are included in the `v2.6.0-alpha.1` development snapshot, not the historical May release. Their original descriptions and dates are retained.
 
 ### Development - version alignment recorded on 2026-08-23
 
@@ -441,6 +469,15 @@ The entries below were previously grouped under `2.5.0` dated 2026-08-23. They p
   has passed its own operational acceptance gate.
 
 ### Added - Typed income-ledger reconciliation (ADR-0045 §1, 2026-07-07)
+
+> Current status clarification (2026-11-16): this historical entry describes the
+> income-ledger path. The position-scan residual writer is removed in this source;
+> successful scans use a guarded, alarm-only checksum. This scoped repair does not
+> complete financial or Spot acceptance. Atomic current-state validation,
+> single-use transfer attribution and funding wallet-accounting integration
+> remain pending; per-call checks and matched rows do not prove those guarantees.
+> See [ADR-0045](docs/adr/ADR-0045-income-ledger-reconciliation.md). The historical
+> entry below is retained as recorded.
 
 - New `IncomePort` trait ingests Binance's typed income stream
   (`GET /fapi/v1/income`) into a new `income_ledger` table, matching each
