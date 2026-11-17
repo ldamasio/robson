@@ -191,9 +191,9 @@ mod metrics_acceptance {
         )
         .await;
         assert_eq!(warnings.load(Ordering::Relaxed), 1, "one dispatch-local warning above15");
-        assert!(OVER.get() >= over_before + 1);
+        assert!(OVER.get() > over_before);
         for (i, outcome) in ["success", "error", "cancelled"].iter().enumerate() {
-            assert!(OUTCOMES.with_label_values(&[outcome]).get() >= outcomes_before[i] + 1);
+            assert!(OUTCOMES.with_label_values(&[outcome]).get() > outcomes_before[i]);
         }
         let rendered = crate::metrics::render(); // actual production TextEncoder
         for (metric, label, expected) in [

@@ -317,7 +317,10 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for OperationLayer {
                     _ => "cancelled",
                 }])
                 .inc();
-            WORK.observe(counts.score.load(Ordering::Relaxed) as f64);
+            // Prometheus requires f64; this is a non-financial integer work count.
+            #[allow(clippy::disallowed_types)]
+            let work_count_for_histogram = counts.score.load(Ordering::Relaxed) as f64;
+            WORK.observe(work_count_for_histogram);
             PENDING.dec();
             tracing::info!(target: "robsond::operation_summary", db_attempts = counts.db.load(Ordering::Relaxed), http_submissions = counts.http.load(Ordering::Relaxed), local_calls = counts.local.load(Ordering::Relaxed), incomplete = counts.incomplete.load(Ordering::Relaxed), outcome = counts.outcome.load(Ordering::Relaxed), "Reconciliation observation ended after its retained work");
         }
