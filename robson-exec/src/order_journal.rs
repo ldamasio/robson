@@ -2689,46 +2689,53 @@ impl OrderJournal {
             if started.elapsed() >= pass_bound {
                 break;
             }
-            let commit = async { self.bounded_commit(&batch).await };
-            let result = if let Some(origin) = &origin {
-                origin.run(commit).await
+            // Derived pending work belongs to the same origin as this retry,
+            // including a failure handled after the backend future completes.
+            let flush = async {
+                match self.bounded_commit(&batch).await {
+                    Ok(()) => {
+                        Self::landed(&mut self.lock(), &client_order_id, &batch);
+                        true
+                    },
+                    Err(failure) => {
+                        let (mut gate, mut state) = self.lock_both();
+                        if failure == CommitFailure::IdSpent {
+                            let occurrence = gate.occur(IncidentReason::PersistenceFailure);
+                            state.retry_set.retain(|id| *id != client_order_id);
+                            match state.intents.get_mut(&client_order_id) {
+                                // Its link stays for its completion; unlinking
+                                // collects it.
+                                Some(memory) if memory.replaced_by.is_some() => {
+                                    memory.in_retry_set = false;
+                                },
+                                _ => {
+                                    state.intents.remove(&client_order_id);
+                                },
+                            }
+                            drop((gate, state));
+                            error!(%client_order_id, "Journal row conflicts with another intent");
+                            occurrence.log();
+                        } else if let Some(position) =
+                            state.retry_set.iter().position(|id| *id == client_order_id)
+                        {
+                            if let Some(id) = state.retry_set.remove(position) {
+                                state.retry_set.push_back(id);
+                            }
+                        }
+                        false
+                    },
+                }
+            };
+            let landed = if let Some(origin) = &origin {
+                origin.run(flush).await
             } else {
                 crate::observation::incomplete_current();
-                commit.await
+                flush.await
             };
-            match result {
-                Ok(()) => {
-                    Self::landed(&mut self.lock(), &client_order_id, &batch);
-                    written += 1;
-                },
-                Err(failure) => {
-                    let (mut gate, mut state) = self.lock_both();
-                    if failure == CommitFailure::IdSpent {
-                        let occurrence = gate.occur(IncidentReason::PersistenceFailure);
-                        state.retry_set.retain(|id| *id != client_order_id);
-                        match state.intents.get_mut(&client_order_id) {
-                            // Its link stays for its completion; unlinking
-                            // collects it.
-                            Some(memory) if memory.replaced_by.is_some() => {
-                                memory.in_retry_set = false;
-                            },
-                            _ => {
-                                state.intents.remove(&client_order_id);
-                            },
-                        }
-                        drop((gate, state));
-                        error!(%client_order_id, "Journal row conflicts with another intent");
-                        occurrence.log();
-                    } else if let Some(position) =
-                        state.retry_set.iter().position(|id| *id == client_order_id)
-                    {
-                        if let Some(id) = state.retry_set.remove(position) {
-                            state.retry_set.push_back(id);
-                        }
-                    }
-                    break;
-                },
+            if !landed {
+                break;
             }
+            written += 1;
         }
         written
     }

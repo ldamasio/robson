@@ -345,15 +345,24 @@ pub(crate) mod probe {
     }
     pub(crate) struct Probe {
         dispatch: tracing::Dispatch,
+        // Retain a second registered dispatcher until after the real one drops.
+        // It is never installed as a default and enables no callsite.
+        _registration_guard: tracing::Dispatch,
         latest: Latest,
     }
     impl Probe {
         pub(crate) fn new() -> Self {
             let latest = Arc::new(Mutex::new(None));
+            // tracing-core 0.1.36's JustOne callsite path asks the registering
+            // thread's default. An unobserved peer can otherwise cache NEVER
+            // while this local probe is the only registered dispatcher.
+            let registration_guard =
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
             let subscriber =
                 tracing_subscriber::registry().with(layer()).with(Capture(Arc::clone(&latest)));
             Self {
                 dispatch: tracing::Dispatch::new(subscriber),
+                _registration_guard: registration_guard,
                 latest,
             }
         }
@@ -376,11 +385,57 @@ pub(crate) mod probe {
             ]
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use tracing::{instrument::WithSubscriber, Instrument};
+
+        use super::*;
+
+        // One new callsite, shared by the unobserved first touch and the real
+        // polled future. No SQL is executed or replayed by this regression.
+        fn boundary() -> tracing::Span {
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64)
+        }
+
+        #[tokio::test]
+        async fn callsite_first_registered_without_subscriber_is_counted_when_polled() {
+            let probe = Probe::new();
+            std::thread::spawn(|| {
+                tracing::dispatcher::get_default(|dispatch| {
+                    assert!(dispatch.is::<tracing::subscriber::NoSubscriber>());
+                });
+                assert!(boundary().is_disabled(), "first touch has no subscriber");
+            })
+            .join()
+            .expect("unobserved registration thread joined");
+
+            let polled = AtomicU64::new(0);
+            robson_exec::observation::reconciliation(async {
+                async {
+                    polled.fetch_add(1, Ordering::Relaxed);
+                }
+                .instrument(boundary())
+                .await;
+                tracing::Span::current().record("outcome", 1_u64);
+            })
+            .with_subscriber(probe.dispatch())
+            .await;
+
+            assert_eq!(polled.load(Ordering::Relaxed), 1, "real future body polled once");
+            assert_eq!(
+                probe.snapshot(),
+                [1, 0, 0, 1, 0, 1, 0, 0, 0],
+                "the one reached boundary remains observed after an unobserved first registration"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     include!("operation_observation_heap_tests.rs");
+    include!("operation_observation_retry_tests.rs");
 
     use std::{
         future::{poll_fn, Future},
