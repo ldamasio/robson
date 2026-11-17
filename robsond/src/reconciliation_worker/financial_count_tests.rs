@@ -135,6 +135,7 @@ mod financial_counts {
     ) {
         use robson_testkit::db_proxy::DbProxy;
         use sqlx::postgres::{PgPoolOptions, PgSslMode};
+        use tracing::instrument::WithSubscriber as _;
         let now = Utc::now();
         // Parse deltas qualify preparation attempts ONLY in each case's fresh
         // connection/cache. Cached later phases are measured separately.
@@ -203,7 +204,16 @@ mod financial_counts {
             }
             let before = proxy.stats();
             let parses_before = proxy.prepared_statement_parses();
-            let result = worker.recalibrate_capital_base_after_pure_financial_drift().await;
+            let production = crate::operation_observation::probe::Probe::new();
+            let result = robson_exec::observation::reconciliation(async {
+                let result = worker.recalibrate_capital_base_after_pure_financial_drift().await;
+                tracing::Span::current()
+                    .record("outcome", if result.is_ok() { 1_u64 } else { 2_u64 });
+                result
+            })
+            .with_subscriber(production.dispatch())
+            .await;
+            let production_tail = production.snapshot();
             let after = proxy.stats();
             let parses_after = proxy.prepared_statement_parses();
             let tail_ports = (
@@ -217,12 +227,14 @@ mod financial_counts {
                 && after.statements - before.statements == 2
                 && after.commits == before.commits
             {
-                let scan = worker.scan_and_reconcile().await;
+                let scan = worker.scan_and_reconcile().with_subscriber(production.dispatch()).await;
+                let production_whole = production.snapshot();
                 Some((
                     scan,
                     proxy.stats(),
                     proxy.prepared_statement_parses(),
                     worker.test_recent_closed_window(),
+                    production_whole,
                     (
                         exchange.inventory.load(Ordering::SeqCst),
                         exchange.wallet.load(Ordering::SeqCst),
@@ -241,7 +253,14 @@ mod financial_counts {
                 {
                     let before_history = proxy.stats();
                     let parse_before_history = proxy.prepared_statement_parses();
-                    let symbols = worker.recently_closed_symbols(at.parse().unwrap()).await;
+                    let symbols = robson_exec::observation::reconciliation(async {
+                        let result = worker.recently_closed_symbols(at.parse().unwrap()).await;
+                        tracing::Span::current().record("outcome", 1_u64);
+                        result
+                    })
+                    .with_subscriber(production.dispatch())
+                    .await;
+                    let production_history = production.snapshot();
                     history_cases.push((
                         expected,
                         symbols,
@@ -249,6 +268,7 @@ mod financial_counts {
                         proxy.stats().commits - before_history.commits,
                         proxy.prepared_statement_parses() - parse_before_history,
                         worker.test_recent_closed_window(),
+                        production_history,
                     ));
                 }
             }
@@ -277,6 +297,20 @@ mod financial_counts {
             };
             eprintln!("SCAN_FRESH_PROTOCOL phase={phase} query_execute={} parses={} expected_query_execute={expected_executions} expected_parses={expected_parses}",
                 after.statements-before.statements, parses_after-parses_before);
+            let failed_prepares = u64::from(phase >= 6);
+            assert_eq!(
+                production_tail[0],
+                after.statements - before.statements + failed_prepares,
+                "public attempt versus independent Execute and failed Parse phase={phase}"
+            );
+            assert_eq!(production_tail[0], production_tail[5..9].iter().sum::<u64>());
+            assert_eq!(
+                &production_tail[6..9],
+                &[0, 0, 0],
+                "tail has no explicit transaction boundary"
+            );
+            assert_eq!(production_tail[1], 0, "fake exchange ports are not HTTP");
+            assert_eq!(production_tail[3], production_tail[0]);
             assert_eq!(
                 after.statements - before.statements,
                 expected_executions,
@@ -325,7 +359,7 @@ mod financial_counts {
             assert_eq!(events, 0, "no scan-authored PG append");
             assert!(store.events().get_all_events().await.unwrap().is_empty());
             if phase == 0 {
-                let (scan, whole, whole_parses, window, ports) =
+                let (scan, whole, whole_parses, window, production_whole, ports) =
                     whole.expect("healthy first tail reaches the separate whole-scan control");
                 assert_eq!(scan.unwrap(), 0);
                 let (at, since, months) = window.expect("real whole scan history must be observed");
@@ -347,6 +381,13 @@ mod financial_counts {
                     "whole empty scan: two tail SQL plus actual 24h PG history months"
                 );
                 assert_eq!(whole.commits - after.commits, 0);
+                assert_eq!(
+                    production_whole[0],
+                    whole.statements - after.statements,
+                    "warm whole operation counts actual executed queries"
+                );
+                assert_eq!(production_whole[1], 0);
+                assert_eq!(production_whole[4], 0);
                 eprintln!(
                     "SCAN_WARM_PROTOCOL query_execute={} parses={}",
                     whole.statements - after.statements,
@@ -362,11 +403,18 @@ mod financial_counts {
                 assert_eq!(ports.2 - tail_ports.2, 1);
                 assert_eq!(ports.3 - tail_ports.3, 3, "missing-position pass, orphan sweep, tail");
             }
-            for (expected, symbols, executions, commits, parses, window) in history_cases {
+            for (expected, symbols, executions, commits, parses, window, production_history) in
+                history_cases
+            {
                 let (at, since, months) = window.expect("actual parameterized PG history window");
                 assert_eq!(since, at - chrono::Duration::hours(24));
                 assert_eq!(months as u64, expected);
                 assert_eq!(executions, expected, "one actual PG history execution per month");
+                assert_eq!(
+                    production_history[0], executions,
+                    "production counter follows independently observed one/two-month SQL"
+                );
+                assert_eq!(production_history[4], 0);
                 assert_eq!(commits, 0, "history lookup has no transaction append");
                 assert_eq!(parses, 0, "same net/history SQL already cached on this connection");
                 assert!(symbols.is_empty(), "empty tenant remains empty across month boundary");

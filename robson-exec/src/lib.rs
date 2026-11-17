@@ -80,3 +80,6 @@ macro_rules! crash_point {
 macro_rules! crash_point {
     ($point:ident) => {};
 }
+
+/// Reconciliation observation context; carries no execution authority.
+pub mod observation;

@@ -39,10 +39,12 @@ async fn prepared_scan_with_fills_journal(
     });
     daemon.exchange.set_futures_balance(dec!(10000));
     let mut ids = Vec::new();
-    for (index, pair) in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-        .into_iter()
-        .take(usize::from(close_count))
-        .enumerate()
+    for (index, pair) in [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT", "XRPUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT",
+    ]
+    .into_iter()
+    .take(usize::from(close_count))
+    .enumerate()
     {
         let mut position =
             active_position(robson_domain::Symbol::from_pair(pair).unwrap(), Side::Long);
@@ -175,7 +177,9 @@ async fn close_survives_failure(pool: sqlx::PgPool, append_fails: bool) {
     let parses_before = wire.proxy.prepared_statement_parses();
     let sends_before = daemon.exchange.mutations().len();
     let ports_before = fixture_activity(&daemon);
-    let first_scan = worker.scan_and_reconcile().await;
+    let production = crate::operation_observation::probe::Probe::new();
+    let first_scan = worker.scan_and_reconcile().with_subscriber(production.dispatch()).await;
+    let production_first = production.snapshot();
     let after_scan = wire.proxy.stats();
     let parses_after_scan = wire.proxy.prepared_statement_parses();
     let history_window = worker.test_recent_closed_window();
@@ -205,11 +209,18 @@ async fn close_survives_failure(pool: sqlx::PgPool, append_fails: bool) {
     let parses_before_flush = wire.proxy.prepared_statement_parses();
     let ports_before_flush = fixture_activity(&daemon);
     let flushed = if primary_ok {
-        Some(daemon.order_journal.flush_pending().await)
+        Some(
+            daemon
+                .order_journal
+                .flush_pending()
+                .with_subscriber(production.dispatch())
+                .await,
+        )
     } else {
         None
     };
     let after_flush = wire.proxy.stats();
+    let production_after_flush = production.snapshot();
     let parses_after_flush = wire.proxy.prepared_statement_parses();
     let ports_after_flush = fixture_activity(&daemon);
     let pending = daemon.order_journal.retry_set_depth();
@@ -248,11 +259,12 @@ async fn close_survives_failure(pool: sqlx::PgPool, append_fails: bool) {
             after_flush.commits - before_flush.commits,
         ) == (6, 2)
     {
-        Some(worker.scan_and_reconcile().await)
+        Some(worker.scan_and_reconcile().with_subscriber(production.dispatch()).await)
     } else {
         None
     };
     let after_next = wire.proxy.stats();
+    let production_next = production.snapshot();
     let parses_after_next = wire.proxy.prepared_statement_parses();
     let next_history_window = worker.test_recent_closed_window();
     let withheld_next = daemon.order_journal.withheld_report();
@@ -269,6 +281,40 @@ async fn close_survives_failure(pool: sqlx::PgPool, append_fails: bool) {
     // Preserve all primary Results; close the observed pool BEFORE an oracle
     // can panic. Drop requests Sever, but is not a joined-relay receipt.
     wire.pool.close().await;
+    assert_production_io(
+        "failed-close reached scan",
+        production_first,
+        after_scan.statements - before.statements,
+        0,
+    );
+    assert_production_io(
+        "failed-close plus late correlated flush",
+        production_after_flush,
+        after_scan.statements - before.statements + after_flush.statements
+            - before_flush.statements,
+        0,
+    );
+    assert_eq!(
+        production_after_flush[0] - production_first[0],
+        after_flush.statements - before_flush.statements,
+        "flush is attributed to its returned scan once"
+    );
+    assert_eq!(
+        production_after_flush[7] - production_first[7],
+        after_flush.commits - before_flush.commits
+    );
+    assert_eq!(
+        production_first[8],
+        u64::from(append_fails),
+        "append error queues rollback; projection error is autocommit"
+    );
+    assert_eq!(production_after_flush[4], 0, "single-origin late work remains complete");
+    assert_production_io(
+        "next after failed close",
+        production_next,
+        after_next.statements - before_next.statements,
+        0,
+    );
     assert_eq!(first_scan.unwrap(), 1);
     history_months(history_window);
     eprintln!("SCAN_FAILURE_PARSE append_fails={append_fails} first={} unit=frontend_Parse actual_not_global_attempts", parses_after_scan-parses_before);

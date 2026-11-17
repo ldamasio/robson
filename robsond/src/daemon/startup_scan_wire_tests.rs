@@ -1,3 +1,4 @@
+use tracing::instrument::WithSubscriber as _;
 // Private measurement fixture: reuse the existing proxy, never a new relay.
 struct ObservedScanPool {
     proxy: robson_testkit::db_proxy::DbProxy,
@@ -69,6 +70,19 @@ fn history_months(window: Option<(DateTime<Utc>, DateTime<Utc>, usize)>) -> u64 
         "SCAN_HISTORY now={now} since={since} months={actual} storage=postgres local_repository=0"
     );
     expected as u64
+}
+fn assert_production_io(label: &str, actual: [u64; 9], statements: u64, failed_prepares: u64) {
+    // Public query attempts include failed preparation; BEGIN/COMMIT and queued
+    // rollback are separate reached units. Wire executes include no failed Parse.
+    eprintln!("SCAN_PRODUCTION label={label:?} db={} http={} local={} score={} incomplete={} query={} begin={} commit={} rollback_queued={} wire={statements} failed_prepares={failed_prepares}", actual[0],actual[1],actual[2],actual[3],actual[4],actual[5],actual[6],actual[7],actual[8]);
+    assert_eq!(actual[0], actual[5..9].iter().sum::<u64>());
+    assert_eq!(
+        actual[0],
+        statements + failed_prepares,
+        "independent wire reconciliation: {label}"
+    );
+    assert_eq!(actual[1], 0, "Stub ports are not HTTP submissions");
+    assert_eq!(actual[3], actual[0] + 2 * actual[1]);
 }
 fn assert_parse_delta(label: &str, before: u64, after: u64, expected: u64) {
     eprintln!("SCAN_PARSE label={label:?} actual={} expected={expected} unit=frontend_Parse_not_global_attempts", after-before);
@@ -185,15 +199,18 @@ async fn real_close_protection_journal_and_tail_have_separate_wire_counts(pool: 
     let before = wire.proxy.stats();
     let parse_before = wire.proxy.prepared_statement_parses();
     let ports_before = fixture_activity(&daemon);
+    let production = crate::operation_observation::probe::Probe::new();
+    let dispatch = production.dispatch();
     let mut scan = tokio::spawn({
         let worker = worker.clone();
-        async move { worker.scan_and_reconcile().await }
+        async move { worker.scan_and_reconcile().await }.with_subscriber(dispatch)
     });
     if let Err(primary) = reached_or_joined(&close_pause, &mut scan).await {
         wire.pool.close().await;
         panic!("close boundary: {primary}");
     }
     let after_close = wire.proxy.stats();
+    let production_close = production.snapshot();
     let parse_close = wire.proxy.prepared_statement_parses();
     let ports_close = fixture_activity(&daemon);
     let guard_pause = worker.test_pause_at(ScanTestPhase::BeforeRiskSnapshot);
@@ -203,12 +220,14 @@ async fn real_close_protection_journal_and_tail_have_separate_wire_counts(pool: 
         panic!("before-tail boundary: {primary}");
     }
     let after_protection = wire.proxy.stats();
+    let production_protection = production.snapshot();
     let history_window = worker.test_recent_closed_window();
     let ports_protection = fixture_activity(&daemon);
     let parse_protection = wire.proxy.prepared_statement_parses();
     guard_pause.resume.notify_one();
     let result = joined(scan).await;
     let after_tail = wire.proxy.stats();
+    let production_tail = production.snapshot();
     let parse_tail = wire.proxy.prepared_statement_parses();
     let ports_tail = fixture_activity(&daemon);
     let cancel_count = daemon.exchange.stop_cancel_call_count();
@@ -250,11 +269,12 @@ async fn real_close_protection_journal_and_tail_have_separate_wire_counts(pool: 
     let parse_before_next = wire.proxy.prepared_statement_parses();
     let ports_before_next = fixture_activity(&daemon);
     let next = if matches!(&result, Ok(Ok(1))) && source_counts_match {
-        Some(worker.scan_and_reconcile().await)
+        Some(worker.scan_and_reconcile().with_subscriber(production.dispatch()).await)
     } else {
         None
     };
     let after_next = wire.proxy.stats();
+    let production_next = production.snapshot();
     let parse_after_next = wire.proxy.prepared_statement_parses();
     let next_history_window = worker.test_recent_closed_window();
     let ports_after_next = fixture_activity(&daemon);
@@ -268,6 +288,34 @@ async fn real_close_protection_journal_and_tail_have_separate_wire_counts(pool: 
     wire.pool.close().await;
     // Worker was released/joined and observed pool closed before assertions.
     // Existing proxy Drop signals Sever; no relay-join proof is inferred.
+    assert_production_io(
+        "close prefix",
+        production_close,
+        after_close.statements - before.statements,
+        0,
+    );
+    assert_production_io(
+        "close plus protection",
+        production_protection,
+        after_protection.statements - before.statements,
+        0,
+    );
+    assert_production_io(
+        "whole positive",
+        production_tail,
+        after_tail.statements - before.statements,
+        0,
+    );
+    assert_production_io(
+        "next whole positive",
+        production_next,
+        after_next.statements - before_next.statements,
+        0,
+    );
+    assert_eq!(production_close[7], after_close.commits - before.commits);
+    assert_eq!(production_tail[7], after_tail.commits - before.commits);
+    assert_eq!(production_tail[8], 0, "healthy transactions queue no rollback");
+    assert_eq!(production_tail[4], 0, "complete positive attribution");
     assert_eq!(result.unwrap().unwrap(), 1);
     let h = history_months(history_window);
     eprintln!("SCAN_PHASE_PARSES close={} protection={} tail={} whole={}; history shares the already-prepared net SELECT", parse_close-parse_before, parse_protection-parse_close, parse_tail-parse_protection, parse_tail-parse_before);
@@ -344,3 +392,7 @@ async fn real_close_protection_journal_and_tail_have_separate_wire_counts(pool: 
     assert_eq!(after.unwrap(), closes);
     assert_eq!(cancel_after, 1);
 }
+
+// Actual multi-leg/cardinality control shares these existing proxy/oracle
+// helpers.
+include!("startup_scan_cardinality_tests.rs");

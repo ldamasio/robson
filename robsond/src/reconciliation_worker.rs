@@ -44,6 +44,9 @@ use crate::{
 /// How long after a leg closes the orphan sweep keeps visiting its symbol.
 const CLOSED_LEG_SWEEP_WINDOW_HOURS: i64 = 24;
 
+#[cfg(test)]
+type HistoryWindow = (DateTime<Utc>, DateTime<Utc>, usize);
+
 /// Background worker that reconciles exchange state with Robson state.
 pub struct ReconciliationWorker<E: ExchangePort + 'static, S: Store + 'static> {
     exchange: Arc<E>,
@@ -67,7 +70,7 @@ pub struct ReconciliationWorker<E: ExchangePort + 'static, S: Store + 'static> {
     #[cfg(test)]
     scan_test_pause: std::sync::Mutex<Option<(ScanTestPhase, Arc<TestPause>)>>,
     #[cfg(test)]
-    recent_closed_window: std::sync::Mutex<Option<(DateTime<Utc>, DateTime<Utc>, usize)>>,
+    recent_closed_window: std::sync::Mutex<Option<HistoryWindow>>,
 }
 
 /// A test's stop at one point of a scan: the scan says it got there, then
@@ -468,9 +471,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     /// Observe the actual history window; never substitutes the production
     /// clock.
     #[cfg(test)]
-    pub(crate) fn test_recent_closed_window(
-        &self,
-    ) -> Option<(DateTime<Utc>, DateTime<Utc>, usize)> {
+    pub(crate) fn test_recent_closed_window(&self) -> Option<HistoryWindow> {
         *self.recent_closed_window.lock().unwrap()
     }
 
@@ -521,7 +522,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     /// startup scan is part of the startup operation.
     pub async fn scan_and_reconcile(&self) -> DaemonResult<usize> {
         let journal = self.order_journal().await;
-        journal.with_permit(OperationKind::ReconciliationScan, self.scan_once()).await?
+        robson_exec::observation::reconciliation(async {
+            let result =
+                journal.with_permit(OperationKind::ReconciliationScan, self.scan_once()).await;
+            tracing::Span::current().record(
+                "outcome",
+                if matches!(&result, Ok(Ok(_))) {
+                    1_u64
+                } else {
+                    2_u64
+                },
+            );
+            result
+        })
+        .await?
     }
 
     async fn scan_once(&self) -> DaemonResult<usize> {

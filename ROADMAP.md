@@ -34,6 +34,8 @@ flowchart TD
 4. Complete integrated database/conformance tests and failure/recovery checks, then the documented observation, cutover and compatible rollback procedures. Component tests alone do not satisfy these gates.
 5. Obtain the operator's explicit activation authorization for the selected account and release candidate. Documentation, merges and version labels do not authorize orders or capital allocation.
 
+The alpha.2 candidate also adds [reconciliation operation measurement](docs/architecture/reconciliation-operation-observation.md), with local wire-count, cardinality, allocator and metric controls. This makes execution cost and incomplete attribution visible while the integration gates remain open; it does not complete the Spot execution path or the SQLx migration acceptance work.
+
 The initial acceptance sequence uses these public identifiers:
 
 - **T1 — Authorized pilot:** execute the first pilot Spot operation under explicit operator authorization.

@@ -52,7 +52,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument as _};
 use uuid::Uuid;
 
 use crate::{
@@ -653,6 +653,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         .bind(month.year() as i16)
         .bind(month.month() as i16)
         .fetch_optional(pool)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await?;
         Ok(base)
     }
@@ -695,6 +698,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         .bind(now.year())
         .bind(now.month() as i16)
         .fetch_optional(pool)
+        .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
         .await?;
 
         if let Some((
@@ -737,6 +741,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         .bind(now.year())
         .bind(now.month() as i16)
         .fetch_optional(pool)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await?;
         let inherited_model = inherited_stored_model
             .map(|stored_model| {
@@ -958,6 +965,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .bind(monthly.capital_base)
             .bind(equity_net)
             .execute(pool)
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+            )
             .await?;
         }
 
@@ -1235,7 +1245,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let exchange = self.exchange();
         let requests = Arc::clone(&self.rules_refresh_requests);
         let symbol = symbol.clone();
-        tokio::spawn(async move {
+        tokio::spawn(robson_exec::observation::inherit_reconciliation(async move {
             if let Err(error) = exchange.trading_rules(&symbol).await {
                 warn!(symbol = %symbol.as_pair(), %error, "Trading-rules refresh failed");
             }
@@ -1244,7 +1254,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             {
                 request.in_flight = false;
             }
-        });
+        }));
     }
 
     /// The streams this manager writes (ADR-0056 step 7, PR P).
@@ -1456,6 +1466,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         )
         .bind(event_id)
         .fetch_one(pool)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await
         .map_err(|e| {
             (

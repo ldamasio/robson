@@ -330,6 +330,7 @@ pub struct EpochView {
 #[derive(Debug)]
 struct OpenIncident {
     incident: Incident,
+    origin: Option<crate::observation::Origin>,
     /// Bumped by every occurrence; the durable upsert is pending while it is
     /// ahead of `landed`.
     version: u64,
@@ -559,6 +560,14 @@ impl GateState {
     fn note(&mut self, reason: IncidentReason, generation: i64, at: DateTime<Utc>) -> bool {
         match self.incidents.get_mut(&reason) {
             Some(open) => {
+                if open.version == open.landed {
+                    open.origin = crate::observation::Origin::measured();
+                } else {
+                    crate::observation::Origin::merge(
+                        &mut open.origin,
+                        crate::observation::Origin::measured(),
+                    );
+                }
                 let incident = &mut open.incident;
                 incident.last_at = incident.last_at.max(at);
                 incident.count += 1;
@@ -576,6 +585,7 @@ impl GateState {
                         first_generation: generation,
                         last_generation: generation,
                     },
+                    origin: crate::observation::Origin::measured(),
                     version: 1,
                     landed: 0,
                 });
@@ -605,10 +615,20 @@ impl GateState {
             .collect()
     }
 
+    pub(crate) fn incident_origin(
+        &self,
+        reason: IncidentReason,
+    ) -> Option<crate::observation::Origin> {
+        self.incidents.get(&reason).and_then(|open| open.origin.clone())
+    }
+
     /// The upsert carrying `version` of `reason`'s incident landed.
     pub(crate) fn incident_landed(&mut self, reason: IncidentReason, version: u64) {
         if let Some(open) = self.incidents.get_mut(&reason) {
             open.landed = open.landed.max(version);
+            if open.landed == open.version {
+                open.origin = None;
+            }
         }
     }
 
@@ -738,6 +758,7 @@ impl OperationGate {
                 None => {
                     state.incidents.insert(incident.reason, OpenIncident {
                         incident,
+                        origin: None,
                         version: 1,
                         landed: 1,
                     });

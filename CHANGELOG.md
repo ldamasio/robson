@@ -31,6 +31,11 @@ Source preparation for the next development snapshot; this entry does not assert
 
 - Align the workspace, 12 local lock entries and frontend with `2.6.0-alpha.2`, without changing external dependencies or pnpm resolution. Keep historical alpha.1 identities and release records below.
 
+### Added - Reconciliation operation measurement
+
+- Count reached public SQLx attempts and real HTTP submissions for an observed reconciliation, including owned late journal work. Fixed labels, bounded origin retention and a threshold warning expose excess work without changing financial permission or retry deadlines. Rollback queuing remains distinct from server acknowledgment.
+- Add independent wire/cardinality comparisons, isolated allocator-trend and metric-rendering controls. [Measurement details](docs/architecture/reconciliation-operation-observation.md) record scoped local results and remaining qualification, including HTTP2 retry failures and deployed alert rules. These results do not complete Spot accounting or authorize activation.
+
 ## [2.6.0-alpha.1] - 2026-11-15
 
 Development snapshot of the Spot-first transition, published from `ccac64c39dfaa2c4c88e4a46d4925f3e469674bd`. The [release notes](https://github.com/ldamasio/robson/releases/tag/v2.6.0-alpha.1) identify the CI-built images and validation. Spot is not ready for real capital; implementation, acceptance and activation gates remain pending. The entries below include the accumulated development present in that source since the historical May v2.5.0 baseline.
