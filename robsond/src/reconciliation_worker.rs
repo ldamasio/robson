@@ -470,7 +470,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
 
     /// Observe the actual history window; never substitutes the production
     /// clock.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "postgres"))]
     pub(crate) fn test_recent_closed_window(&self) -> Option<HistoryWindow> {
         *self.recent_closed_window.lock().unwrap()
     }

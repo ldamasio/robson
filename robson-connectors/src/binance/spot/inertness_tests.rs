@@ -458,8 +458,44 @@ fn the_venue_and_the_order_path_take_exactly_their_own_items() {
     }
 }
 
-/// SD12 points 2 and 4: no code outside `binance/spot/` reaches the module
-/// or names its types, so no production path can construct its reader.
+/// One exact cross-crate HTTP fixture is compiled only by this test gate.
+/// This does not excuse other files or claim a general Rust reachability proof.
+fn isolated_observation_fixture(owner: &str, fixture: &str, references: &[PathBuf]) -> bool {
+    const NAME: &str = "operation_observation_http_tests.rs";
+    const GATE: &str = "#[cfg(all(test, feature = \"crash-points\"))]\n#[path = \"operation_observation_http_tests.rs\"]\nmod http_tests;";
+    fixture.starts_with("#![cfg(all(test, feature = \"crash-points\"))]\n")
+        && owner.matches(GATE).count() == 1
+        && owner.matches(NAME).count() == 1
+        && references.len() == 1
+        && references[0].ends_with("robsond/src/operation_observation.rs")
+}
+
+#[test]
+fn the_observation_fixture_exception_requires_its_test_gate_and_only_include() {
+    let gate = "#[cfg(all(test, feature = \"crash-points\"))]\n#[path = \"operation_observation_http_tests.rs\"]\nmod http_tests;";
+    let fixture = "#![cfg(all(test, feature = \"crash-points\"))]\n";
+    let owner = PathBuf::from("robsond/src/operation_observation.rs");
+    assert!(isolated_observation_fixture(gate, fixture, std::slice::from_ref(&owner)));
+    assert!(!isolated_observation_fixture(
+        &gate.replace("all(test, ", "all("),
+        fixture,
+        std::slice::from_ref(&owner)
+    ));
+    assert!(!isolated_observation_fixture(gate, "", std::slice::from_ref(&owner)));
+    assert!(!isolated_observation_fixture(gate, fixture, &[
+        owner.clone(),
+        PathBuf::from("robsond/src/main.rs")
+    ]));
+    assert!(!isolated_observation_fixture(
+        &format!("{gate}\ninclude!(\"operation_observation_http_tests.rs\");"),
+        fixture,
+        &[owner]
+    ));
+}
+
+/// SD12 points 2 and 4: every production path outside `binance/spot/` remains
+/// scanned. The sole exact fixture exception requires its test-only gate and
+/// sole inclusion site before its Spot pagination control is admitted.
 #[test]
 fn nothing_outside_the_spot_module_names_it() {
     let workspace = crate_dir().parent().unwrap();
@@ -476,9 +512,27 @@ fn nothing_outside_the_spot_module_names_it() {
         assert!(outside.iter().any(|path| path.ends_with(must)), "{must} not scanned");
     }
 
+    let owner = fs::read_to_string(workspace.join("robsond/src/operation_observation.rs")).unwrap();
+    let references: Vec<PathBuf> = outside
+        .iter()
+        .filter(|path| {
+            fs::read_to_string(path)
+                .unwrap()
+                .contains("\"operation_observation_http_tests.rs\"")
+        })
+        .cloned()
+        .collect();
+    let fixture =
+        fs::read_to_string(workspace.join("robsond/src/operation_observation_http_tests.rs"))
+            .unwrap();
+    let fixture_isolated = isolated_observation_fixture(&owner, &fixture, &references);
     let names = spot_type_names();
     let mut found = Vec::new();
     for path in &outside {
+        if path.ends_with("robsond/src/operation_observation_http_tests.rs") {
+            assert!(fixture_isolated, "observation fixture is not uniquely test-gated");
+            continue;
+        }
         let text = fs::read_to_string(path).unwrap();
         if reaches_spot(&text) {
             found.push(format!("{}: reaches binance::spot", path.display()));

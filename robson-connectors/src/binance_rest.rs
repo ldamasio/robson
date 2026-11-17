@@ -274,19 +274,34 @@ impl BinanceRestClient {
     /// (ADR-0056 step 7, D19). A timeout is uncertain: the request may have
     /// reached the venue. Every HTTP status is an answer here.
     async fn answer(&self, request: RequestBuilder) -> Result<RestAnswer, BinanceRestError> {
+        if !robson_exec::observation::reconciliation_active() {
+            return self.legacy_answer(request).await;
+        }
         let answered = async {
-            let response = if robson_exec::observation::reconciliation_active() {
-                // Only the measured scan: no hidden redirect/retry beneath its count.
-                // Signing, gate, headers/body and the outer request bound are unchanged.
-                let (_, built) = request.build_split();
-                let built = built.map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
-                let endpoint = observed_endpoint(built.url().path());
-                single_shot()?.execute(built)
-                    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 5_u64, io_endpoint = endpoint))
-                    .await
-            } else {
-                request.send().await
-            }.map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
+            let (_, built) = request.build_split();
+            let built = built.map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
+            let endpoint = observed_endpoint(built.url().path());
+            let response = single_shot()?.execute(built)
+                .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 5_u64, io_endpoint = endpoint))
+                .await
+                .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
+            let status = response.status();
+            let body =
+                response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+            Ok::<_, BinanceRestError>(RestAnswer { status, body })
+        };
+        timeout(self.request_timeout, answered)
+            .await
+            .map_err(|_| BinanceRestError::Timeout)?
+    }
+
+    /// The unmeasured transport keeps the reviewed baseline body unchanged.
+    async fn legacy_answer(&self, request: RequestBuilder) -> Result<RestAnswer, BinanceRestError> {
+        let answered = async {
+            let response = request
+                .send()
+                .await
+                .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
             let status = response.status();
             let body =
                 response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
@@ -399,7 +414,9 @@ impl BinanceRestClient {
     /// L344-L345, L388-L417), and one request on the [`single_shot`]
     /// transport, with no redirect followed and nothing retried. A read: it
     /// does not pass the mutation gate. [`Self::get_signed_answer`], which
-    /// signs raw values and follows redirects, stays as it is for USD-M.
+    /// signs raw values, retains its legacy redirect behavior outside measured
+    /// reconciliation. Measured reconciliation uses the counted single-shot
+    /// path.
     pub(crate) async fn get_signed_spot_answer(
         &self,
         endpoint: &str,
@@ -2239,15 +2256,16 @@ mod tests {
         &code[start..end]
     }
 
-    /// ADR-0056 step 8c-3: the existing signed path and every mutation that
-    /// rides on it stay as they were on main (`804d9f77`), byte for byte. The
-    /// spot order path has its own helpers; nothing here changed for it.
+    /// ADR-0056 step 8c-3: signed/mutation helpers retain their original pins.
+    /// The extracted unmeasured legacy answer retains its complete baseline
+    /// body; only its signature name is normalized. The measured dispatch is
+    /// qualified separately by actual redirect/count/timeout/cancel controls.
     #[test]
     fn the_existing_mutation_paths_are_byte_identical() {
         use sha2::{Digest, Sha256};
         let goldens = [
             ("    fn build_signed_query(", BUILD_SIGNED_QUERY),
-            ("    async fn answer(&self, request: RequestBuilder)", ANSWER),
+            ("    async fn legacy_answer(&self, request: RequestBuilder)", ANSWER),
             ("    async fn exchange(&self, request: RequestBuilder)", EXCHANGE),
             ("    fn pass_gate(&self, method: &str, endpoint: &str)", PASS_GATE),
             ("    async fn post_signed(", POST_SIGNED),
@@ -2266,7 +2284,16 @@ mod tests {
             ("    pub(crate) async fn get_signed_answer(", GET_SIGNED_ANSWER),
         ];
         for (signature, golden) in goldens {
-            let digest = hex::encode(Sha256::digest(function_text(signature).as_bytes()));
+            let source = function_text(signature);
+            // Only the extracted legacy helper's signature name is normalized;
+            // the original ANSWER pin and complete baseline body stay unchanged.
+            let pinned =
+                if signature == "    async fn legacy_answer(&self, request: RequestBuilder)" {
+                    source.replacen("async fn legacy_answer(", "async fn answer(", 1)
+                } else {
+                    source.to_string()
+                };
+            let digest = hex::encode(Sha256::digest(pinned.as_bytes()));
             assert_eq!(digest, golden, "{signature} changed");
         }
     }

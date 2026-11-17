@@ -324,7 +324,7 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for OperationLayer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "postgres", feature = "crash-points")))]
 pub(crate) mod probe {
     use std::sync::Mutex;
 

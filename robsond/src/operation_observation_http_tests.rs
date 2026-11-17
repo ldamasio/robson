@@ -1,3 +1,5 @@
+#![cfg(all(test, feature = "crash-points"))]
+
 //! Actual REST/adapter requests against a bounded, joined local TCP listener.
 use std::{future::Future, sync::Arc};
 
@@ -125,6 +127,17 @@ async fn real_conditional_order_trade_fanout_matches_server_and_production_count
     assert_http(&probe, received.len());
     assert_eq!(probe.snapshot()[4], 0);
 }
+#[tokio::test]
+async fn unmeasured_requests_keep_the_legacy_redirect_behavior() {
+    let (client, stop, server, _) =
+        scripted(vec![(302, "".into()), (200, "[]".into())], false).await;
+    let result = client.get_all_open_positions().await;
+    let _ = stop.send(());
+    let received = server.await.unwrap().unwrap();
+    assert!(result.unwrap().is_empty());
+    assert_eq!(received, ["GET /fapi/v2/positionRisk", "GET /must-not-follow"]);
+}
+
 #[tokio::test]
 async fn real_redirect_and_server_error_are_one_submission_without_hidden_followup() {
     for status in [302, 503] {
