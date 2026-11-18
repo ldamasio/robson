@@ -283,6 +283,77 @@ fn adoption_counts_the_whole_execution_and_requires_an_open_matching_leg() {
 }
 
 #[test]
+fn adoption_requires_the_venue_or_first_proven_client_lineage() {
+    let a = record();
+    let stored = unowned(&a);
+    let leg = leg();
+    let mut owner = owned(&leg, LegOrderKind::Sell);
+    owner.client_order_id = "unrelated".into();
+    assert_eq!(
+        merge_order(Some(&stored), &a, &owner, &at(2), Some(&leg)),
+        Err(LedgerError::IdentityConflict)
+    );
+    // Current, original and first-proven IDs each remain accepted lineage.
+    let mut renamed = a.clone();
+    renamed.client_order_id = "unrelated".into();
+    assert_eq!(
+        merge_order(Some(&stored), &renamed, &owner, &at(2), Some(&leg))
+            .unwrap()
+            .consumed_delta,
+        dec!(2)
+    );
+    renamed.client_order_id = "cancel-id".into();
+    renamed.orig_client_order_id = Some("unrelated".into());
+    assert!(merge_order(Some(&stored), &renamed, &owner, &at(2), Some(&leg)).is_ok());
+    owner.client_order_id = "original".into();
+    renamed.orig_client_order_id = None;
+    assert!(merge_order(Some(&stored), &renamed, &owner, &at(2), Some(&leg)).is_ok());
+}
+
+#[test]
+fn a_known_quote_is_never_replaced_or_regressed() {
+    let a = record();
+    let stored = unowned(&a);
+    for (executed, quote) in [
+        (dec!(2), dec!(150)),
+        (dec!(2), dec!(201)),
+        (dec!(3), dec!(150)),
+    ] {
+        let mut x = a.clone();
+        x.executed_qty = executed;
+        x.cumulative_quote_qty = Some(quote);
+        assert_eq!(
+            merge_order(Some(&stored), &x, &link(OrderOwner::Discovered), &at(2), None),
+            Err(LedgerError::TradeConflict)
+        );
+        x.phase = OrderPhase::Terminal;
+        x.status = "CANCELED".into();
+        assert_eq!(
+            merge_order(Some(&stored), &x, &link(OrderOwner::Discovered), &at(2), None),
+            Err(LedgerError::TradeConflict)
+        );
+    }
+    let mut x = a.clone();
+    x.executed_qty = dec!(3);
+    x.cumulative_quote_qty = Some(dec!(200));
+    assert_eq!(
+        merge_order(Some(&stored), &x, &link(OrderOwner::Discovered), &at(2), None)
+            .unwrap()
+            .order
+            .cumulative_quote,
+        Some(dec!(200))
+    );
+    x.cumulative_quote_qty = Some(dec!(300));
+    assert_eq!(
+        merge_order(Some(&stored), &x, &link(OrderOwner::Discovered), &at(2), None)
+            .unwrap()
+            .order
+            .cumulative_quote,
+        Some(dec!(300))
+    );
+}
+
+#[test]
 fn terminal_facts_survive_stale_live_audit_and_adoption() {
     let mut a = record();
     a.phase = OrderPhase::Terminal;

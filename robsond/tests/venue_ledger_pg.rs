@@ -356,6 +356,57 @@ async fn conflicts_and_invalid_evidence_leave_no_durable_effect(pool: PgPool) {
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
+async fn adoption_naming_an_unrelated_client_id_leaves_no_durable_effect(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let r = record();
+    assert!(f.ledger.record_order(&r, &unowned(), seen(1)).await.unwrap().changed);
+    let before = snapshot(&pool).await;
+    let mut link = f.link(LegOrderKind::Sell);
+    link.client_order_id = "unrelated".into();
+    assert_eq!(
+        f.ledger.record_order(&r, &link, seen(2)).await,
+        Err(LedgerError::IdentityConflict)
+    );
+    assert_eq!(snapshot(&pool).await, before);
+    assert_eq!(f.consumed(&pool).await, Decimal::ZERO);
+    // The matching client lineage still adopts the whole execution.
+    let link = f.link(LegOrderKind::Sell);
+    assert!(f.ledger.record_order(&r, &link, seen(3)).await.unwrap().changed);
+    assert_eq!(f.consumed(&pool).await, Decimal::from(2));
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_contradictory_known_quote_leaves_no_durable_effect(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let link = f.link(LegOrderKind::Sell);
+    let r = record();
+    f.ledger.record_order(&r, &link, seen(1)).await.unwrap();
+    let before = snapshot(&pool).await;
+    for (executed, quote) in [(2, 150), (2, 201), (3, 150)] {
+        let mut x = r.clone();
+        x.executed_qty = Decimal::from(executed);
+        x.cumulative_quote_qty = Some(Decimal::from(quote));
+        assert_eq!(
+            f.ledger.record_order(&x, &link, seen(2)).await,
+            Err(LedgerError::TradeConflict)
+        );
+        assert_eq!(snapshot(&pool).await, before);
+    }
+    let mut x = r.clone();
+    x.executed_qty = Decimal::from(3);
+    x.cumulative_quote_qty = Some(Decimal::from(300));
+    assert!(f.ledger.record_order(&x, &link, seen(3)).await.unwrap().changed);
+    assert_eq!(f.consumed(&pool).await, Decimal::from(3));
+    let quote: Option<Decimal> = sqlx::query_scalar("SELECT cumulative_quote FROM venue_orders")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(quote, Some(Decimal::from(300)));
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
 async fn first_clock_evidence_is_retained_even_when_later_audit_changes(pool: PgPool) {
     use robson_exec::venue_ledger::{ClockEvidence, ClockVerdict};
     let f = Fixture::new(&pool).await;

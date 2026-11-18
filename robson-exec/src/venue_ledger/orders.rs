@@ -208,6 +208,16 @@ pub fn merge_order(
             },
             (OrderOwner::Leg { .. }, _) => {}, // A non-leg link supplies no new ownership
             // information.
+            // Adoption names the order by client ID, as insertion does: the
+            // venue's current or original ID, or the first ID this row proved.
+            (_, OrderOwner::Leg { .. })
+                if link.client_order_id != record.client_order_id
+                    && record.orig_client_order_id.as_deref()
+                        != Some(link.client_order_id.as_str())
+                    && link.client_order_id != old.client_order_id =>
+            {
+                return Err(LedgerError::IdentityConflict)
+            },
             (_, OrderOwner::Leg { .. }) => {
                 order.owner = link.owner.clone();
                 adopting = true;
@@ -240,6 +250,13 @@ pub fn merge_order(
             // unknown.
         } else {
             if !execution_regressed {
+                // A known total is fixed at its quantity and cannot shrink as
+                // execution grows.
+                if let (Some(a), Some(b)) = (old.cumulative_quote, record.cumulative_quote_qty) {
+                    if b < a || (b != a && record.executed_qty == old.executed_cum) {
+                        return Err(LedgerError::TradeConflict);
+                    }
+                }
                 order.executed_cum = record.executed_qty;
                 // A quote belongs to its executed quantity. An earlier subtotal
                 // cannot become the total for newly observed execution.
