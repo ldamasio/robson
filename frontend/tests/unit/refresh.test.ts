@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { serialRefresh } from '#lib/utils/refresh.ts';
+import { selectionRefresh, serialRefresh } from '#lib/utils/refresh.ts';
 
 function deferred() {
   let resolve!: () => void;
@@ -65,5 +65,60 @@ describe('serialized snapshot refresh', () => {
     await refresh();
     await refresh();
     expect(runs).toBe(2);
+  });
+});
+
+describe('selection-bound history refresh', () => {
+  function harness() {
+    let selected = '2026-10';
+    const reads: Array<{ month: string; resolve: (v: string) => void; reject: (e: Error) => void }> = [];
+    const published: string[] = [];
+    const failed: string[] = [];
+    const refresh = selectionRefresh<string, string>({
+      selection: () => selected,
+      read: (month) => new Promise<string>((resolve, reject) => { reads.push({ month, resolve, reject }); }),
+      publish: (month, result) => published.push(`${month}:${result}`),
+      fail: (month) => failed.push(month),
+    });
+    return { refresh, reads, published, failed, select: (m: string) => { selected = m; } };
+  }
+
+  it('keeps publishing the current selection under sustained refreshes', async () => {
+    const h = harness();
+    h.select('2026-09');
+    h.refresh();
+    for (let round = 0; round < 4; round += 1) {
+      h.refresh();
+      h.reads[round].resolve(`r${round}`);
+      await flush();
+    }
+    expect(h.published).toEqual(['2026-09:r0', '2026-09:r1', '2026-09:r2', '2026-09:r3']);
+  });
+
+  it('drops a response for a selection changed in flight and reads the new one', async () => {
+    const h = harness();
+    h.refresh();
+    h.select('2026-09');
+    h.refresh();
+    h.reads[0].resolve('october-data');
+    await flush();
+    expect(h.published).toEqual([]);
+    expect(h.reads[1].month).toBe('2026-09');
+    h.reads[1].resolve('september-data');
+    await flush();
+    expect(h.published).toEqual(['2026-09:september-data']);
+  });
+
+  it('reports an error only for the current selection', async () => {
+    const h = harness();
+    h.refresh();
+    h.select('2026-09');
+    h.refresh();
+    h.reads[0].reject(new Error('fixture october failure'));
+    await flush();
+    expect(h.failed).toEqual([]);
+    h.reads[1].reject(new Error('fixture september failure'));
+    await flush();
+    expect(h.failed).toEqual(['2026-09']);
   });
 });

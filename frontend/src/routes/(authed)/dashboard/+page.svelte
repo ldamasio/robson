@@ -35,7 +35,7 @@
   } from "#lib/config/slots.ts";
   import { formatTimeUtc, isTodayUtc, utcDateKey } from "#lib/utils/time.ts";
   import { exclusiveMutation, mutationPending } from "$stores/mutation";
-  import { latestOnly } from "#lib/utils/latest.ts";
+  import { selectionRefresh } from "#lib/utils/refresh.ts";
   import {
     deriveBudgetView,
     MONTHLY_BUDGET_LIMIT_PCT,
@@ -56,13 +56,26 @@
   let connected = $state(false);
   let closeSse: (() => void) | null = null;
   let showArmModal = $state(false);
-  let historyError = $state<string | null>(null);
+  // History state carries the month it belongs to, so nothing published for
+  // one month is ever shown under another month's heading.
+  let historyFailure = $state<{ month: string; message: string } | null>(null);
   let eventsError = $state<string | null>(null);
   let eventsLoading = $state(true);
   let eventHistoryRequest = 0;
   let selectedMonth = $state(currentMonthKey());
-  let monthlyPositions = $state<Position[]>([]);
-  let monthlySlotCellsTotal = $state<number | null>(null);
+  let monthlyHistory = $state<{
+    month: string;
+    positions: Position[];
+    slotCellsTotal: number | null;
+  } | null>(null);
+  let shownHistory = $derived(
+    monthlyHistory?.month === selectedMonth ? monthlyHistory : null,
+  );
+  let monthlyPositions = $derived(shownHistory?.positions ?? []);
+  let monthlySlotCellsTotal = $derived(shownHistory?.slotCellsTotal ?? null);
+  let historyError = $derived(
+    historyFailure?.month === selectedMonth ? historyFailure.message : null,
+  );
   let currentStatus = $derived($sharedStatus);
   // From the shared status, so every refresh path (bootstrap, SSE-triggered,
   // poll, NavBar) updates the approval list, not only loadStatus().
@@ -284,29 +297,31 @@
     }
   }
 
-  // Month changes can overlap: only the newest selection may publish its
-  // positions, totals or error, so a slow earlier month never shows under
-  // the current heading.
-  const historyRequests = latestOnly();
-
-  async function loadHistory() {
-    const isCurrent = historyRequests.begin();
-    historyError = null;
-    monthlySlotCellsTotal = null;
-    try {
-      const response = await robsonApi.getMonthlyPositions(selectedMonth);
-      if (!isCurrent()) return;
-      monthlyPositions = response.positions;
+  // History reads are serialized per dashboard and bound to the month on
+  // view: each read publishes only if its month is still selected, repeated
+  // refreshes of the same month keep publishing, and a month change (which
+  // always triggers a refresh) is read by the coalesced follow-up.
+  const loadHistory = selectionRefresh({
+    selection: () => selectedMonth,
+    read: (month: string) => robsonApi.getMonthlyPositions(month),
+    publish: (month, response) => {
       const maybeTotal = Number(
         (response as { slot_cells_total?: unknown }).slot_cells_total,
       );
-      monthlySlotCellsTotal = Number.isFinite(maybeTotal) ? maybeTotal : null;
-    } catch (e) {
-      if (!isCurrent()) return;
-      historyError =
-        e instanceof Error ? e.message : "Failed to load month history";
-    }
-  }
+      monthlyHistory = {
+        month,
+        positions: response.positions,
+        slotCellsTotal: Number.isFinite(maybeTotal) ? maybeTotal : null,
+      };
+      historyFailure = null;
+    },
+    fail: (month, e) => {
+      historyFailure = {
+        month,
+        message: e instanceof Error ? e.message : "Failed to load month history",
+      };
+    },
+  });
 
   async function loadTodayEvents(date = utcDateKey()) {
     const requestId = ++eventHistoryRequest;
