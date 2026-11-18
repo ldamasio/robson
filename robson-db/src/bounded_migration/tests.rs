@@ -160,10 +160,20 @@ fn preflight39_refuses_untimed_or_untransacted_shapes() {
         Migration::new(VERSION39, "shape".into(), MigrationType::Simple, sql.into(), false)
     };
     assert!(preflight39(&selected("ALTER TABLE t ADD COLUMN c INTEGER;\n")).is_ok());
+    let header = "-- refused; kept\n\n  --\n-- a; b;\nALTER TABLE t ADD COLUMN c INTEGER;\n";
+    assert!(preflight39(&selected(header)).is_ok(), "header semicolons are not commands");
     for sql in [
         "ALTER TABLE t ADD COLUMN c INTEGER",
         "ALTER TABLE t ADD COLUMN c INTEGER; SELECT 1;",
         "BEGIN; ALTER TABLE t ADD COLUMN c INTEGER; COMMIT;",
+        "-- header;\nALTER TABLE t ADD COLUMN c INTEGER; SELECT 1;",
+        "-- header;\nBEGIN; ALTER TABLE t ADD COLUMN c INTEGER; COMMIT;",
+        "-- only a comment;",
+        "-- header;\n",
+        // After code starts, a `--` line may be quoted; it still counts.
+        "SELECT $$\n--$$; SELECT 1;\nSELECT 2;",
+        "ALTER TABLE t\n-- inner;\nADD COLUMN c INTEGER;",
+        "ALTER TABLE t ADD COLUMN c INTEGER;\n-- trailing;",
     ] {
         assert!(preflight39(&selected(sql)).is_err(), "accepted {sql}");
     }

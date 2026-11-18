@@ -298,12 +298,23 @@ fn selects39(migration: &Migration, expected: Option<&Migration>) -> bool {
 
 /// PG12 has no per-command statement timer inside a multi-command simple
 /// Query, so the selected contract must stay one transactional statement.
+/// Only the leading header of blank and `--` lines is skipped: no code
+/// precedes it, so no quote can hide a separator there. Every later line,
+/// comment or not, still counts.
 fn preflight39(migration: &Migration) -> Result<(), MigrateError> {
     if migration.no_tx || migration.migration_type != MigrationType::Simple {
         return Err(refusal("migration39 must run inside one SQLx transaction"));
     }
     let sql = migration.sql.trim_end();
-    if !sql.ends_with(';') || sql.matches(';').count() != 1 {
+    let semicolons: usize = sql
+        .lines()
+        .skip_while(|line| {
+            let line = line.trim_start();
+            line.is_empty() || line.starts_with("--")
+        })
+        .map(|line| line.matches(';').count())
+        .sum();
+    if !sql.ends_with(';') || semicolons != 1 {
         return Err(refusal("migration39 must be one top-level statement"));
     }
     Ok(())
