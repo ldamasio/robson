@@ -88,8 +88,15 @@ impl<'de> Deserialize<'de> for ExactDecimal {
 /// Spot amounts/rules/rates: reject negative original values before conversion
 /// could erase their sign. A mathematical negative zero is just zero.
 pub fn nonnegative<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Decimal, D::Error> {
-    let value = ExactDecimal::deserialize(deserializer)?.value();
-    if value < Decimal::ZERO {
+    Ok(nonnegative_exact(deserializer)?.value())
+}
+
+/// Preserve exact original-token provenance across a typed connector boundary.
+pub fn nonnegative_exact<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ExactDecimal, D::Error> {
+    let value = ExactDecimal::deserialize(deserializer)?;
+    if value.value() < Decimal::ZERO {
         return Err(de::Error::custom("negative spot decimal"));
     }
     Ok(value)
