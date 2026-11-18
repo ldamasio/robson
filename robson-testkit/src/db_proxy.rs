@@ -780,7 +780,9 @@ fn simple_query_text(body: &[u8]) -> String {
 
 /// Trace-only: the query string must end at its one canonical NUL.
 fn exact_simple_query_text(body: &[u8]) -> Option<String> {
-    let (&0, text) = body.split_last()? else { return None };
+    let (&0, text) = body.split_last()? else {
+        return None;
+    };
     if text.contains(&0) {
         return None;
     }
@@ -1077,11 +1079,9 @@ mod tests {
             // Default mode still trims, and forwarded bytes never change.
             for (exact, bodies, trace) in [
                 (false, vec![b" SELECT 4; \0".as_slice()], vec!["SELECT 4"]),
-                (
-                    true,
-                    vec![b" SELECT 5; \0".as_slice(), b"SELECT 6\0x\0".as_slice()],
-                    vec![" SELECT 5; "],
-                ),
+                (true, vec![b" SELECT 5; \0".as_slice(), b"SELECT 6\0x\0".as_slice()], vec![
+                    " SELECT 5; ",
+                ]),
             ] {
                 if exact {
                     proxy.enable_exact_query_trace(2);
