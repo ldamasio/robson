@@ -299,6 +299,47 @@ async fn the_planned_statements_are_the_ones_sent_on_spot(pool: PgPool) {
     }
 }
 
+fn db_attempts_total() -> u64 {
+    prometheus::gather()
+        .iter()
+        .find(|family| family.get_name() == "robsond_reconciliation_db_attempts_total")
+        .map_or(0, |family| family.get_metric()[0].get_counter().get_value() as u64)
+}
+
+/// Every statement a balance commit sends is an observed operation attempt,
+/// as on the unflagged path: the proxy's count is the independent oracle.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_balance_commit_counts_every_statement_as_operation_io(pool: PgPool) {
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let tenant = Uuid::now_v7();
+    seed_account(&pool, tenant, SPOT).await;
+    let (proxy, proxied) = through_proxy(&pool).await;
+    let backend = PgJournalBackend::new(&proxied, tenant);
+    backend.check_ready().await.unwrap();
+    robsond::operation_observation::initialize_metrics();
+    for (id, kind) in [("observed-cancel", IntentKind::Cancel), ("observed-exit", IntentKind::Exit)] {
+        let batch = balance_batch(id, kind);
+        let (sent, observed) = async {
+            robson_exec::observation::reconciliation(async {
+                let statements = proxy.stats().statements;
+                let attempts = db_attempts_total();
+                backend.commit(&batch).await.unwrap();
+                (proxy.stats().statements - statements, db_attempts_total() - attempts)
+            })
+            .await
+        }
+        .with_subscriber(
+            tracing_subscriber::registry().with(robsond::operation_observation::layer()),
+        )
+        .await;
+        assert_eq!(sent, u64::from(batch.statements()));
+        assert_eq!(observed, sent, "{id}: every sent statement is one observed attempt");
+    }
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn a_usdm_commit_issues_exactly_its_pre_8e_statements(pool: PgPool) {
