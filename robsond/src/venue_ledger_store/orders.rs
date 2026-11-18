@@ -17,6 +17,18 @@ use uuid::Uuid;
 
 use super::{backend, commit_error, LedgerConnection, PgVenueLedger};
 
+/// Exactly the `o.` columns `decode_order` reads, all builtin types. Never
+/// `o.*`: unread capture columns of a custom type make a cold connection
+/// resolve their type with extra catalog statements.
+pub(super) const ORDER_COLUMNS: &str = "o.venue_id,o.account_scope,o.symbol,o.exchange_order_id,
+    o.tenant_id,o.client_order_id,o.last_client_order_id,o.owner,o.intent_id,o.position_id,o.kind,
+    o.side,o.order_type,o.orig_qty,o.stop_price,o.status,o.phase,o.expiry_reason,o.executed_cum,
+    o.cumulative_quote,o.quote_floor,o.fills_qty,o.trades_cursor,o.last_checked_at,o.venue_time_ms,
+    o.venue_update_time_ms,o.venue_transact_time_ms,o.venue_working_time_ms,o.live_seen_at,
+    o.live_clock_sample_id,o.live_clock_wall_delta_ms,o.live_clock_mono_delta_ms,o.live_clock_verdict,
+    o.terminal_seen_at,o.terminal_clock_sample_id,o.terminal_clock_wall_delta_ms,
+    o.terminal_clock_mono_delta_ms,o.terminal_clock_verdict";
+
 pub(super) struct OrderContext {
     pub(super) order: Option<StoredOrder>,
     pub(super) leg: Option<OrderLeg>,
@@ -90,7 +102,7 @@ impl PgVenueLedger {
     ) -> Result<OrderContext, LedgerError> {
         let lock = if locked { " FOR UPDATE" } else { "" };
         let sql = format!(
-            "SELECT o.*, l.position_id AS leg_position_id,l.tenant_id AS leg_tenant_id,
+            "SELECT {ORDER_COLUMNS}, l.position_id AS leg_position_id,l.tenant_id AS leg_tenant_id,
             l.venue_id AS leg_venue_id,l.account_scope AS leg_scope,l.symbol AS leg_symbol,
             l.admission_intent_id AS leg_admission,l.decided_month AS leg_month,
             l.cohort_month AS leg_cohort,l.consumed_cum AS leg_consumed,l.closed_at AS leg_closed

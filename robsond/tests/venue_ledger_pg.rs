@@ -482,11 +482,29 @@ async fn a_contradictory_known_quote_leaves_no_durable_effect(pool: PgPool) {
 async fn first_clock_evidence_is_retained_even_when_later_audit_changes(pool: PgPool) {
     use robson_exec::venue_ledger::{ClockEvidence, ClockVerdict};
     let f = Fixture::new(&pool).await;
+    // Both clock ids reference clock_samples on the same tenant, venue and
+    // epoch. Idle wall/tick brackets make a matching server time valid.
+    let epoch = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO process_epochs (epoch_id, tenant_id, binary_version) VALUES ($1, $2, 'clock-fixture')")
+        .bind(epoch).bind(f.tenant).execute(&pool).await.unwrap();
+    let [live_sample, terminal_sample] = [uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+    let boot = uuid::Uuid::now_v7();
+    for (sample, valid) in [(live_sample, true), (terminal_sample, false)] {
+        sqlx::query("INSERT INTO clock_samples (sample_id,tenant_id,venue_id,process_epoch,clock_domain,send_wall_seconds,send_wall_nanoseconds,send_tick_before,send_tick_after,receive_wall_seconds,receive_wall_nanoseconds,receive_tick_before,receive_tick_after,server_ms,theta2_ns,r_low_ns,r_high_ns,u2_ns,numeric_verdict,numeric_failures,algorithm_version,recorded_at)
+            VALUES ($1,$2,$3,$4,ROW('boottime',$5::uuid,0,0)::budget_clock_domain_v38,1794614400,0,0,0,1794614400,0,0,0,
+                CASE WHEN $6 THEN 1794614400000 ELSE 0 END,
+                CASE WHEN $6 THEN 0 ELSE -3589228800000000000 END,0,0,
+                CASE WHEN $6 THEN 200000000 ELSE 3589228800200000000 END,
+                CASE WHEN $6 THEN 'valid' ELSE 'invalid' END,
+                CASE WHEN $6 THEN 0 ELSE 1 END,1,now())")
+            .bind(sample).bind(f.tenant).bind(VENUE).bind(epoch).bind(boot).bind(valid)
+            .execute(&pool).await.unwrap();
+    }
     let link = f.link(LegOrderKind::Sell);
     let mut r = record();
     let mut first = seen(1);
     first.clock = Some(ClockEvidence {
-        sample_id: uuid::Uuid::now_v7(),
+        sample_id: live_sample,
         wall_delta_ms: 5,
         mono_delta_ms: 6,
         verdict: ClockVerdict::Valid,
@@ -496,7 +514,7 @@ async fn first_clock_evidence_is_retained_even_when_later_audit_changes(pool: Pg
     r.status = "CANCELED".into();
     let mut terminal = seen(2);
     terminal.clock = Some(ClockEvidence {
-        sample_id: uuid::Uuid::now_v7(),
+        sample_id: terminal_sample,
         wall_delta_ms: 9,
         mono_delta_ms: 10,
         verdict: ClockVerdict::Invalid,

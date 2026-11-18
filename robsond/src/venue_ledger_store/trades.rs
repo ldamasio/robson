@@ -15,7 +15,7 @@ use sqlx::{postgres::PgRow, Connection, PgConnection, Postgres, Row, Transaction
 
 use super::{
     backend, commit_error,
-    orders::{decode_order, order_error},
+    orders::{decode_order, order_error, ORDER_COLUMNS},
     LedgerConnection, PgVenueLedger,
 };
 
@@ -126,7 +126,7 @@ impl PgVenueLedger {
     ) -> Result<(StoredOrder, Vec<StoredTrade>), LedgerError> {
         self.statement();
         let sql = format!(
-            "SELECT o.*,{FILL_COLUMNS} FROM venue_orders o LEFT JOIN order_fills f
+            "SELECT {ORDER_COLUMNS},{FILL_COLUMNS} FROM venue_orders o LEFT JOIN order_fills f
             ON f.venue_id=$1 AND f.account_scope=$2 AND f.symbol=$3 AND f.trade_id=ANY($5)
             WHERE o.venue_id=$1 AND o.account_scope=$2 AND o.symbol=$3 AND o.exchange_order_id=$4"
         );
