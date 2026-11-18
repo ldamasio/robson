@@ -1,7 +1,7 @@
 //! Actual unflagged journal writes blocked by original52, never a Spot grant.
 #[path = "coexistence_cleanup.rs"]
 mod cleanup;
-use std::{sync::Arc, time::Instant};
+use std::{io::Write, sync::Arc, time::Instant};
 
 use robson_exec::{
     gate::{Incident, IncidentReason},
@@ -152,8 +152,10 @@ async fn contend(
     };
     let after = f.proxy.stats();
     // Diagnostic only: the measured values behind the cancellation/outcome and
-    // actor checks below, printed once after the job has finished.
-    eprintln!(
+    // actor checks below, written once straight to stderr (not
+    // captured by libtest) after the job has finished.
+    writeln!(
+        std::io::stderr().lock(),
         "COEXIST_DIAG work={work:?} cancelled_at={cancelled_at:?} apply_bound={APPLY_BOUND:?} status={:?} observed_ok={} refused={refused} actor_statements={} actor_commits={} job_ok={:?} job_err={} job_duration={job_duration:?}",
         f.adapter.status(),
         observed.is_ok(),
@@ -161,7 +163,7 @@ async fn contend(
         cut_stats.commits - before.commits,
         job_result.as_ref().ok(),
         job_result.is_err(),
-    );
+    )?;
     let (windows, (waiting_pid, polls)) = observed?;
     ensure!(
         slot.lock().map_err(|_| anyhow::anyhow!("gate poisoned"))?.is_none(),
