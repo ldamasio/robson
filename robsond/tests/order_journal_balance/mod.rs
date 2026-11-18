@@ -320,6 +320,15 @@ async fn a_balance_commit_counts_every_statement_as_operation_io(pool: PgPool) {
     let backend = PgJournalBackend::new(&proxied, tenant);
     backend.check_ready().await.unwrap();
     robsond::operation_observation::initialize_metrics();
+    // Retain a second registered dispatcher for the whole observation, as the
+    // crate's own probe does: with one registered dispatcher, tracing-core
+    // 0.1.36 asks the registering thread's default, so a concurrent
+    // unobserved test could cache NEVER for a shared balance SQL callsite.
+    // The guard is never installed as a default and enables no callsite.
+    let _registration_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let observed_dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(robsond::operation_observation::layer()),
+    );
     for (id, kind) in [
         ("observed-cancel", IntentKind::Cancel),
         ("observed-exit", IntentKind::Exit),
@@ -334,9 +343,7 @@ async fn a_balance_commit_counts_every_statement_as_operation_io(pool: PgPool) {
             })
             .await
         }
-        .with_subscriber(
-            tracing_subscriber::registry().with(robsond::operation_observation::layer()),
-        )
+        .with_subscriber(observed_dispatch.clone())
         .await;
         assert_eq!(sent, u64::from(batch.statements()));
         assert_eq!(observed, sent, "{id}: every sent statement is one observed attempt");
