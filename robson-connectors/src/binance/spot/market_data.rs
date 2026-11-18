@@ -22,12 +22,11 @@
 //!   minute (L54-L57): the shared stream answers each ping with its payload
 //!   while the caller reads.
 
-use std::str::FromStr;
-
 use async_trait::async_trait;
 use robson_domain::{Price, Symbol};
-use robson_exec::{TradeFeedMessage, TradeFeedPort, TradeStream};
-use rust_decimal::Decimal;
+use robson_exec::{
+    balance_costs::exact::ExactDecimal, TradeFeedMessage, TradeFeedPort, TradeStream,
+};
 
 use crate::binance_ws::{BinanceWebSocketClient, BinanceWsStream, WsMessage};
 
@@ -69,8 +68,8 @@ pub(super) fn decode_message(message: WsMessage) -> TradeFeedMessage {
         return TradeFeedMessage::NonTrade;
     };
 
-    let price_decimal = match Decimal::from_str(&trade.price) {
-        Ok(d) => d,
+    let price_decimal = match trade.price.parse::<ExactDecimal>() {
+        Ok(d) => d.value(),
         Err(e) => {
             return TradeFeedMessage::Malformed {
                 reason: "Failed to parse price",

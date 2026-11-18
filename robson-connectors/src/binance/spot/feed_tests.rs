@@ -248,7 +248,21 @@ async fn the_spot_feed_delivers_what_the_usdm_feed_delivers() {
         delivered(&BinanceUsdmTradeFeed::new(false, vec![endpoint.clone()]), &endpoint).await;
     assert_eq!(usdm_server.await.unwrap(), "/ws/btcusdt@aggTrade");
 
-    assert_eq!(spot, usdm);
+    // Exact spot parsing intentionally has a different diagnostic for invalid
+    // decimal text. Every other delivery remains identical to USD-M.
+    for (index, (spot_message, usdm_message)) in spot.iter().zip(&usdm).enumerate() {
+        if index == 2 {
+            assert!(matches!(spot_message, Ok(TradeFeedMessage::Malformed {
+                reason: "Failed to parse price", value, error
+            }) if value == "not-a-number" && error == "expected a bounded, exactly representable plain decimal string"));
+            assert!(matches!(usdm_message, Ok(TradeFeedMessage::Malformed {
+                reason: "Failed to parse price", value, error
+            }) if value == "not-a-number" && error == "Invalid decimal: unknown character"));
+        } else {
+            assert_eq!(spot_message, usdm_message);
+        }
+    }
+    assert_eq!(spot.len(), usdm.len());
     let kinds: Vec<&str> = spot
         .iter()
         .map(|message| match message {

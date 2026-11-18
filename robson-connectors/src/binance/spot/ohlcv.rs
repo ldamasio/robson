@@ -4,8 +4,8 @@
 //! [`SpotRead::KLINES`] through the shared REST client, whose path rule sends
 //! `/api/v3/` to the spot host; since 8c-3 on its spot read helper, values
 //! encoded and one request with no redirect or retry. The spot response has the
-//! futures layout at the indices the shared kline parser reads, so the rows go
-//! through it, and errors map as `BinanceOhlcvAdapter` maps them. No production
+//! futures layout, but its decimals use the isolated exact spot parser.
+//! Errors map as `BinanceOhlcvAdapter` maps them. No production
 //! path constructs [`BinanceSpotOhlcv`] yet (SD12; `inertness_tests.rs`).
 //!
 //! Venue facts, `rest-api.md` at `995f6eb3` (F25):
@@ -26,12 +26,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use robson_domain::{Candle, Symbol};
-use robson_exec::{CandleInterval, ExecError, OhlcvPort};
+use robson_exec::{balance_costs::exact::ExactDecimal, CandleInterval, ExecError, OhlcvPort};
+use serde_json::Value;
 
 use super::rest::SpotRead;
 use crate::{
     binance::wire,
-    binance_rest::{parse_futures_klines, BinanceRestClient, BinanceRestError},
+    binance_rest::{BinanceKline, BinanceRestClient, BinanceRestError},
 };
 
 /// The most klines one request may ask for (L1292).
@@ -102,7 +103,7 @@ impl OhlcvPort for BinanceSpotOhlcv {
             .get_public_spot_answer(SpotRead::KLINES.path, params)
             .await
             .and_then(|answer| answer.into_body())
-            .and_then(|body| parse_futures_klines(&body))
+            .and_then(|body| parse_spot_klines(&body))
             .map_err(Self::map_error)?;
 
         klines
@@ -125,4 +126,37 @@ impl OhlcvPort for BinanceSpotOhlcv {
             })
             .collect()
     }
+}
+
+/// Keep the legacy USD-M parser untouched. Strings remain strings through
+/// Value; numeric JSON is never converted to a Decimal (or through f64).
+pub(super) fn parse_spot_klines(body: &str) -> Result<Vec<BinanceKline>, BinanceRestError> {
+    let rows: Vec<Vec<Value>> = serde_json::from_str(body)
+        .map_err(|_| BinanceRestError::ParseError("invalid spot kline array".into()))?;
+    if rows.len() > usize::from(KLINES_MAX_LIMIT) {
+        return Err(BinanceRestError::ParseError("too many spot klines".into()));
+    }
+    rows.into_iter().map(parse_spot_kline).collect()
+}
+
+fn parse_spot_kline(row: Vec<Value>) -> Result<BinanceKline, BinanceRestError> {
+    let invalid = || BinanceRestError::ParseError("invalid spot kline field".into());
+    let decimal = |index| {
+        let text = row.get(index).and_then(Value::as_str).ok_or_else(invalid)?;
+        let value = text.parse::<ExactDecimal>().map_err(|_| invalid())?.value();
+        if value.is_sign_negative() && !value.is_zero() {
+            return Err(invalid());
+        }
+        Ok(value)
+    };
+    Ok(BinanceKline {
+        open_time_ms: row.first().and_then(Value::as_i64).ok_or_else(invalid)?,
+        open: decimal(1)?,
+        high: decimal(2)?,
+        low: decimal(3)?,
+        close: decimal(4)?,
+        volume: decimal(5)?,
+        close_time_ms: row.get(6).and_then(Value::as_i64).ok_or_else(invalid)?,
+        trades: row.get(8).and_then(Value::as_u64).ok_or_else(invalid)?,
+    })
 }
