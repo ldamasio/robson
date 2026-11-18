@@ -574,9 +574,9 @@ just v2-db-up
 # Step 2: run all Postgres-backed tests
 just test-pg
 
-# Filter to a specific test
+# Filter by test name (a filtered run is always one test at a time)
 DATABASE_URL=postgresql://robson:robson@localhost:5432/robson_v2 \
-  bash scripts/test-pg.sh --test crash_recovery
+  bash scripts/test-pg.sh crash_recovery
 ```
 
 The `scripts/test-pg.sh` script refuses URLs containing `prod`, `production`, or `live` as a safety guard.

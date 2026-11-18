@@ -16,13 +16,35 @@ use std::{
 
 use anyhow::Result;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
     sync::watch,
     task::JoinHandle,
+};
+
+mod control;
+#[cfg(test)]
+mod control_lifecycle_tests;
+#[cfg(test)]
+mod control_namespace_tests;
+#[cfg(test)]
+mod control_ready_tests;
+#[cfg(test)]
+mod control_tests;
+#[cfg(test)]
+use control::io::test_support as control_test_support;
+mod diagnostic;
+pub use control::{
+    ClientLoss, ControlBoundary, ControlError, ControlGate, ControlHit, ControlLease,
+    ControlSnapshot,
+};
+pub use diagnostic::{
+    Delivery as DiagnosticDelivery, Event as DiagnosticEvent, Identity as DiagnosticIdentity,
+    JournalLabel, Phase as DiagnosticPhase, Record as DiagnosticRecord,
+    Snapshot as DiagnosticSnapshot, SqlCategory,
 };
 
 const SSL_REQUEST: i32 = 80_877_103;
@@ -53,6 +75,11 @@ pub enum ProxyMode {
     DropRollbackAck,
     /// As above, only after a transaction executed matching SQL text.
     DropRollbackAckOf(&'static str),
+    /// Drop completion of one matching single-statement autocommit, after the
+    /// server reports CommandComplete and idle ReadyForQuery. Parse/Bind alone
+    /// do not fire it; explicit transactions and multi-statement simple
+    /// queries are excluded. Cached extended executions remain attributable.
+    DropAutocommitAckOf(&'static str),
 }
 
 /// Connection and commit counts.
@@ -69,11 +96,13 @@ pub struct ProxyStats {
 #[derive(Default)]
 struct Counters {
     connections: AtomicU64,
+    closed_relays: AtomicU64,
     commits: AtomicU64,
     commit_acks_dropped: AtomicU64,
     statements: AtomicU64,
     rollback_acks_dropped: AtomicU64,
     prepared_statement_parses: AtomicU64,
+    autocommit_acks_dropped: AtomicU64,
 }
 
 /// Optional test SQL only: never startup/authentication or bound parameter
@@ -93,6 +122,10 @@ struct Shared {
     mode: watch::Sender<ProxyMode>,
     counters: Counters,
     trace: Mutex<Option<QueryTrace>>,
+    diagnostics: Mutex<Option<diagnostic::Trace>>,
+    control: Mutex<Option<Arc<control::State>>>,
+    #[cfg(test)]
+    close_observation: Mutex<Option<control_test_support::CloseObservation>>,
 }
 
 impl Shared {
@@ -110,6 +143,30 @@ impl Shared {
                 ProxyMode::DropRollbackAckOf(text) if rollback => transaction.executed(text),
                 _ => false,
             };
+            if fires {
+                *mode = ProxyMode::Pass;
+            }
+            fires
+        })
+    }
+
+    fn claim_autocommit_ack_drop(
+        &self,
+        transaction: &TransactionWatch,
+        tag: u8,
+        body: &[u8],
+    ) -> bool {
+        if transaction.in_transaction || !matches!(tag, b'Q' | b'E') {
+            return false;
+        }
+        let Some(sql) = transaction.statement_text(tag, body) else {
+            return false;
+        };
+        if tag == b'Q' && sql.contains(';') {
+            return false;
+        }
+        self.mode.send_if_modified(|mode| {
+            let fires = matches!(*mode, ProxyMode::DropAutocommitAckOf(text) if sql.contains(text));
             if fires {
                 *mode = ProxyMode::Pass;
             }
@@ -142,6 +199,37 @@ struct TransactionWatch {
 }
 
 impl TransactionWatch {
+    fn diagnostic_metadata(&self, tag: u8, body: &[u8]) -> (SqlCategory, bool) {
+        if !matches!(tag, b'P' | b'B' | b'E' | b'Q') {
+            return (SqlCategory::Other, false);
+        }
+        let mut fields = body.splitn(3, |byte| *byte == 0);
+        let first = fields.next().unwrap_or_default();
+        let second = fields.next().unwrap_or_default();
+        let text = match tag {
+            b'P' => std::str::from_utf8(second).ok(),
+            b'B' => self.statements.get(second).map(String::as_str),
+            b'E' => self.portal_statement.get(first).map(String::as_str),
+            b'Q' => std::str::from_utf8(first).ok(),
+            _ => None,
+        };
+        text.map_or((SqlCategory::Other, true), |sql| {
+            // Diagnostic suppression only: this is not a general proof of SQL
+            // effects. Literals/comments can conservatively cause Unknown.
+            let namespace_opaque = sql.len() > 16_384
+                || ["PREPARE", "DEALLOCATE", "DISCARD", "DECLARE"].iter().any(|word| {
+                    sql.as_bytes()
+                        .windows(word.len())
+                        .any(|part| part.eq_ignore_ascii_case(word.as_bytes()))
+                });
+            if namespace_opaque {
+                (SqlCategory::Other, true)
+            } else {
+                (classify_diagnostic_sql(sql), false)
+            }
+        })
+    }
+
     /// Note one frontend message.
     fn observe(&mut self, tag: u8, body: &[u8]) {
         let mut fields = body.splitn(3, |byte| *byte == 0);
@@ -210,6 +298,8 @@ pub struct DbProxy {
 
 impl Drop for DbProxy {
     fn drop(&mut self) {
+        #[cfg(test)]
+        self.shared.close_observation.lock().unwrap().take();
         self.accept.abort();
         self.shared.mode.send_replace(ProxyMode::Sever);
     }
@@ -225,6 +315,10 @@ impl DbProxy {
             mode: watch::Sender::new(ProxyMode::Pass),
             counters: Counters::default(),
             trace: Mutex::default(),
+            diagnostics: Mutex::default(),
+            control: Mutex::default(),
+            #[cfg(test)]
+            close_observation: Mutex::default(),
         });
         let accept = tokio::spawn(accept_loop(listener, shared.clone()));
         Ok(Self { addr, shared, accept })
@@ -235,8 +329,55 @@ impl DbProxy {
         self.addr
     }
 
+    /// Bind one six-second control to an actual, known diagnostic identity.
+    /// Proof remains provisional until the relay confirms its local ACK state.
+    pub fn control(
+        &self,
+        identity: DiagnosticIdentity,
+        orphan: bool,
+    ) -> Result<ControlLease, ControlError> {
+        ControlLease::new(&self.shared, identity, orphan)
+    }
+
+    /// Enable finite protocol metadata before connecting any test client.
+    /// No SQL text, binds, authentication, error messages or cancellation key
+    /// enters this stream. Existing connections cannot acquire a missing PID.
+    pub fn enable_diagnostics(&self) {
+        *self.shared.diagnostics.lock().unwrap() = Some(diagnostic::Trace::new());
+    }
+
+    /// A bounded snapshot; this never locks a connection or performs I/O.
+    pub fn diagnostics(&self) -> Option<DiagnosticSnapshot> {
+        self.shared
+            .diagnostics
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(diagnostic::Trace::snapshot)
+    }
+
+    /// Live observation copies at most 32 identities, never the trace ring.
+    pub fn diagnostic_identities(&self) -> Option<Vec<DiagnosticIdentity>> {
+        self.shared
+            .diagnostics
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(diagnostic::Trace::identities)
+    }
+
+    /// Successful matching autocommits whose completion was swallowed.
+    pub fn autocommit_acks_dropped(&self) -> u64 {
+        self.shared.counters.autocommit_acks_dropped.load(Ordering::Relaxed)
+    }
+
     /// Change the failure mode.
     pub fn set_mode(&self, mode: ProxyMode) {
+        if mode != ProxyMode::Pass {
+            if let Some(state) = self.shared.control.lock().unwrap().as_ref() {
+                state.invalid();
+            }
+        }
         self.shared.mode.send_replace(mode);
     }
 
@@ -294,6 +435,13 @@ impl DbProxy {
             statements: counters.statements.load(Ordering::Relaxed),
         }
     }
+
+    /// Relay scopes that exited after dropping their forwarding future and
+    /// sockets. This is a passive lifetime observation, not SQL durability or
+    /// protocol authority. Callers must also resolve native/session state.
+    pub fn closed_relays(&self) -> u64 {
+        self.shared.counters.closed_relays.load(Ordering::Acquire)
+    }
 }
 
 async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
@@ -305,19 +453,56 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
 /// Relay one client connection until it ends or the mode severs it. Dropping
 /// the relay closes its sockets, so both peers see a closed connection.
 async fn relay_connection(client: TcpStream, shared: Arc<Shared>) {
-    shared.counters.connections.fetch_add(1, Ordering::Relaxed);
+    let connection_id = shared.counters.connections.fetch_add(1, Ordering::Relaxed) + 1;
     let mut mode = shared.mode.subscribe();
-    let severed = async move {
-        let _ = mode.wait_for(|mode| *mode == ProxyMode::Sever).await;
-    };
-    tokio::select! {
-        result = relay(client, &shared) => { let _ = result; },
-        () = severed => {},
+    let _closed = ControlClosed(&shared, connection_id);
+    let relay = relay(client, &shared, connection_id);
+    tokio::pin!(relay);
+    loop {
+        let state = control::active(&shared, connection_id);
+        if *mode.borrow() == ProxyMode::Sever
+            || state.as_ref().is_some_and(|s| s.cancelled.load(Ordering::Acquire))
+        {
+            break;
+        }
+        let expires = async {
+            match state.as_ref() {
+                Some(state) => tokio::time::sleep_until(state.deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            result = &mut relay => { let _ = result; break; },
+            changed = mode.changed() => { if changed.is_err() { break; } },
+            () = expires => { if let Some(state) = state.as_ref() { state.invalid(); } break; },
+        }
     }
 }
 
-async fn relay(mut client: TcpStream, shared: &Shared) -> std::io::Result<()> {
+struct ControlClosed<'a>(&'a Shared, u64);
+impl Drop for ControlClosed<'_> {
+    fn drop(&mut self) {
+        let state = {
+            let mut slot = self.0.control.lock().unwrap();
+            if slot.as_ref().is_some_and(|s| s.identity.connection == self.1) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(state) = state {
+            state.closed();
+        }
+        // The relay future is declared after this guard, so its I/O futures
+        // and socket halves have already dropped before this release witness.
+        self.0.counters.closed_relays.fetch_add(1, Ordering::Release);
+    }
+}
+
+async fn relay(mut client: TcpStream, shared: &Shared, id: u64) -> std::io::Result<()> {
     let startup = read_startup_packet(&mut client).await?;
+    let diagnostic =
+        diagnostic::Connection::new(&shared.diagnostics, id, diagnostic::journal_label(&startup));
     // A blackhole also swallows a new connection: it never reaches the server.
     while shared.blackholed() {
         let mut swallowed = [0; 512];
@@ -332,13 +517,33 @@ async fn relay(mut client: TcpStream, shared: &Shared) -> std::io::Result<()> {
     client.set_nodelay(true)?;
     server.set_nodelay(true)?;
 
-    let (client_read, client_write) = client.into_split();
-    let (server_read, server_write) = server.into_split();
+    let (mut client_read, mut client_write) = client.into_split();
+    let (mut server_read, mut server_write) = server.into_split();
+    #[cfg(test)]
+    let _socket_drop_probe = control_test_support::SocketDropProbe(shared, id);
     let commit_ack_pending = AtomicU8::new(0);
-    // Whichever direction ends first ends the connection.
+    let frontend = frontend_to_backend(
+        &mut client_read,
+        &mut server_write,
+        shared,
+        &commit_ack_pending,
+        diagnostic.as_ref(),
+        id,
+    );
+    let backend = backend_to_frontend(
+        &mut server_read,
+        &mut client_write,
+        shared,
+        &commit_ack_pending,
+        diagnostic.as_ref(),
+        id,
+    );
+    tokio::pin!(frontend, backend);
     tokio::select! {
-        result = frontend_to_backend(client_read, server_write, shared, &commit_ack_pending) => result,
-        result = backend_to_frontend(server_read, client_write, shared, &commit_ack_pending) => result,
+        result = &mut frontend => {
+            if control::active(shared, id).is_some_and(|s| s.orphaned()) { backend.await } else { result }
+        },
+        result = &mut backend => result,
     }
 }
 
@@ -361,14 +566,22 @@ async fn read_startup_packet(client: &mut TcpStream) -> std::io::Result<Vec<u8>>
 }
 
 async fn frontend_to_backend(
-    mut client: OwnedReadHalf,
-    mut server: OwnedWriteHalf,
+    client: &mut OwnedReadHalf,
+    server: &mut OwnedWriteHalf,
     shared: &Shared,
     commit_ack_pending: &AtomicU8,
+    diagnostic: Option<&diagnostic::Connection<'_>>,
+    id: u64,
 ) -> std::io::Result<()> {
     let mut transaction = TransactionWatch::default();
+    let frames = control::io::Frames {
+        shared,
+        pending: commit_ack_pending,
+        diagnostic,
+        id,
+    };
     loop {
-        let (tag, body) = read_message(&mut client).await?;
+        let (tag, body) = frames.read(client, true).await?;
         if shared.blackholed() {
             continue;
         }
@@ -389,31 +602,105 @@ async fn frontend_to_backend(
         {
             commit_ack_pending.store(2, Ordering::SeqCst);
         }
+        if shared.claim_autocommit_ack_drop(&transaction, tag, &body) {
+            commit_ack_pending.store(3, Ordering::SeqCst);
+        }
         if matches!(tag, b'Q' | b'E') {
             shared.counters.statements.fetch_add(1, Ordering::Relaxed);
             shared.trace_query(|| transaction.statement_text(tag, &body));
         }
+        let record = diagnostic.and_then(|diagnostic| {
+            let (category, namespace_opaque) = transaction.diagnostic_metadata(tag, &body);
+            let supported = !namespace_opaque
+                && (tag != b'Q'
+                    || !body.contains(&b';')
+                    || control::active(shared, id).is_some_and(|s| {
+                        s.association_supported(
+                            shared,
+                            commit_ack_pending.load(Ordering::SeqCst),
+                            &body,
+                        )
+                    }));
+            diagnostic.frontend(tag, category, supported)
+        });
         transaction.observe(tag, &body);
-        write_message(&mut server, tag, &body).await?;
+        frames.forward(server, tag, &body, record, true).await?;
     }
 }
 
 async fn backend_to_frontend(
-    mut server: OwnedReadHalf,
-    mut client: OwnedWriteHalf,
+    server: &mut OwnedReadHalf,
+    client: &mut OwnedWriteHalf,
     shared: &Shared,
     commit_ack_pending: &AtomicU8,
+    diagnostic: Option<&diagnostic::Connection<'_>>,
+    id: u64,
 ) -> std::io::Result<()> {
+    let mut autocommit_complete: Option<Vec<u8>> = None;
+    let mut held_record = None;
+    let frames = control::io::Frames {
+        shared,
+        pending: commit_ack_pending,
+        diagnostic,
+        id,
+    };
     loop {
-        let (tag, body) = read_message(&mut server).await?;
+        let (tag, body) = frames.read(server, false).await?;
+        let record = diagnostic.and_then(|trace| trace.backend(tag, &body));
+        let mark = |record, delivery| {
+            if let (Some(trace), Some(record)) = (diagnostic, record) {
+                trace.delivery(record, delivery);
+            }
+        };
         let pending = commit_ack_pending.load(Ordering::SeqCst);
+        if let Some(state) = control::active(shared, id) {
+            state.check(shared, pending)?;
+        }
+        if pending == 3 {
+            // CommandComplete can precede a deferred-constraint ErrorResponse
+            // at implicit commit. Preserve that failed exchange byte-for-byte;
+            // only an error-free idle completion proves the write committed.
+            if tag == b'E' {
+                if let Some(complete) = autocommit_complete.take() {
+                    write_message(client, b'C', &complete).await?;
+                    mark(held_record.take(), DiagnosticDelivery::Forwarded);
+                }
+                commit_ack_pending.store(0, Ordering::SeqCst);
+                write_message(client, tag, &body).await?;
+                mark(record, DiagnosticDelivery::Forwarded);
+                continue;
+            }
+            if tag == b'C' {
+                autocommit_complete = Some(body);
+                held_record = record;
+                mark(record, DiagnosticDelivery::Held);
+                continue;
+            }
+            if tag == b'Z' {
+                if body.first() == Some(&b'I') && autocommit_complete.is_some() {
+                    shared.counters.autocommit_acks_dropped.fetch_add(1, Ordering::Relaxed);
+                    mark(held_record.take(), DiagnosticDelivery::Dropped);
+                    mark(record, DiagnosticDelivery::Dropped);
+                    return Ok(());
+                }
+                if let Some(complete) = autocommit_complete.take() {
+                    write_message(client, b'C', &complete).await?;
+                    mark(held_record.take(), DiagnosticDelivery::Forwarded);
+                }
+                commit_ack_pending.store(0, Ordering::SeqCst);
+            }
+            write_message(client, tag, &body).await?;
+            mark(record, DiagnosticDelivery::Forwarded);
+            continue;
+        }
         if pending != 0 {
+            mark(record, DiagnosticDelivery::Dropped);
             // The commit's reply, up to ReadyForQuery: the server has applied
             // it. Dropped, then the connection closes without an answer.
             if tag == b'Z' {
                 if pending == 1 {
                     shared.counters.commit_acks_dropped.fetch_add(1, Ordering::Relaxed);
-                } else {
+                } else if pending == 2 {
                     shared.counters.rollback_acks_dropped.fetch_add(1, Ordering::Relaxed);
                 }
                 return Ok(());
@@ -421,21 +708,32 @@ async fn backend_to_frontend(
             continue;
         }
         if shared.blackholed() {
+            mark(record, DiagnosticDelivery::Dropped);
             continue;
         }
-        write_message(&mut client, tag, &body).await?;
+        frames.forward(client, tag, &body, record, false).await?;
     }
 }
 
-async fn read_message(stream: &mut OwnedReadHalf) -> std::io::Result<(u8, Vec<u8>)> {
-    let tag = stream.read_u8().await?;
-    let length = stream.read_i32().await?;
-    let mut body = vec![0; (length - 4).max(0) as usize];
-    stream.read_exact(&mut body).await?;
-    Ok((tag, body))
+async fn forward_frontend<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    tag: u8,
+    body: &[u8],
+    diagnostic: Option<&diagnostic::Connection<'_>>,
+    record: Option<DiagnosticRecord>,
+) -> std::io::Result<()> {
+    write_message(stream, tag, body).await?;
+    if let (Some(trace), Some(record)) = (diagnostic, record) {
+        trace.delivery(record, DiagnosticDelivery::Forwarded);
+    }
+    Ok(())
 }
 
-async fn write_message(stream: &mut OwnedWriteHalf, tag: u8, body: &[u8]) -> std::io::Result<()> {
+async fn write_message<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    tag: u8,
+    body: &[u8],
+) -> std::io::Result<()> {
     let mut message = Vec::with_capacity(body.len() + 5);
     message.push(tag);
     message.extend_from_slice(&(body.len() as i32 + 4).to_be_bytes());
@@ -457,6 +755,65 @@ fn simple_query_text(body: &[u8]) -> String {
     let end = body.iter().position(|byte| *byte == 0).unwrap_or(body.len());
     let statement = String::from_utf8_lossy(&body[..end]);
     statement.trim().trim_end_matches(';').trim().to_string()
+}
+
+fn classify_diagnostic_sql(sql: &str) -> SqlCategory {
+    if sql.len() > 16_384 {
+        return SqlCategory::Other;
+    }
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let starts = |needle: &str| {
+        sql.as_bytes()
+            .get(..needle.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(needle.as_bytes()))
+    };
+    let contains = |needle: &str| {
+        sql.as_bytes()
+            .windows(needle.len())
+            .any(|part| part.eq_ignore_ascii_case(needle.as_bytes()))
+    };
+    if sql.eq_ignore_ascii_case("BEGIN") || starts("BEGIN ") {
+        return SqlCategory::Begin;
+    }
+    if sql.eq_ignore_ascii_case("COMMIT") {
+        return SqlCategory::Commit;
+    }
+    if sql.eq_ignore_ascii_case("ROLLBACK") {
+        return SqlCategory::Rollback;
+    }
+    if starts("UPDATE accounting_state SET version = version + 1") {
+        return SqlCategory::JournalAccounting;
+    }
+    if starts("UPDATE accounting_state SET version=version+1") {
+        return SqlCategory::LedgerAccounting;
+    }
+    if starts("SELECT") {
+        if contains("set_config(") {
+            return SqlCategory::Timeouts;
+        }
+        if contains("balance_leg_admit(") {
+            return SqlCategory::LegAdmission;
+        }
+        if contains("FROM venue_orders") {
+            return SqlCategory::OrderRead;
+        }
+        if contains("FROM order_fills") {
+            return SqlCategory::FillRead;
+        }
+    }
+    for (table, category) in [
+        ("venue_orders", SqlCategory::OrderWrite),
+        ("order_fills", SqlCategory::FillWrite),
+        ("balance_legs", SqlCategory::LegWrite),
+        ("order_intents", SqlCategory::JournalIntent),
+        ("submit_attempts", SqlCategory::JournalAttempt),
+        ("spot_intent_clock", SqlCategory::JournalClock),
+    ] {
+        if (starts("INSERT INTO ") || starts("UPDATE ")) && contains(table) {
+            return category;
+        }
+    }
+    SqlCategory::Other
 }
 
 #[cfg(test)]
@@ -612,6 +969,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_closure_is_observed_only_after_live_io_finishes() {
+        bounded(async {
+            for sever in [false, true] {
+                let (upstream, _received) = scripted_server().await;
+                let proxy = DbProxy::start(upstream).await.unwrap();
+                let mut client = connected(&proxy).await;
+                client.write_all(&message(b'Q', b"SELECT 1\0")).await.unwrap();
+                assert_eq!(read_reply(&mut client).await.unwrap(), (b'C', b'Z'));
+                assert_eq!(proxy.stats().connections, 1);
+                assert_eq!(proxy.closed_relays(), 0, "live relay reported closed");
+                if sever {
+                    proxy.set_mode(ProxyMode::Sever);
+                    assert!(read_reply(&mut client).await.is_err());
+                }
+                drop(client);
+                while proxy.closed_relays() == 0 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(proxy.closed_relays(), 1);
+                assert_eq!(proxy.stats().connections, 1);
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn a_blackhole_delivers_nothing_in_either_direction() {
         bounded(async {
             let (upstream, mut received) = scripted_server().await;
@@ -690,4 +1073,121 @@ mod tests {
         })
         .await;
     }
+    #[tokio::test]
+    async fn targeted_autocommit_waits_for_execution_and_excludes_transactions() {
+        bounded(async {
+            let (upstream, mut received) = scripted_server().await;
+            let proxy = DbProxy::start(upstream).await.unwrap();
+            let mut client = connected(&proxy).await;
+            proxy.set_mode(ProxyMode::DropAutocommitAckOf("target_touch"));
+            for (tag, body) in [
+                (b'Q', b"BEGIN\0".as_slice()),
+                (b'Q', b"UPDATE target_touch SET n=1\0".as_slice()),
+                (b'Q', b"COMMIT\0".as_slice()),
+                (b'P', b"cached\0UPDATE target_touch SET n=2\0\0\0".as_slice()),
+                (b'B', b"portal\0cached\0\0\0".as_slice()),
+            ] {
+                client.write_all(&message(tag, body)).await.unwrap();
+                assert_eq!(read_reply(&mut client).await.unwrap(), (b'C', b'Z'));
+                assert_eq!(received.recv().await.unwrap(), body);
+                assert_eq!(proxy.autocommit_acks_dropped(), 0);
+                assert_eq!(proxy.mode(), ProxyMode::DropAutocommitAckOf("target_touch"));
+            }
+            client.write_all(&message(b'E', b"portal\0\0\0\0\0")).await.unwrap();
+            assert_eq!(received.recv().await.unwrap(), b"portal\0\0\0\0\0");
+            assert!(read_reply(&mut client).await.is_err());
+            assert_eq!(proxy.autocommit_acks_dropped(), 1);
+            assert_eq!(proxy.mode(), ProxyMode::Pass);
+        })
+        .await;
+    }
+
+    #[test]
+    fn autocommit_attribution_survives_cached_bind_and_ignores_multi_statement_query() {
+        let mut watch = TransactionWatch::default();
+        watch.observe(b'P', b"cached\0UPDATE target_touch SET n=2\0\0\0");
+        watch.observe(b'B', b"portal\0cached\0\0\0");
+        watch.observe(b'E', b"portal\0\0\0\0\0");
+        watch.observe(b'B', b"other\0cached\0\0\0");
+        assert_eq!(
+            watch.statement_text(b'E', b"other\0\0\0\0\0"),
+            Some("UPDATE target_touch SET n=2".into())
+        );
+        let shared = Shared {
+            upstream: "127.0.0.1:1".parse().unwrap(),
+            mode: watch::Sender::new(ProxyMode::DropAutocommitAckOf("target_touch")),
+            counters: Counters::default(),
+            trace: Mutex::default(),
+            diagnostics: Mutex::default(),
+            control: Mutex::default(),
+            close_observation: Mutex::default(),
+        };
+        assert!(!shared.claim_autocommit_ack_drop(
+            &watch,
+            b'Q',
+            b"BEGIN; UPDATE target_touch SET n=1\0"
+        ));
+        assert!(!shared.claim_autocommit_ack_drop(&watch, b'P', b"target_touch\0"));
+        assert!(shared.claim_autocommit_ack_drop(&watch, b'E', b"other\0\0\0\0\0"));
+        assert_eq!(*shared.mode.borrow(), ProxyMode::Pass);
+    }
+    #[tokio::test]
+    async fn failed_autocommit_is_forwarded_without_claiming_a_landed_ack() {
+        assert_failed_autocommit_is_forwarded(false).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_autocommit_error_after_command_complete_is_forwarded() {
+        assert_failed_autocommit_is_forwarded(true).await;
+    }
+
+    async fn assert_failed_autocommit_is_forwarded(command_completed: bool) {
+        bounded(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let error = message(b'E', b"SERROR\0C23514\0Mfixture failure\0\0");
+            let mut expected = if command_completed {
+                message(b'C', b"UPDATE 1\0")
+            } else {
+                vec![]
+            };
+            expected.extend(error);
+            expected.extend(message(b'Z', b"I"));
+            let reply = expected.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut startup = [0u8; 8];
+                socket.read_exact(&mut startup).await.unwrap();
+                assert_eq!(socket.read_u8().await.unwrap(), b'Q');
+                let length = socket.read_i32().await.unwrap();
+                let mut body = vec![0u8; length as usize - 4];
+                socket.read_exact(&mut body).await.unwrap();
+                assert_eq!(body, b"UPDATE target_touch SET n=2\0");
+                socket.write_all(&reply).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            });
+            let proxy = DbProxy::start(addr).await.unwrap();
+            let mut client = connected(&proxy).await;
+            proxy.set_mode(ProxyMode::DropAutocommitAckOf("target_touch"));
+            client
+                .write_all(&message(b'Q', b"UPDATE target_touch SET n=2\0"))
+                .await
+                .unwrap();
+            let mut received = vec![0u8; expected.len()];
+            let result = client.read_exact(&mut received).await;
+            assert!(result.is_ok(), "failed autocommit completion was suppressed: {result:?}");
+            assert_eq!(received, expected);
+            assert_eq!(proxy.autocommit_acks_dropped(), 0);
+            server.await.unwrap();
+        })
+        .await;
+    }
 }
+
+#[cfg(test)]
+#[path = "db_proxy/forwarding_tests.rs"]
+mod forwarding_tests;
+
+#[cfg(test)]
+#[path = "db_proxy/namespace_tests.rs"]
+mod namespace_tests;

@@ -1,0 +1,58 @@
+DO $migration38$
+BEGIN
+    -- Additive only: no backfill, validation, worker or readiness grant.
+
+    -- ddl 01: budget_clock_domain_v38
+    -- ddl 02: budget_integer_fits
+    -- ddl 03: clock_samples
+    -- ddl 04: clock_samples_immutable
+    -- ddl 05: clock_samples_epoch_fk
+    -- ddl 06: venue_pauses
+    -- ddl 07: budget_pause_moves_forward
+    -- ddl 08: budget_pause_moves_forward
+    -- ddl 09: incident_budget_usage
+    -- ddl 10: incident_budget_usage_incident
+    -- ddl 11: budget_allocation_equal_replay
+    -- ddl 12: budget_allocation_equal_replay
+    -- ddl 13: budget_usage_incident_fk
+    -- ddl 14: recovery_incidents_reason_v38
+    -- ddl 15: venue_orders_capture_columns
+    -- ddl 16: venue_orders_capture_constraints
+    -- ddl 17: venue_orders_move_forward
+    -- ddl 18: spot_intent_clock_capture_columns
+    -- ddl 19: spot_intent_clock_receipt_default
+    -- ddl 20: spot_intent_clock_constraints
+    -- ddl 21: budget_venue_state
+    -- ddl 22: budget_venue_moves_forward
+    -- ddl 23: budget_venue_moves_forward
+    -- ddl 24: budget_epochs
+    -- ddl 25: budget_epochs_venue_time
+    -- ddl 26: budget_epochs_process_fk
+    -- ddl 27: budget_epochs_immutable
+    -- ddl 28: budget_source_audits
+    -- ddl 29: budget_audit_moves_forward
+    -- ddl 30: budget_audit_moves_forward
+    -- ddl 31: budget_recovery_cohorts
+    -- ddl 32: budget_cohorts_immutable
+    -- ddl 33: budget_expiry_proofs
+    -- ddl 34: budget_expiry_proofs_immutable
+    -- ddl 35: budget_daily_charges
+    -- ddl 36: budget_daily_charges_active
+    -- ddl 37: budget_charge_clock_fk
+    -- ddl 38: budget_clock_charge_fk
+    -- ddl 39: budget_charge_moves_forward
+    -- ddl 40: budget_charge_moves_forward
+    -- ddl 41: budget_project_clocks
+    -- ddl 42: budget_project_clocks
+    -- ddl 43: budget_insert_clocks
+    -- ddl 44: n5_registry_root
+    -- ddl 45: n5_registry_moves_forward
+    -- ddl 46: n5_registry_moves_forward
+    -- ddl 47: n5_refresh_keys
+    -- ddl 48: n5_key_is_append_only
+    -- ddl 49: n5_key_is_append_only
+    -- ddl 50: n5_refresh_state
+    -- ddl 51: n5_state_moves_forward
+    -- ddl 52: n5_state_moves_forward
+END;
+$migration38$;

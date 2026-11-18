@@ -597,6 +597,9 @@ async fn a_daemon_refuses_to_start_without_the_journal_tables(pool: PgPool) {
     within(DAEMON_TEST_LIMIT, async move {
         let harness = Harness::start(pool).await;
         for statement in [
+            // Migration 38's foreign key onto submit_attempts would block the
+            // drop; removing it in this test database keeps the fault the same.
+            "ALTER TABLE spot_intent_clock DROP CONSTRAINT spot_intent_clock_attempt_fk",
             "DROP VIEW order_intents_blocking_rollback",
             "DROP TABLE submit_attempts",
         ] {

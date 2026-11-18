@@ -531,8 +531,11 @@ mod tests {
     #[ignore = "requires DATABASE_URL"]
     async fn an_open_incident_of_an_unknown_reason_refuses_the_start(pool: PgPool) {
         let tenant = Uuid::now_v7();
+        // Both reason checks (the original and migration 38's) are dropped in
+        // this test database only; production keeps them.
         sqlx::query(
-            "ALTER TABLE recovery_incidents DROP CONSTRAINT recovery_incidents_reason_check",
+            "ALTER TABLE recovery_incidents DROP CONSTRAINT recovery_incidents_reason_check, \
+                 DROP CONSTRAINT recovery_incidents_reason_v38",
         )
         .execute(&pool)
         .await
