@@ -281,8 +281,8 @@ impl Migrate for BoundedMigration {
     }
 }
 
-// Acceptance sources are owned separately and enter only in ROOT's reviewed
-// composition; this is a private descendant, never a production API.
+// The native PostgreSQL acceptance suite, compiled only into this crate's
+// tests with the postgres feature; never a production API.
 #[cfg(all(test, feature = "postgres"))]
 #[path = "../../robsond/tests/bounded_migration/mod.rs"]
 mod public_pg;
