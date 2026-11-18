@@ -19,6 +19,9 @@
 //! Shutdown → CancellationToken.cancel() → all detectors exit
 //! ```
 
+#[cfg(test)]
+mod capability_tests;
+
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -38,8 +41,10 @@ use robson_engine::{
 #[cfg(feature = "postgres")]
 use robson_eventlog::{append_event, ActorType as EventlogActorType, Event as EventlogEvent};
 use robson_exec::{
-    gate::OperationKind, quantize, venue::VenueId, ActionResult, ExchangePort, ExchangePosition,
-    ExecError, Executor, OhlcvPort, StubOhlcv,
+    gate::OperationKind,
+    quantize,
+    venue::{VenueCapabilities, VenueId},
+    ActionResult, ExchangePort, ExchangePosition, ExecError, Executor, OhlcvPort, StubOhlcv,
 };
 #[cfg(feature = "postgres")]
 use robson_projector::apply_event_to_projections;
@@ -56,6 +61,7 @@ use tracing::{debug, error, info, warn, Instrument as _};
 use uuid::Uuid;
 
 use crate::{
+    capability::{record_refusal, require_side},
     circuit_breaker::CircuitBreaker,
     detector::DetectorTask,
     error::{DaemonError, DaemonResult},
@@ -2317,6 +2323,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     async fn rearm_detector(
+        capabilities: VenueCapabilities,
         venue: VenueId,
         position_id: PositionId,
         position: Position,
@@ -2332,6 +2339,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         stop_invalidation_lookback_candles: usize,
         initial_fire_delay: Option<std::time::Duration>,
     ) -> bool {
+        if require_side(&capabilities, position.side).is_err() {
+            record_refusal("rearm");
+            return false;
+        }
         let cancel_token = shutdown_token.child_token();
         match DetectorTask::from_position_with_policy(
             &position,
@@ -2395,6 +2406,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         symbol: Symbol,
         side: Side,
     ) -> DaemonResult<EntryPreviewJob<E>> {
+        require_side(&self.exchange().capabilities(), side)
+            .inspect_err(|_| record_refusal("preview"))?;
         let now = chrono::Utc::now();
         let capital = self.admission_capital_base(now).await?;
         let risk_config = self
@@ -2494,6 +2507,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         position: &Position,
         reason: &'static str,
     ) -> bool {
+        if require_side(&self.exchange().capabilities(), position.side).is_err() {
+            record_refusal("governed_rearm");
+            return false;
+        }
         // ADR-0050 §2: a position in needs_operator_rearm never re-arms
         // autonomously.
         if self.is_entry_exhausted(position_id).await {
@@ -2527,6 +2544,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let technical_stop_config =
             TechnicalStopConfig::with_bounds(&self.risk_config_snapshot().stop_distance_bounds());
         Self::rearm_detector(
+            self.exchange().capabilities(),
             self.venue.clone(),
             position_id,
             position.clone(),
@@ -2676,6 +2694,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let entry_exhausted = Arc::clone(&self.entry_exhausted);
         let pending_approvals = Arc::clone(&self.pending_approvals);
         let query_engine = Arc::clone(&self.query_engine);
+        let capabilities = self.exchange().capabilities();
         let venue = self.venue.clone();
         let event_bus = Arc::clone(&self.event_bus);
         let ohlcv_port = Arc::clone(&self.ohlcv_port);
@@ -2707,6 +2726,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     };
 
                     if let Some(mut record_inner) = record.take() {
+                        if !capabilities.supports_short {
+                            if let Err(error) = Self::approval_position_for_capabilities(
+                                store.as_ref(), &capabilities, &record_inner,
+                            ).await {
+                                let error = Self::record_capability_approval_failure(
+                                    &query_engine, &event_bus, &mut record_inner, error, "approval_expiry",
+                                ).await;
+                                warn!(%error, "Approval expiry refused without rearm");
+                                return;
+                            }
+                        }
                         // A failed expiry still removed the approval, and with it
                         // the position's only way to an entry: it re-arms like an
                         // expiry (ADR-0051 Recovery).
@@ -2775,6 +2805,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         let delay = governed_rearm_backoff(attempt);
 
                         let rearmed = PositionManager::<E, S>::rearm_detector(
+                            capabilities,
                             venue,
                             position.id,
                             position,
@@ -3270,6 +3301,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         account_id: Uuid,
         entry_policy: EntryPolicyConfig,
     ) -> DaemonResult<Position> {
+        require_side(&self.exchange().capabilities(), side)
+            .inspect_err(|_| record_refusal("arm"))?;
         // Snapshot the ADR-0041 buffer at arm (issue #154): the position's
         // executable stop derives from this value forever, so a later config
         // change cannot move a live stop.
@@ -3483,6 +3516,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         position: &Position,
         entry_policy: EntryPolicyConfig,
     ) -> DaemonResult<()> {
+        require_side(&self.exchange().capabilities(), position.side)
+            .inspect_err(|_| record_refusal("restore"))?;
         let position_id = position.id;
 
         {
@@ -4051,14 +4086,90 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(())
     }
 
+    fn emit_capability_rejection(
+        event_bus: &EventBus,
+        position_id: PositionId,
+        error: &DaemonError,
+        site: &'static str,
+    ) {
+        record_refusal(site);
+        event_bus.send(DaemonEvent::EntryRejected {
+            position_id,
+            reason_code: "venue_unsupported".to_string(),
+            reason: error.to_string(),
+            terminal: false,
+            rejected_at: chrono::Utc::now(),
+        });
+    }
+
+    async fn approval_position_for_capabilities(
+        store: &S,
+        capabilities: &VenueCapabilities,
+        record: &PendingApprovalRecord,
+    ) -> DaemonResult<Position> {
+        let position = store
+            .positions()
+            .find_by_id(record.position.id)
+            .await?
+            .ok_or(DaemonError::PositionNotFound(record.position.id))?;
+        require_side(capabilities, record.position.side)?;
+        require_side(capabilities, position.side)?;
+        let proposed_side = if record.proposed.side.eq_ignore_ascii_case("long") {
+            Side::Long
+        } else if record.proposed.side.eq_ignore_ascii_case("short") {
+            Side::Short
+        } else {
+            return Err(DaemonError::Config("Pending approval has an invalid side".to_string()));
+        };
+        require_side(capabilities, proposed_side)?;
+        Ok(position)
+    }
+
+    async fn record_capability_approval_failure(
+        query_engine: &QueryEngine<Arc<dyn QueryRecorder>>,
+        event_bus: &EventBus,
+        record: &mut PendingApprovalRecord,
+        error: DaemonError,
+        site: &'static str,
+    ) -> DaemonError {
+        // Publish before awaiting the sole audit. An error or cancellation
+        // must never enter ordinary expiry/rearm cleanup or exhaust the leg.
+        Self::emit_capability_rejection(event_bus, record.position.id, &error, site);
+        record.query.fail(error.to_string(), "awaiting_approval".to_string());
+        match query_engine.on_state_change(&record.query, "failed").await {
+            Ok(()) => error,
+            Err(audit_error) => audit_error.into(),
+        }
+    }
+
     pub async fn handle_signal(&self, signal: DetectorSignal) -> DaemonResult<()> {
         let mut entry_flow_guard = Some(self.entry_flow_lock.lock().await);
         let position_id = signal.position_id;
         // The detector is single-shot: its handle is spent once its signal is
         // here, so a handle found after the flow is a re-arm the flow made.
         self.kill_detector(position_id).await;
+        let capabilities = self.exchange().capabilities();
+        let prepared_position = if !capabilities.supports_short {
+            let position = self
+                .store
+                .positions()
+                .find_by_id(position_id)
+                .await?
+                .ok_or(DaemonError::PositionNotFound(position_id))?;
+            if let Err(error) = require_side(&capabilities, signal.side)
+                .and_then(|()| require_side(&capabilities, position.side))
+            {
+                Self::emit_capability_rejection(&self.event_bus, position_id, &error, "signal");
+                return Err(error);
+            }
+            Some(position)
+        } else {
+            None
+        };
         let mut reach = AdmissionReach::DetectorSpent(position_id);
-        let result = self.process_signal(signal, &mut entry_flow_guard, &mut reach).await;
+        let result = self
+            .process_signal(signal, prepared_position, &mut entry_flow_guard, &mut reach)
+            .await;
         if let (Err(error), AdmissionReach::DetectorSpent(position_id), Some(_)) =
             (&result, reach, &entry_flow_guard)
         {
@@ -4070,6 +4181,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     async fn process_signal(
         &self,
         signal: DetectorSignal,
+        prepared_position: Option<Position>,
         entry_flow_guard: &mut Option<MutexGuard<'_, ()>>,
         reach: &mut AdmissionReach,
     ) -> DaemonResult<()> {
@@ -4119,18 +4231,21 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.record_query_transition(&query, "processing").await?;
 
         // Load position
-        let position = match self.store.positions().find_by_id(position_id).await {
-            Ok(Some(pos)) => pos,
-            Ok(None) => {
-                let e = DaemonError::PositionNotFound(position_id);
-                query.fail(format!("{}", e), "processing".to_string());
-                self.record_query_failure(&query).await?;
-                return Err(e);
-            },
-            Err(e) => {
-                query.fail(format!("{}", e), "processing".to_string());
-                self.record_query_failure(&query).await?;
-                return Err(e.into());
+        let position = match prepared_position {
+            Some(position) => position,
+            None => match self.store.positions().find_by_id(position_id).await {
+                Ok(Some(pos)) => pos,
+                Ok(None) => {
+                    let e = DaemonError::PositionNotFound(position_id);
+                    query.fail(format!("{}", e), "processing".to_string());
+                    self.record_query_failure(&query).await?;
+                    return Err(e);
+                },
+                Err(e) => {
+                    query.fail(format!("{}", e), "processing".to_string());
+                    self.record_query_failure(&query).await?;
+                    return Err(e.into());
+                },
             },
         };
 
@@ -4504,8 +4619,35 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Approve a pending query and resume execution.
     pub async fn approve_query(&self, query_id: Uuid) -> DaemonResult<ExecutionQuery> {
         let mut entry_flow_guard = Some(self.entry_flow_lock.lock().await);
+        let capabilities = self.exchange().capabilities();
+        let prepared = if !capabilities.supports_short {
+            let mut record = self.take_approval_for_entry(query_id).await?;
+            match Self::approval_position_for_capabilities(
+                self.store.as_ref(),
+                &capabilities,
+                &record,
+            )
+            .await
+            {
+                Ok(position) => Some((record, position)),
+                Err(error) => {
+                    return Err(Self::record_capability_approval_failure(
+                        &self.query_engine,
+                        &self.event_bus,
+                        &mut record,
+                        error,
+                        "approval",
+                    )
+                    .await)
+                },
+            }
+        } else {
+            None
+        };
         let mut reach = AdmissionReach::Untouched;
-        let result = self.process_approval(query_id, &mut entry_flow_guard, &mut reach).await;
+        let result = self
+            .process_approval(query_id, prepared, &mut entry_flow_guard, &mut reach)
+            .await;
         if let (Err(error), AdmissionReach::DetectorSpent(position_id), Some(_)) =
             (&result, reach, &entry_flow_guard)
         {
@@ -4514,12 +4656,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         result
     }
 
-    async fn process_approval(
-        &self,
-        query_id: Uuid,
-        entry_flow_guard: &mut Option<MutexGuard<'_, ()>>,
-        reach: &mut AdmissionReach,
-    ) -> DaemonResult<ExecutionQuery> {
+    async fn take_approval_for_entry(&self, query_id: Uuid) -> DaemonResult<PendingApprovalRecord> {
         // Approval resume is a new entry — respect MonthlyHalt.
         // The query was approved by the operator, but the system may have
         // entered MonthlyHalt between when the query was queued and now.
@@ -4530,11 +4667,25 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.check_no_unresolved_residual().await?;
         self.check_admissions_open()?;
 
-        let mut record = {
+        let record = {
             let mut pending_approvals = self.pending_approvals.write().await;
             pending_approvals
                 .remove(&query_id)
                 .ok_or(DaemonError::QueryNotFound(query_id))?
+        };
+        Ok(record)
+    }
+
+    async fn process_approval(
+        &self,
+        query_id: Uuid,
+        prepared: Option<(PendingApprovalRecord, Position)>,
+        entry_flow_guard: &mut Option<MutexGuard<'_, ()>>,
+        reach: &mut AdmissionReach,
+    ) -> DaemonResult<ExecutionQuery> {
+        let (mut record, prepared_position) = match prepared {
+            Some((record, position)) => (record, Some(position)),
+            None => (self.take_approval_for_entry(query_id).await?, None),
         };
         // The approval was the position's only way to an entry.
         *reach = AdmissionReach::DetectorSpent(record.position.id);
@@ -4564,22 +4715,25 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             return Err(DaemonError::ApprovalExpired(query_id));
         }
 
-        let current_position = match self.store.positions().find_by_id(record.position.id).await {
-            Ok(Some(position)) => position,
-            Ok(None) => {
-                let err = DaemonError::PositionNotFound(record.position.id);
-                record.query.fail(
-                    format!("Pending approval invalidated: {}", err),
-                    "awaiting_approval".to_string(),
-                );
-                self.record_query_failure(&record.query).await?;
-                return Err(err);
-            },
-            Err(e) => {
-                let err_str = format!("{}", e);
-                record.query.fail(err_str.clone(), "awaiting_approval".to_string());
-                self.record_query_failure(&record.query).await?;
-                return Err(e.into());
+        let current_position = match prepared_position {
+            Some(position) => position,
+            None => match self.store.positions().find_by_id(record.position.id).await {
+                Ok(Some(position)) => position,
+                Ok(None) => {
+                    let err = DaemonError::PositionNotFound(record.position.id);
+                    record.query.fail(
+                        format!("Pending approval invalidated: {}", err),
+                        "awaiting_approval".to_string(),
+                    );
+                    self.record_query_failure(&record.query).await?;
+                    return Err(err);
+                },
+                Err(e) => {
+                    let err_str = format!("{}", e);
+                    record.query.fail(err_str.clone(), "awaiting_approval".to_string());
+                    self.record_query_failure(&record.query).await?;
+                    return Err(e.into());
+                },
             },
         };
 

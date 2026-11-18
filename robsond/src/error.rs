@@ -1,6 +1,6 @@
 //! Daemon error types.
 
-use robson_domain::DomainError;
+use robson_domain::{DomainError, Side};
 use robson_engine::EngineError;
 use robson_exec::ExecError;
 use robson_store::StoreError;
@@ -23,6 +23,10 @@ pub struct StartupStaleActiveInfo {
 /// Daemon-level errors.
 #[derive(Debug, Error)]
 pub enum DaemonError {
+    /// The selected venue does not support this entry direction.
+    #[error("Venue does not support entry side {side:?}")]
+    VenueUnsupported { side: Side },
+
     /// Domain error
     #[error("Domain error: {0}")]
     Domain(#[from] DomainError),
