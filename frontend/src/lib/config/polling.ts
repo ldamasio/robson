@@ -15,3 +15,19 @@ export function shouldPollStatus(
 ): boolean {
   return activeCount > 0 && visibilityState === 'visible';
 }
+
+// Operation details: the SSE stream is a delta feed, so the page re-reads the
+// position snapshot when an event concerns this position, when the server
+// asks for a resync, and after every reconnect. Refreshes are coalesced to at
+// most one request per window, so an event burst cannot become a request storm.
+
+export const OPERATION_REFRESH_MS = 1_500;
+
+/** Whether an SSE event should trigger a snapshot re-read of `operationId`. */
+export function operationNeedsRefresh(
+  event: { event_type: string; payload: Record<string, unknown> },
+  operationId: string,
+): boolean {
+  if (event.event_type === 'system.resync_required') return true;
+  return operationId !== '' && event.payload?.position_id === operationId;
+}

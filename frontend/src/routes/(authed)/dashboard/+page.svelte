@@ -30,6 +30,7 @@
     sortPositionsOldestFirst,
   } from "#lib/config/slots.ts";
   import { formatTimeUtc, isTodayUtc, utcDateKey } from "#lib/utils/time.ts";
+  import { singleFlight } from "#lib/utils/mutation.ts";
   import {
     deriveBudgetView,
     MONTHLY_BUDGET_LIMIT_PCT,
@@ -450,23 +451,27 @@
     };
   });
 
-  async function approve(queryId: string) {
+  // One mutation at a time: APPROVE and DISARM stay disabled until the
+  // pending request resolves (guardrail 4, no double submit).
+  let mutating = $state(false);
+
+  const approve = singleFlight(async (queryId: string) => {
     try {
       await robsonApi.approveQuery(queryId);
       void load();
     } catch {
       // error handled by next poll refresh
     }
-  }
+  }, (busy) => (mutating = busy));
 
-  async function disarm(positionId: string) {
+  const disarm = singleFlight(async (positionId: string) => {
     try {
       await robsonApi.closePosition(positionId);
       void load();
     } catch {
       // next poll will refresh state
     }
-  }
+  }, (busy) => (mutating = busy));
 </script>
 
 <svelte:head>
@@ -736,8 +741,11 @@
                           op,
                         ).join("\n")}</pre>
                       <Row justify="end">
-                        <button class="btn-disarm" onclick={() => disarm(op.id)}
-                          >DISARM</button
+                        <button
+                          class="btn-disarm"
+                          disabled={mutating}
+                          aria-busy={mutating}
+                          onclick={() => disarm(op.id)}>DISARM</button
                         >
                       </Row>
                     </Stack>
@@ -811,6 +819,8 @@
                 </Stack>
                 <button
                   class="btn-approve"
+                  disabled={mutating}
+                  aria-busy={mutating}
                   onclick={() => approve(approval.query_id)}>APPROVE</button
                 >
               </Row>
@@ -1198,8 +1208,13 @@
     transition: background var(--dur) var(--ease);
     white-space: nowrap;
   }
-  .btn-approve:hover {
+  .btn-approve:hover:not(:disabled) {
     background: var(--cyan-subtle);
+  }
+  .btn-approve:disabled,
+  .btn-disarm:disabled {
+    opacity: 0.5;
+    cursor: wait;
   }
   .btn-disarm {
     background: transparent;
@@ -1213,7 +1228,7 @@
     border-radius: 2px;
     transition: background 0.15s;
   }
-  .btn-disarm:hover {
+  .btn-disarm:hover:not(:disabled) {
     background: color-mix(in srgb, var(--color-err, #e55) 15%, transparent);
   }
   .btn-nav {

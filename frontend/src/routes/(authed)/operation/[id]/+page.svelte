@@ -6,6 +6,8 @@
   import { page } from '$app/state';
   import { robsonApi, connectEventStream, type Position, type SseEvent } from '$api/robson';
   import { formatTimeUtc } from '#lib/utils/time.ts';
+  import { OPERATION_REFRESH_MS, operationNeedsRefresh } from '#lib/config/polling.ts';
+  import { sseFreshness, markSseEvent, markSseConnected, markSseStale } from '$stores/sseFreshness';
   import {
     positionLabel,
     positionSummaryLines,
@@ -22,6 +24,7 @@
   let events = $state<TaggedEvent[]>([]);
   let seq = $state(0);
   let closeSse: (() => void) | null = null;
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
   const MAX_OP_EVENTS = 500;
 
   let summaryLines = $derived(position ? positionSummaryLines(position) : []);
@@ -37,18 +40,49 @@
     }
   }
 
+  // The stream is a delta feed: re-read the position snapshot when an event
+  // concerns it, on a server resync request and after every reconnect, at
+  // most once per window so a burst cannot become a request storm.
+  function scheduleRefresh() {
+    if (refreshTimer) return;
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      void loadPosition();
+    }, OPERATION_REFRESH_MS);
+  }
+
   function startSse() {
     stopSse();
-    closeSse = connectEventStream((event: SseEvent) => {
-      const payload = event.payload as Record<string, unknown>;
-      if (payload.position_id === operationId) {
-        seq += 1;
-        const tagged: TaggedEvent = { ...event, _seq: seq };
-        events = events.length >= MAX_OP_EVENTS
-          ? [...events.slice(-(MAX_OP_EVENTS - 1)), tagged]
-          : [...events, tagged];
+    closeSse = connectEventStream(
+      (event: SseEvent) => {
+        markSseEvent();
+        const payload = event.payload as Record<string, unknown>;
+        if (payload.position_id === operationId) {
+          seq += 1;
+          const tagged: TaggedEvent = { ...event, _seq: seq };
+          events = events.length >= MAX_OP_EVENTS
+            ? [...events.slice(-(MAX_OP_EVENTS - 1)), tagged]
+            : [...events, tagged];
+        }
+        if (operationNeedsRefresh(event, operationId)) scheduleRefresh();
+      },
+      () => {
+        markSseStale();
+      },
+      () => {
+        markSseConnected();
+        scheduleRefresh();
+      },
+      () => {
+        markSseStale();
+      },
+      () => {
+        markSseEvent();
+      },
+      () => {
+        markSseConnected();
       }
-    });
+    );
   }
 
   function stopSse() {
@@ -56,15 +90,21 @@
       closeSse();
       closeSse = null;
     }
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
   }
 
   $effect(() => {
     untrack(() => {
       void loadPosition();
       startSse();
+      sseFreshness.start();
     });
     return () => {
       stopSse();
+      sseFreshness.stop();
     };
   });
 </script>
@@ -99,7 +139,19 @@
     </LCorners>
 
     <section class="event-stream-section">
-      <div class="eyebrow">{$_('operation.eventStreamLabel')}</div>
+      <div class="eyebrow">
+        {$_('operation.eventStreamLabel')}
+        <span
+          class="sse-badge"
+          class:live={$sseFreshness.fresh}
+          class:stale={!$sseFreshness.fresh}
+          title={$sseFreshness.fresh
+            ? 'Event stream is fresh'
+            : `No SSE data for ${$sseFreshness.staleSeconds}s`}
+        >
+          {$sseFreshness.fresh ? 'LIVE' : 'STALE, reconnecting'}
+        </span>
+      </div>
       <div class="limitation">
         {$_('operation.sessionOnly')}
       </div>
@@ -167,6 +219,22 @@
     font-size: var(--text-xs);
     color: var(--fg-3);
     letter-spacing: var(--track-wide);
+  }
+  .sse-badge {
+    margin-left: var(--s-2);
+    padding: var(--s-1) var(--s-2);
+    border-radius: var(--radius-sm);
+    border: 1px solid transparent;
+  }
+  .sse-badge.live {
+    color: var(--ok);
+    border-color: var(--ok);
+    background: rgba(127, 183, 126, 0.08);
+  }
+  .sse-badge.stale {
+    color: var(--warn, #f59e0b);
+    border-color: var(--warn, #f59e0b);
+    background: rgba(245, 158, 11, 0.08);
   }
   .events {
     font-family: var(--font-mono);
