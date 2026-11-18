@@ -37,6 +37,7 @@
 #![warn(clippy::all)]
 
 pub mod balance_costs;
+pub mod balance_liability;
 pub mod balance_sizing;
 pub mod cancel;
 // Inert C8 arithmetic; a later reviewed producer owns persistence and
