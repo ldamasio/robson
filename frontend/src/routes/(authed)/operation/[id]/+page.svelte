@@ -7,6 +7,7 @@
   import { robsonApi, connectEventStream, type Position, type SseEvent } from '$api/robson';
   import { formatTimeUtc } from '#lib/utils/time.ts';
   import { OPERATION_REFRESH_MS, operationNeedsRefresh } from '#lib/config/polling.ts';
+  import { latestOnly } from '#lib/utils/latest.ts';
   import { sseFreshness, markSseEvent, markSseConnected, markSseStale } from '$stores/sseFreshness';
   import {
     positionLabel,
@@ -30,13 +31,19 @@
   let summaryLines = $derived(position ? positionSummaryLines(position) : []);
   let metaLine = $derived(position ? positionMetaLine(position) : '');
 
+  // Refreshes can overlap (events, reconnects, retry): only the newest
+  // request may publish, so a slow older snapshot never restores stale state.
+  const positionRequests = latestOnly();
+
   async function loadPosition() {
     if (!operationId) return;
+    const isCurrent = positionRequests.begin();
     error = null;
     try {
-      position = await robsonApi.getPosition(operationId);
+      const loaded = await robsonApi.getPosition(operationId);
+      if (isCurrent()) position = loaded;
     } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to load position';
+      if (isCurrent()) error = e instanceof Error ? e.message : 'Failed to load position';
     }
   }
 
