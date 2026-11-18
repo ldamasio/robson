@@ -11,7 +11,7 @@ function deferred() {
 describe('single-flight mutation guard', () => {
   it('refuses a second submission while the first is pending', async () => {
     const pending = deferred();
-    const action = vi.fn(() => pending.promise);
+    const action = vi.fn((_id: string) => pending.promise);
     const busy: boolean[] = [];
     const run = singleFlight(action, (value) => busy.push(value));
     const first = run('fixture-a');
