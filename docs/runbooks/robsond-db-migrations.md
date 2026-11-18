@@ -216,24 +216,39 @@ that embeds 38; record it before any later merge.
 ### Failure outcomes
 
 The adapter logs `migration connection retired` (warn) with the phase and one
-outcome (`kubectl logs -n robson -l job-name=robsond-db-migrate`), then drops the raw connection without a graceful close, so a pending
-ROLLBACK is discarded with the session:
+outcome (`kubectl logs -n robson -l job-name=robsond-db-migrate`), then drops
+the raw connection without a graceful close, so a pending ROLLBACK is discarded
+with the session. Dropping the socket does not prove the server backend has
+finished: it may still be completing the transaction.
 
 | Outcome | Meaning | Operator check |
 |---|---|---|
 | `ApplyNotStarted` | failed before the transaction began | 38 absent; rerun `robsond db migrate` after the cause is fixed |
-| `MayHaveCommitted` | interrupted inside BEGIN..COMMIT; the COMMIT may or may not have landed | query below decides; never infer absence |
-| `AppliedButSessionUnrestored` | COMMIT acknowledged; elapsed UPDATE or settings restore failed | 38 is applied; the session settings died with the connection |
+| `MayHaveCommitted` | interrupted anywhere from BEGIN through the post-commit `execution_time` UPDATE; the COMMIT may or may not have landed | unresolved until the checks below; never infer absence |
+| `AppliedButSessionUnrestored` | COMMIT and the `execution_time` UPDATE returned; only the settings restore failed | 38 is applied; the session settings died with the connection |
 
-```sql
-SELECT version, success, execution_time
-FROM _sqlx_migrations WHERE version = 20240101000038;
-```
+For `MayHaveCommitted`, an empty history row read from another connection is
+not proof of absence while the original backend can still commit. In order:
 
-No row: 38 did not commit (the INSERT is inside the transaction); the schema
-objects are absent too. A row with `success = true`: 38 committed; an
-`execution_time` of `-1` only means the post-commit UPDATE did not land, and
-SQLx treats the migration as applied. Do not edit `_sqlx_migrations` or rerun
-38's SQL by hand; a database lost mid-apply is handled by the same query once
-it is reachable again. Repeated deadline failures on a busy database need the
-operator's direction, not wider bounds.
+1. Wait until no backend of the failed migrate job remains: check
+   `pg_stat_activity` for the job's connection (and any lock it held in
+   `pg_locks`) until it is gone. If it does not go away, stop and get the
+   operator's direction; the outcome stays unresolved.
+2. Rerun the canonical `robsond db migrate`. It takes SQLx's migration lock
+   before it reads the applied history, so its decision is serialized behind
+   any surviving migrator: it skips 38 if the COMMIT landed and applies it if
+   not.
+3. Afterwards confirm with:
+
+   ```sql
+   SELECT version, success, execution_time
+   FROM _sqlx_migrations WHERE version = 20240101000038;
+   ```
+
+   A row with `success = true` means 38 is applied; an `execution_time` of
+   `-1` only means the post-commit UPDATE did not land, and SQLx treats the
+   migration as applied.
+
+Do not edit `_sqlx_migrations` or rerun 38's SQL by hand. A database lost
+mid-apply follows the same steps once it is reachable again. Repeated deadline
+failures on a busy database need the operator's direction, not wider bounds.
