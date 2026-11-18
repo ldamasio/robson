@@ -325,6 +325,7 @@ async fn journaled(status: u16, body: String, evidence: Evidence) -> (BinanceSpo
     if let Some(rejected) = rejected {
         let now = Utc::now();
         let batch = JournalBatch {
+            balance: None,
             intent: IntentRow {
                 intent_id: Default::default(),
                 venue_id: VenueId::BINANCE_SPOT.to_string(),

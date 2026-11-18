@@ -40,6 +40,7 @@ async fn seeded(pool: &PgPool, id: &'static str, outcome: Option<OutcomeRow>) ->
     let backend = PgJournalBackend::new(pool, Uuid::now_v7());
     backend
         .commit(&JournalBatch {
+            balance: None,
             intent,
             attempts: vec![AttemptRow {
                 attempt_id: Uuid::now_v7(),
@@ -206,6 +207,7 @@ async fn seeded_for(
     let intent_id = intent.intent_id;
     PgJournalBackend::new(pool, tenant)
         .commit(&JournalBatch {
+            balance: None,
             intent,
             attempts: vec![AttemptRow {
                 attempt_id: Uuid::now_v7(),

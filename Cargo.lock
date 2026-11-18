@@ -2188,6 +2188,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "libc",
+ "proptest",
  "robson-domain",
  "robson-engine",
  "robson-store",

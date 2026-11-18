@@ -49,6 +49,7 @@ pub mod ports;
 pub mod quantize;
 pub mod stub;
 pub mod venue;
+pub mod venue_ledger;
 
 // Re-exports for convenience
 pub use error::{ExecError, ExecResult};

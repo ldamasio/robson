@@ -92,6 +92,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use robson_domain::{OrderSide, PositionId, Side, Symbol};
+use rust_decimal::Decimal;
 use serde_json::Value;
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -220,6 +221,19 @@ pub enum CommitFailure {
     Uncertain(String),
 }
 
+/// Keep the storage failure separate from the public no-send explanation.
+/// Cancel wrappers must distinguish an id collision from all other refusals.
+struct BeforeSendRefusal {
+    refusal: SendRefusal,
+    commit_failure: Option<CommitFailure>,
+}
+
+impl From<SendRefusal> for BeforeSendRefusal {
+    fn from(refusal: SendRefusal) -> Self {
+        Self { refusal, commit_failure: None }
+    }
+}
+
 /// The intent's identity and parameters, written once.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IntentRow {
@@ -283,12 +297,50 @@ impl OutcomeRow {
     }
 }
 
+/// The immutable admission payload of one balance-account entry. The journal
+/// supplies its generated intent ID, venue, scope and creation timestamp;
+/// the backend supplies its tenant. This avoids competing identity sources.
+/// Terms come from the admitted rules/envelope snapshot (ADR-0056 step 8, 8g).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionRow {
+    pub position_id: PositionId,
+    pub symbol: String,
+    pub decided_month: NaiveDate,
+    pub taker_bps: Decimal,
+    pub gap_bps: Decimal,
+    pub notional_margin_bps: Decimal,
+    pub min_notional: Decimal,
+    pub lot_step: Decimal,
+    pub fee_asset_policy: String,
+    pub envelope_source: String,
+    pub envelope_as_of: DateTime<Utc>,
+    pub envelope_hash: String,
+    pub planned_qty: Decimal,
+    pub requested_qty: Decimal,
+    pub reference_price: Decimal,
+    pub remainder_reserve: Decimal,
+    pub admission_charge: Decimal,
+    pub initial_trigger: Decimal,
+}
+
+/// Extra writes for a balance-account journal, carried on every batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BalanceBatch {
+    pub admission: Option<Arc<AdmissionRow>>,
+    /// A send ticket and an outcome that is not a proven no-send. A strict
+    /// commit's lost acknowledgement alone cannot establish handoff.
+    pub handed_off: bool,
+    /// The whole journal commit's bound, including connection acquisition.
+    pub commit_bound: Duration,
+}
+
 /// Everything one commit writes about one intent, in one transaction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JournalBatch {
     pub intent: IntentRow,
     pub attempts: Vec<AttemptRow>,
     pub outcome: Option<OutcomeRow>,
+    pub balance: Option<BalanceBatch>,
 }
 
 impl JournalBatch {
@@ -296,7 +348,13 @@ impl JournalBatch {
     /// intent, the attempts, the outcome, `COMMIT`. What it plans to run, not a
     /// measure of what reached the database.
     pub fn statements(&self) -> u32 {
-        3 + u32::from(!self.attempts.is_empty()) + u32::from(self.outcome.is_some())
+        let attempts = u32::from(!self.attempts.is_empty());
+        3 + attempts
+            + u32::from(self.outcome.is_some())
+            + self
+                .balance
+                .as_ref()
+                .map_or(0, |balance| 2 + attempts + u32::from(balance.admission.is_some()))
     }
 }
 
@@ -407,6 +465,13 @@ pub trait JournalBackend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Check the balance schema and, when requested, the durable one-attempt
+    /// index. Called only under either venue capability flag. PostgreSQL's
+    /// implementation follows in 8e-3; in-memory backends can script it.
+    async fn check_balance_schema(&self, _: &str, _: bool) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Record a stream suspension in one transaction. An open suspension of
     /// the same stream already on record stands, so a replay changes nothing.
     async fn record_suspension(
@@ -478,6 +543,7 @@ pub struct StubJournalRow {
     pub intent: Option<IntentRow>,
     pub attempts: Vec<AttemptRow>,
     pub outcome: Option<OutcomeRow>,
+    pub balance: Option<BalanceBatch>,
     /// The release that tombstoned it.
     pub tombstoned_by: Option<Uuid>,
 }
@@ -508,6 +574,8 @@ pub struct StubJournalBackend {
     commit_hold: Mutex<Option<(usize, Arc<tokio::sync::Notify>)>>,
     releases: Mutex<Vec<ReleaseRecord>>,
     release_fails: AtomicBool,
+    balance_schema_checks: Mutex<Vec<(String, bool)>>,
+    balance_schema_error: Mutex<Option<String>>,
 }
 
 impl StubJournalBackend {
@@ -627,6 +695,17 @@ impl StubJournalBackend {
         self.releases.lock().unwrap().clone()
     }
 
+    /// Script the balance-schema readiness answer; does not affect legacy
+    /// readiness.
+    pub fn set_balance_schema_error(&self, error: Option<String>) {
+        *self.balance_schema_error.lock().unwrap() = error;
+    }
+
+    /// Every balance-schema readiness probe, in order.
+    pub fn balance_schema_checks(&self) -> Vec<(String, bool)> {
+        self.balance_schema_checks.lock().unwrap().clone()
+    }
+
     /// The next scripted fault, or the standing one.
     fn next_fault(&self) -> Option<JournalFault> {
         let scripted = self.faults.lock().unwrap().pop_front();
@@ -645,6 +724,21 @@ impl StubJournalBackend {
         let row = rows.entry(batch.intent.client_order_id.clone()).or_default();
         if row.intent.as_ref().is_some_and(|i| i.intent_id != batch.intent.intent_id) {
             return Err(CommitFailure::IdSpent);
+        }
+        if row.balance.as_ref().is_some_and(|stored| {
+            batch
+                .balance
+                .as_ref()
+                .is_none_or(|incoming| stored.admission != incoming.admission)
+        }) {
+            return Err(CommitFailure::Known("admission changed on replay".to_string()));
+        }
+        if let Some(incoming) = &batch.balance {
+            let handed_off = row.balance.as_ref().is_some_and(|stored| stored.handed_off);
+            row.balance = Some(BalanceBatch {
+                handed_off: handed_off || incoming.handed_off,
+                ..incoming.clone()
+            });
         }
         row.intent = Some(batch.intent.clone());
         for attempt in &batch.attempts {
@@ -707,6 +801,17 @@ impl JournalBackend for StubJournalBackend {
             },
             Some(JournalFault::Hang) => std::future::pending().await,
             Some(JournalFault::IdSpent) => Err(CommitFailure::IdSpent),
+        }
+    }
+
+    async fn check_balance_schema(&self, venue: &str, one_attempt: bool) -> Result<(), String> {
+        self.balance_schema_checks
+            .lock()
+            .unwrap()
+            .push((venue.to_string(), one_attempt));
+        match self.balance_schema_error.lock().unwrap().clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -964,6 +1069,7 @@ impl AttemptMemory {
 struct IntentMemory {
     row: IntentRow,
     origin: Option<crate::observation::Origin>,
+    balance: Option<BalanceBatch>,
     operation: u64,
     attempts: Vec<AttemptMemory>,
     outcome: Option<OutcomeRow>,
@@ -1013,6 +1119,11 @@ impl IntentMemory {
             intent: self.row.clone(),
             attempts: self.attempts.iter().map(|attempt| attempt.row.clone()).collect(),
             outcome: self.outcome.clone(),
+            balance: self.balance.as_ref().map(|balance| BalanceBatch {
+                handed_off: self.ticket_issued
+                    && self.outcome.as_ref().is_some_and(|outcome| !outcome.not_sent),
+                ..balance.clone()
+            }),
         }
     }
 
@@ -1246,6 +1357,8 @@ pub struct OrderJournal {
     /// One attempt per client id, with granted sends (ADR-0056 step 8). Fixed
     /// before the journal is shared; `false` for USD-M and the stub.
     one_attempt_per_client_id: bool,
+    /// Fixed before sharing; no factory venue selects this before 8o.
+    balance_account: bool,
     /// The next grant id: never reused in this journal's life. Exhausted, it
     /// grants nothing more.
     next_grant: AtomicU64,
@@ -1274,6 +1387,7 @@ impl OrderJournal {
             release_bound: RELEASE_BOUND,
             withheld: Mutex::default(),
             one_attempt_per_client_id: false,
+            balance_account: false,
             next_grant: AtomicU64::new(1),
             #[cfg(test)]
             after_failure_snapshot: Mutex::new(None),
@@ -1302,6 +1416,18 @@ impl OrderJournal {
     /// Whether this journal allows one attempt per client id and grants sends.
     pub fn one_attempt_per_client_id(&self) -> bool {
         self.one_attempt_per_client_id
+    }
+
+    /// Carry the balance-account ledger writes on every intent's batch.
+    /// Set from the venue's account capability before sharing the journal.
+    pub fn with_balance_account(mut self, on: bool) -> Self {
+        self.balance_account = on;
+        self
+    }
+
+    /// Whether this journal carries balance-account ledger writes.
+    pub fn balance_account(&self) -> bool {
+        self.balance_account
     }
 
     /// Shorten the release's bound, for tests that wait it out.
@@ -1454,7 +1580,13 @@ impl OrderJournal {
 
     /// Whether the database can take journal writes (startup check).
     pub async fn check_ready(&self) -> Result<(), String> {
-        self.backend.check_ready().await
+        self.backend.check_ready().await?;
+        if self.balance_account || self.one_attempt_per_client_id {
+            self.backend
+                .check_balance_schema(&self.venue_id, self.one_attempt_per_client_id)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Entries in `operations_in_flight`.
@@ -1689,6 +1821,33 @@ impl OrderJournal {
     /// Register an intent in memory. Nothing is written until
     /// [`Self::before_send`].
     pub fn open_intent(&self, spec: IntentSpec) -> JournaledIntent {
+        self.open_intent_with_admission(spec, None)
+    }
+
+    /// Open one balance entry with its immutable admitted terms. Identity
+    /// checks happen before registration, and insertion carries the admission
+    /// atomically: a duplicate client ID never changes another intent's row.
+    pub fn open_balance_entry(
+        &self,
+        spec: IntentSpec,
+        admission: AdmissionRow,
+    ) -> Result<JournaledIntent, SendRefusal> {
+        if !self.balance_account
+            || spec.kind != IntentKind::Entry
+            || spec.position_id != Some(admission.position_id)
+        {
+            return Err(SendRefusal::NotSent(
+                "admission does not match a balance entry".to_string(),
+            ));
+        }
+        Ok(self.open_intent_with_admission(spec, Some(Arc::new(admission))))
+    }
+
+    fn open_intent_with_admission(
+        &self,
+        spec: IntentSpec,
+        admission: Option<Arc<AdmissionRow>>,
+    ) -> JournaledIntent {
         let operation = CURRENT_OPERATION.try_with(|current| current.id).unwrap_or(0);
         let intent_id = Uuid::now_v7();
         let handle = JournaledIntent {
@@ -1723,6 +1882,11 @@ impl OrderJournal {
         state.intents.insert(spec.client_order_id, IntentMemory {
             row,
             origin: crate::observation::Origin::measured(),
+            balance: self.balance_account.then_some(BalanceBatch {
+                admission,
+                handed_off: false,
+                commit_bound: self.commit_bound,
+            }),
             operation,
             attempts: Vec::new(),
             outcome: None,
@@ -1765,13 +1929,21 @@ impl OrderJournal {
         intent: &JournaledIntent,
         class: WriteClass,
     ) -> Result<(), SendRefusal> {
+        self.before_send_typed(intent, class).await.map_err(|failure| failure.refusal)
+    }
+
+    async fn before_send_typed(
+        &self,
+        intent: &JournaledIntent,
+        class: WriteClass,
+    ) -> Result<(), BeforeSendRefusal> {
         let one_attempt = self.one_attempt_per_client_id;
         let (batch, attempt_id, first) = {
             let mut state = self.lock();
             if (class == WriteClass::Strict || one_attempt)
                 && !state.operations.contains_key(&intent.operation)
             {
-                return Err(SendRefusal::NotSent("operation is not registered".to_string()));
+                return Err(SendRefusal::NotSent("operation is not registered".to_string()).into());
             }
             if state.discarded.contains(&intent.client_order_id) {
                 // Refused for good, but on the handle that sent it this is a
@@ -1781,24 +1953,34 @@ impl OrderJournal {
                         memory.retry_refused = !memory.attempts.is_empty();
                     }
                 }
-                return Err(SendRefusal::NotSent("the id was discarded".to_string()));
+                return Err(SendRefusal::NotSent("the id was discarded".to_string()).into());
             }
             let Some(memory) = state.intents.get_mut(&intent.client_order_id) else {
-                return Err(SendRefusal::NotSent("the id's history is gone".to_string()));
+                return Err(SendRefusal::NotSent("the id's history is gone".to_string()).into());
             };
             if memory.row.intent_id != intent.intent_id {
-                return Err(SendRefusal::NotSent("the id is in use".to_string()));
+                return Err(SendRefusal::NotSent("the id is in use".to_string()).into());
             }
             if memory.sealed {
                 memory.retry_refused = !memory.attempts.is_empty();
                 return Err(SendRefusal::NotSent(
                     "an earlier commit on this id failed".to_string(),
-                ));
+                )
+                .into());
             }
             if one_attempt && !memory.attempts.is_empty() {
                 return Err(SendRefusal::NotSent(
                     "one attempt per client id on this venue".to_string(),
-                ));
+                )
+                .into());
+            }
+            if self.balance_account
+                && memory.row.kind == IntentKind::Entry
+                && memory.balance.as_ref().and_then(|balance| balance.admission.as_ref()).is_none()
+            {
+                return Err(
+                    SendRefusal::NotSent("balance entry has no admission".to_string()).into()
+                );
             }
             let first = memory.attempts.is_empty();
             let attempt_id = Uuid::now_v7();
@@ -1816,7 +1998,10 @@ impl OrderJournal {
         let result = self.bounded_commit(&batch).await;
         let (mut gate, mut state) = self.lock_both();
         if !state.intents.contains_key(&intent.client_order_id) {
-            return Err(SendRefusal::NotSent("the id's history is gone".to_string()));
+            return Err(BeforeSendRefusal {
+                refusal: SendRefusal::NotSent("the id's history is gone".to_string()),
+                commit_failure: result.err(),
+            });
         }
         let failure = match result {
             Ok(()) => {
@@ -1855,24 +2040,29 @@ impl OrderJournal {
         }
         drop(gate);
         let Some(memory) = state.intents.get_mut(&intent.client_order_id) else {
-            return Err(SendRefusal::NotSent("the id's history is gone".to_string()));
+            return Err(BeforeSendRefusal {
+                refusal: SendRefusal::NotSent("the id's history is gone".to_string()),
+                commit_failure: Some(failure),
+            });
         };
         memory.sealed = true;
         memory.retry_refused = !first;
-        match failure {
+        let commit_failure = Some(failure.clone());
+        let refusal = match failure {
             CommitFailure::IdSpent => {
                 memory.attempts.retain(|attempt| attempt.row.attempt_id != attempt_id);
-                Err(SendRefusal::NotSent("the client id is already spent".to_string()))
+                SendRefusal::NotSent("the client id is already spent".to_string())
             },
             CommitFailure::Known(reason) => {
                 memory.attempts.retain(|attempt| attempt.row.attempt_id != attempt_id);
-                Err(SendRefusal::NotSent(reason))
+                SendRefusal::NotSent(reason)
             },
             CommitFailure::Uncertain(reason) => {
                 memory.commit_uncertain = true;
-                Err(SendRefusal::UncertainCommit(reason))
+                SendRefusal::UncertainCommit(reason)
             },
-        }
+        };
+        Err(BeforeSendRefusal { refusal, commit_failure })
     }
 
     /// Commit an order's one attempt and grant its one send, on a one-attempt
@@ -2453,8 +2643,9 @@ impl OrderJournal {
     }
 
     /// Run `cancel` as its own intent, under a local id that never reaches the
-    /// venue, and classify what it answered. The cancel goes out whatever the
-    /// journal says, and the journal's wait is bounded.
+    /// venue, and classify what it answered. The journal's wait is bounded.
+    /// A spent id on a balance journal withholds the cancel; other refusals
+    /// preserve the bounded send behaviour.
     pub async fn journaled_cancel<F>(
         &self,
         position_id: Option<PositionId>,
@@ -2471,7 +2662,11 @@ impl OrderJournal {
             cancels_order_id: Some(order_id.to_string()),
             params: Value::Null,
         });
-        if let Err(refusal) = self.before_send(&intent, WriteClass::Bounded).await {
+        if let Err(failure) = self.before_send_typed(&intent, WriteClass::Bounded).await {
+            if self.balance_account && failure.commit_failure == Some(CommitFailure::IdSpent) {
+                return CancelClass::Errored(failure.refusal.into());
+            }
+            let refusal = failure.refusal;
             warn!(%order_id, %refusal, "Cancel goes out without a journal row");
         }
         let class = classify_cancel(cancel.await);
@@ -2499,7 +2694,11 @@ impl OrderJournal {
             cancels_order_id: Some(order_id.to_string()),
             params: Value::Null,
         });
-        if let Err(refusal) = self.before_send(&intent, WriteClass::Bounded).await {
+        if let Err(failure) = self.before_send_typed(&intent, WriteClass::Bounded).await {
+            if self.balance_account && failure.commit_failure == Some(CommitFailure::IdSpent) {
+                return OrphanCancel::Withheld;
+            }
+            let refusal = failure.refusal;
             warn!(%order_id, %refusal, "Orphan cancel goes on without a journal row");
         }
         let handoff = Arc::new(OrphanSweepCancel::default());
@@ -3185,6 +3384,9 @@ impl Drop for Permit {
     }
 }
 
+#[cfg(test)]
+#[path = "balance_journal_tests.rs"]
+mod balance_journal_tests;
 #[cfg(test)]
 #[path = "one_attempt_tests.rs"]
 mod one_attempt_tests;
