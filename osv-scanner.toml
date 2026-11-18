@@ -46,3 +46,8 @@ reason = "deepmerge 4.3.1 (prototype pollution via attacker-supplied source obje
 [[IgnoredVulns]]
 id = "GHSA-g3hv-75wg-m249"
 reason = "minimatch 3.1.5 (globparts amplification DoS with attacker-supplied patterns at optimizationLevel >= 2): the only fixed release is 11.0.1, a semver-major reachable only when eslint and @eslint/config-array/@eslint/eslintrc move off their ^3 edges (eslint 10 still pins ^10.2.6, also unfixed). Precondition absent: minimatch is pulled solely by eslint, a dev-only tool that is not part of the CI gates or the production image, and the only patterns it sees are the repository's own eslint config globs. Re-evaluate on eslint releases that bump minimatch to >= 11.0.1. (2026-11-03)"
+
+[[IgnoredVulns]]
+id = "GHSA-fc5q-39xc-vjpf"
+ignoreUntil = 2026-12-18T00:00:00Z
+reason = "picomatch <= 4.0.7 (ReDoS through repeated extglobs in attacker-supplied patterns): no fixed release exists (latest 4.0.7, advisory first_patched_version null as of 2026-11-18). Pulled only by frontend build/test tooling (vite, vitest, svelte-check, tinyglobby/fdir); the production image contains only the static build output. Patterns are the repository's own config globs. Operator-approved on 2026-11-18 for this advisory only, expiring 2026-12-18T00:00:00Z; remove and bump as soon as a fixed release exists. (2026-11-18)"

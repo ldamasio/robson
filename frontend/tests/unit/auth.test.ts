@@ -86,6 +86,23 @@ describe('silent refresh settlement ownership', () => {
     expect(get(auth.authToken)).toBeNull();
   });
 
+  it('settles every waiter when publishing the credential fails', async () => {
+    vi.stubGlobal('sessionStorage', {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: () => { throw new Error('fixture storage failure'); },
+      removeItem: (key: string) => { storage.delete(key); }
+    });
+    const results = [auth.silentRefreshGoogleToken('fixture-client'), auth.silentRefreshGoogleToken('fixture-client')];
+    callbacks[0]({ credential: 'unstorable-fixture-token' });
+    for (const result of results) await expect(result).rejects.toThrow('fixture storage failure');
+    expect(get(auth.authToken)).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+    const next = auth.silentRefreshGoogleToken('fixture-client');
+    expect(initialize).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(5000);
+    await expect(next).resolves.toBeNull();
+  });
+
   it('preserves prompt rejection and permits a later independent refresh', async () => {
     prompt.mockImplementationOnce(() => { throw new Error('fixture prompt failure'); });
     await expect(auth.silentRefreshGoogleToken('fixture-client')).rejects.toThrow('fixture prompt failure');
