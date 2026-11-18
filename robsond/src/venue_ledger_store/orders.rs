@@ -140,7 +140,8 @@ impl PgVenueLedger {
                 terminal_clock_sample_id=CASE WHEN terminal_seen_at IS NULL THEN $17 ELSE terminal_clock_sample_id END,
                 terminal_clock_wall_delta_ms=CASE WHEN terminal_seen_at IS NULL THEN $18 ELSE terminal_clock_wall_delta_ms END,
                 terminal_clock_mono_delta_ms=CASE WHEN terminal_seen_at IS NULL THEN $19 ELSE terminal_clock_mono_delta_ms END,
-                terminal_clock_verdict=CASE WHEN terminal_seen_at IS NULL THEN $20 ELSE terminal_clock_verdict END
+                terminal_clock_verdict=CASE WHEN terminal_seen_at IS NULL THEN $20 ELSE terminal_clock_verdict END,
+                quote_floor=$26
                 WHERE venue_id=$21 AND account_scope=$22 AND symbol=$23 AND exchange_order_id=$24 AND tenant_id=$25")
                 .bind(owner).bind(intent).bind(position).bind(kind).bind(&order.last_client_order_id)
                 .bind(&order.status).bind(phase_text(order.phase)).bind(order.executed_cum).bind(order.cumulative_quote)
@@ -148,7 +149,7 @@ impl PgVenueLedger {
                 .bind(order.venue_transact_time_ms).bind(order.venue_working_time_ms).bind(terminal_at)
                 .bind(terminal_sample).bind(terminal_wall).bind(terminal_mono).bind(terminal_verdict)
                 .bind(order.key.venue.as_str()).bind(&order.key.account_scope).bind(&order.key.symbol)
-                .bind(order.key.exchange_order_id.to_string()).bind(self.tenant_id).execute(&mut **tx).await
+                .bind(order.key.exchange_order_id.to_string()).bind(self.tenant_id).bind(order.quote_floor).execute(&mut **tx).await
         } else {
             let mut insert=QueryBuilder::<Postgres>::new("INSERT INTO venue_orders (
                 venue_id,account_scope,symbol,exchange_order_id,tenant_id,client_order_id,last_client_order_id,
@@ -156,7 +157,7 @@ impl PgVenueLedger {
                 executed_cum,cumulative_quote,last_checked_at,live_seen_at,live_clock_sample_id,
                 live_clock_wall_delta_ms,live_clock_mono_delta_ms,live_clock_verdict,terminal_seen_at,
                 terminal_clock_sample_id,terminal_clock_wall_delta_ms,terminal_clock_mono_delta_ms,
-                terminal_clock_verdict,expiry_reason,venue_time_ms,venue_update_time_ms,venue_transact_time_ms,venue_working_time_ms) ");
+                terminal_clock_verdict,expiry_reason,venue_time_ms,venue_update_time_ms,venue_transact_time_ms,venue_working_time_ms,quote_floor) ");
             insert.push_values(std::iter::once(order),|mut row,order| {
                 row.push_bind(order.key.venue.as_str()).push_bind(&order.key.account_scope).push_bind(&order.key.symbol)
                     .push_bind(order.key.exchange_order_id.to_string()).push_bind(self.tenant_id)
@@ -168,7 +169,7 @@ impl PgVenueLedger {
                     .push_bind(live_mono).push_bind(live_verdict).push_bind(terminal_at).push_bind(terminal_sample)
                     .push_bind(terminal_wall).push_bind(terminal_mono).push_bind(terminal_verdict)
                     .push_bind(&order.expiry_reason).push_bind(order.venue_time_ms).push_bind(order.venue_update_time_ms)
-                    .push_bind(order.venue_transact_time_ms).push_bind(order.venue_working_time_ms);
+                    .push_bind(order.venue_transact_time_ms).push_bind(order.venue_working_time_ms).push_bind(order.quote_floor);
             });
             insert.build().execute(&mut **tx).await
         }.map_err(order_error)?;
@@ -301,6 +302,7 @@ pub(super) fn decode_order(row: &PgRow, tenant: Uuid) -> Result<Option<StoredOrd
         phase,
         executed_cum: row.try_get("executed_cum").map_err(backend)?,
         cumulative_quote: row.try_get("cumulative_quote").map_err(backend)?,
+        quote_floor: row.try_get("quote_floor").map_err(backend)?,
         fills_qty: row.try_get("fills_qty").map_err(backend)?,
         trades_cursor: row.try_get("trades_cursor").map_err(backend)?,
         last_checked_at: row.try_get("last_checked_at").map_err(backend)?,
@@ -351,6 +353,11 @@ pub(super) fn order_error(error: sqlx::Error) -> LedgerError {
                 && database.constraint() == Some("venue_orders_leg"))
         {
             return LedgerError::IdentityConflict;
+        }
+        if database.code().as_deref() == Some("23514")
+            && database.constraint() == Some("venue_orders_quote_floor_bound")
+        {
+            return LedgerError::TradeConflict;
         }
         if database.code().as_deref() == Some("23514")
             && database.constraint() == Some("balance_legs_consumed_cum_check")

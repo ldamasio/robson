@@ -576,6 +576,62 @@ proptest! {
 }
 
 #[test]
+fn the_quote_floor_survives_an_unknown_total_as_execution_grows() {
+    let mut incoming = record();
+    let known = unowned(&incoming);
+    assert_eq!(known.quote_floor, Some(dec!(200)));
+    incoming.executed_qty = dec!(3);
+    incoming.cumulative_quote_qty = None;
+    let unknown = merge_order(Some(&known), &incoming, &link(OrderOwner::Discovered), &at(2), None)
+        .unwrap()
+        .order;
+    assert_eq!((unknown.cumulative_quote, unknown.quote_floor), (None, Some(dec!(200))));
+    incoming.cumulative_quote_qty = Some(dec!(150));
+    for phase in [OrderPhase::Live, OrderPhase::Terminal] {
+        incoming.phase = phase;
+        incoming.status = if phase == OrderPhase::Terminal {
+            "CANCELED"
+        } else {
+            "PARTIALLY_FILLED"
+        }
+        .into();
+        assert_eq!(
+            merge_order(Some(&unknown), &incoming, &link(OrderOwner::Discovered), &at(3), None),
+            Err(LedgerError::TradeConflict)
+        );
+    }
+    incoming.phase = OrderPhase::Live;
+    incoming.status = "PARTIALLY_FILLED".into();
+    incoming.cumulative_quote_qty = Some(dec!(300));
+    let exact = merge_order(Some(&unknown), &incoming, &link(OrderOwner::Discovered), &at(4), None)
+        .unwrap()
+        .order;
+    assert_eq!((exact.cumulative_quote, exact.quote_floor), (Some(dec!(300)), Some(dec!(300))));
+    // A pre-floor row with no exact evidence stays unknown; one with an exact
+    // total uses it as the floor without a change on replay.
+    let mut old = known.clone();
+    old.quote_floor = None;
+    incoming.executed_qty = dec!(2);
+    incoming.cumulative_quote_qty = Some(dec!(200));
+    assert!(
+        !merge_order(Some(&old), &incoming, &link(OrderOwner::Discovered), &at(5), None)
+            .unwrap()
+            .changed
+    );
+    incoming.executed_qty = dec!(3);
+    incoming.cumulative_quote_qty = Some(dec!(150));
+    assert_eq!(
+        merge_order(Some(&old), &incoming, &link(OrderOwner::Discovered), &at(5), None),
+        Err(LedgerError::TradeConflict)
+    );
+    old.cumulative_quote = None;
+    let blind = merge_order(Some(&old), &incoming, &link(OrderOwner::Discovered), &at(6), None)
+        .unwrap()
+        .order;
+    assert_eq!(blind.quote_floor, Some(dec!(150)));
+}
+
+#[test]
 fn a_quote_subtotal_never_becomes_an_unknown_larger_execution_total() {
     for terminal_first in [false, true] {
         let mut incoming = record();

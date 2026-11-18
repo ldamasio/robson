@@ -181,7 +181,7 @@ async fn the_ledger_schema_installs_fresh(pool: PgPool) {
     }
     let versions: Vec<i64>=sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE version>=20240101000036 AND success ORDER BY version")
         .fetch_all(&pool).await.unwrap();
-    assert_eq!(versions, [20240101000036, 20240101000037]);
+    assert_eq!(versions, [20240101000036, 20240101000037, 20240101000039]);
     let f = Fixture::new(&pool).await;
     f.all_rows(&pool).await;
     let volatility: String=sqlx::query_scalar("SELECT provolatile::text FROM pg_proc WHERE oid='balance_leg_admit(uuid,text,text,text,uuid,uuid,date,numeric,numeric,numeric,numeric,numeric,text,text,timestamptz,text,numeric,numeric,numeric,numeric,numeric,numeric,timestamptz,boolean)'::regprocedure AND prorettype='void'::regtype")

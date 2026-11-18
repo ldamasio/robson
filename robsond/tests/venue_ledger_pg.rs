@@ -273,6 +273,78 @@ async fn concurrent_adoption_counts_once_and_refuses_another_leg(pool: PgPool) {
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
+async fn quote_floor_survives_an_unknown_total_across_row_persistence(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let link = f.link(LegOrderKind::Sell);
+    let mut r = record();
+    f.ledger.record_order(&r, &link, seen(1)).await.unwrap();
+    r.executed_qty = Decimal::from(3);
+    r.cumulative_quote_qty = None;
+    assert!(f.ledger.record_order(&r, &link, seen(2)).await.unwrap().changed);
+    let row = sqlx::query("SELECT cumulative_quote,quote_floor FROM venue_orders")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<Option<Decimal>, _>("cumulative_quote"), None);
+    assert_eq!(row.get::<Option<Decimal>, _>("quote_floor"), Some(Decimal::from(200)));
+    let before = snapshot(&pool).await;
+    let version = f.version(&pool).await;
+    let consumed = f.consumed(&pool).await;
+    r.cumulative_quote_qty = Some(Decimal::from(150));
+    for terminal in [false, true] {
+        if terminal {
+            r.phase = OrderPhase::Terminal;
+            r.status = "CANCELED".into();
+        }
+        assert_eq!(
+            f.ledger.record_order(&r, &link, seen(3)).await,
+            Err(LedgerError::TradeConflict)
+        );
+        assert_eq!(snapshot(&pool).await, before);
+        assert_eq!(f.version(&pool).await, version);
+        assert_eq!(f.consumed(&pool).await, consumed);
+    }
+    r.phase = OrderPhase::Live;
+    r.status = "PARTIALLY_FILLED".into();
+    r.cumulative_quote_qty = Some(Decimal::from(300));
+    assert!(f.ledger.record_order(&r, &link, seen(4)).await.unwrap().changed);
+    let row = sqlx::query("SELECT cumulative_quote,quote_floor FROM venue_orders")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<Option<Decimal>, _>("cumulative_quote"), Some(Decimal::from(300)));
+    assert_eq!(row.get::<Option<Decimal>, _>("quote_floor"), Some(Decimal::from(300)));
+    // A row written before 0039 has a known exact total and no floor. The
+    // first larger observation without an exact total keeps that total.
+    sqlx::query("UPDATE venue_orders SET quote_floor=NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    r.executed_qty = Decimal::from(4);
+    r.cumulative_quote_qty = None;
+    assert!(f.ledger.record_order(&r, &link, seen(5)).await.unwrap().changed);
+    let row = sqlx::query("SELECT cumulative_quote,quote_floor FROM venue_orders")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<Option<Decimal>, _>("cumulative_quote"), None);
+    assert_eq!(row.get::<Option<Decimal>, _>("quote_floor"), Some(Decimal::from(300)));
+    // The NOT VALID checks still refuse new writes.
+    let before = snapshot(&pool).await;
+    for (sql, name) in [
+        ("UPDATE venue_orders SET quote_floor=-1", "venue_orders_quote_floor_fit"),
+        ("UPDATE venue_orders SET cumulative_quote=200", "venue_orders_quote_floor_bound"),
+    ] {
+        let error = sqlx::query(sql).execute(&pool).await.unwrap_err();
+        let database = error.as_database_error().unwrap();
+        assert_eq!(database.code().as_deref(), Some("23514"));
+        assert_eq!(database.constraint(), Some(name));
+    }
+    assert_eq!(snapshot(&pool).await, before);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
 async fn adoption_after_trade_evidence_counts_the_entire_stored_execution(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let mut r = record();
@@ -286,7 +358,7 @@ async fn adoption_after_trade_evidence_counts_the_entire_stored_execution(pool: 
         .await
         .unwrap();
     sqlx::query("INSERT INTO order_fills(venue_id,account_scope,symbol,exchange_order_id,trade_id,tenant_id,price,qty,quote_qty,commission,commission_asset,trade_time,recorded_at) VALUES ('binance:spot','scope','BTCUSDT','7','11',$1,100,3,300,0,'USDT',$2,$2)").bind(f.tenant).bind(seen(2).at).execute(&mut *tx).await.unwrap();
-    sqlx::query("UPDATE venue_orders SET executed_cum=3,fills_qty=3,trades_cursor=12")
+    sqlx::query("UPDATE venue_orders SET executed_cum=3,cumulative_quote=300,quote_floor=300,fills_qty=3,trades_cursor=12")
         .execute(&mut *tx)
         .await
         .unwrap();

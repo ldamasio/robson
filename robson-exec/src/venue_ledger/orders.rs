@@ -45,6 +45,8 @@ pub struct StoredOrder {
     pub phase: OrderPhase,
     pub executed_cum: Decimal,
     pub cumulative_quote: Option<Decimal>,
+    /// Greatest exact total ever accepted; survives an unknown total.
+    pub quote_floor: Option<Decimal>,
     pub fills_qty: Decimal,
     pub trades_cursor: i64,
     pub last_checked_at: DateTime<Utc>,
@@ -228,6 +230,14 @@ pub fn merge_order(
         if record.phase == OrderPhase::Terminal && record.executed_qty < old.executed_cum {
             return Err(LedgerError::TradeConflict);
         }
+        // A known exact total is the floor for rows written before the floor.
+        let floor = old.quote_floor.max(old.cumulative_quote);
+        if matches!((floor, record.cumulative_quote_qty), (Some(f), Some(b)) if b < f)
+            && record.executed_qty >= old.executed_cum
+            && (!old.terminal() || record.phase == OrderPhase::Terminal)
+        {
+            return Err(LedgerError::TradeConflict);
+        }
         let execution_regressed = record.executed_qty < old.executed_cum;
         if execution_regressed {
             anomalies.push(OrderAnomaly::ExecutionRegressed);
@@ -265,6 +275,16 @@ pub fn merge_order(
                 } else {
                     record.cumulative_quote_qty.or(old.cumulative_quote)
                 };
+                // Only an old row with no exact evidence stays unknown. A
+                // pre-floor row's replay leaves the floor implied by its
+                // exact total, so it is not a change.
+                let raised = floor.max(record.cumulative_quote_qty);
+                order.quote_floor = if old.quote_floor.is_none() && raised == order.cumulative_quote
+                {
+                    None
+                } else {
+                    raised
+                };
                 order.phase = record.phase;
                 order.status = record.status.clone();
                 if record.phase == OrderPhase::Terminal {
@@ -299,6 +319,7 @@ pub fn merge_order(
             phase: record.phase,
             executed_cum: record.executed_qty,
             cumulative_quote: record.cumulative_quote_qty,
+            quote_floor: record.cumulative_quote_qty,
             fills_qty: Decimal::ZERO,
             trades_cursor: 0,
             last_checked_at: seen.at,
