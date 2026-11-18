@@ -6,11 +6,11 @@
 //! a database; it only sits in front of one the test environment provides.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicU64, AtomicU8, Ordering},
+        Arc, Mutex,
     },
 };
 
@@ -49,6 +49,10 @@ pub enum ProxyMode {
     /// `Execute` on each connection, so a statement SQLx cached and sends with
     /// no `Parse` still counts, and a commit of any other work passes.
     DropCommitAckOf(&'static str),
+    /// Apply the next simple-query rollback but close before its answer.
+    DropRollbackAck,
+    /// As above, only after a transaction executed matching SQL text.
+    DropRollbackAckOf(&'static str),
 }
 
 /// Connection and commit counts.
@@ -68,13 +72,27 @@ struct Counters {
     commits: AtomicU64,
     commit_acks_dropped: AtomicU64,
     statements: AtomicU64,
+    rollback_acks_dropped: AtomicU64,
     prepared_statement_parses: AtomicU64,
 }
+
+/// Optional test SQL only: never startup/authentication or bound parameter
+/// data. Both retained statements and each statement's text have explicit
+/// bounds.
+struct QueryTrace {
+    capacity: usize,
+    statements: VecDeque<String>,
+    dropped: u64,
+}
+
+const TRACE_CAP: usize = 1024;
+const TRACE_SQL_CHARS: usize = 16_384;
 
 struct Shared {
     upstream: SocketAddr,
     mode: watch::Sender<ProxyMode>,
     counters: Counters,
+    trace: Mutex<Option<QueryTrace>>,
 }
 
 impl Shared {
@@ -83,11 +101,13 @@ impl Shared {
     }
 
     /// Claim a pending commit-ack drop, so only one connection fires it.
-    fn claim_commit_ack_drop(&self, transaction: &TransactionWatch) -> bool {
+    fn claim_end_ack_drop(&self, transaction: &TransactionWatch, rollback: bool) -> bool {
         self.mode.send_if_modified(|mode| {
             let fires = match *mode {
-                ProxyMode::DropCommitAck => true,
-                ProxyMode::DropCommitAckOf(text) => transaction.executed(text),
+                ProxyMode::DropCommitAck if !rollback => true,
+                ProxyMode::DropCommitAckOf(text) if !rollback => transaction.executed(text),
+                ProxyMode::DropRollbackAck if rollback => true,
+                ProxyMode::DropRollbackAckOf(text) if rollback => transaction.executed(text),
                 _ => false,
             };
             if fires {
@@ -95,6 +115,17 @@ impl Shared {
             }
             fires
         })
+    }
+
+    fn trace_query(&self, sql: impl FnOnce() -> Option<String>) {
+        let mut trace = self.trace.lock().unwrap();
+        let Some(trace) = trace.as_mut() else { return };
+        let Some(sql) = sql() else { return };
+        if trace.statements.len() == trace.capacity {
+            trace.statements.pop_front();
+            trace.dropped += 1;
+        }
+        trace.statements.push_back(sql.chars().take(TRACE_SQL_CHARS).collect());
     }
 }
 
@@ -153,6 +184,18 @@ impl TransactionWatch {
         }
     }
 
+    fn statement_text(&self, tag: u8, body: &[u8]) -> Option<String> {
+        match tag {
+            b'Q' => Some(simple_query_text(body)),
+            b'E' => body
+                .split(|byte| *byte == 0)
+                .next()
+                .and_then(|portal| self.portal_statement.get(portal))
+                .cloned(),
+            _ => None,
+        }
+    }
+
     fn executed(&self, text: &str) -> bool {
         self.executed.iter().any(|statement| statement.contains(text))
     }
@@ -181,6 +224,7 @@ impl DbProxy {
             upstream,
             mode: watch::Sender::new(ProxyMode::Pass),
             counters: Counters::default(),
+            trace: Mutex::default(),
         });
         let accept = tokio::spawn(accept_loop(listener, shared.clone()));
         Ok(Self { addr, shared, accept })
@@ -199,6 +243,38 @@ impl DbProxy {
     /// Current mode; `DropCommitAck` reverts to `Pass` once it has fired.
     pub fn mode(&self) -> ProxyMode {
         *self.shared.mode.borrow()
+    }
+
+    /// Enable bounded SQL tracing for an individual test. Off by default;
+    /// records SQL text only, excluding startup/authentication packets and
+    /// bind parameters. Callers must use nonsecret SQL fixtures.
+    pub fn enable_query_trace(&self, capacity: usize) {
+        *self.shared.trace.lock().unwrap() = Some(QueryTrace {
+            capacity: capacity.clamp(1, TRACE_CAP),
+            statements: VecDeque::new(),
+            dropped: 0,
+        });
+    }
+
+    pub fn disable_query_trace(&self) {
+        *self.shared.trace.lock().unwrap() = None;
+    }
+
+    pub fn query_trace(&self) -> Vec<String> {
+        self.shared
+            .trace
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or_else(Vec::new, |trace| trace.statements.iter().cloned().collect())
+    }
+
+    pub fn query_trace_dropped(&self) -> u64 {
+        self.shared.trace.lock().unwrap().as_ref().map_or(0, |trace| trace.dropped)
+    }
+
+    pub fn rollback_acks_dropped(&self) -> u64 {
+        self.shared.counters.rollback_acks_dropped.load(Ordering::Relaxed)
     }
 
     /// Complete frontend Parse messages observed before forwarding, including
@@ -258,7 +334,7 @@ async fn relay(mut client: TcpStream, shared: &Shared) -> std::io::Result<()> {
 
     let (client_read, client_write) = client.into_split();
     let (server_read, server_write) = server.into_split();
-    let commit_ack_pending = AtomicBool::new(false);
+    let commit_ack_pending = AtomicU8::new(0);
     // Whichever direction ends first ends the connection.
     tokio::select! {
         result = frontend_to_backend(client_read, server_write, shared, &commit_ack_pending) => result,
@@ -288,7 +364,7 @@ async fn frontend_to_backend(
     mut client: OwnedReadHalf,
     mut server: OwnedWriteHalf,
     shared: &Shared,
-    commit_ack_pending: &AtomicBool,
+    commit_ack_pending: &AtomicU8,
 ) -> std::io::Result<()> {
     let mut transaction = TransactionWatch::default();
     loop {
@@ -301,14 +377,21 @@ async fn frontend_to_backend(
         }
         if is_simple_query_commit(tag, &body) {
             shared.counters.commits.fetch_add(1, Ordering::Relaxed);
-            if shared.claim_commit_ack_drop(&transaction) {
+            if shared.claim_end_ack_drop(&transaction, false) {
                 // Set before the commit is forwarded, so the backend half has
                 // always seen it by the time the reply arrives.
-                commit_ack_pending.store(true, Ordering::SeqCst);
+                commit_ack_pending.store(1, Ordering::SeqCst);
             }
+        }
+        if tag == b'Q'
+            && simple_query_text(&body).eq_ignore_ascii_case("ROLLBACK")
+            && shared.claim_end_ack_drop(&transaction, true)
+        {
+            commit_ack_pending.store(2, Ordering::SeqCst);
         }
         if matches!(tag, b'Q' | b'E') {
             shared.counters.statements.fetch_add(1, Ordering::Relaxed);
+            shared.trace_query(|| transaction.statement_text(tag, &body));
         }
         transaction.observe(tag, &body);
         write_message(&mut server, tag, &body).await?;
@@ -319,15 +402,20 @@ async fn backend_to_frontend(
     mut server: OwnedReadHalf,
     mut client: OwnedWriteHalf,
     shared: &Shared,
-    commit_ack_pending: &AtomicBool,
+    commit_ack_pending: &AtomicU8,
 ) -> std::io::Result<()> {
     loop {
         let (tag, body) = read_message(&mut server).await?;
-        if commit_ack_pending.load(Ordering::SeqCst) {
+        let pending = commit_ack_pending.load(Ordering::SeqCst);
+        if pending != 0 {
             // The commit's reply, up to ReadyForQuery: the server has applied
             // it. Dropped, then the connection closes without an answer.
             if tag == b'Z' {
-                shared.counters.commit_acks_dropped.fetch_add(1, Ordering::Relaxed);
+                if pending == 1 {
+                    shared.counters.commit_acks_dropped.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    shared.counters.rollback_acks_dropped.fetch_add(1, Ordering::Relaxed);
+                }
                 return Ok(());
             }
             continue;
@@ -541,6 +629,64 @@ mod tests {
             assert!(reply.await.is_err(), "the client must see only its own timeout");
             assert_eq!(received.recv().await.unwrap(), b"SELECT 1\0".to_vec());
             assert!(received.try_recv().is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pass_preserves_forwarding_and_trace_is_opt_in_and_bounded() {
+        bounded(async {
+            let (upstream, mut received) = scripted_server().await;
+            let proxy = DbProxy::start(upstream).await.unwrap();
+            let mut client = connected(&proxy).await;
+            client.write_all(&message(b'Q', b"SELECT 0\0")).await.unwrap();
+            read_reply(&mut client).await.unwrap();
+            assert!(proxy.query_trace().is_empty());
+            proxy.enable_query_trace(2);
+            for n in 1..=3 {
+                client
+                    .write_all(&message(b'Q', format!("SELECT {n}\0").as_bytes()))
+                    .await
+                    .unwrap();
+                assert_eq!(read_reply(&mut client).await.unwrap(), (b'C', b'Z'));
+            }
+            assert_eq!(proxy.query_trace(), vec!["SELECT 2", "SELECT 3"]);
+            assert_eq!(proxy.query_trace_dropped(), 1);
+            assert_eq!(proxy.stats().statements, 4);
+            assert_eq!(proxy.mode(), ProxyMode::Pass);
+            for n in 0..=3 {
+                assert_eq!(received.recv().await.unwrap(), format!("SELECT {n}\0").into_bytes());
+            }
+            proxy.disable_query_trace();
+            assert!(proxy.query_trace().is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_targeted_lost_rollback_answer_applies_rollback_then_retires() {
+        bounded(async {
+            let (upstream, mut received) = scripted_server().await;
+            let proxy = DbProxy::start(upstream).await.unwrap();
+            let mut client = connected(&proxy).await;
+            proxy.set_mode(ProxyMode::DropRollbackAckOf("expected"));
+            for sql in [
+                "BEGIN",
+                "SELECT 1",
+                "ROLLBACK",
+                "BEGIN",
+                "CREATE TEMP TABLE expected (n int)",
+            ] {
+                client.write_all(&message(b'Q', format!("{sql}\0").as_bytes())).await.unwrap();
+                assert_eq!(read_reply(&mut client).await.unwrap(), (b'C', b'Z'));
+                assert_eq!(received.recv().await.unwrap(), format!("{sql}\0").into_bytes());
+            }
+            client.write_all(&message(b'Q', b"ROLLBACK\0")).await.unwrap();
+            assert_eq!(received.recv().await.unwrap(), b"ROLLBACK\0".to_vec());
+            assert!(read_reply(&mut client).await.is_err());
+            assert_eq!(proxy.rollback_acks_dropped(), 1);
+            assert_eq!(proxy.stats().commit_acks_dropped, 0);
+            assert_eq!(proxy.mode(), ProxyMode::Pass);
         })
         .await;
     }

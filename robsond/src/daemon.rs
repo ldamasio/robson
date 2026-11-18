@@ -194,7 +194,12 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     // ADR-0056 step 8: the capability is fixed before the journal is shared.
     let one_attempt = venue.capabilities().one_attempt_per_client_id;
     let journal = Arc::new(
-        OrderJournal::new(backend, venue.id()).with_one_attempt_per_client_id(one_attempt),
+        OrderJournal::new(backend, venue.id())
+            .with_one_attempt_per_client_id(one_attempt)
+            .with_balance_account(
+                venue.capabilities().account_kind
+                    == robson_exec::venue::AccountKind::BalanceAccount,
+            ),
     );
     venue.attach_order_journal(Arc::clone(&journal));
     executor.with_order_journal(journal)
@@ -2440,6 +2445,78 @@ mod tests {
     use crate::query::{ActorKind, ExecutionQuery, QueryKind};
     #[cfg(feature = "postgres")]
     use crate::query_engine::QueryStateChangedEvent;
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn factory_journals_are_wired_without_balance_or_one_attempt(pool: sqlx::PgPool) {
+        use robson_exec::order_journal::{IntentKind, IntentSpec, WriteClass};
+
+        use crate::{config::VenueSelection, venue::VenueFactory};
+        let pool = Some(Arc::new(pool));
+        for (index, selection) in [
+            VenueSelection::Unset,
+            VenueSelection::BinanceUsdm,
+            VenueSelection::Stub,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut config = Config::test();
+            config.venue = selection;
+            config.binance.use_testnet = true;
+            config.binance.api_key = Some("key-fixture".to_string());
+            config.binance.api_secret = Some("secret-fixture".to_string());
+            config.projection.tenant_id = Some(uuid::Uuid::now_v7());
+            let venue = VenueFactory::build(&config).unwrap().venue;
+            let executor = Executor::new(
+                venue.clone(),
+                Arc::new(IntentJournal::new()),
+                Arc::new(MemoryStore::new()),
+            );
+            let executor = with_durable_order_journal(executor, &venue, &pool, &config);
+            let journal = executor.order_journal();
+            assert!(!journal.balance_account());
+            assert!(!journal.one_attempt_per_client_id());
+            journal.check_ready().await.unwrap();
+            let op = journal.begin_operation();
+            op.scope(async {
+                let intent = journal.open_intent(IntentSpec {
+                    position_id: None,
+                    kind: IntentKind::Exit,
+                    client_order_id: format!("factory-{index}"),
+                    cancels_order_id: None,
+                    params: serde_json::Value::Null,
+                });
+                journal.before_send(&intent, WriteClass::Strict).await.unwrap();
+                journal.finish_success(&intent, None).await;
+            })
+            .await;
+            assert_eq!(journal.statements_total(), 9);
+        }
+        let pool = pool.as_ref().unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM order_intents")
+                .fetch_one(&**pool)
+                .await
+                .unwrap(),
+            3
+        );
+        for table in [
+            "accounting_state",
+            "spot_intent_clock",
+            "balance_leg_admissions",
+            "balance_legs",
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM {table}"))
+                    .fetch_one(&**pool)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_daemon_stub_creation() {

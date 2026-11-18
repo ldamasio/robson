@@ -4,7 +4,12 @@
 //! Every write is one explicit transaction ending in `Transaction::commit`,
 //! which goes out as a simple-query `COMMIT`. Nothing here commits implicitly.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[path = "order_journal_balance.rs"]
+mod balance;
+#[path = "order_journal_readiness.rs"]
+mod readiness;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -31,9 +36,9 @@ const JOURNAL_ACQUIRE_BOUND: Duration = Duration::from_millis(250);
 /// unless its work finished. A dropped future leaves a statement whose replies
 /// may never arrive; returned to the pool it would wait on a ping, holding its
 /// slot with no deadline, and two of those are the whole pool.
-struct RetiringConnection {
-    connection: PoolConnection<Postgres>,
-    finished: bool,
+pub(crate) struct RetiringConnection {
+    pub(crate) connection: PoolConnection<Postgres>,
+    pub(crate) finished: bool,
 }
 
 impl Drop for RetiringConnection {
@@ -223,6 +228,9 @@ impl PgJournalBackend {
             .await
             .map_err(known)?;
         }
+        if batch.balance.is_some() {
+            Box::pin(self.write_balance(batch, tx)).await?;
+        }
         Ok(())
     }
 }
@@ -230,6 +238,10 @@ impl PgJournalBackend {
 #[async_trait]
 impl JournalBackend for PgJournalBackend {
     async fn commit(&self, batch: &JournalBatch) -> Result<(), CommitFailure> {
+        let started = Instant::now();
+        if batch.balance.is_some() {
+            return Box::pin(self.commit_balance(batch, started)).await;
+        }
         let known = |e: sqlx::Error| CommitFailure::Known(e.to_string());
         let connection = self.pool.acquire().await.map_err(known)?;
         let mut write = RetiringConnection { connection, finished: false };
@@ -480,6 +492,10 @@ impl JournalBackend for PgJournalBackend {
             Ok(result) => result,
             Err(_) => Err(format!("no answer within {} ms", self.ready_wait.as_millis())),
         }
+    }
+
+    async fn check_balance_schema(&self, venue: &str, one_attempt: bool) -> Result<(), String> {
+        self.probe_balance_schema(venue, one_attempt).await
     }
 
     async fn attempt_states(
