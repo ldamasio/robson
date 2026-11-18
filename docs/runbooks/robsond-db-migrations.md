@@ -232,8 +232,12 @@ not proof of absence while the original backend can still commit. In order:
 
 1. Wait until no backend of the failed migrate job remains: check
    `pg_stat_activity` for the job's connection (and any lock it held in
-   `pg_locks`) until it is gone. If it does not go away, stop and get the
-   operator's direction; the outcome stays unresolved.
+   `pg_locks`) until it is gone. The retained job and session evidence must
+   identify that backend uniquely: an empty activity query proves nothing when
+   the identity was never known. If either the identity or its retirement
+   cannot be proved within a bounded diagnostic window, stop without further
+   polling; the outcome stays `MayHaveCommitted` (unresolved) until the
+   operator decides.
 2. Rerun the canonical `robsond db migrate`. It takes SQLx's migration lock
    before it reads the applied history, so its decision is serialized behind
    any surviving migrator: it skips 38 if the COMMIT landed and applies it if
