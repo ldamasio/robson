@@ -97,7 +97,7 @@ pub(super) async fn prepare_with(
     contract::declared(&reference)?;
     same(&before, &capture(&mut f.observer, "B1").await?, true)?;
     f.baseline = f.proxy.stats();
-    f.proxy.enable_query_trace(32);
+    f.proxy.enable_exact_query_trace(32);
     eprintln!("GENERATED_SETUP fixed_fixture_once=true trigger_DDL={} full_captures=3 metadata_reads=1 history_reads=1 advisory_SQL=2 reference_owner_SQL=4",if deferred{3}else{1});
     Ok(Oracle {
         before,
@@ -302,7 +302,7 @@ pub(super) async fn configure_reconnect(f: &mut Fixture, old_pid: i32) -> Result
         "generated new owner's actual advisory setup2"
     );
     f.baseline = f.proxy.stats();
-    f.proxy.enable_query_trace(32);
+    f.proxy.enable_exact_query_trace(32);
     eprintln!(
         "GENERATED_RECONNECT old_pid={old_pid} new_pid={} setup_owner_SQL=4 reseed_SQL=0",
         f.pid

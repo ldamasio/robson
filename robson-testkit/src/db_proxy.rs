@@ -112,6 +112,9 @@ struct QueryTrace {
     capacity: usize,
     statements: VecDeque<String>,
     dropped: u64,
+    /// The exact mode preserves simple Query text, including the terminal
+    /// delimiter, up to `TRACE_SQL_CHARS`. `E` capture is unchanged.
+    exact: bool,
 }
 
 const TRACE_CAP: usize = 1024;
@@ -174,10 +177,10 @@ impl Shared {
         })
     }
 
-    fn trace_query(&self, sql: impl FnOnce() -> Option<String>) {
+    fn trace_query(&self, sql: impl FnOnce(bool) -> Option<String>) {
         let mut trace = self.trace.lock().unwrap();
         let Some(trace) = trace.as_mut() else { return };
-        let Some(sql) = sql() else { return };
+        let Some(sql) = sql(trace.exact) else { return };
         if trace.statements.len() == trace.capacity {
             trace.statements.pop_front();
             trace.dropped += 1;
@@ -390,10 +393,25 @@ impl DbProxy {
     /// records SQL text only, excluding startup/authentication packets and
     /// bind parameters. Callers must use nonsecret SQL fixtures.
     pub fn enable_query_trace(&self, capacity: usize) {
+        self.reset_query_trace(capacity, false);
+    }
+
+    /// As [`Self::enable_query_trace`], but a simple query is recorded as its
+    /// exact UTF-8 text up to the single trailing NUL, whitespace and terminal
+    /// `;` included. Malformed bodies (missing/interior NUL, invalid UTF-8)
+    /// are not recorded. Extended `Execute` capture is unchanged. Each entry
+    /// keeps the preexisting `TRACE_SQL_CHARS` per-entry character cap. This
+    /// only affects recorded evidence windows, never forwarded bytes or modes.
+    pub fn enable_exact_query_trace(&self, capacity: usize) {
+        self.reset_query_trace(capacity, true);
+    }
+
+    fn reset_query_trace(&self, capacity: usize, exact: bool) {
         *self.shared.trace.lock().unwrap() = Some(QueryTrace {
             capacity: capacity.clamp(1, TRACE_CAP),
             statements: VecDeque::new(),
             dropped: 0,
+            exact,
         });
     }
 
@@ -607,7 +625,10 @@ async fn frontend_to_backend(
         }
         if matches!(tag, b'Q' | b'E') {
             shared.counters.statements.fetch_add(1, Ordering::Relaxed);
-            shared.trace_query(|| transaction.statement_text(tag, &body));
+            shared.trace_query(|exact| match tag {
+                b'Q' if exact => exact_simple_query_text(&body),
+                _ => transaction.statement_text(tag, &body),
+            });
         }
         let record = diagnostic.and_then(|diagnostic| {
             let (category, namespace_opaque) = transaction.diagnostic_metadata(tag, &body);
@@ -755,6 +776,15 @@ fn simple_query_text(body: &[u8]) -> String {
     let end = body.iter().position(|byte| *byte == 0).unwrap_or(body.len());
     let statement = String::from_utf8_lossy(&body[..end]);
     statement.trim().trim_end_matches(';').trim().to_string()
+}
+
+/// Trace-only: the query string must end at its one canonical NUL.
+fn exact_simple_query_text(body: &[u8]) -> Option<String> {
+    let (&0, text) = body.split_last()? else { return None };
+    if text.contains(&0) {
+        return None;
+    }
+    std::str::from_utf8(text).ok().map(str::to_owned)
 }
 
 fn classify_diagnostic_sql(sql: &str) -> SqlCategory {
@@ -1042,6 +1072,31 @@ mod tests {
             }
             proxy.disable_query_trace();
             assert!(proxy.query_trace().is_empty());
+
+            // Exact mode keeps the terminal `;` and skips a malformed body.
+            // Default mode still trims, and forwarded bytes never change.
+            for (exact, bodies, trace) in [
+                (false, vec![b" SELECT 4; \0".as_slice()], vec!["SELECT 4"]),
+                (
+                    true,
+                    vec![b" SELECT 5; \0".as_slice(), b"SELECT 6\0x\0".as_slice()],
+                    vec![" SELECT 5; "],
+                ),
+            ] {
+                if exact {
+                    proxy.enable_exact_query_trace(2);
+                } else {
+                    proxy.enable_query_trace(2);
+                }
+                for body in bodies {
+                    client.write_all(&message(b'Q', body)).await.unwrap();
+                    assert_eq!(read_reply(&mut client).await.unwrap(), (b'C', b'Z'));
+                    assert_eq!(received.recv().await.unwrap(), body.to_vec());
+                }
+                assert_eq!(proxy.query_trace(), trace);
+                assert_eq!(proxy.query_trace_dropped(), 0);
+            }
+            assert_eq!(proxy.stats().statements, 7);
         })
         .await;
     }

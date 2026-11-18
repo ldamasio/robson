@@ -53,9 +53,9 @@ pub(super) async fn apply(
         #[cfg(not(test))]
         let _ = index;
         point!(Stage::Ddl(number), Edge::BeforeCall);
-        sqlx::query(chunk)
-            .persistent(false)
-            .execute(&mut *transaction)
+        // Intentionally one unbound simple Query per validated single-command
+        // slice: PG12 lacks per-command timers in a multi-command Query.
+        sqlx::Executor::execute(&mut *transaction, sqlx::raw_sql(chunk))
             .await
             .map_err(|error| MigrateError::ExecuteMigration(error, migration.version))?;
         point!(Stage::Ddl(number), Edge::AfterReturn);

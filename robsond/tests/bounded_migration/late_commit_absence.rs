@@ -55,7 +55,7 @@ async fn exercise(f: &mut Fixture, warm: &Value) -> Result<()> {
                     Edge::AfterReturn
                 };
                 let next = stages::arm(&slot, points[n + 1], edge)?;
-                proxy.enable_query_trace(32);
+                proxy.enable_exact_query_trace(32);
                 current
                     .1
                     .send(())
@@ -280,7 +280,7 @@ async fn actual52_absence_precedes_same_original_late_commit(pool: PgPool) -> Re
             "warm observer/original identity not established"
         );
         f.baseline = f.proxy.stats();
-        f.proxy.enable_query_trace(32);
+        f.proxy.enable_exact_query_trace(32);
         exercise(&mut f, &warm).await
     })
     .await

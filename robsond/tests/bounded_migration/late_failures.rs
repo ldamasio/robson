@@ -45,6 +45,8 @@ mod oracles;
 use oracles::{cleanup, committed, database_code, error_class, post_fault, prepare, Oracle};
 
 async fn exercise(f: &mut Fixture, fault: Fault, oracle: &mut Oracle) -> Result<()> {
+    // Re-arms prepare's empty default ring in exact mode; no SQL in between.
+    f.proxy.enable_exact_query_trace(32);
     let slot = f.adapter.gate.clone();
     let points = [
         Stage::Ddl(16),
@@ -74,7 +76,7 @@ async fn exercise(f: &mut Fixture, fault: Fault, oracle: &mut Oracle) -> Result<
                     Edge::AfterReturn
                 };
                 let next = stages::arm(&slot, points[n + 1], edge)?;
-                proxy.enable_query_trace(32);
+                proxy.enable_exact_query_trace(32);
                 current.1.send(()).map_err(|_| anyhow::anyhow!("late window release lost"))?;
                 current = next;
             } else {

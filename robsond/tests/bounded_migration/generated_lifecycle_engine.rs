@@ -80,7 +80,7 @@ pub(super) async fn attempt_with(
                 ensure!(proxy.mode() == ProxyMode::Pass, "unexpected preexisting fault");
                 proxy.set_mode(ProxyMode::DropCommitAck);
             }
-            proxy.enable_query_trace(32);
+            proxy.enable_exact_query_trace(32);
             current.1.send(()).map_err(|_| anyhow::anyhow!("generated release lost"))?;
             if let Some(next) = next {
                 current = next;
