@@ -276,10 +276,14 @@ pub fn merge_order(
                     record.cumulative_quote_qty.or(old.cumulative_quote)
                 };
                 // Only an old row with no exact evidence stays unknown. A
-                // pre-floor row's replay leaves the floor implied by its
-                // exact total, so it is not a change.
+                // pre-floor row's replay of its own execution and exact total
+                // leaves the floor implied, so it is not a change; a newly
+                // accepted total or grown execution makes the floor durable.
                 let raised = floor.max(record.cumulative_quote_qty);
-                order.quote_floor = if old.quote_floor.is_none() && raised == order.cumulative_quote
+                order.quote_floor = if old.quote_floor.is_none()
+                    && record.executed_qty == old.executed_cum
+                    && raised == old.cumulative_quote
+                    && raised == order.cumulative_quote
                 {
                     None
                 } else {
