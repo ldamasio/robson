@@ -64,7 +64,12 @@ async fn the_ledger_schema_installs_fresh(pool: PgPool) {
     }
     let versions: Vec<i64>=sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE version>=20240101000036 AND success ORDER BY version")
         .fetch_all(&pool).await.unwrap();
-    assert_eq!(versions, [20240101000036, 20240101000037, 20240101000038, 20240101000039]);
+    assert_eq!(versions, [
+        20240101000036,
+        20240101000037,
+        20240101000038,
+        20240101000039
+    ]);
     let f = Fixture::new_for_all_rows(&pool).await.unwrap();
     f.all_rows(&pool).await.unwrap();
     let graph: i64 = sqlx::query_scalar("SELECT count(*) FROM spot_intent_clock c JOIN submit_attempts a USING(attempt_id) JOIN order_intents i ON i.intent_id=c.intent_id JOIN budget_daily_charges d USING(attempt_id) WHERE c.tenant_id=$1 AND c.intent_id=$2 AND a.venue_id=c.venue_id AND a.account_scope=i.account_scope AND a.client_order_id=i.client_order_id AND a.created_at=c.attempt_created_at AND d.tenant_id=c.tenant_id AND d.intent_id=c.intent_id AND d.venue_id=c.venue_id AND d.account_scope=i.account_scope AND d.client_order_id=i.client_order_id AND d.kind=i.kind AND d.source_created_at=c.attempt_created_at AND d.daily_units=1 AND d.budget_clock_domain IS NOT DISTINCT FROM c.budget_clock_domain AND d.budget_created_tick IS NOT DISTINCT FROM c.budget_created_tick AND d.budget_recorded_at IS NOT DISTINCT FROM c.budget_recorded_at AND c.budget_clock_domain IS NULL AND c.budget_created_tick IS NULL AND c.clock_sample_id IS NULL AND c.capture_epoch IS NULL")

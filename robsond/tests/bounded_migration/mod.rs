@@ -7,3 +7,4 @@ mod cases;
 mod catalog_cases;
 mod helpers;
 mod late;
+mod migration39;

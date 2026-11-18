@@ -185,7 +185,8 @@ type; changing argument types creates a different function. Do not overwrite
 
 `robson_db::migrate()` runs every pending migration through
 `bounded_migration::BoundedMigration`, a dedicated raw connection that is never
-returned to a pool. Migrations other than 38 keep SQLx's own apply path.
+returned to a pool. Migration 39 has its own bounded path (next section);
+every other migration keeps SQLx's own apply path.
 Migration 38 (`20240101000038_request_budget.sql`) is applied as 58 operations
 on that connection: settings install, BEGIN, the 52 fixed DDL slices of the
 original file, the original `_sqlx_migrations` INSERT, COMMIT, the
@@ -256,3 +257,59 @@ not proof of absence while the original backend can still commit. In order:
 Do not edit `_sqlx_migrations` or rerun 38's SQL by hand. A database lost
 mid-apply follows the same steps once it is reachable again. Repeated deadline
 failures on a busy database need the operator's direction, not wider bounds.
+
+## Migration 39: venue order quote floor through the bounded adapter
+
+Migration 39 (`20240101000039_venue_order_quote_floor.sql`) is one
+`ALTER TABLE venue_orders` statement: a nullable `quote_floor` column and two
+`NOT VALID` checks. It needs an `ACCESS EXCLUSIVE` lock on `venue_orders`.
+Unbounded, that request would wait behind any open transaction that touched
+the table and, while waiting, block every later reader and writer of it.
+
+The adapter applies it on the same dedicated raw connection as 38, in 7
+operations: settings install, SQLx's own unmodified apply (BEGIN, the original
+statement, the `_sqlx_migrations` INSERT, COMMIT, the `execution_time`
+UPDATE), and the settings restore. The 40 ms statement, 20 ms lock and 20 ms
+idle-in-transaction timeouts, the 200 ms whole-apply bound and the 5 s
+connection and advisory-lock bounds are the same as 38. A lock wait longer than
+20 ms fails with `55P03` (`lock_not_available`) and fails the
+`robsond-db-migrate` hook; it never queues indefinitely. The path is selected
+only for the exact embedded file; the original bytes, checksum and history row
+are SQLx's own. Any other version-39 source is refused before any SQL
+(`migration39 contract mismatch`) instead of running unbounded.
+
+### Rollback boundary
+
+Record the deployed image digest before the merge that carries 39. **Once 39
+is applied, an image without 39 is not a rollback target**: SQLx rejects
+applied migrations missing from its embedded set. The earliest compatible
+rollback artifact is the first image that embeds 39; record it before any
+later merge. There is no down migration: the column and checks are not removed
+by a rollback, and a schema correction must be a new numbered migration.
+
+Two cases differ. **Deploying** an image without 39 runs its
+`robsond-db-migrate` hook, whose `robsond db migrate` rejects the applied 39
+missing from its embedded set; the hook fails and the sync stops, so that
+deployment never happens. **A daemon of an image without 39 that is already
+running** (including a restart of such a pod) is row-compatible: the daemon
+does not run migrations at startup (only the `db` subcommand does), it never
+names `quote_floor`, every existing row has a NULL floor, and the
+`venue_orders_quote_floor_bound` check only refuses a write that lowers
+`cumulative_quote` below a recorded floor (fail closed, `23514`). Its open
+`venue_orders` transactions can still make the 39 apply fail with `55P03`; the
+bound limits that wait.
+
+### Failure outcomes
+
+The `migration connection retired` warning, its phases and outcomes, and the
+operator checks are those of migration 38 above, applied to version
+`20240101000039`. A `55P03` lock timeout is reported as `MayHaveCommitted`
+because SQLx's apply is opaque to the adapter: resolve it with the same
+steps (wait for the failed backend to be gone, rerun `robsond db migrate`,
+confirm with the query below), after the conflicting `venue_orders`
+transaction has finished.
+
+```sql
+SELECT version, success, execution_time
+FROM _sqlx_migrations WHERE version = 20240101000039;
+```
