@@ -75,7 +75,7 @@ async fn run_ack_inner(args: IncomeAckArgs) -> Result<i32, i32> {
         EXIT_USAGE_ERROR
     })?;
 
-    let token = crate::auth::current_id_token().await.map_err(|error| {
+    let token = crate::auth::current_access_token().await.map_err(|error| {
         eprintln!("error: {error:#}");
         EXIT_UNAUTHORIZED
     })?;
@@ -114,6 +114,13 @@ async fn run_ack_inner(args: IncomeAckArgs) -> Result<i32, i32> {
         },
         IncomeAckApiResponse::Unauthorized(response) => {
             eprintln!("unauthorized: {}", response.error);
+            Err(EXIT_UNAUTHORIZED)
+        },
+        IncomeAckApiResponse::Forbidden(response) => {
+            eprintln!(
+                "forbidden: {} (the RBX identity lacks the required Robson role)",
+                response.error
+            );
             Err(EXIT_UNAUTHORIZED)
         },
         IncomeAckApiResponse::Unavailable(response) => {

@@ -583,6 +583,7 @@ fn ordered_quantity(params: &Value) -> Option<Decimal> {
 /// named operator attached.
 pub async fn record_disposition(
     pool: &PgPool,
+    tenant_id: Uuid,
     disposition: &Disposition,
 ) -> Result<DispositionReceipt, DispositionError> {
     let mut tx = pool
@@ -595,10 +596,11 @@ pub async fn record_disposition(
     let row = sqlx::query_as::<_, (String, Option<String>, bool, bool, Value)>(
         r#"
         SELECT client_order_id, cancels_order_id, venue_outcome IS NOT NULL, not_sent, params
-        FROM order_intents WHERE intent_id = $1 FOR UPDATE
+        FROM order_intents WHERE intent_id = $1 AND tenant_id = $2 FOR UPDATE
         "#,
     )
     .bind(disposition.intent_id)
+    .bind(tenant_id)
     .fetch_optional(&mut *tx)
     .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
@@ -644,7 +646,7 @@ pub async fn record_disposition(
             risk_accepted_by = $6,
             risk_accepted_auth = $7,
             risk_accepted_note = $8
-        WHERE intent_id = $1
+        WHERE intent_id = $1 AND tenant_id = $9
         "#,
     )
     .bind(disposition.intent_id)
@@ -655,6 +657,7 @@ pub async fn record_disposition(
     .bind(accepted_by)
     .bind(accepted_auth)
     .bind(accepted_note)
+    .bind(tenant_id)
     .execute(&mut *tx)
     .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
@@ -683,8 +686,11 @@ pub async fn record_disposition(
     .await?;
 
     let boundary_b_blockers = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::BIGINT FROM order_intents_blocking_rollback",
+        "SELECT COUNT(*)::BIGINT FROM order_intents \
+         WHERE tenant_id = $1 AND venue_outcome IS NULL AND NOT not_sent \
+         AND disposition_kind IS NULL",
     )
+    .bind(tenant_id)
     .fetch_one(&mut *tx)
     .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;

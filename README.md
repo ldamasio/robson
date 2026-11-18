@@ -113,12 +113,13 @@ follow-up work; the authorship invariant itself is non-negotiable.
 
 **Query Engine** — Every state transition passes through a lifecycle-tracked `ExecutionQuery`: `Accepted → Processing → RiskChecked → Acting → Completed / Denied / Failed`. Denials are governed outcomes, not errors.
 
-**Event Stream** — All domain events are persisted in the canonical event log. A narrow public SSE projection carries incremental runtime updates, while an authenticated REST bootstrap supplies durable events for the dashboard's current UTC day.
+**Event Stream** — All domain events are persisted in the canonical event log. An authenticated SSE projection carries incremental runtime updates, while an authenticated REST bootstrap supplies durable events for the dashboard's current UTC day.
 
 ## API
 
 ```
-GET  /health                          # Health check
+GET  /health                          # Public health check
+GET  /auth/session                    # Verified RBX subject, tenant, roles, permissions
 GET  /status                          # Positions, slots, monthly risk state
 GET  /positions?month=YYYY-MM         # Monthly position history
 GET  /positions/{id}                  # Single position detail
@@ -132,6 +133,11 @@ POST /panic                           # Emergency close all open positions
 GET  /events/history?date=YYYY-MM-DD  # Latest 100 durable events for a UTC day (bearer header)
 GET  /events                          # SSE event stream (bearer header)
 ```
+
+Every route except health, readiness, and metrics requires an RBX
+Identity/ZITADEL access token. Read routes require an observer-capable role;
+ordinary mutations require `operator`, funding mutations require `funding`,
+and panic/monthly-halt require `emergency` (ADR-0057).
 
 ## Development
 

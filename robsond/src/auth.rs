@@ -1,188 +1,183 @@
-//! Google ID token verification (ADR-0054).
+//! RBX Identity authentication and Robson role authorization.
 //!
-//! Every authenticated request presents a Google-issued ID token as its
-//! Bearer credential. Verification is stateless and per-request: robsond
-//! never issues or stores a session. The token's signature is checked
-//! against Google's published JWKS (`google_jwks.rs`), then standard OIDC
-//! claims (`iss`, `aud`, `exp`) plus a single-email allowlist are enforced —
-//! Robson has exactly one operator (`ROBSON_ALLOWED_EMAIL`).
-//!
-//! Any verification failure returns a generic, opaque error to the caller.
-//! The real reason is logged at `warn` level server-side only — see
-//! `verify_google_id_token`'s callers in `api.rs`.
+//! Human callers authenticate with Google through ZITADEL. `robsond` trusts
+//! only the configured RBX issuer, audience, client IDs, canonical subjects,
+//! and organization-scoped project roles. Static API tokens and direct Google
+//! ID tokens are deliberately not accepted.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
-use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
-use serde::Deserialize;
+use serde::Serialize;
+use uuid::Uuid;
 
-use crate::google_jwks::GoogleJwksCache;
+use crate::{
+    config::OidcConfig,
+    oidc_auth::{RbxOidcError, RbxOidcVerifier},
+};
 
-/// Google's two historically-used `iss` values for ID tokens.
-const GOOGLE_ISSUERS: [&str; 2] = ["accounts.google.com", "https://accounts.google.com"];
+pub const ROLE_OBSERVER: &str = "rbx:robson:observer";
+pub const ROLE_OPERATOR: &str = "rbx:robson:operator";
+pub const ROLE_FUNDING: &str = "rbx:robson:funding";
+pub const ROLE_EMERGENCY: &str = "rbx:robson:emergency";
 
-/// Runtime configuration for Google ID token verification.
-#[derive(Clone)]
-pub struct GoogleAuthConfig {
-    /// Acceptable `aud` values: the frontend's Web client ID and/or the
-    /// CLI's Device Authorization Grant (TV/limited-input) client ID.
-    /// Either is accepted so both the browser and `robson-cli` can call the
-    /// same API.
-    pub client_ids: Vec<String>,
-    /// The single allowlisted operator email, matched case-insensitively.
-    pub allowed_email: String,
-    /// Shared JWKS cache, refreshed independently of any single request.
-    pub jwks: Arc<GoogleJwksCache>,
-}
-
-/// Claims extracted from a verified Google ID token.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GoogleClaims {
-    pub sub: String,
-    pub email: Option<String>,
-    #[serde(default)]
-    pub email_verified: bool,
-    pub iss: String,
-    pub aud: String,
-    pub exp: usize,
-}
-
-/// How the caller of an authenticated route proved who it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperatorAuth {
-    /// A verified Google ID token.
-    Verified,
-    /// The legacy shared token: it proves possession, not a person.
-    Asserted,
+pub enum RequiredPermission {
+    Observer,
+    Operator,
+    Funding,
+    Emergency,
 }
 
-impl OperatorAuth {
-    pub fn as_str(self) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMethod {
+    Disabled,
+    RbxOidc,
+}
+
+impl AuthMethod {
+    /// Value accepted by the existing recovery-decision audit schema.
+    ///
+    /// RBX OIDC proves the operator identity cryptographically. The disabled
+    /// development mode is retained only for explicit loopback development
+    /// and therefore remains an asserted identity in recovery records.
+    pub fn decision_auth_kind(self) -> &'static str {
         match self {
-            Self::Verified => "verified",
-            Self::Asserted => "asserted",
+            Self::Disabled => "asserted",
+            Self::RbxOidc => "verified",
         }
     }
 }
 
-/// Who called an authenticated route, kept in the request's extensions by the
-/// auth layer for routes that record a decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OperatorIdentity {
+#[derive(Debug, Clone)]
+pub struct AuthContext {
+    pub method: AuthMethod,
+    pub issuer: String,
     pub subject: String,
-    pub auth: OperatorAuth,
+    pub client_id: Option<String>,
+    pub tenant_id: Option<Uuid>,
+    pub roles: BTreeSet<String>,
+    grants_all: bool,
 }
 
-impl OperatorIdentity {
-    pub fn from_claims(claims: &GoogleClaims) -> Self {
+impl AuthContext {
+    fn disabled(tenant_id: Option<Uuid>) -> Self {
         Self {
-            subject: claims.email.clone().unwrap_or_else(|| claims.sub.clone()),
-            auth: OperatorAuth::Verified,
+            method: AuthMethod::Disabled,
+            issuer: "robsond-development".to_owned(),
+            subject: "development-operator".to_owned(),
+            client_id: None,
+            tenant_id,
+            roles: BTreeSet::new(),
+            grants_all: true,
         }
     }
 
-    pub fn legacy_token() -> Self {
-        Self {
-            subject: "legacy-bearer-token".to_string(),
-            auth: OperatorAuth::Asserted,
+    fn allows(&self, required: RequiredPermission) -> bool {
+        if self.grants_all {
+            return true;
         }
+
+        match required {
+            RequiredPermission::Observer => self.roles.iter().any(|role| {
+                matches!(
+                    role.as_str(),
+                    ROLE_OBSERVER | ROLE_OPERATOR | ROLE_FUNDING | ROLE_EMERGENCY
+                )
+            }),
+            RequiredPermission::Operator => self.roles.contains(ROLE_OPERATOR),
+            RequiredPermission::Funding => self.roles.contains(ROLE_FUNDING),
+            RequiredPermission::Emergency => self.roles.contains(ROLE_EMERGENCY),
+        }
+    }
+
+    pub fn permissions(&self) -> Vec<&'static str> {
+        [
+            RequiredPermission::Observer,
+            RequiredPermission::Operator,
+            RequiredPermission::Funding,
+            RequiredPermission::Emergency,
+        ]
+        .into_iter()
+        .filter(|permission| self.allows(*permission))
+        .map(|permission| match permission {
+            RequiredPermission::Observer => "observer",
+            RequiredPermission::Operator => "operator",
+            RequiredPermission::Funding => "funding",
+            RequiredPermission::Emergency => "emergency",
+        })
+        .collect()
     }
 }
 
-/// Verification failure. Deliberately opaque: `Display` is for server-side
-/// logs only and must never be rendered into an HTTP response body.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
-    #[error("malformed token: {0}")]
-    Malformed(String),
-    #[error("unknown signing key: {0}")]
-    UnknownKey(String),
-    #[error("signature/claim verification failed: {0}")]
-    Verification(String),
-    #[error("email not verified")]
-    EmailNotVerified,
-    #[error("email not allowlisted")]
-    EmailNotAllowed,
+    #[error("missing or invalid Authorization header")]
+    MissingBearer,
+    #[error("bearer token is invalid")]
+    InvalidToken,
+    #[error("authenticated identity lacks the required Robson role")]
+    Forbidden,
+    #[error("identity provider is temporarily unavailable")]
+    IdentityUnavailable,
 }
 
-/// Verify `token` as a Google-issued ID token under `cfg`.
-///
-/// Checks (in order): well-formed header with a `kid`, RS256 signature
-/// against the matching Google public key, `aud` in `cfg.client_ids`, `iss`
-/// in Google's known issuer set, `exp` not passed, `email_verified == true`,
-/// and `email` case-insensitively equal to `cfg.allowed_email`.
-pub async fn verify_google_id_token(
-    token: &str,
-    cfg: &GoogleAuthConfig,
-) -> Result<GoogleClaims, AuthError> {
-    let header = decode_header(token).map_err(|e| AuthError::Malformed(e.to_string()))?;
-    let kid = header.kid.ok_or_else(|| AuthError::Malformed("missing kid".to_string()))?;
-
-    let key = cfg.jwks.get_key(&kid).await.map_err(|e| AuthError::UnknownKey(e.to_string()))?;
-
-    let mut validation = Validation::new(Algorithm::RS256);
-    validation.set_audience(&cfg.client_ids);
-    validation.set_issuer(&GOOGLE_ISSUERS);
-    // `exp` is validated by default by the `jsonwebtoken` crate.
-
-    let data = decode::<GoogleClaims>(token, &key, &validation)
-        .map_err(|e| AuthError::Verification(e.to_string()))?;
-    let claims = data.claims;
-
-    if !claims.email_verified {
-        return Err(AuthError::EmailNotVerified);
-    }
-
-    let email = claims.email.as_deref().unwrap_or_default();
-    if !email.eq_ignore_ascii_case(&cfg.allowed_email) {
-        return Err(AuthError::EmailNotAllowed);
-    }
-
-    Ok(claims)
+#[derive(Clone)]
+pub struct AuthService {
+    verifier: Option<Arc<RbxOidcVerifier>>,
+    development_tenant_id: Option<Uuid>,
 }
 
-/// True when `value` has the three dot-separated, base64url-charset
-/// segments characteristic of a JWT, as opposed to an opaque legacy bearer
-/// token. Used by the auth middleware's dual-accept rollout bridge to route
-/// a presented credential to the right verifier.
-///
-/// TEMPORARY: dual-accept bridge helper during ADR-0054 rollout, remove
-/// after cutover — see ADR-0054 migration plan and `api.rs`'s auth layer.
-pub fn looks_like_jwt(value: &str) -> bool {
-    let parts: Vec<&str> = value.split('.').collect();
-    parts.len() == 3
-        && parts.iter().all(|p| {
-            !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        })
-}
+impl AuthService {
+    pub fn new(oidc: Option<OidcConfig>, tenant_id: Option<Uuid>) -> Self {
+        Self {
+            verifier: oidc.map(|config| Arc::new(RbxOidcVerifier::new(config))),
+            development_tenant_id: tenant_id,
+        }
+    }
 
-/// Constant-time equality for the legacy bearer-token rollout bridge.
-///
-/// A plain `==` short-circuits on the first mismatched byte, which leaks
-/// timing information an attacker could use to recover the token
-/// byte-by-byte — exactly the class of risk this migration exists to
-/// remove, so the temporary bridge must not reintroduce it.
-///
-/// Note: the length check is a fast-path `return`, so distinct-length
-/// inputs are distinguishable by timing (only equal-length inputs compare
-/// in constant time). This is the same trade-off standard constant-time
-/// primitives make (e.g. `subtle`'s `ConstantTimeEq` on byte slices,
-/// `ring`'s `verify_slices_are_equal`) — hiding length as well would mean
-/// comparing against a fixed maximum size, which isn't warranted for a
-/// bridge already scheduled for removal.
-///
-/// TEMPORARY: dual-accept bridge helper during ADR-0054 rollout, remove
-/// after cutover — see ADR-0054 migration plan and `api.rs`'s auth layer.
-pub fn constant_time_eq(expected: &str, actual: &str) -> bool {
-    let (expected, actual) = (expected.as_bytes(), actual.as_bytes());
-    if expected.len() != actual.len() {
-        return false;
+    pub async fn authenticate(
+        &self,
+        authorization: Option<&str>,
+        required: RequiredPermission,
+    ) -> Result<AuthContext, AuthError> {
+        let Some(verifier) = &self.verifier else {
+            return Ok(AuthContext::disabled(self.development_tenant_id));
+        };
+
+        let token = authorization
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .filter(|value| !value.is_empty())
+            .ok_or(AuthError::MissingBearer)?;
+
+        let identity = verifier.verify(token).await.map_err(|error| match error {
+            RbxOidcError::InvalidToken => AuthError::InvalidToken,
+            RbxOidcError::IdentityUnavailable => AuthError::IdentityUnavailable,
+        })?;
+        let context = AuthContext {
+            method: AuthMethod::RbxOidc,
+            issuer: identity.issuer,
+            subject: identity.subject,
+            client_id: Some(identity.client_id),
+            tenant_id: Some(identity.tenant_id),
+            roles: identity.roles,
+            grants_all: false,
+        };
+
+        if context.allows(required) {
+            Ok(context)
+        } else {
+            Err(AuthError::Forbidden)
+        }
     }
-    let mut diff: u8 = 0;
-    for (a, b) in expected.iter().zip(actual.iter()) {
-        diff |= a ^ b;
+
+    #[cfg(test)]
+    pub(crate) fn from_verifier_for_test(verifier: RbxOidcVerifier) -> Self {
+        Self {
+            verifier: Some(Arc::new(verifier)),
+            development_tenant_id: None,
+        }
     }
-    diff == 0
 }
 
 #[cfg(test)]
@@ -190,29 +185,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn looks_like_jwt_accepts_three_base64url_segments() {
-        assert!(looks_like_jwt("eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2ln"));
+    fn roles_are_independent_and_observer_access_is_implied() {
+        let tenant_id = Uuid::now_v7();
+        let context = AuthContext {
+            method: AuthMethod::RbxOidc,
+            issuer: "https://auth.merovelis.com".to_owned(),
+            subject: "rbx-user-1".to_owned(),
+            client_id: Some("robson-android".to_owned()),
+            tenant_id: Some(tenant_id),
+            roles: BTreeSet::from([ROLE_OPERATOR.to_owned()]),
+            grants_all: false,
+        };
+
+        assert!(context.allows(RequiredPermission::Observer));
+        assert!(context.allows(RequiredPermission::Operator));
+        assert!(!context.allows(RequiredPermission::Funding));
+        assert!(!context.allows(RequiredPermission::Emergency));
+        assert_eq!(context.tenant_id, Some(tenant_id));
+    }
+
+    #[tokio::test]
+    async fn development_without_a_verifier_remains_explicitly_disabled() {
+        let tenant_id = Uuid::now_v7();
+        let context = AuthService::new(None, Some(tenant_id))
+            .authenticate(None, RequiredPermission::Emergency)
+            .await
+            .unwrap();
+
+        assert_eq!(context.method, AuthMethod::Disabled);
+        assert_eq!(context.tenant_id, Some(tenant_id));
+        assert_eq!(context.permissions(), vec!["observer", "operator", "funding", "emergency"]);
+        assert_eq!(context.method.decision_auth_kind(), "asserted");
     }
 
     #[test]
-    fn looks_like_jwt_rejects_opaque_tokens() {
-        assert!(!looks_like_jwt("secret-token-123"));
-        assert!(!looks_like_jwt(""));
-        assert!(!looks_like_jwt("only.two"));
-        assert!(!looks_like_jwt("a.b.c.d"));
-        assert!(!looks_like_jwt("has spaces.in.it"));
-    }
-
-    #[test]
-    fn constant_time_eq_matches_equal_strings() {
-        assert!(constant_time_eq("secret-token-123", "secret-token-123"));
-    }
-
-    #[test]
-    fn constant_time_eq_rejects_different_strings() {
-        assert!(!constant_time_eq("secret-token-123", "secret-token-124"));
-        assert!(!constant_time_eq("short", "much-longer-value"));
-        assert!(!constant_time_eq("", "nonempty"));
-        assert!(constant_time_eq("", ""));
+    fn rbx_oidc_is_a_verified_recovery_identity() {
+        assert_eq!(AuthMethod::RbxOidc.decision_auth_kind(), "verified");
     }
 }

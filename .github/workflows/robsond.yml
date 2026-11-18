@@ -244,11 +244,12 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          # latest moves only with the pin; see "Move latest to this image".
+          # `latest` is intentionally not moved here; the deployment pin is
+          # proposed for human review in a separate repository.
           tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.sha_tag }}
           no-cache: false
 
-      - name: Update image tags in rbx-infra
+      - name: Propose image pin in rbx-infra
         id: pin
         env:
           GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
@@ -271,89 +272,71 @@ jobs:
           K=apps/prod/robson/kustomization.yml
           PIN='.images[] | select(.name == "ghcr.io/rbxrobotica/robson-v2") | .newTag'
 
-          # Three pushes; the fourth pass only checks the pin, so a run that a
-          # newer pin beat on the last push ends as a skip, not a failure.
-          for i in 1 2 3 4; do
-            # Never move the pin backwards (scripts/promotion-guard.sh). The
-            # guard reads the pin from the rbx-infra commit this push builds
-            # on: a newer pin pushed meanwhile rejects the push, and the next
-            # pass checks again from a fresh rbx-infra main.
-            PINNED=$(yq "$PIN" "$K")
-            git -C "$GITHUB_WORKSPACE" fetch --quiet --no-tags origin main
-            TIP=$(git -C "$GITHUB_WORKSPACE" rev-parse FETCH_HEAD)
-            VERDICT=$(cd "$GITHUB_WORKSPACE" && bash scripts/promotion-guard.sh "$SHA" "$PINNED" "$TIP")
-            echo "$VERDICT"
-            if [ "${VERDICT%%:*}" != promote ]; then
-              echo "::notice title=Pin not moved::$VERDICT"
-              echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+          branch="image-promotion/robson-v2/${SHA_TAG}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git switch -c "$branch"
 
-            yq -i "($PIN) = \"${SHA_TAG}\"" "$K"
-            grep -q "newTag: ${SHA_TAG}$" "$K" || { echo "::error::kustomize pin was not updated in $K"; exit 1; }
+          PINNED=$(yq "$PIN" "$K")
+          git -C "$GITHUB_WORKSPACE" fetch --quiet --no-tags origin main
+          TIP=$(git -C "$GITHUB_WORKSPACE" rev-parse FETCH_HEAD)
+          VERDICT=$(cd "$GITHUB_WORKSPACE" && bash scripts/promotion-guard.sh "$SHA" "$PINNED" "$TIP")
+          echo "$VERDICT"
+          echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
+          if [ "${VERDICT%%:*}" != promote ]; then
+            echo "::notice title=Promotion not proposed::$VERDICT"
+            exit 0
+          fi
 
-            git add "$K"
+          yq -i "($PIN) = \"${SHA_TAG}\"" "$K"
+          grep -q "newTag: ${SHA_TAG}$" "$K" || {
+            echo "::error::kustomize pin was not updated in $K"
+            exit 1
+          }
+          git add "$K"
 
-            if git diff --staged --quiet; then
-              echo "No manifest changes needed (already at ${SHA_TAG})"
-              echo "promoted=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            if [ "$i" = 4 ]; then
-              echo "::error::Failed to push to rbx-infra after 3 attempts"
-              exit 1
-            fi
+          if git diff --staged --quiet; then
+            echo "No promotion proposal needed (already at ${SHA_TAG})"
+            exit 0
+          fi
 
-            git commit -m "chore(robson-v2): update image tag to ${SHA_TAG}" \
-              -m "Automated update by Robson v2 CI/CD pipeline." \
-              -m "Triggered by: ${REPO}@${SHA}" \
-              -m "[skip ci]"
+          git commit -m "chore(robson-v2): propose image ${SHA_TAG}" \
+            -m "Automated promotion proposal by the Robson v2 pipeline." \
+            -m "Triggered by: ${REPO}@${SHA}" \
+            -m "[skip ci]"
 
-            if git push origin main; then
-              echo "Manifests pushed - ArgoCD will auto-sync"
-              echo "promoted=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "Push attempt $i failed, starting over from rbx-infra main..."
-            git fetch origin main
-            git reset --hard FETCH_HEAD
-          done
+          git push --set-upstream origin "$branch"
 
-      # Copies the pushed manifest; nothing is rebuilt.
-      - name: Move latest to this image
-        id: latest
-        if: steps.pin.outputs.promoted == 'true'
-        env:
-          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
-        run: docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$SHA_TAG"
+          body_file="${RUNNER_TEMP}/robson-promotion.md"
+          {
+            echo "Automated immutable-image promotion proposal."
+            echo
+            echo "- Image: ghcr.io/rbxrobotica/robson-v2:${SHA_TAG}"
+            echo "- Source: ${REPO}@${SHA}"
+            echo "- Deployment: none; review and merge remain human-gated."
+            echo "- Identity rollout: verify the matching RBX Identity/ZITADEL and tenant configuration before approval."
+          } > "$body_file"
 
-      # Runs after a failure too: "Move latest" can fail once the pin has
-      # moved, and the summary must still say that production is deploying.
+          GH_TOKEN="$GITOPS_TOKEN" gh pr create \
+            --repo rbxrobotica/rbx-infra \
+            --base main \
+            --head "$branch" \
+            --title "chore(robson-v2): propose ${SHA_TAG}" \
+            --body-file "$body_file"
+
       - name: Summary
         if: always()
         env:
           SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
           BUILD: ${{ steps.build.outcome }}
           PIN_STEP: ${{ steps.pin.outcome }}
-          PROMOTED: ${{ steps.pin.outputs.promoted }}
           VERDICT: ${{ steps.pin.outputs.verdict }}
-          LATEST: ${{ steps.latest.outcome }}
         run: |
-          if [ "$PROMOTED" = true ]; then
-            PIN_ROW="moved to \`$SHA_TAG\`; ArgoCD will auto-sync"
-          elif [ -n "$VERDICT" ]; then
-            PIN_ROW="not moved. $VERDICT"
-          elif [ "$PIN_STEP" = skipped ]; then
-            PIN_ROW="not moved: an earlier step failed"
+          if [ -n "$VERDICT" ]; then
+            PIN_ROW="proposal result: $VERDICT"
+          elif [ "$PIN_STEP" = success ]; then
+            PIN_ROW="human-gated PR proposed"
           else
-            # A push can land while its acknowledgement is lost.
-            PIN_ROW="unknown (update step: $PIN_STEP); check the pin in rbx-infra"
+            PIN_ROW="not proposed (step: $PIN_STEP)"
           fi
-          case "$LATEST" in
-            success) LATEST_ROW="moved" ;;
-            failure) LATEST_ROW="failed to move; production is unaffected (see the runbook)" ;;
-            *) LATEST_ROW="not moved" ;;
-          esac
           echo "## Robson v2 CI/CD" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| | |" >> $GITHUB_STEP_SUMMARY
@@ -361,4 +344,4 @@ jobs:
           echo "| Image | \`${{ env.IMAGE }}:${{ steps.meta.outputs.sha_tag }}\` (push: $BUILD) |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Production pin | $PIN_ROW |" >> $GITHUB_STEP_SUMMARY
-          echo "| latest | $LATEST_ROW |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment | none; review and merge remain human-gated |" >> $GITHUB_STEP_SUMMARY

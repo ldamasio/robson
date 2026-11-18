@@ -24,7 +24,7 @@
 //! - `ROBSON_ENV`: Environment (test, development, production)
 //! - `ROBSON_VENUE`: Venue (`binance_usdm`, `stub`). Unset selects from Binance
 //!   credentials and environment markers
-//! - `ROBSON_API_HOST`: API host (default: 0.0.0.0)
+//! - `ROBSON_API_HOST`: API host (default: 127.0.0.1)
 //! - `ROBSON_API_PORT`: API port (default: 8080)
 //! - `ROBSON_DEFAULT_RISK_PERCENT`: Default risk (default: 0.01)
 //! - `ROBSON_MIN_TECH_STOP_PERCENT`: Min tech stop (default: 0.001)

@@ -180,13 +180,13 @@ Before issuing the close, every operator MUST tick all of:
 
 ### Command
 
-Ensure you are signed in (ADR-0054: Google OAuth, not a static token):
+Ensure you are signed in (ADR-0057: Google through RBX Identity, not a static token):
 
 ```bash
 robson-cli auth status || robson-cli auth login
 ```
 
-`robson-cli` reads the cached, transparently-refreshed Google ID token
+`robson-cli` reads the cached, transparently-refreshed RBX access token
 from `~/.config/robson/credentials.json` — there is no token to place on
 the command line or in the process environment.
 

@@ -2,7 +2,7 @@
 //!
 //! Loads configuration from environment variables with sensible defaults.
 
-use std::{env, str::FromStr};
+use std::{env, net::IpAddr, str::FromStr};
 
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -52,34 +52,28 @@ pub struct Config {
 /// CORS allow-list is read directly from `ROBSON_CORS_ALLOWED_ORIGINS`
 /// (comma-separated) inside `api::build_cors_layer`; not duplicated here.
 ///
-/// ADR-0054 replaced the static `ROBSON_API_TOKEN` bearer token with Google
-/// OAuth ID token verification. `google_web_client_id` / `google_cli_client_id`
-/// are the acceptable `aud` values (frontend GIS flow and `robson-cli`'s
-/// Device Authorization Grant respectively); `allowed_email` is the single
-/// operator allowlisted to authenticate. At least one client id plus
-/// `allowed_email` is required when `ROBSON_ENV=production`.
+/// Human authentication is exclusively RBX Identity/ZITADEL. Google is an
+/// upstream provider of that issuer, never a token issuer trusted directly by
+/// Robson.
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
     /// Host to bind to
     pub host: String,
     /// Port to bind to
     pub port: u16,
-    /// Google OAuth Web client id — `aud` for ID tokens issued to the
-    /// SvelteKit frontend via Google Identity Services.
-    pub google_web_client_id: Option<String>,
-    /// Google OAuth CLI (TV/limited-input) client id — `aud` for ID tokens
-    /// issued to `robson-cli` via the Device Authorization Grant.
-    pub google_cli_client_id: Option<String>,
-    /// The single allowlisted operator email (case-insensitive match).
-    pub allowed_email: Option<String>,
-    /// TEMPORARY: dual-accept bridge during ADR-0054 rollout, remove after
-    /// cutover — see ADR-0054 migration plan. Read from the renamed
-    /// `ROBSON_LEGACY_API_TOKEN` env var (the old `ROBSON_API_TOKEN` name is
-    /// rejected outright, see `reject_removed_api_token_env`). When set, the
-    /// auth middleware still accepts an exact match against this value for
-    /// non-JWT-shaped bearer credentials, alongside Google ID token
-    /// verification.
-    pub legacy_api_token: Option<String>,
+    /// RBX Identity/ZITADEL access-token verification contract.
+    pub oidc: Option<OidcConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcConfig {
+    pub issuer: String,
+    pub audience: String,
+    pub jwks_uri: String,
+    pub allowed_client_ids: Vec<String>,
+    pub organization_id: String,
+    pub tenant_id: Uuid,
+    pub allowed_subjects: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -373,18 +367,37 @@ impl Config {
         let reconciliation = Self::load_reconciliation_config()?;
         let funding = Self::load_funding_config()?;
 
-        // Fail-fast: Google OAuth auth is mandatory in production (ADR-0054).
-        if environment == Environment::Production {
-            if api.allowed_email.is_none() {
+        if environment == Environment::Production && api.oidc.is_none() {
+            return Err(DaemonError::Config(
+                "A complete ROBSON_OIDC_* configuration is required when ROBSON_ENV=production"
+                    .to_owned(),
+            ));
+        }
+        if environment != Environment::Production && api.oidc.is_none() {
+            let explicitly_allowed = env::var("ROBSON_ALLOW_INSECURE_DEV_AUTH")
+                .is_ok_and(|value| value.trim().eq_ignore_ascii_case("true"));
+            if !explicitly_allowed {
                 return Err(DaemonError::Config(
-                    "ROBSON_ALLOWED_EMAIL is required when ROBSON_ENV=production".to_string(),
+                    "RBX Identity is not configured; set ROBSON_ALLOW_INSECURE_DEV_AUTH=true only for an explicit loopback development server"
+                        .to_owned(),
                 ));
             }
-            if api.google_web_client_id.is_none() && api.google_cli_client_id.is_none() {
+            if !Self::is_loopback_host(&api.host) {
                 return Err(DaemonError::Config(
-                    "At least one of ROBSON_GOOGLE_WEB_CLIENT_ID / ROBSON_GOOGLE_CLI_CLIENT_ID \
-                     is required when ROBSON_ENV=production"
-                        .to_string(),
+                    "ROBSON_ALLOW_INSECURE_DEV_AUTH requires ROBSON_API_HOST to be loopback"
+                        .to_owned(),
+                ));
+            }
+        }
+        if environment == Environment::Production && projection.tenant_id.is_none() {
+            return Err(DaemonError::Config(
+                "PROJECTION_TENANT_ID is required when ROBSON_ENV=production".to_owned(),
+            ));
+        }
+        if let (Some(oidc), Some(projection_tenant_id)) = (&api.oidc, projection.tenant_id) {
+            if oidc.tenant_id != projection_tenant_id {
+                return Err(DaemonError::Config(
+                    "ROBSON_OIDC_TENANT_BINDING does not match PROJECTION_TENANT_ID".to_owned(),
                 ));
             }
         }
@@ -409,10 +422,7 @@ impl Config {
             api: ApiConfig {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Let OS assign port
-                google_web_client_id: None,
-                google_cli_client_id: None,
-                allowed_email: None,
-                legacy_api_token: None,
+                oidc: None,
             },
             engine: EngineConfig {
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
@@ -480,54 +490,145 @@ impl Config {
         Ok(())
     }
 
-    /// ADR-0054 replaced the static `ROBSON_API_TOKEN` bearer token with
-    /// Google OAuth ID token verification. Presence of the old var is
-    /// rejected outright (not silently ignored) so a stale deployment
-    /// manifest can't keep the old scheme's blast radius around by
-    /// accident. Operators who still need the temporary dual-accept
-    /// rollout bridge (see `ApiConfig::legacy_api_token`) must rename the
-    /// value to `ROBSON_LEGACY_API_TOKEN`.
+    /// Reject every superseded human-auth input. A stale manifest must fail
+    /// visibly instead of silently preserving direct Google or bearer-token
+    /// access beside RBX Identity.
     fn reject_removed_api_token_env() -> DaemonResult<()> {
-        if env::var_os("ROBSON_API_TOKEN").is_some() {
-            return Err(DaemonError::Config(
-                "ROBSON_API_TOKEN was removed by ADR-0054; rename it to \
-                 ROBSON_LEGACY_API_TOKEN to keep the temporary dual-accept rollout bridge, \
-                 or remove it once Google OAuth is confirmed stable"
-                    .to_string(),
-            ));
+        const REMOVED: [&str; 5] = [
+            "ROBSON_API_TOKEN",
+            "ROBSON_LEGACY_API_TOKEN",
+            "ROBSON_GOOGLE_WEB_CLIENT_ID",
+            "ROBSON_GOOGLE_CLI_CLIENT_ID",
+            "ROBSON_ALLOWED_EMAIL",
+        ];
+        for name in REMOVED {
+            if env::var_os(name).is_some() {
+                return Err(DaemonError::Config(format!(
+                    "{name} was removed; Robson human authentication must use RBX Identity/ZITADEL"
+                )));
+            }
         }
         Ok(())
     }
 
     fn load_api_config() -> DaemonResult<ApiConfig> {
-        let host = env::var("ROBSON_API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+        let host = env::var("ROBSON_API_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let port_str = env::var("ROBSON_API_PORT").unwrap_or_else(|_| "8080".to_string());
 
         let port = port_str
             .parse::<u16>()
             .map_err(|_| DaemonError::Config(format!("Invalid ROBSON_API_PORT: {}", port_str)))?;
 
-        let google_web_client_id =
-            env::var("ROBSON_GOOGLE_WEB_CLIENT_ID").ok().filter(|v| !v.trim().is_empty());
-        let google_cli_client_id =
-            env::var("ROBSON_GOOGLE_CLI_CLIENT_ID").ok().filter(|v| !v.trim().is_empty());
-        let allowed_email = env::var("ROBSON_ALLOWED_EMAIL").ok().filter(|v| !v.trim().is_empty());
+        let oidc = Self::load_oidc_config()?;
 
-        // TEMPORARY: dual-accept bridge during ADR-0054 rollout, remove
-        // after cutover — see ADR-0054 migration plan. Deliberately a
-        // separate, clearly-deprecated env var name (not `ROBSON_API_TOKEN`,
-        // which `reject_removed_api_token_env` rejects outright above).
-        let legacy_api_token =
-            env::var("ROBSON_LEGACY_API_TOKEN").ok().filter(|v| !v.trim().is_empty());
+        Ok(ApiConfig { host, port, oidc })
+    }
 
-        Ok(ApiConfig {
-            host,
-            port,
-            google_web_client_id,
-            google_cli_client_id,
-            allowed_email,
-            legacy_api_token,
-        })
+    fn is_loopback_host(host: &str) -> bool {
+        host.eq_ignore_ascii_case("localhost")
+            || host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
+    }
+
+    fn load_oidc_config() -> DaemonResult<Option<OidcConfig>> {
+        const VARIABLES: [&str; 6] = [
+            "ROBSON_OIDC_ISSUER",
+            "ROBSON_OIDC_AUDIENCE",
+            "ROBSON_OIDC_JWKS_URI",
+            "ROBSON_OIDC_ALLOWED_CLIENT_IDS",
+            "ROBSON_OIDC_TENANT_BINDING",
+            "ROBSON_OIDC_ALLOWED_SUBJECTS",
+        ];
+
+        let values =
+            VARIABLES.map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()));
+        if values.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+
+        let required = |index: usize| {
+            values[index].clone().ok_or_else(|| {
+                DaemonError::Config(format!(
+                    "{} is required when any ROBSON_OIDC_* variable is configured",
+                    VARIABLES[index]
+                ))
+            })
+        };
+
+        let issuer = Self::validate_https_oidc_url(VARIABLES[0], &required(0)?)?
+            .trim_end_matches('/')
+            .to_owned();
+        let audience = required(1)?.trim().to_owned();
+        let jwks_uri = Self::validate_https_oidc_url(VARIABLES[2], &required(2)?)?;
+        let issuer_url = reqwest::Url::parse(&issuer)
+            .map_err(|error| DaemonError::Config(format!("Invalid issuer URL: {error}")))?;
+        let jwks_url = reqwest::Url::parse(&jwks_uri)
+            .map_err(|error| DaemonError::Config(format!("Invalid JWKS URL: {error}")))?;
+        if issuer_url.host_str() != jwks_url.host_str()
+            || issuer_url.port_or_known_default() != jwks_url.port_or_known_default()
+        {
+            return Err(DaemonError::Config(
+                "ROBSON_OIDC_JWKS_URI must use the same origin as ROBSON_OIDC_ISSUER".to_owned(),
+            ));
+        }
+        let allowed_client_ids = Self::parse_nonempty_csv(VARIABLES[3], &required(3)?)?;
+        let binding = required(4)?;
+        let (organization_id, tenant_id) = binding.split_once('=').ok_or_else(|| {
+            DaemonError::Config(
+                "ROBSON_OIDC_TENANT_BINDING must use <organization-id>=<tenant-uuid>".to_owned(),
+            )
+        })?;
+        let organization_id = organization_id.trim().to_owned();
+        if organization_id.is_empty() {
+            return Err(DaemonError::Config(
+                "ROBSON_OIDC_TENANT_BINDING organization id must not be empty".to_owned(),
+            ));
+        }
+        let tenant_id = Uuid::parse_str(tenant_id.trim()).map_err(|_| {
+            DaemonError::Config("ROBSON_OIDC_TENANT_BINDING tenant id must be a UUID".to_owned())
+        })?;
+        let allowed_subjects = Self::parse_nonempty_csv(VARIABLES[5], &required(5)?)?;
+
+        Ok(Some(OidcConfig {
+            issuer,
+            audience,
+            jwks_uri,
+            allowed_client_ids,
+            organization_id,
+            tenant_id,
+            allowed_subjects,
+        }))
+    }
+
+    fn validate_https_oidc_url(name: &str, value: &str) -> DaemonResult<String> {
+        let url = reqwest::Url::parse(value.trim())
+            .map_err(|error| DaemonError::Config(format!("Invalid {name}: {error}")))?;
+        if url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.host_str().is_none()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(DaemonError::Config(format!(
+                "{name} must be a credential-free https URL without query or fragment"
+            )));
+        }
+        Ok(url.to_string().trim_end_matches('/').to_owned())
+    }
+
+    fn parse_nonempty_csv(name: &str, value: &str) -> DaemonResult<Vec<String>> {
+        let mut entries = value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries.dedup();
+        if entries.is_empty() {
+            return Err(DaemonError::Config(format!("{name} must contain at least one value")));
+        }
+        Ok(entries)
     }
 
     fn load_engine_config() -> DaemonResult<EngineConfig> {
@@ -860,12 +961,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             api: ApiConfig {
-                host: "0.0.0.0".to_string(),
+                host: "127.0.0.1".to_string(),
                 port: 8080,
-                google_web_client_id: None,
-                google_cli_client_id: None,
-                allowed_email: None,
-                legacy_api_token: None,
+                oidc: None,
             },
             engine: EngineConfig {
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
@@ -1043,6 +1141,8 @@ mod tests {
             ("ROBSON_VENUE", None),
             ("ROBSON_BINANCE_USE_TESTNET", Some("true")),
             ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+            ("ROBSON_ALLOW_INSECURE_DEV_AUTH", Some("true")),
+            ("ROBSON_API_HOST", Some("127.0.0.1")),
         ]);
         let config = Config::from_env().unwrap();
         assert_eq!(config.venue, VenueSelection::Unset);
@@ -1054,6 +1154,8 @@ mod tests {
             ("ROBSON_VENUE", None),
             ("ROBSON_BINANCE_USE_TESTNET", Some("TRUE")),
             ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+            ("ROBSON_ALLOW_INSECURE_DEV_AUTH", Some("true")),
+            ("ROBSON_API_HOST", Some("127.0.0.1")),
         ]);
         assert!(!Config::from_env().unwrap().binance.use_testnet);
     }
@@ -1087,53 +1189,281 @@ mod tests {
     }
 
     #[test]
-    fn startup_fails_fast_when_removed_api_token_env_is_present() {
+    fn startup_rejects_every_superseded_human_auth_variable() {
         let _lock = env_lock().lock().unwrap();
-        let _env = EnvGuard::new(&[("ROBSON_API_TOKEN", Some("old-secret-123"))]);
-
-        let error = Config::from_env().unwrap_err();
-        assert!(matches!(
-            error,
-            DaemonError::Config(message)
-                if message.contains("ROBSON_API_TOKEN")
-                    && message.contains("removed by ADR-0054")
-        ));
-    }
-
-    #[test]
-    fn startup_fails_fast_in_production_without_allowed_email() {
-        let _lock = env_lock().lock().unwrap();
-        let _env = EnvGuard::new(&[
-            ("ROBSON_ENV", Some("production")),
-            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
-            ("ROBSON_ALLOWED_EMAIL", None),
-            ("ROBSON_GOOGLE_WEB_CLIENT_ID", Some("web-client-id")),
-        ]);
-
-        let error = Config::from_env().unwrap_err();
-        assert!(matches!(
-            error,
-            DaemonError::Config(message) if message.contains("ROBSON_ALLOWED_EMAIL")
-        ));
-    }
-
-    #[test]
-    fn startup_fails_fast_in_production_without_any_google_client_id() {
-        let _lock = env_lock().lock().unwrap();
-        let _env = EnvGuard::new(&[
-            ("ROBSON_ENV", Some("production")),
-            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
-            ("ROBSON_ALLOWED_EMAIL", Some("ldamasio@gmail.com")),
+        let _clean = EnvGuard::new(&[
+            ("ROBSON_API_TOKEN", None),
+            ("ROBSON_LEGACY_API_TOKEN", None),
             ("ROBSON_GOOGLE_WEB_CLIENT_ID", None),
             ("ROBSON_GOOGLE_CLI_CLIENT_ID", None),
+            ("ROBSON_ALLOWED_EMAIL", None),
+        ]);
+        for name in [
+            "ROBSON_API_TOKEN",
+            "ROBSON_LEGACY_API_TOKEN",
+            "ROBSON_GOOGLE_WEB_CLIENT_ID",
+            "ROBSON_GOOGLE_CLI_CLIENT_ID",
+            "ROBSON_ALLOWED_EMAIL",
+        ] {
+            let env = EnvGuard::new(&[(name, Some("superseded-value"))]);
+            let error = Config::from_env().unwrap_err();
+            assert!(matches!(
+                error,
+                DaemonError::Config(message)
+                    if message.contains(name) && message.contains("RBX Identity/ZITADEL")
+            ));
+            drop(env);
+        }
+    }
+
+    #[test]
+    fn startup_fails_fast_in_production_without_oidc() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_ENV", Some("production")),
+            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
+            ("PROJECTION_TENANT_ID", Some("018f0000-0000-7000-8000-000000000001")),
+            ("ROBSON_OIDC_ISSUER", None),
+            ("ROBSON_OIDC_AUDIENCE", None),
+            ("ROBSON_OIDC_JWKS_URI", None),
+            ("ROBSON_OIDC_ALLOWED_CLIENT_IDS", None),
+            ("ROBSON_OIDC_TENANT_BINDING", None),
+            ("ROBSON_OIDC_ALLOWED_SUBJECTS", None),
+            ("ROBSON_API_TOKEN", None),
+            ("ROBSON_LEGACY_API_TOKEN", None),
+            ("ROBSON_GOOGLE_WEB_CLIENT_ID", None),
+            ("ROBSON_GOOGLE_CLI_CLIENT_ID", None),
+            ("ROBSON_ALLOWED_EMAIL", None),
+        ]);
+
+        let error = Config::from_env().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message) if message.contains("complete ROBSON_OIDC_*")
+        ));
+    }
+
+    #[test]
+    fn startup_fails_fast_in_production_without_tenant() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_ENV", Some("production")),
+            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
+            ("PROJECTION_TENANT_ID", None),
+            ("ROBSON_OIDC_ISSUER", Some("https://auth.merovelis.com")),
+            ("ROBSON_OIDC_AUDIENCE", Some("robson-api")),
+            ("ROBSON_OIDC_JWKS_URI", Some("https://auth.merovelis.com/oauth/v2/keys")),
+            ("ROBSON_OIDC_ALLOWED_CLIENT_IDS", Some("robson-tauri")),
+            (
+                "ROBSON_OIDC_TENANT_BINDING",
+                Some("rbx-org=018f0000-0000-7000-8000-000000000001"),
+            ),
+            ("ROBSON_OIDC_ALLOWED_SUBJECTS", Some("owner-subject")),
+            ("ROBSON_API_TOKEN", None),
+            ("ROBSON_LEGACY_API_TOKEN", None),
+            ("ROBSON_GOOGLE_WEB_CLIENT_ID", None),
+            ("ROBSON_GOOGLE_CLI_CLIENT_ID", None),
+            ("ROBSON_ALLOWED_EMAIL", None),
+        ]);
+
+        let error = Config::from_env().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message) if message.contains("PROJECTION_TENANT_ID")
+        ));
+    }
+
+    #[test]
+    fn startup_rejects_oidc_organization_bound_to_another_projection_tenant() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_ENV", Some("production")),
+            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
+            ("DATABASE_URL", Some("postgresql://example.invalid/robson")),
+            ("PROJECTION_TENANT_ID", Some("018f0000-0000-7000-8000-000000000001")),
+            ("ROBSON_OIDC_ISSUER", Some("https://auth.merovelis.com")),
+            ("ROBSON_OIDC_AUDIENCE", Some("robson-api")),
+            ("ROBSON_OIDC_JWKS_URI", Some("https://auth.merovelis.com/oauth/v2/keys")),
+            ("ROBSON_OIDC_ALLOWED_CLIENT_IDS", Some("robson-tauri")),
+            (
+                "ROBSON_OIDC_TENANT_BINDING",
+                Some("rbx-org=018f0000-0000-7000-8000-000000000002"),
+            ),
+            ("ROBSON_OIDC_ALLOWED_SUBJECTS", Some("owner-subject")),
+            ("ROBSON_API_TOKEN", None),
+            ("ROBSON_LEGACY_API_TOKEN", None),
+            ("ROBSON_GOOGLE_WEB_CLIENT_ID", None),
+            ("ROBSON_GOOGLE_CLI_CLIENT_ID", None),
+            ("ROBSON_ALLOWED_EMAIL", None),
         ]);
 
         let error = Config::from_env().unwrap_err();
         assert!(matches!(
             error,
             DaemonError::Config(message)
-                if message.contains("ROBSON_GOOGLE_WEB_CLIENT_ID")
-                    && message.contains("ROBSON_GOOGLE_CLI_CLIENT_ID")
+                if message.contains("does not match PROJECTION_TENANT_ID")
+        ));
+    }
+
+    #[test]
+    fn development_auth_disabled_requires_explicit_loopback_opt_in() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_ENV", Some("development")),
+            ("ROBSON_API_HOST", Some("127.0.0.1")),
+            ("ROBSON_ALLOW_INSECURE_DEV_AUTH", None),
+            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
+            ("ROBSON_OIDC_ISSUER", None),
+            ("ROBSON_OIDC_AUDIENCE", None),
+            ("ROBSON_OIDC_JWKS_URI", None),
+            ("ROBSON_OIDC_ALLOWED_CLIENT_IDS", None),
+            ("ROBSON_OIDC_TENANT_BINDING", None),
+            ("ROBSON_OIDC_ALLOWED_SUBJECTS", None),
+        ]);
+
+        let error = Config::from_env().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message)
+                if message.contains("ROBSON_ALLOW_INSECURE_DEV_AUTH")
+        ));
+    }
+
+    #[test]
+    fn development_auth_disabled_rejects_non_loopback_binding() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_ENV", Some("development")),
+            ("ROBSON_API_HOST", Some("0.0.0.0")),
+            ("ROBSON_ALLOW_INSECURE_DEV_AUTH", Some("true")),
+            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
+            ("ROBSON_OIDC_ISSUER", None),
+            ("ROBSON_OIDC_AUDIENCE", None),
+            ("ROBSON_OIDC_JWKS_URI", None),
+            ("ROBSON_OIDC_ALLOWED_CLIENT_IDS", None),
+            ("ROBSON_OIDC_TENANT_BINDING", None),
+            ("ROBSON_OIDC_ALLOWED_SUBJECTS", None),
+        ]);
+
+        let error = Config::from_env().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message) if message.contains("requires ROBSON_API_HOST")
+        ));
+    }
+
+    #[test]
+    fn development_auth_disabled_allows_explicit_loopback_binding() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_ENV", Some("development")),
+            ("ROBSON_API_HOST", Some("127.0.0.1")),
+            ("ROBSON_ALLOW_INSECURE_DEV_AUTH", Some("true")),
+            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
+            ("ROBSON_OIDC_ISSUER", None),
+            ("ROBSON_OIDC_AUDIENCE", None),
+            ("ROBSON_OIDC_JWKS_URI", None),
+            ("ROBSON_OIDC_ALLOWED_CLIENT_IDS", None),
+            ("ROBSON_OIDC_TENANT_BINDING", None),
+            ("ROBSON_OIDC_ALLOWED_SUBJECTS", None),
+        ]);
+
+        let config = Config::from_env().unwrap();
+        assert!(config.api.oidc.is_none());
+        assert_eq!(config.api.host, "127.0.0.1");
+    }
+
+    #[test]
+    fn oidc_config_is_complete_trimmed_and_deduplicated() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_OIDC_ISSUER", Some("https://auth.merovelis.com/")),
+            ("ROBSON_OIDC_AUDIENCE", Some(" robson-api ")),
+            ("ROBSON_OIDC_JWKS_URI", Some("https://auth.merovelis.com/oauth/v2/keys")),
+            ("ROBSON_OIDC_ALLOWED_CLIENT_IDS", Some("robson-web, robson-tauri,robson-web")),
+            ("ROBSON_OIDC_TENANT_BINDING", Some("org-1=018f0000-0000-7000-8000-000000000001")),
+            ("ROBSON_OIDC_ALLOWED_SUBJECTS", Some("owner-subject")),
+        ]);
+
+        let config = Config::load_oidc_config().unwrap().unwrap();
+        assert_eq!(config.issuer, "https://auth.merovelis.com");
+        assert_eq!(config.audience, "robson-api");
+        assert_eq!(config.allowed_client_ids, vec!["robson-tauri", "robson-web"]);
+        assert_eq!(config.organization_id, "org-1");
+        assert_eq!(
+            config.tenant_id,
+            Uuid::parse_str("018f0000-0000-7000-8000-000000000001").unwrap()
+        );
+        assert_eq!(config.allowed_subjects, vec!["owner-subject"]);
+    }
+
+    #[test]
+    fn partial_oidc_config_is_rejected() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_OIDC_ISSUER", Some("https://auth.merovelis.com")),
+            ("ROBSON_OIDC_AUDIENCE", None),
+            ("ROBSON_OIDC_JWKS_URI", None),
+            ("ROBSON_OIDC_ALLOWED_CLIENT_IDS", None),
+            ("ROBSON_OIDC_TENANT_BINDING", None),
+            ("ROBSON_OIDC_ALLOWED_SUBJECTS", None),
+        ]);
+
+        let error = Config::load_oidc_config().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message) if message.contains("ROBSON_OIDC_AUDIENCE")
+        ));
+    }
+
+    #[test]
+    fn oidc_endpoints_require_https() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_OIDC_ISSUER", Some("http://auth.example")),
+            ("ROBSON_OIDC_AUDIENCE", Some("robson-api")),
+            ("ROBSON_OIDC_JWKS_URI", Some("https://auth.example/keys")),
+            ("ROBSON_OIDC_ALLOWED_CLIENT_IDS", Some("robson-tauri")),
+            (
+                "ROBSON_OIDC_TENANT_BINDING",
+                Some("rbx-org=018f0000-0000-7000-8000-000000000001"),
+            ),
+            ("ROBSON_OIDC_ALLOWED_SUBJECTS", Some("owner-subject")),
+        ]);
+
+        let error = Config::load_oidc_config().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message)
+                if message.contains("ROBSON_OIDC_ISSUER") && message.contains("https")
+        ));
+    }
+
+    #[test]
+    fn oidc_jwks_must_share_the_issuer_origin() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_OIDC_ISSUER", Some("https://auth.merovelis.com")),
+            ("ROBSON_OIDC_AUDIENCE", Some("robson-api")),
+            ("ROBSON_OIDC_JWKS_URI", Some("https://keys.example/keys")),
+            ("ROBSON_OIDC_ALLOWED_CLIENT_IDS", Some("robson-tauri")),
+            (
+                "ROBSON_OIDC_TENANT_BINDING",
+                Some("rbx-org=018f0000-0000-7000-8000-000000000001"),
+            ),
+            ("ROBSON_OIDC_ALLOWED_SUBJECTS", Some("owner-subject")),
+        ]);
+
+        let error = Config::load_oidc_config().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message) if message.contains("same origin")
         ));
     }
 

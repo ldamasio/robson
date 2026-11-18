@@ -34,10 +34,15 @@ fn intent_row(id: &str) -> IntentRow {
     }
 }
 
-async fn seeded(pool: &PgPool, id: &'static str, outcome: Option<OutcomeRow>) -> Uuid {
+async fn seeded(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    id: &'static str,
+    outcome: Option<OutcomeRow>,
+) -> Uuid {
     let intent = intent_row(id);
     let intent_id = intent.intent_id;
-    let backend = PgJournalBackend::new(pool, Uuid::now_v7());
+    let backend = PgJournalBackend::new(pool, tenant_id);
     backend
         .commit(&JournalBatch {
             balance: None,
@@ -93,8 +98,10 @@ fn terminal(intent_id: Uuid, order_ref: &str, filled_qty: Decimal) -> Dispositio
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn boundary_b_holds_only_when_every_outstanding_intent_has_a_disposition(pool: PgPool) {
+    let tenant_id = Uuid::now_v7();
     let uncertain = seeded(
         &pool,
+        tenant_id,
         "uncertain",
         Some(OutcomeRow {
             uncertain_at: Some(Utc::now()),
@@ -102,20 +109,23 @@ async fn boundary_b_holds_only_when_every_outstanding_intent_has_a_disposition(p
         }),
     )
     .await;
-    let unstamped = seeded(&pool, "unstamped", None).await;
+    let unstamped = seeded(&pool, tenant_id, "unstamped", None).await;
     assert_eq!(blockers(&pool).await, vec!["uncertain", "unstamped"]);
 
-    let receipt = record_disposition(&pool, &accepted_risk(uncertain)).await.unwrap();
+    let receipt = record_disposition(&pool, tenant_id, &accepted_risk(uncertain)).await.unwrap();
     assert_eq!(receipt.boundary_b_blockers, 1);
     assert_eq!(blockers(&pool).await, vec!["unstamped"]);
 
-    let wrong = record_disposition(&pool, &terminal(unstamped, "another", dec!(0.1))).await;
+    let wrong =
+        record_disposition(&pool, tenant_id, &terminal(unstamped, "another", dec!(0.1))).await;
     assert!(matches!(wrong, Err(DispositionError::EvidenceForAnotherOrder)), "{wrong:?}");
-    let too_much = record_disposition(&pool, &terminal(unstamped, "unstamped", dec!(0.2))).await;
+    let too_much =
+        record_disposition(&pool, tenant_id, &terminal(unstamped, "unstamped", dec!(0.2))).await;
     assert!(matches!(too_much, Err(DispositionError::ImpossibleQuantity)), "{too_much:?}");
-    let receipt = record_disposition(&pool, &terminal(unstamped, "unstamped", dec!(0.1)))
-        .await
-        .unwrap();
+    let receipt =
+        record_disposition(&pool, tenant_id, &terminal(unstamped, "unstamped", dec!(0.1)))
+            .await
+            .unwrap();
     assert_eq!(receipt.boundary_b_blockers, 0);
     assert_eq!(blockers(&pool).await, Vec::<String>::new());
 }
@@ -125,11 +135,14 @@ async fn boundary_b_holds_only_when_every_outstanding_intent_has_a_disposition(p
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn a_disposition_never_writes_a_venue_outcome_and_is_append_only(pool: PgPool) {
-    let intent_id = seeded(&pool, "a", None).await;
+    let tenant_id = Uuid::now_v7();
+    let intent_id = seeded(&pool, tenant_id, "a", None).await;
 
-    record_disposition(&pool, &accepted_risk(intent_id)).await.unwrap();
-    record_disposition(&pool, &accepted_risk(intent_id)).await.unwrap();
-    record_disposition(&pool, &terminal(intent_id, "a", dec!(0.1))).await.unwrap();
+    record_disposition(&pool, tenant_id, &accepted_risk(intent_id)).await.unwrap();
+    record_disposition(&pool, tenant_id, &accepted_risk(intent_id)).await.unwrap();
+    record_disposition(&pool, tenant_id, &terminal(intent_id, "a", dec!(0.1)))
+        .await
+        .unwrap();
 
     let outcome: (Option<String>, bool, Option<serde_json::Value>) = sqlx::query_as(
         "SELECT venue_outcome, not_sent, venue_evidence FROM order_intents WHERE intent_id = $1",
@@ -159,19 +172,50 @@ async fn a_disposition_never_writes_a_venue_outcome_and_is_append_only(pool: PgP
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn a_settled_intent_takes_no_disposition(pool: PgPool) {
-    let not_sent =
-        seeded(&pool, "n", Some(OutcomeRow { not_sent: true, ..OutcomeRow::default() })).await;
-    let refused = record_disposition(&pool, &accepted_risk(not_sent)).await;
+    let tenant_id = Uuid::now_v7();
+    let not_sent = seeded(
+        &pool,
+        tenant_id,
+        "n",
+        Some(OutcomeRow { not_sent: true, ..OutcomeRow::default() }),
+    )
+    .await;
+    let refused = record_disposition(&pool, tenant_id, &accepted_risk(not_sent)).await;
     assert!(matches!(refused, Err(DispositionError::NotOutstanding)), "{refused:?}");
-    let missing = record_disposition(&pool, &accepted_risk(Uuid::now_v7())).await;
+    let missing = record_disposition(&pool, tenant_id, &accepted_risk(Uuid::now_v7())).await;
     assert!(matches!(missing, Err(DispositionError::NotFound)), "{missing:?}");
+}
+
+/// A valid operator for one runtime cannot inspect or dispose another
+/// tenant's intent, and the returned boundary count is tenant-local.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_disposition_is_strictly_tenant_scoped(pool: PgPool) {
+    let ours = Uuid::now_v7();
+    let theirs = Uuid::now_v7();
+    let ours_intent = seeded(&pool, ours, "ours", None).await;
+    let theirs_intent = seeded(&pool, theirs, "theirs", None).await;
+
+    let cross_tenant = record_disposition(&pool, ours, &accepted_risk(theirs_intent)).await;
+    assert!(matches!(cross_tenant, Err(DispositionError::NotFound)));
+
+    let receipt = record_disposition(&pool, ours, &accepted_risk(ours_intent)).await.unwrap();
+    assert_eq!(receipt.boundary_b_blockers, 0, "their blocker must not leak into our count");
+    let theirs_disposition: Option<String> =
+        sqlx::query_scalar("SELECT disposition_kind FROM order_intents WHERE intent_id = $1")
+            .bind(theirs_intent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(theirs_disposition, None);
 }
 
 /// A disposition is one explicit transaction too, and the proxy counts it.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn a_disposition_is_one_simple_query_commit(pool: PgPool) {
-    let intent_id = seeded(&pool, "a", None).await;
+    let tenant_id = Uuid::now_v7();
+    let intent_id = seeded(&pool, tenant_id, "a", None).await;
     let options = pool.connect_options();
     let upstream = tokio::net::lookup_host((options.get_host(), options.get_port()))
         .await
@@ -184,7 +228,9 @@ async fn a_disposition_is_one_simple_query_commit(pool: PgPool) {
         .unwrap();
     let proxied = PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
 
-    record_disposition(&proxied, &accepted_risk(intent_id)).await.unwrap();
+    record_disposition(&proxied, tenant_id, &accepted_risk(intent_id))
+        .await
+        .unwrap();
 
     assert_eq!(proxy.stats().commits, 1);
 }
@@ -325,7 +371,7 @@ async fn a_release_tombstones_what_it_covers_and_nothing_else(pool: PgPool) {
     )
     .await;
     let disposed = seeded_for(&pool, tenant, "disposed", uncertain_at(20)).await;
-    record_disposition(&pool, &accepted_risk(disposed)).await.unwrap();
+    record_disposition(&pool, tenant, &accepted_risk(disposed)).await.unwrap();
     seeded_for(&pool, Uuid::now_v7(), "theirs", uncertain_at(20)).await;
     // A stamp with no `uncertain_at` is never tombstoned.
     sqlx::query(

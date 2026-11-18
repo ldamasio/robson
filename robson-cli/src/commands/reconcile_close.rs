@@ -161,7 +161,7 @@ async fn run_inner(args: ReconcileCloseArgs) -> Result<i32, i32> {
     let request_body =
         api_client::ReconcileCloseRequest { position_id: args.position_id, evidence };
 
-    let token = crate::auth::current_id_token().await.map_err(|e| {
+    let token = crate::auth::current_access_token().await.map_err(|e| {
         eprintln!("error: {e:#}");
         EXIT_UNAUTHORIZED
     })?;
@@ -205,6 +205,13 @@ async fn run_inner(args: ReconcileCloseArgs) -> Result<i32, i32> {
         },
         api_client::ReconcileCloseResponse::Unauthorized(resp) => {
             eprintln!("unauthorized: {}", resp.error);
+            Err(EXIT_UNAUTHORIZED)
+        },
+        api_client::ReconcileCloseResponse::Forbidden(resp) => {
+            eprintln!(
+                "forbidden: {} (the RBX identity lacks the required Robson role)",
+                resp.error
+            );
             Err(EXIT_UNAUTHORIZED)
         },
     }

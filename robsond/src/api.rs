@@ -24,7 +24,7 @@ use axum::{
         IntoResponse, Response,
     },
     routing::{delete, get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 #[cfg(feature = "postgres")]
 use chrono::DateTime;
@@ -52,10 +52,7 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{
-    auth::{
-        constant_time_eq, looks_like_jwt, verify_google_id_token, GoogleAuthConfig,
-        OperatorIdentity,
-    },
+    auth::{AuthContext, AuthError, AuthService, RequiredPermission},
     circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot},
     config::FundingConfig,
     error::DaemonError,
@@ -82,15 +79,8 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     pub pg_pool: Option<std::sync::Arc<sqlx::PgPool>>,
     #[cfg(feature = "postgres")]
     pub tenant_id: Option<Uuid>,
-    /// Google OAuth ID token verification config for authenticating
-    /// mutating routes (ADR-0054). `None` means auth is disabled
-    /// (non-production environments only).
-    pub google_auth: Option<GoogleAuthConfig>,
-    /// TEMPORARY: dual-accept bridge during ADR-0054 rollout, remove after
-    /// cutover — see ADR-0054 migration plan. When set, a non-JWT-shaped
-    /// bearer credential is still accepted via exact string match against
-    /// this legacy value, alongside Google ID token verification.
-    pub legacy_api_token: Option<String>,
+    /// RBX Identity/ZITADEL access-token verifier and role authorizer.
+    pub auth: AuthService,
     pub funding: FundingConfig,
     /// How the funding worker treats unfinished sagas, so the funding views
     /// report what holds them.
@@ -543,6 +533,17 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct AuthSessionResponse {
+    pub authentication_method: crate::auth::AuthMethod,
+    pub issuer: String,
+    pub subject: String,
+    pub client_id: Option<String>,
+    pub tenant_id: Option<Uuid>,
+    pub roles: Vec<String>,
+    pub permissions: Vec<&'static str>,
+}
+
 fn default_usdt_asset() -> String {
     "USDT".to_string()
 }
@@ -649,104 +650,45 @@ pub struct IncomeAckErrorResponse {
 
 /// Create the API router.
 ///
-/// Public read-only routes are mounted without authentication.
-/// Operator-sensitive and mutating routes use bearer-token authentication.
+/// Only health and metrics routes are public. Every route exposing trading
+/// state or accepting a mutation requires an RBX Identity role.
 pub fn create_router<E, S>(state: Arc<ApiState<E, S>>) -> Router
 where
     E: Venue + 'static,
     S: Store + 'static,
 {
-    // Read-only routes — no auth required
-    let read_only = Router::new()
+    let public = Router::new()
         // Kubernetes health probes
         .route("/healthz", get(health_liveness))
         .route("/readyz", get(health_readiness))
-        // Standard read-only endpoints
         .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
+        .with_state(state.clone());
+
+    let observer = Router::new()
+        .route("/auth/session", get(auth_session_handler))
         .route("/status", get(status_handler))
         .route("/positions", get(month_positions_handler))
         .route("/positions/:id", get(get_position_handler))
-        // Prometheus metrics
-        .route("/metrics", get(metrics_handler))
-        // MonthlyHalt status (read-only)
+        .route("/events", get(events_handler))
+        .route("/events/history", get(event_history_handler))
         .route("/monthly-halt", get(monthly_halt_status_handler))
+        .route("/funding/:id", get(funding_get_handler::<E, S>))
+        .route("/funding", get(funding_list_handler::<E, S>));
+    #[cfg(feature = "postgres")]
+    let observer = observer.route("/recovery/pending", get(recovery_pending_handler::<E, S>));
+    let observer = observer
+        .layer(axum::middleware::from_fn_with_state(
+            AuthMiddlewareState::new(state.auth.clone(), RequiredPermission::Observer),
+            authorize_request,
+        ))
         .with_state(state.clone());
 
-    // Operator-sensitive and mutating routes — Google ID token required
-    // (ADR-0054). See `verify_google_id_token` for the verification steps;
-    // any failure returns a generic 401 here and the real reason is logged
-    // via `tracing::warn!` inside that function — never leaked to the
-    // client.
-    let google_auth = state.google_auth.clone();
-    // TEMPORARY: dual-accept bridge during ADR-0054 rollout, remove after
-    // cutover — see ADR-0054 migration plan.
-    let legacy_api_token = state.legacy_api_token.clone();
-    let auth_layer = axum::middleware::from_fn(move |mut req: Request, next: Next| {
-        let google_auth = google_auth.clone();
-        let legacy_api_token = legacy_api_token.clone();
-        async move {
-            // Neither Google auth nor the legacy bridge is configured — auth
-            // disabled (non-production environments only).
-            if google_auth.is_none() && legacy_api_token.is_none() {
-                return next.run(req).await;
-            }
-
-            let unauthorized = || {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(ErrorResponse { error: "Unauthorized".to_string() }),
-                )
-                    .into_response()
-            };
-
-            let auth_header =
-                req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
-
-            let Some(value) = auth_header.and_then(|v| v.strip_prefix("Bearer ")) else {
-                return unauthorized();
-            };
-
-            if looks_like_jwt(value) {
-                let Some(cfg) = google_auth.as_ref() else {
-                    warn!("Received JWT-shaped credential but Google auth is not configured");
-                    return unauthorized();
-                };
-                match verify_google_id_token(value, cfg).await {
-                    Ok(claims) => {
-                        req.extensions_mut().insert(OperatorIdentity::from_claims(&claims));
-                        next.run(req).await
-                    },
-                    Err(e) => {
-                        warn!(error = %e, "Google ID token verification failed");
-                        unauthorized()
-                    },
-                }
-            } else {
-                // TEMPORARY: dual-accept bridge during ADR-0054 rollout,
-                // remove after cutover — see ADR-0054 migration plan.
-                match legacy_api_token.as_deref() {
-                    Some(expected) if constant_time_eq(expected, value) => {
-                        warn!(
-                            "Authenticated via deprecated legacy bearer token bridge \
-                             (ADR-0054 rollout); migrate this caller to Google OAuth"
-                        );
-                        req.extensions_mut().insert(OperatorIdentity::legacy_token());
-                        next.run(req).await
-                    },
-                    _ => unauthorized(),
-                }
-            }
-        }
-    });
     // New funding sagas and the endpoints that create them exist only on a
     // venue with a funding surface (ADR-0056 §3). The read endpoints below stay
     // so an older saga remains visible after switching venues.
     let has_funding = state.exchange.funding().is_some();
-    let authenticated = Router::new()
-        // SSE — authenticated via Bearer header (not query param)
-        .route("/events", get(events_handler))
-        // Durable event bootstrap for the operator dashboard.
-        .route("/events/history", get(event_history_handler))
+    let operator = Router::new()
         .route("/positions", post(arm_handler))
         // Dry run of an immediate arm: analysis, sizing and the rejection the
         // real arm would hit, with nothing persisted.
@@ -754,15 +696,17 @@ where
         .route("/positions/:id", delete(cancel_or_close_handler))
         .route("/positions/:id/signal", post(signal_handler))
         .route("/queries/:id/approve", post(approve_query_handler))
-        .route("/panic", post(panic_handler))
-        // MonthlyHalt trigger (mutating)
-        .route("/monthly-halt", post(monthly_halt_trigger_handler))
-        // Manual reconciliation close (Slice 5B1)
         .route("/reconcile-close", post(reconcile_close_handler))
-        // Manual acknowledgement of an unmatched income-ledger item.
-        .route("/income/:exchange_income_id/ack", post(income_ack_handler::<E, S>));
-    let authenticated = if has_funding {
-        authenticated
+        .route("/income/:exchange_income_id/ack", post(income_ack_handler::<E, S>))
+        .layer(axum::middleware::from_fn_with_state(
+            AuthMiddlewareState::new(state.auth.clone(), RequiredPermission::Operator),
+            authorize_request,
+        ))
+        .with_state(state.clone());
+
+    let funding = Router::new().route("/capital/refresh", post(capital_refresh_handler::<E, S>));
+    let funding = if has_funding {
+        funding
             .route("/funding/quote", post(funding_quote_handler::<E, S>))
             .route("/funding/execute", post(funding_execute_handler::<E, S>))
             .route(
@@ -770,20 +714,80 @@ where
                 post(funding_recover_spot_usdt_to_futures_handler::<E, S>),
             )
     } else {
-        authenticated
+        funding
     };
-    let authenticated = authenticated
-        .route("/funding/:id", get(funding_get_handler::<E, S>))
-        .route("/funding", get(funding_list_handler::<E, S>))
-        .route("/capital/refresh", post(capital_refresh_handler::<E, S>));
-    #[cfg(feature = "postgres")]
-    let authenticated = authenticated
-        .route("/recovery/disposition", post(recovery_disposition_handler::<E, S>))
-        .route("/recovery/release", post(recovery_release_handler::<E, S>))
-        .route("/recovery/pending", get(recovery_pending_handler::<E, S>));
-    let authenticated = authenticated.layer(auth_layer).with_state(state);
+    let funding = funding
+        .layer(axum::middleware::from_fn_with_state(
+            AuthMiddlewareState::new(state.auth.clone(), RequiredPermission::Funding),
+            authorize_request,
+        ))
+        .with_state(state.clone());
 
-    read_only.merge(authenticated).layer(build_cors_layer())
+    let emergency = Router::new()
+        .route("/panic", post(panic_handler))
+        .route("/monthly-halt", post(monthly_halt_trigger_handler));
+    #[cfg(feature = "postgres")]
+    let emergency = emergency
+        .route("/recovery/disposition", post(recovery_disposition_handler::<E, S>))
+        .route("/recovery/release", post(recovery_release_handler::<E, S>));
+    let emergency = emergency
+        .layer(axum::middleware::from_fn_with_state(
+            AuthMiddlewareState::new(state.auth.clone(), RequiredPermission::Emergency),
+            authorize_request,
+        ))
+        .with_state(state);
+
+    public
+        .merge(observer)
+        .merge(operator)
+        .merge(funding)
+        .merge(emergency)
+        .layer(build_cors_layer())
+}
+
+#[derive(Clone)]
+struct AuthMiddlewareState {
+    auth: AuthService,
+    required: RequiredPermission,
+}
+
+impl AuthMiddlewareState {
+    fn new(auth: AuthService, required: RequiredPermission) -> Self {
+        Self { auth, required }
+    }
+}
+
+async fn authorize_request(
+    State(state): State<AuthMiddlewareState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let authorization = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    match state.auth.authenticate(authorization.as_deref(), state.required).await {
+        Ok(context) => {
+            request.extensions_mut().insert(context);
+            next.run(request).await
+        },
+        Err(error) => {
+            let (status, code) = match error {
+                AuthError::MissingBearer => (StatusCode::UNAUTHORIZED, "authentication_required"),
+                AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "invalid_bearer_token"),
+                AuthError::Forbidden => (StatusCode::FORBIDDEN, "insufficient_robson_role"),
+                AuthError::IdentityUnavailable => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "identity_unavailable")
+                },
+            };
+            if !matches!(error, AuthError::MissingBearer) {
+                warn!(%error, required = ?state.required, "RBX Identity authorization failed");
+            }
+            (status, Json(ErrorResponse { error: code.to_owned() })).into_response()
+        },
+    }
 }
 
 // =============================================================================
@@ -985,7 +989,7 @@ struct DispositionResponse {
 #[cfg(feature = "postgres")]
 async fn recovery_disposition_handler<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
-    identity: Option<axum::Extension<OperatorIdentity>>,
+    Extension(identity): Extension<AuthContext>,
     Json(body): Json<DispositionBody>,
 ) -> Result<Json<DispositionResponse>, (StatusCode, Json<ErrorResponse>)>
 where
@@ -998,9 +1002,6 @@ where
 
     let fail = |status: StatusCode, message: &str| {
         (status, Json(ErrorResponse { error: message.to_string() }))
-    };
-    let Some(axum::Extension(identity)) = identity else {
-        return Err(fail(StatusCode::UNAUTHORIZED, "a verified identity is required"));
     };
     let note = body.note.trim();
     if note.is_empty() {
@@ -1029,13 +1030,21 @@ where
     let Some(pool) = &state.pg_pool else {
         return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "no database is configured"));
     };
+    let Some(tenant_id) = identity.tenant_id else {
+        return Err(fail(StatusCode::FORBIDDEN, "identity is not bound to a tenant"));
+    };
+    if state.tenant_id != Some(tenant_id) {
+        return Err(fail(StatusCode::FORBIDDEN, "identity tenant does not match this runtime"));
+    }
 
-    let client_order_id: Option<String> =
-        sqlx::query_scalar("SELECT client_order_id FROM order_intents WHERE intent_id = $1")
-            .bind(body.intent_id)
-            .fetch_optional(pool.as_ref())
-            .await
-            .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"))?;
+    let client_order_id: Option<String> = sqlx::query_scalar(
+        "SELECT client_order_id FROM order_intents WHERE intent_id = $1 AND tenant_id = $2",
+    )
+    .bind(body.intent_id)
+    .bind(tenant_id)
+    .fetch_optional(pool.as_ref())
+    .await
+    .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "database unavailable"))?;
     let Some(client_order_id) = client_order_id else {
         return Err(fail(StatusCode::NOT_FOUND, "no such intent"));
     };
@@ -1050,9 +1059,9 @@ where
         treatment: body.treatment.as_str(),
         note: note.to_string(),
         actor: identity.subject,
-        auth_kind: identity.auth.as_str(),
+        auth_kind: identity.method.decision_auth_kind(),
     };
-    match record_disposition(pool, &disposition).await {
+    match record_disposition(pool, tenant_id, &disposition).await {
         Ok(receipt) => Ok(Json(DispositionResponse {
             decision_id: receipt.decision_id,
             boundary_b_blockers: receipt.boundary_b_blockers,
@@ -1121,7 +1130,7 @@ pub struct ReleaseRefusedResponse {
 #[cfg(feature = "postgres")]
 async fn recovery_release_handler<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
-    identity: Option<axum::Extension<OperatorIdentity>>,
+    Extension(identity): Extension<AuthContext>,
     Json(body): Json<ReleaseBody>,
 ) -> Result<Json<ReleaseResponse>, (StatusCode, Json<ReleaseRefusedResponse>)>
 where
@@ -1140,9 +1149,6 @@ where
             }),
         )
     };
-    let Some(axum::Extension(identity)) = identity else {
-        return Err(refused(StatusCode::UNAUTHORIZED, "a verified identity is required"));
-    };
     let note = body.note.trim();
     if note.is_empty() {
         return Err(refused(StatusCode::BAD_REQUEST, "a note is required"));
@@ -1151,7 +1157,7 @@ where
         decision_id: Uuid::now_v7(),
         generation: body.generation,
         actor: identity.subject,
-        auth_kind: identity.auth.as_str(),
+        auth_kind: identity.method.decision_auth_kind(),
         note: note.to_string(),
         treatment: body.treatment.as_str(),
         decided_at: Utc::now(),
@@ -1352,14 +1358,12 @@ struct PendingQuery {
 
 /// The pending list: memory (the gate, `operations_in_flight`,
 /// `persistence_pending`) and six SQL queries, a count and a page for each of
-/// three durable collections. No venue request, no manager lock. It requires
-/// an identity itself, as release and disposition do: with neither Google
-/// auth nor the legacy token configured the router lets a request through
-/// unauthenticated, and this answers 401 then.
+/// three durable collections. No venue request, no manager lock. The observer
+/// middleware supplies the verified RBX Identity context.
 #[cfg(feature = "postgres")]
 async fn recovery_pending_handler<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
-    identity: Option<axum::Extension<OperatorIdentity>>,
+    Extension(_identity): Extension<AuthContext>,
     Query(query): Query<PendingQuery>,
 ) -> Result<Json<PendingResponse>, (StatusCode, Json<ErrorResponse>)>
 where
@@ -1369,9 +1373,6 @@ where
     let fail = |status: StatusCode, message: &str| {
         (status, Json(ErrorResponse { error: message.to_string() }))
     };
-    if identity.is_none() {
-        return Err(fail(StatusCode::UNAUTHORIZED, "a verified identity is required"));
-    }
     let (Some(pool), Some(tenant_id)) = (&state.pg_pool, state.tenant_id) else {
         return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "no database is configured"));
     };
@@ -1595,6 +1596,21 @@ async fn metrics_handler() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
     )
+}
+
+async fn auth_session_handler(
+    Extension(context): Extension<AuthContext>,
+) -> Json<AuthSessionResponse> {
+    let permissions = context.permissions();
+    Json(AuthSessionResponse {
+        authentication_method: context.method,
+        issuer: context.issuer,
+        subject: context.subject,
+        client_id: context.client_id,
+        tenant_id: context.tenant_id,
+        roles: context.roles.into_iter().collect(),
+        permissions,
+    })
 }
 
 #[cfg(feature = "postgres")]
@@ -2252,7 +2268,7 @@ where
     }
 }
 
-/// Stream public operator events over Server-Sent Events.
+/// Stream authenticated operator events over Server-Sent Events.
 ///
 /// Clients should bootstrap state via REST and use this stream only for
 /// incremental updates. `event_id` is emitted for uniqueness and client-side
@@ -3043,6 +3059,7 @@ where
 /// without deleting the income item or treating it as governed evidence.
 async fn income_ack_handler<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
+    Extension(identity): Extension<AuthContext>,
     Path(exchange_income_id): Path<String>,
     Json(req): Json<IncomeAckRequest>,
 ) -> Result<(StatusCode, Json<IncomeAckResponse>), (StatusCode, Json<IncomeAckErrorResponse>)>
@@ -3052,7 +3069,7 @@ where
 {
     #[cfg(not(feature = "postgres"))]
     {
-        let _ = (state, req);
+        let _ = (state, identity, req);
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(IncomeAckErrorResponse {
@@ -3097,7 +3114,10 @@ where
             );
         }
 
-        let actor = req.actor.trim();
+        let actor = match identity.method {
+            crate::auth::AuthMethod::Disabled => req.actor.trim(),
+            crate::auth::AuthMethod::RbxOidc => identity.subject.as_str(),
+        };
         if actor.is_empty() {
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -4157,8 +4177,7 @@ mod tests {
             pg_pool: None,
             #[cfg(feature = "postgres")]
             tenant_id: None,
-            google_auth: None,
-            legacy_api_token: None,
+            auth: AuthService::new(None, None),
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
@@ -4438,8 +4457,7 @@ mod tests {
             wallet_balance_cache: Mutex::new(None),
             pg_pool: Some(Arc::new(pool.clone())),
             tenant_id: Some(tenant_id),
-            google_auth: None,
-            legacy_api_token: None,
+            auth: AuthService::new(None, Some(tenant_id)),
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
@@ -4546,8 +4564,7 @@ mod tests {
             wallet_balance_cache: Mutex::new(None),
             pg_pool: Some(Arc::new(pool.clone())),
             tenant_id: Some(tenant_id),
-            google_auth: None,
-            legacy_api_token: None,
+            auth: AuthService::new(None, Some(tenant_id)),
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
@@ -4891,8 +4908,7 @@ mod tests {
             pg_pool: None,
             #[cfg(feature = "postgres")]
             tenant_id: None,
-            google_auth: None,
-            legacy_api_token: None,
+            auth: AuthService::new(None, None),
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
@@ -4902,10 +4918,7 @@ mod tests {
         (create_router(state), event_bus, position_manager, exchange)
     }
 
-    /// Build a test app with Google ID token verification enabled — mirrors
-    /// `create_test_app_with_event_bus` but wires `google_auth` instead of
-    /// leaving auth disabled. Used by the ADR-0054 auth middleware tests.
-    async fn create_test_app_with_google_auth(google_auth: Option<GoogleAuthConfig>) -> Router {
+    async fn create_test_app_with_auth(auth: AuthService) -> Router {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
@@ -4935,8 +4948,7 @@ mod tests {
             pg_pool: None,
             #[cfg(feature = "postgres")]
             tenant_id: None,
-            google_auth,
-            legacy_api_token: None,
+            auth,
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
@@ -4946,16 +4958,18 @@ mod tests {
         create_router(state)
     }
 
-    // =========================================================================
-    // ADR-0054: Google OAuth ID token verification — test fixtures.
-    // =========================================================================
+    const TEST_OIDC_KID: &str = "test-key-1";
+    const TEST_OIDC_ISSUER: &str = "https://identity.example";
+    const TEST_OIDC_AUDIENCE: &str = "robson-api";
+    const TEST_OIDC_CLIENT_ID: &str = "robson-tauri";
+    const TEST_OIDC_SUBJECT: &str = "owner-subject";
+    const TEST_OIDC_ORGANIZATION_ID: &str = "rbx-org";
 
-    const TEST_GOOGLE_KID: &str = "test-key-1";
-    const TEST_GOOGLE_CLIENT_ID: &str = "test-client-id.apps.googleusercontent.com";
-    const TEST_ALLOWED_EMAIL: &str = "ldamasio@gmail.com";
+    #[cfg(feature = "postgres")]
+    fn recovery_test_tenant() -> Uuid {
+        Uuid::from_u128(0x5242_5800_0000_0000_0000_0000_0000_0001)
+    }
 
-    /// TEST-ONLY, NON-SECRET RSA keypair used to sign fixture Google ID
-    /// tokens — see `robsond/src/testdata/`.
     fn test_rsa_private_pem() -> &'static [u8] {
         include_bytes!("testdata/test_rsa_key.pem")
     }
@@ -4964,59 +4978,150 @@ mod tests {
         include_bytes!("testdata/test_rsa_key_pub.pem")
     }
 
-    fn test_google_auth_config() -> GoogleAuthConfig {
+    async fn test_oidc_auth(tenant_id: Uuid) -> AuthService {
         let decoding_key = jsonwebtoken::DecodingKey::from_rsa_pem(test_rsa_public_pem())
             .expect("valid test RSA public key");
         let mut keys = std::collections::HashMap::new();
-        keys.insert(TEST_GOOGLE_KID.to_string(), decoding_key);
+        keys.insert(TEST_OIDC_KID.to_string(), decoding_key);
 
-        GoogleAuthConfig {
-            client_ids: vec![TEST_GOOGLE_CLIENT_ID.to_string()],
-            allowed_email: TEST_ALLOWED_EMAIL.to_string(),
-            jwks: crate::google_jwks::GoogleJwksCache::from_keys_for_test(keys),
-        }
+        let verifier = crate::oidc_auth::RbxOidcVerifier::new(crate::config::OidcConfig {
+            issuer: TEST_OIDC_ISSUER.to_owned(),
+            audience: TEST_OIDC_AUDIENCE.to_owned(),
+            jwks_uri: format!("{TEST_OIDC_ISSUER}/oauth/v2/keys"),
+            allowed_client_ids: vec![TEST_OIDC_CLIENT_ID.to_owned()],
+            organization_id: TEST_OIDC_ORGANIZATION_ID.to_owned(),
+            tenant_id,
+            allowed_subjects: vec![TEST_OIDC_SUBJECT.to_owned()],
+        });
+        verifier
+            .set_test_cache(keys, Some(std::time::Instant::now()), Some(std::time::Instant::now()))
+            .await;
+        AuthService::from_verifier_for_test(verifier)
     }
 
     #[derive(serde::Serialize)]
-    struct TestGoogleClaims {
-        sub: String,
-        email: String,
-        email_verified: bool,
-        iss: String,
-        aud: String,
+    struct TestOidcClaims<'a> {
+        iss: &'a str,
+        sub: &'a str,
+        aud: &'a str,
         exp: i64,
-        iat: i64,
+        azp: &'a str,
+        #[serde(rename = "urn:zitadel:iam:org:project:roles")]
+        roles: serde_json::Value,
     }
 
-    impl Default for TestGoogleClaims {
-        fn default() -> Self {
-            let now = chrono::Utc::now().timestamp();
-            Self {
-                sub: "1234567890".to_string(),
-                email: TEST_ALLOWED_EMAIL.to_string(),
-                email_verified: true,
-                iss: "https://accounts.google.com".to_string(),
-                aud: TEST_GOOGLE_CLIENT_ID.to_string(),
-                exp: now + 3600,
-                iat: now,
-            }
-        }
-    }
-
-    /// Sign `claims` with the test-only RSA key, producing a JWT shaped
-    /// exactly like a real Google ID token (RS256, `kid` set in the header).
-    fn make_test_google_token(claims: TestGoogleClaims) -> String {
+    fn make_test_oidc_token(issuer: &str, roles: &[&str]) -> String {
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-        header.kid = Some(TEST_GOOGLE_KID.to_string());
+        header.kid = Some(TEST_OIDC_KID.to_owned());
         let key = jsonwebtoken::EncodingKey::from_rsa_pem(test_rsa_private_pem())
             .expect("valid test RSA private key");
-        jsonwebtoken::encode(&header, &claims, &key).expect("token encoding cannot fail here")
+        let roles = roles
+            .iter()
+            .map(|role| ((*role).to_owned(), serde_json::json!({"rbx-org": "rbx.example"})))
+            .collect::<serde_json::Map<_, _>>();
+        jsonwebtoken::encode(
+            &header,
+            &TestOidcClaims {
+                iss: issuer,
+                sub: TEST_OIDC_SUBJECT,
+                aud: TEST_OIDC_AUDIENCE,
+                exp: chrono::Utc::now().timestamp() + 3600,
+                azp: TEST_OIDC_CLIENT_ID,
+                roles: roles.into(),
+            },
+            &key,
+        )
+        .expect("token encoding cannot fail here")
     }
 
     #[tokio::test]
-    async fn google_auth_valid_token_returns_200_on_authenticated_route() {
-        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
-        let token = make_test_google_token(TestGoogleClaims::default());
+    async fn oidc_session_binds_subject_roles_and_tenant() {
+        let tenant_id = Uuid::now_v7();
+        let app = create_test_app_with_auth(test_oidc_auth(tenant_id).await).await;
+        let token = make_test_oidc_token(TEST_OIDC_ISSUER, &[crate::auth::ROLE_OBSERVER]);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/session")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["authentication_method"], "rbx_oidc");
+        assert_eq!(json["subject"], TEST_OIDC_SUBJECT);
+        assert_eq!(json["tenant_id"], tenant_id.to_string());
+        assert_eq!(json["roles"], serde_json::json!([crate::auth::ROLE_OBSERVER]));
+    }
+
+    #[tokio::test]
+    async fn oidc_missing_header_returns_401_on_read_route() {
+        let app = create_test_app_with_auth(test_oidc_auth(Uuid::now_v7()).await).await;
+
+        let response = app
+            .oneshot(Request::builder().uri("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "authentication_required");
+    }
+
+    #[tokio::test]
+    async fn direct_google_issuer_is_rejected() {
+        let app = create_test_app_with_auth(test_oidc_auth(Uuid::now_v7()).await).await;
+        let token =
+            make_test_oidc_token("https://accounts.google.com", &[crate::auth::ROLE_OBSERVER]);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn observer_role_cannot_invoke_emergency_action() {
+        let app = create_test_app_with_auth(test_oidc_auth(Uuid::now_v7()).await).await;
+        let token = make_test_oidc_token(TEST_OIDC_ISSUER, &[crate::auth::ROLE_OBSERVER]);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/panic")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "insufficient_robson_role");
+    }
+
+    #[tokio::test]
+    async fn emergency_role_can_invoke_panic() {
+        let app = create_test_app_with_auth(test_oidc_auth(Uuid::now_v7()).await).await;
+        let token = make_test_oidc_token(TEST_OIDC_ISSUER, &[crate::auth::ROLE_EMERGENCY]);
 
         let response = app
             .oneshot(
@@ -5037,22 +5142,24 @@ mod tests {
     // -----------------------
 
     #[cfg(feature = "postgres")]
-    const LEGACY: &str = "legacy-test-token";
+    /// Test helper sentinel: request helpers replace this with a signed RBX
+    /// OIDC token carrying the emergency role.
+    const AUTHENTICATED: &str = "authenticated-oidc-test-request";
 
     #[cfg(feature = "postgres")]
     async fn disposition_app(
         pool: sqlx::PgPool,
         journal: Arc<OrderJournal>,
-        legacy: Option<&str>,
+        authenticated: Option<&str>,
     ) -> Router {
-        recovery_app(pool, journal, legacy, None).await
+        recovery_app(pool, journal, authenticated, None).await
     }
 
     #[cfg(feature = "postgres")]
     async fn recovery_app(
         pool: sqlx::PgPool,
         journal: Arc<OrderJournal>,
-        legacy: Option<&str>,
+        _authenticated: Option<&str>,
         tenant_id: Option<Uuid>,
     ) -> Router {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
@@ -5073,6 +5180,7 @@ mod tests {
         );
         let position_manager = Arc::new(RwLock::new(manager));
         let circuit_breaker = position_manager.read().await.circuit_breaker();
+        let tenant_id = tenant_id.unwrap_or_else(recovery_test_tenant);
         create_router(Arc::new(ApiState {
             exchange,
             position_manager,
@@ -5080,9 +5188,8 @@ mod tests {
             circuit_breaker,
             wallet_balance_cache: Mutex::new(None),
             pg_pool: Some(Arc::new(pool)),
-            tenant_id,
-            google_auth: legacy.is_some().then(test_google_auth_config),
-            legacy_api_token: legacy.map(str::to_string),
+            tenant_id: Some(tenant_id),
+            auth: test_oidc_auth(tenant_id).await,
             funding: FundingConfig::default(),
             funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
@@ -5092,8 +5199,18 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     async fn seed_intent(pool: &sqlx::PgPool, id: &str, cancels: Option<&str>) -> Uuid {
+        seed_intent_for(pool, recovery_test_tenant(), id, cancels).await
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn seed_intent_for(
+        pool: &sqlx::PgPool,
+        tenant_id: Uuid,
+        id: &str,
+        cancels: Option<&str>,
+    ) -> Uuid {
         use robson_exec::order_journal::{IntentKind, IntentSpec, JournalBackend, WriteClass};
-        let backend = crate::order_journal_store::PgJournalBackend::new(pool, Uuid::now_v7());
+        let backend = crate::order_journal_store::PgJournalBackend::new(pool, tenant_id);
         let backend: Arc<dyn JournalBackend> = Arc::new(backend);
         let journal = Arc::new(OrderJournal::new(backend, &VenueId::new("test:venue")));
         let operation = journal.begin_operation();
@@ -5128,7 +5245,9 @@ mod tests {
             .method("POST")
             .uri("/recovery/disposition")
             .header(header::CONTENT_TYPE, "application/json");
-        if let Some(bearer) = bearer {
+        let oidc_token = (bearer == Some(AUTHENTICATED))
+            .then(|| make_test_oidc_token(TEST_OIDC_ISSUER, &[crate::auth::ROLE_EMERGENCY]));
+        if let Some(bearer) = oidc_token.as_deref().or(bearer) {
             request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
         }
         let response = app
@@ -5197,8 +5316,8 @@ mod tests {
         let journal = Arc::new(OrderJournal::unpersisted());
         let intent_id = seed_intent(&pool, "c1", None).await;
         let before = venue_side(&pool, intent_id).await;
-        let app = disposition_app(pool.clone(), journal, Some(LEGACY)).await;
-        let token = make_test_google_token(TestGoogleClaims::default());
+        let app = disposition_app(pool.clone(), journal, Some(AUTHENTICATED)).await;
+        let token = make_test_oidc_token(TEST_OIDC_ISSUER, &[crate::auth::ROLE_EMERGENCY]);
 
         let (status, body) = post_disposition(&app, Some(&token), accepted_risk(intent_id)).await;
 
@@ -5215,7 +5334,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             (kind.as_str(), treatment.as_str(), by.as_str(), auth.as_str()),
-            ("accepted_risk", "unbooked_accepted", TEST_ALLOWED_EMAIL, "verified")
+            ("accepted_risk", "unbooked_accepted", TEST_OIDC_SUBJECT, "verified")
         );
         let decision: (String, String, String) = sqlx::query_as(
             "SELECT actor, auth_kind, note FROM journal_decisions WHERE intent_id = $1",
@@ -5224,29 +5343,59 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(decision.0, TEST_ALLOWED_EMAIL);
+        assert_eq!(decision.0, TEST_OIDC_SUBJECT);
         assert_eq!(decision.1, "verified");
     }
 
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
-    async fn the_legacy_token_is_recorded_as_asserted(pool: sqlx::PgPool) {
+    async fn a_static_bearer_token_is_rejected(pool: sqlx::PgPool) {
         let intent_id = seed_intent(&pool, "c1", None).await;
-        let app =
-            disposition_app(pool.clone(), Arc::new(OrderJournal::unpersisted()), Some(LEGACY))
-                .await;
+        let app = disposition_app(
+            pool.clone(),
+            Arc::new(OrderJournal::unpersisted()),
+            Some(AUTHENTICATED),
+        )
+        .await;
 
-        let (status, body) = post_disposition(&app, Some(LEGACY), accepted_risk(intent_id)).await;
+        let (status, _) =
+            post_disposition(&app, Some("legacy-test-token"), accepted_risk(intent_id)).await;
 
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let auth: String =
-            sqlx::query_scalar("SELECT auth_kind FROM journal_decisions WHERE intent_id = $1")
-                .bind(intent_id)
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let decisions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM journal_decisions WHERE intent_id = $1",
+        )
+        .bind(intent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(decisions, 0);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn an_authenticated_operator_cannot_dispose_another_tenants_intent(pool: sqlx::PgPool) {
+        let foreign_intent = seed_intent_for(&pool, Uuid::now_v7(), "foreign", None).await;
+        let app = disposition_app(
+            pool.clone(),
+            Arc::new(OrderJournal::unpersisted()),
+            Some(AUTHENTICATED),
+        )
+        .await;
+
+        let (status, _) =
+            post_disposition(&app, Some(AUTHENTICATED), accepted_risk(foreign_intent)).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let disposition: Option<String> =
+            sqlx::query_scalar("SELECT disposition_kind FROM order_intents WHERE intent_id = $1")
+                .bind(foreign_intent)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(auth, "asserted");
+        assert_eq!(disposition, None);
     }
 
     /// Terminal evidence is not accepted risk and not a venue outcome.
@@ -5256,16 +5405,20 @@ mod tests {
     async fn terminal_evidence_names_the_order_and_stays_apart_from_finality(pool: sqlx::PgPool) {
         let intent_id = seed_intent(&pool, "c1", None).await;
         let before = venue_side(&pool, intent_id).await;
-        let app =
-            disposition_app(pool.clone(), Arc::new(OrderJournal::unpersisted()), Some(LEGACY))
-                .await;
+        let app = disposition_app(
+            pool.clone(),
+            Arc::new(OrderJournal::unpersisted()),
+            Some(AUTHENTICATED),
+        )
+        .await;
 
         let (status, _) =
-            post_disposition(&app, Some(LEGACY), terminal_evidence(intent_id, "other")).await;
+            post_disposition(&app, Some(AUTHENTICATED), terminal_evidence(intent_id, "other"))
+                .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "evidence for another order");
 
         let (status, body) =
-            post_disposition(&app, Some(LEGACY), terminal_evidence(intent_id, "c1")).await;
+            post_disposition(&app, Some(AUTHENTICATED), terminal_evidence(intent_id, "c1")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(venue_side(&pool, intent_id).await, before);
         let (kind, accepted_at): (String, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
@@ -5282,10 +5435,11 @@ mod tests {
         // id never reached the venue, so nothing there can be its record.
         let cancel_id = seed_intent(&pool, "cxl-1", Some("777")).await;
         let (status, _) =
-            post_disposition(&app, Some(LEGACY), terminal_evidence(cancel_id, "cxl-1")).await;
+            post_disposition(&app, Some(AUTHENTICATED), terminal_evidence(cancel_id, "cxl-1"))
+                .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "the local cancellation id");
         let (status, body) =
-            post_disposition(&app, Some(LEGACY), terminal_evidence(cancel_id, "777")).await;
+            post_disposition(&app, Some(AUTHENTICATED), terminal_evidence(cancel_id, "777")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
@@ -5295,9 +5449,12 @@ mod tests {
     #[ignore = "requires DATABASE_URL"]
     async fn an_empty_account_observation_is_not_terminal_evidence(pool: sqlx::PgPool) {
         let intent_id = seed_intent(&pool, "c1", None).await;
-        let app =
-            disposition_app(pool.clone(), Arc::new(OrderJournal::unpersisted()), Some(LEGACY))
-                .await;
+        let app = disposition_app(
+            pool.clone(),
+            Arc::new(OrderJournal::unpersisted()),
+            Some(AUTHENTICATED),
+        )
+        .await;
         let mut body = terminal_evidence(intent_id, "c1");
         body["evidence"] = json!({
             "positions": [],
@@ -5305,7 +5462,7 @@ mod tests {
             "observed_at": "2026-11-08T12:00:00Z",
         });
 
-        let (status, _) = post_disposition(&app, Some(LEGACY), body).await;
+        let (status, _) = post_disposition(&app, Some(AUTHENTICATED), body).await;
 
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         let blockers: i64 =
@@ -5323,9 +5480,12 @@ mod tests {
     #[ignore = "requires DATABASE_URL"]
     async fn impossible_or_unattached_evidence_is_refused(pool: sqlx::PgPool) {
         let intent_id = seed_intent(&pool, "c1", None).await;
-        let app =
-            disposition_app(pool.clone(), Arc::new(OrderJournal::unpersisted()), Some(LEGACY))
-                .await;
+        let app = disposition_app(
+            pool.clone(),
+            Arc::new(OrderJournal::unpersisted()),
+            Some(AUTHENTICATED),
+        )
+        .await;
         let mut too_much = terminal_evidence(intent_id, "c1");
         too_much["evidence"]["filled_qty"] = json!("0.5");
         too_much["evidence"]["terminal_status"] = json!("filled");
@@ -5352,14 +5512,14 @@ mod tests {
             ("rejected with a fill", rejected_with_fill),
             ("more than ordered", too_much),
         ] {
-            let (status, reply) = post_disposition(&app, Some(LEGACY), body).await;
+            let (status, reply) = post_disposition(&app, Some(AUTHENTICATED), body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {reply}");
         }
         // A record that is missing altogether does not even deserialize.
         let mut assertion = terminal_evidence(intent_id, "c1");
         assertion["evidence"].as_object_mut().unwrap().remove("venue_record");
         assert_eq!(
-            post_disposition(&app, Some(LEGACY), assertion).await.0,
+            post_disposition(&app, Some(AUTHENTICATED), assertion).await.0,
             StatusCode::UNPROCESSABLE_ENTITY
         );
         let blockers: i64 =
@@ -5370,7 +5530,8 @@ mod tests {
         assert_eq!(blockers, 1);
 
         // The same operator may still accept the risk knowingly.
-        let (status, reply) = post_disposition(&app, Some(LEGACY), accepted_risk(intent_id)).await;
+        let (status, reply) =
+            post_disposition(&app, Some(AUTHENTICATED), accepted_risk(intent_id)).await;
         assert_eq!(status, StatusCode::OK, "{reply}");
     }
 
@@ -5380,28 +5541,32 @@ mod tests {
     async fn a_disposition_is_refused_when_it_cannot_apply(pool: sqlx::PgPool) {
         let intent_id = seed_intent(&pool, "c1", None).await;
         let journal = Arc::new(OrderJournal::unpersisted());
-        let app = disposition_app(pool.clone(), journal, Some(LEGACY)).await;
+        let app = disposition_app(pool.clone(), journal, Some(AUTHENTICATED)).await;
 
         // Not authenticated.
         let (status, _) = post_disposition(&app, None, accepted_risk(intent_id)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         // Unknown intent, empty note, evidence that does not belong.
-        let (status, _) = post_disposition(&app, Some(LEGACY), accepted_risk(Uuid::now_v7())).await;
+        let (status, _) =
+            post_disposition(&app, Some(AUTHENTICATED), accepted_risk(Uuid::now_v7())).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let mut blank = accepted_risk(intent_id);
         blank["note"] = json!("   ");
-        assert_eq!(post_disposition(&app, Some(LEGACY), blank).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            post_disposition(&app, Some(AUTHENTICATED), blank).await.0,
+            StatusCode::BAD_REQUEST
+        );
         let mut evidence_on_risk = terminal_evidence(intent_id, "c1");
         evidence_on_risk["disposition_kind"] = json!("accepted_risk");
         assert_eq!(
-            post_disposition(&app, Some(LEGACY), evidence_on_risk).await.0,
+            post_disposition(&app, Some(AUTHENTICATED), evidence_on_risk).await.0,
             StatusCode::BAD_REQUEST
         );
         let mut no_evidence = terminal_evidence(intent_id, "c1");
         no_evidence.as_object_mut().unwrap().remove("evidence");
         assert_eq!(
-            post_disposition(&app, Some(LEGACY), no_evidence).await.0,
+            post_disposition(&app, Some(AUTHENTICATED), no_evidence).await.0,
             StatusCode::BAD_REQUEST
         );
 
@@ -5412,7 +5577,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            post_disposition(&app, Some(LEGACY), accepted_risk(intent_id)).await.0,
+            post_disposition(&app, Some(AUTHENTICATED), accepted_risk(intent_id)).await.0,
             StatusCode::CONFLICT
         );
     }
@@ -5448,9 +5613,10 @@ mod tests {
                 });
             })
             .await;
-        let app = disposition_app(pool.clone(), journal.clone(), Some(LEGACY)).await;
+        let app = disposition_app(pool.clone(), journal.clone(), Some(AUTHENTICATED)).await;
 
-        let (status, _) = post_disposition(&app, Some(LEGACY), accepted_risk(intent_id)).await;
+        let (status, _) =
+            post_disposition(&app, Some(AUTHENTICATED), accepted_risk(intent_id)).await;
 
         assert_eq!(status, StatusCode::CONFLICT);
         drop(operation);
@@ -5586,143 +5752,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn google_auth_missing_header_returns_401() {
-        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
-
-        let response = app
-            .oneshot(Request::builder().method("POST").uri("/panic").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn google_auth_wrong_audience_returns_401() {
-        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
-        let token = make_test_google_token(TestGoogleClaims {
-            aud: "some-other-client-id.apps.googleusercontent.com".to_string(),
-            ..TestGoogleClaims::default()
-        });
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/panic")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn google_auth_wrong_issuer_returns_401() {
-        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
-        let token = make_test_google_token(TestGoogleClaims {
-            iss: "https://evil.example.com".to_string(),
-            ..TestGoogleClaims::default()
-        });
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/panic")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn google_auth_expired_token_returns_401() {
-        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
-        let now = chrono::Utc::now().timestamp();
-        // `jsonwebtoken`'s default `Validation` applies a 60s leeway around
-        // `exp`, so back this off well past that to land unambiguously
-        // outside the acceptance window.
-        let token = make_test_google_token(TestGoogleClaims {
-            exp: now - 3600,
-            iat: now - 7200,
-            ..TestGoogleClaims::default()
-        });
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/panic")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn google_auth_email_not_verified_returns_401() {
-        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
-        let token = make_test_google_token(TestGoogleClaims {
-            email_verified: false,
-            ..TestGoogleClaims::default()
-        });
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/panic")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn google_auth_email_not_allowlisted_returns_401() {
-        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
-        let token = make_test_google_token(TestGoogleClaims {
-            email: "someone-else@gmail.com".to_string(),
-            ..TestGoogleClaims::default()
-        });
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/panic")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn google_auth_disabled_allows_request_without_header() {
-        // Mirrors the pre-existing dev-mode-no-op coverage: when neither
-        // Google auth nor the legacy bridge is configured, auth is disabled
-        // entirely (non-production environments only).
-        let app = create_test_app_with_google_auth(None).await;
+    async fn development_auth_disabled_allows_request_without_header() {
+        let app = create_test_app_with_auth(AuthService::new(None, None)).await;
 
         let response = app
             .oneshot(Request::builder().method("POST").uri("/panic").body(Body::empty()).unwrap())
@@ -6681,7 +6712,9 @@ mod tests {
             .method("POST")
             .uri("/recovery/release")
             .header(header::CONTENT_TYPE, "application/json");
-        if let Some(bearer) = bearer {
+        let oidc_token = (bearer == Some(AUTHENTICATED))
+            .then(|| make_test_oidc_token(TEST_OIDC_ISSUER, &[crate::auth::ROLE_EMERGENCY]));
+        if let Some(bearer) = oidc_token.as_deref().or(bearer) {
             request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
         }
         let response = app
@@ -6711,27 +6744,33 @@ mod tests {
         let backend = Arc::new(StubJournalBackend::default());
         let journal = Arc::new(OrderJournal::new(backend.clone(), &VenueId::new("test:venue")));
         journal.gate().record(IncidentReason::UncleanStart);
-        let app = recovery_app(unreachable_pool(), Arc::clone(&journal), Some(LEGACY), None).await;
+        let app =
+            recovery_app(unreachable_pool(), Arc::clone(&journal), Some(AUTHENTICATED), None).await;
         let current = journal.gate().generation();
 
         let (status, _) = post_release(&app, None, release_body(current, "x")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let (status, _) = post_release(&app, Some(LEGACY), release_body(current, "  ")).await;
+        let (status, _) =
+            post_release(&app, Some(AUTHENTICATED), release_body(current, "  ")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, body) =
-            post_release(&app, Some(LEGACY), json!({ "generation": current, "note": "x" })).await;
+            post_release(&app, Some(AUTHENTICATED), json!({ "generation": current, "note": "x" }))
+                .await;
         assert!(status.is_client_error(), "a treatment is mandatory: {status} {body}");
 
-        let (status, body) = post_release(&app, Some(LEGACY), release_body(current, "x")).await;
+        let (status, body) =
+            post_release(&app, Some(AUTHENTICATED), release_body(current, "x")).await;
         assert_eq!((status, body["error"].clone()), (StatusCode::CONFLICT, json!("persisting")));
         journal.flush_pending().await;
-        let (status, body) = post_release(&app, Some(LEGACY), release_body(current - 1, "x")).await;
+        let (status, body) =
+            post_release(&app, Some(AUTHENTICATED), release_body(current - 1, "x")).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "stale");
         assert_eq!(body["current_generation"], current);
         assert!(journal.gate().fenced());
 
-        let (status, body) = post_release(&app, Some(LEGACY), release_body(current, "x")).await;
+        let (status, body) =
+            post_release(&app, Some(AUTHENTICATED), release_body(current, "x")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
             (body["fence_open"].clone(), body["incidents_released"].clone()),
@@ -6739,15 +6778,13 @@ mod tests {
         );
         assert!(!journal.gate().fenced());
         let recorded = &backend.releases()[0];
-        assert_eq!(
-            (recorded.actor.as_str(), recorded.auth_kind),
-            ("legacy-bearer-token", "asserted")
-        );
+        assert_eq!((recorded.actor.as_str(), recorded.auth_kind), (TEST_OIDC_SUBJECT, "verified"));
 
         journal.gate().record(IncidentReason::OperationAborted);
         journal.flush_pending().await;
         let latest = journal.gate().generation();
-        let (status, body) = post_release(&app, Some(LEGACY), release_body(latest, "x")).await;
+        let (status, body) =
+            post_release(&app, Some(AUTHENTICATED), release_body(latest, "x")).await;
         assert_eq!((status, body["error"].clone()), (StatusCode::CONFLICT, json!("latched")));
         assert!(journal.gate().fenced());
     }
@@ -6841,15 +6878,18 @@ mod tests {
         journal.replace_withheld_report(report);
 
         let app =
-            recovery_app(pool.clone(), Arc::clone(&journal), Some(LEGACY), Some(tenant)).await;
+            recovery_app(pool.clone(), Arc::clone(&journal), Some(AUTHENTICATED), Some(tenant))
+                .await;
+        let token = make_test_oidc_token(TEST_OIDC_ISSUER, &[crate::auth::ROLE_EMERGENCY]);
         let get = |page: u64| {
             let app = app.clone();
+            let token = token.clone();
             async move {
                 let response = app
                     .oneshot(
                         Request::builder()
                             .uri(format!("/recovery/pending?page={page}"))
-                            .header(header::AUTHORIZATION, format!("Bearer {LEGACY}"))
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
                             .body(Body::empty())
                             .unwrap(),
                     )
@@ -7245,8 +7285,7 @@ mod tests {
                 pg_pool: None,
                 #[cfg(feature = "postgres")]
                 tenant_id: None,
-                google_auth: None,
-                legacy_api_token: Some("secret-token-123".to_string()),
+                auth: test_oidc_auth(Uuid::now_v7()).await,
                 funding: FundingConfig::default(),
                 funding_route_mode: FundingRouteMode::Selected,
                 venue_feed: VenueFeedView::default(),
