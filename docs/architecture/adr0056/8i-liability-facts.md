@@ -52,3 +52,21 @@ certified basis, event-delivery generation and complete measured budgets.
 Admission35 and owner25/200 are not increased; no schema or factory activation
 follows. All15 activation prerequisites and SD15/SD16/T6/operator-only decisions
 remain separate.
+
+
+## Executable quantity candidates
+
+The first calculation derives executable quantity from recorded gross and
+base commission on the persisted positive lot step. A provisional bound
+uses the supplied persisted rate as a dimensionless fraction, with exact
+multiplication and native decimal export. The final-fee calculation uses
+the smaller of the prior executable quantity and the new exact lot floor.
+If final commission falls, the prior quantity stays fixed and the excess
+becomes dust. Both paths reuse the same partition and report a deficit
+without a remainder when prior consumption exceeds executable quantity.
+
+The quantity candidates take supplied values. The later owner must bind the
+same immutable lot step and fee source to the durable leg and coherent order
+evidence before persisting any change. These functions use the private
+sizing arithmetic frame with at most five fixed imports and six charged
+calls. They issue zero SQL and venue requests and hold no locks.
