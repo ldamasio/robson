@@ -17,10 +17,13 @@
   "login": {
     "title": "Robson",
     "pageTitle": "Login · RBX Robson",
-    "description": "Sign in with Google to access the operations console.",
-    "signIn": "Sign in with Google",
+    "description": "Sign in with your Google account through RBX Identity.",
+    "signIn": "Continue with Google",
     "signingIn": "Signing in...",
-    "connectionFailed": "Connection failed"
+    "connectionFailed": "Connection failed",
+    "identityProvider": "Authentication is brokered by RBX Identity (ZITADEL).",
+    "notConfigured": "RBX Identity is not configured for this build.",
+    "tryAgain": "Try again"
   },
   "dashboard": {
     "pageTitle": "Dashboard · RBX Robson",

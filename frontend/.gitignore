@@ -5,9 +5,12 @@ dist/
 .env
 .env.*
 !.env.example
+!.env.tauri.example
 .DS_Store
 *.log
 coverage/
 .vite/
+src-tauri/target/
+src-tauri/gen/schemas/
 test-results/
 playwright-report/

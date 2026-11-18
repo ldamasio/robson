@@ -1,205 +1,167 @@
-import { writable, derived } from 'svelte/store';
-import { browser } from '$app/env';
+import { browser } from "$app/env";
+import * as env from "$app/env/public";
+import { get, writable } from "svelte/store";
+import {
+  clearNativeAuthSession,
+  getNativeAuthSession,
+  isNativeRuntime,
+  onNativeAuthExpired,
+  onNativeAuthSession,
+} from "#lib/auth/native.ts";
+
+export type AuthSource = "native-oidc" | "web-oidc" | "bff-cookie" | "none";
 
 export type Session = {
   authenticated: boolean;
-  tokenSource: 'stored' | 'session' | 'none';
+  initialized: boolean;
+  tokenSource: AuthSource;
+  expiresAt: number | null;
 };
 
-// ADR-0054: the stored credential is now a Google-issued ID token (a JWT),
-// not an opaque bearer token issued by robsond. Renamed so a stale token
-// from before the cutover isn't mistaken for a valid one.
-const STORAGE_KEY = 'robson_google_id_token';
-
-// Google ID tokens are typically valid for ~1h. Trigger a silent refresh
-// this many seconds before expiry, matching the plan's "~10 minutes left"
-// recommendation.
-export const SILENT_REFRESH_THRESHOLD_SECS = 600;
-
-/** Google Identity Services' shape for the pieces this app uses. Declared
- *  narrowly here rather than pulling in a full type package for one global. */
-type GoogleCredentialResponse = { credential?: string };
-type GoogleIdConfig = {
-  client_id: string;
-  callback: (response: GoogleCredentialResponse) => void;
-};
-type GooglePromptMoment = {
-  isNotDisplayed?: () => boolean;
-  isSkippedMoment?: () => boolean;
-  isDismissedMoment?: () => boolean;
-};
-type GoogleAccountsId = {
-  initialize: (config: GoogleIdConfig) => void;
-  renderButton: (parent: HTMLElement, options: Record<string, unknown>) => void;
-  prompt: (momentListener?: (notification: GooglePromptMoment) => void) => void;
-  cancel: () => void;
+const initialSession: Session = {
+  authenticated: false,
+  initialized: false,
+  tokenSource: "none",
+  expiresAt: null,
 };
 
-declare global {
-  interface Window {
-    google?: { accounts: { id: GoogleAccountsId } };
-  }
+/** Access tokens exist here only for the browser public-client flow.
+ *
+ * Tauri keeps its token exclusively in Rust memory and BFF mode uses an
+ * HttpOnly cookie. Nothing in this store writes a credential to Web Storage.
+ */
+export const authToken = writable<string | null>(null);
+export const session = writable<Session>(initialSession);
+
+let expirationTimer: ReturnType<typeof setTimeout> | null = null;
+let initPromise: Promise<void> | null = null;
+
+export function webAuthMode(): "oidc" | "bff" {
+  return env.PUBLIC_ROBSON_WEB_AUTH_MODE === "bff" ? "bff" : "oidc";
 }
 
-/** Base64url-decode a JWT's payload segment and parse the `exp` claim.
- *  No signature verification is performed here — this is purely
- *  informational, used only to drive the client-side silent-refresh timer.
- *  robsond independently re-verifies the signature and every claim on
- *  every request (see `robsond/src/auth.rs`); a forged `exp` client-side
- *  gains an attacker nothing. */
-export function decodeTokenExpiry(token: string): number | null {
-  try {
-    const payload = token.split('.')[1];
-    if (!payload) return null;
-    const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
-    const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
-    const json = atob(padded);
-    const claims = JSON.parse(json) as { exp?: unknown };
-    return typeof claims.exp === 'number' ? claims.exp : null;
-  } catch {
-    return null;
-  }
-}
-
-/** True when `token`'s `exp` claim is within `thresholdSecs` of now, or
- *  can't be determined at all (fail safe: treat as needing a refresh). */
-export function isNearExpiry(
-  token: string,
-  thresholdSecs: number = SILENT_REFRESH_THRESHOLD_SECS,
-): boolean {
-  const exp = decodeTokenExpiry(token);
-  if (exp === null) return true;
-  return exp - Date.now() / 1000 <= thresholdSecs;
-}
-
-function createAuthStore() {
-  const token = writable<string | null>(null);
-  const session = derived(token, ($token): Session => {
-    if (!$token) return { authenticated: false, tokenSource: 'none' };
-    return { authenticated: true, tokenSource: 'stored' };
+export function initAuth(): Promise<void> {
+  if (!browser) return Promise.resolve();
+  if (initPromise) return initPromise;
+  initPromise = initialize().catch(() => {
+    setUnauthenticated(true);
   });
+  return initPromise;
+}
 
-  function init() {
-    if (!browser) return;
-    const stored = sessionStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      token.set(stored);
+async function initialize(): Promise<void> {
+  if (isNativeRuntime()) {
+    await Promise.all([
+      onNativeAuthSession((nativeSession) => {
+        session.set({
+          authenticated: nativeSession.authenticated,
+          initialized: true,
+          tokenSource: nativeSession.authenticated ? "native-oidc" : "none",
+          expiresAt: nativeSession.expiresAt,
+        });
+        scheduleExpiration(nativeSession.expiresAt);
+      }),
+      onNativeAuthExpired(() => setUnauthenticated(true)),
+    ]);
+    const nativeSession = await getNativeAuthSession();
+    session.set({
+      authenticated: nativeSession.authenticated,
+      initialized: true,
+      tokenSource: nativeSession.authenticated ? "native-oidc" : "none",
+      expiresAt: nativeSession.expiresAt,
+    });
+    scheduleExpiration(nativeSession.expiresAt);
+    return;
+  }
+
+  if (webAuthMode() === "bff") {
+    const base = env.PUBLIC_ROBSON_API_BASE ?? "";
+    const response = await fetch(`${base}/auth/session`, {
+      credentials: "include",
+      headers: { Accept: "application/json" },
+    });
+    if (response.ok) {
+      session.set({
+        authenticated: true,
+        initialized: true,
+        tokenSource: "bff-cookie",
+        expiresAt: null,
+      });
+      return;
     }
   }
 
-  function setToken(t: string) {
-    if (browser) sessionStorage.setItem(STORAGE_KEY, t);
-    token.set(t);
-  }
-
-  function clear() {
-    if (browser) sessionStorage.removeItem(STORAGE_KEY);
-    token.set(null);
-  }
-
-  // Google only allows one `navigator.credentials.get()` (FedCM) call
-  // outstanding at a time — a second concurrent call rejects with
-  // NotAllowedError, and re-calling `initialize()` while one is pending
-  // logs GIS's own "called multiple times" warning. `apiFetch`'s 401
-  // handler, `FetchEventSource`'s 401 handler, and the periodic
-  // near-expiry timer in `(authed)/+layout.svelte` can all independently
-  // decide to refresh around the same time (e.g. several dashboard
-  // requests landing together right after mount) — without sharing one
-  // in-flight attempt, each caller raced its own `initialize()`/`prompt()`
-  // against the others', producing a self-sustaining loop of these
-  // warnings. This holds the one in-flight attempt so every concurrent
-  // caller awaits the same result instead of starting a new one.
-  let inFlightRefresh: Promise<string | null> | null = null;
-
-  /** Ask Google Identity Services for a fresh credential in the background
-   *  (`google.accounts.id.prompt()`), without forcing a visible click.
-   *  Resolves with the new token on success — via the same `setToken` path
-   *  as the login page's button flow — or `null` if GIS is unavailable or
-   *  declines to issue one silently (e.g. third-party cookies blocked,
-   *  session revoked, no active Google session). Callers should treat
-   *  `null` as "let the normal expired-token/401 handling take over"
-   *  rather than as an error. Safe to call concurrently from multiple call
-   *  sites — see `inFlightRefresh` above. */
-  function silentRefresh(clientId: string): Promise<string | null> {
-    if (!browser || !window.google?.accounts?.id) return Promise.resolve(null);
-    if (inFlightRefresh) return inFlightRefresh;
-
-    inFlightRefresh = new Promise<string | null>((resolve, reject) => {
-      let settled = false;
-      let timeoutId: ReturnType<typeof setTimeout> | undefined;
-      const settle = (value: string | null): boolean => {
-        if (settled) return false;
-        settled = true;
-        clearTimeout(timeoutId);
-        // Only the winning callback may publish a credential. A callback
-        // delivered after cancellation or timeout must not restore auth.
-        // A storage failure while publishing still settles the shared
-        // attempt: every waiter sees the error instead of hanging forever.
-        try {
-          if (value) setToken(value);
-        } catch (error) {
-          reject(error);
-          return true;
-        }
-        resolve(value);
-        return true;
-      };
-
-      // Own the timer before GIS can invoke either callback synchronously.
-      // The timeout selects its result before cancel can re-enter the
-      // credential callback. The single-flight lock is released by finally
-      // after this synchronous cancellation has returned.
-      timeoutId = setTimeout(() => {
-        if (!settle(null)) return;
-        try {
-          window.google?.accounts?.id?.cancel?.();
-        } catch {
-          // best-effort — the timeout already owns the null result
-        }
-      }, 5000);
-
-      try {
-        window.google!.accounts.id.initialize({
-          client_id: clientId,
-          callback: (response) => {
-            settle(response?.credential || null);
-          },
-        });
-
-        if (!settled) {
-          window.google!.accounts.id.prompt((notification) => {
-            if (
-              notification?.isNotDisplayed?.() ||
-              notification?.isSkippedMoment?.() ||
-              notification?.isDismissedMoment?.()
-            ) {
-              settle(null);
-            }
-          });
-        }
-      } catch (error) {
-        // Preserve SDK rejection semantics while releasing our timer.
-        if (!settled) {
-          settled = true;
-          clearTimeout(timeoutId);
-          reject(error);
-        }
-      }
-    }).finally(() => {
-      inFlightRefresh = null;
-    });
-
-    return inFlightRefresh;
-  }
-
-  return { token, session, init, setToken, clear, silentRefresh };
+  // Browser PKCE access tokens are deliberately memory-only. A reload starts
+  // a new authorization flow; the ZITADEL/Google SSO session makes it cheap.
+  setUnauthenticated(true);
 }
 
-export const {
-  token: authToken,
-  session,
-  init: initAuth,
-  setToken,
-  clear: clearAuth,
-  silentRefresh: silentRefreshGoogleToken,
-} = createAuthStore();
+export function setWebOidcToken(token: string, expiresInSeconds: number): void {
+  if (
+    !token ||
+    !Number.isSafeInteger(expiresInSeconds) ||
+    expiresInSeconds <= 0
+  ) {
+    throw new Error("OIDC access token lifetime is invalid");
+  }
+  const expiresAt = Date.now() + expiresInSeconds * 1_000;
+  if (!Number.isSafeInteger(expiresAt)) {
+    throw new Error("OIDC access token lifetime is invalid");
+  }
+  authToken.set(token);
+  session.set({
+    authenticated: true,
+    initialized: true,
+    tokenSource: "web-oidc",
+    expiresAt,
+  });
+  scheduleExpiration(expiresAt);
+}
+
+export function markBffAuthenticated(): void {
+  authToken.set(null);
+  session.set({
+    authenticated: true,
+    initialized: true,
+    tokenSource: "bff-cookie",
+    expiresAt: null,
+  });
+  scheduleExpiration(null);
+}
+
+export function currentAccessToken(): string | null {
+  return get(authToken);
+}
+
+export function clearAuth(): void {
+  if (browser && isNativeRuntime()) {
+    void clearNativeAuthSession().catch(() => {});
+  }
+  setUnauthenticated(true);
+}
+
+function setUnauthenticated(initialized: boolean): void {
+  if (expirationTimer !== null) {
+    clearTimeout(expirationTimer);
+    expirationTimer = null;
+  }
+  authToken.set(null);
+  session.set({
+    authenticated: false,
+    initialized,
+    tokenSource: "none",
+    expiresAt: null,
+  });
+}
+
+function scheduleExpiration(expiresAt: number | null): void {
+  if (expirationTimer !== null) clearTimeout(expirationTimer);
+  expirationTimer = null;
+  if (!browser || expiresAt === null) return;
+  const remaining = expiresAt - Date.now();
+  if (remaining <= 0) {
+    setUnauthenticated(true);
+    return;
+  }
+  expirationTimer = setTimeout(() => setUnauthenticated(true), remaining);
+}

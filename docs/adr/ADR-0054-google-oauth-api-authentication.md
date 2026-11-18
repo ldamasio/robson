@@ -1,7 +1,12 @@
 # ADR-0054: Google OAuth (ID Token) API Authentication, replacing Bearer Token
 
 **Date:** 2026-09-10
-**Status:** Proposed
+**Status:** Superseded by ADR-0057 and ADR-0058
+
+> Direct Google ID-token authentication is no longer the RBX standard. Google
+> is an external IdP behind RBX Identity (ZITADEL); clients use Authorization
+> Code + PKCE or a BFF session, and `robsond` verifies RBX Identity access
+> tokens. See ADR-0057 and ADR-0058.
 
 ## Context
 
@@ -57,7 +62,7 @@ verification of Google-issued ID tokens**. robsond issues no session of
 its own.
 
 1. **Verification (robsond, every request).** The `Authorization: Bearer
-   <token>` header must carry a Google ID token (a JWT). robsond:
+<token>` header must carry a Google ID token (a JWT). robsond:
    - Fetches and caches Google's public signing keys from
      `https://www.googleapis.com/oauth2/v3/certs` (JWKS), refreshed
      periodically in the background and on-demand for an unrecognized
@@ -149,7 +154,7 @@ this ADR.
   `refresh_token` for the CLI) or the operator is logged out roughly
   hourly. This adds real client-side complexity that did not exist
   before.
-- **Still single-operator by design.** This is an auth *mechanism*
+- **Still single-operator by design.** This is an auth _mechanism_
   change, not a multi-tenancy change. Adding a second operator later
   means extending the allowlist (or replacing it with a real
   authorization model) — out of scope here.
@@ -246,7 +251,7 @@ this ADR.
   mode `0600`; `current_id_token()` transparently refreshes within ~5
   minutes of expiry.
 - `robson-cli/src/commands/auth.rs` — `robson auth login|status|logout|
-  print-token` (the last for scripting/curl use in runbooks).
+print-token` (the last for scripting/curl use in runbooks).
 - `robson-cli/src/commands/reconcile_close.rs`, `income.rs` — dropped
   `--token` / `env = "ROBSON_API_TOKEN"`; call `current_id_token()`,
   erroring with "run `robson auth login` first" when nothing is cached.

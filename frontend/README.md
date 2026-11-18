@@ -1,15 +1,16 @@
-# RBX Robson Frontend v2
+# RBX Robson Client
 
-SvelteKit static frontend for Robson v3. Dual-domain:
+SvelteKit frontend and Tauri 2 client for Robson v3. Dual-domain web build:
 `robson.rbx.ia.br` (pt-BR default) and `robson.rbxsystems.ch` (en default).
 
 ## Stack
 
 - SvelteKit 2 + `@sveltejs/adapter-static`
+- Tauri 2 for Android and desktop packaging
 - TypeScript strict
 - Custom design tokens from RBX Voltage System (no Tailwind)
 - `svelte-i18n` for locale handling
-- Auth.js for GitHub OAuth (to be wired in EP-003)
+- Google sign-in brokered by RBX Identity/ZITADEL (Authorization Code + PKCE)
 - Vitest + Playwright
 
 ## Quickstart
@@ -17,26 +18,45 @@ SvelteKit static frontend for Robson v3. Dual-domain:
 ```bash
 pnpm install
 cp .env.example .env.local
-# fill in AUTH_GITHUB_ID / AUTH_GITHUB_SECRET / AUTH_SECRET
+# fill in the real public RBX Identity client/project metadata
 pnpm dev
 ```
 
 ## Scripts
 
-| Command | Purpose |
-|---------|---------|
-| `pnpm dev` | Run dev server (http://localhost:5173) |
-| `pnpm build` | Build static output to `build/` |
-| `pnpm preview` | Preview production build |
-| `pnpm check` | Run TypeScript + svelte-check |
-| `pnpm test` | Run Vitest unit tests |
-| `pnpm test:e2e` | Run Playwright E2E tests |
-| `pnpm lint` | Run Prettier + ESLint |
+| Command                                              | Purpose                                 |
+| ---------------------------------------------------- | --------------------------------------- |
+| `pnpm dev`                                           | Run dev server (http://localhost:5173)  |
+| `pnpm build`                                         | Build static output to `build/`         |
+| `pnpm preview`                                       | Preview production build                |
+| `pnpm check`                                         | Run TypeScript + svelte-check           |
+| `pnpm test`                                          | Run Vitest unit tests                   |
+| `pnpm test:e2e`                                      | Run Playwright E2E tests                |
+| `pnpm lint`                                          | Run Prettier + ESLint                   |
+| `pnpm tauri:dev`                                     | Run the Tauri desktop development shell |
+| `pnpm tauri:android:init`                            | Generate the Android Studio project     |
+| `pnpm tauri:android:build -- --target aarch64 --apk` | Build an ARM64 Android APK              |
 
 ## Architecture
 
-See `docs/adr/ADR-0025`, `ADR-0026`, `ADR-0027` and
+See `docs/adr/ADR-0025`, `ADR-0026`, `ADR-0027`, `ADR-0057`, `ADR-0058` and
 `docs/implementation/FE-P1-FRONTEND-MVP.md`.
+
+## Authentication modes
+
+- Tauri owns the PKCE exchange, bearer token, REST requests, and SSE stream in
+  Rust. The access token is process-memory-only and never reaches Web Storage
+  or the WebView.
+- Browser `bff` mode uses a Secure, HttpOnly session cookie.
+- Browser `oidc` mode is an explicit static-hosting compatibility mode. It
+  keeps the ZITADEL access token in JavaScript memory only; a reload signs in
+  again through SSO.
+
+The ZITADEL organization must be configured Google-only, the client must have
+`accessTokenRoleAssertion=true`, and the authorize request is scoped to the
+real RBX organization and Robson project audience. See ADR-0058. The example
+files intentionally leave client/project/Google-IdP IDs blank when no
+repository-verified value exists.
 
 ## Brand
 
