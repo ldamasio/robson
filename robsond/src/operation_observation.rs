@@ -372,6 +372,15 @@ pub(crate) mod probe {
         pub(crate) fn dispatch(&self) -> tracing::Dispatch {
             self.dispatch.clone()
         }
+        /// Drop the probe after first releasing its captured Counts. A peer
+        /// test thread rebuilding callsite interest can briefly upgrade the
+        /// globally registered (weak) dispatcher, keeping this subscriber and
+        /// its Capture alive for an instant after the probe drops; clearing
+        /// the capture first means it no longer holds the observed origin, so
+        /// strong-count ownership checks see only the test's own reference.
+        pub(crate) fn release(self) {
+            self.latest.lock().unwrap().take();
+        }
         pub(crate) fn snapshot(&self) -> [u64; 9] {
             let guard = self.latest.lock().unwrap();
             let c = guard.as_ref().expect("real observation root");
