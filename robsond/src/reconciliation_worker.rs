@@ -11,7 +11,7 @@ use std::{
 
 use chrono::{DateTime, Datelike, Utc};
 use robson_domain::{
-    Event, OrderFillEvidence, Position, PositionId, PositionState, Price, Quantity,
+    OrderFillEvidence, Position, PositionId, PositionState, Price, Quantity,
     ReconciliationEvidence, Side, Symbol, UserTradeEvidence,
 };
 use robson_exec::{
@@ -44,6 +44,9 @@ use crate::{
 /// How long after a leg closes the orphan sweep keeps visiting its symbol.
 const CLOSED_LEG_SWEEP_WINDOW_HOURS: i64 = 24;
 
+#[cfg(test)]
+type HistoryWindow = (DateTime<Utc>, DateTime<Utc>, usize);
+
 /// Background worker that reconciles exchange state with Robson state.
 pub struct ReconciliationWorker<E: ExchangePort + 'static, S: Store + 'static> {
     exchange: Arc<E>,
@@ -64,15 +67,31 @@ pub struct ReconciliationWorker<E: ExchangePort + 'static, S: Store + 'static> {
     /// Where a test stops the UNTRACKED pass right after its claim attempt.
     #[cfg(test)]
     sweep_claim_pause: std::sync::Mutex<Option<Arc<TestPause>>>,
+    #[cfg(test)]
+    scan_test_pause: std::sync::Mutex<Option<(ScanTestPhase, Arc<TestPause>)>>,
+    #[cfg(test)]
+    recent_closed_window: std::sync::Mutex<Option<HistoryWindow>>,
 }
 
 /// A test's stop at one point of a scan: the scan says it got there, then
 /// waits to be let go.
 #[cfg(test)]
 #[derive(Default)]
-struct TestPause {
-    reached: tokio::sync::Notify,
-    resume: tokio::sync::Notify,
+pub(crate) struct TestPause {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanTestPhase {
+    AfterClose,
+    BeforeRiskSnapshot,
+    AfterRiskSnapshot,
+    AfterGuardSnapshot,
+    AfterWallet,
+    AfterMonth,
+    AfterNet,
 }
 
 #[derive(Debug, Clone)]
@@ -85,9 +104,9 @@ struct MissingObservation {
 }
 
 // ---------------------------------------------------------------------------
-// Free functions — evidence gathering helpers extracted from
-// ReconciliationWorker for reuse by the planned startup auto_reconcile path
-// (Slice 5B2B).
+// Free functions — evidence gathering helpers shared by ReconciliationWorker
+// and the current startup auto_reconcile path. Extraction originated in
+// Slice 5B2B; this is present reuse, not a pending implementation.
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn gather_real_evidence<E, S>(
@@ -398,6 +417,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             fresh_read_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             sweep_claim_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            scan_test_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            recent_closed_window: std::sync::Mutex::new(None),
         }
     }
 
@@ -437,6 +460,37 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         pause
     }
 
+    /// One test-owned stop around actual async scan work, consumed once.
+    #[cfg(test)]
+    pub(crate) fn test_pause_at(&self, phase: ScanTestPhase) -> Arc<TestPause> {
+        let pause = Arc::new(TestPause::default());
+        *self.scan_test_pause.lock().unwrap() = Some((phase, pause.clone()));
+        pause
+    }
+
+    /// Observe the actual history window; never substitutes the production
+    /// clock.
+    #[cfg(all(test, feature = "postgres"))]
+    pub(crate) fn test_recent_closed_window(&self) -> Option<HistoryWindow> {
+        *self.recent_closed_window.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    async fn test_scan_boundary(&self, phase: ScanTestPhase) {
+        let pause = {
+            let mut slot = self.scan_test_pause.lock().unwrap();
+            if slot.as_ref().is_some_and(|(target, _)| *target == phase) {
+                slot.take().map(|(_, pause)| pause)
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+    }
+
     /// Run the periodic reconciliation loop until shutdown.
     pub async fn run(self) -> DaemonResult<()> {
         let mut interval = tokio::time::interval(self.scan_interval);
@@ -468,7 +522,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     /// startup scan is part of the startup operation.
     pub async fn scan_and_reconcile(&self) -> DaemonResult<usize> {
         let journal = self.order_journal().await;
-        journal.with_permit(OperationKind::ReconciliationScan, self.scan_once()).await?
+        robson_exec::observation::reconciliation(async {
+            let result =
+                journal.with_permit(OperationKind::ReconciliationScan, self.scan_once()).await;
+            tracing::Span::current().record(
+                "outcome",
+                if matches!(&result, Ok(Ok(_))) {
+                    1_u64
+                } else {
+                    2_u64
+                },
+            );
+            result
+        })
+        .await?
     }
 
     async fn scan_once(&self) -> DaemonResult<usize> {
@@ -555,11 +622,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             return Err(error);
         }
 
-        if reconciled > 0 {
-            self.recalibrate_capital_base_after_manual_drift(reconciled).await?;
-        } else {
-            self.recalibrate_capital_base_after_pure_financial_drift().await?;
-        }
+        // A real close explains that position, not an unrelated wallet residual.
+        // Keep the existing guarded checksum for every successful scan; only
+        // independent typed accounting/month-boundary paths may change the basis.
+        self.recalibrate_capital_base_after_pure_financial_drift().await?;
 
         Ok(reconciled)
     }
@@ -977,6 +1043,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             months.push(since);
         }
 
+        #[cfg(test)]
+        {
+            *self.recent_closed_window.lock().unwrap() = Some((now, since, months.len()));
+        }
         let manager = self.position_manager.read().await;
         let mut symbols = HashSet::new();
         for month in months {
@@ -1068,6 +1138,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                     let manager = self.position_manager.read().await;
                     manager.reconcile_close(input).await?
                 };
+                #[cfg(test)]
+                self.test_scan_boundary(ScanTestPhase::AfterClose).await;
 
                 match outcome {
                     ReconcileCloseOutcome::Closed | ReconcileCloseOutcome::AlreadyTerminal => {
@@ -1302,30 +1374,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         }
     }
 
-    async fn recalibrate_capital_base_after_manual_drift(
-        &self,
-        reconciled_positions: usize,
-    ) -> DaemonResult<()> {
-        self.recalibrate_capital_base(
-            format!("reconciliation_worker:positions_reconciled={reconciled_positions}"),
-            Some(reconciled_positions),
-        )
-        .await
-    }
-
-    /// Pure-financial-drift check (ADR-0045 §2). No longer writes
-    /// `capital_base` itself — it only alarms. `income_ledger.rs`'s
-    /// `IncomeLedgerWorker::recalibrate_from_confirmed_transfers` is the
-    /// only remaining path that may write, and only when the ledger
-    /// explains the delta as 100% matched `TRANSFER` items with zero other
-    /// unmatched items in the same window. This function still runs (same
-    /// `in_flight_count` guard, unchanged) so the alarm continues even
-    /// while the ledger worker independently confirms or fails to confirm
-    /// the same delta.
+    /// Guarded account checksum (ADR-0045 §2): alarms without writing a basis.
+    /// Independent typed-income validation remains responsible for its own
+    /// evidence, current-state and single-use accounting requirements.
     async fn recalibrate_capital_base_after_pure_financial_drift(&self) -> DaemonResult<()> {
         let now = Utc::now();
+        #[cfg(test)]
+        self.test_scan_boundary(ScanTestPhase::BeforeRiskSnapshot).await;
         let risk_open = self.live_risk_open_positions().await?;
+        #[cfg(test)]
+        self.test_scan_boundary(ScanTestPhase::AfterRiskSnapshot).await;
         let all_open = self.store.positions().find_active().await?;
+        #[cfg(test)]
+        self.test_scan_boundary(ScanTestPhase::AfterGuardSnapshot).await;
         let armed_count = all_open
             .iter()
             .filter(|position| matches!(position.state, PositionState::Armed))
@@ -1354,14 +1415,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         }
 
         let wallet_balance = self.exchange.get_futures_balance().await?.wallet_balance;
+        #[cfg(test)]
+        self.test_scan_boundary(ScanTestPhase::AfterWallet).await;
         let previous_capital_base = {
             let manager = self.position_manager.read().await;
             manager.load_monthly_state(now).await?.capital_base
         };
+        #[cfg(test)]
+        self.test_scan_boundary(ScanTestPhase::AfterMonth).await;
         let robson_month_net: Decimal = {
             let manager = self.position_manager.read().await;
             manager.robson_month_net(now).await?
         };
+        #[cfg(test)]
+        self.test_scan_boundary(ScanTestPhase::AfterNet).await;
         let expected_wallet_balance = previous_capital_base + robson_month_net;
         let unexplained_delta = wallet_balance - expected_wallet_balance;
 
@@ -1370,11 +1437,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         }
 
         // ADR-0045 §2: an unattributed residual is an alarm, never a write.
-        // This used to call self.recalibrate_capital_base(...) here directly
-        // — that write is now gated behind the typed income ledger
-        // confirming the delta is 100% TRANSFER (income_ledger.rs). This
-        // path only alarms so the operator always sees the drift even on
-        // cycles where the ledger worker hasn't run yet or can't confirm it.
+        // Position reconciliation cannot attribute an unrelated residual.
+        // Independent income reconciliation checks typed evidence; its remaining
+        // accounting limitations are not repaired by this alarm-only checksum.
         warn!(
             %wallet_balance,
             %expected_wallet_balance,
@@ -1391,136 +1456,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     async fn live_risk_open_positions(&self) -> DaemonResult<Vec<Position>> {
         let manager = self.position_manager.read().await;
         manager.live_risk_open_positions().await
-    }
-
-    async fn recalibrate_capital_base(
-        &self,
-        evidence: String,
-        reconciled_positions: Option<usize>,
-    ) -> DaemonResult<()> {
-        let now = Utc::now();
-        let wallet_balance = self.exchange.get_futures_balance().await?.wallet_balance;
-        let monthly = {
-            let manager = self.position_manager.read().await;
-            manager.load_monthly_state(now).await?
-        };
-        let previous_capital_base = monthly.capital_base;
-
-        let carried_risk_committed =
-            Self::calculate_committed_carried_risk(&self.live_risk_open_positions().await?);
-        let armed_count = self
-            .store
-            .positions()
-            .find_active()
-            .await?
-            .iter()
-            .filter(|position| matches!(position.state, PositionState::Armed))
-            .count() as u32;
-        let armed_risk = previous_capital_base * Decimal::new(1, 2) * Decimal::from(armed_count);
-        let carried_risk = carried_risk_committed + armed_risk;
-
-        // Recalibration must absorb ONLY out-of-band drift (deposits,
-        // withdrawals, manual trades). Governed month results already live in
-        // monthly_state.realized_loss and slot accounting; folding them into
-        // the base double-counts every governed loss (2026-07-03: the first
-        // insurance-stop fill was absorbed as "manual drift" and the slot
-        // gauge showed 4 free after a 1% loss). Back the month's net result
-        // out of the wallet before deriving the base.
-        let robson_month_net: Decimal = {
-            let manager = self.position_manager.read().await;
-            manager.robson_month_net(now).await?
-        };
-        let new_capital_base =
-            (wallet_balance - robson_month_net - carried_risk).max(Decimal::ZERO);
-
-        if new_capital_base == previous_capital_base {
-            info!(
-                %previous_capital_base,
-                %wallet_balance,
-                %carried_risk,
-                ?reconciled_positions,
-                "Capital base recalibration skipped: value unchanged after reconciliation"
-            );
-            return Ok(());
-        }
-
-        if !monthly
-            .budget_model
-            .allows_capital_base_change(previous_capital_base, new_capital_base)
-        {
-            // ADR-0051 §1: manual drift may only shrink the basis intra-month
-            // under net-from-start; an increase waits for the month boundary.
-            info!(
-                %previous_capital_base,
-                %new_capital_base,
-                %wallet_balance,
-                model = %monthly.budget_model.as_str(),
-                ?reconciled_positions,
-                "Capital base increase withheld after manual account drift: non-expanding monthly budget basis"
-            );
-            return Ok(());
-        }
-
-        info!(
-            %previous_capital_base,
-            %new_capital_base,
-            %wallet_balance,
-            %carried_risk,
-            ?reconciled_positions,
-            "Capital base recalibrated after manual account drift"
-        );
-
-        let event = Event::CapitalBaseRecalibrated {
-            previous_capital_base,
-            new_capital_base,
-            wallet_balance,
-            carried_risk,
-            reason: "manual_account_change".to_string(),
-            evidence,
-            month: now.month(),
-            year: now.year(),
-            timestamp: now,
-        };
-
-        let manager = self.position_manager.read().await;
-        manager.emit_domain_event(event).await?;
-
-        Ok(())
-    }
-
-    fn calculate_committed_carried_risk(positions: &[Position]) -> Decimal {
-        positions
-            .iter()
-            .filter_map(|position| {
-                let qty = position.quantity.as_decimal();
-                if qty == Decimal::ZERO {
-                    return None;
-                }
-
-                let (entry, stop) = match &position.state {
-                    PositionState::Active { trailing_stop, .. } => {
-                        (position.entry_price?.as_decimal(), trailing_stop.as_decimal())
-                    },
-                    PositionState::Entering { expected_entry, .. } => {
-                        let entry = expected_entry.as_decimal();
-                        let stop = position
-                            .tech_stop_distance
-                            .as_ref()
-                            .map(|tech_stop| tech_stop.initial_stop.as_decimal())
-                            .unwrap_or(entry);
-                        (entry, stop)
-                    },
-                    _ => return None,
-                };
-
-                let risk = match position.side {
-                    Side::Long => (entry - stop) * qty,
-                    Side::Short => (stop - entry) * qty,
-                };
-
-                Some(risk.max(Decimal::ZERO))
-            })
-            .sum()
     }
 }
 
@@ -1558,6 +1493,9 @@ mod tests {
 
     use super::*;
     use crate::query_engine::TracingQueryRecorder;
+
+    include!("reconciliation_worker/financial_basis_tests.rs");
+    include!("reconciliation_worker/financial_count_tests.rs");
 
     /// A worker whose manager writes to a scripted journal.
     fn journaled_worker(
@@ -1840,11 +1778,11 @@ mod tests {
         // ADR-0045 §2 (income-ledger mission, robson-income-ledger): this
         // path used to write capital_base directly from an unattributed
         // scalar residual. It no longer does — an unexplained residual is
-        // an alarm only. The only remaining auto-write path is
-        // `income_ledger::IncomeLedgerWorker::recalibrate_from_confirmed_transfers`,
-        // gated on the typed ledger explaining the delta as 100% matched
-        // TRANSFER with zero other unmatched items (tested separately,
-        // against a real Postgres, in the income_ledger integration suite).
+        // an alarm only. The ledger writer for this pure-financial-drift path
+        // requires matched TRANSFER evidence (tested separately against PG).
+        // The position scan now reaches this checksum after every successful
+        // scan; its former total-based writer has been removed. This test does
+        // not establish the separate typed-income accounting requirements.
         let exchange = Arc::new(StubExchange::new(dec!(100)));
         let store = Arc::new(MemoryStore::new());
         let event_bus = Arc::new(EventBus::new(16));
@@ -4657,25 +4595,14 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // TD-2026-05-05-001 — Stale-Active drift baseline canary (Slice 0).
-    //
-    // Documents the *current, buggy* behavior of the asymmetric reconciliation
-    // loop: when a position is `Active` in Robson's store but absent on the
-    // exchange, today's worker is a no-op. It does not detect the drift, does
-    // not emit any event, and does not transition the local state.
-    //
-    // This test pins that observation. When Slice 4 lands the symmetric loop
-    // and `reconcile_close`, the post-condition assertions in this test are
-    // expected to fail; they will be inverted as part of that slice (the
-    // position MUST then be `Closed` and a `CorePositionClosed` event MUST be
-    // observed). Until then, the test passing is the diagnostic — not the
-    // green check mark.
-    //
-    // See:
-    //   - docs/implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md
-    //   - docs/analysis/2026-05-08-lifecycle-drift-repro.md
-    //   - docs/technical-debt.md  (TD-2026-05-05-001)
-    //   - docs/policies/UNTRACKED-POSITION-RECONCILIATION.md  (I3, pending)
+    // First-observation grace for an Active position missing from the exchange.
+    // The reverse store check exists: this single scan records the first missing
+    // observation and returns before grace/evidence-based close handling.
+    // It retains Active and emits no domain event on this first observation.
+    // These assertions do not establish eventual reconciliation, settlement,
+    // or the absence of a reverse check. The test name is retained historically.
+    // Historical context: TD-2026-05-05-001 and the lifecycle-drift analysis;
+    // they are not claims that the current reverse loop is unimplemented.
     // -------------------------------------------------------------------------
     #[tokio::test]
     async fn test_reconciliation_does_not_close_active_missing_on_exchange() {
@@ -4700,17 +4627,15 @@ mod tests {
 
         let reconciled = worker.scan_and_reconcile().await.unwrap();
 
-        // Current behavior: the worker only walks `exchange.get_all_open_positions()`.
-        // Empty list → zero iterations → no UNTRACKED action and, critically,
-        // no reverse check against `store.find_active()`. Reconciled count is 0.
+        // The reverse check records this first missing observation. Grace and
+        // evidence handling have not completed a reconciliation in this scan.
         assert_eq!(
             reconciled, 0,
-            "baseline canary: today's asymmetric loop reports 0 even when \
-             a stale Active exists locally"
+            "first observation records missing Active without completing a reconciliation"
         );
 
-        // The Robson store is unchanged — the position is still Active.
-        // This is the bug. Slice 4 will flip this assertion.
+        // First-observation grace preserves the local Active state; this is
+        // not an assertion about the outcome of later scans.
         let still_active = store
             .positions()
             .find_by_id(position_id)
@@ -4719,17 +4644,14 @@ mod tests {
             .expect("position must still exist in store");
         assert!(
             matches!(still_active.state, PositionState::Active { .. }),
-            "baseline canary: stale Active is NOT transitioned to Closed today \
-             (TD-2026-05-05-001)"
+            "first observation must retain Active until grace and evidence checks complete"
         );
 
-        // No domain event was emitted: no PositionClosed, no CorePositionClosed,
-        // no RoguePositionDetected, no SafetyExitExecuted, no
-        // ReconciliationStaleNonActiveDetected. The drift is silent.
+        // The first observation logs a debug diagnostic but emits no domain
+        // event here. This does not establish silence on subsequent scans.
         assert!(
             receiver.try_recv().is_none(),
-            "baseline canary: no event emitted today for Robson-Active / \
-             exchange-missing drift"
+            "first observation must not emit a domain close or stale-state event"
         );
     }
 }

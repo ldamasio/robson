@@ -9,6 +9,7 @@
 use robson_eventlog::EventEnvelope;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
+use tracing::Instrument as _;
 
 use crate::{
     error::{ProjectionError, Result},
@@ -55,6 +56,7 @@ pub(crate) async fn handle_position_opened(pool: &PgPool, envelope: &EventEnvelo
     )
     .bind(payload.position_id)
     .fetch_optional(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     if let Some(seq) = existing {
@@ -111,6 +113,7 @@ pub(crate) async fn handle_position_opened(pool: &PgPool, envelope: &EventEnvelo
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())
@@ -145,6 +148,7 @@ pub(crate) async fn handle_position_closed(pool: &PgPool, envelope: &EventEnvelo
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())
@@ -227,6 +231,7 @@ pub(crate) async fn handle_entry_order_placed(
     )
     .bind(payload.position_id)
     .fetch_optional(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?
     else {
         return Err(ProjectionError::InvariantViolated {
@@ -266,6 +271,7 @@ pub(crate) async fn handle_entry_order_placed(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())
@@ -293,6 +299,7 @@ pub(crate) async fn handle_entry_order_requested(
     )
     .bind(payload.position_id)
     .fetch_optional(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?
     else {
         return Err(ProjectionError::InvariantViolated {
@@ -306,7 +313,13 @@ pub(crate) async fn handle_entry_order_requested(
         return Ok(());
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool
+        .begin()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+        )
+        .await?;
+    let mut rollback_observation = RollbackObservation::new();
 
     // EntryOrderRequested is the projection home for the local order row.
     // Create it before setting positions_current.entry_order_id so the FK is valid.
@@ -348,6 +361,7 @@ pub(crate) async fn handle_entry_order_requested(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     // Audit-only for position state: record entry data, do NOT set state =
@@ -376,9 +390,15 @@ pub(crate) async fn handle_entry_order_requested(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
-    tx.commit().await?;
+    tx.commit()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+        )
+        .await?;
+    rollback_observation.disarm();
     Ok(())
 }
 
@@ -395,17 +415,20 @@ pub(crate) async fn handle_entry_order_accepted(
             }
         })?;
 
-    let Some((last_seq, technical_stop_price, technical_stop_distance)) =
-        sqlx::query_as::<_, (i64, Option<Decimal>, Option<Decimal>)>(
-            r#"
+    let Some((last_seq, technical_stop_price, technical_stop_distance)) = sqlx::query_as::<
+        _,
+        (i64, Option<Decimal>, Option<Decimal>),
+    >(
+        r#"
             SELECT last_seq, technical_stop_price, technical_stop_distance
             FROM positions_current
             WHERE position_id = $1
             "#,
-        )
-        .bind(payload.position_id)
-        .fetch_optional(pool)
-        .await?
+    )
+    .bind(payload.position_id)
+    .fetch_optional(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
+    .await?
     else {
         return Err(ProjectionError::InvariantViolated {
             event_type: "entry_order_accepted".to_string(),
@@ -420,7 +443,13 @@ pub(crate) async fn handle_entry_order_accepted(
 
     validate_entry_accepted_technical_stop(technical_stop_price, technical_stop_distance)?;
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool
+        .begin()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+        )
+        .await?;
+    let mut rollback_observation = RollbackObservation::new();
 
     // Upsert the order row so positions_current.entry_order_id remains a valid FK
     // and accepted-but-not-filled entries can be reconstructed after restart.
@@ -465,6 +494,7 @@ pub(crate) async fn handle_entry_order_accepted(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     sqlx::query(
@@ -492,9 +522,15 @@ pub(crate) async fn handle_entry_order_accepted(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
-    tx.commit().await?;
+    tx.commit()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+        )
+        .await?;
+    rollback_observation.disarm();
     Ok(())
 }
 
@@ -520,6 +556,7 @@ pub(crate) async fn handle_entry_order_failed(
     )
     .bind(payload.position_id)
     .fetch_optional(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?
     else {
         return Err(ProjectionError::InvariantViolated {
@@ -533,7 +570,13 @@ pub(crate) async fn handle_entry_order_failed(
         return Ok(());
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool
+        .begin()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+        )
+        .await?;
+    let mut rollback_observation = RollbackObservation::new();
 
     sqlx::query(
         r#"
@@ -551,6 +594,7 @@ pub(crate) async fn handle_entry_order_failed(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     // Audit-only for position state: update last_event_id/seq, no state change.
@@ -569,9 +613,15 @@ pub(crate) async fn handle_entry_order_failed(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
-    tx.commit().await?;
+    tx.commit()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+        )
+        .await?;
+    rollback_observation.disarm();
     Ok(())
 }
 
@@ -595,6 +645,7 @@ pub(crate) async fn handle_entry_execution_rejected(
     )
     .bind(payload.position_id)
     .fetch_optional(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?
     else {
         return Err(ProjectionError::InvariantViolated {
@@ -608,7 +659,13 @@ pub(crate) async fn handle_entry_execution_rejected(
         return Ok(());
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool
+        .begin()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+        )
+        .await?;
+    let mut rollback_observation = RollbackObservation::new();
 
     sqlx::query(
         r#"
@@ -626,6 +683,7 @@ pub(crate) async fn handle_entry_execution_rejected(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     sqlx::query(
@@ -644,9 +702,15 @@ pub(crate) async fn handle_entry_execution_rejected(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
-    tx.commit().await?;
+    tx.commit()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+        )
+        .await?;
+    rollback_observation.disarm();
     Ok(())
 }
 
@@ -706,6 +770,7 @@ pub(crate) async fn handle_entry_filled(pool: &PgPool, envelope: &EventEnvelope)
     .bind(envelope.occurred_at)
     .bind(payload.filled_quantity)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())
@@ -775,6 +840,7 @@ pub(crate) async fn handle_entry_signal_received(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     tracing::debug!(
@@ -828,6 +894,7 @@ pub(crate) async fn handle_trailing_stop_updated(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())
@@ -867,6 +934,7 @@ pub(crate) async fn handle_favorable_extreme_advanced(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())
@@ -909,6 +977,7 @@ pub(crate) async fn handle_insurance_stop_linked(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())
@@ -945,6 +1014,7 @@ pub(crate) async fn handle_insurance_stop_cleared(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())
@@ -979,6 +1049,7 @@ pub(crate) async fn handle_exit_triggered(pool: &PgPool, envelope: &EventEnvelop
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())
@@ -996,7 +1067,13 @@ pub(crate) async fn handle_exit_order_placed(
             }
         })?;
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool
+        .begin()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+        )
+        .await?;
+    let mut rollback_observation = RollbackObservation::new();
 
     // Upsert the exit order into orders_current first so the FK
     // positions_current.exit_order_id → orders_current is satisfied.
@@ -1036,6 +1113,7 @@ pub(crate) async fn handle_exit_order_placed(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     sqlx::query(
@@ -1058,9 +1136,15 @@ pub(crate) async fn handle_exit_order_placed(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
-    tx.commit().await?;
+    tx.commit()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+        )
+        .await?;
+    rollback_observation.disarm();
     Ok(())
 }
 
@@ -1092,6 +1176,7 @@ pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelop
     )
     .bind(payload.position_id)
     .fetch_optional(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     if let Some(seq) = existing {
@@ -1143,9 +1228,36 @@ pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelop
     .bind(envelope.seq)
     .bind(payload.timestamp)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())
+}
+
+
+// The public SQLx Transaction Drop queues rollback while open. This only counts
+// that application cleanup request; it never claims server acknowledgement.
+struct RollbackObservation {
+    origin: tracing::Span,
+    armed: bool,
+}
+impl RollbackObservation {
+    fn new() -> Self {
+        Self {
+            origin: tracing::Span::current(),
+            armed: true,
+        }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for RollbackObservation {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::info_span!(target: "robson_operation", parent: &self.origin, "operation_io", io_kind = 4_u64).in_scope(|| {});
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1215,6 +1327,7 @@ pub(crate) async fn handle_position_disarmed(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())
@@ -1253,6 +1366,7 @@ pub(crate) async fn handle_exit_filled(pool: &PgPool, envelope: &EventEnvelope) 
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())
@@ -1301,6 +1415,7 @@ pub(crate) async fn handle_position_closed_domain(
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())
@@ -1337,6 +1452,7 @@ pub(crate) async fn handle_entry_policy_resolved(
     .bind(envelope.occurred_at)
     .bind(payload.position_id)
     .execute(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     Ok(())

@@ -1,13 +1,14 @@
 //! Typed income-ledger reconciliation (ADR-0045 §1/§2).
 //!
 //! Polls the exchange's typed income stream, ingests each item idempotently,
-//! and matches it against governed state. An unexplained residual becomes a
-//! named, persistent alarm — never an automatic write to `capital_base`.
-//! Only a residual the ledger explains as 100% `TRANSFER` may recalibrate
-//! automatically (ADR-0045 §2); this module is the *only* place that does
-//! so. `reconciliation_worker::recalibrate_capital_base_after_pure_financial_drift`
-//! no longer writes `capital_base` for the generic case — see its doc
-//! comment.
+//! and matches it against governed state. In this module, an unexplained
+//! residual becomes an alarm. Recalibration checks a matched `TRANSFER`
+//! aggregate and idle-book snapshots; these are not atomic current-state or
+//! single-use evidence guarantees. The separate pure-financial-drift check
+//! only alarms after every successful position scan; that scan's wallet-total
+//! writer has been removed in source. Accepting that scoped repair does not
+//! complete the independent typed route's accounting requirements before Spot
+//! capital acceptance; unexplained adjustments remain prohibited.
 //!
 //! # Matching limitation (documented, not silent)
 //!
@@ -17,8 +18,8 @@
 //! `positions_current` or in `event_log` payloads for ordinary (non
 //! reconciled-close) fills, so exact id-level matching is not available yet.
 //! This module matches `REALIZED_PNL`/`COMMISSION` by (symbol, time
-//! proximity to `entry_filled_at`/`closed_at`) instead — a coarser but safe
-//! substitute: if more than one position falls inside the window, the item
+//! proximity to `entry_filled_at`/`closed_at`) instead — a coarser heuristic:
+//! if more than one position falls inside the window, the item
 //! is left unmatched (alarm) rather than guessed, mirroring the "ambiguous
 //! evidence -> don't act" discipline `gather_user_trade_evidence` already
 //! uses in `reconciliation_worker.rs`. The raw `trade_id`/`tran_id` is
@@ -26,9 +27,10 @@
 //! matcher (once exact linkage is persisted) can use it without re-ingesting
 //! history.
 //!
-//! `FUNDING_FEE` never links to a governed fill by construction (it is a
-//! cost of holding, not a robsond-authored action) — it is always recognized
-//! and folded into `expected_wallet_balance`, never alarmed.
+//! `FUNDING_FEE` is marked matched without a governed-fill link. That is
+//! recognition only: `expected_wallet_balance` uses the basis plus governed
+//! closed-position P&L/fees and does not include funding. Funding can therefore
+//! remain in the wallet residual; wallet-accounting integration is pending.
 
 use std::{sync::Arc, time::Duration};
 
@@ -99,6 +101,18 @@ pub enum AcknowledgeIncomeOutcome {
     NotFound,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IncomeTestOutcome {
+    Guarded,
+    Balanced,
+    Unexplained,
+    Unchanged,
+    PolicyRefused,
+    Applied,
+    Error,
+}
+
 pub struct IncomeLedgerWorker<E: ExchangePort + IncomePort + 'static, S: Store + 'static> {
     exchange: Arc<E>,
     position_manager: Arc<RwLock<PositionManager<E, S>>>,
@@ -107,6 +121,8 @@ pub struct IncomeLedgerWorker<E: ExchangePort + IncomePort + 'static, S: Store +
     event_bus: Arc<EventBus>,
     poll_interval: Duration,
     shutdown_token: CancellationToken,
+    #[cfg(test)]
+    test_outcome: Arc<std::sync::Mutex<Option<IncomeTestOutcome>>>,
 }
 
 impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWorker<E, S> {
@@ -127,7 +143,19 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
             event_bus,
             poll_interval,
             shutdown_token,
+            #[cfg(test)]
+            test_outcome: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_outcome(&self) -> Arc<std::sync::Mutex<Option<IncomeTestOutcome>>> {
+        self.test_outcome.clone()
+    }
+
+    #[cfg(test)]
+    fn test_record_outcome(&self, outcome: IncomeTestOutcome) {
+        *self.test_outcome.lock().unwrap() = Some(outcome);
     }
 
     /// Run the periodic poll→ingest→match loop until shutdown.
@@ -191,6 +219,8 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
         }
 
         if let Err(error) = self.recalibrate_from_confirmed_transfers().await {
+            #[cfg(test)]
+            self.test_record_outcome(IncomeTestOutcome::Error);
             warn!(%error, "Transfer-confirmed recalibration check failed this cycle");
         }
 
@@ -202,13 +232,15 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
         })
     }
 
-    /// The only remaining path that may write `capital_base` automatically
-    /// (ADR-0045 §2): the pure-financial-drift check now requires the ledger
-    /// to explain the wallet delta as 100% matched `TRANSFER` items, with
-    /// zero other unmatched items in the same window. Everything else is an
-    /// alarm, never a write — see
-    /// `reconciliation_worker::recalibrate_capital_base_after_pure_financial_drift`,
-    /// which no longer performs the write itself.
+    /// Automatic recalibration for the pure-financial-drift ledger path
+    /// (ADR-0045 §2): checks a matched `TRANSFER` aggregate, no other unmatched
+    /// items and idle-book snapshots. Its separate drift check only alarms.
+    /// Atomic validation against current persisted state and single-use
+    /// transfer attribution remain pending; these per-call checks do not
+    /// prove either. The position scan's total-based writer has been
+    /// removed in source. Validating that removal does not establish
+    /// complete typed reconciliation or waive this method's outstanding
+    /// accounting requirements.
     async fn recalibrate_from_confirmed_transfers(&self) -> DaemonResult<()> {
         let now = Utc::now();
         let manager = self.position_manager.read().await;
@@ -225,6 +257,8 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
             .count();
 
         if !risk_open.is_empty() || armed_count > 0 || in_flight_count > 0 {
+            #[cfg(test)]
+            self.test_record_outcome(IncomeTestOutcome::Guarded);
             return Ok(());
         }
 
@@ -236,13 +270,15 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
         let unexplained_delta = wallet_balance - expected_wallet_balance;
 
         if unexplained_delta.abs() <= financial_drift_tolerance() {
+            #[cfg(test)]
+            self.test_record_outcome(IncomeTestOutcome::Balanced);
             return Ok(());
         }
 
-        // Window: since the position manager's own capital_base was last
-        // set. Using month-start as a bound is sufficient here because
-        // recalibration only ever runs when the book is fully idle
-        // (checked above) — there is no in-progress month boundary race.
+        // The current query re-sums matched transfers since month start without
+        // consumption. Idle-book prechecks do not make this aggregate a fresh
+        // independent explanation, nor make state validation atomic across
+        // awaits. Both limitations remain required pre-Spot correction work.
         let month_start = DateTime::<Utc>::from_naive_utc_and_offset(
             chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
                 .expect("valid calendar month")
@@ -260,6 +296,8 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
         .await?;
 
         let Some(matched_transfer_sum) = explanation else {
+            #[cfg(test)]
+            self.test_record_outcome(IncomeTestOutcome::Unexplained);
             debug!(
                 %unexplained_delta,
                 "Financial drift not fully explained by matched TRANSFER items — no write"
@@ -272,12 +310,16 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
             (wallet_balance - robson_month_net - carried_risk).max(Decimal::ZERO);
 
         if new_capital_base == previous_capital_base {
+            #[cfg(test)]
+            self.test_record_outcome(IncomeTestOutcome::Unchanged);
             return Ok(());
         }
         if !monthly
             .budget_model
             .allows_capital_base_change(previous_capital_base, new_capital_base)
         {
+            #[cfg(test)]
+            self.test_record_outcome(IncomeTestOutcome::PolicyRefused);
             // ADR-0051 §1: a confirmed deposit must not expand the current
             // month's 4% budget. The money is in the wallet and in margin;
             // the basis follows at the next month boundary.
@@ -315,6 +357,8 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
 
         self.event_bus.send(DaemonEvent::DomainEvent(event.clone()));
         manager.emit_domain_event(event).await?;
+        #[cfg(test)]
+        self.test_record_outcome(IncomeTestOutcome::Applied);
 
         Ok(())
     }
@@ -634,13 +678,14 @@ pub async fn acknowledge_income_item(
     }
 }
 
-/// Whether the ledger explains `unexplained_delta` as 100% matched
-/// `TRANSFER` items since `since`, with zero other unmatched items in the
-/// same window. Acknowledged items remain unmatched for this safety check:
-/// acknowledgement silences an alarm but does not become accounting
-/// evidence. Returns `Some(matched_transfer_sum)` only when both hold —
-/// `None` means "do not recalibrate" (ADR-0045 §2: never write from a
-/// partially- or un-attributed residual).
+/// Checks aggregate matched `TRANSFER` equality since `since`, within
+/// tolerance, and absence of unmatched items in that window. It does not
+/// consume rows or bind them to one recalibration: `Some` is no independent
+/// single-use evidence or atomic persistence grant. Acknowledgement leaves
+/// items unmatched; it does not turn alarming state into accounting evidence.
+/// `None` refuses this check. Non-reusable attribution and current-state
+/// validation remain pending under ADR-0045's unchanged prohibition on
+/// unexplained adjustments.
 pub async fn transfer_explains_delta(
     pool: &PgPool,
     since: DateTime<Utc>,

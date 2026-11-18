@@ -1,8 +1,8 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { browser } from '$app/environment';
-  // ADR-0054: dynamic, not static, public env — see robson.ts for why.
-  import { env } from '$env/dynamic/public';
+  import { browser } from '$app/env';
+  // ADR-0054: optional dynamic public values are declared in src/env.ts.
+  import * as env from '$app/env/public';
   import type { Snippet } from 'svelte';
   import NavBar from '$design/components/NavBar.svelte';
   import RiskDisclaimer from '$design/components/RiskDisclaimer.svelte';

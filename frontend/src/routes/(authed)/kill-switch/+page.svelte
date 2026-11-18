@@ -5,7 +5,7 @@
   import { robsonApi, type MonthlyHaltStatus, type StatusResponse, type ApiError } from '$api/robson';
   import { haltStatus } from '$stores/slots';
   import { _ } from 'svelte-i18n';
-  import { positionLabel, positionStateLabel } from '$lib/presentation/labels';
+  import { positionLabel, positionStateLabel } from '#lib/presentation/labels.ts';
 
   type PageState = 'loading' | 'active' | 'halted' | 'error';
 

@@ -3,7 +3,7 @@ import {
   budgetModelKind,
   deriveBudgetView,
   MONTHLY_BUDGET_LIMIT_PCT,
-} from "$lib/presentation/budget";
+} from "#lib/presentation/budget.ts";
 import type { StatusResponse } from "$api/robson";
 
 function makeStatus(overrides: Partial<StatusResponse> = {}): StatusResponse {

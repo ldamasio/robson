@@ -17,6 +17,7 @@ use chrono::{DateTime, Datelike, Utc};
 use robson_eventlog::EventEnvelope;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
+use tracing::Instrument as _;
 
 use crate::{
     error::{ProjectionError, Result},
@@ -80,6 +81,9 @@ pub(crate) async fn handle_month_boundary_reset(
         .bind(payload.carried_positions_risk)
         .bind(payload.timestamp)
         .execute(pool)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await?;
 
     Ok(())
@@ -127,6 +131,9 @@ pub(crate) async fn handle_capital_base_recalibrated(
         .bind(payload.carried_risk)
         .bind(payload.timestamp)
         .execute(pool)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await?;
 
     Ok(())
@@ -161,14 +168,26 @@ async fn add_to_month_counters(
         .bind(trades_opened)
         .bind(realized_loss)
         .execute(pool)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await?;
     if updated.rows_affected() > 0 {
         return Ok(());
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = pool
+        .begin()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+        )
+        .await?;
+    let mut rollback_observation = RollbackObservation::new();
     sqlx::query("LOCK TABLE monthly_state IN SHARE ROW EXCLUSIVE MODE")
         .execute(&mut *tx)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await?;
     sqlx::query(ADD)
         .bind(year)
@@ -176,8 +195,16 @@ async fn add_to_month_counters(
         .bind(trades_opened)
         .bind(realized_loss)
         .execute(&mut *tx)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await?;
-    tx.commit().await?;
+    tx.commit()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+        )
+        .await?;
+    rollback_observation.disarm();
 
     Ok(())
 }
@@ -222,4 +249,29 @@ pub(crate) async fn handle_position_closed_monthly(
     }
 
     add_to_month_counters(pool, envelope.occurred_at, 0, net.abs()).await
+}
+
+// The public SQLx Transaction Drop queues rollback while open. This only counts
+// that application cleanup request; it never claims server acknowledgement.
+struct RollbackObservation {
+    origin: tracing::Span,
+    armed: bool,
+}
+impl RollbackObservation {
+    fn new() -> Self {
+        Self {
+            origin: tracing::Span::current(),
+            armed: true,
+        }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for RollbackObservation {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::info_span!(target: "robson_operation", parent: &self.origin, "operation_io", io_kind = 4_u64).in_scope(|| {});
+        }
+    }
 }

@@ -246,10 +246,10 @@ test.describe("Dashboard", () => {
     await routeHealthyDashboard(page);
     await page.route("**/events/history?date=*", (route) =>
       route.fulfill({
-        status: 401,
+        status: 503,
         contentType: "application/json",
         body: JSON.stringify({
-          error: "Missing or invalid Authorization header",
+          error: "Event history temporarily unavailable",
         }),
       }),
     );
@@ -259,7 +259,9 @@ test.describe("Dashboard", () => {
     await expect(page.getByRole("alert")).toContainText(
       "Today's events could not be loaded.",
     );
-    await expect(page.getByRole("alert")).toContainText("401 Unauthorized");
+    await expect(page.getByRole("alert")).toContainText(
+      "503 Service Unavailable",
+    );
     await expect(page.getByText("No events today.")).toHaveCount(0);
   });
 

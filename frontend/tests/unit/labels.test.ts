@@ -10,7 +10,7 @@ import {
   trailingStopMoveTarget,
   trailingLadderRung,
   stopMethodDetail
-} from '$lib/presentation/labels';
+} from '#lib/presentation/labels.ts';
 import type { Position, PositionState, SseEvent } from '$api/robson';
 
 function basePosition(overrides: Partial<Position> = {}): Position {

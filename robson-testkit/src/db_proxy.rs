@@ -68,6 +68,7 @@ struct Counters {
     commits: AtomicU64,
     commit_acks_dropped: AtomicU64,
     statements: AtomicU64,
+    prepared_statement_parses: AtomicU64,
 }
 
 struct Shared {
@@ -200,6 +201,13 @@ impl DbProxy {
         *self.shared.mode.borrow()
     }
 
+    /// Complete frontend Parse messages observed before forwarding, including
+    /// preparations rejected by PostgreSQL. Not successful preparations or
+    /// execution/operation attempts: cached execution can send no Parse.
+    pub fn prepared_statement_parses(&self) -> u64 {
+        self.shared.counters.prepared_statement_parses.load(Ordering::Relaxed)
+    }
+
     /// Counts so far.
     pub fn stats(&self) -> ProxyStats {
         let counters = &self.shared.counters;
@@ -287,6 +295,9 @@ async fn frontend_to_backend(
         let (tag, body) = read_message(&mut client).await?;
         if shared.blackholed() {
             continue;
+        }
+        if tag == b'P' {
+            shared.counters.prepared_statement_parses.fetch_add(1, Ordering::Relaxed);
         }
         if is_simple_query_commit(tag, &body) {
             shared.counters.commits.fetch_add(1, Ordering::Relaxed);

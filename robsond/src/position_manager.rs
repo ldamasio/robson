@@ -52,7 +52,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument as _};
 use uuid::Uuid;
 
 use crate::{
@@ -233,6 +233,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// The streams `persist_event_to_log` writes: their locks and which ones
     /// refuse appends (ADR-0056 step 7, PR P).
     event_streams: EventStreams,
+    #[cfg(test)]
+    risk_inventory_pause: std::sync::Mutex<Option<Arc<crate::reconciliation_worker::TestPause>>>,
     /// Optional postgres pool for persisting domain events to robson-eventlog.
     #[cfg(feature = "postgres")]
     event_log_pool: Option<PgPool>,
@@ -508,6 +510,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// already committed in the order/execution pipeline even before fill.
     pub(crate) async fn live_risk_open_positions(&self) -> DaemonResult<Vec<Position>> {
         let open_positions = self.store.positions().find_risk_open().await?;
+        #[cfg(test)]
+        {
+            let pause = self.risk_inventory_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
         let exchange_positions = match self.exchange_open_positions().await {
             Ok(positions) => Some(positions),
             Err(error) => {
@@ -532,6 +542,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 .collect(),
             None => open_positions,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pause_before_inventory(
+        &self,
+    ) -> Arc<crate::reconciliation_worker::TestPause> {
+        let pause = Arc::new(crate::reconciliation_worker::TestPause::default());
+        *self.risk_inventory_pause.lock().unwrap() = Some(pause.clone());
+        pause
     }
 
     /// Update the engine's capital from an external source (exchange balance).
@@ -634,6 +653,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         .bind(month.year() as i16)
         .bind(month.month() as i16)
         .fetch_optional(pool)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await?;
         Ok(base)
     }
@@ -676,6 +698,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         .bind(now.year())
         .bind(now.month() as i16)
         .fetch_optional(pool)
+        .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
         .await?;
 
         if let Some((
@@ -718,6 +741,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         .bind(now.year())
         .bind(now.month() as i16)
         .fetch_optional(pool)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await?;
         let inherited_model = inherited_stored_model
             .map(|stored_model| {
@@ -939,6 +965,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .bind(monthly.capital_base)
             .bind(equity_net)
             .execute(pool)
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+            )
             .await?;
         }
 
@@ -1065,6 +1094,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             shadow_slots_last: Mutex::new(None),
             latent_risk_warning_positions: RwLock::new(HashSet::new()),
             event_streams: EventStreams::default(),
+            #[cfg(test)]
+            risk_inventory_pause: std::sync::Mutex::new(None),
             #[cfg(feature = "postgres")]
             event_log_pool: None,
             #[cfg(feature = "postgres")]
@@ -1214,7 +1245,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let exchange = self.exchange();
         let requests = Arc::clone(&self.rules_refresh_requests);
         let symbol = symbol.clone();
-        tokio::spawn(async move {
+        tokio::spawn(robson_exec::observation::inherit_reconciliation(async move {
             if let Err(error) = exchange.trading_rules(&symbol).await {
                 warn!(symbol = %symbol.as_pair(), %error, "Trading-rules refresh failed");
             }
@@ -1223,7 +1254,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             {
                 request.in_flight = false;
             }
-        });
+        }));
     }
 
     /// The streams this manager writes (ADR-0056 step 7, PR P).
@@ -1435,6 +1466,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         )
         .bind(event_id)
         .fetch_one(pool)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await
         .map_err(|e| {
             (

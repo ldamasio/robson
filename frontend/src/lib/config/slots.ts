@@ -1,5 +1,5 @@
 import type { PositionState } from '$api/robson';
-import { isRenderableLivePosition } from '$lib/presentation/labels';
+import { isRenderableLivePosition } from '#lib/presentation/labels.ts';
 
 export type SlotCell = {
   index: number;

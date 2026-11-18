@@ -6,9 +6,9 @@ import {
   isPositionActive,
   eventSummaryText,
   eventTypeLabel,
-} from "$lib/presentation/labels";
-import { deriveSlots, occupiedCount } from "$lib/config/slots";
-import { formatTimeUtc, isTodayUtc } from "$lib/utils/time";
+} from "#lib/presentation/labels.ts";
+import { deriveSlots, occupiedCount } from "#lib/config/slots.ts";
+import { formatTimeUtc, isTodayUtc } from "#lib/utils/time.ts";
 import type {
   Position,
   PositionState,
