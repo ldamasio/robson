@@ -35,6 +35,7 @@
   } from "#lib/config/slots.ts";
   import { formatTimeUtc, isTodayUtc, utcDateKey } from "#lib/utils/time.ts";
   import { exclusiveMutation, mutationPending } from "$stores/mutation";
+  import { latestOnly } from "#lib/utils/latest.ts";
   import {
     deriveBudgetView,
     MONTHLY_BUDGET_LIMIT_PCT,
@@ -283,17 +284,25 @@
     }
   }
 
+  // Month changes can overlap: only the newest selection may publish its
+  // positions, totals or error, so a slow earlier month never shows under
+  // the current heading.
+  const historyRequests = latestOnly();
+
   async function loadHistory() {
+    const isCurrent = historyRequests.begin();
     historyError = null;
     monthlySlotCellsTotal = null;
     try {
       const response = await robsonApi.getMonthlyPositions(selectedMonth);
+      if (!isCurrent()) return;
       monthlyPositions = response.positions;
       const maybeTotal = Number(
         (response as { slot_cells_total?: unknown }).slot_cells_total,
       );
       monthlySlotCellsTotal = Number.isFinite(maybeTotal) ? maybeTotal : null;
     } catch (e) {
+      if (!isCurrent()) return;
       historyError =
         e instanceof Error ? e.message : "Failed to load month history";
     }
