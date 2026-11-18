@@ -18,7 +18,11 @@
   import { recentEvents, pushEvent, mergeEvents } from "$stores/events";
   import { toasts, showToast } from "$stores/toast";
   import { status as sharedStatus, refreshStatus } from "$stores/status";
-  import { STATUS_POLL_MS, shouldPollStatus } from "#lib/config/polling.ts";
+  import {
+    STATUS_POLL_MS,
+    dashboardStreamHandlers,
+    shouldPollStatus,
+  } from "#lib/config/polling.ts";
   import {
     sseFreshness,
     markSseEvent,
@@ -51,7 +55,6 @@
   let connected = $state(false);
   let closeSse: (() => void) | null = null;
   let showArmModal = $state(false);
-  let pendingApprovals = $state<PendingApproval[]>([]);
   let historyError = $state<string | null>(null);
   let eventsError = $state<string | null>(null);
   let eventsLoading = $state(true);
@@ -60,6 +63,11 @@
   let monthlyPositions = $state<Position[]>([]);
   let monthlySlotCellsTotal = $state<number | null>(null);
   let currentStatus = $derived($sharedStatus);
+  // From the shared status, so every refresh path (bootstrap, SSE-triggered,
+  // poll, NavBar) updates the approval list, not only loadStatus().
+  let pendingApprovals = $derived<PendingApproval[]>(
+    currentStatus?.pending_approvals ?? [],
+  );
   let approvalTick = $state(Date.now());
   let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
   let sseRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -265,7 +273,6 @@
         activePositions.set(
           status.positions.filter((op) => isRenderableLivePosition(op)),
         );
-        pendingApprovals = status.pending_approvals;
       }
       haltStatus.set(halt);
       connected = true;
@@ -327,47 +334,25 @@
 
   function startSse() {
     stopSse();
+    const handlers = dashboardStreamHandlers<SseEvent>({
+      anchor: () => void Promise.all([loadStatus(), loadTodayEvents()]),
+      scheduleRefresh,
+      pushEvent,
+      markEvent: markSseEvent,
+      markConnected: markSseConnected,
+      markStale: markSseStale,
+      setConnected: (value) => (connected = value),
+    });
     closeSse = connectEventStream(
-      (event: SseEvent) => {
-        markSseEvent();
-        pushEvent(event);
-        const payload = event.payload as Record<string, unknown>;
-        const posId = payload.position_id as string | undefined;
-        if (posId && event.event_type === "position.changed") {
-          scheduleRefresh();
-        }
-        if (event.event_type.startsWith("query.")) {
-          scheduleRefresh();
-        }
-        if (event.event_type === "month_boundary.reset") {
-          scheduleRefresh();
-        }
-        if (event.event_type === "system.resync_required") {
-          scheduleRefresh();
-        }
-      },
-      () => {
-        connected = false;
-      },
-      () => {
-        connected = true;
-        markSseConnected();
-        void Promise.all([loadStatus(), loadTodayEvents()]);
-      },
+      handlers.onEvent,
+      handlers.onError,
+      handlers.onReconnect,
       (staleSecs) => {
-        markSseStale();
-        connected = false;
+        handlers.onStale();
         console.warn(`SSE stale for ${staleSecs}s, reconnecting`);
       },
-      () => {
-        markSseEvent();
-      },
-      () => {
-        // First connection included: without this the badge read "STALE,
-        // reconnecting" on every mount until the first heartbeat.
-        connected = true;
-        markSseConnected();
-      },
+      handlers.onActivity,
+      handlers.onOpen,
     );
   }
 

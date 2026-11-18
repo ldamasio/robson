@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { OPERATION_REFRESH_MS, STATUS_POLL_MS, operationNeedsRefresh, operationStreamHandlers, shouldPollStatus } from '#lib/config/polling.ts';
+import { OPERATION_REFRESH_MS, STATUS_POLL_MS, dashboardNeedsRefresh, dashboardStreamHandlers, operationNeedsRefresh, operationStreamHandlers, shouldPollStatus } from '#lib/config/polling.ts';
 
 describe('status polling policy', () => {
   it('polls only with an open position in a visible tab', () => {
@@ -84,5 +84,50 @@ describe('operation stream handlers', () => {
     h.onError();
     h.onStale();
     expect(calls).toEqual(['stale', 'stale']);
+  });
+});
+
+describe('dashboard stream handlers', () => {
+  function handlers() {
+    const calls: string[] = [];
+    const h = dashboardStreamHandlers({
+      anchor: () => calls.push('anchor'),
+      scheduleRefresh: () => calls.push('schedule'),
+      pushEvent: () => calls.push('push'),
+      markEvent: () => calls.push('event'),
+      markConnected: () => calls.push('connected'),
+      markStale: () => calls.push('stale'),
+      setConnected: (value) => calls.push(`setConnected:${value}`),
+    });
+    return { h, calls };
+  }
+
+  it('anchors on the snapshot when the first connection opens', () => {
+    const { h, calls } = handlers();
+    h.onOpen();
+    expect(calls).toEqual(['setConnected:true', 'connected', 'anchor']);
+  });
+
+  it('anchors again after every reconnect', () => {
+    const { h, calls } = handlers();
+    h.onReconnect();
+    expect(calls).toEqual(['setConnected:true', 'connected', 'anchor']);
+  });
+
+  it('refreshes on lifecycle, approval, boundary and resync events only', () => {
+    const ev = (event_type: string, payload: Record<string, unknown> = {}) => ({ event_type, payload });
+    expect(dashboardNeedsRefresh(ev('position.changed', { position_id: 'p' }))).toBe(true);
+    expect(dashboardNeedsRefresh(ev('position.changed'))).toBe(false);
+    expect(dashboardNeedsRefresh(ev('query.awaiting_approval'))).toBe(true);
+    expect(dashboardNeedsRefresh(ev('month_boundary.reset'))).toBe(true);
+    expect(dashboardNeedsRefresh(ev('system.resync_required'))).toBe(true);
+    expect(dashboardNeedsRefresh(ev('position.mark_advanced', { position_id: 'p' }))).toBe(false);
+  });
+
+  it('shows the stream down on error and stale', () => {
+    const { h, calls } = handlers();
+    h.onError();
+    h.onStale();
+    expect(calls).toEqual(['setConnected:false', 'stale', 'setConnected:false']);
   });
 });

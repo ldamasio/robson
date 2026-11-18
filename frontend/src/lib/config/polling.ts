@@ -74,3 +74,53 @@ export function operationStreamHandlers<E extends StreamEvent>(
     },
   };
 }
+
+/** Whether a dashboard SSE event should trigger a coalesced status refresh. */
+export function dashboardNeedsRefresh(event: StreamEvent): boolean {
+  const type = event.event_type;
+  if (type === 'position.changed' && event.payload?.position_id) return true;
+  return (
+    type.startsWith('query.') ||
+    type === 'month_boundary.reset' ||
+    type === 'system.resync_required'
+  );
+}
+
+/** SSE handlers for the dashboard. Like the operation page, every stream
+ *  establishment, the first one included, re-anchors on the REST snapshot:
+ *  the server does not replay events sent before the subscription, and with
+ *  an empty book the status poll stays off, so nothing else would notice. */
+export function dashboardStreamHandlers<E extends StreamEvent>(deps: {
+  anchor: () => void;
+  scheduleRefresh: () => void;
+  pushEvent: (event: E) => void;
+  markEvent: () => void;
+  markConnected: () => void;
+  markStale: () => void;
+  setConnected: (connected: boolean) => void;
+}) {
+  const established = () => {
+    deps.setConnected(true);
+    deps.markConnected();
+    deps.anchor();
+  };
+  return {
+    onEvent(event: E) {
+      deps.markEvent();
+      deps.pushEvent(event);
+      if (dashboardNeedsRefresh(event)) deps.scheduleRefresh();
+    },
+    onError() {
+      deps.setConnected(false);
+    },
+    onReconnect: established,
+    onStale() {
+      deps.markStale();
+      deps.setConnected(false);
+    },
+    onActivity() {
+      deps.markEvent();
+    },
+    onOpen: established,
+  };
+}
