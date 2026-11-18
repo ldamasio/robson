@@ -115,39 +115,28 @@ The daemon refuses to start in production mode without a real
 exchange configuration. Development mode runs against the
 in-memory store.
 
-**Frontend + backend together (ADR-0054, Google OAuth):**
+**Frontend + backend together (ADR-0057, RBX Identity):**
 
-robsond's auth middleware is a no-op — same as before — as long as
-`ROBSON_ALLOWED_EMAIL` and both `ROBSON_GOOGLE_WEB_CLIENT_ID` /
-`ROBSON_GOOGLE_CLI_CLIENT_ID` are left unset in development. That part
-is unchanged from the old bearer-token setup. What changed is the
-frontend: `/login` no longer has a paste-a-token field, only a "Sign in
-with Google" button, so getting into the dashboard locally without a
-real Google OAuth client needs one extra step:
+Development leaves backend authorization disabled only when no
+`ROBSON_OIDC_*` variable is configured, the API binds to loopback, and
+`ROBSON_ALLOW_INSECURE_DEV_AUTH=true` is explicitly set. Do not emulate login
+by placing a placeholder token in browser storage. To exercise authentication, register a
+development public client in RBX Identity/ZITADEL, enable Google federation for
+that organization, and configure the complete verifier contract:
 
-1. Run robsond as above (no `ROBSON_GOOGLE_*` / `ROBSON_ALLOWED_EMAIL`
-   set — auth stays disabled, identical to today).
-2. In another terminal, run `pnpm run dev` in `frontend/` (with
-   `PUBLIC_GOOGLE_WEB_CLIENT_ID` unset or a placeholder — the button
-   will render but does not need to actually work for this path).
-3. Open `http://localhost:5173/dashboard` directly. The `(authed)`
-   layout only checks for the *presence* of a cached credential, and
-   the backend isn't checking its contents (auth disabled), so open the
-   browser devtools console and run:
-   ```js
-   sessionStorage.setItem('robson_google_id_token', 'dev-placeholder');
-   ```
-   then reload. The dashboard loads exactly as it did with the old
-   paste-any-string flow.
+```bash
+export ROBSON_OIDC_ISSUER=https://auth.merovelis.com
+export ROBSON_OIDC_AUDIENCE=<registered-robson-api-audience>
+export ROBSON_OIDC_JWKS_URI=https://auth.merovelis.com/oauth/v2/keys
+export ROBSON_OIDC_ALLOWED_CLIENT_IDS=<registered-development-client-id>
+export ROBSON_OIDC_TENANT_BINDING='<registered-organization-id>=<projection-tenant-uuid>'
+export ROBSON_OIDC_ALLOWED_SUBJECTS=<canonical-owner-subject>
+```
 
-**To test the real Google sign-in flow locally** (verifying GIS
-end-to-end, not just the disabled-auth dev path): register a Google
-OAuth 2.0 "Web application" client in Google Cloud Console with
-`http://localhost:5173` as an authorized JavaScript origin, then set
-`PUBLIC_GOOGLE_WEB_CLIENT_ID` (frontend `.env`) and
-`ROBSON_GOOGLE_WEB_CLIENT_ID` + `ROBSON_ALLOWED_EMAIL` (robsond env) to
-matching real values before starting both processes. See
-`frontend/.env.example` and `docs/adr/ADR-0054-google-oauth-api-authentication.md`.
+All six values are required together. They are registration metadata, not
+guessed placeholders. The client uses Authorization Code with PKCE and sends
+the resulting RBX access token; `robsond` does not trust a Google token
+directly. See `docs/adr/ADR-0057-rbx-identity-and-tenant-boundary.md`.
 
 ---
 

@@ -1,7 +1,11 @@
 # ADR-0054: Google OAuth (ID Token) API Authentication, replacing Bearer Token
 
+> **Superseded by ADR-0057** (2026-11-18). Robson no longer trusts Google
+> tokens directly. Google is an upstream login provider of RBX Identity;
+> Robson trusts only RBX Identity/ZITADEL access tokens.
+
 **Date:** 2026-09-10
-**Status:** Proposed
+**Status:** Superseded
 
 ## Context
 

@@ -59,12 +59,11 @@ use crate::query::ExecutionQuery;
 use crate::query_engine::{append_query_state_changed_event, EventLogQueryRecorder};
 use crate::{
     api::{create_router, ApiState, VenueFeedView},
-    auth::GoogleAuthConfig,
+    auth::AuthService,
     config::{Config, StartupStaleActivePolicy},
     error::{DaemonError, DaemonResult, StartupStaleActiveInfo},
     event_bus::{DaemonEvent, EventBus},
     funding::FundingRouteMode,
-    google_jwks::GoogleJwksCache,
     market_data::{FallbackSupport, FeedHealth, MarketDataManager, RestFallbackConfig},
     position_manager::{PositionManager, ReconcileCloseOutcome, ReconciledCloseInput},
     query_engine::{QueryRecorder, TracingQueryRecorder},
@@ -2112,36 +2111,6 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 .collect(),
         };
 
-        // ADR-0054: Google OAuth ID token verification, replacing the
-        // static ROBSON_API_TOKEN bearer token. `google_auth` is `None`
-        // (auth disabled) unless at least one client id AND the operator
-        // allowlist email are configured — see `Config::from_env`'s
-        // production fail-fast check, which requires both in production.
-        let google_auth = match &self.config.api.allowed_email {
-            Some(allowed_email) => {
-                let client_ids: Vec<String> = [
-                    self.config.api.google_web_client_id.clone(),
-                    self.config.api.google_cli_client_id.clone(),
-                ]
-                .into_iter()
-                .flatten()
-                .collect();
-
-                if client_ids.is_empty() {
-                    None
-                } else {
-                    let jwks = GoogleJwksCache::new();
-                    jwks.spawn_refresh_loop();
-                    Some(GoogleAuthConfig {
-                        client_ids,
-                        allowed_email: allowed_email.clone(),
-                        jwks,
-                    })
-                }
-            },
-            None => None,
-        };
-
         let state = Arc::new(ApiState {
             exchange: self.exchange.clone(),
             position_manager: self.position_manager.clone(),
@@ -2152,10 +2121,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             pg_pool: self.pg_pool.clone(),
             #[cfg(feature = "postgres")]
             tenant_id: self.config.projection.tenant_id,
-            google_auth,
-            // TEMPORARY: dual-accept bridge during ADR-0054 rollout, remove
-            // after cutover — see ADR-0054 migration plan.
-            legacy_api_token: self.config.api.legacy_api_token.clone(),
+            auth: AuthService::new(self.config.api.oidc.clone(), self.config.projection.tenant_id),
             funding: self.config.funding.clone(),
             funding_route_mode: self.funding_worker_route().1,
             venue_feed,

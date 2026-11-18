@@ -109,6 +109,10 @@ impl DaemonProcess {
             .env("ROBSON_ENV", "test")
             .env("ROBSON_API_HOST", "127.0.0.1")
             .env("ROBSON_API_PORT", api.port().to_string())
+            // Crash harnesses run only on an ephemeral loopback listener. The
+            // explicit opt-in keeps production fail-closed while avoiding a
+            // dependency on a live identity provider in process-crash tests.
+            .env("ROBSON_ALLOW_INSECURE_DEV_AUTH", "true")
             .env("DATABASE_URL", &spec.database_url)
             .env("PROJECTION_TENANT_ID", spec.tenant_id.to_string())
             .env("ROBSON_VENUE", "binance_usdm")

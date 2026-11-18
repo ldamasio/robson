@@ -70,6 +70,7 @@ pub enum ReconcileCloseResponse {
     Inconsistent(ErrorResponse),
     Unsupported(ErrorResponse),
     Unauthorized(UnauthorizedResponse),
+    Forbidden(UnauthorizedResponse),
 }
 
 #[derive(Debug)]
@@ -79,16 +80,17 @@ pub enum IncomeAckApiResponse {
     NotFound(ErrorResponse),
     Conflict(ErrorResponse),
     Unauthorized(UnauthorizedResponse),
+    Forbidden(UnauthorizedResponse),
     Unavailable(ErrorResponse),
 }
 
 pub struct ApiClient {
     base_url: String,
-    /// Google ID token (ADR-0054) — always present. Callers obtain it via
-    /// `crate::auth::current_id_token()`, which transparently refreshes it
-    /// and errors out (telling the operator to run `robson auth login`)
-    /// when there is no usable cached credential, so by the time an
-    /// `ApiClient` exists there is always a token to send.
+    /// RBX Identity access token (ADR-0057) — always present. Callers obtain it
+    /// via `crate::auth::current_access_token()`, which transparently
+    /// refreshes it and errors out (telling the operator to run `robson
+    /// auth login`) when there is no usable cached credential, so by the
+    /// time an `ApiClient` exists there is always a token to send.
     token: String,
     client: reqwest::Client,
 }
@@ -130,6 +132,11 @@ impl ApiClient {
                 let err: UnauthorizedResponse =
                     resp.json().await.context("failed to parse 401 response")?;
                 Ok(ReconcileCloseResponse::Unauthorized(err))
+            },
+            403 => {
+                let err: UnauthorizedResponse =
+                    resp.json().await.context("failed to parse 403 response")?;
+                Ok(ReconcileCloseResponse::Forbidden(err))
             },
             404 => {
                 let err: NotFoundResponse =
@@ -177,6 +184,10 @@ impl ApiClient {
                 let error = resp.json().await.context("failed to parse 401 response")?;
                 Ok(IncomeAckApiResponse::Unauthorized(error))
             },
+            403 => {
+                let error = resp.json().await.context("failed to parse 403 response")?;
+                Ok(IncomeAckApiResponse::Forbidden(error))
+            },
             404 => {
                 let error = resp.json().await.context("failed to parse 404 response")?;
                 Ok(IncomeAckApiResponse::NotFound(error))
@@ -194,5 +205,69 @@ impl ApiClient {
                 anyhow::bail!("unexpected HTTP {} from robsond: {}", other, text)
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    async fn forbidden_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = r#"{"error":"insufficient_robson_role"}"#;
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn reconcile_close_reports_forbidden_role() {
+        let (base_url, server) = forbidden_server().await;
+        let client = ApiClient::new(&base_url, "access-token");
+        let response = client
+            .reconcile_close(ReconcileCloseRequest {
+                position_id: Uuid::now_v7(),
+                evidence: EvidenceJson::Estimated(serde_json::json!({})),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            response,
+            ReconcileCloseResponse::Forbidden(UnauthorizedResponse { error })
+                if error == "insufficient_robson_role"
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn income_ack_reports_forbidden_role() {
+        let (base_url, server) = forbidden_server().await;
+        let client = ApiClient::new(&base_url, "access-token");
+        let response = client
+            .acknowledge_income("income-1", IncomeAckRequest {
+                reason: "reviewed".to_owned(),
+                actor: "ignored".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            response,
+            IncomeAckApiResponse::Forbidden(UnauthorizedResponse { error })
+                if error == "insufficient_robson_role"
+        ));
+        server.await.unwrap();
     }
 }

@@ -11,7 +11,7 @@ use clap::Parser;
     about = "Operational CLI for Robson daemon"
 )]
 enum Cli {
-    /// Google OAuth sign-in for the CLI (ADR-0054).
+    /// Google sign-in through RBX Identity/ZITADEL (ADR-0057).
     Auth(commands::auth::AuthArgs),
     ReconcileClose(commands::reconcile_close::ReconcileCloseArgs),
     Income(commands::income::IncomeArgs),

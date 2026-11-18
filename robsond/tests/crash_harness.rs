@@ -117,9 +117,9 @@ impl Harness {
         }
     }
 
-    /// A daemon with the harness's operator token, which `/recovery/*` needs.
+    /// A loopback-only daemon with the harness's explicit development auth.
     fn operated(&self, crash_point: Option<&str>) -> DaemonProcess {
-        self.daemon_with_env(crash_point, &[("ROBSON_LEGACY_API_TOKEN", OPERATOR_TOKEN)])
+        self.daemon_with_env(crash_point, &[])
     }
 
     /// The pending list of an operated daemon.
@@ -633,7 +633,7 @@ async fn an_operator_disposition_clears_the_rollback_boundary(pool: PgPool) {
         assert_eq!(harness.blockers().await, 1);
 
         let token = "harness-only-token";
-        let restarted = harness.daemon_with_env(None, &[("ROBSON_LEGACY_API_TOKEN", token)]);
+        let restarted = harness.daemon_with_env(None, &[]);
         restarted.wait_ready(STEP).await.expect("daemon ready");
         let intent_id: Uuid = sqlx::query_scalar("SELECT intent_id FROM order_intents LIMIT 1")
             .fetch_one(&harness.pool)
@@ -1255,7 +1255,7 @@ async fn an_unclean_start_is_fenced_until_an_audited_release_then_stops_clean(po
         .expect("the release's decision");
         assert_eq!(
             (actor.as_str(), auth.as_str(), kind.as_str()),
-            ("legacy-bearer-token", "asserted", "release")
+            ("development-operator", "asserted", "release")
         );
 
         b.send_signal("TERM").expect("signal");

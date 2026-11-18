@@ -85,7 +85,7 @@ ROBSON_CORS_ALLOWED_ORIGINS: "https://robson.rbx.ia.br,https://robson.rbxsystems
   to add/remove origins (e.g., adding a staging frontend).
 - Default empty behavior preserves test compatibility.
 - Pattern matches the existing env-direct reads in robsond
-  (`ROBSON_API_HOST`, `ROBSON_API_PORT`, `ROBSON_API_TOKEN`) — no
+  (`ROBSON_API_HOST`, `ROBSON_API_PORT`, `ROBSON_OIDC_ISSUER`) — no
   new architectural concept introduced.
 
 **Negative / trade-offs**

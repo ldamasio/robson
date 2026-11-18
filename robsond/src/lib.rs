@@ -51,9 +51,9 @@ pub mod error;
 pub mod event_bus;
 mod event_streams;
 pub mod funding;
-pub mod google_jwks;
 pub mod market_data;
 pub mod metrics;
+pub mod oidc_auth;
 pub mod operation_observation;
 pub mod position_manager;
 pub mod query;
@@ -86,17 +86,16 @@ pub mod projection_worker;
 mod chaos_tests;
 
 // Re-exports for convenience
-pub use auth::{AuthError, GoogleAuthConfig, GoogleClaims};
+pub use auth::{AuthContext, AuthError, AuthMethod, AuthService, RequiredPermission};
 pub use circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
 pub use config::{
     ApiConfig, BinanceConfig, Config, EngineConfig, Environment, FundingConfig, MarketDataConfig,
-    ProjectionConfig, ReconciliationConfig, StartupStaleActivePolicy, VenueSelection,
+    OidcConfig, ProjectionConfig, ReconciliationConfig, StartupStaleActivePolicy, VenueSelection,
 };
 pub use daemon::Daemon;
 pub use detector::{DetectorConfig, DetectorTask};
 pub use error::{exit_code_for_daemon_error, DaemonError, DaemonResult};
 pub use event_bus::{DaemonEvent, EventBus, EventReceiver, FeedKey, MarketData, OrderFill};
-pub use google_jwks::GoogleJwksCache;
 #[cfg(feature = "postgres")]
 pub use income_ledger::IncomeLedgerWorker;
 pub use position_manager::PositionManager;

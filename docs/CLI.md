@@ -32,26 +32,28 @@ For an operated environment, use only an approved binary built from a reviewed s
 
 Both commands call the authenticated `robsond` HTTP API. The default base URL is `http://localhost:8080`.
 
-Since ADR-0054, the CLI authenticates as the operator's Google account via
-the OAuth 2.0 Device Authorization Grant — there is no bearer token to
-export or pass on the command line.
+Since ADR-0057, the CLI authenticates with Google through RBX Identity/ZITADEL
+using the OAuth 2.0 Device Authorization Grant. `robsond` never accepts a
+Google-issued token or a static API token directly.
 
-The device client's **client secret** must be in the environment for
-`auth login` and for every transparent refresh: Google issues one for the
-"TVs and Limited-Input devices" client type and rejects the token exchange
-without it. It is not treated as confidential by Google for installed
-applications, but it is a credential of the `rbx-systems` project, so it is
-not in the repository: take it from Google Cloud Console → APIs & Services
-→ Credentials → the `robson-cli` OAuth client, keep it in the operator's
-password store, and export it per shell (never on the command line of
-another process, never in tickets):
+Configure the registered RBX public client before signing in:
 
 ```bash
-export ROBSON_GOOGLE_CLI_CLIENT_SECRET="$(pass rbx/google/robson-cli-client-secret)"
+export ROBSON_CLI_OIDC_ISSUER=https://auth.merovelis.com
+export ROBSON_CLI_OIDC_CLIENT_ID=<registered-public-client-id>
+export ROBSON_CLI_OIDC_SCOPES='openid profile email offline_access urn:zitadel:iam:org:id:<organization-id> urn:zitadel:iam:org:project:id:<api-project-id>:aud'
 ```
 
-Without it the CLI fails before printing a user code
-(`ROBSON_GOOGLE_CLI_CLIENT_SECRET is not set; ...`).
+The client ID, organization ID, and API project ID are public registration
+metadata, not secrets. The organization scope selects the
+organization-specific login policy and role context. The registered public
+client must assert project roles in its access tokens. Do not substitute
+guessed values.
+
+The CLI is a ZITADEL public device client. It has no client secret: login and
+refresh use only the registered public client ID and the scopes above. Google
+is selected inside the RBX Identity login policy and is never called directly
+by the CLI.
 
 Sign in once per machine:
 
@@ -59,9 +61,10 @@ Sign in once per machine:
 robson-cli auth login
 ```
 
-This prints a short user code and a Google verification URL. Open the URL
-on any device, enter the code, and approve. `robson-cli` polls until
-approval, then caches `{id_token, refresh_token, expiry}` at
+This prints a short user code and an RBX Identity verification URL. Open the
+URL on any device, choose Google, enter the code, and approve. `robson-cli`
+polls until approval, then caches `{issuer, client_id, access_token,
+refresh_token, email, expiry}` at
 `~/.config/robson/credentials.json` (or under `$XDG_CONFIG_HOME` if set)
 with `0600` permissions. `reconcile-close` and `income ack` read this
 cache automatically and refresh it transparently as it nears expiry — no
@@ -72,26 +75,23 @@ Other `auth` subcommands:
 ```bash
 robson-cli auth status        # print the cached email/expiry — no network call
 robson-cli auth logout        # delete the cached credential
-robson-cli auth print-token   # print the current (refreshed) ID token, for scripting/curl
+robson-cli auth print-token   # print the current RBX access token, for scripting/curl
 ```
 
 If neither command finds a cached credential, it fails with `run
-\`robson auth login\` first` rather than silently falling back to an
+\`robson-cli auth login\` first` rather than silently falling back to an
 unauthenticated request. For a remote daemon, use an approved secure
 tunnel or local port forward — never send the bearer credential over
 plaintext remote HTTP.
 
-`ROBSON_OPERATOR_ID` may supply the default audited actor for `income ack`.
-`ROBSON_GOOGLE_CLI_CLIENT_SECRET` (above) is read by `auth login` and by the
-silent refresh inside `reconcile-close` and `income ack`.
+`ROBSON_OPERATOR_ID` may supply the default actor for `income ack` only in the
+explicit loopback development-auth mode. In an authenticated deployment the
+API ignores that client-supplied actor and records the canonical OIDC subject.
 
-**Legacy note:** `ROBSON_API_TOKEN` / `--token` are removed. Setting
-`ROBSON_API_TOKEN` on the `robsond` side now fails startup loudly (see
-ADR-0054) rather than being silently accepted; a temporary rollout bridge
-exists under the separately-named `ROBSON_LEGACY_API_TOKEN` for
-production continuity during the Google-auth cutover, but it is not a
-CLI-facing option and is removed once the repo owner confirms Google
-auth is stable in production.
+**Legacy note:** `ROBSON_API_TOKEN`, `ROBSON_LEGACY_API_TOKEN`, direct Google
+client configuration, and `--token` are removed. Setting any legacy human-auth
+variable on `robsond` fails startup loudly; there is no dual-authentication
+bridge.
 
 ## Stale-Active recovery
 

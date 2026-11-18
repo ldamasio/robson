@@ -1,5 +1,5 @@
-//! `robson auth login|status|logout|print-token` — Google OAuth Device
-//! Authorization Grant for the CLI (ADR-0054). See `crate::auth` for the
+//! `robson-cli auth login|status|logout|print-token` — RBX Identity Device
+//! Authorization Grant for the CLI (ADR-0057). See `crate::auth` for the
 //! actual flow; this module is just the `clap` wiring and human-facing
 //! output.
 
@@ -17,15 +17,15 @@ pub struct AuthArgs {
 
 #[derive(Subcommand)]
 pub enum AuthCommand {
-    /// Sign in with Google via the Device Authorization Grant.
+    /// Sign in with Google through RBX Identity's Device Authorization Grant.
     Login,
     /// Show the cached credential's email and expiry — no network call.
     Status,
     /// Delete the cached credential.
     Logout,
-    /// Print the current (transparently refreshed) Google ID token.
+    /// Print the current (transparently refreshed) RBX access token.
     /// Intended for scripting/curl use, e.g.
-    /// `curl -H "Authorization: Bearer $(robson auth print-token)" ...`.
+    /// `curl -H "Authorization: Bearer $(robson-cli auth print-token)" ...`.
     PrintToken,
 }
 
@@ -58,18 +58,18 @@ fn run_status() -> i32 {
             let email = email.as_deref().unwrap_or("<unknown email>");
             match chrono::DateTime::from_timestamp(exp, 0) {
                 Some(expiry) if exp > now => {
-                    println!("Signed in as {email} (id_token expires {})", expiry.to_rfc3339());
+                    println!("Signed in as {email} (access token expires {})", expiry.to_rfc3339());
                 },
                 Some(expiry) => {
                     println!(
-                        "Signed in as {email}, but the cached id_token expired at {} \
+                        "Signed in as {email}, but the cached access token expired at {} \
                          (it will be refreshed automatically on next use, if a refresh_token \
                          is cached)",
                         expiry.to_rfc3339()
                     );
                 },
                 None => {
-                    println!("Signed in as {email} (id_token has an unparseable expiry)");
+                    println!("Signed in as {email} (access token has an unparseable expiry)");
                 },
             }
             EXIT_SUCCESS
@@ -99,7 +99,7 @@ fn run_logout() -> i32 {
 }
 
 async fn run_print_token() -> i32 {
-    match auth::current_id_token().await {
+    match auth::current_access_token().await {
         Ok(token) => {
             println!("{token}");
             EXIT_SUCCESS
