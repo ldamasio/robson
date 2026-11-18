@@ -18,18 +18,38 @@ use rust_decimal_macros::dec;
 
 pub(crate) struct RestrictedExchange {
     delegate: StubExchange,
+    capabilities: VenueCapabilities,
     requests: AtomicUsize,
+    capability_scopes: AtomicUsize,
 }
 
 impl RestrictedExchange {
     pub(crate) fn new() -> Self {
         let delegate = StubExchange::new(dec!(100));
         delegate.set_futures_balance(dec!(10000));
-        Self { delegate, requests: AtomicUsize::new(0) }
+        Self {
+            delegate,
+            capabilities: robson_testkit::balance_stub::spot_capabilities(),
+            requests: AtomicUsize::new(0),
+            capability_scopes: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn with_capabilities(mut self, capabilities: VenueCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     pub(crate) fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_trading_rules(&self, rules: SymbolTradingRules) {
+        self.delegate.set_trading_rules(rules);
+    }
+
+    pub(crate) fn capability_scopes(&self) -> usize {
+        self.capability_scopes.load(Ordering::SeqCst)
     }
 
     fn requested(&self) {
@@ -52,7 +72,10 @@ impl AccountPort for RestrictedExchange {
         AccountPort::execution_costs(&self.delegate, symbol).await
     }
     fn capabilities(&self) -> VenueCapabilities {
-        robson_testkit::balance_stub::spot_capabilities()
+        if robson_exec::order_journal::in_operation() {
+            self.capability_scopes.fetch_add(1, Ordering::SeqCst);
+        }
+        self.capabilities.clone()
     }
 }
 
