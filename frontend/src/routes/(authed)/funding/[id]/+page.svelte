@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import Card from '$design/components/Card.svelte';
   import Stack from '$design/components/Stack.svelte';
   import Row from '$design/components/Row.svelte';
@@ -13,7 +13,7 @@
   const POLL_INTERVAL_MS = 5_000;
   const TERMINAL_STATES = new Set(['REFRESHED', 'FAILED']);
 
-  let sagaId = $derived($page.params.id ?? '');
+  let sagaId = $derived(page.params.id ?? '');
   let saga = $state<FundingSaga | null>(null);
   let error = $state<string | null>(null);
   let pollTimer: ReturnType<typeof setInterval> | null = null;

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { robsonApi, type EntryPreview } from "$api/robson";
-  import { previewLines, previewSeverity } from "$lib/presentation/preview";
+  import { previewLines, previewSeverity } from "#lib/presentation/preview.ts";
 
   let {
     onclose,

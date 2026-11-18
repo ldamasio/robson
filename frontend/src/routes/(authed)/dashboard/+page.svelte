@@ -18,7 +18,7 @@
   import { recentEvents, pushEvent, mergeEvents } from "$stores/events";
   import { toasts, showToast } from "$stores/toast";
   import { status as sharedStatus, refreshStatus } from "$stores/status";
-  import { STATUS_POLL_MS, shouldPollStatus } from "$lib/config/polling";
+  import { STATUS_POLL_MS, shouldPollStatus } from "#lib/config/polling.ts";
   import {
     sseFreshness,
     markSseEvent,
@@ -28,12 +28,12 @@
   import {
     deriveMonthSlots,
     sortPositionsOldestFirst,
-  } from "$lib/config/slots";
-  import { formatTimeUtc, isTodayUtc, utcDateKey } from "$lib/utils/time";
+  } from "#lib/config/slots.ts";
+  import { formatTimeUtc, isTodayUtc, utcDateKey } from "#lib/utils/time.ts";
   import {
     deriveBudgetView,
     MONTHLY_BUDGET_LIMIT_PCT,
-  } from "$lib/presentation/budget";
+  } from "#lib/presentation/budget.ts";
   import {
     positionLabel,
     positionStateLabel,
@@ -43,7 +43,7 @@
     isPositionCancelled,
     haltStateLabel,
     eventTypeLabel,
-  } from "$lib/presentation/labels";
+  } from "#lib/presentation/labels.ts";
   import { _ } from "svelte-i18n";
 
   let error = $state<string | null>(null);

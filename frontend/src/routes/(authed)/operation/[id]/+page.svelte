@@ -3,19 +3,19 @@
   import Card from '$design/components/Card.svelte';
   import Stack from '$design/components/Stack.svelte';
   import LCorners from '$design/components/LCorners.svelte';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { robsonApi, connectEventStream, type Position, type SseEvent } from '$api/robson';
-  import { formatTimeUtc } from '$lib/utils/time';
+  import { formatTimeUtc } from '#lib/utils/time.ts';
   import {
     positionLabel,
     positionSummaryLines,
     positionMetaLine,
     eventTypeLabel,
     eventSummaryText
-  } from '$lib/presentation/labels';
+  } from '#lib/presentation/labels.ts';
   import { _ } from 'svelte-i18n';
 
-  let operationId = $derived($page.params.id ?? '');
+  let operationId = $derived(page.params.id ?? '');
   let position = $state<Position | null>(null);
   let error = $state<string | null>(null);
   type TaggedEvent = SseEvent & { _seq: number };

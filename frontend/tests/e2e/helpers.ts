@@ -1,4 +1,4 @@
-import type { Page } from '@playwright/test';
+import { expect, type Page } from '@playwright/test';
 
 export const TEST_POS_ID = 'test-pos-1';
 
@@ -156,7 +156,51 @@ export async function installMockEventSource(page: Page): Promise<void> {
   });
 }
 
+/**
+ * Fulfill the GIS script locally while exercising the real login component's
+ * script.onload -> initialize -> renderButton -> credential callback lifecycle.
+ * This synthetic credential is accepted only by intercepted test API responses.
+ */
+export async function installMockGoogleIdentity(
+  page: Page,
+  credential = 'test-token'
+): Promise<void> {
+  await page.route('https://accounts.google.com/gsi/client', (route) =>
+    route.fulfill({
+      contentType: 'application/javascript',
+      body: `(() => {
+        const credential = ${JSON.stringify(credential)};
+        let config;
+        window.google = {
+          accounts: {
+            id: {
+              initialize(value) {
+                config = value;
+              },
+              renderButton(parent) {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.textContent = 'Sign in with Google (test)';
+                button.addEventListener('click', () => {
+                  if (!config) throw new Error('GIS initialize was not called');
+                  config.callback({ credential });
+                });
+                parent.replaceChildren(button);
+              },
+              prompt(listener) {
+                listener?.({ isNotDisplayed: () => true });
+              },
+              cancel() {}
+            }
+          }
+        };
+      })();`
+    })
+  );
+}
+
 export async function authAndGoto(page: Page, path: string): Promise<void> {
+  await installMockGoogleIdentity(page);
   await page.route('**/health', (route) =>
     route.fulfill({
       status: 200,
@@ -166,8 +210,16 @@ export async function authAndGoto(page: Page, path: string): Promise<void> {
   );
 
   await page.goto(`/login?redirect=${encodeURIComponent(path)}`);
-  await page.fill('input[type="password"]', 'test-token');
-  await page.click('button[type="submit"]');
+  const health = page.waitForResponse((response) =>
+    new URL(response.url()).pathname.endsWith('/health') &&
+    response.request().method() === 'GET'
+  );
+  await page.getByRole('button', { name: 'Sign in with Google (test)' }).click();
+  const healthResponse = await health;
+  expect(healthResponse.ok()).toBe(true);
+  expect(healthResponse.request().headers().authorization).toBe('Bearer test-token');
+  expect(await page.evaluate(() => sessionStorage.getItem('robson_google_id_token')))
+    .toBe('test-token');
   await page.waitForURL((url) => url.pathname === path, { timeout: 10_000 });
 }
 

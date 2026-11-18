@@ -5,7 +5,7 @@ import {
   deriveSlots,
   occupiedCount,
   sortPositionsOldestFirst
-} from '$lib/config/slots';
+} from '#lib/config/slots.ts';
 import type { PositionState } from '$api/robson';
 
 const activeState: PositionState = {

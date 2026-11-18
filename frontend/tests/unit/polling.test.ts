@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { STATUS_POLL_MS, shouldPollStatus } from '$lib/config/polling';
+import { STATUS_POLL_MS, shouldPollStatus } from '#lib/config/polling.ts';
 
 describe('status polling policy', () => {
   it('polls only with an open position in a visible tab', () => {
