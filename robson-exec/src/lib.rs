@@ -43,6 +43,7 @@ pub mod cancel;
 // lifecycle.
 #[allow(dead_code)]
 mod clock_sample_facts;
+pub mod clock_records;
 mod compat;
 #[cfg(feature = "crash-points")]
 pub mod crash_points;

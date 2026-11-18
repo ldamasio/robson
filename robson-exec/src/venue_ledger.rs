@@ -85,6 +85,8 @@ pub struct SeenAt {
     /// Robson's wall clock, sampled after the venue answer arrived.
     pub at: DateTime<Utc>,
     pub clock: Option<ClockEvidence>,
+    /// Original unqualified exact bracket; legacy rows remain absent.
+    pub capture: Option<crate::clock_records::RawClockCapture>,
 }
 
 /// An unsigned venue integer id, printed without signs or leading zeroes.

@@ -41,6 +41,9 @@
 
 #![warn(clippy::all)]
 
+#[cfg(all(test, feature = "postgres"))]
+extern crate self as robsond;
+
 pub mod api;
 pub mod auth;
 mod capability;
@@ -77,6 +80,8 @@ mod ledger_connection;
 pub mod order_journal_store;
 #[cfg(feature = "postgres")]
 pub mod process_epoch;
+#[cfg(feature = "postgres")]
+mod venue_clock_store;
 #[cfg(feature = "postgres")]
 pub mod venue_ledger_store;
 

@@ -223,6 +223,8 @@ async fn unless_stopped<T>(
 struct EpochMarker {
     pool: Arc<sqlx::PgPool>,
     epoch: crate::process_epoch::Epoch,
+    // Inert backend bound only after the epoch commits.
+    _sample_store: Option<crate::venue_clock_store::ClockSampleStore>,
 }
 
 #[cfg(feature = "postgres")]
@@ -1236,6 +1238,13 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         Ok(Some(Box::new(EpochMarker {
             pool: Arc::clone(pool),
             epoch: start.epoch,
+            _sample_store: (self.exchange.id().as_str()
+                == robson_exec::venue::VenueId::BINANCE_SPOT)
+                .then(|| {
+                    crate::venue_clock_store::ClockSampleStore::from_committed_epoch(
+                        pool, tenant_id, &start,
+                    )
+                }),
         })))
     }
 

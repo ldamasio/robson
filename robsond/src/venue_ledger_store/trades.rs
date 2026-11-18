@@ -118,7 +118,7 @@ impl PgVenueLedger {
         },&committing).await
     }
 
-    async fn read_trade_context(
+    pub(super) async fn read_trade_context(
         &self,
         conn: &mut PgConnection,
         key: &OrderKey,

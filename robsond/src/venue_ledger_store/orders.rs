@@ -12,26 +12,21 @@ use robson_exec::{
     },
 };
 use rust_decimal::Decimal;
-use sqlx::{postgres::PgRow, Connection, PgConnection, Postgres, QueryBuilder, Row, Transaction};
+use sqlx::{postgres::PgRow, Connection, PgConnection, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use super::{backend, commit_error, LedgerConnection, PgVenueLedger};
 
-/// Exactly the `o.` columns `decode_order` reads, all builtin types. Never
-/// `o.*`: unread capture columns of a custom type make a cold connection
-/// resolve their type with extra catalog statements.
-pub(super) const ORDER_COLUMNS: &str = "o.venue_id,o.account_scope,o.symbol,o.exchange_order_id,
-    o.tenant_id,o.client_order_id,o.last_client_order_id,o.owner,o.intent_id,o.position_id,o.kind,
-    o.side,o.order_type,o.orig_qty,o.stop_price,o.status,o.phase,o.expiry_reason,o.executed_cum,
-    o.cumulative_quote,o.quote_floor,o.fills_qty,o.trades_cursor,o.last_checked_at,o.venue_time_ms,
-    o.venue_update_time_ms,o.venue_transact_time_ms,o.venue_working_time_ms,o.live_seen_at,
-    o.live_clock_sample_id,o.live_clock_wall_delta_ms,o.live_clock_mono_delta_ms,o.live_clock_verdict,
-    o.terminal_seen_at,o.terminal_clock_sample_id,o.terminal_clock_wall_delta_ms,
-    o.terminal_clock_mono_delta_ms,o.terminal_clock_verdict";
-
 pub(super) struct OrderContext {
     pub(super) order: Option<StoredOrder>,
     pub(super) leg: Option<OrderLeg>,
+}
+
+use crate::venue_clock_store::codec::CaptureBind;
+pub(super) use crate::venue_clock_store::codec::ORDER_COLUMNS;
+
+fn exact_capture_error(_: crate::venue_clock_store::codec::CodecError) -> LedgerError {
+    LedgerError::InvalidEvidence("malformed exact clock capture".into())
 }
 
 impl PgVenueLedger {
@@ -139,12 +134,17 @@ impl PgVenueLedger {
         let terminal_at = order.terminal_seen.as_ref().map(|seen| seen.at);
         let (terminal_sample, terminal_wall, terminal_mono, terminal_verdict) =
             clock_values(order.terminal_seen.as_ref().and_then(|seen| seen.clock.as_ref()));
+        let live_capture =
+            CaptureBind::new(order.live_seen.capture.as_ref()).map_err(exact_capture_error)?;
+        let terminal_capture =
+            CaptureBind::new(order.terminal_seen.as_ref().and_then(|seen| seen.capture.as_ref()))
+                .map_err(exact_capture_error)?;
         self.statement();
         let result=if exists {
             // Immutable identity/live evidence, fills and cursor are not named.
             // The first terminal clock tuple is kept even if stored partial
             // invalid evidence decoded conservatively as None.
-            sqlx::query("UPDATE venue_orders SET owner=$1,intent_id=$2,position_id=$3,kind=$4,
+            let query = sqlx::query("UPDATE venue_orders SET owner=$1,intent_id=$2,position_id=$3,kind=$4,
                 last_client_order_id=$5,status=$6,phase=$7,executed_cum=$8,cumulative_quote=$9,
                 last_checked_at=GREATEST(last_checked_at,$10),expiry_reason=$11,
                 venue_time_ms=$12,venue_update_time_ms=$13,venue_transact_time_ms=$14,venue_working_time_ms=$15,
@@ -153,7 +153,15 @@ impl PgVenueLedger {
                 terminal_clock_wall_delta_ms=CASE WHEN terminal_seen_at IS NULL THEN $18 ELSE terminal_clock_wall_delta_ms END,
                 terminal_clock_mono_delta_ms=CASE WHEN terminal_seen_at IS NULL THEN $19 ELSE terminal_clock_mono_delta_ms END,
                 terminal_clock_verdict=CASE WHEN terminal_seen_at IS NULL THEN $20 ELSE terminal_clock_verdict END,
-                quote_floor=$26
+                terminal_capture_epoch=CASE WHEN terminal_seen_at IS NULL THEN $26 ELSE terminal_capture_epoch END,
+                terminal_wall_seconds=CASE WHEN terminal_seen_at IS NULL THEN $27 ELSE terminal_wall_seconds END,
+                terminal_wall_nanoseconds=CASE WHEN terminal_seen_at IS NULL THEN $28 ELSE terminal_wall_nanoseconds END,
+                terminal_tick_before=CASE WHEN terminal_seen_at IS NULL THEN $29 ELSE terminal_tick_before END,
+                terminal_tick_after=CASE WHEN terminal_seen_at IS NULL THEN $30 ELSE terminal_tick_after END,
+                terminal_capture_domain=CASE WHEN terminal_seen_at IS NULL THEN
+                    CASE WHEN $31::text IS NULL THEN NULL::budget_clock_domain_v38
+                    ELSE ROW($31,$32,$33,$34)::budget_clock_domain_v38 END ELSE terminal_capture_domain END,
+                quote_floor=$35
                 WHERE venue_id=$21 AND account_scope=$22 AND symbol=$23 AND exchange_order_id=$24 AND tenant_id=$25")
                 .bind(owner).bind(intent).bind(position).bind(kind).bind(&order.last_client_order_id)
                 .bind(&order.status).bind(phase_text(order.phase)).bind(order.executed_cum).bind(order.cumulative_quote)
@@ -161,29 +169,38 @@ impl PgVenueLedger {
                 .bind(order.venue_transact_time_ms).bind(order.venue_working_time_ms).bind(terminal_at)
                 .bind(terminal_sample).bind(terminal_wall).bind(terminal_mono).bind(terminal_verdict)
                 .bind(order.key.venue.as_str()).bind(&order.key.account_scope).bind(&order.key.symbol)
-                .bind(order.key.exchange_order_id.to_string()).bind(self.tenant_id).bind(order.quote_floor).execute(&mut **tx).await
+                .bind(order.key.exchange_order_id.to_string()).bind(self.tenant_id);
+            terminal_capture.bind(query).bind(order.quote_floor).execute(&mut **tx).await
         } else {
-            let mut insert=QueryBuilder::<Postgres>::new("INSERT INTO venue_orders (
-                venue_id,account_scope,symbol,exchange_order_id,tenant_id,client_order_id,last_client_order_id,
-                owner,intent_id,position_id,kind,side,order_type,orig_qty,stop_price,status,phase,
-                executed_cum,cumulative_quote,last_checked_at,live_seen_at,live_clock_sample_id,
-                live_clock_wall_delta_ms,live_clock_mono_delta_ms,live_clock_verdict,terminal_seen_at,
-                terminal_clock_sample_id,terminal_clock_wall_delta_ms,terminal_clock_mono_delta_ms,
-                terminal_clock_verdict,expiry_reason,venue_time_ms,venue_update_time_ms,venue_transact_time_ms,venue_working_time_ms,quote_floor) ");
-            insert.push_values(std::iter::once(order),|mut row,order| {
-                row.push_bind(order.key.venue.as_str()).push_bind(&order.key.account_scope).push_bind(&order.key.symbol)
-                    .push_bind(order.key.exchange_order_id.to_string()).push_bind(self.tenant_id)
-                    .push_bind(&order.client_order_id).push_bind(&order.last_client_order_id)
-                    .push_bind(owner).push_bind(intent).push_bind(position).push_bind(kind)
-                    .push_bind(order.side.to_string()).push_bind(&order.order_type).push_bind(order.orig_qty).push_bind(order.stop_price)
-                    .push_bind(&order.status).push_bind(phase_text(order.phase)).push_bind(order.executed_cum).push_bind(order.cumulative_quote)
-                    .push_bind(order.last_checked_at).push_bind(order.live_seen.at).push_bind(live_sample).push_bind(live_wall)
-                    .push_bind(live_mono).push_bind(live_verdict).push_bind(terminal_at).push_bind(terminal_sample)
-                    .push_bind(terminal_wall).push_bind(terminal_mono).push_bind(terminal_verdict)
-                    .push_bind(&order.expiry_reason).push_bind(order.venue_time_ms).push_bind(order.venue_update_time_ms)
-                    .push_bind(order.venue_transact_time_ms).push_bind(order.venue_working_time_ms).push_bind(order.quote_floor);
-            });
-            insert.build().execute(&mut **tx).await
+            let query=sqlx::query("INSERT INTO venue_orders (
+                venue_id,account_scope,symbol,exchange_order_id,tenant_id,client_order_id,
+                last_client_order_id,owner,intent_id,position_id,kind,side,
+                order_type,orig_qty,stop_price,status,phase,executed_cum,
+                cumulative_quote,last_checked_at,live_seen_at,live_clock_sample_id,live_clock_wall_delta_ms,live_clock_mono_delta_ms,
+                live_clock_verdict,terminal_seen_at,terminal_clock_sample_id,terminal_clock_wall_delta_ms,terminal_clock_mono_delta_ms,terminal_clock_verdict,
+                expiry_reason,venue_time_ms,venue_update_time_ms,venue_transact_time_ms,venue_working_time_ms,live_capture_epoch,
+                live_wall_seconds,live_wall_nanoseconds,live_tick_before,live_tick_after,live_capture_domain,terminal_capture_epoch,
+                terminal_wall_seconds,terminal_wall_nanoseconds,terminal_tick_before,terminal_tick_after,terminal_capture_domain,quote_floor)
+                VALUES ($1,$2,$3,$4,$5,$6,
+                $7,$8,$9,$10,$11,$12,
+                $13,$14,$15,$16,$17,$18,
+                $19,$20,$21,$22,$23,$24,
+                $25,$26,$27,$28,$29,$30,
+                $31,$32,$33,$34,$35,$36,
+                $37,$38,$39,$40,CASE WHEN $41::text IS NULL THEN NULL::budget_clock_domain_v38 ELSE ROW($41,$42,$43,$44)::budget_clock_domain_v38 END,$45,
+                $46,$47,$48,$49,CASE WHEN $50::text IS NULL THEN NULL::budget_clock_domain_v38 ELSE ROW($50,$51,$52,$53)::budget_clock_domain_v38 END,$54)")
+                .bind(order.key.venue.as_str()).bind(&order.key.account_scope).bind(&order.key.symbol)
+                    .bind(order.key.exchange_order_id.to_string()).bind(self.tenant_id)
+                    .bind(&order.client_order_id).bind(&order.last_client_order_id)
+                    .bind(owner).bind(intent).bind(position).bind(kind)
+                    .bind(order.side.to_string()).bind(&order.order_type).bind(order.orig_qty).bind(order.stop_price)
+                    .bind(&order.status).bind(phase_text(order.phase)).bind(order.executed_cum).bind(order.cumulative_quote)
+                    .bind(order.last_checked_at).bind(order.live_seen.at).bind(live_sample).bind(live_wall)
+                    .bind(live_mono).bind(live_verdict).bind(terminal_at).bind(terminal_sample)
+                    .bind(terminal_wall).bind(terminal_mono).bind(terminal_verdict)
+                    .bind(&order.expiry_reason).bind(order.venue_time_ms).bind(order.venue_update_time_ms)
+                    .bind(order.venue_transact_time_ms).bind(order.venue_working_time_ms);
+            terminal_capture.bind(live_capture.bind(query)).bind(order.quote_floor).execute(&mut **tx).await
         }.map_err(order_error)?;
         if result.rows_affected() != 1 {
             return Err(LedgerError::Invariant("order write did not affect one row".into()));
@@ -296,6 +313,15 @@ pub(super) fn decode_order(row: &PgRow, tenant: Uuid) -> Result<Option<StoredOrd
         _ => return Err(LedgerError::Invariant("invalid stored order phase".into())),
     };
     let terminal_at: Option<DateTime<Utc>> = row.try_get("terminal_seen_at").map_err(backend)?;
+    // Decode even without the legacy instant: partial/untimed raw evidence
+    // must not collapse to absence. The schema's whole check is independent.
+    let terminal_capture =
+        crate::venue_clock_store::codec::capture(row, "terminal").map_err(exact_capture_error)?;
+    if terminal_at.is_none() && terminal_capture.is_some() {
+        return Err(LedgerError::InvalidEvidence(
+            "terminal capture without terminal instant".into(),
+        ));
+    }
     Ok(Some(StoredOrder {
         key: OrderKey {
             venue: VenueId::new(row.try_get::<String, _>("venue_id").map_err(backend)?),
@@ -321,9 +347,17 @@ pub(super) fn decode_order(row: &PgRow, tenant: Uuid) -> Result<Option<StoredOrd
         live_seen: SeenAt {
             at: row.try_get("live_seen_at").map_err(backend)?,
             clock: read_clock(row, "live")?,
+            capture: crate::venue_clock_store::codec::capture(row, "live")
+                .map_err(exact_capture_error)?,
         },
         terminal_seen: terminal_at
-            .map(|at| read_clock(row, "terminal").map(|clock| SeenAt { at, clock }))
+            .map(|at| -> Result<SeenAt, LedgerError> {
+                Ok(SeenAt {
+                    at,
+                    clock: read_clock(row, "terminal")?,
+                    capture: terminal_capture,
+                })
+            })
             .transpose()?,
         expiry_reason: row.try_get("expiry_reason").map_err(backend)?,
         venue_time_ms: row.try_get("venue_time_ms").map_err(backend)?,
@@ -379,3 +413,6 @@ pub(super) fn order_error(error: sqlx::Error) -> LedgerError {
     }
     backend(error)
 }
+
+#[cfg(test)]
+mod pg_tests;

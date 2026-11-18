@@ -602,7 +602,7 @@ async fn schedules(pool: PgPool) {
         assert!(ok_changed <= version_delta);
         assert!(version_delta <= ok_changed + uncertain.len() as i64 + replay_changed);
         for (key, owner, is_entry, total, trades) in &model {
-            let row=sqlx::query("SELECT * FROM venue_orders WHERE venue_id=$1 AND account_scope=$2 AND symbol=$3 AND exchange_order_id=$4")
+            let row=sqlx::query("SELECT client_order_id,last_client_order_id,owner,intent_id,position_id,kind,side,order_type,orig_qty,stop_price,status,phase,terminal,executed_cum,cumulative_quote,fills_qty,fills_complete,trades_cursor,last_checked_at,live_seen_at,terminal_seen_at FROM venue_orders WHERE venue_id=$1 AND account_scope=$2 AND symbol=$3 AND exchange_order_id=$4")
                 .bind(key.venue.as_str()).bind(&key.account_scope).bind(&key.symbol).bind(key.exchange_order_id.to_string()).fetch_one(&pool).await.unwrap();
             let OrderOwner::Leg { intent_id, position_id, kind } = &owner.owner else {
                 unreachable!()
