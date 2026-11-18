@@ -495,3 +495,23 @@ fn configured_override_rejects_every_explicit_identity_mismatch() {
         );
     }
 }
+
+// Cross-module pure sizing fixtures use the same sealed test-only authority;
+// no public constructor or production proof bypass is added.
+pub(crate) fn sizing_terms(id: &CostIdentity, taker: &str, gap: &str) -> CostTerms {
+    let body = json!({"version":1,"tenant_id":id.tenant(),"venue":id.venue().as_str(),"scope":id.scope(),"uid":id.uid(),"symbol":id.symbol().as_pair(),"maker_bps":"0","taker_bps":taker,"as_of":date(),"note":"sizing fixture"});
+    let candidate = parse_dated_override(&body.to_string(), id).unwrap();
+    let authority = Authority {
+        absence: Some(Ok(())),
+        ..Authority::default()
+    }
+    .with(&candidate, 1);
+    select_costs(
+        &authority,
+        id,
+        VenueCostEvidence::Unavailable,
+        DatedOverrideEvidence::Available(&candidate),
+        exact(gap),
+    )
+    .unwrap()
+}

@@ -15,3 +15,6 @@ pub use terms::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::sizing_terms;

@@ -60,6 +60,8 @@ impl Arithmetic {
             return Err(MathError::WorkLimit);
         }
         self.operations += 1;
+        #[cfg(test)]
+        trace("call", 1);
         Ok(())
     }
 
@@ -166,6 +168,8 @@ impl Arithmetic {
         self.charge()?;
         let mut scaled = value.numerator.clone();
         for scale in 0..=MAX_EXPORT_SCALE {
+            #[cfg(test)]
+            trace("export_div", 1);
             let (coefficient, remainder) = quotient_remainder(&scaled, &value.denominator);
             if coefficient.bits() > 96 {
                 // Later scales only increase the coefficient.
@@ -190,6 +194,8 @@ impl Arithmetic {
 }
 
 fn product(a: &BigUint, b: &BigUint) -> Result<BigUint, MathError> {
+    #[cfg(test)]
+    trace("bits", a.bits() + b.bits());
     if a.bits() == 0 || b.bits() == 0 {
         return Ok(BigUint::from(0_u8));
     }
@@ -202,6 +208,8 @@ fn product(a: &BigUint, b: &BigUint) -> Result<BigUint, MathError> {
 }
 
 fn sum(a: &BigUint, b: &BigUint) -> Result<BigUint, MathError> {
+    #[cfg(test)]
+    trace("bits", a.bits().max(b.bits()) + 1);
     if a.bits().max(b.bits()) + 1 > MAX_BITS {
         return Err(MathError::WorkLimit);
     }
@@ -219,3 +227,10 @@ fn quotient_remainder(numerator: &BigUint, denominator: &BigUint) -> (BigUint, B
 #[cfg(test)]
 #[path = "arithmetic_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+thread_local! { pub(super) static TRACE: std::cell::RefCell<Vec<(&'static str,u64)>> = const {std::cell::RefCell::new(Vec::new())}; }
+#[cfg(test)]
+pub(super) fn trace(kind: &'static str, value: u64) {
+    TRACE.with_borrow_mut(|t| t.push((kind, value)));
+}
