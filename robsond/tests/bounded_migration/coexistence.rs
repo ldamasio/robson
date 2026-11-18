@@ -151,6 +151,17 @@ async fn contend(
         None => job.await,
     };
     let after = f.proxy.stats();
+    // Diagnostic only: the measured values behind the cancellation/outcome and
+    // actor checks below, printed once after the job has finished.
+    eprintln!(
+        "COEXIST_DIAG work={work:?} cancelled_at={cancelled_at:?} apply_bound={APPLY_BOUND:?} status={:?} observed_ok={} refused={refused} actor_statements={} actor_commits={} job_ok={:?} job_err={} job_duration={job_duration:?}",
+        f.adapter.status(),
+        observed.is_ok(),
+        cut_stats.statements - before.statements,
+        cut_stats.commits - before.commits,
+        job_result.as_ref().ok(),
+        job_result.is_err(),
+    );
     let (windows, (waiting_pid, polls)) = observed?;
     ensure!(
         slot.lock().map_err(|_| anyhow::anyhow!("gate poisoned"))?.is_none(),
