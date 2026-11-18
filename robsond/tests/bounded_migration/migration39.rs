@@ -7,7 +7,7 @@ use std::{
 };
 
 use robson_testkit::db_proxy::{DbProxy, ProxyMode, ProxyStats};
-use sqlx::{postgres::PgSslMode, PgConnection, PgPool};
+use sqlx::{migrate::Migrator, postgres::PgSslMode, PgConnection, PgPool};
 
 use super::{
     super::stages::{self, Edge, Stage},
@@ -27,7 +27,16 @@ const RESTORE_NEEDLE: &str = "SELECT set_config('lock_timeout',$1,false)";
 const HELD: &str = "SELECT l.classid::bigint,l.objid::bigint FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.pid=$1 AND a.backend_start::text=$2 AND a.state='idle' AND a.xact_start IS NULL AND l.locktype='advisory' AND l.granted AND l.objsubid=1";
 const SAME_KEY: &str = "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory' AND granted AND objsubid=1 AND classid::bigint=$1 AND objid::bigint=$2)";
 const HOLDS: &str = "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND relation='public.venue_orders'::regclass AND mode='AccessShareLock' AND granted)";
+// The given backend holds SQLx's advisory key (granted, bigint form).
+const LOCKED: &str = "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND granted AND objsubid=1 AND classid::bigint=$2 AND objid::bigint=$3)";
+// The whole durable 39 row plus the history size: any rewrite or insert moves
+// it.
+const HISTORY: &str = "SELECT description,installed_on::text,success,checksum,execution_time,(SELECT count(*) FROM _sqlx_migrations) FROM _sqlx_migrations WHERE version=20240101000039";
+// Outer test watchdog, well past the production 200 ms bound: a build without
+// that bound reaches a named assertion instead of hanging on the blackhole.
+const WATCHDOG: Duration = Duration::from_millis(1000);
 type Schema = (bool, bool, i64, i64);
+type History = (String, String, bool, Vec<u8>, i64, i64);
 const ABSENT: Schema = (false, false, 0, 0);
 const APPLIED: Schema = (true, true, 2, 2);
 
@@ -36,6 +45,29 @@ fn migration39() -> &'static Migration {
         .iter()
         .find(|m| m.version == VERSION39)
         .expect("embedded original39")
+}
+
+/// The test-only through38 inventory: the binary before migration39 existed.
+fn through38() -> Migrator {
+    let mut through38 = sqlx::migrate!("../migrations");
+    through38.migrations =
+        Cow::Owned(through38.iter().filter(|m| m.version <= VERSION).cloned().collect());
+    through38
+}
+
+/// Bounded 60x5ms poll, as in `finish`, for one raw-dropped backend.
+async fn retires(observer: &mut PgConnection, pid: i32) -> Result<bool, sqlx::Error> {
+    tokio::time::timeout(Duration::from_millis(300), async {
+        for _ in 0..60 {
+            if !alive(observer, pid).await? {
+                return Ok(true);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(false)
+    })
+    .await
+    .unwrap_or(Ok(false))
 }
 
 struct Fixture39 {
@@ -65,10 +97,7 @@ async fn metadata(c: &mut PgConnection) -> Result<Option<(bool, Vec<u8>, i64)>, 
 
 impl Fixture39 {
     async fn new(pool: &PgPool) -> anyhow::Result<Self> {
-        let mut through38 = sqlx::migrate!("../migrations");
-        through38.migrations =
-            Cow::Owned(through38.iter().filter(|m| m.version <= VERSION).cloned().collect());
-        through38.run(pool).await?;
+        through38().run(pool).await?;
         let options = pool.connect_options();
         let upstream = tokio::net::lookup_host((options.get_host(), options.get_port()))
             .await?
@@ -328,6 +357,7 @@ async fn migration39_lost_commit_ack_is_uncertain_and_durable(pool: PgPool) {
     let stats = f.proxy.stats();
     let refused = refuses_after_retirement(&mut f.adapter).await;
     let after_refusals = f.proxy.stats();
+    let key = f.key;
     let finished = f.finish().await;
     eprintln!("primary apply={result:?} duration={duration:?} status={status:?}");
     assert!(result.is_err(), "lost_commit_ack39_reported_success");
@@ -354,6 +384,158 @@ async fn migration39_lost_commit_ack_is_uncertain_and_durable(pool: PgPool) {
     assert!(success);
     assert_eq!(checksum.as_slice(), migration39().checksum.as_ref());
     assert_eq!(elapsed, -1, "lost_commit39_ran_postcommit_elapsed");
+
+    // Binary rollback boundary over the proven durable 39: SQLx 0.8.6
+    // run_direct takes its advisory lock, then returns VersionMissing before
+    // its unlock, so only retiring that raw connection releases the key.
+    let options = pool.connect_options();
+    let mut watcher = options.connect().await.expect("rollback39 watcher");
+    let before: History = sqlx::query_as(HISTORY)
+        .fetch_one(&mut watcher)
+        .await
+        .expect("durable39 history");
+    let mut old = options.connect().await.expect("rollback39 through38 connection");
+    let old_pid: i32 =
+        sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut old).await.unwrap();
+    let rollback = tokio::time::timeout(ACQUIRE_BOUND, through38().run_direct(&mut old)).await;
+    let leaked: bool = sqlx::query_scalar(LOCKED)
+        .bind(old_pid)
+        .bind(key.0)
+        .bind(key.1)
+        .fetch_one(&mut watcher)
+        .await
+        .unwrap();
+    drop(old); // Raw drop: the lock retires with its backend, never unlock SQL.
+    let old_retired = retires(&mut watcher, old_pid).await;
+    // The canonical migrator then acquires the same key, skips the durable 39
+    // by matching checksum, and unlocks.
+    let mut current = options.connect().await.expect("canonical39 connection");
+    let current_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut current)
+        .await
+        .unwrap();
+    let canonical =
+        tokio::time::timeout(ACQUIRE_BOUND, crate::MIGRATOR.run_direct(&mut current)).await;
+    let kept: bool = sqlx::query_scalar(LOCKED)
+        .bind(current_pid)
+        .bind(key.0)
+        .bind(key.1)
+        .fetch_one(&mut watcher)
+        .await
+        .unwrap();
+    let after: History = sqlx::query_as(HISTORY)
+        .fetch_one(&mut watcher)
+        .await
+        .expect("canonical39 history");
+    drop(current);
+    drop(watcher);
+    eprintln!("rollback39={rollback:?} leaked={leaked} old_retired={old_retired:?} canonical39={canonical:?} kept={kept}");
+    assert!(
+        matches!(rollback, Ok(Err(MigrateError::VersionMissing(v))) if v == VERSION39),
+        "rollback39_through38_did_not_refuse_missing39"
+    );
+    assert!(leaked, "rollback39_sqlx_refusal_boundary_changed");
+    assert!(old_retired.unwrap(), "rollback39_refusing_backend_survived_with_lock");
+    assert!(matches!(canonical, Ok(Ok(()))), "canonical39_did_not_skip_durable39");
+    assert!(!kept, "canonical39_preserved_advisory_lock");
+    assert_eq!(after, before, "canonical39_rewrote_history");
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires DATABASE_URL"]
+async fn migration39_blackhole_after_install_fires_global200_and_retires(pool: PgPool) {
+    let mut f = Fixture39::new(&pool).await.unwrap();
+    let baseline = f.baseline;
+    let slot = f.adapter.gate.clone();
+    let (hit, release) = match stages::arm(&slot, Stage::Install, Edge::AfterReturn) {
+        Ok(gate) => gate,
+        Err(error) => {
+            let cleanup = f.finish().await;
+            panic!("blackhole39 gate setup failed: {error}; cleanup_error={:?}", cleanup.err());
+        },
+    };
+    // Settings are installed and confirmed; SQLx's BEGIN has not been sent.
+    let (watched, gate) = {
+        let adapter = &mut f.adapter;
+        let proxy = &f.proxy;
+        let producer = async {
+            let started = Instant::now();
+            let result = adapter.apply(migration39()).await;
+            (result, started.elapsed())
+        };
+        let controller = async {
+            hit.await.map_err(|_| refusal("blackhole39 install return not reached"))?;
+            let seen = (proxy.mode(), proxy.stats().statements - baseline.statements);
+            proxy.set_mode(ProxyMode::Blackhole);
+            release.send(()).map_err(|_| refusal("blackhole39 stage release lost"))?;
+            Ok::<_, MigrateError>(seen)
+        };
+        tokio::join!(
+            tokio::time::timeout(WATCHDOG, producer),
+            tokio::time::timeout(Duration::from_millis(300), controller)
+        )
+    };
+    let status = f.adapter.status();
+    let stats = f.proxy.stats();
+    let trace = f.proxy.query_trace();
+    let mode = f.proxy.mode();
+    let disarmed = slot.lock().is_ok_and(|gate| gate.is_none());
+    let refused = refuses_after_retirement(&mut f.adapter).await;
+    let after_refusals = f.proxy.stats();
+    // Physical close: the raw-dropped client socket ends its relay scope.
+    let closed = tokio::time::timeout(Duration::from_millis(300), async {
+        while f.proxy.closed_relays() < stats.connections {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let closed_relays = f.proxy.closed_relays();
+    let finished = f.finish().await;
+    eprintln!(
+        "primary watched={watched:?} status={status:?} gate={gate:?} closed_relays={closed_relays}"
+    );
+    let (result, duration) = match watched {
+        Ok(returned) => returned,
+        Err(_) => panic!("migration39_blackhole_global200_missing"),
+    };
+    let error = result.expect_err("blackhole39_reported_success");
+    assert!(
+        matches!(&error, MigrateError::Source(e) if e.to_string() == "migration39 whole-apply deadline exceeded"),
+        "blackhole39_not_the_global200_branch"
+    );
+    assert!(duration >= APPLY_BOUND && duration < WATCHDOG, "blackhole39_global200_timing");
+    let seen = gate.expect("blackhole39 observer deadline").expect("actual install return");
+    assert_eq!(seen, (ProxyMode::Pass, 1), "blackhole39_injected_at_wrong_call");
+    assert_eq!(mode, ProxyMode::Blackhole, "blackhole39_mode_not_in_effect");
+    assert_eq!(
+        status,
+        Status {
+            phase: Phase::Retired,
+            failure: Some(Failure {
+                at: Phase::DelegatedApply,
+                outcome: Outcome::MayHaveCommitted,
+            }),
+        },
+        "blackhole39_wrong_conservative_outcome"
+    );
+    assert!(disarmed, "blackhole39_app_gate_survived");
+    assert_eq!(stats.statements - baseline.statements, 1, "install only reached the server");
+    assert_eq!(stats.commits - baseline.commits, 0, "blackhole39_commit_sent");
+    assert_eq!(trace.len(), 1, "blackhole39_received_trace");
+    assert!(trace[0].trim().starts_with("WITH old AS MATERIALIZED"));
+    assert!(refused, "blackhole39_retired_adapter_reused");
+    assert_eq!(after_refusals, stats);
+    assert!(
+        closed && stats.connections == baseline.connections && closed_relays == stats.connections,
+        "blackhole39_relay_not_physically_closed"
+    );
+    let finished = finished.expect("blackhole39 cleanup observation");
+    assert!(finished.retired, "blackhole39_backend_not_retired");
+    assert_eq!(finished.status, status);
+    assert_eq!(finished.stats, stats, "blackhole39_retirement_flushed_sql");
+    assert_eq!(finished.schema, ABSENT, "blackhole39_partial_schema");
+    assert_eq!(finished.metadata, None, "blackhole39_history_written");
 }
 
 #[sqlx::test(migrations = false)]
