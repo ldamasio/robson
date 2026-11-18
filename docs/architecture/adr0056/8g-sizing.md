@@ -116,11 +116,12 @@ no frontend, stream, infrastructure or production change is part of this slice.
 
 ## Private geometry staging (8g2b-1)
 
-The crate-private `balance_sizing` module now contains raw fixed-shape
-observations and exact geometry verification. This is implemented pure data
-validation, not a public sizing entry point, a current receipt, or a capital
-certificate. Candidate sizing and the connector projection remain pending in
-8g2b-2. No production caller, SQL, HTTP, task or send capability is added.
+At the8g2b-1 checkpoint, the crate-private `balance_sizing` module introduced
+raw fixed-shape observations and exact geometry verification. That staging
+checkpoint had no public sizing entry point. The next section describes the
+8g2b-2 raw calculation API; neither checkpoint creates a current receipt or
+capital certificate. No production caller, SQL, HTTP, task or send capability
+is added.
 
 `validate` checks full binding and scalar domains, reconstructing RiskConfig
 with the supplied basis and selected per-leg costs while retaining operator
@@ -160,8 +161,71 @@ sealed fixture authority; there is no public proof constructor. Zero I/O and
 no durable effects mean cancellation/crash discards only transient data.
 Missing/stale external evidence must still be refused by later admission.
 
-The staged module and bridge remain private. A narrow dead-code allowance
-marks this inert boundary and must be removed by the reviewed consuming slice.
+The first checkpoint kept the module and bridge private with a narrow staging
+dead-code allowance. The consuming8g2b-2 slice removes that allowance and
+exports only raw inputs and unqualified calculation data; the bridge stays private.
 This split trades an extra private bridge for smaller independent reviews;
 it changes neither policy nor the128-per-frame computational budget. Typed
 TechnicalWorkLimit is a proof-invariant failure, never a financial cap.
+
+
+## Unqualified candidate calculation (8g2b-2)
+
+`calculate_balance_candidate` evaluates fixed raw observations; matching IDs
+are not proof of currentness, certified capital or admission. Result fields
+are private and immutable, retaining copied original terms/hash, observations
+and exact S/Q/AF/L/Rhat/a/gross. The synchronous spot `sizing_inputs` projection
+copies full relevant price/lot/notional metadata from an already-read record,
+checking spot venue, configured symbol/assets, status and bounded order types.
+It cannot authorize account permissions or STP. No production caller exists.
+
+Preparation uses the SAME Arithmetic frame for the32-call geometry prefix and
+25 remaining calls. Candidate0..3 each get one independently bounded frame,
+maximum37 calls:57+4*37=205, within the unchanged128-per-frame/640 ceiling.
+The independent symbolic table is approved in8g2bP1; implementation traces also
+check maximal operands872bits, <=26 exact exports and <=774 integer divisions.
+Exact export may try29 scales internally; these divisions are counted separately
+from charged formula operations. TechnicalWorkLimit is an invariant failure,
+never an exposure cap or an alternate sizing policy.
+
+Native imports are also bounded. Geometry consumes at most24 conversions;
+remaining preparation20; each candidate reuses converted price/AF/step/S/Q/
+minimum/maximum/filter values and needs at most12. Total <=44+4*12=92, below
+approved128. The initial draft repeated conversions and failed the bound at154
+in a four-candidate late-Unrepresentable case with all nonbinding filters/cap
+active. Local reuse fixes that computational issue without changing charged
+operations, bits, results or counter resets. Its regression/mutant is a WORK
+budget check, not a financial-semantic kill. Native scalar comparisons remain
+fixed (conservative<=256); no caller-controlled list/exponent enters the graph.
+
+B is the supplied capital basis, A the guard-aware instrument stop. Risk quantity
+uses floor12 of(B/100)/L; physical quantity uses floor8 ofmin(B,free)*h/P. Both
+then use the lot step. Every allowed candidate prices grossQ=ceil(S/(1-f)),
+Rhat=min(S,ceil(minNotional/(AF*(1-m)))), and
+`a=S*L+(Q-S)*P+Rhat*AF*(1-f)`. No clamp, fourth reduction, percentage chart stop
+or shared USD-M helper is introduced. Stop early only when S is nonpositive or
+below mandatory quantity minimum; an unrepresentable S/Q/charge may still
+permit a later candidate and must not terminate all attempts.
+
+S0 stays rational: the max96bit/scale28 Fraction fixture has an unrepresentable
+initial S0 and an accepted second candidate. R0 also stays rational until min;
+its huge-R0 fixture correctly reaches an ordinary minimum refusal instead of
+an artificial preparation Unrepresentable error. It is NOT an example of an
+accepted trade below its protection minimum. Exact final outputs never round;
+a separate late-unrepresentable fixture passes all financial bounds before
+all four final-export refusals. Risk-floor12, physical-floor8, margin reserve,
+gross-cash and tiny-quote cancellation goldens cover the actual public function.
+
+Applicable venue min/max compare bothQ*V_filter andS*V_filter; P and AF are not
+substitutes. Financially, Q upper and S lower dominate their counterparts when
+Q>=S; mutation claims must not count redundant counterpart deletion as distinct
+financial coverage. Envelope minima, physical/operator gross caps and1% charge
+remain separate. The actual V_filter producer is still absent: later8i/8h must
+supply an already-budgeted qualifying observation or keep entry closed. No extra
+GET or composition budget is granted.8h2 sealed receipt,8l certified basis,
+8g2c handoff/capacity and8i serialized admission remain pending integration.
+
+The code retains no cache/listener/task/queue; all BigUint work is transient and
+bounded. Cancellation has no durable effect. No live production memory-profile
+claim is made for an inert calculator. Whole-workspace/security/CI and future
+caller memory/atomicity acceptance remain required before activation.

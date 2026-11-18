@@ -1,5 +1,4 @@
-//! Private, unqualified exact geometry for the later balance sizing slice.
-//! No production caller, public API, input certification, sizing or send grant.
+//! Pure unqualified balance candidate data. No production caller or send grant.
 mod arithmetic;
 mod bridge;
 mod geometry;
@@ -8,3 +7,7 @@ mod geometry_tests;
 mod inputs;
 #[cfg(test)]
 mod test_support;
+
+mod sizing;
+pub use inputs::*;
+pub use sizing::calculate_balance_candidate;

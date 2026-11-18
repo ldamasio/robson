@@ -27,6 +27,7 @@ mod ohlcv;
 mod records;
 mod rest;
 mod rules;
+mod sizing_inputs;
 mod trades;
 mod trading;
 

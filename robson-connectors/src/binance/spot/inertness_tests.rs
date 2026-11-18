@@ -315,11 +315,21 @@ fn port_contract_violations(file: &str, code: &str) -> Vec<String> {
                 && !code[at + found.len()..].chars().next().is_some_and(is_ident)
         })
         .count();
-    // 8g's bounded pure scalar parser is not a port or an activation seam.
-    // Allow only these exact helper imports, only in their input boundaries.
+    // 8g's pure scalar and metadata boundaries are not ports or activation seams.
+    // Allow only these exact imports in their designated input boundaries.
     let pure: &[&str] = match file {
         "records.rs" | "rest.rs" | "rules.rs" => &["balance_costs::exact"],
         "market_data.rs" | "ohlcv.rs" => &["balance_costs::exact::ExactDecimal"],
+        "sizing_inputs.rs" => &[
+            "balance_costs::CostIdentity",
+            "balance_sizing::LotLimits",
+            "balance_sizing::NotionalLimits",
+            "balance_sizing::ObservationRef",
+            "balance_sizing::PriceLimits",
+            "balance_sizing::SizingError",
+            "balance_sizing::SizingRules",
+            "venue::VenueId",
+        ],
         "costs.rs" => &[
             "balance_costs::CommissionComponents",
             "balance_costs::CostCandidate",
@@ -1006,4 +1016,22 @@ fn the_spot_module_sends_orders_only_through_the_ledger_and_reads_no_configurati
     assert_eq!(code("trading.rs").matches("post_signed_answer").count(), 1, "one POST call");
     assert_eq!(code("trading.rs").matches("delete_signed_answer").count(), 1, "one DELETE call");
     assert!(code("exchange.rs").contains("SubmitAttemptLedger::one_attempt("));
+}
+
+#[test]
+fn pure_sizing_projection_cannot_import_ports_or_wildcards() {
+    let pure = "use robson_exec::{balance_costs::CostIdentity,balance_sizing::{LotLimits,NotionalLimits,ObservationRef,PriceLimits,SizingError,SizingRules},venue::VenueId};";
+    assert!(port_contract_violations("sizing_inputs.rs", pure).is_empty());
+    for wrong in [
+        "use robson_exec::balance_sizing::*;",
+        "use robson_exec::{balance_sizing::SizingRules,AccountPort};",
+    ] {
+        assert!(!port_contract_violations("sizing_inputs.rs", wrong).is_empty());
+    }
+    assert!(!port_contract_violations("cache.rs", pure).is_empty());
+    assert!(!port_contract_violations(
+        "sizing_inputs.rs",
+        &format!("{pure} fn f(_: &dyn TradingPort) {{}} ")
+    )
+    .is_empty());
 }

@@ -143,3 +143,37 @@ pub enum SizingError {
         attempts: u8,
     },
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizedAmounts {
+    pub protection: Decimal,
+    pub gross_entry: Decimal,
+    pub adverse_fill: Decimal,
+    pub loss_per_unit: Decimal,
+    pub remainder: Decimal,
+    pub charge: Decimal,
+    pub gross_notional: Decimal,
+}
+/// Immutable, unqualified data; no admission, send or current-age capability.
+/// ```compile_fail
+/// use robson_exec::balance_sizing::SizingCalculation;
+/// fn overwrite_attempts(mut result: SizingCalculation) {
+///     result.attempts = 1;
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct SizingCalculation {
+    pub(super) amounts: SizedAmounts,
+    pub(super) inputs: SizingInputs,
+    pub(super) attempts: u8,
+}
+impl SizingCalculation {
+    pub fn amounts(&self) -> &SizedAmounts {
+        &self.amounts
+    }
+    pub fn inputs(&self) -> &SizingInputs {
+        &self.inputs
+    }
+    pub fn attempts(&self) -> u8 {
+        self.attempts
+    }
+}

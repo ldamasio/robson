@@ -37,8 +37,7 @@
 #![warn(clippy::all)]
 
 pub mod balance_costs;
-#[allow(dead_code)] // Private geometry staging; removed by reviewed sizing consumer.
-mod balance_sizing;
+pub mod balance_sizing;
 pub mod cancel;
 mod compat;
 #[cfg(feature = "crash-points")]
