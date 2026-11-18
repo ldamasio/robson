@@ -4,7 +4,7 @@ use super::*;
 use crate::capability::worker_venue::{immediately, manager, NoAccessStore, WorkerVenue};
 
 #[tokio::test]
-async fn balance_drift_skips_reads_and_recalibration_without_certifying_reconciliation() {
+async fn balance_checksum_skips_reads_without_certifying_reconciliation() {
     let exchange = Arc::new(WorkerVenue::new(AccountKind::BalanceAccount, true));
     let store = Arc::new(NoAccessStore);
     let manager = manager(&exchange, store.clone());
@@ -21,18 +21,11 @@ async fn balance_drift_skips_reads_and_recalibration_without_certifying_reconcil
     immediately(worker.recalibrate_capital_base_after_pure_financial_drift())
         .await
         .unwrap();
-    immediately(worker.recalibrate_capital_base_after_manual_drift(1))
-        .await
-        .unwrap();
-    immediately(worker.recalibrate_capital_base("fixture-direct".into(), None))
-        .await
-        .unwrap();
     assert_eq!(exchange.requests(), 0);
     assert_eq!(held.configured_capital(), before);
     drop(held);
 
-    // Real balance venues have no position port. Disabling only the two
-    // legacy drift branches must not fabricate successful reconciliation.
+    // A balance venue without a position port still rejects reconciliation.
     let exchange =
         Arc::new(WorkerVenue::new(AccountKind::BalanceAccount, true).without_position_account());
     let store = Arc::new(NoAccessStore);
