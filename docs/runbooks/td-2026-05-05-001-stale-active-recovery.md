@@ -31,10 +31,11 @@ Two startup policies exist:
 
 **Known policy drifts**:
 
-- When `auto_reconcile` finds a stale-Active position but no unambiguous real
-  evidence, current source logs a warning, returns success, and continues
-  startup for periodic reconciliation instead of exiting 78.
-- Phase 2 persists each reconciliation close sequentially. A later apply failure
+- The prior source continued startup when `auto_reconcile` found no unambiguous
+  real evidence. The source correction now returns the existing stale-Active
+  error before Phase 2. Verify the deployed source and its scoped release
+  evidence independently; source behavior alone is not operational acceptance.
+- Phase 2 persists each reconciliation close sequentially. A later returned apply failure
   stops the batch but does not roll back an earlier persisted close, so the
   policy's no-partial-close guarantee is not mechanically enforced.
 
@@ -56,7 +57,7 @@ process exit alone.
 
 This runbook fires when ONE of the following is true:
 
-1. **Startup reported stale-Active state**: exit 78 under `abort`, an evidence-backed close under `auto_reconcile`, or the known no-evidence warning where current source continues startup.
+1. **Startup reported stale-Active state**: exit 78 under `abort`, an evidence-backed close under `auto_reconcile`, or an abort before any close when Phase 1 lacks evidence. Verify the deployed revision and its scoped validation before using this procedure.
 2. **Steady-state unresolved event**: logs contain `Reverse reconciliation stale Active unresolved`, or `/status.reconciliation_blockers[]` reports the affected position because the worker could not gather unambiguous real fill evidence.
 3. **Operator-initiated** verification: `/status` reports `stale_active_count > 0` or a non-empty `reconciliation_blockers[]` list. The affected position may be omitted from `positions[]` so operators do not count it as live capacity, but it remains a blocker until reconciled.
 
@@ -84,7 +85,7 @@ Concretely:
 - Manual `reconcile-close` accepts `OrderFillRecord` or `UserTradeRecord` only.
 - The code default is `abort`; production currently opts into `auto_reconcile`.
 - Startup may close only when real evidence is unambiguous for the required batch.
-- The current no-evidence continue behavior is documented drift, not proof of resolution.
+- Missing or ambiguous evidence must abort before Phase 2; this source behavior alone is not operational acceptance.
 - If evidence is doubtful or ambiguous, stop and escalate. Do not estimate a fill for this command.
 
 ---
@@ -283,14 +284,19 @@ login` and retry — do not fall back to a shared token of any kind.
 - Phase 1 gathers real evidence for stale-Active positions before any close.
 - Only `OrderFillRecord` or `UserTradeRecord` may be applied automatically.
 - `AccountSnapshot` and `Estimated` are not accepted by this startup close path.
-- Phase 2 applies the evidence-backed reconciliation closes sequentially and
-  stops on the first rejection or persistence error. It is not a batch
-  transaction; an earlier persisted close is not rolled back if a later apply
-  fails.
-- Current source does not exit 78 when evidence gathering returns no match. It
-  logs a warning and continues startup for periodic reconciliation.
-- Both deviations from the fail-closed, no-partial-close policy require a
-  separate money-path review.
+- Phase 2 applies evidence-backed closes sequentially and stops on an error or
+  rejection actually returned by the apply path. It is not a batch transaction;
+  an earlier persisted close is not rolled back if a later apply fails.
+  A real close may remain in memory after append/projection failure, with stream
+  suspension and admission fencing; `Closed` alone does not prove durability.
+- The source correction returns `StartupStaleActiveDetected` when evidence
+  gathering returns no match. No Phase 2 close runs for that batch; this is
+  distinct from a persistence failure after Phase 2 has begun.
+- Source/release evidence must identify the deployed revision. Phase 2 remains
+  sequential, not transactional; its partial-persistence limitation is a separate
+  money-path dependency. A real close can remain in memory when append/projection
+  fails, with stream suspension and admission fencing; a reported close is not
+  by itself proof of durable persistence.
 
 ---
 

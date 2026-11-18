@@ -58,7 +58,16 @@ jobs:
       # the directory of each scanned lockfile, so without it the root file would
       # not apply to frontend/pnpm-lock.yaml.
       - name: Run osv-scanner
-        run: ./osv-scanner scan source --config osv-scanner.toml --lockfile Cargo.lock --lockfile frontend/pnpm-lock.yaml --lockfile scripts/requirements-security.txt
+        run: |
+          python3 scripts/test_chrono_maintenance.py
+          python3 scripts/check-chrono-maintenance.py
+      - name: Preserve original OSV result and disposition
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dependency-scan-raw-${{ github.sha }}
+          path: ${{ runner.temp }}/robson-osv-evidence/
+          if-no-files-found: error
 
   cargo-audit:
     name: Cargo Audit

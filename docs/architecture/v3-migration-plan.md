@@ -7,21 +7,27 @@
 
 ---
 
+## Product release naming and current direction
+
+The `v3` title, filenames and `MIG-v3#N` identifiers are historical internal architecture names. The next product release target is **v2.6, Binance Spot LONG-only**, following the v2.5 Futures implementation. These are separate naming axes; existing documents and identifiers are not renumbered.
+
+The Spot transition is **in progress and not ready for real capital**. Use the [public roadmap](../../ROADMAP.md) for current scope and acceptance gates, and [ADR-0056](../adr/ADR-0056-core-risk-vs-venue-adapters.md) for the venue transition. Historical launch narratives below are not evidence of current readiness or operational activation. Activation remains reserved to the operator.
+
 ## 0. PRODUCT DEFINITION
 
 ### What Robson v3 Is
 
-Robson v3 is an institutional-grade AI risk management assistant for leveraged cryptocurrency trading, operated by a single operator (Leandro) from Baar, Canton Zug, Switzerland. It enforces position sizing via the Golden Rule (`Position Size = (Capital x 1%) / |Entry - Technical Stop|`), manages position lifecycle (arm -> enter -> trail -> exit), monitors risk in real-time, and provides a complete audit trail of every decision, execution, and risk evaluation. It does NOT generate signals, predict prices, or execute trades autonomously. The operator decides WHEN to trade; Robson decides HOW MUCH and enforces THAT the risk rules are never violated.
+Robson is a single-operator execution and risk management system. It sizes governed entries from chart-derived technical stops and execution costs, manages the position lifecycle (arm -> enter -> trail -> exit), and records execution and risk decisions. It does not generate signals, predict prices, or use an LLM for trading decisions. The operator decides the entry; Robson applies deterministic execution and risk controls. The v2.6 target is Binance Spot LONG-only; the existing Futures path is legacy implementation context.
 
 ### Core Capabilities at Launch
 
 1. **Position lifecycle management**: Arm position with risk parameters -> receive entry signal -> calculate position size -> place entry -> trail stop -> exit on stop/target/manual
-2. **Risk enforcement**: Hard limits (max position size, max open positions, max daily loss, max drawdown, max exposure) and circuit breakers that HALT execution on breach
+2. **Risk enforcement**: A 1% per-trade worst-case cap and a 4% monthly budget against `capital_base`, with budget-metered admission and chart-derived stops; no static position-count or daily-loss limit ([ADR-0024](../adr/ADR-0024-trading-policy-layer.md), [ADR-0043](../adr/ADR-0043-budget-metered-entry-admission.md))
 3. **Real-time market data**: Binance WebSocket price feeds with REST fallback
 4. **Event-sourced audit trail**: Every state transition, risk decision, and execution produces an immutable event in PostgreSQL
 5. **Operator control surface**: Web UI for monitoring, ARM, approval, monthly halt, panic, and audit review
 6. **Exceptional operator CLI**: Narrow Rust commands for stale-Active recovery and income-ledger acknowledgement only
-7. **USD-M Futures trading**: Binance USD-M Futures with automatic position management
+7. **Venue transition**: Current legacy Binance USD-M Futures position management; Binance Spot LONG-only is the v2.6 target, pending its acceptance and operator activation
 
 ### What Robson v3 is NOT
 

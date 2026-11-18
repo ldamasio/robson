@@ -1,10 +1,10 @@
 {
   "name": "@robson/frontend-v2",
-  "version": "2.5.0",
+  "version": "2.6.0-alpha.2",
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=20.19"
+    "node": "22.23.5"
   },
   "scripts": {
     "dev": "vite dev",
@@ -18,23 +18,23 @@
     "lint": "prettier --check . && eslint ."
   },
   "devDependencies": {
-    "@playwright/test": "^1.65.0",
-    "@sveltejs/adapter-static": "^3.0.11",
-    "@sveltejs/kit": "^2.70.4",
-    "@sveltejs/vite-plugin-svelte": "^6.2.4",
-    "@types/node": "^20.19.43",
-    "eslint": "^10.14.0",
-    "jsdom": "^29.1.1",
-    "prettier": "^3.9.10",
-    "prettier-plugin-svelte": "^4.1.1",
-    "svelte": "^5.57.3",
-    "svelte-check": "^4.7.8",
-    "typescript": "^5.9.3",
-    "vite": "^7.3.7",
-    "vitest": "^4.1.12"
+    "@playwright/test": "1.65.0",
+    "@sveltejs/adapter-static": "4.0.1",
+    "@sveltejs/kit": "3.1.1",
+    "@sveltejs/vite-plugin-svelte": "7.0.0",
+    "@types/node": "22.19.15",
+    "eslint": "10.14.0",
+    "jsdom": "29.1.1",
+    "prettier": "3.9.10",
+    "prettier-plugin-svelte": "4.1.1",
+    "svelte": "5.57.3",
+    "svelte-check": "4.7.8",
+    "typescript": "6.0.3",
+    "vite": "8.1.6",
+    "vitest": "4.1.12"
   },
   "dependencies": {
-    "svelte-i18n": "^4.0.1"
+    "svelte-i18n": "4.0.1"
   },
   "pnpm": {
     "overrides": {
@@ -42,5 +42,8 @@
       "svelte-i18n>esbuild": "^0.28.1"
     }
   },
-  "packageManager": "pnpm@9.15.9+sha512.68046141893c66fad01c079231128e9afb89ef87e2691d69e4d40eee228988295fd4682181bae55b58418c3a253bde65a505ec7c5f9403ece5cc3cd37dcf2531"
+  "packageManager": "pnpm@9.15.9+sha512.68046141893c66fad01c079231128e9afb89ef87e2691d69e4d40eee228988295fd4682181bae55b58418c3a253bde65a505ec7c5f9403ece5cc3cd37dcf2531",
+  "imports": {
+    "#lib/*": "./src/lib/*"
+  }
 }

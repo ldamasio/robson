@@ -5,7 +5,10 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock, RwLock,
+    },
     time::Duration,
 };
 
@@ -119,6 +122,7 @@ impl<V> BoundedHistory<V> {
 /// Simulates immediate fills at a configured price.
 /// Default configuration: One-way position mode, 1x leverage.
 pub struct StubExchange {
+    fixture_reads: [AtomicU64; 8],
     /// Venue id (`stub`).
     venue_id: VenueId,
     /// Whether the optional funding surface is exposed (default: yes).
@@ -276,6 +280,7 @@ impl StubExchange {
 
     pub(crate) fn with_history_capacity(default_price: Decimal, capacity: usize) -> Self {
         Self {
+            fixture_reads: std::array::from_fn(|_| AtomicU64::new(0)),
             venue_id: VenueId::new(STUB_VENUE_ID),
             has_funding: true,
             prices: RwLock::new(HashMap::new()),
@@ -522,6 +527,14 @@ impl StubExchange {
 
     pub fn trading_rules_call_count(&self, symbol: &str) -> u64 {
         self.trading_rules_calls.read().unwrap().get(symbol).copied().unwrap_or(0)
+    }
+
+    /// Fixture port attempts, including errors, in fixed order: inventory,
+    /// wallet, order-by-id, protection-fill, open-protective-orders,
+    /// user-trades, price, trading-rules. No payload/HTTP claim; never
+    /// financial authority.
+    pub fn fixture_read_counts(&self) -> [u64; 8] {
+        std::array::from_fn(|i| self.fixture_reads[i].load(Ordering::Relaxed))
     }
 
     /// Create a stub exchange with a specific futures balance.
@@ -855,6 +868,7 @@ impl venue::TradingPort for StubExchange {
         &self,
         symbol: &Symbol,
     ) -> Result<robson_domain::SymbolTradingRules, ExecError> {
+        self.fixture_reads[7].fetch_add(1, Ordering::Relaxed);
         let symbol_pair = symbol.as_pair();
         *self
             .trading_rules_calls
@@ -1213,6 +1227,7 @@ impl venue::TradingPort for StubExchange {
         &self,
         symbol: &Symbol,
     ) -> Result<Vec<OpenOrderRecord>, ExecError> {
+        self.fixture_reads[4].fetch_add(1, Ordering::Relaxed);
         if self.should_fail() || *self.open_orders_fail.read().unwrap() {
             return Err(ExecError::Exchange("Simulated open-orders query failure".to_string()));
         }
@@ -1247,6 +1262,7 @@ impl venue::TradingPort for StubExchange {
     }
 
     async fn price(&self, symbol: &Symbol) -> Result<Price, ExecError> {
+        self.fixture_reads[6].fetch_add(1, Ordering::Relaxed);
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated price fetch failure".to_string()));
         }
@@ -1267,6 +1283,7 @@ impl venue::TradingPort for StubExchange {
         _symbol: &Symbol,
         order_id: &str,
     ) -> Result<Option<OrderResult>, ExecError> {
+        self.fixture_reads[2].fetch_add(1, Ordering::Relaxed);
         if self.should_fail() {
             return Err(ExecError::Exchange(
                 "Simulated get_order_by_exchange_id failure".to_string(),
@@ -1282,6 +1299,7 @@ impl venue::TradingPort for StubExchange {
         _symbol: &Symbol,
         stop: &StopRef,
     ) -> Result<Option<OrderResult>, ExecError> {
+        self.fixture_reads[3].fetch_add(1, Ordering::Relaxed);
         self.protection_fill_lookups
             .write()
             .unwrap()
@@ -1306,6 +1324,7 @@ impl venue::TradingPort for StubExchange {
         since: DateTime<Utc>,
         limit: u16,
     ) -> Result<Vec<UserTradeRecord>, ExecError> {
+        self.fixture_reads[5].fetch_add(1, Ordering::Relaxed);
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated get_user_trades_since failure".to_string()));
         }
@@ -1536,6 +1555,7 @@ impl venue::PositionAccountPort for StubExchange {
     }
 
     async fn balance(&self) -> Result<FuturesBalance, ExecError> {
+        self.fixture_reads[1].fetch_add(1, Ordering::Relaxed);
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated futures balance fetch failure".to_string()));
         }
@@ -1548,6 +1568,7 @@ impl venue::PositionAccountPort for StubExchange {
     }
 
     async fn open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError> {
+        self.fixture_reads[0].fetch_add(1, Ordering::Relaxed);
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated reconciliation scan failure".to_string()));
         }

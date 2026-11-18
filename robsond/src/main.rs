@@ -100,9 +100,13 @@ fn runs_the_daemon() -> bool {
 async fn async_main(stop: StopRequest) -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("robsond=info")))
+        .with(robsond::operation_observation::layer())
+        .with(fmt::layer().with_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("robsond=info")),
+        ))
         .init();
+
+    robsond::operation_observation::initialize_metrics();
 
     // Check for db subcommand
     #[cfg(feature = "postgres")]

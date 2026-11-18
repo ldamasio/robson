@@ -1,19 +1,16 @@
 // Typed API client for Robson backend.
 // Mapped to actual robsond endpoints (v2 API).
 
-import { browser } from "$app/environment";
+import { browser } from "$app/env";
 import { get as getStore } from "svelte/store";
 import { authToken, clearAuth, silentRefreshGoogleToken } from "$stores/auth";
-import { env } from "$env/dynamic/public";
+import * as env from "$app/env/public";
 
 const API_BASE: string = env.PUBLIC_ROBSON_API_BASE ?? "";
-// ADR-0054: `$env/dynamic/public` rather than `$env/static/public` — the
-// latter's named exports only exist when the var is set at `vite
-// build`/`svelte-kit sync` time, which fails typecheck entirely in any
-// environment (CI, a fresh clone) that hasn't configured a real Google
-// Client ID yet. Same build-time-baked-in mechanism either way once
-// deployed (see frontend/Dockerfile's PUBLIC_ROBSON_API_BASE precedent) —
-// this only relaxes the compile-time contract, not the runtime one.
+// ADR-0054: src/env.ts declares both public values as dynamic and optional,
+// retaining empty-string defaults in CI and fresh clones. Configured values
+// stay on SvelteKit's dynamic public path and retain the existing Docker
+// PUBLIC_* build arguments used by this static deployment.
 const GOOGLE_WEB_CLIENT_ID: string = env.PUBLIC_GOOGLE_WEB_CLIENT_ID ?? "";
 
 // --- Backend response types (match robsond serde output) ---

@@ -28,8 +28,9 @@ All slices through 5B2B are implemented and merged:
 - **Startup abort gate**: exit code 78 on any stale-Active at startup (default policy).
 - **Manual recovery path**: `robson-cli reconcile-close` + `POST /reconcile-close`.
 - **Startup `auto_reconcile`**: implemented and opt-in. Production configuration
-  was read-only verified as enabled on 2026-08-06. Validation and the no-evidence
-  fail-closed correction are tracked separately below.
+  was read-only verified as enabled on 2026-08-06. The no-evidence refusal is
+  now corrected in repository source; operational validation and the remaining
+  batch atomicity gap are tracked separately below.
 
 ### What Remains (v3)
 
@@ -39,9 +40,11 @@ All slices through 5B2B are implemented and merged:
 ### What is Deferred (v4)
 
 - Testnet drill for startup `auto_reconcile` (MIG-v4#3).
-- Estimated-evidence operator-confirmed close path (MIG-v4#7).
-- Startup no-evidence fail-closed correction (TD-2026-08-06-001).
 - Startup reconciliation batch atomicity correction (TD-2026-08-06-002).
+
+`Estimated` evidence remains permanently prohibited in `reconcile_close`. The
+historical MIG-v4#7 roadmap item does not authorize an operator-confirmed
+exception.
 
 ### References
 
@@ -56,34 +59,39 @@ All slices through 5B2B are implemented and merged:
 
 ## TD-2026-08-06-001: Startup auto-reconcile continues without evidence
 
-**Status**: Open
+**Status**: Source correction present; operational validation pending
 **Severity**: High
 **Area**: `robsond` startup reconciliation, financial lifecycle safety
 **Discovered**: 2026-08-06
+**Source correction recorded**: 2026-11-16
 
-### Evidence
+### Historical evidence
 
-When startup `auto_reconcile` detects a stale-Active position and
-`gather_real_evidence` returns no unambiguous match, current
-`robsond/src/daemon.rs` logs a warning and returns success. Startup continues
-so the periodic reconciliation worker may resolve the position.
+The 2026-08-06 implementation logged a warning and returned success when
+startup `auto_reconcile` detected a stale-Active position but
+`gather_real_evidence` returned no unambiguous match. Startup continued so the
+periodic reconciliation worker might resolve the position. Production
+configuration was read-only verified as `auto_reconcile` on that date.
 
-This differs from ADR-0022 and the reconciliation policy, which require exit 78
-with no partial close when any stale-Active position lacks real evidence.
-Production configuration was read-only verified as `auto_reconcile` on
-2026-08-06, so this is not a dormant branch.
+This differed from ADR-0022 and the reconciliation policy, which require exit
+78 with no partial close when any stale-Active position lacks real evidence.
+The historical description above is not the current repository behavior.
 
-### Required correction
+### Repository correction and remaining acceptance
 
-- Keep `OrderFillRecord` and `UserTradeRecord` as the only automatic startup
-  evidence sources.
-- Return the startup stale-Active error when any required evidence is absent.
-- Preserve the read-only first phase and no-partial-close guarantee.
-- Add a regression test for the no-evidence branch and complete the deferred
-  testnet drill before declaring the operational path validated.
+`run_startup_auto_reconcile` in `robsond/src/daemon.rs` now returns
+`StartupStaleActiveDetected` if any required real evidence is absent, before
+Phase 2 applies any close. Its existing startup error mapping is exit 78. The
+first phase remains read-only. Only `OrderFillRecord` and `UserTradeRecord`
+qualify; `AccountSnapshot` and `Estimated` remain rejected for automatic
+startup and the manual recovery evidence rules are unchanged.
 
-The correction changes a real-money lifecycle path and requires a separate,
-explicitly approved PR. This documentation cleanup does not modify runtime code.
+This source correction does not establish deployment or completed operational
+validation. Applicable review, validation and the outstanding testnet drill
+remain necessary before calling the operational path validated. It also does
+not resolve Phase 2's partial-batch liability in TD-2026-08-06-002: the policy's
+no-partial-close requirement remains in force. This documentation update does
+not change runtime code.
 
 ---
 
@@ -98,9 +106,11 @@ explicitly approved PR. This documentation cleanup does not modify runtime code.
 
 `run_startup_auto_reconcile` gathers evidence for the full stale-Active set
 before writing, but `apply_startup_auto_reconcile_batch` then calls
-`reconcile_close` once per position in a sequential loop. Each successful call
-persists its own terminal event. A rejection or persistence error on a later
-position stops the loop without rolling back earlier closes.
+`reconcile_close` once per position in a sequential loop. Terminal events are
+persisted per position, not as one batch. A rejection or persistence error on a
+later position cannot roll back an earlier persisted close. In addition,
+`record_venue_close(false)` can leave a position locally `Closed` under fencing;
+a close result alone is not proof of a durable terminal event.
 
 The read-only evidence phase is all-or-nothing, but the write phase is not a
 batch transaction. Therefore the policy's no-partial-close guarantee is not

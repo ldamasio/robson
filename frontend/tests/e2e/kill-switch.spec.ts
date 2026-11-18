@@ -13,6 +13,7 @@ const MOCK_STATUS = {
   monthly_realized_loss: 0,
   monthly_realized_loss_pct: 0,
   capital_base: 10000,
+  wallet_balance: 10000,
 };
 
 const MOCK_HALT_HALTED = {
@@ -217,7 +218,7 @@ test.describe("Kill Switch", () => {
     await expect(page.locator(".state-line")).toContainText("SLOT 2/4");
   });
 
-  test("pt-BR locale uses DESLIGAR keyword", async ({ page }) => {
+  test("pt-BR locale uses DESLIGAR keyword", async ({ page, baseURL }) => {
     await page.route("**/monthly-halt", (route) =>
       route.fulfill({
         status: 200,
@@ -233,12 +234,10 @@ test.describe("Kill Switch", () => {
       }),
     );
 
-    // Set pt-BR locale cookie before auth
+    // Set pt-BR locale cookie for the served origin before auth
     await page
       .context()
-      .addCookies([
-        { name: "locale", value: "pt-BR", domain: "localhost", path: "/" },
-      ]);
+      .addCookies([{ name: "locale", value: "pt-BR", url: baseURL }]);
 
     await authAndGoto(page, "/kill-switch");
     await expect(page.locator(".ks-page")).toBeVisible({ timeout: 10_000 });
@@ -254,7 +253,7 @@ test.describe("Kill Switch", () => {
     await expect(page.locator(".btn-confirm")).toBeDisabled();
   });
 
-  test("en locale uses DISABLE keyword", async ({ page }) => {
+  test("en locale uses DISABLE keyword", async ({ page, baseURL }) => {
     await page.route("**/monthly-halt", (route) =>
       route.fulfill({
         status: 200,
@@ -270,12 +269,10 @@ test.describe("Kill Switch", () => {
       }),
     );
 
-    // Set en locale cookie before auth
+    // Set en locale cookie for the served origin before auth
     await page
       .context()
-      .addCookies([
-        { name: "locale", value: "en", domain: "localhost", path: "/" },
-      ]);
+      .addCookies([{ name: "locale", value: "en", url: baseURL }]);
 
     await authAndGoto(page, "/kill-switch");
     await expect(page.locator(".ks-page")).toBeVisible({ timeout: 10_000 });

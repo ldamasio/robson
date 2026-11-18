@@ -1,5 +1,5 @@
 import { writable, derived } from 'svelte/store';
-import { browser } from '$app/environment';
+import { browser } from '$app/env';
 
 export type Session = {
   authenticated: boolean;
@@ -124,69 +124,60 @@ function createAuthStore() {
     if (!browser || !window.google?.accounts?.id) return Promise.resolve(null);
     if (inFlightRefresh) return inFlightRefresh;
 
-    inFlightRefresh = new Promise<string | null>((resolve) => {
+    inFlightRefresh = new Promise<string | null>((resolve, reject) => {
       let settled = false;
-      // Cleared on every settlement path (not just its own timeout firing)
-      // so an early settle via the credential callback or moment listener
-      // doesn't leave this timer armed to `cancel()` a *later*,
-      // independent silentRefresh call after this one's lock has already
-      // been released — Codex review caught this as a real, separate race
-      // from the one the timeout/cancel logic itself was added to fix.
       let timeoutId: ReturnType<typeof setTimeout> | undefined;
-      const settle = (value: string | null) => {
-        if (settled) return;
+      const settle = (value: string | null): boolean => {
+        if (settled) return false;
         settled = true;
         clearTimeout(timeoutId);
+        // Only the winning callback may publish a credential. A callback
+        // delivered after cancellation or timeout must not restore auth.
+        if (value) setToken(value);
         resolve(value);
+        return true;
       };
 
-      window.google!.accounts.id.initialize({
-        client_id: clientId,
-        callback: (response) => {
-          if (response?.credential) {
-            setToken(response.credential);
-            settle(response.credential);
-          } else {
-            settle(null);
-          }
-        },
-      });
-
-      window.google!.accounts.id.prompt((notification) => {
-        if (
-          notification?.isNotDisplayed?.() ||
-          notification?.isSkippedMoment?.() ||
-          notification?.isDismissedMoment?.()
-        ) {
-          settle(null);
-        }
-      });
-
-      // Safety timeout: GIS's moment listener isn't guaranteed to fire in
-      // every browser/state combination — never hang the caller forever.
-      // Waiting it out passively isn't enough, though: Google's own docs
-      // say the underlying FedCM `navigator.credentials.get()` this
-      // triggers can take up to a minute to notify (or never notify at
-      // all), so merely *timing out* on our end doesn't mean that
-      // browser-level call has actually finished — releasing
-      // `inFlightRefresh` at that point could let a second concurrent
-      // caller start another `initialize()`/`prompt()` cycle into it,
-      // reproducing the exact NotAllowedError race this lock exists to
-      // prevent (confirmed by a Codex review round on an earlier version
-      // of this fix that just extended the timeout instead). So this
-      // explicitly cancels the pending GIS operation first — the
-      // documented way to actually terminate it — before releasing the
-      // lock, rather than assuming it settled on its own. `cancel()`'s
-      // failure/no-op behavior isn't documented, so this doesn't assume
-      // it's safe to call unconditionally.
+      // Own the timer before GIS can invoke either callback synchronously.
+      // The timeout selects its result before cancel can re-enter the
+      // credential callback. The single-flight lock is released by finally
+      // after this synchronous cancellation has returned.
       timeoutId = setTimeout(() => {
+        if (!settle(null)) return;
         try {
           window.google?.accounts?.id?.cancel?.();
         } catch {
-          // best-effort — still settle below either way
+          // best-effort — the timeout already owns the null result
         }
-        settle(null);
       }, 5000);
+
+      try {
+        window.google!.accounts.id.initialize({
+          client_id: clientId,
+          callback: (response) => {
+            settle(response?.credential || null);
+          },
+        });
+
+        if (!settled) {
+          window.google!.accounts.id.prompt((notification) => {
+            if (
+              notification?.isNotDisplayed?.() ||
+              notification?.isSkippedMoment?.() ||
+              notification?.isDismissedMoment?.()
+            ) {
+              settle(null);
+            }
+          });
+        }
+      } catch (error) {
+        // Preserve SDK rejection semantics while releasing our timer.
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeoutId);
+          reject(error);
+        }
+      }
     }).finally(() => {
       inFlightRefresh = null;
     });
