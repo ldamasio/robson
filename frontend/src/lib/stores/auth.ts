@@ -133,7 +133,14 @@ function createAuthStore() {
         clearTimeout(timeoutId);
         // Only the winning callback may publish a credential. A callback
         // delivered after cancellation or timeout must not restore auth.
-        if (value) setToken(value);
+        // A storage failure while publishing still settles the shared
+        // attempt: every waiter sees the error instead of hanging forever.
+        try {
+          if (value) setToken(value);
+        } catch (error) {
+          reject(error);
+          return true;
+        }
         resolve(value);
         return true;
       };

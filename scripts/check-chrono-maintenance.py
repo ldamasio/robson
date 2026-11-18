@@ -5,7 +5,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
+# subprocess runs only the hash-pinned scanner in main(), never a shell.
+import subprocess  # nosec B404
 import sys
 import tomllib
 
@@ -102,7 +103,8 @@ def main():
             argv += ["--lockfile", name]
         decision.update(scanner_started=True, argv=argv, inputs_sha256=before)
         with (evidence / "scanner.stdout.json").open("xb") as out, (evidence / "scanner.stderr.log").open("xb") as err:
-            completed = subprocess.run(argv, cwd=root, stdout=out, stderr=err, timeout=600, check=False)
+            # argv is fixed: the SHA-256-verified scanner and constant flags/lockfiles; no shell.
+            completed = subprocess.run(argv, cwd=root, stdout=out, stderr=err, timeout=600, check=False)  # nosec B603
         decision["raw_scanner_status"] = completed.returncode
         (evidence / "scanner.exit.txt").write_text(str(completed.returncode) + "\n")
         require(before == input_hashes(root), "scanner/input changed during scan")

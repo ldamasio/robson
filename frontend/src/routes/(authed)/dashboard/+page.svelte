@@ -18,7 +18,11 @@
   import { recentEvents, pushEvent, mergeEvents } from "$stores/events";
   import { toasts, showToast } from "$stores/toast";
   import { status as sharedStatus, refreshStatus } from "$stores/status";
-  import { STATUS_POLL_MS, shouldPollStatus } from "#lib/config/polling.ts";
+  import {
+    STATUS_POLL_MS,
+    dashboardStreamHandlers,
+    shouldPollStatus,
+  } from "#lib/config/polling.ts";
   import {
     sseFreshness,
     markSseEvent,
@@ -30,6 +34,8 @@
     sortPositionsOldestFirst,
   } from "#lib/config/slots.ts";
   import { formatTimeUtc, isTodayUtc, utcDateKey } from "#lib/utils/time.ts";
+  import { exclusiveMutation, mutationPending } from "$stores/mutation";
+  import { selectionRefresh } from "#lib/utils/refresh.ts";
   import {
     deriveBudgetView,
     MONTHLY_BUDGET_LIMIT_PCT,
@@ -50,15 +56,32 @@
   let connected = $state(false);
   let closeSse: (() => void) | null = null;
   let showArmModal = $state(false);
-  let pendingApprovals = $state<PendingApproval[]>([]);
-  let historyError = $state<string | null>(null);
+  // History state carries the month it belongs to, so nothing published for
+  // one month is ever shown under another month's heading.
+  let historyFailure = $state<{ month: string; message: string } | null>(null);
   let eventsError = $state<string | null>(null);
   let eventsLoading = $state(true);
   let eventHistoryRequest = 0;
   let selectedMonth = $state(currentMonthKey());
-  let monthlyPositions = $state<Position[]>([]);
-  let monthlySlotCellsTotal = $state<number | null>(null);
+  let monthlyHistory = $state<{
+    month: string;
+    positions: Position[];
+    slotCellsTotal: number | null;
+  } | null>(null);
+  let shownHistory = $derived(
+    monthlyHistory?.month === selectedMonth ? monthlyHistory : null,
+  );
+  let monthlyPositions = $derived(shownHistory?.positions ?? []);
+  let monthlySlotCellsTotal = $derived(shownHistory?.slotCellsTotal ?? null);
+  let historyError = $derived(
+    historyFailure?.month === selectedMonth ? historyFailure.message : null,
+  );
   let currentStatus = $derived($sharedStatus);
+  // From the shared status, so every refresh path (bootstrap, SSE-triggered,
+  // poll, NavBar) updates the approval list, not only loadStatus().
+  let pendingApprovals = $derived<PendingApproval[]>(
+    currentStatus?.pending_approvals ?? [],
+  );
   let approvalTick = $state(Date.now());
   let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
   let sseRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -264,7 +287,6 @@
         activePositions.set(
           status.positions.filter((op) => isRenderableLivePosition(op)),
         );
-        pendingApprovals = status.pending_approvals;
       }
       haltStatus.set(halt);
       connected = true;
@@ -275,21 +297,31 @@
     }
   }
 
-  async function loadHistory() {
-    historyError = null;
-    monthlySlotCellsTotal = null;
-    try {
-      const response = await robsonApi.getMonthlyPositions(selectedMonth);
-      monthlyPositions = response.positions;
+  // History reads are serialized per dashboard and bound to the month on
+  // view: each read publishes only if its month is still selected, repeated
+  // refreshes of the same month keep publishing, and a month change (which
+  // always triggers a refresh) is read by the coalesced follow-up.
+  const loadHistory = selectionRefresh({
+    selection: () => selectedMonth,
+    read: (month: string) => robsonApi.getMonthlyPositions(month),
+    publish: (month, response) => {
       const maybeTotal = Number(
         (response as { slot_cells_total?: unknown }).slot_cells_total,
       );
-      monthlySlotCellsTotal = Number.isFinite(maybeTotal) ? maybeTotal : null;
-    } catch (e) {
-      historyError =
-        e instanceof Error ? e.message : "Failed to load month history";
-    }
-  }
+      monthlyHistory = {
+        month,
+        positions: response.positions,
+        slotCellsTotal: Number.isFinite(maybeTotal) ? maybeTotal : null,
+      };
+      historyFailure = null;
+    },
+    fail: (month, e) => {
+      historyFailure = {
+        month,
+        message: e instanceof Error ? e.message : "Failed to load month history",
+      };
+    },
+  });
 
   async function loadTodayEvents(date = utcDateKey()) {
     const requestId = ++eventHistoryRequest;
@@ -326,47 +358,25 @@
 
   function startSse() {
     stopSse();
+    const handlers = dashboardStreamHandlers<SseEvent>({
+      anchor: () => void Promise.all([loadStatus(), loadTodayEvents()]),
+      scheduleRefresh,
+      pushEvent,
+      markEvent: markSseEvent,
+      markConnected: markSseConnected,
+      markStale: markSseStale,
+      setConnected: (value) => (connected = value),
+    });
     closeSse = connectEventStream(
-      (event: SseEvent) => {
-        markSseEvent();
-        pushEvent(event);
-        const payload = event.payload as Record<string, unknown>;
-        const posId = payload.position_id as string | undefined;
-        if (posId && event.event_type === "position.changed") {
-          scheduleRefresh();
-        }
-        if (event.event_type.startsWith("query.")) {
-          scheduleRefresh();
-        }
-        if (event.event_type === "month_boundary.reset") {
-          scheduleRefresh();
-        }
-        if (event.event_type === "system.resync_required") {
-          scheduleRefresh();
-        }
-      },
-      () => {
-        connected = false;
-      },
-      () => {
-        connected = true;
-        markSseConnected();
-        void Promise.all([loadStatus(), loadTodayEvents()]);
-      },
+      handlers.onEvent,
+      handlers.onError,
+      handlers.onReconnect,
       (staleSecs) => {
-        markSseStale();
-        connected = false;
+        handlers.onStale();
         console.warn(`SSE stale for ${staleSecs}s, reconnecting`);
       },
-      () => {
-        markSseEvent();
-      },
-      () => {
-        // First connection included: without this the badge read "STALE,
-        // reconnecting" on every mount until the first heartbeat.
-        connected = true;
-        markSseConnected();
-      },
+      handlers.onActivity,
+      handlers.onOpen,
     );
   }
 
@@ -450,23 +460,25 @@
     };
   });
 
-  async function approve(queryId: string) {
+  // One mutation at a time, app-wide: the authed layout freezes the whole
+  // surface until the pending request resolves (guardrail 4).
+  const approve = exclusiveMutation(async (queryId: string) => {
     try {
       await robsonApi.approveQuery(queryId);
       void load();
     } catch {
       // error handled by next poll refresh
     }
-  }
+  });
 
-  async function disarm(positionId: string) {
+  const disarm = exclusiveMutation(async (positionId: string) => {
     try {
       await robsonApi.closePosition(positionId);
       void load();
     } catch {
       // next poll will refresh state
     }
-  }
+  });
 </script>
 
 <svelte:head>
@@ -736,8 +748,11 @@
                           op,
                         ).join("\n")}</pre>
                       <Row justify="end">
-                        <button class="btn-disarm" onclick={() => disarm(op.id)}
-                          >DISARM</button
+                        <button
+                          class="btn-disarm"
+                          disabled={$mutationPending}
+                          aria-busy={$mutationPending}
+                          onclick={() => disarm(op.id)}>DISARM</button
                         >
                       </Row>
                     </Stack>
@@ -811,6 +826,8 @@
                 </Stack>
                 <button
                   class="btn-approve"
+                  disabled={$mutationPending}
+                  aria-busy={$mutationPending}
                   onclick={() => approve(approval.query_id)}>APPROVE</button
                 >
               </Row>
@@ -1198,8 +1215,13 @@
     transition: background var(--dur) var(--ease);
     white-space: nowrap;
   }
-  .btn-approve:hover {
+  .btn-approve:hover:not(:disabled) {
     background: var(--cyan-subtle);
+  }
+  .btn-approve:disabled,
+  .btn-disarm:disabled {
+    opacity: 0.5;
+    cursor: wait;
   }
   .btn-disarm {
     background: transparent;
@@ -1213,7 +1235,7 @@
     border-radius: 2px;
     transition: background 0.15s;
   }
-  .btn-disarm:hover {
+  .btn-disarm:hover:not(:disabled) {
     background: color-mix(in srgb, var(--color-err, #e55) 15%, transparent);
   }
   .btn-nav {
