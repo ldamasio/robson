@@ -105,9 +105,9 @@ mod derived_retry {
         }
         .with_subscriber(probe.dispatch())
         .await;
-        // Capture intentionally owns the most recent Counts. Drop only that
+        // Capture intentionally owns the most recent Counts. Release only that
         // test capture, keeping the real journal/backend alive for drain proof.
-        drop(probe);
+        probe.release();
         assert_eq!(Arc::strong_count(&old), 1, "no retained old origin after landing");
         if let Some(new) = new {
             assert_eq!(Arc::strong_count(&new), 1, "no derived work retained by B");
