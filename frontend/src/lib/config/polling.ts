@@ -31,3 +31,46 @@ export function operationNeedsRefresh(
   if (event.event_type === 'system.resync_required') return true;
   return operationId !== '' && event.payload?.position_id === operationId;
 }
+
+type StreamEvent = { event_type: string; payload: Record<string, unknown> };
+
+/** SSE handlers for the operation page. Every successful stream
+ *  establishment, the first one included, re-reads the snapshot: events sent
+ *  before the subscription existed are not replayed, so the snapshot taken at
+ *  mount can already be stale when the stream opens. */
+export function operationStreamHandlers<E extends StreamEvent>(
+  operationId: string,
+  deps: {
+    refreshNow: () => void;
+    scheduleRefresh: () => void;
+    appendEvent: (event: E) => void;
+    markEvent: () => void;
+    markConnected: () => void;
+    markStale: () => void;
+  },
+) {
+  return {
+    onEvent(event: E) {
+      deps.markEvent();
+      if (event.payload?.position_id === operationId) deps.appendEvent(event);
+      if (operationNeedsRefresh(event, operationId)) deps.scheduleRefresh();
+    },
+    onError() {
+      deps.markStale();
+    },
+    onReconnect() {
+      deps.markConnected();
+      deps.refreshNow();
+    },
+    onStale() {
+      deps.markStale();
+    },
+    onActivity() {
+      deps.markEvent();
+    },
+    onOpen() {
+      deps.markConnected();
+      deps.refreshNow();
+    },
+  };
+}

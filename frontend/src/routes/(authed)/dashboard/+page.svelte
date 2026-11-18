@@ -30,7 +30,7 @@
     sortPositionsOldestFirst,
   } from "#lib/config/slots.ts";
   import { formatTimeUtc, isTodayUtc, utcDateKey } from "#lib/utils/time.ts";
-  import { singleFlight } from "#lib/utils/mutation.ts";
+  import { exclusiveMutation, mutationPending } from "$stores/mutation";
   import {
     deriveBudgetView,
     MONTHLY_BUDGET_LIMIT_PCT,
@@ -451,27 +451,25 @@
     };
   });
 
-  // One mutation at a time: APPROVE and DISARM stay disabled until the
-  // pending request resolves (guardrail 4, no double submit).
-  let mutating = $state(false);
-
-  const approve = singleFlight(async (queryId: string) => {
+  // One mutation at a time, app-wide: the authed layout freezes the whole
+  // surface until the pending request resolves (guardrail 4).
+  const approve = exclusiveMutation(async (queryId: string) => {
     try {
       await robsonApi.approveQuery(queryId);
       void load();
     } catch {
       // error handled by next poll refresh
     }
-  }, (busy) => (mutating = busy));
+  });
 
-  const disarm = singleFlight(async (positionId: string) => {
+  const disarm = exclusiveMutation(async (positionId: string) => {
     try {
       await robsonApi.closePosition(positionId);
       void load();
     } catch {
       // next poll will refresh state
     }
-  }, (busy) => (mutating = busy));
+  });
 </script>
 
 <svelte:head>
@@ -743,8 +741,8 @@
                       <Row justify="end">
                         <button
                           class="btn-disarm"
-                          disabled={mutating}
-                          aria-busy={mutating}
+                          disabled={$mutationPending}
+                          aria-busy={$mutationPending}
                           onclick={() => disarm(op.id)}>DISARM</button
                         >
                       </Row>
@@ -819,8 +817,8 @@
                 </Stack>
                 <button
                   class="btn-approve"
-                  disabled={mutating}
-                  aria-busy={mutating}
+                  disabled={$mutationPending}
+                  aria-busy={$mutationPending}
                   onclick={() => approve(approval.query_id)}>APPROVE</button
                 >
               </Row>

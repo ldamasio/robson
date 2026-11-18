@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { OPERATION_REFRESH_MS, STATUS_POLL_MS, operationNeedsRefresh, shouldPollStatus } from '#lib/config/polling.ts';
+import { OPERATION_REFRESH_MS, STATUS_POLL_MS, operationNeedsRefresh, operationStreamHandlers, shouldPollStatus } from '#lib/config/polling.ts';
 
 describe('status polling policy', () => {
   it('polls only with an open position in a visible tab', () => {
@@ -43,5 +43,46 @@ describe('operation details refresh policy', () => {
 
   it('coalesces refreshes into a bounded window', () => {
     expect(OPERATION_REFRESH_MS).toBeGreaterThanOrEqual(1_000);
+  });
+});
+
+describe('operation stream handlers', () => {
+  function handlers() {
+    const calls: string[] = [];
+    const h = operationStreamHandlers('op-1', {
+      refreshNow: () => calls.push('refreshNow'),
+      scheduleRefresh: () => calls.push('schedule'),
+      appendEvent: () => calls.push('append'),
+      markEvent: () => calls.push('event'),
+      markConnected: () => calls.push('connected'),
+      markStale: () => calls.push('stale'),
+    });
+    return { h, calls };
+  }
+
+  it('re-reads the snapshot when the first connection opens', () => {
+    const { h, calls } = handlers();
+    h.onOpen();
+    expect(calls).toEqual(['connected', 'refreshNow']);
+  });
+
+  it('re-reads the snapshot after every reconnect', () => {
+    const { h, calls } = handlers();
+    h.onReconnect();
+    expect(calls).toEqual(['connected', 'refreshNow']);
+  });
+
+  it('schedules a refresh for its own position and ignores others', () => {
+    const { h, calls } = handlers();
+    h.onEvent({ event_type: 'position.changed', payload: { position_id: 'op-1' } });
+    h.onEvent({ event_type: 'position.changed', payload: { position_id: 'op-2' } });
+    expect(calls).toEqual(['event', 'append', 'schedule', 'event']);
+  });
+
+  it('marks the stream stale on error and on the idle watchdog', () => {
+    const { h, calls } = handlers();
+    h.onError();
+    h.onStale();
+    expect(calls).toEqual(['stale', 'stale']);
   });
 });

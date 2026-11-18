@@ -6,8 +6,8 @@
   import { page } from '$app/state';
   import { robsonApi, connectEventStream, type Position, type SseEvent } from '$api/robson';
   import { formatTimeUtc } from '#lib/utils/time.ts';
-  import { OPERATION_REFRESH_MS, operationNeedsRefresh } from '#lib/config/polling.ts';
-  import { latestOnly } from '#lib/utils/latest.ts';
+  import { OPERATION_REFRESH_MS, operationStreamHandlers } from '#lib/config/polling.ts';
+  import { serialRefresh } from '#lib/utils/refresh.ts';
   import { sseFreshness, markSseEvent, markSseConnected, markSseStale } from '$stores/sseFreshness';
   import {
     positionLabel,
@@ -31,25 +31,24 @@
   let summaryLines = $derived(position ? positionSummaryLines(position) : []);
   let metaLine = $derived(position ? positionMetaLine(position) : '');
 
-  // Refreshes can overlap (events, reconnects, retry): only the newest
-  // request may publish, so a slow older snapshot never restores stale state.
-  const positionRequests = latestOnly();
-
-  async function loadPosition() {
+  // Snapshot reads run one at a time; triggers during a read coalesce into
+  // one follow-up. Results publish in order and every read publishes, so a
+  // slow older snapshot never overwrites a newer one and a steady trigger
+  // stream cannot starve the page.
+  const loadPosition = serialRefresh(async () => {
     if (!operationId) return;
-    const isCurrent = positionRequests.begin();
     error = null;
     try {
-      const loaded = await robsonApi.getPosition(operationId);
-      if (isCurrent()) position = loaded;
+      position = await robsonApi.getPosition(operationId);
     } catch (e) {
-      if (isCurrent()) error = e instanceof Error ? e.message : 'Failed to load position';
+      error = e instanceof Error ? e.message : 'Failed to load position';
     }
-  }
+  });
 
   // The stream is a delta feed: re-read the position snapshot when an event
-  // concerns it, on a server resync request and after every reconnect, at
-  // most once per window so a burst cannot become a request storm.
+  // concerns it or the server asks for a resync, at most once per window so a
+  // burst cannot become a request storm; every stream establishment re-reads
+  // it at once (operationStreamHandlers).
   function scheduleRefresh() {
     if (refreshTimer) return;
     refreshTimer = setTimeout(() => {
@@ -60,35 +59,27 @@
 
   function startSse() {
     stopSse();
+    const handlers = operationStreamHandlers<SseEvent>(operationId, {
+      refreshNow: () => void loadPosition(),
+      scheduleRefresh,
+      appendEvent: (event) => {
+        seq += 1;
+        const tagged: TaggedEvent = { ...event, _seq: seq };
+        events = events.length >= MAX_OP_EVENTS
+          ? [...events.slice(-(MAX_OP_EVENTS - 1)), tagged]
+          : [...events, tagged];
+      },
+      markEvent: markSseEvent,
+      markConnected: markSseConnected,
+      markStale: markSseStale
+    });
     closeSse = connectEventStream(
-      (event: SseEvent) => {
-        markSseEvent();
-        const payload = event.payload as Record<string, unknown>;
-        if (payload.position_id === operationId) {
-          seq += 1;
-          const tagged: TaggedEvent = { ...event, _seq: seq };
-          events = events.length >= MAX_OP_EVENTS
-            ? [...events.slice(-(MAX_OP_EVENTS - 1)), tagged]
-            : [...events, tagged];
-        }
-        if (operationNeedsRefresh(event, operationId)) scheduleRefresh();
-      },
-      () => {
-        markSseStale();
-      },
-      () => {
-        markSseConnected();
-        scheduleRefresh();
-      },
-      () => {
-        markSseStale();
-      },
-      () => {
-        markSseEvent();
-      },
-      () => {
-        markSseConnected();
-      }
+      handlers.onEvent,
+      handlers.onError,
+      handlers.onReconnect,
+      handlers.onStale,
+      handlers.onActivity,
+      handlers.onOpen
     );
   }
 

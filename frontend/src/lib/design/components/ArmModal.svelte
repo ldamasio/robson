@@ -1,6 +1,7 @@
 <script lang="ts">
   import { robsonApi, type EntryPreview } from "$api/robson";
   import { previewLines, previewSeverity } from "#lib/presentation/preview.ts";
+  import { exclusiveMutation } from "$stores/mutation";
 
   let {
     onclose,
@@ -55,7 +56,7 @@
     symbol = input.value.toUpperCase();
   }
 
-  async function submit() {
+  const submit = exclusiveMutation(async () => {
     error = null;
     if (!symbol.trim()) {
       error = "SYMBOL REQUIRED";
@@ -83,7 +84,7 @@
     } finally {
       submitting = false;
     }
-  }
+  });
 </script>
 
 <svelte:window
