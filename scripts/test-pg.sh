@@ -16,12 +16,22 @@
 #
 # Usage:
 #   DATABASE_URL=postgres://... bash scripts/test-pg.sh
-#   DATABASE_URL=postgres://... bash scripts/test-pg.sh --test crash_recovery
+#   DATABASE_URL=postgres://... bash scripts/test-pg.sh crash_recovery   # name filter, serial
 #   DATABASE_URL=postgres://... bash scripts/test-pg.sh --crash-harness
 #
-# What runs:
+# What runs (no extra args): two phases over the same workspace selection,
+#   1. cargo test --workspace --exclude robson-connectors --features postgres
+#                 --no-fail-fast -- --ignored --skip bounded_migration::public_pg::
+#   2. the same selection -- --ignored bounded_migration::public_pg:: --test-threads=1
+#   Phase 2 is the migration38 suite: its server-side 40 ms statement and 200 ms
+#   apply bounds are measured, so its tests never run beside each other. Phase 1
+#   keeps libtest's default concurrency. Both phases run; the script fails if
+#   either failed. Together they select every ignored test exactly once.
+# With extra args (a caller subset), one invocation:
 #   cargo test --workspace --exclude robson-connectors --features postgres
-#              -- --ignored [extra args]
+#              --no-fail-fast -- --ignored [extra args] --test-threads=1
+#   A caller may pass --test-threads=1; any other thread count is refused, so a
+#   subset that reaches the suite cannot run it concurrently.
 #   robson-connectors is excluded, as in CI: its ignored tests call the live
 #   Binance API and need no database.
 #   With --crash-harness (robsond/tests/crash_harness.rs, ADR-0056 step 7):
@@ -122,7 +132,32 @@ echo ""
 warn "sqlx::test creates temporary databases on the server — expected, safe, ephemeral."
 echo ""
 
-cargo test --workspace --exclude robson-connectors --features postgres -- --ignored "$@"
+SUITE="bounded_migration::public_pg::"
+CARGO=(cargo test --workspace --exclude robson-connectors --features postgres --no-fail-fast)
+
+if [[ $# -gt 0 ]]; then
+    args=()
+    for arg in "$@"; do
+        case "${arg}" in
+            --test-threads=1) ;;
+            --test-threads|--test-threads=*)
+                fail "Only --test-threads=1 is accepted: ${SUITE} tests must not run concurrently."
+                exit 2 ;;
+            *) args+=("${arg}") ;;
+        esac
+    done
+    "${CARGO[@]}" -- --ignored "${args[@]}" --test-threads=1
+else
+    status=0
+    info "Phase 1: every ignored test outside ${SUITE}"
+    "${CARGO[@]}" -- --ignored --skip "${SUITE}" || status=1
+    info "Phase 2: ${SUITE} one test at a time"
+    "${CARGO[@]}" -- --ignored "${SUITE}" --test-threads=1 || status=1
+    if [[ ${status} -ne 0 ]]; then
+        fail "Postgres integration tests failed."
+        exit 1
+    fi
+fi
 
 echo ""
 success "All Postgres integration tests passed."
