@@ -1,7 +1,7 @@
 # Stage 1: build
-# Pinned by digest; Vite 7 needs Node >= 20.19 and engine-strict in .npmrc
+# Pinned by digest; SvelteKit 3 needs Node >= 22.17 and engine-strict in .npmrc
 # makes pnpm fail loudly if the runtime ever drifts below it.
-FROM docker.io/library/node:20.20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS build
+FROM docker.io/library/node:22.23.5-alpine3.24@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a AS build
 
 WORKDIR /app
 
@@ -24,6 +24,13 @@ RUN pnpm run build
 
 # Stage 2: runtime
 FROM docker.io/library/nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+
+# Prepare cache ownership and a PID path writable by the runtime user.
+RUN set -eu; \
+    test "$(grep -Fxc 'pid        /run/nginx.pid;' /etc/nginx/nginx.conf)" -eq 1; \
+    sed -i 's|^pid        /run/nginx[.]pid;$|pid        /tmp/nginx.pid;|' /etc/nginx/nginx.conf; \
+    test "$(grep -Fxc 'pid        /tmp/nginx.pid;' /etc/nginx/nginx.conf)" -eq 1; \
+    chown -R nginx:nginx /var/cache/nginx
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/build /usr/share/nginx/html

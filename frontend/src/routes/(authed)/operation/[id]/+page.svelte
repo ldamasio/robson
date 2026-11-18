@@ -3,31 +3,39 @@
   import Card from '$design/components/Card.svelte';
   import Stack from '$design/components/Stack.svelte';
   import LCorners from '$design/components/LCorners.svelte';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { robsonApi, connectEventStream, type Position, type SseEvent } from '$api/robson';
-  import { formatTimeUtc } from '$lib/utils/time';
+  import { formatTimeUtc } from '#lib/utils/time.ts';
+  import { OPERATION_REFRESH_MS, operationStreamHandlers } from '#lib/config/polling.ts';
+  import { serialRefresh } from '#lib/utils/refresh.ts';
+  import { sseFreshness, markSseEvent, markSseConnected, markSseStale } from '$stores/sseFreshness';
   import {
     positionLabel,
     positionSummaryLines,
     positionMetaLine,
     eventTypeLabel,
     eventSummaryText
-  } from '$lib/presentation/labels';
+  } from '#lib/presentation/labels.ts';
   import { _ } from 'svelte-i18n';
 
-  let operationId = $derived($page.params.id ?? '');
+  let operationId = $derived(page.params.id ?? '');
   let position = $state<Position | null>(null);
   let error = $state<string | null>(null);
   type TaggedEvent = SseEvent & { _seq: number };
   let events = $state<TaggedEvent[]>([]);
   let seq = $state(0);
   let closeSse: (() => void) | null = null;
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
   const MAX_OP_EVENTS = 500;
 
   let summaryLines = $derived(position ? positionSummaryLines(position) : []);
   let metaLine = $derived(position ? positionMetaLine(position) : '');
 
-  async function loadPosition() {
+  // Snapshot reads run one at a time; triggers during a read coalesce into
+  // one follow-up. Results publish in order and every read publishes, so a
+  // slow older snapshot never overwrites a newer one and a steady trigger
+  // stream cannot starve the page.
+  const loadPosition = serialRefresh(async () => {
     if (!operationId) return;
     error = null;
     try {
@@ -35,20 +43,44 @@
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to load position';
     }
+  });
+
+  // The stream is a delta feed: re-read the position snapshot when an event
+  // concerns it or the server asks for a resync, at most once per window so a
+  // burst cannot become a request storm; every stream establishment re-reads
+  // it at once (operationStreamHandlers).
+  function scheduleRefresh() {
+    if (refreshTimer) return;
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      void loadPosition();
+    }, OPERATION_REFRESH_MS);
   }
 
   function startSse() {
     stopSse();
-    closeSse = connectEventStream((event: SseEvent) => {
-      const payload = event.payload as Record<string, unknown>;
-      if (payload.position_id === operationId) {
+    const handlers = operationStreamHandlers<SseEvent>(operationId, {
+      refreshNow: () => void loadPosition(),
+      scheduleRefresh,
+      appendEvent: (event) => {
         seq += 1;
         const tagged: TaggedEvent = { ...event, _seq: seq };
         events = events.length >= MAX_OP_EVENTS
           ? [...events.slice(-(MAX_OP_EVENTS - 1)), tagged]
           : [...events, tagged];
-      }
+      },
+      markEvent: markSseEvent,
+      markConnected: markSseConnected,
+      markStale: markSseStale
     });
+    closeSse = connectEventStream(
+      handlers.onEvent,
+      handlers.onError,
+      handlers.onReconnect,
+      handlers.onStale,
+      handlers.onActivity,
+      handlers.onOpen
+    );
   }
 
   function stopSse() {
@@ -56,15 +88,21 @@
       closeSse();
       closeSse = null;
     }
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
   }
 
   $effect(() => {
     untrack(() => {
       void loadPosition();
       startSse();
+      sseFreshness.start();
     });
     return () => {
       stopSse();
+      sseFreshness.stop();
     };
   });
 </script>
@@ -99,7 +137,19 @@
     </LCorners>
 
     <section class="event-stream-section">
-      <div class="eyebrow">{$_('operation.eventStreamLabel')}</div>
+      <div class="eyebrow">
+        {$_('operation.eventStreamLabel')}
+        <span
+          class="sse-badge"
+          class:live={$sseFreshness.fresh}
+          class:stale={!$sseFreshness.fresh}
+          title={$sseFreshness.fresh
+            ? 'Event stream is fresh'
+            : `No SSE data for ${$sseFreshness.staleSeconds}s`}
+        >
+          {$sseFreshness.fresh ? 'LIVE' : 'STALE, reconnecting'}
+        </span>
+      </div>
       <div class="limitation">
         {$_('operation.sessionOnly')}
       </div>
@@ -167,6 +217,22 @@
     font-size: var(--text-xs);
     color: var(--fg-3);
     letter-spacing: var(--track-wide);
+  }
+  .sse-badge {
+    margin-left: var(--s-2);
+    padding: var(--s-1) var(--s-2);
+    border-radius: var(--radius-sm);
+    border: 1px solid transparent;
+  }
+  .sse-badge.live {
+    color: var(--ok);
+    border-color: var(--ok);
+    background: rgba(127, 183, 126, 0.08);
+  }
+  .sse-badge.stale {
+    color: var(--warn, #f59e0b);
+    border-color: var(--warn, #f59e0b);
+    background: rgba(245, 158, 11, 0.08);
   }
   .events {
     font-family: var(--font-mono);

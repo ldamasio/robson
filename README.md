@@ -6,7 +6,7 @@
 
 Robson is an execution and risk management system. The operator decides the entry and arms it; Robson sizes and executes governed orders and manages their lifecycle under deterministic risk policies. It does not originate trade ideas, predict prices, scan for opportunities, or use an LLM to make trading decisions.
 
-**Status (2026-11-15): v2.6 is the next product target: Binance Spot, LONG-only. The transition is in progress and is not ready for real capital.** Spot adapters, tests and ledger foundations are present, but they do not constitute a complete or activated Spot runtime. The current execution path is the legacy v2.5 Binance USD-M Futures implementation at fixed 1x leverage; the Futures behavior described below is current context, not a claim that Spot is operational. Activation remains an explicit operator decision after the [acceptance gates](ROADMAP.md#next-gates-before-activation).
+**Status (2026-11-16): v2.6 is the next product target: Binance Spot, LONG-only. The transition is in progress and is not ready for real capital.** Spot adapters, tests and ledger foundations are present, but they do not constitute a complete or activated Spot runtime. The current execution path is the legacy v2.5 Binance USD-M Futures implementation at fixed 1x leverage; the Futures behavior described below is current context, not a claim that Spot is operational. Activation remains an explicit operator decision after the [acceptance gates](ROADMAP.md#next-gates-before-activation).
 
 Robson is concerned with what happens **after** a trading decision is made: position sizing from chart-derived stops, governed order execution, lifecycle management through entry to settlement, and safe failure handling under volatile conditions.
 
@@ -14,7 +14,7 @@ The system provides a single-operator runtime with budget-metered entry capacity
 
 ## Release identity
 
-The current development candidate is **`2.6.0-alpha.1`**, aligned across Rust workspace metadata, local lock entries and the frontend. No prerelease or alpha binary is published by this source change. Progress follows alpha → beta → rc → `2.6.0`; `2.5.x` is compatible maintenance only.
+This source carries **`2.6.0-alpha.2`**. Published snapshots, their exact source identities, artifacts and scoped validation are recorded in [Releases](https://github.com/ldamasio/robson/releases); package metadata alone does not assert publication or deployment. The first development snapshot, **[v2.6.0-alpha.1](https://github.com/ldamasio/robson/releases/tag/v2.6.0-alpha.1)**, was published on 2026-11-15 from `ccac64c39dfaa2c4c88e4a46d4925f3e469674bd`. Progress follows alpha → beta → rc → `2.6.0`; `2.5.x` is compatible maintenance only. Spot operational acceptance remains pending.
 
 The historical [`v2.5.0` source](https://github.com/ldamasio/robson/tree/v2.5.0) is the 2026-05-09 [I3 reconciliation merge](https://github.com/ldamasio/robson/pull/59), not the later July/August development entries. See the [correction record and original notes](docs/RELEASING.md#read-version-labels-carefully). Release identity does not establish operational readiness or authorize capital.
 
@@ -28,7 +28,9 @@ The historical [`v2.5.0` source](https://github.com/ldamasio/robson/tree/v2.5.0)
 - **Exit execution**: exits and protective stops are always market orders (taker) — non-execution there is an unbounded loss; fee optimization is only ever applied to legs where waiting is costless (ADR-0040)
 - **Entry capacity**: budget-metered (ADR-0043). Each entry is charged its actual planned worst-case loss against the monthly budget, not the full 1% cap — **at least 4 full-cap operations per month are guaranteed, and saved risk becomes extra operations**. No static cap on concurrent positions or entries per day; the budget is the only constraint
 
-`capital_base` is set at month start as a pessimistic snapshot: `wallet_balance − carried_risk(Entering + Active + Armed)`. It is immutable during normal operation, but must be recalibrated if reconciliation detects manual account changes outside Robson.
+`capital_base` is governed by the persisted monthly budget model. Net-from-start **requires** no intra-month increase, including from confirmed deposits; this is a policy, not a proven concurrent implementation guarantee. [Position reconciliation](robsond/src/reconciliation_worker.rs) no longer has a wallet-total basis writer: successful scans use the existing guarded, alarm-only checksum. Startup `auto_reconcile` returns the stale-Active error before Phase 2 if real evidence is missing or ambiguous. These scoped changes do not make all accounting paths safe or establish Spot acceptance.
+
+**Required before Spot capital acceptance:** atomic validation against current persisted state, single-use transfer attribution, exact trade/amount/asset linkage, durable missing-evidence and freshness reporting with status errors kept distinct from zero, and complete Spot settlement, reservations and month-boundary carry. The [income ledger](robsond/src/income_ledger.rs) still uses a TRANSFER aggregate and idle-book snapshots; funding recognition remains distinct from its wallet-accounting integration. Startup Phase 2 remains sequential rather than transactional. See [ADR-0045's implementation limits](docs/adr/ADR-0045-income-ledger-reconciliation.md) and the [recovery runbook](docs/runbooks/td-2026-05-05-001-stale-active-recovery.md).
 
 ## Position Lifecycle
 
@@ -183,7 +185,7 @@ The CLI is not currently packaged in the runtime image or published as a version
 
 ### Environment
 
-Copy `.env.example` and configure `DATABASE_URL` and exchange credentials. The daemon reads configuration from environment variables and a `robsond.toml` file.
+Copy `.env.example` and configure `DATABASE_URL` and exchange credentials. The daemon loads configuration from environment variables and an optional `.env` file; accepted names and defaults are defined in [config.rs](robsond/src/config.rs).
 
 ## Deployment
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { fmtNum, previewLines, previewSeverity } from '$lib/presentation/preview';
+import { fmtNum, previewLines, previewSeverity } from '#lib/presentation/preview.ts';
 import { normalizeEntryPreview, type EntryPreview } from '$api/robson';
 
 function preview(overrides: Partial<EntryPreview> = {}): EntryPreview {

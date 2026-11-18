@@ -18,6 +18,7 @@ use robson_exec::{
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{pool::PoolConnection, postgres::PgPoolOptions, Connection, PgPool, Postgres};
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 /// The journal's own pool, so order writes never queue behind the daemon's.
@@ -92,7 +93,8 @@ impl PgJournalBackend {
                      stream_suspensions, recovery_incidents LIMIT 0",
                 )
                 .execute(&mut *read.connection)
-                .await?;
+                .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
+        .await?;
                 read.finished = true;
                 Ok::<_, sqlx::Error>(())
             };
@@ -135,6 +137,9 @@ impl PgJournalBackend {
         .bind(&intent.params)
         .bind(intent.created_at)
         .fetch_one(&mut **tx)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await
         .map_err(known)?;
         if owner != intent.intent_id {
@@ -171,6 +176,9 @@ impl PgJournalBackend {
             .bind(&created)
             .bind(&rejected)
             .execute(&mut **tx)
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+            )
             .await
             .map_err(|error| {
                 // Only the spot one-attempt constraint proves that this id
@@ -209,6 +217,9 @@ impl PgJournalBackend {
             .bind(outcome.uncertain_at)
             .bind(outcome.uncertain_generation)
             .execute(&mut **tx)
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+            )
             .await
             .map_err(known)?;
         }
@@ -222,10 +233,24 @@ impl JournalBackend for PgJournalBackend {
         let known = |e: sqlx::Error| CommitFailure::Known(e.to_string());
         let connection = self.pool.acquire().await.map_err(known)?;
         let mut write = RetiringConnection { connection, finished: false };
-        let mut tx = write.connection.begin().await.map_err(known)?;
+        let mut tx = write
+            .connection
+            .begin()
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+            )
+            .await
+            .map_err(known)?;
+        let mut rollback_observation = RollbackObservation::new();
         self.write(batch, &mut tx).await?;
         // Sent and not answered: the row may exist.
-        tx.commit().await.map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
+        tx.commit()
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+            )
+            .await
+            .map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
+        rollback_observation.disarm();
         write.finished = true;
         Ok(())
     }
@@ -237,7 +262,15 @@ impl JournalBackend for PgJournalBackend {
         let known = |e: sqlx::Error| CommitFailure::Known(e.to_string());
         let connection = self.pool.acquire().await.map_err(known)?;
         let mut write = RetiringConnection { connection, finished: false };
-        let mut tx = write.connection.begin().await.map_err(known)?;
+        let mut tx = write
+            .connection
+            .begin()
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+            )
+            .await
+            .map_err(known)?;
+        let mut rollback_observation = RollbackObservation::new();
         // An open suspension of the stream, or this one replayed, stands.
         sqlx::query(
             r#"
@@ -258,9 +291,18 @@ impl JournalBackend for PgJournalBackend {
         .bind(suspension.epoch_id)
         .bind(suspension.suspended_at)
         .execute(&mut *tx)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await
         .map_err(known)?;
-        tx.commit().await.map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
+        tx.commit()
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+            )
+            .await
+            .map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
+        rollback_observation.disarm();
         write.finished = true;
         Ok(())
     }
@@ -269,7 +311,15 @@ impl JournalBackend for PgJournalBackend {
         let known = |e: sqlx::Error| CommitFailure::Known(e.to_string());
         let connection = self.pool.acquire().await.map_err(known)?;
         let mut write = RetiringConnection { connection, finished: false };
-        let mut tx = write.connection.begin().await.map_err(known)?;
+        let mut tx = write
+            .connection
+            .begin()
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+            )
+            .await
+            .map_err(known)?;
+        let mut rollback_observation = RollbackObservation::new();
         // Every value only grows, so a replay or a reordering converges. A
         // released row does not conflict: this opens a new one.
         sqlx::query(
@@ -297,9 +347,18 @@ impl JournalBackend for PgJournalBackend {
         .bind(incident.first_generation)
         .bind(incident.last_generation)
         .execute(&mut *tx)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await
         .map_err(known)?;
-        tx.commit().await.map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
+        tx.commit()
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+            )
+            .await
+            .map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
+        rollback_observation.disarm();
         write.finished = true;
         Ok(())
     }
@@ -316,7 +375,15 @@ impl JournalBackend for PgJournalBackend {
         // daemon-pool slot (J's rule for the journal's own pool).
         let connection = self.daemon_pool.acquire().await.map_err(error)?;
         let mut held = RetiringConnection { connection, finished: false };
-        let mut tx = held.connection.begin().await.map_err(error)?;
+        let mut tx = held
+            .connection
+            .begin()
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+            )
+            .await
+            .map_err(error)?;
+        let mut rollback_observation = RollbackObservation::new();
         // A row with no `uncertain_at` is never tombstoned, nor one with an
         // outcome, proven unsent, or already disposed of.
         let tombstoned = sqlx::query(
@@ -345,6 +412,9 @@ impl JournalBackend for PgJournalBackend {
         .bind(release.auth_kind)
         .bind(&release.note)
         .execute(&mut *tx)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await
         .map_err(error)?
         .rows_affected();
@@ -359,6 +429,9 @@ impl JournalBackend for PgJournalBackend {
         .bind(release.decided_at)
         .bind(release.decision_id)
         .execute(&mut *tx)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await
         .map_err(error)?
         .rows_affected();
@@ -383,9 +456,18 @@ impl JournalBackend for PgJournalBackend {
         .bind(&payload)
         .bind(release.decided_at)
         .execute(&mut *tx)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await
         .map_err(error)?;
-        tx.commit().await.map_err(error)?;
+        tx.commit()
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+            )
+            .await
+            .map_err(error)?;
+        rollback_observation.disarm();
         held.finished = true;
         Ok(ReleaseCounts {
             intents_tombstoned: tombstoned,
@@ -418,6 +500,9 @@ impl JournalBackend for PgJournalBackend {
         .bind(account_scope)
         .bind(client_order_id)
         .fetch_all(&mut *read.connection)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await
         .map_err(|e| e.to_string())?;
         read.finished = true;
@@ -484,7 +569,13 @@ pub async fn record_disposition(
     pool: &PgPool,
     disposition: &Disposition,
 ) -> Result<DispositionReceipt, DispositionError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool
+        .begin()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+        )
+        .await?;
+    let mut rollback_observation = RollbackObservation::new();
     let row = sqlx::query_as::<_, (String, Option<String>, bool, bool, Value)>(
         r#"
         SELECT client_order_id, cancels_order_id, venue_outcome IS NOT NULL, not_sent, params
@@ -493,6 +584,7 @@ pub async fn record_disposition(
     )
     .bind(disposition.intent_id)
     .fetch_optional(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
     let Some((client_order_id, cancels_order_id, has_outcome, not_sent, params)) = row else {
         return Err(DispositionError::NotFound);
@@ -548,6 +640,7 @@ pub async fn record_disposition(
     .bind(accepted_auth)
     .bind(accepted_note)
     .execute(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     let decision_id = Uuid::now_v7();
@@ -570,13 +663,45 @@ pub async fn record_disposition(
     .bind(&payload)
     .bind(now)
     .execute(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
 
     let boundary_b_blockers = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::BIGINT FROM order_intents_blocking_rollback",
     )
     .fetch_one(&mut *tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await?;
-    tx.commit().await?;
+    tx.commit()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+        )
+        .await?;
+    rollback_observation.disarm();
     Ok(DispositionReceipt { decision_id, boundary_b_blockers })
+}
+
+// The public SQLx Transaction Drop queues rollback while open. This only counts
+// that application cleanup request; it never claims server acknowledgement.
+struct RollbackObservation {
+    origin: tracing::Span,
+    armed: bool,
+}
+impl RollbackObservation {
+    fn new() -> Self {
+        Self {
+            origin: tracing::Span::current(),
+            armed: true,
+        }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for RollbackObservation {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::info_span!(target: "robson_operation", parent: &self.origin, "operation_io", io_kind = 4_u64).in_scope(|| {});
+        }
+    }
 }

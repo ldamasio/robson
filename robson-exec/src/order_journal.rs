@@ -963,6 +963,7 @@ impl AttemptMemory {
 #[derive(Debug)]
 struct IntentMemory {
     row: IntentRow,
+    origin: Option<crate::observation::Origin>,
     operation: u64,
     attempts: Vec<AttemptMemory>,
     outcome: Option<OutcomeRow>,
@@ -1171,6 +1172,20 @@ pub enum PendingEntry {
     Incident(IncidentReason),
 }
 
+type RetriedBatch = (String, JournalBatch, Option<crate::observation::Origin>);
+
+#[derive(Debug, Clone)]
+struct ObservedSuspension {
+    row: StreamSuspensionRow,
+    origin: Option<crate::observation::Origin>,
+}
+impl std::ops::Deref for ObservedSuspension {
+    type Target = StreamSuspensionRow;
+    fn deref(&self) -> &Self::Target {
+        &self.row
+    }
+}
+
 #[derive(Debug, Default)]
 struct JournalState {
     /// Intents in flight or with something unlanded. Removed once finished
@@ -1183,7 +1198,7 @@ struct JournalState {
     retry_set: VecDeque<String>,
     /// `persistence_pending` too: stream suspensions not yet on record. The
     /// two share [`RETRY_SET_CAPACITY`].
-    suspensions: VecDeque<StreamSuspensionRow>,
+    suspensions: VecDeque<ObservedSuspension>,
     /// `operations_in_flight`. A list is as long as its operation's orders.
     operations: HashMap<u64, OperationEntry>,
     /// Entries of `operations` held by operations without a permit.
@@ -1374,17 +1389,29 @@ impl OrderJournal {
     pub fn record_suspension(&self, suspension: StreamSuspensionRow) {
         let (mut gate, mut state) = self.lock_both();
         let mut occurrences = vec![gate.occur(IncidentReason::StreamSuspended)];
-        let kept = if state.suspensions.iter().any(|row| row.stream_key == suspension.stream_key) {
+        let kept = if let Some(row) =
+            state.suspensions.iter_mut().find(|row| row.stream_key == suspension.stream_key)
+        {
+            crate::observation::Origin::merge(
+                &mut row.origin,
+                crate::observation::Origin::measured(),
+            );
             true
         } else if state.pending() >= RETRY_SET_CAPACITY {
             occurrences.push(gate.occur(IncidentReason::PersistenceFailure));
             false
         } else {
-            state.suspensions.push_back(suspension.clone());
+            state.suspensions.push_back(ObservedSuspension {
+                row: suspension.clone(),
+                origin: crate::observation::Origin::measured(),
+            });
             true
         };
         drop((gate, state));
         if !kept {
+            if let Some(origin) = crate::observation::Origin::measured() {
+                origin.incomplete();
+            }
             error!(
                 stream_key = %suspension.stream_key,
                 "Journal retry set is full; this stream suspension is not recorded durably"
@@ -1695,6 +1722,7 @@ impl OrderJournal {
         };
         state.intents.insert(spec.client_order_id, IntentMemory {
             row,
+            origin: crate::observation::Origin::measured(),
             operation,
             attempts: Vec::new(),
             outcome: None,
@@ -2646,52 +2674,68 @@ impl OrderJournal {
         let pass_bound = self.commit_bound * RETRY_PASS_COMMIT_BOUNDS;
         let mut written = self.flush_incidents(started, pass_bound).await;
         written += self.flush_suspensions(started, pass_bound).await;
-        let batches: Vec<(String, JournalBatch)> = {
+        let batches: Vec<RetriedBatch> = {
             let state = self.lock();
             state
                 .retry_set
                 .iter()
                 .take(RETRY_PASS_LIMIT.saturating_sub(written))
-                .filter_map(|id| state.intents.get(id).map(|m| (id.clone(), m.batch())))
+                .filter_map(|id| {
+                    state.intents.get(id).map(|m| (id.clone(), m.batch(), m.origin.clone()))
+                })
                 .collect()
         };
-        for (client_order_id, batch) in batches {
+        for (client_order_id, batch, origin) in batches {
             if started.elapsed() >= pass_bound {
                 break;
             }
-            match self.bounded_commit(&batch).await {
-                Ok(()) => {
-                    Self::landed(&mut self.lock(), &client_order_id, &batch);
-                    written += 1;
-                },
-                Err(failure) => {
-                    let (mut gate, mut state) = self.lock_both();
-                    if failure == CommitFailure::IdSpent {
-                        let occurrence = gate.occur(IncidentReason::PersistenceFailure);
-                        state.retry_set.retain(|id| *id != client_order_id);
-                        match state.intents.get_mut(&client_order_id) {
-                            // Its link stays for its completion; unlinking
-                            // collects it.
-                            Some(memory) if memory.replaced_by.is_some() => {
-                                memory.in_retry_set = false;
-                            },
-                            _ => {
-                                state.intents.remove(&client_order_id);
-                            },
+            // Derived pending work belongs to the same origin as this retry,
+            // including a failure handled after the backend future completes.
+            let flush = async {
+                match self.bounded_commit(&batch).await {
+                    Ok(()) => {
+                        Self::landed(&mut self.lock(), &client_order_id, &batch);
+                        true
+                    },
+                    Err(failure) => {
+                        let (mut gate, mut state) = self.lock_both();
+                        if failure == CommitFailure::IdSpent {
+                            let occurrence = gate.occur(IncidentReason::PersistenceFailure);
+                            state.retry_set.retain(|id| *id != client_order_id);
+                            match state.intents.get_mut(&client_order_id) {
+                                // Its link stays for its completion; unlinking
+                                // collects it.
+                                Some(memory) if memory.replaced_by.is_some() => {
+                                    memory.in_retry_set = false;
+                                },
+                                _ => {
+                                    state.intents.remove(&client_order_id);
+                                },
+                            }
+                            drop((gate, state));
+                            error!(%client_order_id, "Journal row conflicts with another intent");
+                            occurrence.log();
+                        } else if let Some(position) =
+                            state.retry_set.iter().position(|id| *id == client_order_id)
+                        {
+                            if let Some(id) = state.retry_set.remove(position) {
+                                state.retry_set.push_back(id);
+                            }
                         }
-                        drop((gate, state));
-                        error!(%client_order_id, "Journal row conflicts with another intent");
-                        occurrence.log();
-                    } else if let Some(position) =
-                        state.retry_set.iter().position(|id| *id == client_order_id)
-                    {
-                        if let Some(id) = state.retry_set.remove(position) {
-                            state.retry_set.push_back(id);
-                        }
-                    }
-                    break;
-                },
+                        false
+                    },
+                }
+            };
+            let landed = if let Some(origin) = &origin {
+                origin.run(flush).await
+            } else {
+                crate::observation::incomplete_current();
+                flush.await
+            };
+            if !landed {
+                break;
             }
+            written += 1;
         }
         written
     }
@@ -2708,8 +2752,18 @@ impl OrderJournal {
             }
             self.statements_total
                 .fetch_add(u64::from(INCIDENT_STATEMENTS), Ordering::Relaxed);
-            let upsert = self.backend.upsert_incident(&incident);
-            let failure = match tokio::time::timeout(self.commit_bound, upsert).await {
+            let origin = self.gate.lock().incident_origin(incident.reason);
+            let upsert = async {
+                tokio::time::timeout(self.commit_bound, self.backend.upsert_incident(&incident))
+                    .await
+            };
+            let result = if let Some(origin) = &origin {
+                origin.run(upsert).await
+            } else {
+                crate::observation::incomplete_current();
+                upsert.await
+            };
+            let failure = match result {
                 Ok(Ok(())) => None,
                 Ok(Err(failure)) => Some(failure),
                 Err(_) => Some(CommitFailure::Uncertain("no answer within the bound".to_string())),
@@ -2737,7 +2791,7 @@ impl OrderJournal {
     /// written; a failure ends this part, with that entry sent to the back,
     /// and the pass goes on to the intents.
     async fn flush_suspensions(&self, started: std::time::Instant, pass_bound: Duration) -> usize {
-        let pending: Vec<StreamSuspensionRow> =
+        let pending: Vec<ObservedSuspension> =
             self.lock().suspensions.iter().take(RETRY_PASS_LIMIT).cloned().collect();
         let mut written = 0;
         for suspension in pending {
@@ -2746,8 +2800,17 @@ impl OrderJournal {
             }
             self.statements_total
                 .fetch_add(u64::from(SUSPENSION_STATEMENTS), Ordering::Relaxed);
-            let write = self.backend.record_suspension(&suspension);
-            let failure = match tokio::time::timeout(self.commit_bound, write).await {
+            let write = async {
+                tokio::time::timeout(self.commit_bound, self.backend.record_suspension(&suspension))
+                    .await
+            };
+            let result = if let Some(origin) = &suspension.origin {
+                origin.run(write).await
+            } else {
+                crate::observation::incomplete_current();
+                write.await
+            };
+            let failure = match result {
                 Ok(Ok(())) => None,
                 Ok(Err(failure)) => Some(failure),
                 Err(_) => Some(CommitFailure::Uncertain("no answer within the bound".to_string())),

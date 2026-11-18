@@ -1,4 +1,4 @@
-import { browser } from '$app/environment';
+import { browser } from '$app/env';
 import { init, register, getLocaleFromNavigator, locale } from 'svelte-i18n';
 import ptBR from './pt-BR.json';
 import en from './en.json';

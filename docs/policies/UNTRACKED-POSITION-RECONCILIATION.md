@@ -224,7 +224,10 @@ position is left unresolved rather than closed on a guess.
 
 #### I3 §E — Startup policy and operational status
 
-**Current operational state (repository and read-only production verified, 2026-08-06):**
+**Historical operational snapshot (read-only production verification, 2026-08-06):**
+
+This dated snapshot does not establish deployment or operational validation of
+the repository correction recorded below.
 
 - I3 runtime steady-state reconciliation (worker loop) is **live** (Slice 4B).
 - Startup `auto_reconcile` is **live** and is **the policy prod runs**. The
@@ -245,17 +248,25 @@ position is left unresolved rather than closed on a guess.
 - If any position lacks real evidence, abort with exit 78 (same as `abort`
   policy). No partial close.
 
-**Open implementation drifts (2026-08-06)**:
+**Repository source correction (2026-11-16; operational validation pending):**
 
-- Current source returns success when evidence gathering produces no
-  unambiguous match, allowing startup to continue for periodic reconciliation.
-  This is tracked as TD-2026-08-06-001.
-- Phase 2 applies closes sequentially without a batch transaction. A later
-  failure stops processing but does not roll back an earlier persisted close.
-  This is tracked as TD-2026-08-06-002.
+The 2026-08-06 implementation returned success when evidence gathering found no
+unambiguous match. That description is superseded for the current repository
+source: `run_startup_auto_reconcile` now returns `StartupStaleActiveDetected`
+before Phase 2 if any required real evidence is absent. The existing startup
+error mapping is exit 78. Evidence gathering remains read-only, so this refusal
+occurs before any reconciliation close in the batch. TD-2026-08-06-001 records
+the source correction and its outstanding operational validation; this is not a
+claim that the correction has been deployed or accepted operationally.
+
+**Remaining implementation drift — Phase 2:** closes are still applied
+sequentially without a batch transaction. A later failure cannot roll back an
+earlier persisted close. TD-2026-08-06-002 remains open; correcting the missing
+evidence branch does not establish batch atomicity or make every close durable.
 
 Both items are in [the technical debt register](../technical-debt.md). The
-fail-closed and no-partial-close policy has not been relaxed.
+fail-closed and no-partial-close policy has not been relaxed. Manual recovery
+and the rejection of `AccountSnapshot` and `Estimated` evidence are unchanged.
 
 The startup path has always anchored its evidence window at
 `entry_filled_at`. Until 2026-07-31 the periodic worker did not, which is
