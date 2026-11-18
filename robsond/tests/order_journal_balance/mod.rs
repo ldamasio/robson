@@ -320,7 +320,10 @@ async fn a_balance_commit_counts_every_statement_as_operation_io(pool: PgPool) {
     let backend = PgJournalBackend::new(&proxied, tenant);
     backend.check_ready().await.unwrap();
     robsond::operation_observation::initialize_metrics();
-    for (id, kind) in [("observed-cancel", IntentKind::Cancel), ("observed-exit", IntentKind::Exit)] {
+    for (id, kind) in [
+        ("observed-cancel", IntentKind::Cancel),
+        ("observed-exit", IntentKind::Exit),
+    ] {
         let batch = balance_batch(id, kind);
         let (sent, observed) = async {
             robson_exec::observation::reconciliation(async {
