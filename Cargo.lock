@@ -2120,6 +2120,10 @@ name = "robson-db"
 version = "2.6.0-alpha.2"
 dependencies = [
  "anyhow",
+ "proptest",
+ "robson-exec",
+ "robson-testkit",
+ "robsond",
  "serde_json",
  "sqlx",
  "tokio",
