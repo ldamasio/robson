@@ -1,198 +1,11 @@
 //! Opt-in protocol metadata. Borrowed frames yield only validated metadata;
 //! packets, SQL text, parameters and error messages are never retained.
 //! Ambiguous response attribution stays explicitly unknown.
-use std::{collections::VecDeque, sync::Mutex, time::Instant};
+use std::{collections::VecDeque, sync::Mutex};
 
 pub const RECORD_LIMIT: usize = 4_096;
 const CONNECTION_LIMIT: usize = 32;
 const PHASE_LIMIT: usize = 32;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SqlCategory {
-    Other,
-    Begin,
-    Commit,
-    Rollback,
-    JournalAccounting,
-    LedgerAccounting,
-    OrderRead,
-    OrderWrite,
-    FillRead,
-    FillWrite,
-    LegAdmission,
-    LegWrite,
-    JournalIntent,
-    JournalAttempt,
-    JournalClock,
-    Timeouts,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Phase {
-    Unknown,
-    Parse,
-    Bind,
-    Describe,
-    Close,
-    Execute,
-    Simple,
-    Sync,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Event {
-    Connected,
-    BackendPid,
-    /// Frontend request observed locally before write; no physical-send proof.
-    Sent,
-    Complete,
-    Error,
-    Ready,
-    Skipped,
-    Closed,
-    Overflow,
-    AttributionLost,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Delivery {
-    Local,
-    Received,
-    Forwarded,
-    Held,
-    Dropped,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct JournalLabel {
-    pub case: u8,
-    pub leg: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Identity {
-    pub connection: u64,
-    pub pid: Option<i32>,
-    pub journal: Option<JournalLabel>,
-    pub live: bool,
-    pub attribution_unknown: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Record {
-    pub micros: u64,
-    pub identity: Identity,
-    pub ordinal: Option<u64>,
-    pub phase: Phase,
-    pub category: SqlCategory,
-    pub event: Event,
-    pub delivery: Delivery,
-    pub sqlstate: Option<[u8; 5]>,
-    pub transaction: Option<u8>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Snapshot {
-    pub records: Vec<Record>,
-    pub connections: Vec<Identity>,
-    pub dropped: u64,
-    pub connection_overflow: u64,
-    pub phase_overflow: u64,
-}
-
-pub(super) struct Trace {
-    started: Instant,
-    records: VecDeque<Record>,
-    connections: Vec<Identity>,
-    dropped: u64,
-    connection_overflow: u64,
-    phase_overflow: u64,
-}
-
-impl Trace {
-    pub(super) fn new() -> Self {
-        Self {
-            started: Instant::now(),
-            records: VecDeque::with_capacity(RECORD_LIMIT),
-            connections: Vec::with_capacity(CONNECTION_LIMIT),
-            dropped: 0,
-            connection_overflow: 0,
-            phase_overflow: 0,
-        }
-    }
-
-    pub(super) fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            records: self.records.iter().copied().collect(),
-            connections: self.connections.clone(),
-            dropped: self.dropped,
-            connection_overflow: self.connection_overflow,
-            phase_overflow: self.phase_overflow,
-        }
-    }
-
-    pub(super) fn identities(&self) -> Vec<Identity> {
-        self.connections.clone()
-    }
-
-    pub(super) fn control_identity(&self, id: u64) -> Option<Identity> {
-        if self.dropped != 0 || self.connection_overflow != 0 || self.phase_overflow != 0 {
-            return None;
-        }
-        self.connections.iter().copied().find(|identity| {
-            identity.connection == id
-                && identity.live
-                && !identity.attribution_unknown
-                && identity.pid.is_some_and(|pid| pid > 0)
-        })
-    }
-
-    // Only the serial backend hook asks immediately after recording its Ready.
-    // Delivery copies do not add completions; a missing prior Ready is unknown.
-    pub(super) fn control_ready_ordinal(&self, id: u64) -> Option<u64> {
-        self.control_identity(id)?;
-        let mut received = self.records.iter().rev().filter(|record| {
-            record.identity.connection == id && record.delivery == Delivery::Received
-        });
-        if received.next()?.event != Event::Ready {
-            return None;
-        }
-        let mut ordinal = None;
-        for record in received {
-            match record.event {
-                Event::Ready => return ordinal,
-                Event::Error => return None,
-                Event::Complete => {
-                    if ordinal.is_some() || !matches!(record.phase, Phase::Simple | Phase::Execute)
-                    {
-                        return None;
-                    }
-                    ordinal = Some(record.ordinal?);
-                },
-                _ => {},
-            }
-        }
-        None
-    }
-
-    fn push(&mut self, mut record: Record) {
-        record.micros = self.started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
-        if let Some(identity) = self
-            .connections
-            .iter_mut()
-            .find(|identity| identity.connection == record.identity.connection)
-            .filter(|_| matches!(record.delivery, Delivery::Local | Delivery::Received))
-        {
-            // Delivery records keep historical identity, never restore it.
-            *identity = record.identity;
-        }
-        if self.records.len() == RECORD_LIMIT {
-            self.records.pop_front();
-            self.dropped = self.dropped.saturating_add(1);
-        }
-        self.records.push_back(record);
-    }
-}
 
 #[derive(Clone, Copy)]
 struct Pending {
@@ -428,6 +241,13 @@ impl Drop for Connection<'_> {
         self.emit(Self::record(&state, Pending::unknown(), Event::Closed));
     }
 }
+
+#[path = "diagnostic/record.rs"]
+mod record;
+pub use record::{Delivery, Event, Identity, JournalLabel, Phase, Record, Snapshot, SqlCategory};
+#[path = "diagnostic/trace.rs"]
+mod trace;
+pub(super) use trace::Trace;
 
 mod validation;
 pub(super) use validation::journal_label;

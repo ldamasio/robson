@@ -4,6 +4,10 @@ use sqlx::{postgres::PgSslMode, Connection, PgConnection};
 
 use super::*;
 
+#[path = "generated_lifecycle_native_dispose.rs"]
+mod dispose;
+pub(super) use dispose::{dispose, dispose_resources};
+
 pub(super) const SETTINGS:&str="SELECT pg_backend_pid(),current_setting('lock_timeout'),current_setting('statement_timeout'),current_setting('idle_in_transaction_session_timeout')";
 pub(super) const GONE:&str="SELECT NOT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1) AND NOT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1)";
 const HISTORY:&str="SELECT COALESCE(jsonb_agg((to_jsonb(m)||jsonb_build_object('checksum',encode(m.checksum,'hex'))) ORDER BY version),'[]'::jsonb) FROM (SELECT * FROM _sqlx_migrations ORDER BY version LIMIT 65) m";
@@ -304,48 +308,4 @@ pub(super) async fn configure_reconnect(f: &mut Fixture, old_pid: i32) -> Result
         f.pid
     );
     Ok(())
-}
-
-pub(super) async fn dispose(
-    active: Option<Fixture>,
-    parked: Option<Parked>,
-    pool: PgPool,
-    end: tokio::time::Instant,
-) -> Result<()> {
-    let retirement = dispose_resources(active, parked).await;
-    let closed = tokio::time::timeout_at(end, pool.close())
-        .await
-        .context("generated shared cleanup5s pool close");
-    match (retirement, closed) {
-        (Ok(()), Ok(())) => Ok(()),
-        (a, b) => Err(anyhow::anyhow!("generated cleanup native={} pool={}", cause(&a), cause(&b))),
-    }
-}
-
-/// Native owner retirement and observer/proxy disposal without closing the
-/// shared pool, so a generated run can start its next case in the same
-/// database.
-pub(super) async fn dispose_resources(
-    active: Option<Fixture>,
-    parked: Option<Parked>,
-) -> Result<()> {
-    let retirement = if let Some(f) = active {
-        match park(f).await {
-            Ok(p) => {
-                drop(p.observer);
-                p.proxy.set_mode(ProxyMode::Sever);
-                drop(p.proxy);
-                Ok(())
-            },
-            Err(e) => Err(e),
-        }
-    } else {
-        Ok(())
-    };
-    if let Some(p) = parked {
-        drop(p.observer);
-        p.proxy.set_mode(ProxyMode::Sever);
-        drop(p.proxy);
-    }
-    retirement
 }
