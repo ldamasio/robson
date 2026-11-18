@@ -180,3 +180,79 @@ Any later body change needs a new numbered migration and compatibility review.
 `CREATE OR REPLACE FUNCTION` must preserve the callable signature and return
 type; changing argument types creates a different function. Do not overwrite
 36 or deploy an image carrying a modified checksum.
+
+## Migration 38: request budget schema through the bounded adapter
+
+`robson_db::migrate()` runs every pending migration through
+`bounded_migration::BoundedMigration`, a dedicated raw connection that is never
+returned to a pool. Migrations other than 38 keep SQLx's own apply path.
+Migration 38 (`20240101000038_request_budget.sql`) is applied as 58 operations
+on that connection: settings install, BEGIN, the 52 fixed DDL slices of the
+original file, the original `_sqlx_migrations` INSERT, COMMIT, the
+`execution_time` UPDATE after the acknowledged COMMIT, and the settings restore.
+Each statement runs with `statement_timeout=40ms`, `lock_timeout=20ms` and
+`idle_in_transaction_session_timeout=20ms`; the whole apply is bounded at
+200 ms; the connection and the migration advisory lock are each bounded at 5 s. Any bound exceeded fails
+`robsond db migrate`, so the `robsond-db-migrate` Sync hook job fails and the
+sync stops before the new deployment (see Deployment Flow).
+
+### What migration 38 changes at deploy
+
+- New request-budget tables, functions and triggers; a second reason check
+  `recovery_incidents_reason_v38` (NOT VALID) beside the original one.
+- Every insert into `spot_intent_clock` is projected into the daily budget and
+  is **refused (23514) until `budget_venue_state` for that venue is
+  `complete`**. While Spot stays refused by the production factory no clock row
+  is written, so this is inert for USD-M; enabling Spot needs the venue
+  initialization first.
+
+### Before the merge that carries 38
+
+Record the deployed image digest. **Once 38 is applied, an image without 38 is
+not a rollback target**: SQLx rejects applied migrations missing from its
+embedded set. The earliest compatible rollback artifact is the first image
+that embeds 38; record it before any later merge.
+
+### Failure outcomes
+
+The adapter logs `migration connection retired` (warn) with the phase and one
+outcome (`kubectl logs -n robson -l job-name=robsond-db-migrate`), then drops
+the raw connection without a graceful close, so a pending ROLLBACK is discarded
+with the session. Dropping the socket does not prove the server backend has
+finished: it may still be completing the transaction.
+
+| Outcome | Meaning | Operator check |
+|---|---|---|
+| `ApplyNotStarted` | failed before the transaction began | 38 absent; rerun `robsond db migrate` after the cause is fixed |
+| `MayHaveCommitted` | interrupted anywhere from BEGIN through the post-commit `execution_time` UPDATE; the COMMIT may or may not have landed | unresolved until the checks below; never infer absence |
+| `AppliedButSessionUnrestored` | COMMIT and the `execution_time` UPDATE returned; only the settings restore failed | 38 is applied; the session settings died with the connection |
+
+For `MayHaveCommitted`, an empty history row read from another connection is
+not proof of absence while the original backend can still commit. In order:
+
+1. Wait until no backend of the failed migrate job remains: check
+   `pg_stat_activity` for the job's connection (and any lock it held in
+   `pg_locks`) until it is gone. The retained job and session evidence must
+   identify that backend uniquely: an empty activity query proves nothing when
+   the identity was never known. If either the identity or its retirement
+   cannot be proved within a bounded diagnostic window, stop without further
+   polling; the outcome stays `MayHaveCommitted` (unresolved) until the
+   operator decides.
+2. Rerun the canonical `robsond db migrate`. It takes SQLx's migration lock
+   before it reads the applied history, so its decision is serialized behind
+   any surviving migrator: it skips 38 if the COMMIT landed and applies it if
+   not.
+3. Afterwards confirm with:
+
+   ```sql
+   SELECT version, success, execution_time
+   FROM _sqlx_migrations WHERE version = 20240101000038;
+   ```
+
+   A row with `success = true` means 38 is applied; an `execution_time` of
+   `-1` only means the post-commit UPDATE did not land, and SQLx treats the
+   migration as applied.
+
+Do not edit `_sqlx_migrations` or rerun 38's SQL by hand. A database lost
+mid-apply follows the same steps once it is reachable again. Repeated deadline
+failures on a busy database need the operator's direction, not wider bounds.

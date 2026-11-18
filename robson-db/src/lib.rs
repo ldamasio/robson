@@ -2,6 +2,7 @@
 //!
 //! Provides migration running, status checking, and minimal data seeding.
 
+pub mod bounded_migration;
 mod init;
 
 pub use init::init_minimal_data;
@@ -11,15 +12,21 @@ use tracing::{info, warn};
 /// Result type for DB operations.
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
 
+// One embedded inventory is shared by the runner and its private38 contract.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+
 /// Run all pending migrations.
 ///
-/// Uses sqlx migrations from the `v2/migrations` directory.
-/// Idempotent: safe to run multiple times.
+/// Historical repairs retain their existing behavior. The dedicated owned
+/// adapter preserves SQLx migration ordering and applies the38-specific bound.
+/// An interrupted migration is not retried or inferred absent here.
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     info!("Running database migrations...");
 
     repair_known_migration_state(pool).await?;
-    sqlx::migrate!("../migrations").run(pool).await?;
+    let mut connection =
+        bounded_migration::BoundedMigration::connect(&pool.connect_options()).await?;
+    MIGRATOR.run_direct(&mut connection).await?;
 
     info!("Migrations completed successfully");
     Ok(())

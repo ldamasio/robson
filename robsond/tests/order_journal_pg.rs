@@ -564,7 +564,9 @@ async fn the_readiness_check_refuses_a_schema_without_the_journal(pool: PgPool) 
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("DROP TABLE submit_attempts").execute(&pool).await.unwrap();
+    // Migration 38 adds foreign keys onto submit_attempts; CASCADE drops only
+    // those constraints, so the journal table itself is what goes missing.
+    sqlx::query("DROP TABLE submit_attempts CASCADE").execute(&pool).await.unwrap();
     let started = std::time::Instant::now();
     let refused = real_journal(&pool).check_ready().await;
     assert!(refused.is_err(), "{refused:?}");
