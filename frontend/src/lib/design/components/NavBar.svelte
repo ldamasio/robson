@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { status, refreshStatus } from '$stores/status';
   import Row from './Row.svelte';
 
@@ -7,7 +7,7 @@
     void refreshStatus().catch(() => {});
   });
 
-  let currentPath = $derived($page.url.pathname);
+  let currentPath = $derived(page.url.pathname);
 
   function isActive(href: string): boolean {
     if (href === '/') return currentPath === '/';

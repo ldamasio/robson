@@ -1552,9 +1552,22 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                         position_id = %position.id,
                         symbol = %position.symbol.as_pair(),
                         side = ?position.side,
-                        "Startup auto-reconcile: no unambiguous real evidence for stale-active position; continuing so the periodic reconciliation worker can resolve it"
+                        "Startup auto-reconcile: no unambiguous real evidence; aborting before any reconciliation close"
                     );
-                    return Ok(());
+                    let positions = stale_actives
+                        .iter()
+                        .map(|p| StartupStaleActiveInfo {
+                            position_id: p.id,
+                            symbol: p.symbol.as_pair(),
+                            side: format!("{:?}", p.side),
+                            quantity: p.quantity.as_decimal(),
+                            entry_price: p.entry_price.map(|price| price.as_decimal()),
+                        })
+                        .collect();
+                    return Err(DaemonError::StartupStaleActiveDetected {
+                        count: stale_actives.len(),
+                        positions,
+                    });
                 },
             }
         }
@@ -4665,7 +4678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_startup_auto_reconcile_no_evidence_allows_startup() {
+    async fn test_startup_auto_reconcile_no_evidence_aborts_startup() {
         use robson_domain::Symbol;
         let daemon = Daemon::new_stub(config_with_auto_reconcile());
 
@@ -4673,47 +4686,17 @@ mod tests {
         let pid = position.id;
         daemon.store.positions().save(&position).await.unwrap();
 
-        daemon.run_startup_auto_reconcile().await.unwrap();
+        let result = daemon.run_startup_auto_reconcile().await;
+        assert!(
+            matches!(result, Err(DaemonError::StartupStaleActiveDetected { count: 1, ref positions }) if positions.len() == 1 && positions[0].position_id == pid),
+            "startup_missing_real_evidence_must_abort: {result:?}"
+        );
 
         let stored = daemon.store.positions().find_by_id(pid).await.unwrap().unwrap();
         assert!(matches!(stored.state, PositionState::Active { .. }));
     }
 
-    #[tokio::test]
-    async fn test_startup_auto_reconcile_phase1_all_or_nothing() {
-        use robson_domain::Symbol;
-        let daemon = Daemon::new_stub(config_with_auto_reconcile());
-        let symbol_a = Symbol::from_pair("BTCUSDT").unwrap();
-        let symbol_b = Symbol::from_pair("ETHUSDT").unwrap();
-
-        let mut pos_a = active_position(symbol_a.clone(), Side::Long);
-        let pid_a = pos_a.id;
-        attach_insurance_order(&daemon.store, &mut pos_a, "EX-ORDER-A").await;
-        daemon.store.positions().save(&pos_a).await.unwrap();
-
-        let pos_b = active_position(symbol_b.clone(), Side::Long);
-        let pid_b = pos_b.id;
-        daemon.store.positions().save(&pos_b).await.unwrap();
-
-        let now = chrono::Utc::now();
-        daemon
-            .exchange
-            .set_order_result("EX-ORDER-A", order_result("EX-ORDER-A", dec!(90), dec!(0.010), now));
-        // pos_b has no evidence
-
-        daemon.run_startup_auto_reconcile().await.unwrap();
-
-        let stored_a = daemon.store.positions().find_by_id(pid_a).await.unwrap().unwrap();
-        let stored_b = daemon.store.positions().find_by_id(pid_b).await.unwrap().unwrap();
-        assert!(
-            matches!(stored_a.state, PositionState::Active { .. }),
-            "pos_a must remain Active while unresolved evidence is present"
-        );
-        assert!(
-            matches!(stored_b.state, PositionState::Active { .. }),
-            "pos_b must remain Active while unresolved evidence is present"
-        );
-    }
+    include!("daemon/startup_evidence_tests.rs");
 
     #[tokio::test]
     async fn test_startup_auto_reconcile_entering_not_processed() {

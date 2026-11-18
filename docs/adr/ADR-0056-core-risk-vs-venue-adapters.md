@@ -575,14 +575,22 @@ isolation (§3); durable intent journal (§8 step 7).
 Eight PRs, each Codex-reviewed before merge, during the empty-book window. Mechanical steps (1, 3) change no timing,
 threshold or budget; any such change is its own step.
 
-**Priority order decided 2026-11-05 ("Fase S", Binance spot first).** The operator's priority is to execute a long on
+**Spot-first activation update (2026-11-15).** The approved step-8 design requires the net-from-start budget basis,
+month-boundary snapshots and revisions, and carried-leg accounting (step 8p) as part of the minimum **before real
+capital**. Deferring the historical step 5 is no longer a justification for operating Spot without that support, and
+draining the book before month-end is not an alternative activation contract. The historical sequencing and interim
+contract below are retained as history and are **superseded for Spot-first activation**. This records the already
+approved design; it does not claim that implementation or acceptance is complete. The rollback and compatibility
+conditions in this section remain applicable. See the [public roadmap](../../ROADMAP.md#next-gates-before-activation).
+
+**Historical priority order decided 2026-11-05 ("Fase S", Binance spot first) — superseded for Spot-first activation by the update above.** The operator's priority is to execute a long on
 Binance spot as soon as it is safe, keeping the USDⓈ-M adapter intact as `binance:usdm`. The steps are therefore merged
 in the order **1 → 2 → 3 → 4 → 6 → 7 → 8**; step 5 (cost-priced boundary downside, carried-basis migration) is deferred
 until after step 8 and before any second venue, with today's basis derivation kept meanwhile (§2.4 already allows
 this). The rollback boundaries of the table are unchanged by the reordering: step 6 and step 7 still require the stated
 empty-book conditions, and step 8 depends on steps 2, 3, 6 and 7.
 
-**Interim accounting contract while step 5 is deferred.** Step 8 must establish and persist the interim capital basis
+**Historical interim accounting contract while step 5 was deferred — superseded for Spot-first activation, not an active alternative.** Step 8 must establish and persist the interim capital basis
 from the operated spot wallet (quote cash plus governed inventory at the venue mark, §2.4), preserving the active
 monthly model and the consumed budget without any intra-month budget increase. Until step 5 ships, **carrying
 risk-bearing or unsettled legs across a UTC month boundary is unsupported**: admissions quiesce before the boundary and

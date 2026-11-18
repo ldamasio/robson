@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use robson_exec::order_journal::{CommitFailure, JournalBatch};
 use sqlx::{Connection, Postgres, Transaction};
+use tracing::Instrument as _;
 
 use super::PgJournalBackend;
 use crate::ledger_connection::LedgerConnection;
@@ -30,11 +31,25 @@ impl PgJournalBackend {
     ) -> Result<(), CommitFailure> {
         let connection = self.pool.acquire().await.map_err(known)?;
         let mut write = LedgerConnection::new(connection);
-        let mut tx = write.connection().begin().await.map_err(known)?;
+        // Same operation_io spans as the unflagged commit path, so the
+        // operation's database attempts include the balance statements.
+        let mut tx = write
+            .connection()
+            .begin()
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+            )
+            .await
+            .map_err(known)?;
         Box::pin(self.prepare_balance(batch, &mut tx, started)).await?;
         self.write(batch, &mut tx).await?;
         // Preserve J's existing conservative COMMIT classification.
-        tx.commit().await.map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
+        tx.commit()
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+            )
+            .await
+            .map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
         write.finished = true;
         Ok(())
     }
@@ -51,10 +66,14 @@ impl PgJournalBackend {
         let timeout =
             format!("{}ms", statement_budget(balance.commit_bound, started.elapsed())?.as_millis());
         sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true), set_config('idle_in_transaction_session_timeout', '1s', true)")
-            .bind(timeout).execute(&mut **tx).await.map_err(known)?;
+            .bind(timeout).execute(&mut **tx)
+            .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
+            .await.map_err(known)?;
         let version = sqlx::query_scalar::<_, i64>(
             "UPDATE accounting_state SET version = version + 1 WHERE tenant_id = $1 AND venue_id = $2 RETURNING version",
-        ).bind(self.tenant_id).bind(&batch.intent.venue_id).fetch_optional(&mut **tx).await.map_err(known)?;
+        ).bind(self.tenant_id).bind(&batch.intent.venue_id).fetch_optional(&mut **tx)
+            .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
+            .await.map_err(known)?;
         if version.is_none() {
             return Err(CommitFailure::Known("balance journal has no accounting row".to_string()));
         }
@@ -78,7 +97,9 @@ impl PgJournalBackend {
                  SELECT id, $2, $3, $4, created_at FROM UNNEST($1::uuid[], $5::timestamptz[]) AS incoming(id, created_at) \
                  ON CONFLICT (attempt_id) DO NOTHING",
             ).bind(ids).bind(intent.intent_id).bind(self.tenant_id).bind(&intent.venue_id)
-                .bind(created).execute(&mut **tx).await.map_err(known)?;
+                .bind(created).execute(&mut **tx)
+                .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
+                .await.map_err(known)?;
         }
         if let Some(admission) = &balance.admission {
             sqlx::query(
@@ -91,7 +112,9 @@ impl PgJournalBackend {
                 .bind(&admission.envelope_hash).bind(admission.planned_qty).bind(admission.requested_qty)
                 .bind(admission.reference_price).bind(admission.remainder_reserve).bind(admission.admission_charge)
                 .bind(admission.initial_trigger).bind(intent.created_at).bind(balance.handed_off)
-                .execute(&mut **tx).await.map_err(known)?;
+                .execute(&mut **tx)
+                .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
+                .await.map_err(known)?;
         }
         Ok(())
     }

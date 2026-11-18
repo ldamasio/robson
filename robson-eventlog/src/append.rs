@@ -2,7 +2,7 @@
 
 use chrono::Utc;
 use sqlx::{PgPool, Postgres, Row, Transaction};
-use tracing::{debug, warn};
+use tracing::{debug, warn, Instrument as _};
 use uuid::Uuid;
 
 use crate::{
@@ -30,9 +30,20 @@ pub async fn append_event(
     expected_seq: Option<i64>,
     event: Event,
 ) -> Result<Uuid> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool
+        .begin()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+        )
+        .await?;
+    let mut rollback_observation = RollbackObservation::new();
     let event_id = append_event_tx(&mut tx, stream_key, expected_seq, event).await?;
-    tx.commit().await?;
+    tx.commit()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+        )
+        .await?;
+    rollback_observation.disarm();
     Ok(event_id)
 }
 
@@ -68,6 +79,7 @@ pub async fn append_event_tx(
     .bind(&idempotency_key)
     .bind(&event_id)
     .fetch_optional(&mut **tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await;
 
     match idempotency_check {
@@ -86,7 +98,8 @@ pub async fn append_event_tx(
             .bind(&event.tenant_id)
             .bind(&idempotency_key)
             .fetch_one(&mut **tx)
-            .await?;
+            .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
+        .await?;
 
             warn!(
                 existing_event_id = %existing_event_id,
@@ -127,6 +140,7 @@ pub async fn append_event_tx(
     .bind(&event.actor_id)
     .bind(event.payload_schema_version)
     .execute(&mut **tx)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await;
 
     match result {
@@ -163,6 +177,9 @@ async fn get_next_seq(
         )
         .bind(stream_key)
         .fetch_optional(&mut **tx)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
         .await?;
 
         match current_seq {
@@ -179,6 +196,9 @@ async fn get_next_seq(
             .bind(stream_key)
             .bind(tenant_id)
             .fetch_one(&mut **tx)
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+            )
             .await?;
 
         Ok(next_seq)
@@ -199,9 +219,36 @@ async fn update_stream_state(
     .bind(event_id)
     .bind(stream_key)
     .execute(&mut **tx)
-    .await?;
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
+        .await?;
 
     Ok(())
+}
+
+
+// The public SQLx Transaction Drop queues rollback while open. This only counts
+// that application cleanup request; it never claims server acknowledgement.
+struct RollbackObservation {
+    origin: tracing::Span,
+    armed: bool,
+}
+impl RollbackObservation {
+    fn new() -> Self {
+        Self {
+            origin: tracing::Span::current(),
+            armed: true,
+        }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for RollbackObservation {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::info_span!(target: "robson_operation", parent: &self.origin, "operation_io", io_kind = 4_u64).in_scope(|| {});
+        }
+    }
 }
 
 #[cfg(test)]

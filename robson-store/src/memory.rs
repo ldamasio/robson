@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicI64, AtomicU64, Ordering},
         RwLock,
     },
 };
@@ -26,6 +26,7 @@ use crate::{
 /// Used by tests and as the robsond runtime projection store. Events are
 /// kept for in-process replay, except audit-only telemetry (see `append`).
 pub struct MemoryStore {
+    fixture_repository_calls: [AtomicU64; 5],
     positions: RwLock<HashMap<PositionId, Position>>,
     orders: RwLock<HashMap<OrderId, Order>>,
     events: RwLock<Vec<StoredEvent>>,
@@ -43,11 +44,20 @@ impl MemoryStore {
     /// Create a new empty in-memory store
     pub fn new() -> Self {
         Self {
+            fixture_repository_calls: std::array::from_fn(|_| AtomicU64::new(0)),
             positions: RwLock::new(HashMap::new()),
             orders: RwLock::new(HashMap::new()),
             events: RwLock::new(Vec::new()),
             event_seq: AtomicI64::new(0),
         }
+    }
+
+    /// Fixture Repository calls (reads AND writes), including failed attempts:
+    /// Position, Order, Event, then risk-open and active as POSITION SUBSETS.
+    /// Sum only the first three for repository total. Direct map/apply_event
+    /// work is outside this boundary; no payload or financial decision uses it.
+    pub fn fixture_repository_call_counts(&self) -> [u64; 5] {
+        std::array::from_fn(|i| self.fixture_repository_calls[i].load(Ordering::Relaxed))
     }
 
     /// Get the number of positions
@@ -504,22 +514,35 @@ impl Default for MemoryStore {
 #[async_trait]
 impl PositionRepository for MemoryStore {
     async fn save(&self, position: &Position) -> Result<(), StoreError> {
+        self.fixture_repository_calls[0].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let mut positions = self.positions.write().unwrap();
         positions.insert(position.id, position.clone());
         Ok(())
     }
 
     async fn find_by_id(&self, id: PositionId) -> Result<Option<Position>, StoreError> {
+        self.fixture_repository_calls[0].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let positions = self.positions.read().unwrap();
         Ok(positions.get(&id).cloned())
     }
 
     async fn find_by_account(&self, account_id: Uuid) -> Result<Vec<Position>, StoreError> {
+        self.fixture_repository_calls[0].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let positions = self.positions.read().unwrap();
         Ok(positions.values().filter(|p| p.account_id == account_id).cloned().collect())
     }
 
     async fn find_active(&self) -> Result<Vec<Position>, StoreError> {
+        self.fixture_repository_calls[0].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
+        self.fixture_repository_calls[4].fetch_add(1, Ordering::Relaxed);
         let positions = self.positions.read().unwrap();
         // Open core-lifecycle states only: Armed, Entering, Active, Exiting.
         // Excludes Closed and Error. Error requires manual intervention and is
@@ -540,6 +563,10 @@ impl PositionRepository for MemoryStore {
     }
 
     async fn find_risk_open(&self) -> Result<Vec<Position>, StoreError> {
+        self.fixture_repository_calls[0].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
+        self.fixture_repository_calls[3].fetch_add(1, Ordering::Relaxed);
         let positions = self.positions.read().unwrap();
         Ok(positions
             .values()
@@ -555,6 +582,9 @@ impl PositionRepository for MemoryStore {
     }
 
     async fn find_by_state(&self, state: &str) -> Result<Vec<Position>, StoreError> {
+        self.fixture_repository_calls[0].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let positions = self.positions.read().unwrap();
         Ok(positions.values().filter(|p| p.state.name() == state).cloned().collect())
     }
@@ -564,6 +594,9 @@ impl PositionRepository for MemoryStore {
         symbol: &robson_domain::Symbol,
         side: robson_domain::Side,
     ) -> Result<Option<Position>, StoreError> {
+        self.fixture_repository_calls[0].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let positions = self.positions.read().unwrap();
         Ok(positions
             .values()
@@ -581,6 +614,9 @@ impl PositionRepository for MemoryStore {
     }
 
     async fn delete(&self, id: PositionId) -> Result<(), StoreError> {
+        self.fixture_repository_calls[0].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let mut positions = self.positions.write().unwrap();
         if positions.remove(&id).is_some() {
             Ok(())
@@ -594,6 +630,9 @@ impl PositionRepository for MemoryStore {
         year: i32,
         month: u32,
     ) -> Result<Vec<Position>, StoreError> {
+        self.fixture_repository_calls[0].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let positions = self.positions.read().unwrap();
         Ok(positions
             .values()
@@ -606,6 +645,9 @@ impl PositionRepository for MemoryStore {
     }
 
     async fn find_all_closed(&self) -> Result<Vec<Position>, StoreError> {
+        self.fixture_repository_calls[0].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let positions = self.positions.read().unwrap();
         Ok(positions
             .values()
@@ -622,22 +664,34 @@ impl PositionRepository for MemoryStore {
 #[async_trait]
 impl OrderRepository for MemoryStore {
     async fn save(&self, order: &Order) -> Result<(), StoreError> {
+        self.fixture_repository_calls[1].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let mut orders = self.orders.write().unwrap();
         orders.insert(order.id, order.clone());
         Ok(())
     }
 
     async fn find_by_id(&self, id: OrderId) -> Result<Option<Order>, StoreError> {
+        self.fixture_repository_calls[1].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let orders = self.orders.read().unwrap();
         Ok(orders.get(&id).cloned())
     }
 
     async fn find_by_position(&self, position_id: PositionId) -> Result<Vec<Order>, StoreError> {
+        self.fixture_repository_calls[1].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let orders = self.orders.read().unwrap();
         Ok(orders.values().filter(|o| o.position_id == position_id).cloned().collect())
     }
 
     async fn find_by_exchange_id(&self, exchange_id: &str) -> Result<Option<Order>, StoreError> {
+        self.fixture_repository_calls[1].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let orders = self.orders.read().unwrap();
         Ok(orders
             .values()
@@ -646,11 +700,17 @@ impl OrderRepository for MemoryStore {
     }
 
     async fn find_by_client_id(&self, client_id: &str) -> Result<Option<Order>, StoreError> {
+        self.fixture_repository_calls[1].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let orders = self.orders.read().unwrap();
         Ok(orders.values().find(|o| o.client_order_id == client_id).cloned())
     }
 
     async fn find_pending(&self) -> Result<Vec<Order>, StoreError> {
+        self.fixture_repository_calls[1].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let orders = self.orders.read().unwrap();
         Ok(orders
             .values()
@@ -667,6 +727,9 @@ impl OrderRepository for MemoryStore {
 #[async_trait]
 impl EventRepository for MemoryStore {
     async fn append(&self, event: &Event) -> Result<i64, StoreError> {
+        self.fixture_repository_calls[2].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let seq = self.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
         // Audit-only telemetry is never read back from this store: recovery
         // and audit replay the durable event log (ADR-0049). Keeping one
@@ -683,6 +746,9 @@ impl EventRepository for MemoryStore {
     }
 
     async fn find_by_position(&self, position_id: PositionId) -> Result<Vec<Event>, StoreError> {
+        self.fixture_repository_calls[2].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let events = self.events.read().unwrap();
         Ok(events
             .iter()
@@ -696,6 +762,9 @@ impl EventRepository for MemoryStore {
         position_id: PositionId,
         after_seq: i64,
     ) -> Result<Vec<Event>, StoreError> {
+        self.fixture_repository_calls[2].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let events = self.events.read().unwrap();
         Ok(events
             .iter()
@@ -705,6 +774,9 @@ impl EventRepository for MemoryStore {
     }
 
     async fn get_latest_seq(&self, position_id: PositionId) -> Result<Option<i64>, StoreError> {
+        self.fixture_repository_calls[2].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let events = self.events.read().unwrap();
         Ok(events
             .iter()
@@ -714,6 +786,9 @@ impl EventRepository for MemoryStore {
     }
 
     async fn get_all_events(&self) -> Result<Vec<Event>, StoreError> {
+        self.fixture_repository_calls[2].fetch_add(1, Ordering::Relaxed);
+        tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 6_u64)
+            .in_scope(|| {});
         let events = self.events.read().unwrap();
         // Clone and sort by sequence number to guarantee ordering
         let mut sorted: Vec<StoredEvent> = events.iter().cloned().collect();

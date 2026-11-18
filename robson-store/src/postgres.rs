@@ -18,6 +18,7 @@ use robson_domain::{
 };
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::error::StoreError;
@@ -572,6 +573,7 @@ pub async fn find_active_from_projection(
     )
     .bind(tenant_id)
     .fetch_all(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await
     .map_err(|e| StoreError::Database(format!("Failed to read projection: {}", e)))?;
 
@@ -608,6 +610,7 @@ pub async fn find_armed_entry_policies(
     )
     .bind(tenant_id)
     .fetch_all(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await
     .map_err(|e| StoreError::Database(format!("Failed to read armed entry policies: {}", e)))?;
 
@@ -695,6 +698,7 @@ pub async fn find_positions_overlapping_month(
     .bind(month_start)
     .bind(month_end)
     .fetch_all(pool)
+    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
     .await
     .map_err(|e| StoreError::Database(format!("Failed to read historical positions: {}", e)))?;
 

@@ -11,6 +11,7 @@
     type ApiError,
   } from '$api/robson';
   import { _ } from 'svelte-i18n';
+  import { exclusiveMutation } from '$stores/mutation';
 
   // Monetary fields arrive as Decimal strings from the backend; format for
   // display only (no money math in the browser).
@@ -63,7 +64,9 @@
     }
   }
 
-  async function getQuote() {
+  // Every funding request goes through the app-wide mutation guard, which
+  // freezes the whole surface until it settles (guardrail 4).
+  const getQuote = exclusiveMutation(async () => {
     error = null;
     quote = null;
     confirmInput = '';
@@ -79,7 +82,7 @@
     } finally {
       submitting = false;
     }
-  }
+  });
 
   function toConfirm() {
     if (!quote || isExpired) return;
@@ -87,7 +90,7 @@
     phase = 'confirm';
   }
 
-  async function execute() {
+  const execute = exclusiveMutation(async () => {
     if (!quote || !canConfirm) return;
     error = null;
     phase = 'executing';
@@ -111,7 +114,7 @@
     } finally {
       submitting = false;
     }
-  }
+  });
 
   function startTick() {
     stopTick();
@@ -148,7 +151,7 @@
     return `${Number(v).toFixed(8)} USDT`;
   }
 
-  async function previewSpotRecovery() {
+  const previewSpotRecovery = exclusiveMutation(async () => {
     recoveryError = null;
     recoveryResult = null;
     recoveryConfirmInput = '';
@@ -165,9 +168,9 @@
     } finally {
       recoverySubmitting = false;
     }
-  }
+  });
 
-  async function executeSpotRecovery() {
+  const executeSpotRecovery = exclusiveMutation(async () => {
     if (!recoveryPreview || !recoveryCanExecute) return;
     recoveryError = null;
     recoverySubmitting = true;
@@ -189,7 +192,7 @@
     } finally {
       recoverySubmitting = false;
     }
-  }
+  });
 
   $effect(() => {
     void loadRecent();

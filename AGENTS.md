@@ -7,7 +7,9 @@ Vendor-specific files such as `CLAUDE.md`, Cursor rules, or other tool adapters 
 
 ## Project Identity
 
-Robson is an execution and risk management system for cryptocurrency futures, operating at fixed 1x leverage.
+Robson is an execution and risk management system. The next product release target is v2.6: Binance Spot, LONG-only. The current v2.5 execution path is the legacy Binance USD-M Futures implementation at fixed 1x leverage. Spot development is in progress and is not ready for real capital; merged components do not authorize activation. See [ROADMAP.md](ROADMAP.md) for public scope, evidence and gates.
+
+Product release numbers and historical internal architecture identifiers are separate: `v3` filenames and `MIG-v3#N` remain internal planning names, not a promise of a product v3 release. Do not renumber those documents to implement the v2.6 roadmap. Binance is first; additional exchanges are future work requiring separate decisions and acceptance.
 
 The operator decides the entry and arms it; Robson executes it when the armed condition is met and manages the exit under deterministic risk and reward policies.
 It does not originate trade ideas, justify signals, or bypass operator governance.

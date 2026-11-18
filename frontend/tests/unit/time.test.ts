@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { formatTimeUtc, isTodayUtc, utcDateKey } from "$lib/utils/time";
+import { formatTimeUtc, isTodayUtc, utcDateKey } from "#lib/utils/time.ts";
 
 describe("formatTimeUtc", () => {
   it("formats ISO8601 as HH:mm:ss.SSS UTC", () => {

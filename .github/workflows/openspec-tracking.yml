@@ -6,6 +6,9 @@ on:
       - 'openspec/**'
       - 'scripts/openspec_github.py'
       - 'scripts/tests/test_openspec_github.py'
+      - 'scripts/check-release-identity.py'
+      - 'scripts/tests/test_release_identity.py'
+      - '.github/workflows/release-identity.yml'
       - 'scripts/requirements-security.txt'
       - '.github/workflows/openspec-tracking.yml'
   push:
@@ -33,7 +36,7 @@ jobs:
         run: |
           python3.12 -m venv "$RUNNER_TEMP/openspec-security"
           "$RUNNER_TEMP/openspec-security/bin/pip" install --require-hashes -r scripts/requirements-security.txt
-          "$RUNNER_TEMP/openspec-security/bin/bandit" -q scripts/openspec_github.py
+          "$RUNNER_TEMP/openspec-security/bin/bandit" -q scripts/openspec_github.py scripts/check-release-identity.py
       - name: Preview progress without GitHub writes
         env:
           SOURCE_SHA: ${{ github.sha }}

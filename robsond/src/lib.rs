@@ -54,6 +54,7 @@ pub mod funding;
 pub mod google_jwks;
 pub mod market_data;
 pub mod metrics;
+pub mod operation_observation;
 pub mod position_manager;
 pub mod query;
 pub mod query_engine;
