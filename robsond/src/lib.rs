@@ -49,6 +49,7 @@ pub mod auth;
 mod capability;
 pub mod circuit_breaker;
 pub mod config;
+pub mod control_delivery;
 pub mod daemon;
 pub mod detector;
 pub mod error;
