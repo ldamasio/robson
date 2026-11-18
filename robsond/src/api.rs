@@ -1597,6 +1597,20 @@ async fn metrics_handler() -> impl IntoResponse {
     )
 }
 
+/// Map only this pure account-kind refusal to HTTP 400. Existing supported
+/// account errors retain each handler's current mapping.
+fn account_operation_refusal<E: ExchangePort>(
+    exchange: &E,
+    operation: &'static str,
+) -> Option<Response> {
+    crate::capability::require_position_account(&exchange.capabilities(), operation)
+        .err()
+        .map(|error| {
+            (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: error.to_string() }))
+                .into_response()
+        })
+}
+
 #[cfg(feature = "postgres")]
 fn funding_service<E, S>(
     state: &ApiState<E, S>,
@@ -1629,6 +1643,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     match funding_service(&state) {
         Ok(service) => match service.quote().await {
             Ok(quote) => (StatusCode::OK, Json(quote)).into_response(),
@@ -1643,17 +1661,22 @@ where
 }
 
 #[cfg(not(feature = "postgres"))]
-async fn funding_quote_handler<E, S>(State(_state): State<Arc<ApiState<E, S>>>) -> impl IntoResponse
+async fn funding_quote_handler<E, S>(State(state): State<Arc<ApiState<E, S>>>) -> impl IntoResponse
 where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(ErrorResponse {
             error: "funding_store_unavailable".to_string(),
         }),
     )
+        .into_response()
 }
 
 /// `POST /funding/execute`, ordinary class: the saga can convert and transfer
@@ -1668,6 +1691,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     let work = Box::pin(funding_execute(State(Arc::clone(&state)), headers, Json(request)));
     permitted(&state, OperationKind::FundingExecute, work).await
 }
@@ -1682,6 +1709,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     if !state.funding.enabled {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1729,6 +1760,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     if !state.funding.enabled {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1754,6 +1789,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     let executes = request.execute && !request.dry_run;
     let work = Box::pin(recover_spot_usdt(State(Arc::clone(&state)), Json(request)));
     if !executes {
@@ -1770,6 +1809,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     const CONFIRM: &str = "TRANSFER_SPOT_USDT_TO_FUTURES";
     const TRANSFER_TYPE: UniversalTransferType = UniversalTransferType::MainUmfuture;
 
@@ -1994,6 +2037,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "capital refresh") {
+        return response;
+    }
+
     match refresh_capital_from_exchange(&state.exchange, &state.position_manager).await {
         Ok(capital) => (StatusCode::OK, Json(CapitalRefreshResponse { capital })).into_response(),
         Err(error) => (
@@ -2012,6 +2059,7 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    crate::capability::require_position_account(&exchange.capabilities(), "capital refresh")?;
     let balance = exchange.get_futures_balance().await?;
     let capital = balance.wallet_balance;
     if capital <= Decimal::ZERO {
@@ -7902,3 +7950,6 @@ mod tests {
         assert_eq!(exchange.market_order_call_count(), 1);
     }
 }
+
+#[cfg(test)]
+mod account_worker_tests;
