@@ -683,6 +683,15 @@ fn through_35() -> sqlx::migrate::Migrator {
     old
 }
 
+/// The official embedded inventory, filtered through migration 37.
+fn through_37() -> sqlx::migrate::Migrator {
+    let mut old = sqlx::migrate!("../migrations");
+    old.migrations = std::borrow::Cow::Owned(
+        old.iter().filter(|m| m.version <= 20240101000037).cloned().collect(),
+    );
+    old
+}
+
 #[sqlx::test(migrations = false)]
 #[ignore = "requires DATABASE_URL"]
 async fn the_ledger_schema_upgrades_from_35_and_preserves_the_rollback_boundary(pool: PgPool) {
@@ -753,7 +762,17 @@ async fn old_pod_writes_remain_compatible_during_36_and_37(pool: PgPool) {
     sqlx::query("INSERT INTO submit_attempts (attempt_id,venue_id,account_scope,client_order_id,state,created_at) VALUES ($1,'binance:usdm','scope','predecessor','started',now())")
         .bind(Uuid::now_v7()).execute(&mut *predecessor).await.unwrap();
     let migration_pool = pool.clone();
-    let migrating = tokio::spawn(async move { robson_db::migrate(&migration_pool).await });
+    // Same production adapter path as robson_db::migrate, bounded to this test's
+    // named 36/37 boundary. Migration38 coexistence has its dedicated tests.
+    let migrating = tokio::spawn(async move {
+        robson_db::repair_known_migration_state(&migration_pool).await?;
+        let mut connection = robson_db::bounded_migration::BoundedMigration::connect(
+            &migration_pool.connect_options(),
+        )
+        .await?;
+        through_37().run_direct(&mut connection).await?;
+        robson_db::Result::<()>::Ok(())
+    });
     tokio::time::timeout(Duration::from_secs(10),async {
         loop {
             let lock:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='submit_attempts'::regclass AND mode='ShareUpdateExclusiveLock' AND granted)")
@@ -787,6 +806,13 @@ async fn old_pod_writes_remain_compatible_during_36_and_37(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(rows, 2);
+    let applied: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM _sqlx_migrations WHERE version>=20240101000036 AND success ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(applied, [20240101000036, 20240101000037], "applied inventory stops at 37");
     for table in TABLES {
         let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(&pool)

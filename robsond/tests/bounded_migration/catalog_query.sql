@@ -83,11 +83,18 @@ raw AS MATERIALIZED (
  FROM relations0 c JOIN objects0 o ON o.classid='pg_class'::regclass AND o.oid=c.oid AND o.subid=0
  LEFT JOIN pg_catalog.pg_am am ON am.oid=c.relam WHERE (SELECT n<=4096 FROM precheck)
  UNION ALL
- SELECT o.key,a.attrelid::text||':'||a.attnum,jsonb_build_object(
+ -- pg_attver is server-owned and derived from WAL insertion positions, which
+ -- advance after rollback. It stays in native identity, never in semantics;
+ -- every other option keeps its order, and NULL options remain NULL.
+ SELECT o.key,a.attrelid::text||':'||a.attnum||coalesce('/'||(SELECT string_agg(u.opt,',' ORDER BY u.n)
+ FROM unnest(a.attoptions) WITH ORDINALITY u(opt,n) WHERE starts_with(u.opt,'pg_attver=')),''),jsonb_build_object(
  'number',a.attnum,'type',pg_catalog.format_type(a.atttypid,a.atttypmod),'typmod',a.atttypmod,
  'not_null',a.attnotnull,'identity',a.attidentity,'generated',a.attgenerated,
  'collation',(SELECT n.nspname||'.'||c.collname FROM pg_catalog.pg_collation c JOIN pg_catalog.pg_namespace n ON n.oid=c.collnamespace WHERE c.oid=a.attcollation),
- 'default',pg_catalog.pg_get_expr(d.adbin,d.adrelid,false),'options',a.attoptions)
+ 'default',pg_catalog.pg_get_expr(d.adbin,d.adrelid,false),
+ 'options',CASE WHEN a.attoptions IS NOT NULL THEN ARRAY(SELECT u.opt
+ FROM unnest(a.attoptions) WITH ORDINALITY u(opt,n)
+ WHERE u.opt IS NULL OR NOT starts_with(u.opt,'pg_attver=') ORDER BY u.n) END)
  FROM attributes0 a JOIN objects0 o ON o.classid='pg_class'::regclass AND o.oid=a.attrelid AND o.subid=a.attnum
  LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
  WHERE (SELECT n<=4096 FROM precheck)
