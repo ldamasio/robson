@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+# Test coexistence only; the private synthetic migration contract remains cfg(test).
+postgres = ["robsond/postgres"]
+
 [dependencies]
 sqlx = { workspace = true }
 tokio = { workspace = true }
@@ -16,3 +20,7 @@ serde_json = { workspace = true }
 [dev-dependencies]
 # For testing only
 tokio = { workspace = true, features = ["test-util"] }
+robson-testkit = { path = "../robson-testkit" }
+robsond = { path = "../robsond", default-features = false }
+robson-exec = { path = "../robson-exec" }
+proptest = "=1.11.0"

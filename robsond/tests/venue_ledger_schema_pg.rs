@@ -3,16 +3,11 @@
 //! infrastructure.
 #![cfg(feature = "postgres")]
 
-use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
-const VENUE: &str = "binance:spot";
-// Synthetic chart fixture: the second support identified by the fixture's
-// analysis.
-const CHART_STOP: &str = "90";
 const TABLES: &[&str] = &[
     "accounting_state",
     "venue_accounts",
@@ -24,121 +19,9 @@ const TABLES: &[&str] = &[
     "spot_intent_clock",
 ];
 
-#[derive(Clone)]
-struct Fixture {
-    tenant: Uuid,
-    position: Uuid,
-    intent: Uuid,
-    at: DateTime<Utc>,
-}
-
-async fn execute(pool: &PgPool, sql: &str) {
-    sqlx::raw_sql(sql).execute(pool).await.unwrap();
-}
-
-impl Fixture {
-    async fn new(pool: &PgPool) -> Self {
-        let f = Self {
-            tenant: Uuid::now_v7(),
-            position: Uuid::now_v7(),
-            intent: Uuid::now_v7(),
-            at: DateTime::parse_from_rfc3339("2026-11-14T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        };
-        sqlx::query("INSERT INTO accounting_state (tenant_id, venue_id, budget_model) VALUES ($1,$2,'net_from_start_non_expanding_v1')")
-            .bind(f.tenant).bind(VENUE).execute(pool).await.unwrap();
-        sqlx::query("INSERT INTO leg_routes VALUES ($1,$2,$3,'scope',$4)")
-            .bind(f.position)
-            .bind(f.tenant)
-            .bind(VENUE)
-            .bind(f.at)
-            .execute(pool)
-            .await
-            .unwrap();
-        f.insert_intent(pool, f.intent).await;
-        f.admit(pool, f.intent, "2026-11-01", false).await.unwrap();
-        f
-    }
-
-    async fn insert_intent(&self, pool: &PgPool, intent: Uuid) {
-        sqlx::query("INSERT INTO order_intents (intent_id,tenant_id,venue_id,account_scope,client_order_id,position_id,kind,params,created_at) VALUES ($1,$2,$3,'scope',$4,$5,'entry','{}',$6)")
-            .bind(intent).bind(self.tenant).bind(VENUE).bind(intent.to_string()).bind(self.position).bind(self.at)
-            .execute(pool).await.unwrap();
-    }
-
-    async fn admission(
-        &self,
-        tx: &mut Transaction<'_, Postgres>,
-        intent: Uuid,
-        month: &str,
-        handed_off: bool,
-    ) -> Result<(), sqlx::Error> {
-        // The real future writer's protocol: accounting row first, then admission.
-        sqlx::query(
-            "UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id=$2",
-        )
-        .bind(self.tenant)
-        .bind(VENUE)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query("SELECT balance_leg_admit($1,$2,'scope','BTCUSDT',$3,$4,$5::text::date,10,10,200,5,0.01,'base','fixture-chart',$6,'fixture-hash',1,1.01,100,0.1,12,$7::text::numeric,$6,$8)")
-            .bind(self.tenant).bind(VENUE).bind(self.position).bind(intent).bind(month).bind(self.at)
-            .bind(CHART_STOP).bind(handed_off).execute(&mut **tx).await?;
-        Ok(())
-    }
-
-    async fn admit(
-        &self,
-        pool: &PgPool,
-        intent: Uuid,
-        month: &str,
-        handed_off: bool,
-    ) -> Result<(), sqlx::Error> {
-        let mut tx = pool.begin().await?;
-        self.admission(&mut tx, intent, month, handed_off).await?;
-        tx.commit().await
-    }
-
-    async fn order(&self, pool: &PgPool) {
-        sqlx::query("INSERT INTO venue_orders (venue_id,account_scope,symbol,exchange_order_id,tenant_id,client_order_id,last_client_order_id,owner,intent_id,position_id,kind,side,order_type,orig_qty,stop_price,status,phase,executed_cum,cumulative_quote,fills_qty,last_checked_at,live_seen_at) VALUES ($1,'scope','BTCUSDT','1',$2,'stop','stop','leg',$3,$4,'stop','SELL','STOP_LOSS',1,$5::text::numeric,'NEW','live',0.3,30,0.3,$6,$6)")
-            .bind(VENUE).bind(self.tenant).bind(Uuid::now_v7()).bind(self.position).bind(CHART_STOP).bind(self.at)
-            .execute(pool).await.unwrap();
-    }
-
-    async fn all_rows(&self, pool: &PgPool) {
-        self.order(pool).await;
-        sqlx::query("INSERT INTO venue_accounts VALUES ($1,'scope',$2,'fixture-uid',$3,$4)")
-            .bind(VENUE)
-            .bind(self.tenant)
-            .bind(self.at)
-            .bind(Uuid::now_v7())
-            .execute(pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO order_fills VALUES ($1,'scope','BTCUSDT','1','1',$2,100,0.3,30,0.03,'USDT',$3,$3)")
-            .bind(VENUE).bind(self.tenant).bind(self.at).execute(pool).await.unwrap();
-        sqlx::query("INSERT INTO spot_intent_clock (attempt_id,intent_id,tenant_id,venue_id,attempt_created_at) VALUES ($1,$2,$3,$4,$5)")
-            .bind(Uuid::now_v7()).bind(self.intent).bind(self.tenant).bind(VENUE).bind(self.at).execute(pool).await.unwrap();
-    }
-}
-
-fn constraint(error: &sqlx::Error, code: &str, name: Option<&str>) {
-    let db = error.as_database_error().expect("database rejection");
-    assert_eq!(db.code().as_deref(), Some(code), "{error}");
-    if let Some(name) = name {
-        assert_eq!(db.constraint(), Some(name), "{error}");
-    }
-}
-
-/// Use a transaction per refusal, so the rejected statement cannot poison a
-/// later assertion.
-async fn refused(pool: &PgPool, sql: &str, code: &str, name: Option<&str>) {
-    let mut tx = pool.begin().await.unwrap();
-    let err = sqlx::raw_sql(sql).execute(&mut *tx).await.unwrap_err();
-    constraint(&err, code, name);
-    tx.rollback().await.unwrap();
-}
+#[path = "venue_ledger_schema/fixture.rs"]
+mod fixture;
+use fixture::*;
 
 async fn row(pool: &PgPool, table: &str) -> Value {
     sqlx::query_scalar(&format!("SELECT to_jsonb(t) FROM {table} t LIMIT 1"))
@@ -181,9 +64,15 @@ async fn the_ledger_schema_installs_fresh(pool: PgPool) {
     }
     let versions: Vec<i64>=sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE version>=20240101000036 AND success ORDER BY version")
         .fetch_all(&pool).await.unwrap();
-    assert_eq!(versions, [20240101000036, 20240101000037]);
-    let f = Fixture::new(&pool).await;
-    f.all_rows(&pool).await;
+    assert_eq!(versions, [20240101000036, 20240101000037, 20240101000038]);
+    let f = Fixture::new_for_all_rows(&pool).await.unwrap();
+    f.all_rows(&pool).await.unwrap();
+    let graph: i64 = sqlx::query_scalar("SELECT count(*) FROM spot_intent_clock c JOIN submit_attempts a USING(attempt_id) JOIN order_intents i ON i.intent_id=c.intent_id JOIN budget_daily_charges d USING(attempt_id) WHERE c.tenant_id=$1 AND c.intent_id=$2 AND a.venue_id=c.venue_id AND a.account_scope=i.account_scope AND a.client_order_id=i.client_order_id AND a.created_at=c.attempt_created_at AND d.tenant_id=c.tenant_id AND d.intent_id=c.intent_id AND d.venue_id=c.venue_id AND d.account_scope=i.account_scope AND d.client_order_id=i.client_order_id AND d.kind=i.kind AND d.source_created_at=c.attempt_created_at AND d.daily_units=1 AND d.budget_clock_domain IS NOT DISTINCT FROM c.budget_clock_domain AND d.budget_created_tick IS NOT DISTINCT FROM c.budget_created_tick AND d.budget_recorded_at IS NOT DISTINCT FROM c.budget_recorded_at AND c.budget_clock_domain IS NULL AND c.budget_created_tick IS NULL AND c.clock_sample_id IS NULL AND c.capture_epoch IS NULL")
+        .bind(f.tenant).bind(f.intent).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        graph, 1,
+        "actual trigger must preserve the complete source binding without native evidence"
+    );
     let volatility: String=sqlx::query_scalar("SELECT provolatile::text FROM pg_proc WHERE oid='balance_leg_admit(uuid,text,text,text,uuid,uuid,date,numeric,numeric,numeric,numeric,numeric,text,text,timestamptz,text,numeric,numeric,numeric,numeric,numeric,numeric,timestamptz,boolean)'::regprocedure AND prorettype='void'::regtype")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(volatility, "v");
@@ -191,17 +80,30 @@ async fn the_ledger_schema_installs_fresh(pool: PgPool) {
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
-async fn no_new_constraint_references_a_table_the_daemon_writes(pool: PgPool) {
-    let refs: Vec<String>=sqlx::query_scalar("SELECT c.conname FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid WHERE t.relname=ANY($1) AND c.contype='f' AND c.confrelid NOT IN (SELECT oid FROM pg_class WHERE relname=ANY($1))")
+async fn the_ledger_schema_has_only_reviewed_external_foreign_keys(pool: PgPool) {
+    // Exactly the reviewed38 edges may leave the original ledger table set.
+    // Flags encode deferrable/initially-deferred/validated, not just the names.
+    let refs: Vec<(String, String, String, i32)> = sqlx::query_as("SELECT c.conname,t.relname,r.relname,c.condeferrable::int*4+c.condeferred::int*2+c.convalidated::int FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_class r ON r.oid=c.confrelid WHERE t.relnamespace='public'::regnamespace AND t.relname=ANY($1) AND c.contype='f' AND c.confrelid NOT IN (SELECT oid FROM pg_class WHERE relname=ANY($1)) ORDER BY t.relname,c.conname")
         .bind(TABLES).fetch_all(&pool).await.unwrap();
-    assert!(refs.is_empty(), "{refs:?}");
+    let refs: Vec<_> = refs
+        .iter()
+        .map(|(name, from, to, flags)| (name.as_str(), from.as_str(), to.as_str(), *flags))
+        .collect();
+    assert_eq!(refs, [
+        ("budget_clock_charge_fk", "spot_intent_clock", "budget_daily_charges", 6),
+        ("spot_intent_clock_attempt_fk", "spot_intent_clock", "submit_attempts", 0),
+        ("spot_intent_clock_intent_fk", "spot_intent_clock", "order_intents", 0),
+        ("spot_intent_clock_sample_fk", "spot_intent_clock", "clock_samples", 0),
+        ("venue_orders_live_sample_fk", "venue_orders", "clock_samples", 0),
+        ("venue_orders_terminal_sample_fk", "venue_orders", "clock_samples", 0),
+    ]);
 }
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn every_amount_rejects_nonfinite_and_unrepresentable_values(pool: PgPool) {
-    let f = Fixture::new(&pool).await;
-    f.all_rows(&pool).await;
+    let f = Fixture::new_for_all_rows(&pool).await.unwrap();
+    f.all_rows(&pool).await.unwrap();
     let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
         .fetch_one(&pool)
         .await
@@ -232,8 +134,8 @@ async fn every_amount_rejects_nonfinite_and_unrepresentable_values(pool: PgPool)
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn the_ledger_schema_refuses_what_the_design_forbids(pool: PgPool) {
-    let f = Fixture::new(&pool).await;
-    f.all_rows(&pool).await;
+    let f = Fixture::new_for_all_rows(&pool).await.unwrap();
+    f.all_rows(&pool).await.unwrap();
     // Every single-column domain; CHECK failures happen before duplicate primary
     // keys.
     let cases = &[
@@ -402,8 +304,8 @@ async fn the_ledger_schema_refuses_what_the_design_forbids(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn numbers_and_canonical_ids_round_trip_exactly(pool: PgPool) {
-    let fixture = Fixture::new(&pool).await;
-    fixture.all_rows(&pool).await;
+    let fixture = Fixture::new_for_all_rows(&pool).await.unwrap();
+    fixture.all_rows(&pool).await.unwrap();
     for value in [
         "0.0000000001",
         "0.0000000000000000000000000001",
@@ -461,8 +363,8 @@ async fn numbers_and_canonical_ids_round_trip_exactly(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn ledger_rows_only_move_forward(pool: PgPool) {
-    let f = Fixture::new(&pool).await;
-    f.all_rows(&pool).await;
+    let f = Fixture::new_for_all_rows(&pool).await.unwrap();
+    f.all_rows(&pool).await.unwrap();
     for table in TABLES {
         refused(&pool, &format!("DELETE FROM {table}"), "23514", None).await;
     }
@@ -497,25 +399,6 @@ async fn ledger_rows_only_move_forward(pool: PgPool) {
     }
     execute(&pool, "UPDATE venue_orders SET trades_cursor=2").await;
     refused(&pool, "UPDATE venue_orders SET trades_cursor=1", "23514", None).await;
-    execute(&pool,"UPDATE venue_orders SET phase='terminal',status='CANCELED',terminal_seen_at=last_checked_at,terminal_clock_sample_id=gen_random_uuid(),terminal_clock_wall_delta_ms=0,terminal_clock_mono_delta_ms=0,terminal_clock_verdict='valid'").await;
-    for field in [
-        "terminal_clock_wall_delta_ms",
-        "terminal_clock_mono_delta_ms",
-    ] {
-        refused(&pool, &format!("UPDATE venue_orders SET {field}=1"), "23514", None).await;
-    }
-    for sql in [
-        "UPDATE venue_orders SET phase='live',terminal_seen_at=NULL",
-        "UPDATE venue_orders SET status='FILLED'",
-        "UPDATE venue_orders SET executed_cum=0.4",
-        "UPDATE venue_orders SET terminal_clock_verdict='invalid'",
-        "UPDATE venue_orders SET terminal_clock_sample_id=gen_random_uuid()",
-    ] {
-        refused(&pool, sql, "23514", None).await;
-    }
-    // Rotation and late fill coverage may advance after terminal; its final
-    // evidence cannot.
-    execute(&pool,"UPDATE venue_orders SET fills_qty=executed_cum,last_checked_at=last_checked_at+interval '1 second'").await;
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -660,8 +543,8 @@ async fn balance_leg_admit_inserts_replays_and_supersedes_only_proven_unsent(poo
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn tenant_relationships_and_trade_identity_cannot_be_crossed(pool: PgPool) {
-    let f = Fixture::new(&pool).await;
-    f.all_rows(&pool).await;
+    let f = Fixture::new_for_all_rows(&pool).await.unwrap();
+    f.all_rows(&pool).await.unwrap();
     let other = Uuid::now_v7();
     sqlx::query("INSERT INTO accounting_state (tenant_id,venue_id,budget_model) VALUES ($1,$2,'net_from_start_non_expanding_v1')")
         .bind(other).bind(VENUE).execute(&pool).await.unwrap();
@@ -800,6 +683,15 @@ fn through_35() -> sqlx::migrate::Migrator {
     old
 }
 
+/// The official embedded inventory, filtered through migration 37.
+fn through_37() -> sqlx::migrate::Migrator {
+    let mut old = sqlx::migrate!("../migrations");
+    old.migrations = std::borrow::Cow::Owned(
+        old.iter().filter(|m| m.version <= 20240101000037).cloned().collect(),
+    );
+    old
+}
+
 #[sqlx::test(migrations = false)]
 #[ignore = "requires DATABASE_URL"]
 async fn the_ledger_schema_upgrades_from_35_and_preserves_the_rollback_boundary(pool: PgPool) {
@@ -834,7 +726,27 @@ async fn the_ledger_schema_upgrades_from_35_and_preserves_the_rollback_boundary(
         assert_eq!(count, 0);
     }
     let f = Fixture::new(&pool).await;
-    f.all_rows(&pool).await;
+    // Nonempty legacy sources cannot use the fresh-empty fixture initializer.
+    // Migration38 keeps clock projection closed until real initialization.
+    let error = f.all_rows(&pool).await.unwrap_err();
+    constraint(&error, "23514", None);
+    assert_eq!(
+        error.as_database_error().unwrap().message(),
+        "clock source binding or global daily budget is incomplete"
+    );
+    let effects: (i64, i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM spot_intent_clock),(SELECT count(*) FROM budget_daily_charges),(SELECT count(*) FROM submit_attempts),(SELECT count(*) FROM budget_venue_state),(SELECT count(*) FROM budget_source_audits)")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        effects,
+        (0, 0, 1, 0, 0),
+        "clock/attempt transaction must roll back; the original legacy attempt remains"
+    );
+    let preserved: Value =
+        sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(t)) FROM submit_attempts t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, preserved, "refusal must preserve the original legacy attempt exactly");
 }
 
 #[sqlx::test(migrations = false)]
@@ -850,7 +762,17 @@ async fn old_pod_writes_remain_compatible_during_36_and_37(pool: PgPool) {
     sqlx::query("INSERT INTO submit_attempts (attempt_id,venue_id,account_scope,client_order_id,state,created_at) VALUES ($1,'binance:usdm','scope','predecessor','started',now())")
         .bind(Uuid::now_v7()).execute(&mut *predecessor).await.unwrap();
     let migration_pool = pool.clone();
-    let migrating = tokio::spawn(async move { robson_db::migrate(&migration_pool).await });
+    // Same production adapter path as robson_db::migrate, bounded to this test's
+    // named 36/37 boundary. Migration38 coexistence has its dedicated tests.
+    let migrating = tokio::spawn(async move {
+        robson_db::repair_known_migration_state(&migration_pool).await?;
+        let mut connection = robson_db::bounded_migration::BoundedMigration::connect(
+            &migration_pool.connect_options(),
+        )
+        .await?;
+        through_37().run_direct(&mut connection).await?;
+        robson_db::Result::<()>::Ok(())
+    });
     tokio::time::timeout(Duration::from_secs(10),async {
         loop {
             let lock:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='submit_attempts'::regclass AND mode='ShareUpdateExclusiveLock' AND granted)")
@@ -884,96 +806,19 @@ async fn old_pod_writes_remain_compatible_during_36_and_37(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(rows, 2);
+    let applied: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM _sqlx_migrations WHERE version>=20240101000036 AND success ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(applied, [20240101000036, 20240101000037], "applied inventory stops at 37");
     for table in TABLES {
         let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(count, 0);
-    }
-}
-
-#[sqlx::test(migrations = "../migrations")]
-#[ignore = "requires DATABASE_URL"]
-async fn every_frozen_order_and_leg_field_rejects_rewriting(pool: PgPool) {
-    let f = Fixture::new(&pool).await;
-    f.order(&pool).await;
-    execute(&pool,"UPDATE balance_legs SET gross_qty=1.01,acquisition_cost=101,base_commission=0.01,base_commission_final=true,executable_qty=1,cohort_month=decided_month,closed_at=now()").await;
-    execute(&pool,"UPDATE venue_orders SET phase='terminal',status='CANCELED',terminal_seen_at=now(),terminal_clock_sample_id=gen_random_uuid(),terminal_clock_wall_delta_ms=0,terminal_clock_mono_delta_ms=0,terminal_clock_verdict='valid'").await;
-    for (table, fields) in [
-        ("accounting_state", vec!["tenant_id", "venue_id", "created_at"]),
-        ("balance_legs", vec![
-            "position_id",
-            "tenant_id",
-            "venue_id",
-            "account_scope",
-            "symbol",
-            "created_at",
-            "gross_qty",
-            "acquisition_cost",
-            "base_commission",
-            "cohort_month",
-            "closed_at",
-        ]),
-        ("venue_orders", vec![
-            "venue_id",
-            "account_scope",
-            "symbol",
-            "exchange_order_id",
-            "tenant_id",
-            "client_order_id",
-            "side",
-            "order_type",
-            "orig_qty",
-            "stop_price",
-            "live_seen_at",
-            "live_clock_sample_id",
-            "live_clock_wall_delta_ms",
-            "live_clock_mono_delta_ms",
-            "live_clock_verdict",
-            "intent_id",
-            "position_id",
-            "kind",
-            "phase",
-            "status",
-            "executed_cum",
-            "cumulative_quote",
-            "expiry_reason",
-            "terminal_seen_at",
-            "terminal_clock_sample_id",
-            "terminal_clock_wall_delta_ms",
-            "terminal_clock_mono_delta_ms",
-            "terminal_clock_verdict",
-        ]),
-    ] {
-        for field in fields {
-            let ty:String=sqlx::query_scalar("SELECT t.typname FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid WHERE a.attrelid=$1::regclass AND a.attname=$2")
-                .bind(table).bind(field).fetch_one(&pool).await.unwrap();
-            let expr = match ty.as_str() {
-                "uuid" => "gen_random_uuid()".into(),
-                "timestamptz" => format!("COALESCE({field},now())+interval '1 second'"),
-                "date" => format!("{field}+1"),
-                "numeric" | "int8" => format!("COALESCE({field},0)+1"),
-                "text" => format!("COALESCE({field},'')||'-changed'"),
-                other => panic!("unexpected fixture type {other}"),
-            };
-            let mut tx = pool.begin().await.unwrap();
-            let version = if table == "accounting_state" {
-                ",version=version+1"
-            } else {
-                ""
-            };
-            let error = sqlx::query(&format!("UPDATE {table} SET {field}={expr}{version}"))
-                .execute(&mut *tx)
-                .await
-                .unwrap_err();
-            constraint(&error, "23514", None);
-            assert!(
-                error.as_database_error().unwrap().message().starts_with("ledger invariant:"),
-                "{table}.{field}: {error}"
-            );
-            tx.rollback().await.unwrap();
-        }
     }
 }
 
@@ -1042,4 +887,166 @@ async fn admission_and_leg_keys_require_the_exact_route_and_month(pool: PgPool) 
         Some("balance_legs_admission"),
     );
     tx.rollback().await.unwrap();
+}
+
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn empty_budget_fixture_rejects_nonspot_global_source(pool: PgPool) {
+    sqlx::query("INSERT INTO order_intents (intent_id,tenant_id,venue_id,account_scope,client_order_id,kind,params,created_at) VALUES ($1,$2,'binance:usdm','scope','global-source','exit','{}','2026-11-14T00:00:00Z')")
+        .bind(Uuid::now_v7()).bind(Uuid::now_v7()).execute(&pool).await.unwrap();
+    let error = Fixture::new_for_all_rows(&pool)
+        .await
+        .err()
+        .expect("global nonspot source must refuse empty initialization");
+    match error {
+        sqlx::Error::Protocol(message) => assert_eq!(message, "isolated empty fixture refused"),
+        _ => panic!("unexpected empty-fixture refusal class"),
+    }
+    let effects: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM order_intents),(SELECT count(*) FROM budget_venue_state),(SELECT count(*) FROM budget_source_audits)")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        effects,
+        (1, 0, 0),
+        "source survives; failed fixture initialization is explicitly rolled back"
+    );
+}
+
+// Terminal evidence now references clock_samples (migration 38). These rows are
+// SQL-only test data for the foreign keys: deliberately numerically invalid
+// (u2 > 2 s), never a qualified clock or a send grant.
+async fn diagnostic_samples(pool: &PgPool, tenant: Uuid) -> [Uuid; 2] {
+    let epoch = Uuid::now_v7();
+    sqlx::query("INSERT INTO process_epochs (epoch_id, tenant_id, binary_version) VALUES ($1, $2, 'clock-fixture')")
+        .bind(epoch).bind(tenant).execute(pool).await.unwrap();
+    let ids = [Uuid::now_v7(), Uuid::now_v7()];
+    for id in ids {
+        sqlx::query("INSERT INTO clock_samples (sample_id,tenant_id,venue_id,process_epoch,clock_domain,send_wall_seconds,send_wall_nanoseconds,send_tick_before,send_tick_after,receive_wall_seconds,receive_wall_nanoseconds,receive_tick_before,receive_tick_after,server_ms,theta2_ns,r_low_ns,r_high_ns,u2_ns,numeric_verdict,numeric_failures,algorithm_version,recorded_at) VALUES ($1,$2,$3,$4,ROW('boottime',$5::uuid,0,0)::budget_clock_domain_v38,1794614400,0,0,0,1794614400,0,0,0,0,-3589228800000000000,0,0,3589228800200000000,'invalid',1,1,now())")
+            .bind(id).bind(tenant).bind(VENUE).bind(epoch).bind(Uuid::now_v7())
+            .execute(pool).await.unwrap();
+    }
+    ids
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn terminal_clock_suffix_only_moves_forward(pool: PgPool) {
+    let tenant = Uuid::now_v7();
+    let [initial_sample, alternate_sample] = diagnostic_samples(&pool, tenant).await;
+    let f = Fixture::for_tenant(&pool, tenant).await;
+    f.order(&pool).await;
+    execute(&pool, "UPDATE venue_orders SET trades_cursor=2").await;
+    sqlx::query("UPDATE venue_orders SET phase='terminal',status='CANCELED',terminal_seen_at=last_checked_at,terminal_clock_sample_id=$1,terminal_clock_wall_delta_ms=0,terminal_clock_mono_delta_ms=0,terminal_clock_verdict='valid'").bind(initial_sample).execute(&pool).await.unwrap();
+    for field in [
+        "terminal_clock_wall_delta_ms",
+        "terminal_clock_mono_delta_ms",
+    ] {
+        refused(&pool, &format!("UPDATE venue_orders SET {field}=1"), "23514", None).await;
+    }
+    let rewrite =
+        format!("UPDATE venue_orders SET terminal_clock_sample_id='{alternate_sample}'::uuid");
+    for sql in [
+        "UPDATE venue_orders SET phase='live',terminal_seen_at=NULL",
+        "UPDATE venue_orders SET status='FILLED'",
+        "UPDATE venue_orders SET executed_cum=0.4",
+        "UPDATE venue_orders SET terminal_clock_verdict='invalid'",
+        rewrite.as_str(),
+    ] {
+        refused(&pool, sql, "23514", None).await;
+    }
+    // Rotation and late fill coverage may advance after terminal; its final
+    // evidence cannot.
+    execute(&pool,"UPDATE venue_orders SET fills_qty=executed_cum,last_checked_at=last_checked_at+interval '1 second'").await;
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn every_frozen_order_and_leg_field_rejects_rewriting(pool: PgPool) {
+    let tenant = Uuid::now_v7();
+    let [initial_sample, alternate_sample] = diagnostic_samples(&pool, tenant).await;
+    let f = Fixture::for_tenant(&pool, tenant).await;
+    f.order(&pool).await;
+    execute(&pool,"UPDATE balance_legs SET gross_qty=1.01,acquisition_cost=101,base_commission=0.01,base_commission_final=true,executable_qty=1,cohort_month=decided_month,closed_at=now()").await;
+    sqlx::query("UPDATE venue_orders SET phase='terminal',status='CANCELED',terminal_seen_at=now(),terminal_clock_sample_id=$1,terminal_clock_wall_delta_ms=0,terminal_clock_mono_delta_ms=0,terminal_clock_verdict='valid'").bind(initial_sample).execute(&pool).await.unwrap();
+    for (table, fields) in [
+        ("accounting_state", vec!["tenant_id", "venue_id", "created_at"]),
+        ("balance_legs", vec![
+            "position_id",
+            "tenant_id",
+            "venue_id",
+            "account_scope",
+            "symbol",
+            "created_at",
+            "gross_qty",
+            "acquisition_cost",
+            "base_commission",
+            "cohort_month",
+            "closed_at",
+        ]),
+        ("venue_orders", vec![
+            "venue_id",
+            "account_scope",
+            "symbol",
+            "exchange_order_id",
+            "tenant_id",
+            "client_order_id",
+            "side",
+            "order_type",
+            "orig_qty",
+            "stop_price",
+            "live_seen_at",
+            "live_clock_sample_id",
+            "live_clock_wall_delta_ms",
+            "live_clock_mono_delta_ms",
+            "live_clock_verdict",
+            "intent_id",
+            "position_id",
+            "kind",
+            "phase",
+            "status",
+            "executed_cum",
+            "cumulative_quote",
+            "expiry_reason",
+            "terminal_seen_at",
+            "terminal_clock_sample_id",
+            "terminal_clock_wall_delta_ms",
+            "terminal_clock_mono_delta_ms",
+            "terminal_clock_verdict",
+        ]),
+    ] {
+        for field in fields {
+            let ty:String=sqlx::query_scalar("SELECT t.typname FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid WHERE a.attrelid=$1::regclass AND a.attname=$2")
+                .bind(table).bind(field).fetch_one(&pool).await.unwrap();
+            let expr = match ty.as_str() {
+                "uuid"
+                    if table == "venue_orders"
+                        && matches!(field, "live_clock_sample_id" | "terminal_clock_sample_id") =>
+                {
+                    format!("'{alternate_sample}'::uuid")
+                },
+                "uuid" => "gen_random_uuid()".into(),
+                "timestamptz" => format!("COALESCE({field},now())+interval '1 second'"),
+                "date" => format!("{field}+1"),
+                "numeric" | "int8" => format!("COALESCE({field},0)+1"),
+                "text" => format!("COALESCE({field},'')||'-changed'"),
+                other => panic!("unexpected fixture type {other}"),
+            };
+            let mut tx = pool.begin().await.unwrap();
+            let version = if table == "accounting_state" {
+                ",version=version+1"
+            } else {
+                ""
+            };
+            let error = sqlx::query(&format!("UPDATE {table} SET {field}={expr}{version}"))
+                .execute(&mut *tx)
+                .await
+                .unwrap_err();
+            constraint(&error, "23514", None);
+            assert!(
+                error.as_database_error().unwrap().message().starts_with("ledger invariant:"),
+                "{table}.{field}: {error}"
+            );
+            tx.rollback().await.unwrap();
+        }
+    }
 }

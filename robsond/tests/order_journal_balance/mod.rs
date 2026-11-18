@@ -13,6 +13,26 @@ use sqlx::Row;
 use super::*;
 
 const SPOT: &str = VenueId::BINANCE_SPOT;
+// empty_budget.rs reads its venue from its parent module.
+const VENUE: &str = SPOT;
+
+#[path = "../venue_ledger_schema/empty_budget.rs"]
+mod empty_budget;
+
+/// Migration 38 refuses Spot clock rows until the venue budget is initialized;
+/// initialize it once per fresh test database, before any intent exists.
+async fn spot_budget_ready(pool: &PgPool) {
+    let state: Option<String> = sqlx::query_scalar(
+        "SELECT initialization_state FROM budget_venue_state WHERE venue_id = $1",
+    )
+    .bind(SPOT)
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    if state.as_deref() != Some("complete") {
+        empty_budget::initialize(pool, Utc::now()).await.unwrap();
+    }
+}
 const BOUND: Duration = Duration::from_millis(500);
 
 fn terms(position_id: Uuid) -> AdmissionRow {
@@ -50,6 +70,9 @@ fn balance_batch(id: &str, kind: IntentKind) -> JournalBatch {
 }
 
 async fn seed_account(pool: &PgPool, tenant: Uuid, venue: &str) {
+    if venue == SPOT {
+        spot_budget_ready(pool).await;
+    }
     PgVenueLedger::new(pool, tenant)
         .ensure_accounting_row(&VenueId::new(venue), MonthlyBudgetModel::HwmV1)
         .await
