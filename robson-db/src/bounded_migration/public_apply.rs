@@ -21,7 +21,7 @@ const ELAPSED: &str = r#"
     WHERE version = $2
                 "#;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 pub(super) fn metadata_insert_sql_for_tests() -> &'static str {
     INSERT
 }
