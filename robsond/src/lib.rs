@@ -81,6 +81,12 @@ pub mod order_journal_store;
 #[cfg(feature = "postgres")]
 pub mod process_epoch;
 #[cfg(feature = "postgres")]
+mod venue_budget;
+#[cfg(feature = "postgres")]
+mod venue_clock_http;
+#[cfg(feature = "postgres")]
+mod venue_clock_owner;
+#[cfg(feature = "postgres")]
 mod venue_clock_store;
 #[cfg(feature = "postgres")]
 pub mod venue_ledger_store;

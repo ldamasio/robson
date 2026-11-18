@@ -1,6 +1,7 @@
 use std::ffi::CStr;
 
 use super::{ClockDomain, ClockError, TickCapture};
+use crate::clock_records::RawClockCapture;
 
 mod syscalls;
 use syscalls::System;
@@ -179,5 +180,116 @@ pub(super) fn tick() -> Result<(i64, i64), ClockError> {
     System.clock()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadClock {
+    Boottime,
+    Realtime,
+}
+
+fn wall_bracket_with(
+    domain: ClockDomain,
+    epoch: uuid::Uuid,
+    mut read: impl FnMut(ReadClock) -> Result<(i64, i64), ClockError>,
+) -> Result<RawClockCapture, ClockError> {
+    let (seconds, nanos) = read(ReadClock::Boottime)?;
+    let before = TickCapture::new(domain, seconds, nanos)?;
+    let (wall_seconds, wall_nanos) = read(ReadClock::Realtime)?;
+    if !(0..1_000_000_000).contains(&wall_nanos) {
+        return Err(ClockError::InvalidTick);
+    }
+    let (seconds, nanos) = read(ReadClock::Boottime)?;
+    let after = TickCapture::new(domain, seconds, nanos)?;
+    after.elapsed_since(&before)?;
+    let raw = RawClockCapture {
+        epoch,
+        wall_seconds,
+        wall_nanoseconds: u32::try_from(wall_nanos).map_err(|_| ClockError::Range)?,
+        domain,
+        before_ns: i128::try_from(before.nanoseconds()).map_err(|_| ClockError::Range)?,
+        after_ns: i128::try_from(after.nanoseconds()).map_err(|_| ClockError::Range)?,
+    };
+    raw.check()?;
+    Ok(raw)
+}
+
+pub(super) fn wall_bracket(
+    domain: ClockDomain,
+    epoch: uuid::Uuid,
+) -> Result<RawClockCapture, ClockError> {
+    wall_bracket_with(domain, epoch, |clock| match clock {
+        ReadClock::Boottime => System.clock(),
+        ReadClock::Realtime => syscalls::realtime(),
+    })
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod wall_tests {
+    use super::*;
+
+    #[test]
+    fn bracket_retains_original_epoch_domain_wall_and_exact_ticks_in_order() {
+        let epoch = uuid::Uuid::from_u128(17);
+        let domain = ClockDomain::new(uuid::Uuid::from_u128(3), -4, 9).unwrap();
+        let mut calls = Vec::new();
+        let mut values = [(i64::MAX, 7), (-5, 999_999_999), (i64::MAX, 8)].into_iter();
+        let raw = wall_bracket_with(domain, epoch, |clock| {
+            calls.push(clock);
+            Ok(values.next().unwrap())
+        })
+        .unwrap();
+        assert_eq!(calls, [
+            ReadClock::Boottime,
+            ReadClock::Realtime,
+            ReadClock::Boottime
+        ]);
+        assert!(values.next().is_none(), "exactly three native reads");
+        assert_eq!(raw.epoch, epoch);
+        assert_eq!(raw.domain, domain);
+        assert_eq!((raw.wall_seconds, raw.wall_nanoseconds), (-5, 999_999_999));
+        assert_eq!(raw.before_ns, i128::from(i64::MAX) * 1_000_000_000 + 7);
+        assert_eq!(raw.after_ns, raw.before_ns + 1);
+    }
+
+    #[test]
+    fn bracket_propagates_each_read_error_without_retry_or_later_reads() {
+        let domain = ClockDomain::new(uuid::Uuid::from_u128(3), 0, 0).unwrap();
+        for failed in 0..3 {
+            let mut calls = 0;
+            let error = ClockError::Native { operation: "fixture", errno: libc::EIO };
+            let actual = wall_bracket_with(domain, uuid::Uuid::from_u128(1), |_| {
+                let index = calls;
+                calls += 1;
+                if index == failed {
+                    Err(error)
+                } else {
+                    Ok((10, 0))
+                }
+            });
+            assert_eq!(actual, Err(error));
+            assert_eq!(calls, failed + 1);
+        }
+    }
+
+    #[test]
+    fn bracket_refuses_bad_nanos_negative_ticks_reversal_and_nil_epoch() {
+        let domain = ClockDomain::new(uuid::Uuid::from_u128(3), 0, 0).unwrap();
+        for values in [
+            [(-1, 0), (10, 0), (11, 0)],
+            [(10, -1), (10, 0), (11, 0)],
+            [(10, 0), (10, -1), (11, 0)],
+            [(10, 0), (10, 1_000_000_000), (11, 0)],
+            [(10, 0), (10, 0), (11, 1_000_000_000)],
+            [(10, 1), (10, 0), (10, 0)],
+        ] {
+            let mut values = values.into_iter();
+            assert!(wall_bracket_with(domain, uuid::Uuid::from_u128(1), |_| {
+                Ok(values.next().unwrap())
+            })
+            .is_err());
+        }
+        assert!(wall_bracket_with(domain, uuid::Uuid::nil(), |_| Ok((0, 0))).is_err());
+    }
+}

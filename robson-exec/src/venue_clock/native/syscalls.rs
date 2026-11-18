@@ -11,6 +11,29 @@ fn error(operation: &'static str) -> ClockError {
     }
 }
 
+fn clock(clock_id: libc::clockid_t) -> Result<(i64, i64), ClockError> {
+    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: cfg restricts this module to GNU Linux LP64 x86_64/aarch64.
+    // SYS_clock_gettime expects this native two-long timespec, whose aligned
+    // initialized storage remains valid for the synchronous kernel write.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_clock_gettime,
+            clock_id as libc::c_long,
+            &mut time as *mut libc::timespec,
+        )
+    };
+    match result {
+        0 => Ok((time.tv_sec, time.tv_nsec)),
+        -1 => Err(error("clock_gettime")),
+        _ => Err(ClockError::InvalidTick),
+    }
+}
+
+pub(super) fn realtime() -> Result<(i64, i64), ClockError> {
+    clock(libc::CLOCK_REALTIME)
+}
+
 impl NativeIo for System {
     fn open(&mut self, path: &CStr) -> Result<i32, ClockError> {
         // SAFETY: valid borrowed NUL-terminated path; no O_CREAT, so no mode argument.
@@ -50,21 +73,6 @@ impl NativeIo for System {
         }
     }
     fn clock(&mut self) -> Result<(i64, i64), ClockError> {
-        let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        // SAFETY: cfg restricts this module to GNU Linux LP64 x86_64/aarch64.
-        // SYS_clock_gettime expects this native two-long timespec, whose aligned
-        // initialized storage remains valid for the synchronous kernel write.
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_clock_gettime,
-                libc::CLOCK_BOOTTIME as libc::c_long,
-                &mut time as *mut libc::timespec,
-            )
-        };
-        match result {
-            0 => Ok((time.tv_sec, time.tv_nsec)),
-            -1 => Err(error("clock_gettime")),
-            _ => Err(ClockError::InvalidTick),
-        }
+        clock(libc::CLOCK_BOOTTIME)
     }
 }

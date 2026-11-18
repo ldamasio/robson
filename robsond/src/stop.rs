@@ -364,6 +364,78 @@ pub async fn stop_when_asked(
     report
 }
 
+/// The same bounded stop with the concrete controlled TIME participant.
+/// Invalidation precedes the Closing phase; all actual app joins precede the
+/// journal's final checks. Other callers retain the no-clock path below.
+#[cfg(feature = "postgres")]
+pub(crate) async fn stop_when_asked_with_clock(
+    stop: StopRequest,
+    journal: Arc<OrderJournal>,
+    close: impl FnOnce(),
+    marker: Option<Box<dyn StopMarker>>,
+    clock: Option<Arc<crate::venue_clock_owner::ClockClosing>>,
+    timings: StopTimings,
+) -> StopReport {
+    let asked_at = stop.asked().await;
+    let report = run_stop_with_clock(
+        &journal,
+        asked_at,
+        close,
+        marker.as_deref(),
+        clock.as_deref(),
+        timings,
+    )
+    .await;
+    crate::metrics::GRACEFUL_STOP.with_label_values(&[report.result.label()]).inc();
+    crate::metrics::observe_order_journal(&journal);
+    info!(result = report.result.label(), marker = ?report.marker, "Stop completed");
+    report
+}
+
+#[cfg(feature = "postgres")]
+pub(crate) async fn run_stop_with_clock(
+    journal: &OrderJournal,
+    asked_at: Instant,
+    close: impl FnOnce(),
+    marker: Option<&dyn StopMarker>,
+    clock: Option<&crate::venue_clock_owner::ClockClosing>,
+    timings: StopTimings,
+) -> StopReport {
+    let deadline = asked_at + timings.deadline;
+    let gate = journal.gate();
+    gate.begin_draining();
+    gate.wait_no_permits((asked_at + timings.drain_limit).min(deadline)).await;
+    let draining = asked_at.elapsed();
+    if let Some(clock) = clock {
+        clock.begin_closing();
+    }
+    gate.begin_closing();
+    close();
+    let joined = match clock {
+        Some(clock) => clock.join(deadline).await,
+        None => true,
+    };
+    let (result, marker) = if !joined {
+        (
+            if Instant::now() >= deadline {
+                StopResult::Deadline
+            } else {
+                StopResult::Unlanded
+            },
+            MarkerWrite::NotAttempted,
+        )
+    } else {
+        closing(journal, marker, deadline).await
+    };
+    StopReport {
+        result,
+        marker,
+        draining,
+        closing: asked_at.elapsed().saturating_sub(draining),
+        deadline,
+    }
+}
+
 /// The stop itself, its clock started at `asked_at`.
 pub async fn run_stop(
     journal: &OrderJournal,
@@ -505,6 +577,25 @@ mod tests {
 
     fn secs(seconds: u64) -> Duration {
         Duration::from_secs(seconds)
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(start_paused = true)]
+    async fn concrete_clock_path_with_none_preserves_the_idle_stop() {
+        let (_backend, journal) = stub_journal();
+        let marker = Marker::default();
+        let report = run_stop_with_clock(
+            &journal,
+            Instant::now(),
+            || {},
+            Some(&marker),
+            None,
+            StopTimings::default(),
+        )
+        .await;
+        assert_eq!((report.result, report.marker), (StopResult::Clean, MarkerWrite::Written));
+        assert_eq!(marker.marked.load(Ordering::SeqCst), 1);
+        assert_eq!(report.draining, Duration::ZERO);
     }
 
     /// An idle daemon: Draining ends at once, nothing to flush, epoch marked.

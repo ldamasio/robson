@@ -1,4 +1,5 @@
 //! Private numerical transitions, never runtime reservations or send grants.
+pub mod bridge;
 use std::{
     slice,
     sync::{Arc, Weak},

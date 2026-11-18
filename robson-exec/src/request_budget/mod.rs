@@ -14,6 +14,7 @@ pub use limits::{
     additional_cost_facts, restart_cap_candidates, Class, EpochHistoryCandidate, LimitFacts,
     StartupCapsFacts, UnqualifiedDailyCount,
 };
+pub use local_model::bridge::{BudgetTransitions, PendingCharge, TransitionError};
 pub use time_candidates::{
     attempt_age_candidate, daily_retention_candidate, quarantine_elapsed_candidate,
     AttemptAgeCandidate, DailyRetentionCandidate, QuarantineAnchorCandidate, QuarantineCandidate,

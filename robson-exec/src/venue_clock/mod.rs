@@ -27,6 +27,12 @@ mod native {
     pub(super) fn tick() -> Result<(i64, i64), ClockError> {
         Err(ClockError::Unsupported)
     }
+    pub(super) fn wall_bracket(
+        _domain: ClockDomain,
+        _epoch: Uuid,
+    ) -> Result<crate::clock_records::RawClockCapture, ClockError> {
+        Err(ClockError::Unsupported)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -136,6 +142,15 @@ impl NativeClock {
     pub fn capture(&self) -> Result<TickCapture, ClockError> {
         let (seconds, nanoseconds) = native::tick()?;
         TickCapture::new(self.initial.domain, seconds, nanoseconds)
+    }
+    /// One actual realtime read bracketed by two BOOTTIME reads, retaining
+    /// the original coordinates and initialized domain. This does no procfs
+    /// work and supplies raw evidence only, never freshness or send authority.
+    pub fn wall_bracket(
+        &self,
+        epoch: Uuid,
+    ) -> Result<crate::clock_records::RawClockCapture, ClockError> {
+        native::wall_bracket(self.initial.domain, epoch)
     }
 }
 

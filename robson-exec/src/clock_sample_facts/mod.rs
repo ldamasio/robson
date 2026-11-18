@@ -190,7 +190,10 @@ impl CaptureFacts {
     }
 }
 
-fn interval(a: &WallMarkCandidate, b: &WallMarkCandidate) -> Result<(i128, i128), FactsError> {
+pub(crate) fn interval(
+    a: &WallMarkCandidate,
+    b: &WallMarkCandidate,
+) -> Result<(i128, i128), FactsError> {
     if a.epoch != b.epoch {
         return Err(FactsError::Identity);
     }
@@ -201,14 +204,14 @@ fn interval(a: &WallMarkCandidate, b: &WallMarkCandidate) -> Result<(i128, i128)
         i128::try_from(high).map_err(|_| FactsError::Range)?,
     ))
 }
-fn wall_delta(a: &WallMarkCandidate, b: &WallMarkCandidate) -> Result<i128, FactsError> {
+pub(crate) fn wall_delta(a: &WallMarkCandidate, b: &WallMarkCandidate) -> Result<i128, FactsError> {
     let delta = b.wall_ns.checked_sub(a.wall_ns).ok_or(FactsError::Range)?;
     if delta < 0 {
         return Err(FactsError::ReversedWall);
     }
     Ok(delta)
 }
-fn discrepancy(wall: i128, interval: (i128, i128)) -> Result<bool, FactsError> {
+pub(crate) fn discrepancy(wall: i128, interval: (i128, i128)) -> Result<bool, FactsError> {
     let low = wall
         .checked_sub(interval.0)
         .and_then(i128::checked_abs)

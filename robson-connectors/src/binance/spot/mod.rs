@@ -28,6 +28,7 @@ mod records;
 mod rest;
 mod rules;
 mod sizing_inputs;
+mod time;
 mod trades;
 mod trading;
 
@@ -40,6 +41,7 @@ pub use records::{
 };
 pub use rest::{SpotOrderRef, SpotRead, SpotReadError, SpotRestReader};
 pub use rules::{SpotLotFilter, SpotNotionalFilter, SpotPriceFilter, SpotSymbolRules};
+pub use time::PreparedSpotTime;
 pub use trades::{
     SpotTrade, SpotTradePage, SpotTradesQuery, SpotTradesRead, MY_TRADES_MAX_PAGES,
     MY_TRADES_PAGE_LIMIT,

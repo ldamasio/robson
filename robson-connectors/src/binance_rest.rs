@@ -1157,7 +1157,7 @@ fn observed_endpoint(path: &str) -> u64 {
 /// client built for one request has no connection to reuse. A client that
 /// cannot be built sends nothing: `Refused`.
 
-fn single_shot() -> Result<Client, BinanceRestError> {
+pub(crate) fn single_shot() -> Result<Client, BinanceRestError> {
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())

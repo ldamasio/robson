@@ -56,6 +56,29 @@ impl RawClockCapture {
         .map_err(|_| ClockError::Metadata("raw wall bracket"))
     }
 
+    /// Exact descriptive wall-step comparison using the original C8 bounds.
+    /// Native provenance and lifecycle authority remain the caller's burden.
+    pub fn wall_agrees(&self, later: &Self) -> Result<bool, ClockError> {
+        let before = self.mark()?;
+        let after = later.mark()?;
+        let bounds = crate::clock_sample_facts::interval(&before, &after)
+            .map_err(|_| ClockError::Metadata("wall interval"))?;
+        let wall = crate::clock_sample_facts::wall_delta(&before, &after)
+            .map_err(|_| ClockError::Metadata("wall delta"))?;
+        crate::clock_sample_facts::discrepancy(wall, bounds)
+            .map_err(|_| ClockError::Metadata("wall discrepancy"))
+    }
+
+    /// Original end of this raw bracket, with representation checks only.
+    pub fn end_tick(&self) -> Result<TickCapture, ClockError> {
+        self.check()?;
+        TickCapture::new(
+            self.domain,
+            i64::try_from(self.after_ns / 1_000_000_000).map_err(|_| ClockError::Range)?,
+            i64::try_from(self.after_ns % 1_000_000_000).map_err(|_| ClockError::Range)?,
+        )
+    }
+
     /// Validate representation only; this does not authenticate a native read.
     pub fn check(&self) -> Result<(), ClockError> {
         self.mark().map(|_| ())
@@ -94,7 +117,35 @@ pub struct SampleNumbers {
     pub failures: i16,
 }
 
+/// Frozen numerical comparison, with no persistence or lifecycle authority.
+pub struct SampleArithmetic(SampleFacts);
+
+impl SampleArithmetic {
+    pub fn fits_capture(&self, capture: &RawClockCapture) -> Result<bool, ClockError> {
+        let facts = self
+            .0
+            .compare(&capture.mark()?)
+            .map_err(|_| ClockError::Metadata("sample comparison"))?;
+        Ok(facts.fits_sample() && facts.fits_age() && facts.fits_discrepancy())
+    }
+}
+
 impl RawClockSample {
+    /// Reuses the existing exact C8 engine; the actual owner must additionally
+    /// prove consume-once source, persistence and fresh generation/Closing CAS.
+    pub fn arithmetic(&self) -> Result<SampleArithmetic, ClockError> {
+        SampleFacts::calculate(SampleCandidate {
+            id: self.id,
+            tenant: self.tenant,
+            venue: &self.venue,
+            epoch: self.receive.epoch,
+            send: self.send.mark()?,
+            receive: self.receive.mark()?,
+            server_ms: self.server_ms,
+        })
+        .map(SampleArithmetic)
+        .map_err(|_| ClockError::Metadata("raw sample"))
+    }
     /// Recompute through the existing private C8 arithmetic. Invalid numerical
     /// diagnostics remain invalid; a passing result still confers no authority.
     pub fn numbers(&self) -> Result<SampleNumbers, ClockError> {

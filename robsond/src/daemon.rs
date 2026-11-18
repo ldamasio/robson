@@ -218,13 +218,17 @@ async fn unless_stopped<T>(
     }
 }
 
+struct PreparedStart {
+    marker: Option<Box<dyn StopMarker>>,
+    #[cfg(feature = "postgres")]
+    clock: Option<Arc<crate::venue_clock_owner::ClockClosing>>,
+}
+
 /// Writes the clean-stop marker on this process's epoch.
 #[cfg(feature = "postgres")]
 struct EpochMarker {
     pool: Arc<sqlx::PgPool>,
     epoch: crate::process_epoch::Epoch,
-    // Inert backend bound only after the epoch commits.
-    _sample_store: Option<crate::venue_clock_store::ClockSampleStore>,
 }
 
 #[cfg(feature = "postgres")]
@@ -838,7 +842,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         // The journal's readiness and this process's epoch. A stop asked for
         // meanwhile ends the start here: nothing has been sent, and an epoch
         // that landed stays unmarked.
-        let marker = tokio::select! {
+        let prepared_start = tokio::select! {
             biased;
             _ = stop.asked() => {
                 warn!(
@@ -859,13 +863,24 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 closing.cancel();
                 detectors.cancel();
             };
-            tokio::spawn(crate::stop::stop_when_asked(
+            #[cfg(feature = "postgres")]
+            let stopping = tokio::spawn(crate::stop::stop_when_asked_with_clock(
                 stop,
                 Arc::clone(&journal),
                 close,
-                marker,
+                prepared_start.marker,
+                prepared_start.clock,
                 self.stop_timings,
-            ))
+            ));
+            #[cfg(not(feature = "postgres"))]
+            let stopping = tokio::spawn(crate::stop::stop_when_asked(
+                stop,
+                Arc::clone(&journal),
+                close,
+                prepared_start.marker,
+                self.stop_timings,
+            ));
+            stopping
         };
 
         // The startup phase holds the startup slot's permit throughout; the
@@ -920,10 +935,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     /// pool and refuses a schema without its tables, then this process's
     /// epoch, with a strict commit (ADR-0056 step 7). Only the stub starts
     /// without one. The marker a clean stop writes on it.
-    async fn prepare_start(
-        &self,
-        journal: &OrderJournal,
-    ) -> DaemonResult<Option<Box<dyn StopMarker>>> {
+    async fn prepare_start(&self, journal: &OrderJournal) -> DaemonResult<PreparedStart> {
         journal
             .check_ready()
             .await
@@ -1211,11 +1223,11 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     /// marker a clean stop writes on it. Without a database there is none, and
     /// only the stub may start.
     #[cfg(feature = "postgres")]
-    async fn start_epoch(&self) -> DaemonResult<Option<Box<dyn StopMarker>>> {
+    async fn start_epoch(&self) -> DaemonResult<PreparedStart> {
         let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id)
         else {
             refuse_an_epochless_venue(self.exchange.id())?;
-            return Ok(None);
+            return Ok(PreparedStart { marker: None, clock: None });
         };
         let start =
             crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION")).await?;
@@ -1235,24 +1247,28 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             .await
             .event_streams()
             .set_epoch(start.epoch.epoch_id);
-        Ok(Some(Box::new(EpochMarker {
-            pool: Arc::clone(pool),
-            epoch: start.epoch,
-            _sample_store: (self.exchange.id().as_str()
-                == robson_exec::venue::VenueId::BINANCE_SPOT)
-                .then(|| {
-                    crate::venue_clock_store::ClockSampleStore::from_committed_epoch(
-                        pool, tenant_id, &start,
-                    )
-                }),
-        })))
+        // I1's real component is exercised only from an isolated controlled
+        // source. Production C2/2b/final audit is still unavailable: refuse
+        // BEFORE constructing a TIME client/task or sending any request.
+        if self.exchange.id().as_str() == robson_exec::venue::VenueId::BINANCE_SPOT {
+            crate::venue_budget::bootstrap::production_input().map_err(|reason| {
+                DaemonError::Config(format!("Spot TIME prerequisites unavailable: {reason:?}"))
+            })?;
+        }
+        Ok(PreparedStart {
+            marker: Some(Box::new(EpochMarker {
+                pool: Arc::clone(pool),
+                epoch: start.epoch,
+            })),
+            clock: None,
+        })
     }
 
     /// A build without PostgreSQL has no epochs: only the stub may start.
     #[cfg(not(feature = "postgres"))]
-    async fn start_epoch(&self) -> DaemonResult<Option<Box<dyn StopMarker>>> {
+    async fn start_epoch(&self) -> DaemonResult<PreparedStart> {
         refuse_an_epochless_venue(self.exchange.id())?;
-        Ok(None)
+        Ok(PreparedStart { marker: None })
     }
 
     async fn poll_month_boundary(&self, now: DateTime<Utc>) -> DaemonResult<bool> {
