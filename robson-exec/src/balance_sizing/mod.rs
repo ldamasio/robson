@@ -4,7 +4,9 @@ mod bridge;
 mod geometry;
 #[cfg(test)]
 mod geometry_tests;
+mod handoff;
 mod inputs;
+pub use handoff::{candidate_admission, HandoffError};
 #[cfg(test)]
 mod test_support;
 
