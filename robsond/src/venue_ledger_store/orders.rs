@@ -19,7 +19,7 @@ use uuid::Uuid;
 use super::{backend, commit_error, LedgerConnection, PgVenueLedger};
 
 /// One statement from four bounded sections; see order_source.sql.
-const ORDER_PROJECTION: &str = concat!(
+pub(super) const ORDER_PROJECTION: &str = concat!(
     include_str!("../spot_order_set_store/order_source.sql"),
     include_str!("../spot_order_set_store/order_sell.sql"),
     include_str!("../spot_order_set_store/order_cancel.sql"),
