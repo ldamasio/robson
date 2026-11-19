@@ -272,10 +272,10 @@ async fn mismatched_evidence_refuses_before_sql(pool: PgPool) -> anyhow::Result<
 }
 
 /// A fixed local wrapper that returns the real helper's completed rows with one
-/// client order id changed. Reached through this test database's search path
-/// only, by the actual clocked writer.
+/// client order id changed. Reached only by the actual clocked writer inside
+/// the disposable migration fixture.
 const CORRUPTING_WRAPPER: &str = r#"
-CREATE FUNCTION j2b_wrap.budget_insert_clocks(
+CREATE FUNCTION public.budget_insert_clocks(
     uuid[],uuid,uuid,text,timestamptz[],uuid[],bigint[],bigint[],text[],text[],uuid[],bigint[],
     integer[],numeric[],uuid[],bigint[],integer[],numeric[],numeric[],text[],uuid[],bigint[],integer[])
 RETURNS TABLE(
@@ -299,7 +299,7 @@ LANGUAGE sql VOLATILE AS $fn$
         r.expiry_proof_id,r.retired_at,r.budget_created_tick_scale,r.budget_created_tick_fits,
         r.capture_tick_before_scale,r.capture_tick_before_fits,r.capture_tick_after_scale,
         r.capture_tick_after_fits
-    FROM public.budget_insert_clocks($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+    FROM public.j2b_fixture_original_insert_clocks($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
         $18,$19,$20,$21,$22,$23) r
 $fn$"#;
 
@@ -309,15 +309,17 @@ async fn a_corrupted_completed_receipt_is_refused_before_commit(
     pool: PgPool,
 ) -> anyhow::Result<()> {
     let scope = scope(&pool).await?;
-    sqlx::query("CREATE SCHEMA j2b_wrap").execute(&pool).await?;
-    sqlx::query(CORRUPTING_WRAPPER).execute(&pool).await?;
+    // Preserve the original M38 function and corrupt only its returned
+    // client identity. The production-style call remains schema-qualified.
     sqlx::query(
-        "DO $$BEGIN EXECUTE format('ALTER DATABASE %I SET search_path = j2b_wrap, public',
-            current_database()); END$$",
+        "ALTER FUNCTION public.budget_insert_clocks(
+            uuid[],uuid,uuid,text,timestamptz[],uuid[],bigint[],bigint[],text[],text[],uuid[],bigint[],
+            integer[],numeric[],uuid[],bigint[],integer[],numeric[],numeric[],text[],uuid[],bigint[],integer[])
+         RENAME TO j2b_fixture_original_insert_clocks",
     )
     .execute(&pool)
     .await?;
-    // Created after the database setting, so every journal connection sees it.
+    sqlx::query(CORRUPTING_WRAPPER).execute(&pool).await?;
     let backend = PgJournalBackend::new(&pool, scope.tenant);
     let (batch, input) = one(&scope, "j2b-corrupt")?;
     let result = backend.commit_clocked(&batch, &input).await;

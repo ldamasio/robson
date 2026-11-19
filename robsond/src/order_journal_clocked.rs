@@ -32,7 +32,7 @@ const MAX_ATTEMPTS: usize = 1;
 /// Fields returned by `budget_insert_clocks`.
 const RECEIPT_FIELDS: usize = 36;
 
-const INSERT_CLOCKS: &str = "SELECT * FROM budget_insert_clocks(\
+const INSERT_CLOCKS: &str = "SELECT * FROM public.budget_insert_clocks(\
     $1::uuid[],$2,$3,$4,$5::timestamptz[],$6::uuid[],$7::bigint[],$8::bigint[],$9::text[],\
     $10::text[],$11::uuid[],$12::bigint[],$13::integer[],$14::numeric[],\
     $15::uuid[],$16::bigint[],$17::integer[],$18::numeric[],$19::numeric[],\
