@@ -361,7 +361,16 @@ async fn persisted_cold_route_scans_eight_routes_and_two_point_probes_under_skew
             }
             let plan = query.fetch_one(&mut *conn).await?;
             bounded_leaf(&plan, "leg_routes", &[INDEX], 1, 8)?;
-            bounded_leaf(&plan, "balance_legs", &["balance_legs_pkey"], 8, 1)?;
+            bounded_leaf(
+                &plan,
+                "balance_legs",
+                &[
+                    "balance_legs_pkey",
+                    "balance_legs_position_id_tenant_id_venue_id_account_scope_s_key",
+                ],
+                8,
+                1,
+            )?;
             bounded_leaf(
                 &plan,
                 "balance_leg_admissions",
