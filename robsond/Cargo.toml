@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = []
-postgres = ["robson-store/postgres", "sqlx"]
+postgres = ["robson-store/postgres", "robson-exec/n5-native", "sqlx"]
 # Test harness only (ADR-0056 step 7): never in a production build.
 crash-points = ["robson-exec/crash-points", "robson-connectors/crash-points"]
 

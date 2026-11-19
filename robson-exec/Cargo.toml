@@ -7,6 +7,7 @@ license.workspace = true
 
 [features]
 default = []
+n5-native = ["robson-store/postgres"]
 # Test harness only (ADR-0056 step 7): `compile_error!` under a release build.
 crash-points = []
 

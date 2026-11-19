@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use robson_connectors::{binance::spot::SpotCommission, BinanceRestClient};
 use robson_domain::Symbol;
 use robson_exec::{
+    balance_costs::{native_n5::PreparedFeeOwner, AgeError, CostError},
     venue::VenueId,
     venue_clock::{NativeClock, TickCapture},
 };
@@ -598,6 +599,7 @@ async fn verify_persisted_success(
     Ok(ReadReport {
         pid: std::process::id(),
         age_ns: now.nanoseconds() - r,
+        warm_checks: 0,
         receipt: ObservedReceipt {
             claim: row.try_get("claim_id")?,
             revision: 3,
@@ -645,6 +647,7 @@ struct ObservedReceipt {
 struct ReadReport {
     pid: u32,
     age_ns: u128,
+    warm_checks: u8,
     receipt: ObservedReceipt,
 }
 
@@ -682,6 +685,7 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
     ensure!(reader_pid == reader.pid && reader_pid != writer_pid);
     ensure!(reader.receipt == writer.committed.receipt, "original committed receipt");
     ensure!(reader.age_ns > writer.committed.age_ns, "original response aged across restart");
+    ensure!(writer.committed.warm_checks == 0 && reader.warm_checks == 4);
     wait_child_sessions(&pool, "robson-n5-reader").await?;
     let stats = proxy.stats();
     ensure!(stats.connections == 1 && stats.statements == 1 && stats.commits == 0);
@@ -692,6 +696,7 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
     ensure!(proxy.data_rows() == 3 && result_bytes > 0 && result_bytes < response_bytes);
     ensure!(response_bytes <= 8 * 1024 * 1024);
     eprintln!("N5_NATIVE_RESTART writer_pid={writer_pid} writer_exit=0 reader_pid={reader_pid} reader_exit=0 sql=1 rows=3 data_row_wire_bytes={result_bytes} total_response_bytes={response_bytes} reader_http=0 age_advanced=true");
+    eprintln!("N5_WARM_SELECTION exact_terms=1 refused_wrong_uid=1 retired_view_refused=1 terms_unchanged=1 sql=0 http=0");
     cold_load::verify_real_receipt_controls(&pool, &account(writer.tenant, PAIR)?).await?;
     Ok(())
 }
@@ -1003,18 +1008,19 @@ fn n5_restart_participant() -> anyhow::Result<()> {
 }
 
 async fn read_committed(pool: &PgPool, tenant: Uuid) -> anyhow::Result<ReadReport> {
-    let clock = NativeClock::initialize()?;
+    let clock = Arc::new(NativeClock::initialize()?);
+    let identity = account(tenant, PAIR)?;
     let trace = Trace::default();
     let entries = cold_load::load(
         pool,
-        &[account(tenant, PAIR)?],
+        std::slice::from_ref(&identity),
         &clock,
         Instant::now() + Duration::from_secs(2),
         &trace,
     )
     .await
     .map_err(|error| anyhow!("bounded N5 read: {error:?}"))?;
-    let [entry] = entries.as_slice() else {
+    let [entry] = entries.entries() else {
         return Err(anyhow!("expected one configured key"));
     };
     ensure!(trace.issued() == 1 && entry.key.symbol == PAIR && entry.key.recovery_generation == 0);
@@ -1024,9 +1030,10 @@ async fn read_committed(pool: &PgPool, tenant: Uuid) -> anyhow::Result<ReadRepor
     };
     let mark = receipt.original;
     let (offset_seconds, offset_ns) = mark.domain.offset();
-    Ok(ReadReport {
+    let mut report = ReadReport {
         pid: std::process::id(),
         age_ns: receipt.age.as_nanos(),
+        warm_checks: 0,
         receipt: ObservedReceipt {
             claim: prior.identity.claim_id,
             revision: prior.revision,
@@ -1042,9 +1049,31 @@ async fn read_committed(pool: &PgPool, tenant: Uuid) -> anyhow::Result<ReadRepor
             original_after_ns: u128::try_from(mark.after_ns)?,
             wall_seconds: mark.wall_seconds,
             wall_ns: mark.wall_nanoseconds,
-            as_of: receipt.evidence.as_of(),
-            evidence_hash: *receipt.evidence.hash(),
+            as_of: receipt.evidence().as_of(),
+            evidence_hash: *receipt.evidence().hash(),
             payload_digest: receipt.payload_digest,
         },
-    })
+    };
+    let owner = PreparedFeeOwner::prepare(entries, clock)?;
+    let view = owner.selection();
+    let gap = "1.25".parse()?;
+    let terms = view.select(&identity, gap)?;
+    ensure!(
+        terms.evidence().hash() == &report.receipt.evidence_hash
+            && terms.evidence().as_of() == report.receipt.as_of
+    );
+    let wrong_uid = CostIdentity::new(
+        identity.tenant(),
+        identity.venue().clone(),
+        identity.scope().to_owned(),
+        identity.uid() ^ 1,
+        identity.symbol().clone(),
+    )?;
+    ensure!(matches!(view.select(&wrong_uid, gap), Err(CostError::Age(AgeError::Identity))));
+    let held_terms_hash = *terms.hash();
+    drop(owner);
+    ensure!(matches!(view.select(&identity, gap), Err(CostError::Age(AgeError::Unresolved))));
+    ensure!(*terms.hash() == held_terms_hash && trace.issued() == 1);
+    report.warm_checks = 4;
+    Ok(report)
 }

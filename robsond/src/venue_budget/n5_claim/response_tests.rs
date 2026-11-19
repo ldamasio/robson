@@ -2,7 +2,12 @@ use robson_domain::Symbol;
 use robson_exec::{venue::VenueId, venue_clock::ClockDomain};
 use serde_json::Value;
 
+use super::super::result::MAX_PAYLOAD_BYTES;
 use super::*;
+use robson_exec::balance_costs::retained_n5::decode_retained;
+use uuid::Uuid;
+
+const POSTGRES_MIN_UNIX_SECONDS: i64 = -210_866_803_200;
 
 // Wire example for one verified fixture account.
 const FEE_RESPONSE: &str = r#"{
@@ -134,14 +139,16 @@ fn malformed_or_incomparable_response_marks_produce_no_snapshot() {
             Err(ClaimResult::Unknown)
         ));
     }
-    assert!(response_time(
+    assert!(prepare_response(
+        FEE_RESPONSE.as_bytes(),
         RawClockCapture {
             wall_seconds: POSTGRES_MIN_UNIX_SECONDS,
             ..raw
         },
+        &expected,
         handoff
     )
-    .is_some());
+    .is_ok());
 }
 
 #[test]
@@ -151,7 +158,7 @@ fn retained_receipt_decodes_only_the_exact_writer_output() {
     let decoded = decode_retained(&snapshot.payload, &expected, handoff).unwrap();
     assert_eq!(decoded.original, raw);
     assert_eq!(decoded.observed, snapshot.observed);
-    assert_eq!(decoded.evidence, snapshot.evidence);
+    assert_eq!(decoded.candidate.evidence(), &snapshot.evidence);
     let stored = std::str::from_utf8(&snapshot.payload).unwrap();
     let mut padded = snapshot.payload.clone();
     padded.push(b' ');
@@ -181,4 +188,64 @@ fn retained_receipt_decodes_only_the_exact_writer_output() {
     }
     let later = TickCapture::new(raw.domain, 21, 0).unwrap();
     assert!(decode_retained(&snapshot.payload, &expected, later).is_none());
+}
+
+#[test]
+fn original_retained_v1_bytes_and_connector_evidence_stay_equal() {
+    let (original, account, handoff) = attempt();
+    let snapshot = prepare_response(FEE_RESPONSE.as_bytes(), original, &account, handoff).unwrap();
+    let golden = concat!(
+        r#"{"format_version":1,"original":{"epoch":"00000000-0000-0000-0000-000000000002","boot":"00000000-0000-0000-0000-000000000001","offset_seconds":-1,"offset_nanoseconds":123,"wall_seconds":1795123400,"wall_nanoseconds":802345999,"before_ns":"20000000000","after_ns":"20000000016"},"commission":{"symbol":"ETHUSDT","#,
+        r#""standardCommission":{"maker":"0.0010","taker":"0.002","buyer":"0","seller":"0"},"#,
+        r#""specialCommission":{"maker":"0","taker":"0","buyer":"0","seller":"0"},"#,
+        r#""taxCommission":{"maker":"0","taker":"0","buyer":"0","seller":"0"},"#,
+        r#""discount":{"enabledForAccount":false,"enabledForSymbol":true,"discountAsset":"BNB","discount":"0.25"}}}"#,
+    );
+    assert_eq!(snapshot.payload, golden.as_bytes());
+
+    let mut cases = Vec::new();
+    let base: Value = serde_json::from_str(FEE_RESPONSE).unwrap();
+    for group in ["standardCommission", "specialCommission", "taxCommission"] {
+        for rate in ["maker", "taker", "buyer", "seller"] {
+            for value in [
+                "0.000000010000",
+                "-0.00000001",
+                "0.00000000000000000000000000001",
+            ] {
+                let mut changed = base.clone();
+                changed[group][rate] = Value::String(value.to_owned());
+                cases.push(changed);
+            }
+        }
+    }
+    for account_enabled in [true, false] {
+        for symbol_enabled in [true, false] {
+            let mut changed = base.clone();
+            changed["discount"]["enabledForAccount"] = account_enabled.into();
+            changed["discount"]["enabledForSymbol"] = symbol_enabled.into();
+            cases.push(changed);
+        }
+    }
+    for value in ["0", "0.250", "1", "-0.1"] {
+        let mut changed = base.clone();
+        changed["discount"]["discount"] = Value::String(value.to_owned());
+        cases.push(changed);
+    }
+    let mut wrong = base.clone();
+    wrong["symbol"] = "BTCUSDT".into();
+    cases.push(wrong);
+    for body in cases {
+        let body = serde_json::to_vec(&body).unwrap();
+        let retained = prepare_response(&body, original, &account, handoff);
+        let official = connector_evidence(&body, &account, snapshot.evidence.as_of());
+        match (retained, official) {
+            (Ok(encoded), Ok(evidence)) => {
+                assert_eq!(encoded.evidence, evidence);
+                let decoded = decode_retained(&encoded.payload, &account, handoff).unwrap();
+                assert_eq!(decoded.candidate.evidence(), &evidence);
+            },
+            (Err(a), Err(b)) => assert_eq!(a.as_str(), b.as_str()),
+            other => panic!("retained format and connector disagreed: {other:?}"),
+        }
+    }
 }

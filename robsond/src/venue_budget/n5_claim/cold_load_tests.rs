@@ -1,12 +1,24 @@
 use anyhow::{anyhow, ensure, Context};
+use chrono::{DateTime, Utc};
 use robson_domain::Symbol;
+use robson_exec::{
+    balance_costs::{
+        native_n5::{fixture_describe_at, PreparedFeeOwner, DAY_NS},
+        AgeError, CostError,
+    },
+    venue::VenueId,
+    venue_clock::TickCapture,
+};
 use robson_testkit::{
     daemon_process::database_url_through,
     db_proxy::{DbProxy, ProxyMode},
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
+use std::{sync::Arc, time::Duration};
 use tokio::time::{sleep, timeout};
+use uuid::Uuid;
 
 use super::*;
 use robson_store::native_n5::{
@@ -111,58 +123,36 @@ fn account(symbol: &str) -> anyhow::Result<CostIdentity> {
     )?)
 }
 
-#[test]
-fn cold_receipt_refuses_at_exactly_day_and_before_original_bracket_end() {
-    let domain = ClockDomain::new(Uuid::from_u128(1), -2, 345).unwrap();
-    let raw = RawClockCapture {
-        epoch: Uuid::from_u128(2),
-        wall_seconds: 1_795_120_000,
-        wall_nanoseconds: 123_456_789,
-        domain,
-        before_ns: 100,
-        after_ns: 120,
-    };
-    let first = tick(domain, 100).unwrap();
-    let calculate = |at| receipt_age(tick(domain, at).unwrap(), &raw, first);
-    assert!(matches!(calculate(119), Err(BudgetError::PrerequisiteRefusal)));
-    assert_eq!(calculate(120).unwrap(), Some(Duration::from_nanos(20)));
-    assert_eq!(calculate(100 + DAY_NS - 1).unwrap().unwrap().as_nanos(), DAY_NS - 1);
-    assert!(calculate(100 + DAY_NS).unwrap().is_none(), "exactly 24h must be stale");
-    let foreign = ClockDomain::new(domain.boot(), -2, 346).unwrap();
-    assert!(matches!(
-        receipt_age(tick(foreign, 120).unwrap(), &raw, first),
-        Err(BudgetError::PrerequisiteRefusal)
-    ));
-}
-
 pub(in crate::venue_budget::n5_claim) async fn verify_real_receipt_controls(
     pool: &PgPool,
     identity: &CostIdentity,
 ) -> anyhow::Result<()> {
-    let clock = NativeClock::initialize()?;
+    let clock = Arc::new(NativeClock::initialize()?);
     let trace = Trace::default();
     let deadline = || Instant::now() + Duration::from_secs(2);
     let symbol = identity.symbol().as_pair();
-    let rows = read_rows(pool, std::slice::from_ref(&symbol), deadline(), &trace)
+    let observation = read_rows(pool, std::slice::from_ref(&symbol), deadline(), &trace)
         .await
         .map_err(|err| anyhow!("original receipt controls: {err:?}"))?;
-    let row = rows
-        .rows()
-        .iter()
-        .find(|row| row.try_get::<bool>("active").unwrap())
-        .context("active receipt")?;
-    let revision = row.try_get::<i64>("state_revision")?;
+    let expected = std::slice::from_ref(identity);
     let now = clock.capture()?;
-    let (prior, proven) =
-        state(row, revision, identity, now).map_err(|err| anyhow!("current receipt: {err:?}"))?;
-    let prior = prior.context("current claim")?;
-    let ReceiptState::Current(receipt) = proven else {
+    let entries = fixture_describe_at(&observation, expected, now, deadline())?;
+    let [entry] = entries.as_slice() else {
+        return Err(anyhow!("one selected receipt"));
+    };
+    let prior = entry.prior.as_ref().context("current claim")?;
+    let revision = prior.revision;
+    let ReceiptState::Current(receipt) = &entry.receipt else {
         return Err(anyhow!("positive control"));
     };
-    let at_day =
-        tick(receipt.original.domain, u128::try_from(receipt.original.before_ns)? + DAY_NS)
-            .map_err(|err| anyhow!("exactly 24h: {err:?}"))?;
-    ensure!(matches!(state(row, revision, identity, at_day), Ok((_, ReceiptState::Stale))));
+    let day_ns = u128::try_from(receipt.original.before_ns)? + DAY_NS;
+    let at_day = TickCapture::new(
+        receipt.original.domain,
+        i64::try_from(day_ns / 1_000_000_000)?,
+        i64::try_from(day_ns % 1_000_000_000)?,
+    )?;
+    let entries = fixture_describe_at(&observation, expected, at_day, deadline())?;
+    ensure!(matches!(entries[0].receipt, ReceiptState::Stale));
     let wrong_account = CostIdentity::new(
         identity.tenant(),
         identity.venue().clone(),
@@ -170,7 +160,10 @@ pub(in crate::venue_budget::n5_claim) async fn verify_real_receipt_controls(
         identity.uid() ^ 1,
         identity.symbol().clone(),
     )?;
-    ensure!(matches!(state(row, revision, &wrong_account, now), Err(BudgetError::Invalid)));
+    ensure!(matches!(
+        fixture_describe_at(&observation, &[wrong_account], now, deadline()),
+        Err(HistoryError::Invalid)
+    ));
 
     // Stage an unresolved next generation in this isolated test. M38 keeps
     // the complete previous snapshot; the loader must not promote it.
@@ -196,13 +189,18 @@ pub(in crate::venue_budget::n5_claim) async fn verify_real_receipt_controls(
     let reloaded = load(pool, std::slice::from_ref(identity), &clock, deadline(), &trace)
         .await
         .map_err(|err| anyhow!("unresolved next generation: {err:?}"))?;
-    let [entry] = reloaded.as_slice() else {
+    let [entry] = reloaded.entries() else {
         return Err(anyhow!("one configured key"));
     };
     ensure!(matches!(entry.receipt, ReceiptState::Unproven));
     ensure!(entry.prior.as_ref().is_some_and(|claim| claim.revision == revision + 1
         && claim.result.is_none()
         && claim.handoff.is_none()));
+    let closed = PreparedFeeOwner::prepare(reloaded, Arc::clone(&clock))?;
+    ensure!(matches!(
+        closed.selection().select(identity, "1.25".parse()?),
+        Err(CostError::Age(AgeError::Unresolved))
+    ));
     ensure!(trace.issued() == 2);
     eprintln!("N5_COLD_CONTROLS exactly_24h=stale wrong_account=refused prior_payload_preserved=true unresolved_current=unproven");
     Ok(())
@@ -226,7 +224,7 @@ async fn native_cold_manifest_refuses_absent_keys_and_never_certifies_revision_z
     );
     zero_claims(&pool).await?;
     let rows = read().await.map_err(|err| anyhow!("exact manifest: {err:?}"))?;
-    let [entry] = rows.as_slice() else {
+    let [entry] = rows.entries() else {
         return Err(anyhow!("one configured key"));
     };
     ensure!(entry.key.registration_id == registration(0).registration_id);

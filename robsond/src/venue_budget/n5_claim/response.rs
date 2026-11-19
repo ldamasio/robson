@@ -1,163 +1,19 @@
-//! Prepare a result from the original bounded commission response and EOF capture.
-
-use std::{fmt, marker::PhantomData};
+//! Gate the original bounded commission envelope through the venue parser.
 
 use chrono::{DateTime, Utc};
 use robson_connectors::binance::spot::SpotCommission;
 use robson_exec::{
-    balance_costs::{CostError, CostIdentity, EvidenceIdentity},
+    balance_costs::{
+        retained_n5::{encode_retained, RetentionError},
+        CostError, CostIdentity, EvidenceIdentity,
+    },
     clock_records::RawClockCapture,
-    venue_clock::{ClockDomain, TickCapture},
-};
-use serde::{
-    de::{value::MapAccessDeserializer, MapAccess, Visitor},
-    Deserialize, Deserializer, Serialize,
-};
-use uuid::Uuid;
-
-use super::{
-    result::{PreparedSnapshot, MAX_PAYLOAD_BYTES},
-    ClaimResult,
+    venue_clock::TickCapture,
 };
 
-pub(super) const MAX_RESPONSE_BYTES: usize = 16_384;
-const RECEIPT_FORMAT_VERSION: u16 = 1;
-const NANOS_PER_SECOND: i128 = 1_000_000_000;
-// PostgreSQL MIN_TIMESTAMP (-211813488000000000 μs from its 2000 epoch),
-// expressed in Unix wall seconds.
-// Chrono's upper limit is already earlier than PostgreSQL's.
-const POSTGRES_MIN_UNIX_SECONDS: i64 = -210_866_803_200;
+use super::{result::PreparedSnapshot, ClaimResult};
 
-// Derive deserialization so repeated known keys fail at every nesting level.
-// The wire types keep validated string spelling and skip unrelated fields.
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FeeFields {
-    symbol: String,
-    #[serde(deserialize_with = "object")]
-    standard_commission: Rates,
-    #[serde(deserialize_with = "object")]
-    special_commission: Rates,
-    #[serde(deserialize_with = "object")]
-    tax_commission: Rates,
-    #[serde(deserialize_with = "object")]
-    discount: Discount,
-}
-
-// Serde struct derives also accept ordered sequences. Require the named venue
-// object shape at every level while retaining derived duplicate-key checks.
-fn object<'de, D, T>(decoder: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct Object<T>(PhantomData<T>);
-
-    impl<'de, T: Deserialize<'de>> Visitor<'de> for Object<T> {
-        type Value = T;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a commission object with named fields")
-        }
-
-        fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<T, M::Error> {
-            T::deserialize(MapAccessDeserializer::new(map))
-        }
-    }
-
-    decoder.deserialize_map(Object(PhantomData))
-}
-
-#[derive(Deserialize, Serialize)]
-struct Rates {
-    maker: String,
-    taker: String,
-    buyer: String,
-    seller: String,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Discount {
-    enabled_for_account: bool,
-    enabled_for_symbol: bool,
-    discount_asset: String,
-    discount: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct RetainedReceipt {
-    format_version: u16,
-    original: OriginalMark,
-    commission: FeeFields,
-}
-
-#[derive(Deserialize, Serialize)]
-struct OriginalMark {
-    epoch: Uuid,
-    boot: Uuid,
-    offset_seconds: i64,
-    offset_nanoseconds: u32,
-    wall_seconds: i64,
-    wall_nanoseconds: u32,
-    // Decimal strings preserve exact ticks even in readers with narrow JSON integers.
-    before_ns: String,
-    after_ns: String,
-}
-
-impl From<RawClockCapture> for OriginalMark {
-    fn from(raw: RawClockCapture) -> Self {
-        let (offset_seconds, offset_nanoseconds) = raw.domain.offset();
-        Self {
-            epoch: raw.epoch,
-            boot: raw.domain.boot(),
-            offset_seconds,
-            offset_nanoseconds,
-            wall_seconds: raw.wall_seconds,
-            wall_nanoseconds: raw.wall_nanoseconds,
-            before_ns: raw.before_ns.to_string(),
-            after_ns: raw.after_ns.to_string(),
-        }
-    }
-}
-
-fn response_time(
-    raw: RawClockCapture,
-    handoff: TickCapture,
-) -> Option<(TickCapture, DateTime<Utc>)> {
-    // This checks both endpoints, bracket order, epoch shape, and wall fraction.
-    // The owner independently binds the epoch to the actual attempt.
-    raw.check().ok()?;
-    let observed = TickCapture::new(
-        raw.domain,
-        i64::try_from(raw.before_ns / NANOS_PER_SECOND).ok()?,
-        i64::try_from(raw.before_ns % NANOS_PER_SECOND).ok()?,
-    )
-    .ok()?;
-    observed.elapsed_since(&handoff).ok()?;
-    if raw.wall_seconds < POSTGRES_MIN_UNIX_SECONDS {
-        return None;
-    }
-    let as_of =
-        DateTime::<Utc>::from_timestamp(raw.wall_seconds, raw.wall_nanoseconds / 1_000 * 1_000)?;
-    Some((observed, as_of))
-}
-
-fn commission_evidence(
-    bytes: &[u8],
-    expected: &CostIdentity,
-    as_of: DateTime<Utc>,
-) -> Result<EvidenceIdentity, ClaimResult> {
-    let parsed: SpotCommission =
-        serde_json::from_slice(bytes).map_err(|_| ClaimResult::InvalidPayload)?;
-    parsed
-        .cost_candidate(expected.clone(), as_of)
-        .map(|candidate| candidate.evidence().clone())
-        .map_err(|error| match error {
-            CostError::FeePolicyMismatch => ClaimResult::PolicyMismatch,
-            _ => ClaimResult::InvalidPayload,
-        })
-}
+pub(super) use robson_exec::balance_costs::retained_n5::MAX_RESPONSE_BYTES;
 
 pub(super) fn prepare_response(
     body: &[u8],
@@ -165,68 +21,39 @@ pub(super) fn prepare_response(
     expected: &CostIdentity,
     handoff: TickCapture,
 ) -> Result<PreparedSnapshot, ClaimResult> {
-    if body.len() > MAX_RESPONSE_BYTES {
+    let encoded =
+        encode_retained(body, original, expected, handoff).map_err(|error| match error {
+            RetentionError::InvalidPayload => ClaimResult::InvalidPayload,
+            RetentionError::PolicyMismatch => ClaimResult::PolicyMismatch,
+            RetentionError::Unknown => ClaimResult::Unknown,
+        })?;
+    // Keep the original venue parser on the writer side, and require its
+    // evidence to agree with the pure retained reader before publishing.
+    let evidence = encoded.candidate.evidence();
+    if &connector_evidence(body, expected, evidence.as_of())? != evidence {
         return Err(ClaimResult::InvalidPayload);
     }
-    let (observed, as_of) = response_time(original, handoff).ok_or(ClaimResult::Unknown)?;
-    // The same bounded bytes feed the existing exact fee parser and the retained
-    // whitelist. The caller's verified account remains the only account source.
-    let mut decoder = serde_json::Deserializer::from_slice(body);
-    let commission = object(&mut decoder).map_err(|_| ClaimResult::InvalidPayload)?;
-    decoder.end().map_err(|_| ClaimResult::InvalidPayload)?;
-    let evidence = commission_evidence(body, expected, as_of)?;
-    let payload = serde_json::to_vec(&RetainedReceipt {
-        format_version: RECEIPT_FORMAT_VERSION,
-        original: original.into(),
-        commission,
+    Ok(PreparedSnapshot {
+        evidence: evidence.clone(),
+        observed: encoded.observed,
+        payload: encoded.payload,
     })
-    .map_err(|_| ClaimResult::Unknown)?;
-    if payload.len() > MAX_PAYLOAD_BYTES {
-        return Err(ClaimResult::InvalidPayload);
-    }
-    Ok(PreparedSnapshot { evidence, observed, payload })
 }
 
-/// Cold decode of one immutable retained receipt. The caller binds the
-/// original epoch, domain, oldest tick, as-of, and hash to its own columns.
-#[derive(Debug, Clone)]
-pub(super) struct RetainedResponse {
-    pub(super) original: RawClockCapture,
-    pub(super) observed: TickCapture,
-    pub(super) evidence: EvidenceIdentity,
-}
-
-pub(super) fn decode_retained(
-    payload: &[u8],
+fn connector_evidence(
+    body: &[u8],
     expected: &CostIdentity,
-    handoff: TickCapture,
-) -> Option<RetainedResponse> {
-    if payload.is_empty() || payload.len() > MAX_PAYLOAD_BYTES {
-        return None;
-    }
-    // Derived fields reject repeated keys; only the writer's exact compact output
-    // round-trips, so foreign, reordered, escaped, or padded spellings fail here.
-    let receipt: RetainedReceipt = serde_json::from_slice(payload).ok()?;
-    if receipt.format_version != RECEIPT_FORMAT_VERSION
-        || serde_json::to_vec(&receipt).ok()? != payload
-    {
-        return None;
-    }
-    let mark = &receipt.original;
-    let tick = |text: &str| text.parse::<i128>().ok().filter(|n| n.to_string() == text);
-    let original = RawClockCapture {
-        epoch: mark.epoch,
-        wall_seconds: mark.wall_seconds,
-        wall_nanoseconds: mark.wall_nanoseconds,
-        domain: ClockDomain::new(mark.boot, mark.offset_seconds, mark.offset_nanoseconds).ok()?,
-        before_ns: tick(&mark.before_ns)?,
-        after_ns: tick(&mark.after_ns)?,
-    };
-    let (observed, as_of) = response_time(original, handoff)?;
-    // Round-trip equality makes these bytes the retained commission object itself.
-    let commission = serde_json::to_vec(&receipt.commission).ok()?;
-    let evidence = commission_evidence(&commission, expected, as_of).ok()?;
-    Some(RetainedResponse { original, observed, evidence })
+    as_of: DateTime<Utc>,
+) -> Result<EvidenceIdentity, ClaimResult> {
+    let parsed: SpotCommission =
+        serde_json::from_slice(body).map_err(|_| ClaimResult::InvalidPayload)?;
+    parsed
+        .cost_candidate(expected.clone(), as_of)
+        .map(|candidate| candidate.evidence().clone())
+        .map_err(|error| match error {
+            CostError::FeePolicyMismatch => ClaimResult::PolicyMismatch,
+            _ => ClaimResult::InvalidPayload,
+        })
 }
 
 #[cfg(test)]

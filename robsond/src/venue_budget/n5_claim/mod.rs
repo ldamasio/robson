@@ -11,8 +11,6 @@ use uuid::Uuid;
 use super::{bootstrap::issue, completion, BudgetError, Trace};
 
 const STORE_LIMIT: Duration = Duration::from_secs(2);
-const DAY_NS: u128 = 86_400_000_000_000;
-const HANDOFF_NS: u128 = 60_000_000_000;
 const BEGIN: &str = "BEGIN";
 const COMMIT: &str = "COMMIT";
 const SETTINGS: &str = include_str!("../sql/settings.sql");
@@ -24,83 +22,10 @@ mod commission;
 mod response;
 mod result;
 
-#[derive(Clone, Debug)]
-pub(crate) struct FrequencyKey {
-    pub(crate) symbol: String,
-    pub(crate) initialization_id: Uuid,
-    pub(crate) recovery_generation: i64,
-    pub(crate) registration_id: Uuid,
-}
-
-impl FrequencyKey {
-    fn is_valid(&self) -> bool {
-        !self.symbol.is_empty()
-            && self.symbol.len() <= 64
-            && !self.initialization_id.is_nil()
-            && !self.registration_id.is_nil()
-            && self.recovery_generation >= 0
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ClaimIdentity {
-    pub(crate) claim_id: Uuid,
-    pub(crate) owner: Uuid,
-    pub(crate) digest: [u8; 32],
-    pub(crate) captured: TickCapture,
-    pub(crate) audit_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum PriorEligibility {
-    FirstUse,
-    SameDomain,
-    ContinuousObservation,
-}
-
-impl PriorEligibility {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::FirstUse => "first_use",
-            Self::SameDomain => "same_domain",
-            Self::ContinuousObservation => "continuous_observation",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum ClaimResult {
-    Success,
-    NoSend,
-    TransportFailure,
-    VenueRejected,
-    InvalidPayload,
-    PolicyMismatch,
-    Unknown,
-}
-
-impl ClaimResult {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Success => "success",
-            Self::NoSend => "no_send",
-            Self::TransportFailure => "transport_failure",
-            Self::VenueRejected => "venue_rejected",
-            Self::InvalidPayload => "invalid_payload",
-            Self::PolicyMismatch => "policy_mismatch",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PriorClaim {
-    pub(crate) revision: i64,
-    pub(crate) identity: ClaimIdentity,
-    pub(crate) eligibility: PriorEligibility,
-    pub(crate) handoff: Option<TickCapture>,
-    pub(crate) result: Option<ClaimResult>,
-}
+pub(crate) use robson_exec::balance_costs::native_n5::{
+    valid_audit_at, valid_identity, ClaimIdentity, ClaimResult, FrequencyKey, PriorClaim,
+    PriorEligibility, DAY_NS, HANDOFF_NS,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ClaimRequest {
@@ -130,18 +55,6 @@ pub(crate) struct Confirmation {
     key: FrequencyKey,
     expected: ClaimObservation,
     deadline: Instant,
-}
-
-fn valid_audit_at(audit_at: DateTime<Utc>) -> bool {
-    let subsec = audit_at.timestamp_subsec_nanos();
-    subsec < 1_000_000_000 && subsec % 1_000 == 0
-}
-
-fn valid_identity(identity: &ClaimIdentity) -> bool {
-    !identity.claim_id.is_nil()
-        && !identity.owner.is_nil()
-        && identity.captured.nanoseconds() <= TICK_MAX as u128
-        && valid_audit_at(identity.audit_at)
 }
 
 /// Check the shape and exact native arithmetic before sending SQL. PostgreSQL
