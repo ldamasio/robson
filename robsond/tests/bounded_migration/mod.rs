@@ -13,6 +13,7 @@ mod helpers;
 mod late;
 mod migration39;
 mod migration40;
+mod migration41;
 
 /// Freeze a predecessor binary's real embedded inventory in a local fixture.
 fn through(version: i64) -> Migrator {

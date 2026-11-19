@@ -64,6 +64,12 @@ pub mod position_manager;
 pub mod query;
 pub mod query_engine;
 pub mod reconciliation_worker;
+#[cfg(feature = "postgres")]
+#[allow(
+    dead_code,
+    reason = "the order-set owner will consume the observed persisted identity"
+)]
+mod spot_order_set_store;
 mod sse;
 #[cfg(test)]
 mod stack_budget_tests;
