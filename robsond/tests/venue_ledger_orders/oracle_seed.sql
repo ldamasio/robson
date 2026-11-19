@@ -115,13 +115,14 @@ WITH binding AS MATERIALIZED (
     -- requires both leg coordinates or neither. The target and flags survive.
     INSERT INTO public.spot_order_set_cancel_members (
         tenant_id, venue_id, account_scope, generation_id, intent_id,
-        symbol, position_id, target_id, pending, conflict
+        symbol, position_id, source_position, target_id, pending, conflict
     )
     SELECT b.tenant_id, b.venue_id, b.account_scope, b.generation_id, s.intent_id,
            CASE WHEN s.position_id IS NOT NULL THEN s.symbol END,
            CASE WHEN s.symbol IS NOT NULL THEN s.position_id END,
-           s.target_id, s.pending, s.conflict
+           j.position_id, s.target_id, s.pending, s.conflict
     FROM binding b JOIN public.cancel_shadow_members s USING (tenant_id, venue_id, account_scope)
+    JOIN public.order_intents j USING (tenant_id, venue_id, account_scope, intent_id)
     RETURNING 1
 ), cancel_groups AS (
     INSERT INTO public.spot_order_set_cancel_groups (

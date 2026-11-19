@@ -90,11 +90,14 @@ async fn generation(pool: &PgPool, f: &Fixture) -> Result<JournalGeneration> {
 }
 
 fn linked(f: &Fixture, order: u64, intent: Uuid) -> OrderLink {
-    f.link(order, OrderOwner::Leg {
-        position_id: f.position,
-        intent_id: intent,
-        kind: LegOrderKind::Sell,
-    })
+    f.link(
+        order,
+        OrderOwner::Leg {
+            position_id: f.position,
+            intent_id: intent,
+            kind: LegOrderKind::Sell,
+        },
+    )
 }
 
 async fn version(pool: &PgPool, b: &JournalGeneration) -> Result<i64> {
@@ -128,8 +131,9 @@ async fn exact_reference(pool: &PgPool, b: &JournalGeneration) -> Result<()> {
          FROM sell_shadow_orders s WHERE {NORMAL_SCOPE} AND (s.potential OR s.conflict)"
     );
     let cancel_member = format!(
-        "SELECT to_jsonb(s) || jsonb_build_object('position_id',CASE WHEN s.symbol IS NOT NULL THEN s.position_id END)
-         AS fact FROM cancel_shadow_members s WHERE {NORMAL_SCOPE}"
+        "SELECT to_jsonb(s) || jsonb_build_object('position_id',CASE WHEN s.symbol IS NOT NULL THEN s.position_id END, 'source_position',j.position_id)
+         AS fact FROM cancel_shadow_members s
+         JOIN order_intents j USING (tenant_id,venue_id,account_scope,intent_id) WHERE {NORMAL_SCOPE}"
     );
     for table in [
         "sell_intents",
@@ -560,9 +564,10 @@ async fn projected_native_order_requires_inactive_cancel_and_exact_journal_owner
     ensure!(snapshot(&pool).await == before && version(&pool, &b).await? == v);
     sqlx::query(
         "INSERT INTO spot_order_set_cancel_members (
-          tenant_id,venue_id,account_scope,generation_id,intent_id,symbol,position_id,target_id,pending,conflict)
-         SELECT tenant_id,venue_id,account_scope,$2,intent_id,symbol,position_id,target_id,pending,conflict
-         FROM cancel_shadow_members WHERE intent_id=$1",
+          tenant_id,venue_id,account_scope,generation_id,intent_id,symbol,position_id,source_position,target_id,pending,conflict)
+         SELECT tenant_id,venue_id,account_scope,$2,intent_id,s.symbol,s.position_id,j.position_id,s.target_id,s.pending,s.conflict
+         FROM cancel_shadow_members s JOIN order_intents j USING (tenant_id,venue_id,account_scope,intent_id)
+         WHERE intent_id=$1",
     )
     .bind(cancel).bind(b.generation_id).execute(&pool).await?;
 

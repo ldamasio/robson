@@ -4,10 +4,17 @@ use super::*;
 
 async fn shadow_equivalence(pool: &PgPool, b: &JournalGeneration) -> Result<()> {
     for table in ["members", "groups", "legs"] {
-        let forecast = format!(
-            "SELECT row_to_json(s)::jsonb::text FROM cancel_shadow_{table} s
-           WHERE s.tenant_id=$1 AND s.account_scope=$2 ORDER BY row_to_json(s)::jsonb::text"
-        );
+        let forecast = if table == "members" {
+            "SELECT (to_jsonb(s) || jsonb_build_object('source_position', j.position_id))::text AS fact
+             FROM cancel_shadow_members s
+             JOIN order_intents j USING(tenant_id,venue_id,account_scope,intent_id)
+             WHERE s.tenant_id=$1 AND s.account_scope=$2 ORDER BY fact".to_owned()
+        } else {
+            format!(
+                "SELECT to_jsonb(s)::text AS fact FROM cancel_shadow_{table} s
+                     WHERE s.tenant_id=$1 AND s.account_scope=$2 ORDER BY fact"
+            )
+        };
         let projected = format!(
             "SELECT (to_jsonb(p)-'generation_id')::text FROM spot_order_set_cancel_{table} p
            WHERE p.tenant_id=$1 AND p.account_scope=$2 AND p.generation_id=$3
@@ -62,9 +69,10 @@ async fn projected_grouped_cancel_matches_shadow_siblings_and_physical_replay(
             ).bind(id).execute(&pool).await?;
             sqlx::query(
                 "INSERT INTO spot_order_set_cancel_members
-                 (tenant_id,venue_id,account_scope,generation_id,intent_id,symbol,position_id,target_id,pending,conflict)
-                 SELECT tenant_id,venue_id,account_scope,$3,intent_id,symbol,position_id,target_id,pending,conflict
-                 FROM cancel_shadow_members WHERE tenant_id=$1 AND intent_id<>$2",
+                 (tenant_id,venue_id,account_scope,generation_id,intent_id,symbol,position_id,source_position,target_id,pending,conflict)
+                 SELECT tenant_id,venue_id,account_scope,$3,intent_id,s.symbol,s.position_id,j.position_id,s.target_id,s.pending,s.conflict
+                 FROM cancel_shadow_members s JOIN order_intents j USING(tenant_id,venue_id,account_scope,intent_id)
+                 WHERE tenant_id=$1 AND intent_id<>$2",
             ).bind(b.tenant_id).bind(id).bind(b.generation_id).execute(&pool).await?;
             sqlx::query(
                 "UPDATE spot_order_set_cancel_groups SET pending_count=21 WHERE generation_id=$1",
