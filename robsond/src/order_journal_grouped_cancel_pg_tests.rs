@@ -383,3 +383,128 @@ async fn projected_grouped_cancel_seeded_interleavings_converge_one_exact_member
     }
     Ok(())
 }
+
+async fn named_order(pool: &PgPool, tenant: Uuid, cancel_id: Uuid) -> Result<()> {
+    // A separate native (leg-owned) observation naming this J row. The test
+    // initializes the same conservative prior projection before the write.
+    sqlx::query(
+        "INSERT INTO venue_orders (
+             venue_id,account_scope,symbol,exchange_order_id,tenant_id,client_order_id,
+             last_client_order_id,owner,intent_id,position_id,kind,side,order_type,orig_qty,
+             status,phase,last_checked_at,live_seen_at)
+         SELECT venue_id,account_scope,symbol,'4100009',tenant_id,'named-cancel','named-cancel',
+                'leg',$2,position_id,'sell','SELL','MARKET',1,'NEW','live',now(),now()
+           FROM venue_orders WHERE tenant_id=$1 AND exchange_order_id='4100001'",
+    )
+    .bind(tenant)
+    .bind(cancel_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn expected_named_projection(pool: &PgPool, b: &JournalGeneration, id: Uuid) -> Result<()> {
+    sqlx::query("UPDATE spot_order_set_cancel_members SET conflict=true WHERE intent_id=$1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE spot_order_set_cancel_groups SET conflict_count=1 WHERE generation_id=$1")
+        .bind(b.generation_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE spot_order_set_cancel_legs SET conflict_count=1 WHERE generation_id=$1")
+        .bind(b.generation_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_grouped_cancel_reads_named_conflict_only_from_its_native_scope(
+    pool: PgPool,
+) -> Result<()> {
+    migrate_fixture(&pool).await?;
+    for is_foreign in [false, true] {
+        let (_, b, mut batch, v) = prepared(&pool, false).await?;
+        let id = batch.intent.intent_id;
+        let name_owner = if is_foreign {
+            PositiveLeg::admit(&pool).await?.tenant
+        } else {
+            b.tenant_id
+        };
+        named_order(&pool, name_owner, id).await?;
+        expected_named_projection(&pool, &b, id).await?;
+        let durable_before = durable(&pool, b.tenant_id).await?;
+        let previous = read_facts(&pool, &b, id).await?;
+        ensure!(previous.pending && previous.conflict && previous.leg_conflict == 1);
+        let store = PgJournalBackend::new(&pool, b.tenant_id).with_order_set_projection(b.clone());
+        batch.outcome = outcome(true, None);
+        let result = store.commit(&batch).await;
+        if is_foreign {
+            ensure!(matches!(result, Err(CommitFailure::Known(_))));
+            ensure!(durable(&pool, b.tenant_id).await? == durable_before);
+            ensure!(read_facts(&pool, &b, id).await? == previous);
+        } else {
+            result.map_err(|error| anyhow::anyhow!("same-scope named conflict: {error:?}"))?;
+            let actual = read_facts(&pool, &b, id).await?;
+            ensure!(
+                actual
+                    == ResultFacts {
+                        native_not_sent: true,
+                        accounting: v + 1,
+                        projected: v + 1,
+                        ..previous
+                    }
+            );
+        }
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_grouped_cancel_refuses_missing_native_write_and_obsolete_epoch(
+    pool: PgPool,
+) -> Result<()> {
+    migrate_fixture(&pool).await?;
+    let (_, b, mut batch, _) = prepared(&pool, false).await?;
+    let id = batch.intent.intent_id;
+    let previous = read_facts(&pool, &b, id).await?;
+    let store = PgJournalBackend::new(&pool, b.tenant_id).with_order_set_projection(b.clone());
+    let stable = durable(&pool, b.tenant_id).await?;
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_outcome_fixture() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RETURN NULL; END $$;
+         CREATE TRIGGER refuse_outcome_fixture BEFORE UPDATE OF not_sent ON order_intents
+         FOR EACH ROW EXECUTE FUNCTION refuse_outcome_fixture()",
+    )
+    .execute(&pool)
+    .await?;
+    batch.outcome = outcome(true, None);
+    ensure!(matches!(store.commit(&batch).await,
+        Err(CommitFailure::Known(reason)) if reason.contains("did not affect one row")));
+    ensure!(
+        durable(&pool, b.tenant_id).await? == stable
+            && read_facts(&pool, &b, id).await? == previous
+    );
+    sqlx::query("DROP TRIGGER refuse_outcome_fixture ON order_intents")
+        .execute(&pool)
+        .await?;
+
+    let newer = process_epoch::start_epoch(&pool, b.tenant_id, "grouped-outcome-successor").await?;
+    ensure!(newer.predecessor_epoch_id == Some(b.process_epoch));
+    let open: bool =
+        sqlx::query_scalar("SELECT clean_stop_at IS NULL FROM process_epochs WHERE epoch_id=$1")
+            .bind(b.process_epoch)
+            .fetch_one(&pool)
+            .await?;
+    ensure!(open);
+    let after_epoch = durable(&pool, b.tenant_id).await?;
+    ensure!(matches!(store.commit(&batch).await, Err(CommitFailure::Known(_))));
+    ensure!(
+        durable(&pool, b.tenant_id).await? == after_epoch
+            && read_facts(&pool, &b, id).await? == previous
+    );
+    Ok(())
+}
