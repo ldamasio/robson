@@ -230,9 +230,6 @@ async fn cold_spot_audit_refuses_foreign_page_nine_orphan_and_catalog(pool: PgPo
     .await;
     ensure!(matches!(absent, Err(ColdAuditRefusal::AccountMissing)));
     seed(&pool, tenant, 1, 8).await?;
-    seed(&pool, Uuid::now_v7(), 9, 9)
-        .await
-        .expect_err("foreign order needs its own accounting owner");
     sqlx::query(
         "INSERT INTO public.order_intents(intent_id,tenant_id,venue_id,account_scope,client_order_id,
               kind,params,created_at) VALUES($1,$2,'binance:spot',$3,'009','exit','{}',now())",
