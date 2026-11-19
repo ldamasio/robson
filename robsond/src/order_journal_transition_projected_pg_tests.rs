@@ -1,10 +1,16 @@
 //! Native PG16 projection witnesses on the existing first-cancel transaction.
+use std::time::Duration;
+
 use anyhow::{ensure, Result};
+use proptest::{
+    strategy::{Strategy, ValueTree},
+    test_runner::{Config, RngSeed, TestRunner},
+};
 use robson_testkit::db_proxy::ProxyMode;
 use sqlx::PgPool;
 
 use super::{
-    faults::{durable, Wire},
+    faults::{blackhole_commit, durable, Wire},
     positive::{migrate_fixture, PositiveLeg, SYMBOL},
     *,
 };
@@ -58,6 +64,7 @@ async fn assert_projected(
     transition: Uuid,
     expected_version: i64,
     terminal_mask: bool,
+    pending: i64,
 ) -> Result<()> {
     let position = cancel.position_id.unwrap();
     let target = cancel.cancels_order_id.as_deref().unwrap();
@@ -93,11 +100,11 @@ async fn assert_projected(
             == (
                 expected_version,
                 expected_version,
-                1,
+                pending,
                 0,
                 terminal_mask,
                 true,
-                i64::from(!terminal_mask),
+                if terminal_mask { 0 } else { pending },
                 0
             )
     );
@@ -124,7 +131,7 @@ async fn projected_first_cancel_lost_ack_is_one_atomic_observed_write(pool: PgPo
     ensure!(trace.len() == 7 && trace[5].contains("spot_order_set_cancel_members"));
     wire.retires(&pool).await?;
     leg.assert_bare_cancel(&pool, &cancel).await?;
-    assert_projected(&pool, &binding, &cancel, transition, version + 1, false).await?;
+    assert_projected(&pool, &binding, &cancel, transition, version + 1, false, 1).await?;
     eprintln!(
         "Projected first cancel: 7 physical commands, native COMMIT landed without acknowledgement"
     );
@@ -163,6 +170,7 @@ async fn projected_first_cancel_stale_binding_rolls_back_under_native_accounting
 async fn projected_first_cancel_preserves_qualified_terminal_mask(pool: PgPool) -> Result<()> {
     migrate_fixture(&pool).await?;
     let leg = PositiveLeg::admit(&pool).await?;
+    let _alias = leg.alias_on_another_symbol(&pool, "ETHUSDT").await?;
     let cancel = leg.cancel_intent();
     let version = leg.accounting_version(&pool).await?;
     let binding = bind_generation(&pool, leg.tenant, &cancel.account_scope, version).await?;
@@ -171,7 +179,7 @@ async fn projected_first_cancel_preserves_qualified_terminal_mask(pool: PgPool) 
         "WITH target AS (
             UPDATE venue_orders SET status='CANCELED',phase='terminal',terminal_seen_at=now()
             WHERE tenant_id=$1 AND venue_id='binance:spot' AND account_scope=$2
-              AND symbol=$3 AND exchange_order_id=$4
+              AND exchange_order_id=$4
             RETURNING intent_id,tenant_id,venue_id,account_scope,client_order_id,position_id,symbol,exchange_order_id
         ), journal AS (
             INSERT INTO order_intents
@@ -183,7 +191,7 @@ async fn projected_first_cancel_preserves_qualified_terminal_mask(pool: PgPool) 
             (tenant_id,venue_id,account_scope,generation_id,symbol,position_id,target_id,
              pending_count,conflict_count,terminal_mask)
         SELECT t.tenant_id,t.venue_id,t.account_scope,$5,t.symbol,t.position_id,t.exchange_order_id,0,0,true
-        FROM target t JOIN journal j USING (intent_id)",
+        FROM target t JOIN journal j USING (intent_id) WHERE t.symbol=$3",
     )
     .bind(leg.tenant)
     .bind(&cancel.account_scope)
@@ -220,7 +228,7 @@ async fn projected_first_cancel_preserves_qualified_terminal_mask(pool: PgPool) 
         .commit_first_cancel(&cancel, request(transition, version))
         .await
         .map_err(|err| anyhow::anyhow!("projected first cancel: {err:?}"))?;
-    assert_projected(&pool, &binding, &cancel, transition, version + 1, true).await?;
+    assert_projected(&pool, &binding, &cancel, transition, version + 1, true, 1).await?;
     Ok(())
 }
 
@@ -230,7 +238,14 @@ async fn projected_first_cancel_generated_same_version_competitors_publish_once(
     pool: PgPool,
 ) -> Result<()> {
     migrate_fixture(&pool).await?;
-    for seed in 1_u64..=12 {
+    let mut runner = TestRunner::new(Config {
+        rng_seed: RngSeed::Fixed(0x75b3e912),
+        failure_persistence: None,
+        ..Config::default()
+    });
+    let delays = (0_u64..=1_800, 0_u64..=1_800);
+    for case in 0..24 {
+        let (a_delay, b_delay) = delays.new_tree(&mut runner).expect("bounded schedule").current();
         let leg = PositiveLeg::admit(&pool).await?;
         let a = leg.cancel_intent();
         let b = leg.cancel_intent();
@@ -242,26 +257,24 @@ async fn projected_first_cancel_generated_same_version_competitors_publish_once(
             PgJournalBackend::new(&pool, leg.tenant).with_order_set_projection(binding.clone());
         let t1 = Uuid::now_v7();
         let t2 = Uuid::now_v7();
-        let (one, two) = if seed.wrapping_mul(0x9e3779b97f4a7c15) >> 63 == 0 {
-            tokio::join!(
-                left.commit_first_cancel(&a, request(t1, version)),
-                right.commit_first_cancel(&b, request(t2, version)),
-            )
-        } else {
-            let (two, one) = tokio::join!(
-                right.commit_first_cancel(&b, request(t2, version)),
-                left.commit_first_cancel(&a, request(t1, version)),
-            );
-            (one, two)
+        let submit = |store: PgJournalBackend, intent: IntentRow, transition, delay| async move {
+            if delay != 0 {
+                tokio::time::sleep(Duration::from_micros(delay)).await;
+            }
+            store.commit_first_cancel(&intent, request(transition, version)).await
         };
+        let (one, two) = tokio::join!(
+            submit(left, a.clone(), t1, a_delay),
+            submit(right, b.clone(), t2, b_delay),
+        );
         let (winner, transition, loser) = match (one, two) {
             (Ok(_), Err(CommitFailure::Known(_))) => (&a, t1, &b),
             (Err(CommitFailure::Known(_)), Ok(_)) => (&b, t2, &a),
             result => anyhow::bail!(
-                "seed {seed}: expected precisely one acknowledgement, observed {result:?}"
+                "case {case} ({a_delay},{b_delay}): expected precisely one acknowledgement, observed {result:?}"
             ),
         };
-        assert_projected(&pool, &binding, winner, transition, version + 1, false).await?;
+        assert_projected(&pool, &binding, winner, transition, version + 1, false, 1).await?;
         let loser_writes: i64 = sqlx::query_scalar(
             "SELECT (SELECT count(*) FROM order_intents WHERE intent_id=$1)
                     +(SELECT count(*) FROM spot_order_set_cancel_members WHERE intent_id=$1)",
@@ -272,7 +285,199 @@ async fn projected_first_cancel_generated_same_version_competitors_publish_once(
         ensure!(loser_writes == 0);
     }
     eprintln!(
-        "Projected first cancel: 12 generated same-version native schedules, one winner each"
+        "Projected first cancel: 24 proptest-generated same-version native schedules, one winner each"
     );
     Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_first_cancel_rejects_wrong_scope_and_obsolete_epochs(
+    pool: PgPool,
+) -> Result<()> {
+    migrate_fixture(&pool).await?;
+    let leg = PositiveLeg::admit(&pool).await?;
+    let cancel = leg.cancel_intent();
+    let version = leg.accounting_version(&pool).await?;
+    let binding = bind_generation(&pool, leg.tenant, &cancel.account_scope, version).await?;
+    let transition = Uuid::now_v7();
+    let mut wire = Wire::new(&pool, leg.tenant).await?;
+    let before = durable(&pool, leg.tenant).await?;
+    for invalid in [
+        JournalGeneration {
+            tenant_id: Uuid::now_v7(),
+            ..binding.clone()
+        },
+        JournalGeneration {
+            account_scope: "foreign-scope".to_owned(),
+            ..binding.clone()
+        },
+    ] {
+        wire.store.order_set_projection = Some(invalid);
+        ensure!(matches!(
+            wire.store.commit_first_cancel(&cancel, request(transition, version)).await,
+            Err(CommitFailure::Known(reason)) if reason.contains("invalid binding")
+        ));
+        ensure!(wire.proxy.query_trace().is_empty());
+    }
+    ensure!(durable(&pool, leg.tenant).await? == before);
+    let original_epoch = binding.process_epoch;
+    let store = PgJournalBackend::new(&pool, leg.tenant).with_order_set_projection(binding);
+    for phase in ["ended", "superseded"] {
+        if phase == "ended" {
+            sqlx::query(
+                "UPDATE process_epochs SET clean_stop_at=now(),marker_version=$2 WHERE epoch_id=$1",
+            )
+            .bind(original_epoch)
+            .bind(crate::process_epoch::MARKER_VERSION)
+            .execute(&pool)
+            .await?;
+        } else {
+            let next =
+                crate::process_epoch::start_epoch(&pool, leg.tenant, "first-cancel-successor")
+                    .await?;
+            ensure!(next.predecessor_epoch_id == Some(original_epoch));
+        }
+        let stable = durable(&pool, leg.tenant).await?;
+        ensure!(matches!(
+            store.commit_first_cancel(&cancel, request(transition, version)).await,
+            Err(CommitFailure::Known(reason)) if reason.contains("stale generation")
+        ));
+        ensure!(durable(&pool, leg.tenant).await? == stable);
+    }
+    ensure!(leg.accounting_version(&pool).await? == version);
+    assert_no_projection(&pool, leg.tenant, cancel.intent_id).await
+}
+
+async fn assert_no_projection(pool: &PgPool, tenant: Uuid, cancel: Uuid) -> Result<()> {
+    let actual: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM spot_order_set_cancel_members WHERE intent_id=$2),
+                (SELECT count(*) FROM spot_order_set_cancel_groups WHERE tenant_id=$1),
+                (SELECT count(*) FROM spot_order_set_cancel_legs WHERE tenant_id=$1)",
+    )
+    .bind(tenant)
+    .bind(cancel)
+    .fetch_one(pool)
+    .await?;
+    ensure!(actual == (0, 0, 0));
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_first_cancel_updates_populated_group_on_existing_open_transition(
+    pool: PgPool,
+) -> Result<()> {
+    migrate_fixture(&pool).await?;
+    let leg = PositiveLeg::admit(&pool).await?;
+    let first = leg.cancel_intent();
+    let second = leg.cancel_intent();
+    let version = leg.accounting_version(&pool).await?;
+    let binding = bind_generation(&pool, leg.tenant, &first.account_scope, version).await?;
+    let store = PgJournalBackend::new(&pool, leg.tenant).with_order_set_projection(binding.clone());
+    let initial = Uuid::now_v7();
+    store
+        .commit_first_cancel(&first, request(initial, version))
+        .await
+        .map_err(|error| anyhow::anyhow!("original projected first cancel: {error:?}"))?;
+    assert_projected(&pool, &binding, &first, initial, version + 1, false, 1).await?;
+    sqlx::query("UPDATE balance_transitions SET completed_at=now(),outcome='fixture-closed' WHERE transition_id=$1")
+        .bind(initial).execute(&pool).await?;
+    let transition = Uuid::now_v7();
+    let mut command = request(transition, version + 1);
+    sqlx::query(
+        "INSERT INTO balance_transitions (
+             transition_id,position_id,tenant_id,venue_id,account_scope,symbol,kind,
+             target_trigger,reason,started_at)
+         VALUES ($1,$2,$3,'binance:spot',$4,$5,'replace',$6,$7,now())",
+    )
+    .bind(transition)
+    .bind(second.position_id)
+    .bind(leg.tenant)
+    .bind(&second.account_scope)
+    .bind(SYMBOL)
+    .bind(command.target_trigger)
+    .bind(command.reason)
+    .execute(&pool)
+    .await?;
+    command.expected_transition = ExpectedTransition::ExistingOpen(transition);
+    store
+        .commit_first_cancel(&second, command)
+        .await
+        .map_err(|error| anyhow::anyhow!("projected attach to existing transition: {error:?}"))?;
+    assert_projected(&pool, &binding, &first, initial, version + 2, false, 2).await?;
+    assert_projected(&pool, &binding, &second, transition, version + 2, false, 2).await
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_first_cancel_duplicate_member_refuses_without_new_source_or_counters(
+    pool: PgPool,
+) -> Result<()> {
+    migrate_fixture(&pool).await?;
+    let leg = PositiveLeg::admit(&pool).await?;
+    let cancel = leg.cancel_intent();
+    let version = leg.accounting_version(&pool).await?;
+    let binding = bind_generation(&pool, leg.tenant, &cancel.account_scope, version).await?;
+    sqlx::query(
+        "INSERT INTO spot_order_set_cancel_members (
+             tenant_id,venue_id,account_scope,generation_id,intent_id,symbol,position_id,
+             target_id,pending,conflict)
+         VALUES ($1,'binance:spot',$2,$3,$4,$5,$6,$7,true,false)",
+    )
+    .bind(leg.tenant)
+    .bind(&binding.account_scope)
+    .bind(binding.generation_id)
+    .bind(cancel.intent_id)
+    .bind(SYMBOL)
+    .bind(cancel.position_id)
+    .bind(&cancel.cancels_order_id)
+    .execute(&pool)
+    .await?;
+    let before = durable(&pool, leg.tenant).await?;
+    let store = PgJournalBackend::new(&pool, leg.tenant).with_order_set_projection(binding.clone());
+    ensure!(matches!(
+        store.commit_first_cancel(&cancel, request(Uuid::now_v7(), version)).await,
+        Err(CommitFailure::Known(reason)) if reason.contains("stale generation")
+    ));
+    ensure!(durable(&pool, leg.tenant).await? == before);
+    let actual: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT accounting_version,
+                (SELECT count(*) FROM spot_order_set_cancel_members WHERE intent_id=$2 AND pending AND NOT conflict),
+                (SELECT count(*) FROM spot_order_set_cancel_groups WHERE generation_id=$1),
+                (SELECT count(*) FROM spot_order_set_cancel_legs WHERE generation_id=$1)
+         FROM spot_order_set_generation WHERE generation_id=$1",
+    )
+    .bind(binding.generation_id).bind(cancel.intent_id).fetch_one(&pool).await?;
+    ensure!(actual == (version, 1, 0, 0));
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_first_cancel_retires_a_blocked_commit_with_all_writes_absent(
+    pool: PgPool,
+) -> Result<()> {
+    migrate_fixture(&pool).await?;
+    let leg = PositiveLeg::admit(&pool).await?;
+    let cancel = leg.cancel_intent();
+    let version = leg.accounting_version(&pool).await?;
+    let binding = bind_generation(&pool, leg.tenant, &cancel.account_scope, version).await?;
+    let before = durable(&pool, leg.tenant).await?;
+    let mut wire = Wire::new(&pool, leg.tenant).await?;
+    wire.store.order_set_projection = Some(binding);
+    let result = blackhole_commit(
+        wire.store.commit_first_cancel(&cancel, request(Uuid::now_v7(), version)),
+        &wire.proxy,
+    )
+    .await?;
+    ensure!(matches!(result, Err(CommitFailure::Uncertain(_))));
+    let trace = wire.proxy.query_trace();
+    ensure!(
+        trace.len() == 6 && trace[5].contains("spot_order_set_cancel_members"),
+        "{trace:?}"
+    );
+    wire.retires(&pool).await?;
+    ensure!(durable(&pool, leg.tenant).await? == before);
+    assert_no_projection(&pool, leg.tenant, cancel.intent_id).await
 }

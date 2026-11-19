@@ -27,7 +27,7 @@ WITH cancel AS MATERIALIZED (
     SELECT c.*,
            coalesce((
                SELECT o.owner = 'leg'
-                  AND (o.tenant_id, o.symbol, o.position_id) = (c.tenant_id, c.symbol, c.position_id)
+                  AND (o.tenant_id, o.position_id) = (c.tenant_id, c.position_id)
                   AND o.phase = 'terminal'
                   AND o.status IN ('FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED')
                   AND (t.tenant_id, t.venue_id, t.account_scope, t.position_id, t.client_order_id)
@@ -37,8 +37,8 @@ WITH cancel AS MATERIALIZED (
                                            WHEN 'protection' THEN 'stop' WHEN 'exit' THEN 'sell' END
                FROM public.venue_orders o
                JOIN public.order_intents t ON t.intent_id = o.intent_id
-               WHERE (o.venue_id, o.account_scope, o.exchange_order_id)
-                   = (c.venue_id, c.account_scope, c.target_id)
+               WHERE (o.venue_id, o.account_scope, o.symbol, o.exchange_order_id)
+                   = (c.venue_id, c.account_scope, c.symbol, c.target_id)
            ), false) AS terminal_proof
     FROM cancel c
 ), prior AS MATERIALIZED (
