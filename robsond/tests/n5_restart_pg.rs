@@ -414,7 +414,8 @@ fn n5_restart_child_entry() {
             receipt,
         }
     });
-    println!("{CHILD_MARK}{}", serde_json::to_string(&report).unwrap());
+    // libtest prints its test name without a trailing newline under --nocapture.
+    println!("\n{CHILD_MARK}{}", serde_json::to_string(&report).unwrap());
 }
 
 async fn child(
