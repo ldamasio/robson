@@ -13,19 +13,19 @@ mod reader;
 
 use std::time::Duration;
 
-use fixture::{record, seen, Fixture, VENUE};
+use fixture::{record, seen, unowned, Fixture, VENUE};
 use proptest::{
     collection::vec,
     prelude::*,
     test_runner::{Config, RngSeed, TestCaseResult, TestRunner},
 };
-use reader::{Report, Scope, Snapshot};
+use reader::{Report, Scope, Snapshot, VenueLinkage};
 use robson_exec::{
     order_journal::{
         BalanceBatch, IntentKind, IntentRow, JournalBackend, JournalBatch, OutcomeRow, VenueOutcome,
     },
-    venue::{OrderPhase, VenueId},
-    venue_ledger::{LegOrderKind, OrderOwner},
+    venue::{OrderPhase, VenueId, VenueOrderRecord},
+    venue_ledger::{LegOrderKind, OrderLink, OrderOwner},
 };
 use robsond::{order_journal_store::PgJournalBackend, process_epoch::start_epoch};
 use rust_decimal::Decimal;
@@ -304,6 +304,256 @@ async fn another_leg_order_cannot_satisfy_named_or_cancel_evidence(pool: PgPool)
     assert!(
         target.target_conflict,
         "a terminal target cannot discharge another leg's evidence"
+    );
+}
+
+fn zero_execution_order(id: &str, status: &str, phase: OrderPhase) -> VenueOrderRecord {
+    let mut observed = record();
+    observed.exchange_order_id = id.to_owned();
+    observed.status = status.to_owned();
+    observed.phase = phase;
+    observed.executed_qty = Decimal::ZERO;
+    observed.cumulative_quote_qty = Some(Decimal::ZERO);
+    observed
+}
+
+fn linked_sell(f: &Fixture, intent: &IntentRow) -> OrderLink {
+    OrderLink {
+        owner: OrderOwner::Leg {
+            intent_id: intent.intent_id,
+            position_id: f.position,
+            kind: LegOrderKind::Sell,
+        },
+        client_order_id: intent.client_order_id.clone(),
+        ..unowned()
+    }
+}
+
+fn complement(report: &Report) -> Vec<(&str, VenueLinkage)> {
+    report
+        .venue_complement
+        .iter()
+        .map(|row| (row.exchange_order_id.as_str(), row.linkage()))
+        .collect()
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn venue_complement_preserves_unlinked_orders_across_frozen_pages(pool: PgPool) {
+    use VenueLinkage::{MissingJournal, RouteUnowned};
+
+    let f = Fixture::new(&pool).await;
+    let other = Fixture::for_tenant(&pool, f.tenant).await;
+    let s = scope(&f);
+    let j = PgJournalBackend::new(&pool, f.tenant);
+    let live = zero_execution_order("10", "NEW", OrderPhase::Live);
+    let live_link = f.link(LegOrderKind::Sell);
+    f.ledger.record_order(&live, &live_link, seen(1)).await.unwrap();
+
+    let unknown = zero_execution_order("20", "PENDING_CANCEL", OrderPhase::Unknown);
+    f.ledger
+        .record_order(&unknown, &f.link(LegOrderKind::Sell), seen(1))
+        .await
+        .unwrap();
+    let unbound = zero_execution_order("30", "NEW", OrderPhase::Live);
+    f.ledger.record_order(&unbound, &unowned(), seen(1)).await.unwrap();
+
+    // The schema can retain an old terminal flag that disagrees with status.
+    let historical = zero_execution_order("35", "PENDING_CANCEL", OrderPhase::Unknown);
+    f.ledger
+        .record_order(&historical, &f.link(LegOrderKind::Sell), seen(1))
+        .await
+        .unwrap();
+    let fabricated = sqlx::query(
+        "UPDATE venue_orders SET phase='terminal', terminal_seen_at=$6
+         WHERE tenant_id=$1 AND venue_id=$2 AND account_scope=$3 AND symbol=$4
+           AND exchange_order_id=$5",
+    )
+    .bind(f.tenant)
+    .bind(s.venue)
+    .bind(s.account)
+    .bind(s.symbol)
+    .bind(&historical.exchange_order_id)
+    .bind(seen(2).at)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fabricated.rows_affected(), 1);
+
+    let named = batch(s, IntentKind::Exit, None);
+    j.commit(&named).await.unwrap();
+    let named_link = linked_sell(&f, &named.intent);
+    let mut named_order = zero_execution_order("40", "PENDING_CANCEL", OrderPhase::Unknown);
+    named_order.client_order_id = named_link.client_order_id.clone();
+    f.ledger.record_order(&named_order, &named_link, seen(1)).await.unwrap();
+
+    let separate_leg = zero_execution_order("60", "NEW", OrderPhase::Live);
+    other
+        .ledger
+        .record_order(&separate_leg, &other.link(LegOrderKind::Sell), seen(1))
+        .await
+        .unwrap();
+    let mut separate_symbol = zero_execution_order("70", "NEW", OrderPhase::Live);
+    separate_symbol.symbol = "ETHUSDT".into();
+    f.ledger.record_order(&separate_symbol, &unowned(), seen(1)).await.unwrap();
+    let mut separate_account = unowned();
+    separate_account.account_scope = "other-account".into();
+    let outside_account = zero_execution_order("80", "NEW", OrderPhase::Live);
+    f.ledger
+        .record_order(&outside_account, &separate_account, seen(1))
+        .await
+        .unwrap();
+
+    let mut frozen = Snapshot::open(&pool, s).await.unwrap();
+    frozen.step().await.unwrap();
+    let late_journal = batch(s, IntentKind::Protection, None);
+    j.commit(&late_journal).await.unwrap();
+    let late_order = zero_execution_order("50", "NEW", OrderPhase::Live);
+    f.ledger
+        .record_order(&late_order, &f.link(LegOrderKind::Sell), seen(3))
+        .await
+        .unwrap();
+
+    let frozen = frozen.finish().await.unwrap();
+    // The J-only projection sees the matched row and none of the orphans.
+    let named_ids: Vec<_> = frozen.rows.iter().filter_map(|row| row.named_id.as_deref()).collect();
+    assert_eq!(named_ids, ["40"]);
+    let named = frozen.rows.iter().find(|row| row.intent_id == named.intent.intent_id).unwrap();
+    assert_eq!(
+        (named.named_phase.as_deref(), named.named_status.as_deref()),
+        (Some("unknown"), Some("PENDING_CANCEL"))
+    );
+    assert!(!named.named_conflict);
+    assert_eq!(
+        complement(&frozen),
+        [
+            ("10", MissingJournal),
+            ("20", MissingJournal),
+            ("30", RouteUnowned),
+            ("35", MissingJournal)
+        ],
+        "J-only observation lost venue orders without an exact journal link"
+    );
+    assert_eq!(frozen.venue_page_lengths, [2, 2, 1]);
+
+    let rows = &frozen.venue_complement;
+    let OrderOwner::Leg { intent_id, .. } = live_link.owner else {
+        unreachable!()
+    };
+    assert_eq!((rows[0].intent_id, rows[0].position_id), (Some(intent_id), Some(f.position)));
+    assert_eq!(
+        (
+            rows[0].tenant_id,
+            rows[0].venue_id.as_str(),
+            rows[0].account_scope.as_str(),
+            rows[0].symbol.as_str(),
+            rows[0].client_order_id.as_str(),
+            rows[0].owner.as_str(),
+            rows[0].kind.as_deref(),
+            rows[0].side.as_str(),
+            rows[0].phase.as_str(),
+            rows[0].status.as_str(),
+            rows[0].terminal
+        ),
+        (
+            f.tenant,
+            s.venue,
+            s.account,
+            s.symbol,
+            "original",
+            "leg",
+            Some("sell"),
+            "SELL",
+            "live",
+            "NEW",
+            false
+        )
+    );
+    assert_eq!((rows[1].phase.as_str(), rows[1].status.as_str()), ("unknown", "PENDING_CANCEL"));
+    assert_eq!(
+        (rows[2].owner.as_str(), rows[2].position_id, rows[2].intent_id),
+        ("discovered", None, None)
+    );
+    assert_eq!(
+        (rows[3].phase.as_str(), rows[3].status.as_str(), rows[3].terminal),
+        ("terminal", "PENDING_CANCEL", true)
+    );
+    assert!(!ids(&frozen).contains(&late_journal.intent.intent_id));
+
+    let fresh = audit(&pool, s).await.unwrap();
+    assert!(ids(&fresh).contains(&late_journal.intent.intent_id));
+    assert_eq!(
+        complement(&fresh),
+        [
+            ("10", MissingJournal),
+            ("20", MissingJournal),
+            ("30", RouteUnowned),
+            ("35", MissingJournal),
+            ("50", MissingJournal)
+        ]
+    );
+    assert_eq!(fresh.venue_page_lengths, [2, 2, 2, 0]);
+    assert!(fresh.version > frozen.version);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn terminal_client_and_kind_conflicts_survive_original_cancel_lookup(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let s = scope(&f);
+    let j = PgJournalBackend::new(&pool, f.tenant);
+    let mut cases = Vec::new();
+    for (id, journal_kind, wrong_client) in [
+        ("100", IntentKind::Exit, false),
+        ("101", IntentKind::Exit, true),
+        ("102", IntentKind::Protection, false),
+    ] {
+        let intent = batch(s, journal_kind, None);
+        j.commit(&intent).await.unwrap();
+        let mut link = linked_sell(&f, &intent.intent);
+        if wrong_client {
+            link.client_order_id = "wrong-native-client-101".into();
+        }
+        let mut observed = zero_execution_order(id, "CANCELED", OrderPhase::Terminal);
+        observed.client_order_id = link.client_order_id.clone();
+        f.ledger.record_order(&observed, &link, seen(1)).await.unwrap();
+
+        let cancel = batch(s, IntentKind::Cancel, Some(id));
+        j.commit(&cancel).await.unwrap();
+        cases.push((
+            id,
+            intent.intent.intent_id,
+            cancel.intent.intent_id,
+            journal_kind,
+            wrong_client,
+        ));
+    }
+
+    let report = audit(&pool, s).await.unwrap();
+    for (id, intent, cancel, journal_kind, wrong_client) in cases {
+        let wrong_kind = journal_kind == IntentKind::Protection;
+        let expected_conflict = wrong_client || wrong_kind;
+        let named = report.rows.iter().find(|row| row.intent_id == intent).unwrap();
+        assert_eq!(named.named_id.as_deref(), Some(id));
+        assert_eq!(named.named_phase.as_deref(), Some("terminal"));
+        assert_eq!(named.named_status.as_deref(), Some("CANCELED"));
+        assert_eq!(named.named_conflict, expected_conflict, "named evidence for {id}");
+
+        let target = report.rows.iter().find(|row| row.intent_id == cancel).unwrap();
+        assert_eq!(
+            (target.original_target.as_deref(), target.target_id.as_deref()),
+            (Some(id), Some(id))
+        );
+        assert_eq!(target.target_phase.as_deref(), Some("terminal"));
+        assert_eq!(target.target_status.as_deref(), Some("CANCELED"));
+        assert_eq!(target.target_conflict, expected_conflict, "cancel target {id}");
+    }
+    assert_eq!(
+        complement(&report),
+        [
+            ("101", VenueLinkage::JournalConflict),
+            ("102", VenueLinkage::JournalConflict)
+        ]
     );
 }
 
