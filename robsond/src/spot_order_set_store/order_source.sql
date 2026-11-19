@@ -36,10 +36,14 @@ WITH gen AS MATERIALIZED (
            CASE WHEN ledger_canonical_id(j.cancels_order_id) THEN j.cancels_order_id END AS j_target,
            l.symbol AS j_leg_symbol
     FROM gen g
-    JOIN public.venue_orders o
-      ON (o.venue_id, o.account_scope, o.symbol, o.exchange_order_id)
-       = (g.venue_id, g.account_scope, $7, $8)
-     AND o.tenant_id = g.tenant_id
+    JOIN LATERAL (
+        SELECT tenant_id, venue_id, account_scope, symbol, exchange_order_id,
+               owner, intent_id, position_id, kind, side, phase, status, client_order_id
+        FROM public.venue_orders
+        WHERE (venue_id, account_scope, symbol, exchange_order_id)
+            = (g.venue_id, g.account_scope, $7, $8)
+        LIMIT 1
+    ) o ON o.tenant_id = g.tenant_id
     LEFT JOIN LATERAL (
         SELECT intent_id, tenant_id, venue_id, account_scope, position_id, client_order_id,
                kind, not_sent, venue_outcome, venue_evidence, cancels_order_id
