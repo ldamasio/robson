@@ -11,6 +11,30 @@ use super::{
     *,
 };
 
+#[path = "schedule_pg_tests.rs"]
+mod schedule;
+
+async fn project_healthy_spot(pool: &PgPool, tenant: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO accounting_state(tenant_id,venue_id,budget_model)
+         VALUES($1,'binance:spot','net_from_start_non_expanding_v1')",
+    )
+    .bind(tenant)
+    .execute(pool)
+    .await?;
+    let projected = sqlx::query(
+        "INSERT INTO spot_intent_clock(attempt_id,intent_id,tenant_id,venue_id,attempt_created_at)
+         SELECT a.attempt_id,i.intent_id,i.tenant_id,i.venue_id,a.created_at
+         FROM submit_attempts a JOIN order_intents i USING(venue_id,account_scope,client_order_id)
+         WHERE i.tenant_id=$1 AND i.venue_id='binance:spot'",
+    )
+    .bind(tenant)
+    .execute(pool)
+    .await?;
+    ensure!(projected.rows_affected() == 2, "both Spot clocks projected through M38");
+    Ok(())
+}
+
 async fn initialize(pool: &PgPool) -> anyhow::Result<()> {
     let setup = Trace::default();
     let clock = NativeClock::initialize()?;
@@ -22,7 +46,7 @@ async fn initialize(pool: &PgPool) -> anyhow::Result<()> {
 }
 
 /// Actual constrained intent/attempt rows only; no clock or charge rows.
-async fn seed(pool: &PgPool, rows: &[(u128, &str)]) -> anyhow::Result<()> {
+async fn seed(pool: &PgPool, rows: &[(u128, &str)]) -> anyhow::Result<Uuid> {
     let tenant = Uuid::now_v7();
     let at = Utc::now();
     for chunk in rows.chunks(1000) {
@@ -38,7 +62,7 @@ async fn seed(pool: &PgPool, rows: &[(u128, &str)]) -> anyhow::Result<()> {
             .bind(&ids).bind(&venues).bind(&clients).bind(at).execute(pool).await?.rows_affected();
         ensure!(written == u64::try_from(chunk.len())?);
     }
-    Ok(())
+    Ok(tenant)
 }
 
 fn envelope() -> anyhow::Result<Envelope> {
@@ -78,8 +102,20 @@ async fn global_checkpoints_advance_once_per_acknowledged_pass(pool: PgPool) -> 
     let primary = tokio::time::timeout(Duration::from_secs(30), async {
         initialize(&pool).await?;
         let (_, prior, generation) = venue(&pool).await?;
-        let source: Vec<_> = (0..2001u128).map(|n| (n, "binance:usdm")).collect();
-        seed(&pool, &source).await?;
+        let source: Vec<_> = (0..2001u128)
+            .map(|n| {
+                (
+                    n,
+                    if n == 4 || n == 1003 {
+                        "binance:spot"
+                    } else {
+                        "binance:usdm"
+                    },
+                )
+            })
+            .collect();
+        let tenant = seed(&pool, &source).await?;
+        project_healthy_spot(&pool, tenant).await?;
         let trace = Trace::default();
         let envelope = envelope()?;
         let audit = Uuid::now_v7();
@@ -127,7 +163,7 @@ async fn global_checkpoints_advance_once_per_acknowledged_pass(pool: PgPool) -> 
         )
         .fetch_one(&pool)
         .await?;
-        ensure!(usdm == 2001, "non-Spot source preserved");
+        ensure!(usdm == 1999, "non-Spot source preserved");
         Ok(())
     })
     .await;
