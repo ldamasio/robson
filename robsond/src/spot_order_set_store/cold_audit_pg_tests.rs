@@ -1039,3 +1039,217 @@ async fn cold_generation_owner_rejects_overwidth_raw_key_before_cursor(pool: PgP
     ));
     Ok(())
 }
+
+use super::super::cold_install::{
+    install, ClosedWriterFence, FencePhase, FenceReceipt, FixtureFenceError, InstallRefusal,
+    Stage as InstallStage,
+};
+
+/// Deterministically drive SQL failure cuts. Authentication and physical
+/// session retirement have their own independently isolated fixture.
+struct FixtureFence {
+    expected: RestoreIdentity,
+    owner: Uuid,
+    refuse: Option<FencePhase>,
+    seen: Vec<FencePhase>,
+}
+impl FixtureFence {
+    fn matching(expected: RestoreIdentity) -> Self {
+        Self {
+            expected,
+            owner: Uuid::now_v7(),
+            refuse: None,
+            seen: Vec::new(),
+        }
+    }
+}
+impl ClosedWriterFence for FixtureFence {
+    async fn check(
+        &mut self,
+        restore: RestoreIdentity,
+        phase: FencePhase,
+        deadline: Instant,
+    ) -> std::result::Result<FenceReceipt, FixtureFenceError> {
+        self.seen.push(phase);
+        if restore != self.expected || self.refuse == Some(phase) || Instant::now() >= deadline {
+            return Err(FixtureFenceError);
+        }
+        Ok(FenceReceipt { restore, owner: self.owner })
+    }
+}
+
+async fn r2_install_fixture(
+    pool: &PgPool,
+) -> Result<(OwnerRequest<'static>, R2PriorBinding, Uuid)> {
+    let tenant = setup(pool).await?;
+    let old = r2_seed_copied_anchor(pool, tenant).await?;
+    let pair = r2_seed_native_edge(pool, tenant, R2NativeEdge::ExactPair).await?;
+    let other = Uuid::now_v7();
+    let inactive = Uuid::now_v7();
+    let sources = [
+        (Uuid::now_v7(), "exit", Some(pair.position), None, false),
+        (Uuid::now_v7(), "protection", Some(other), None, false),
+        (Uuid::now_v7(), "cancel", Some(pair.position), Some(pair.exchange), false),
+        (inactive, "cancel", Some(pair.position), Some("912309"), true),
+        (Uuid::now_v7(), "cancel", Some(pair.position), Some("912310"), false),
+        (Uuid::now_v7(), "cancel", Some(pair.position), Some("00001"), false),
+        (Uuid::now_v7(), "cancel", Some(other), Some("912311"), false),
+        (Uuid::now_v7(), "cancel", Some(other), None, true),
+    ];
+    for (id, kind, position, target, not_sent) in sources {
+        sqlx::query(
+            "INSERT INTO public.order_intents
+              (intent_id,tenant_id,venue_id,account_scope,client_order_id,position_id,kind,cancels_order_id,
+               params,created_at,not_sent)
+             VALUES($1,$2,'binance:spot',$3,$1::uuid::text,$4,$5,$6,'{}',now(),$7)",
+        ).bind(id).bind(tenant).bind(SCOPE).bind(position).bind(kind).bind(target)
+            .bind(not_sent).execute(pool).await?;
+    }
+    sqlx::query(
+       "INSERT INTO public.venue_orders
+        (tenant_id,venue_id,account_scope,symbol,exchange_order_id,client_order_id,last_client_order_id,
+         owner,side,order_type,orig_qty,status,phase,last_checked_at,live_seen_at)
+        VALUES ($1,'binance:spot',$2,'BTCUSDT','912312','r2-independent-native-sell',
+          'r2-independent-native-sell','discovered','SELL','LIMIT',1,'NEW','live',now(),now())"
+    ).bind(tenant).bind(SCOPE).execute(pool).await?;
+    let version:i64=sqlx::query_scalar("SELECT version FROM public.accounting_state WHERE tenant_id=$1 AND venue_id='binance:spot'")
+        .bind(tenant).fetch_one(pool).await?;
+    Ok((r2_request(tenant, old.current_epoch, version, R2_UID), old.prior, inactive))
+}
+
+const R2_LEAVES: [&str; 10] = [
+    "sell_intents",
+    "sell_orders",
+    "sell_legs",
+    "sell_symbols",
+    "sell_unbound",
+    "cancel_members",
+    "cancel_groups",
+    "cancel_legs",
+    "cancel_unbound",
+    "cancel_ungroupable",
+];
+
+async fn r2_leaf_counts(pool: &PgPool, tenant: Uuid, generation: Option<Uuid>) -> Result<Vec<i64>> {
+    let mut counts = Vec::with_capacity(R2_LEAVES.len());
+    for leaf in R2_LEAVES {
+        let sql=format!(
+         "SELECT count(*) FROM public.spot_order_set_{leaf} WHERE tenant_id=$1
+          AND venue_id='binance:spot' AND account_scope=$2 AND ($3::uuid IS NULL OR generation_id=$3)");
+        counts.push(
+            sqlx::query_scalar(&sql)
+                .bind(tenant)
+                .bind(SCOPE)
+                .bind(generation)
+                .fetch_one(pool)
+                .await?,
+        );
+    }
+    Ok(counts)
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_install_publishes_ten_complete_leaf_sets(pool: PgPool) -> Result<()> {
+    let (request, old, inactive) = r2_install_fixture(&pool).await?;
+    let cut = capture(&pool, &request, deadline())
+        .await
+        .map_err(|e| anyhow!("owner cut: {e:?}"))?;
+    ensure!(cut.anchor.prior == Some(r2_prior(old)) && cut.receipt.statements == 11);
+    let mut fence = FixtureFence::matching(request.restore);
+    let installed = install(&pool, &cut, &mut fence, deadline())
+        .await
+        .map_err(|e| anyhow!("local install: {e:?}"))?;
+    ensure!(
+        fence.seen
+            == [
+                FencePhase::BeforeRead,
+                FencePhase::BeforePublish,
+                FencePhase::AfterReadback
+            ]
+    );
+    let g = &installed.generation;
+    ensure!(
+        installed.restore == request.restore
+            && installed.accounting_version == request.accounting_version
+            && g.generation_id != old.0
+            && g.source_audit_id != old.2
+            && g.process_epoch == request.epoch
+    );
+    ensure!(
+        r2_leaf_counts(&pool, g.tenant_id, Some(g.generation_id)).await?
+            == [2, 1, 1, 1, 1, 6, 3, 1, 1, 1]
+    );
+    let marker:(bool,i64)=sqlx::query_as(
+       "SELECT position_hints_complete,accounting_version FROM public.spot_order_set_generation WHERE generation_id=$1"
+    ).bind(g.generation_id).fetch_one(&pool).await?;
+    ensure!(marker == (true, request.accounting_version));
+    let zero: (i64, i64, bool) = sqlx::query_as(
+        "SELECT pending_count,conflict_count,terminal_mask FROM public.spot_order_set_cancel_groups
+        WHERE generation_id=$1 AND target_id='912309'",
+    )
+    .bind(g.generation_id)
+    .fetch_one(&pool)
+    .await?;
+    ensure!(zero == (0, 0, false));
+    let exact:(Option<Uuid>,Option<Uuid>,bool,bool)=sqlx::query_as(
+       "SELECT source_position,position_id,pending,conflict FROM public.spot_order_set_cancel_members
+        WHERE generation_id=$1 AND intent_id=$2"
+    ).bind(g.generation_id).bind(inactive).fetch_one(&pool).await?;
+    ensure!(exact.0 == exact.1 && exact.0.is_some() && !exact.2 && !exact.3);
+    let mask:bool=sqlx::query_scalar(
+       "SELECT terminal_mask FROM public.spot_order_set_cancel_groups WHERE generation_id=$1 AND target_id='912304'"
+    ).bind(g.generation_id).fetch_one(&pool).await?;
+    ensure!(mask);
+    ensure!(matches!(
+        install(&pool, &cut, &mut fence, deadline()).await,
+        Err(InstallRefusal::AnchorChanged)
+    ));
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_install_blocked_before_publish_rolls_back_every_leaf(
+    pool: PgPool,
+) -> Result<()> {
+    let (request, old, _) = r2_install_fixture(&pool).await?;
+    let cut = capture(&pool, &request, deadline())
+        .await
+        .map_err(|e| anyhow!("owner cut: {e:?}"))?;
+    let mut fence = FixtureFence::matching(request.restore);
+    fence.refuse = Some(FencePhase::BeforePublish);
+    ensure!(matches!(
+        install(&pool, &cut, &mut fence, deadline()).await,
+        Err(InstallRefusal::FixtureFence(InstallStage::Publish))
+    ));
+    let prior:bool=sqlx::query_scalar(
+         "SELECT EXISTS(SELECT 1 FROM spot_order_set_generation WHERE generation_id=$1 AND NOT position_hints_complete)")
+        .bind(old.0).fetch_one(&pool).await?;
+    ensure!(prior && r2_leaf_counts(&pool, request.scope.tenant_id, None).await? == [0; 10]);
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_install_refuses_missing_physical_leaf_write(pool: PgPool) -> Result<()> {
+    let (request, old, _) = r2_install_fixture(&pool).await?;
+    let cut = capture(&pool, &request, deadline())
+        .await
+        .map_err(|e| anyhow!("owner cut: {e:?}"))?;
+    sqlx::raw_sql("CREATE FUNCTION suppress_one_cancel_leaf() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RETURN NULL; END $$;
+        CREATE TRIGGER suppress_one_cancel_leaf BEFORE INSERT ON public.spot_order_set_cancel_members
+        FOR EACH ROW WHEN (NEW.source_position IS NOT NULL) EXECUTE FUNCTION suppress_one_cancel_leaf()")
+        .execute(&pool).await?;
+    let mut fence = FixtureFence::matching(request.restore);
+    ensure!(matches!(
+        install(&pool, &cut, &mut fence, deadline()).await,
+        Err(InstallRefusal::Leaves(_))
+    ));
+    let prior:bool=sqlx::query_scalar(
+         "SELECT EXISTS(SELECT 1 FROM spot_order_set_generation WHERE generation_id=$1 AND NOT position_hints_complete)")
+        .bind(old.0).fetch_one(&pool).await?;
+    ensure!(prior && r2_leaf_counts(&pool, request.scope.tenant_id, None).await? == [0; 10]);
+    Ok(())
+}

@@ -6,6 +6,8 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 mod cold_audit;
+#[cfg(test)]
+mod cold_install;
 mod cold_owner;
 mod cold_source;
 pub(crate) mod warm;
