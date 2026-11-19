@@ -5,6 +5,8 @@
 
 use std::{
     fmt::Write,
+    process::Stdio,
+    str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -18,11 +20,16 @@ use robson_exec::{
     venue_clock::{NativeClock, TickCapture},
 };
 use robson_testkit::{daemon_process::database_url_through, db_proxy::DbProxy};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use sqlx::{
+    postgres::{PgConnectOptions, PgPoolOptions},
+    PgPool, Row,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    process::Command,
     task::JoinHandle,
     time::{sleep, timeout, timeout_at, Instant},
 };
@@ -37,7 +44,10 @@ use crate::{
     venue_clock_store::ClockSampleStore,
 };
 
-use super::super::{ClaimIdentity, ClaimResult, FrequencyKey, PriorClaim, PriorEligibility, Trace};
+use super::super::{
+    cold_load::{self, fixture_manifest, ReceiptState, Registration},
+    ClaimIdentity, ClaimResult, FrequencyKey, PriorClaim, PriorEligibility, Trace,
+};
 use super::{
     content_digest, CommissionOwner, CostIdentity, RefreshOutcome, VerifiedCommissionAccount,
     WIRE_LIMIT,
@@ -303,22 +313,40 @@ async fn seed_history(
     )
     .context("fixture prior wall instant")?;
     let initialization_id = Uuid::now_v7();
+    let registered_at = DateTime::<Utc>::from_timestamp_micros(Utc::now().timestamp_micros())
+        .context("fixture registration instant")?;
+    let provenance = "loopback-fixture";
+    let mut registrations = [NO_CLOCK_PAIR, PAIR, REDIRECT_PAIR].map(|pair| Registration {
+        venue_id: VenueId::BINANCE_SPOT.to_owned(),
+        symbol: pair.to_owned(),
+        descriptor: "commission".to_owned(),
+        key_registry: 1,
+        registration_id: Uuid::now_v7(),
+        registered_revision: 1,
+        registered_at,
+        provenance: provenance.to_owned(),
+    });
+    let digest = fixture_manifest(&mut registrations);
     sqlx::query(
         "INSERT INTO n5_registry_root VALUES
            (1, 38, 1, 1, true, 3, $1, $2, 0, 'normal', NULL, CURRENT_TIMESTAMP)",
     )
-    .bind([0x35_u8; 32].as_slice())
+    .bind(digest.as_slice())
     .bind(initialization_id)
     .execute(pool)
     .await?;
 
     let mut histories = Vec::new();
     for pair in [NO_CLOCK_PAIR, PAIR, REDIRECT_PAIR] {
+        let registration = registrations
+            .iter()
+            .find(|entry| entry.symbol == pair)
+            .context("fixture registration")?;
         let key = FrequencyKey {
             symbol: pair.to_owned(),
             initialization_id,
             recovery_generation: 0,
-            registration_id: Uuid::now_v7(),
+            registration_id: registration.registration_id,
         };
         let prior = PriorClaim {
             revision: 2,
@@ -335,10 +363,12 @@ async fn seed_history(
         };
         sqlx::query(
             "INSERT INTO n5_refresh_keys VALUES
-               ('binance:spot', $1, 'commission', 1, $2, 1, CURRENT_TIMESTAMP, 'loopback-fixture')",
+               ('binance:spot', $1, 'commission', 1, $2, 1, $3, $4)",
         )
         .bind(&key.symbol)
         .bind(key.registration_id)
+        .bind(registered_at)
+        .bind(provenance)
         .execute(pool)
         .await?;
         sqlx::query(
@@ -369,6 +399,7 @@ async fn seed_history(
 
 async fn count_store_wire(
     pool: &PgPool,
+    base_url: &str,
     owner: &mut CommissionOwner<'_>,
     key: FrequencyKey,
     prior: PriorClaim,
@@ -385,7 +416,7 @@ async fn count_store_wire(
     proxy.enable_query_trace(32);
     proxy.enable_diagnostics();
     let url = database_url_through(
-        &std::env::var("DATABASE_URL")?,
+        base_url,
         proxy.addr(),
         options.get_database().context("macro database name")?,
     )?;
@@ -488,7 +519,7 @@ async fn verify_persisted_success(
     epoch: Epoch,
     native: &NativeClock,
     signer_binding: Uuid,
-) -> anyhow::Result<i64> {
+) -> anyhow::Result<ReadReport> {
     let row = sqlx::query(
         "SELECT revision, claim_id, owner_process, content_digest, claim_audit_at,
                 result_class, snapshot_claim_id, snapshot_revision, snapshot_owner,
@@ -564,12 +595,107 @@ async fn verify_persisted_success(
     let evidence = exact.cost_candidate(expected.clone(), stored_as_of)?;
     ensure!(row.try_get::<Vec<u8>, _>("snapshot_hash")? == evidence.evidence().hash().as_slice());
     let audit: DateTime<Utc> = row.try_get("claim_audit_at")?;
-    Ok(audit.timestamp_millis())
+    Ok(ReadReport {
+        pid: std::process::id(),
+        age_ns: now.nanoseconds() - r,
+        receipt: ObservedReceipt {
+            claim: row.try_get("claim_id")?,
+            revision: 3,
+            owner: epoch.epoch_id,
+            claim_digest: content_digest(expected, signer_binding, PAIR),
+            audit_at: audit,
+            claim_tick: c,
+            handoff_tick: h,
+            boot: domain.boot(),
+            offset_seconds,
+            offset_ns,
+            original_before_ns: r,
+            original_after_ns: after,
+            wall_seconds,
+            wall_ns: u32::try_from(wall_ns)?,
+            as_of: stored_as_of,
+            evidence_hash: *evidence.evidence().hash(),
+            payload_digest: Sha256::digest(payload).into(),
+        },
+    })
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ObservedReceipt {
+    claim: Uuid,
+    revision: i64,
+    owner: Uuid,
+    claim_digest: [u8; 32],
+    audit_at: DateTime<Utc>,
+    claim_tick: u128,
+    handoff_tick: u128,
+    boot: Uuid,
+    offset_seconds: i64,
+    offset_ns: u32,
+    original_before_ns: u128,
+    original_after_ns: u128,
+    wall_seconds: i64,
+    wall_ns: u32,
+    as_of: DateTime<Utc>,
+    evidence_hash: [u8; 32],
+    payload_digest: [u8; 32],
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ReadReport {
+    pid: u32,
+    age_ns: u128,
+    receipt: ObservedReceipt,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WriteReport {
+    tenant: Uuid,
+    committed: ReadReport,
 }
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires disposable loopback PostgreSQL and isolated native BOOTTIME >=25h"]
 async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::Result<()> {
+    let options = pool.connect_options();
+    let database = options.get_database().context("macro database name")?;
+    let upstream = tokio::net::lookup_host((options.get_host(), options.get_port()))
+        .await?
+        .next()
+        .context("fixture PostgreSQL endpoint")?;
+    ensure!(upstream.ip().is_loopback(), "local PostgreSQL fixture");
+    let base_url = std::env::var("DATABASE_URL")?;
+    let writer_url = database_url_through(&base_url, upstream, database)?;
+    let (writer_pid, writer): (_, WriteReport) =
+        run_child("writer", WRITER_MARK, &writer_url, None, Duration::from_secs(120)).await?;
+    ensure!(writer_pid == writer.committed.pid);
+    wait_child_sessions(&pool, "robson-n5-writer").await?;
+    eprintln!("N5_NATIVE_LOOPBACK time=1 success=1 redirect=1 no_c8=0 stale_claim=0 sql=8,8,3,8");
+
+    let proxy = DbProxy::start(upstream).await?;
+    proxy.enable_exact_query_trace(4);
+    proxy.enable_diagnostics();
+    let reader_url = database_url_through(&base_url, proxy.addr(), database)?;
+    let (reader_pid, reader): (_, ReadReport) =
+        run_child("reader", READER_MARK, &reader_url, Some(writer.tenant), Duration::from_secs(10))
+            .await?;
+    ensure!(reader_pid == reader.pid && reader_pid != writer_pid);
+    ensure!(reader.receipt == writer.committed.receipt, "original committed receipt");
+    ensure!(reader.age_ns > writer.committed.age_ns, "original response aged across restart");
+    wait_child_sessions(&pool, "robson-n5-reader").await?;
+    let stats = proxy.stats();
+    ensure!(stats.connections == 1 && stats.statements == 1 && stats.commits == 0);
+    ensure!(proxy.query_trace_dropped() == 0 && proxy.query_trace().len() == 1);
+    ensure!(proxy.query_trace()[0].contains("LIMIT 4097"));
+    let result_bytes = proxy.data_row_bytes();
+    let response_bytes = proxy.query_response_bytes();
+    ensure!(proxy.data_rows() == 3 && result_bytes > 0 && result_bytes < response_bytes);
+    ensure!(response_bytes <= 8 * 1024 * 1024);
+    eprintln!("N5_NATIVE_RESTART writer_pid={writer_pid} writer_exit=0 reader_pid={reader_pid} reader_exit=0 sql=1 rows=3 data_row_wire_bytes={result_bytes} total_response_bytes={response_bytes} reader_http=0 age_advanced=true");
+    Ok(())
+}
+
+async fn signed_writer(pool: PgPool, base_url: &str) -> anyhow::Result<WriteReport> {
     let clock = Arc::new(NativeClock::initialize()?);
     let tenant = Uuid::now_v7();
     let init = venue_budget::fixture::prepare(
@@ -679,6 +805,7 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
 
     count_store_wire(
         &pool,
+        base_url,
         &mut CommissionOwner {
             clock: &owner,
             account: verified
@@ -719,6 +846,7 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
     };
     count_store_wire(
         &pool,
+        base_url,
         &mut commission,
         success.clone(),
         success_prior.clone(),
@@ -726,11 +854,12 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
         2,
     )
     .await?;
-    let claim_wall_ms =
+    let committed =
         verify_persisted_success(&pool, &expected, start.epoch, &clock, signer_binding).await?;
     ensure!(budget.handoffs() == Ok(2) && wire.count()? == 3, "one signed commission");
     count_store_wire(
         &pool,
+        base_url,
         &mut commission,
         success,
         success_prior,
@@ -745,6 +874,7 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
 
     count_store_wire(
         &pool,
+        base_url,
         &mut CommissionOwner {
             clock: &owner,
             account: verified
@@ -768,9 +898,152 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
     };
     ensure!(pair == PAIR && declined == REDIRECT_PAIR);
     ensure!(
-        claim_wall_ms <= *signed_ms && *signed_ms <= *arrived_ms,
+        committed.receipt.audit_at.timestamp_millis() <= *signed_ms && *signed_ms <= *arrived_ms,
         "signed timestamp is original bounded millisecond wall time"
     );
-    eprintln!("N5_NATIVE_LOOPBACK time=1 success=1 redirect=1 no_c8=0 stale_claim=0 sql=8,8,3,8");
-    Ok(())
+    pool.close().await;
+    Ok(WriteReport { tenant, committed })
+}
+
+const WRITER_MARK: &str = "N5_RESTART_WRITER=";
+const READER_MARK: &str = "N5_RESTART_READER=";
+const ROLE_VAR: &str = "ROBSON_TEST_N5_RESTART_ROLE";
+const URL_VAR: &str = "ROBSON_TEST_N5_RESTART_URL";
+const TENANT_VAR: &str = "ROBSON_TEST_N5_RESTART_TENANT";
+
+async fn run_child<T: DeserializeOwned>(
+    role: &str,
+    marker: &str,
+    url: &str,
+    tenant: Option<Uuid>,
+    limit: Duration,
+) -> anyhow::Result<(u32, T)> {
+    let (_, module) = module_path!().split_once("::").context("libtest module")?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args([
+            "--exact",
+            &format!("{module}::n5_restart_participant"),
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env_clear()
+        .env("RUST_MIN_STACK", "1048576")
+        .env(ROLE_VAR, role)
+        .env(URL_VAR, url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(tenant) = tenant {
+        command.env(TENANT_VAR, tenant.to_string());
+    }
+    let child = command.spawn()?;
+    let pid = child.id().context("child pid")?;
+    let output = timeout(limit, child.wait_with_output()).await.context("bounded N5 child")??;
+    ensure!(output.status.success(), "N5 {role} child exit {}", output.status);
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut reports = stdout.lines().filter_map(|line| line.strip_prefix(marker));
+    let (Some(report), None) = (reports.next(), reports.next()) else {
+        return Err(anyhow!("expected exactly one N5 {role} report"));
+    };
+    ensure!(pid != std::process::id());
+    Ok((pid, serde_json::from_str(report)?))
+}
+
+async fn wait_child_sessions(pool: &PgPool, application: &str) -> anyhow::Result<()> {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND application_name = $1",
+            )
+            .bind(application)
+            .fetch_one(pool)
+            .await?;
+            if count == 0 {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .context("native child PostgreSQL sessions retired")?
+}
+
+#[test]
+fn n5_restart_participant() -> anyhow::Result<()> {
+    let Ok(role) = std::env::var(ROLE_VAR) else {
+        return Ok(());
+    };
+    ensure!(matches!(role.as_str(), "writer" | "reader"));
+    let url = std::env::var(URL_VAR)?;
+    let options = PgConnectOptions::from_str(&url)
+        .map_err(|_| anyhow!("fixture PostgreSQL connection options"))?
+        .application_name(&format!("robson-n5-{role}"));
+    // The parent creates the migrated SQLx database. Children can only connect.
+    ensure!(options.get_host().parse::<std::net::IpAddr>()?.is_loopback());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let pool = PgPoolOptions::new().connect_lazy_with(options);
+            if role == "writer" {
+                let report = signed_writer(pool, &url).await?;
+                println!("\n{WRITER_MARK}{}", serde_json::to_string(&report)?);
+            } else {
+                let tenant = std::env::var(TENANT_VAR)?.parse::<Uuid>()?;
+                let report = read_committed(&pool, tenant).await?;
+                pool.close().await;
+                println!("\n{READER_MARK}{}", serde_json::to_string(&report)?);
+            }
+            Ok(())
+        })
+}
+
+async fn read_committed(pool: &PgPool, tenant: Uuid) -> anyhow::Result<ReadReport> {
+    let clock = NativeClock::initialize()?;
+    let trace = Trace::default();
+    let entries = cold_load::load(
+        pool,
+        &[account(tenant, PAIR)?],
+        &clock,
+        Instant::now() + Duration::from_secs(2),
+        &trace,
+    )
+    .await
+    .map_err(|error| anyhow!("bounded N5 read: {error:?}"))?;
+    let [entry] = entries.as_slice() else {
+        return Err(anyhow!("expected one configured key"));
+    };
+    ensure!(trace.issued() == 1 && entry.key.symbol == PAIR && entry.key.recovery_generation == 0);
+    let prior = entry.prior.as_ref().context("committed prior identity")?;
+    let ReceiptState::Current(receipt) = &entry.receipt else {
+        return Err(anyhow!("committed current receipt"));
+    };
+    let mark = receipt.original;
+    let (offset_seconds, offset_ns) = mark.domain.offset();
+    Ok(ReadReport {
+        pid: std::process::id(),
+        age_ns: receipt.age.as_nanos(),
+        receipt: ObservedReceipt {
+            claim: prior.identity.claim_id,
+            revision: prior.revision,
+            owner: prior.identity.owner,
+            claim_digest: prior.identity.digest,
+            audit_at: prior.identity.audit_at,
+            claim_tick: prior.identity.captured.nanoseconds(),
+            handoff_tick: prior.handoff.context("committed handoff")?.nanoseconds(),
+            boot: mark.domain.boot(),
+            offset_seconds,
+            offset_ns,
+            original_before_ns: u128::try_from(mark.before_ns)?,
+            original_after_ns: u128::try_from(mark.after_ns)?,
+            wall_seconds: mark.wall_seconds,
+            wall_ns: mark.wall_nanoseconds,
+            as_of: receipt.evidence.as_of(),
+            evidence_hash: *receipt.evidence.hash(),
+            payload_digest: receipt.payload_digest,
+        },
+    })
 }

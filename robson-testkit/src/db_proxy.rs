@@ -111,6 +111,9 @@ struct Counters {
     prepared_statement_parses: AtomicU64,
     autocommit_acks_dropped: AtomicU64,
     simple_in_transaction_acks_dropped: AtomicU64,
+    data_rows: AtomicU64,
+    data_row_bytes: AtomicU64,
+    query_response_bytes: AtomicU64,
 }
 
 /// Optional test SQL only: never startup/authentication or bound parameter
@@ -547,6 +550,22 @@ impl DbProxy {
     pub fn closed_relays(&self) -> u64 {
         self.shared.counters.closed_relays.load(Ordering::Acquire)
     }
+
+    /// Observed PostgreSQL DataRow frames, including message framing bytes.
+    pub fn data_rows(&self) -> u64 {
+        self.shared.counters.data_rows.load(Ordering::Acquire)
+    }
+
+    pub fn data_row_bytes(&self) -> u64 {
+        self.shared.counters.data_row_bytes.load(Ordering::Acquire)
+    }
+
+    /// Observed server protocol bytes after startup, including row descriptions
+    /// and completion. For a fresh proxy serving one query this bounds its
+    /// entire response. No packet contents are retained by this counter.
+    pub fn query_response_bytes(&self) -> u64 {
+        self.shared.counters.query_response_bytes.load(Ordering::Acquire)
+    }
 }
 
 async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
@@ -766,6 +785,14 @@ async fn backend_to_frontend(
     };
     loop {
         let (tag, body) = frames.read(server, false).await?;
+        if !startup {
+            let frame_bytes = (body.len() + 5) as u64;
+            shared.counters.query_response_bytes.fetch_add(frame_bytes, Ordering::Relaxed);
+            if tag == b'D' {
+                shared.counters.data_rows.fetch_add(1, Ordering::Relaxed);
+                shared.counters.data_row_bytes.fetch_add(frame_bytes, Ordering::Relaxed);
+            }
+        }
         let record = diagnostic.and_then(|trace| trace.backend(tag, &body));
         let mark = |record, delivery| {
             if let (Some(trace), Some(record)) = (diagnostic, record) {
@@ -1117,12 +1144,15 @@ mod tests {
             assert_eq!(received.recv().await.unwrap(), b"INSERT\0".to_vec());
             assert_eq!(received.recv().await.unwrap(), b"COMMIT\0".to_vec());
             assert!(read_reply(&mut client).await.is_err());
-            assert_eq!(proxy.stats(), ProxyStats {
-                connections: 1,
-                commits: 1,
-                commit_acks_dropped: 1,
-                statements: 2,
-            });
+            assert_eq!(
+                proxy.stats(),
+                ProxyStats {
+                    connections: 1,
+                    commits: 1,
+                    commit_acks_dropped: 1,
+                    statements: 2,
+                }
+            );
             assert_eq!(proxy.mode(), ProxyMode::Pass);
         })
         .await;
@@ -1221,9 +1251,11 @@ mod tests {
             // Default mode still trims, and forwarded bytes never change.
             for (exact, bodies, trace) in [
                 (false, vec![b" SELECT 4; \0".as_slice()], vec!["SELECT 4"]),
-                (true, vec![b" SELECT 5; \0".as_slice(), b"SELECT 6\0x\0".as_slice()], vec![
-                    " SELECT 5; ",
-                ]),
+                (
+                    true,
+                    vec![b" SELECT 5; \0".as_slice(), b"SELECT 6\0x\0".as_slice()],
+                    vec![" SELECT 5; "],
+                ),
             ] {
                 if exact {
                     proxy.enable_exact_query_trace(2);
@@ -1516,10 +1548,12 @@ mod simple_in_transaction_ack_tests {
                 assert_eq!(proxy.simple_in_transaction_acks_dropped(), 0, "{reply:?}");
                 assert_eq!(proxy.mode(), ARMED, "{reply:?}");
                 // The relay stays open and keeps passing.
-                exchange(&mut client, &mut server, &[(b'Q', b"SELECT 1\0")], &[
-                    (b'C', b"SELECT 1\0"),
-                    (b'Z', b"T"),
-                ])
+                exchange(
+                    &mut client,
+                    &mut server,
+                    &[(b'Q', b"SELECT 1\0")],
+                    &[(b'C', b"SELECT 1\0"), (b'Z', b"T")],
+                )
                 .await;
             }
         })
@@ -1608,10 +1642,12 @@ mod simple_in_transaction_ack_tests {
             }
             assert_eq!(proxy.simple_in_transaction_acks_dropped(), 1);
             for (client, server) in [&mut autocommit, &mut failing, &mut late] {
-                exchange(client, server, &[(b'Q', b"SELECT 1\0")], &[
-                    (b'C', b"SELECT 1\0"),
-                    (b'Z', b"I"),
-                ])
+                exchange(
+                    client,
+                    server,
+                    &[(b'Q', b"SELECT 1\0")],
+                    &[(b'C', b"SELECT 1\0"), (b'Z', b"I")],
+                )
                 .await;
             }
         })
