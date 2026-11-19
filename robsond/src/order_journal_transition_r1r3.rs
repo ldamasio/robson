@@ -909,7 +909,9 @@ async fn local_r1_r3_snapshot_is_bound_to_its_read_and_version(pool: PgPool) -> 
 
     // The original client must physically retire after a read deadline even
     // when the transport remains connected and has no response to forward.
-    let silent = Wire::new(&pool, leg.tenant).await?;
+    // The connection is already established. Skip the idle health check in
+    // this fixture so the fault strikes the read, not the earlier Pool acquire.
+    let silent = Wire::with_idle_health_check(&pool, leg.tenant, false).await?;
     silent.proxy.set_mode(ProxyMode::Blackhole);
     let started = tokio::time::Instant::now();
     let refused =

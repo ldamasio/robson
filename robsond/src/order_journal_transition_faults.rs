@@ -66,6 +66,14 @@ pub(super) struct Wire {
 
 impl Wire {
     pub(super) async fn new(pool: &PgPool, tenant: Uuid) -> Result<Self> {
+        Self::with_idle_health_check(pool, tenant, true).await
+    }
+
+    pub(super) async fn with_idle_health_check(
+        pool: &PgPool,
+        tenant: Uuid,
+        check_idle: bool,
+    ) -> Result<Self> {
         let options = pool.connect_options();
         let upstream = tokio::net::lookup_host((options.get_host(), options.get_port()))
             .await?
@@ -76,6 +84,7 @@ impl Wire {
         let test_pool = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(super::super::JOURNAL_ACQUIRE_BOUND)
+            .test_before_acquire(check_idle)
             .connect_with(
                 options
                     .as_ref()
