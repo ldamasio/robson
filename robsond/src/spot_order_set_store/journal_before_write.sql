@@ -1,7 +1,9 @@
 -- Both this read and the ordinary upsert use the same command snapshot.
 -- Match the activity rule in journal_unbound.sql before changing the source.
 WITH prior_member AS MATERIALIZED (
-    SELECT j.intent_id
+    SELECT j.intent_id,
+           (j.not_sent AND NOT (j.venue_outcome IS NULL AND j.venue_evidence IS NULL))
+               OR j.venue_outcome IS NOT DISTINCT FROM 'rejected' AS conflict
     FROM public.order_intents j
     WHERE (j.intent_id, j.tenant_id, j.venue_id, j.account_scope, j.client_order_id)
         = ($1, $2, $3, $4, $5)

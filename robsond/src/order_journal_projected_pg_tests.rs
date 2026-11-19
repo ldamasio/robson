@@ -712,3 +712,6 @@ async fn persisted_order_set_journal_old_writer_refuses_after_same_version_nativ
 
 #[path = "order_journal_entry_pg_tests.rs"]
 mod entry;
+
+#[path = "order_journal_bound_sell_pg_tests.rs"]
+mod bound_sell;

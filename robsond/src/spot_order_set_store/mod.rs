@@ -38,8 +38,9 @@ pub(crate) const JOURNAL_ENTRY: &str = include_str!("journal_entry.sql");
 /// snapshot, typed by the opted route it belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JournalPrior {
-    /// Unbound SELL activity, as journal_before_write.sql reads it.
-    Sell { member_expected: bool },
+    /// Leg-bound or unbound SELL activity, as journal_before_write.sql reads
+    /// it. Conflict implies potential; neither expects no active member.
+    Sell { potential: bool, conflict: bool },
     /// One preexisting grouped cancel, as journal_cancel_before_write.sql
     /// reads it. Absent J is a fresh intent and refuses.
     Cancel { pending: bool, conflict: bool },
@@ -111,13 +112,16 @@ pub(crate) async fn maintain_cancel_outcome(
 
 /// One statement on the caller's transaction, after its original intent and
 /// attempt effects and under its accounting lock. `version` is the one that
-/// transaction's accounting write returned. No row is a refusal.
+/// transaction's accounting write returned. No row is a refusal. A J with
+/// an actual scoped leg maintains that leg's bucket; one naming a native
+/// order refuses.
 pub(crate) async fn maintain_unbound_journal(
     connection: &mut PgConnection,
     generation: &JournalGeneration,
     version: i64,
     intent: &IntentRow,
-    prior_member_expected: bool,
+    prior_potential: bool,
+    prior_conflict: bool,
 ) -> Result<Option<i64>, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(JOURNAL_UNBOUND)
         .bind(generation.tenant_id)
@@ -130,7 +134,8 @@ pub(crate) async fn maintain_unbound_journal(
         .bind(&intent.client_order_id)
         .bind(intent.position_id)
         .bind(intent.kind.as_str())
-        .bind(prior_member_expected)
+        .bind(prior_potential)
+        .bind(prior_conflict)
         .fetch_optional(connection)
         .instrument(
             tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),

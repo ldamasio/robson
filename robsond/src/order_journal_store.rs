@@ -206,13 +206,17 @@ impl PgJournalBackend {
         bound: Duration,
     ) -> Result<(), CommitFailure> {
         let maintained = match (&batch.intent.kind, prior) {
-            (IntentKind::Protection | IntentKind::Exit, JournalPrior::Sell { member_expected }) => {
+            (
+                IntentKind::Protection | IntentKind::Exit,
+                JournalPrior::Sell { potential, conflict },
+            ) => {
                 maintain_unbound_journal(
                     &mut **tx,
                     generation,
                     version,
                     &batch.intent,
-                    member_expected,
+                    potential,
+                    conflict,
                 )
                 .await
             },
@@ -350,8 +354,9 @@ impl PgJournalBackend {
             let before = include_str!("spot_order_set_store/journal_before_write.sql");
             projected_intent = format!(
                 "{before}, written AS ({ordinary_intent})
-                 SELECT written.intent_id, EXISTS (SELECT 1 FROM prior_member) AS prior_member_expected
-                 FROM written"
+                 SELECT written.intent_id, prior_member.intent_id IS NOT NULL AS prior_potential,
+                        coalesce(prior_member.conflict, false) AS prior_conflict
+                 FROM written LEFT JOIN prior_member ON true"
             );
             projected_intent.as_str()
         } else {
@@ -404,11 +409,13 @@ impl PgJournalBackend {
                 ));
             }
             JournalPrior::Entry { birth }
-        } else {
+        } else if projected {
             JournalPrior::Sell {
-                member_expected: projected
-                    && written.try_get("prior_member_expected").map_err(known)?,
+                potential: written.try_get("prior_potential").map_err(known)?,
+                conflict: written.try_get("prior_conflict").map_err(known)?,
             }
+        } else {
+            JournalPrior::Sell { potential: false, conflict: false }
         };
 
         if !batch.attempts.is_empty() {
