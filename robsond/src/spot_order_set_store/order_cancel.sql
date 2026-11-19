@@ -13,9 +13,12 @@
            m.symbol AS s_symbol, m.position_id AS s_position, m.target_id AS s_target,
            coalesce(m.pending, false) AS s_pending, coalesce(m.conflict, false) AS s_conflict
     FROM links c
-    LEFT JOIN public.spot_order_set_cancel_members m
-      ON (m.tenant_id, m.venue_id, m.account_scope, m.generation_id, m.intent_id)
-       = (c.tenant_id, c.venue_id, c.account_scope, c.generation_id, c.intent_id)
+    LEFT JOIN LATERAL (
+        SELECT intent_id, symbol, position_id, target_id, pending, conflict FROM public.spot_order_set_cancel_members
+        WHERE (tenant_id, venue_id, account_scope, generation_id, intent_id)
+            = (c.tenant_id, c.venue_id, c.account_scope, c.generation_id, c.intent_id)
+        LIMIT 1
+    ) m ON true
     WHERE c.owner = 'leg' AND c.has_j AND c.j_kind = 'cancel'
 ), cancel_member_plan AS MATERIALIZED (
     -- This native row names the cancel: pending and conflict for that J only.
@@ -58,9 +61,12 @@
            coalesce(d.mask_next, p.terminal_mask, false) AS final_mask
     FROM cancel_group_moves d
     CROSS JOIN gen g
-    LEFT JOIN public.spot_order_set_cancel_groups p
-      ON (p.tenant_id, p.venue_id, p.account_scope, p.generation_id, p.symbol, p.position_id, p.target_id)
-       = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.symbol, d.position_id, d.target_id)
+    LEFT JOIN LATERAL (
+        SELECT target_id, pending_count, conflict_count, terminal_mask FROM public.spot_order_set_cancel_groups
+        WHERE (tenant_id, venue_id, account_scope, generation_id, symbol, position_id, target_id)
+            = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.symbol, d.position_id, d.target_id)
+        LIMIT 1
+    ) p ON true
 ), cancel_group_plan AS MATERIALIZED (
     -- The target's prior mask follows the locked native row, not the stored one.
     SELECT p.*,

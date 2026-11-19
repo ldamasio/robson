@@ -29,9 +29,12 @@
            m.scope_position AS s_position,
            coalesce(m.potential, false) AS s_potential, coalesce(m.conflict, false) AS s_conflict
     FROM sell_class c
-    LEFT JOIN public.spot_order_set_sell_orders m
-      ON (m.tenant_id, m.venue_id, m.account_scope, m.generation_id, m.symbol, m.exchange_order_id)
-       = (c.tenant_id, c.venue_id, c.account_scope, c.generation_id, c.symbol, c.exchange_order_id)
+    LEFT JOIN LATERAL (
+        SELECT scope_kind, scope_symbol, scope_position, potential, conflict, exchange_order_id FROM public.spot_order_set_sell_orders
+        WHERE (tenant_id, venue_id, account_scope, generation_id, symbol, exchange_order_id)
+            = (c.tenant_id, c.venue_id, c.account_scope, c.generation_id, c.symbol, c.exchange_order_id)
+        LIMIT 1
+    ) m ON true
 ), sell_order_plan AS MATERIALIZED (
     -- The native member's prior is exactly the locked fingerprint's class.
     SELECT o.*,
@@ -61,9 +64,12 @@
            m.scope_position AS s_position, m.source_position AS s_source,
            coalesce(m.potential, false) AS s_potential, coalesce(m.conflict, false) AS s_conflict
     FROM sell_class c
-    LEFT JOIN public.spot_order_set_sell_intents m
-      ON (m.tenant_id, m.venue_id, m.account_scope, m.generation_id, m.intent_id)
-       = (c.tenant_id, c.venue_id, c.account_scope, c.generation_id, c.intent_id)
+    LEFT JOIN LATERAL (
+        SELECT scope_kind, scope_symbol, scope_position, source_position, potential, conflict, intent_id FROM public.spot_order_set_sell_intents
+        WHERE (tenant_id, venue_id, account_scope, generation_id, intent_id)
+            = (c.tenant_id, c.venue_id, c.account_scope, c.generation_id, c.intent_id)
+        LIMIT 1
+    ) m ON true
     WHERE c.has_j
 ), sell_intent_class AS MATERIALIZED (
     SELECT i.*,

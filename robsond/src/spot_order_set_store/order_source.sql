@@ -40,10 +40,17 @@ WITH gen AS MATERIALIZED (
       ON (o.venue_id, o.account_scope, o.symbol, o.exchange_order_id)
        = (g.venue_id, g.account_scope, $7, $8)
      AND o.tenant_id = g.tenant_id
-    LEFT JOIN public.order_intents j ON j.intent_id = o.intent_id
-    LEFT JOIN public.balance_legs l
-      ON (l.position_id, l.tenant_id, l.venue_id, l.account_scope)
-       = (j.position_id, j.tenant_id, j.venue_id, j.account_scope)
+    LEFT JOIN LATERAL (
+        SELECT intent_id, tenant_id, venue_id, account_scope, position_id, client_order_id,
+               kind, not_sent, venue_outcome, venue_evidence, cancels_order_id
+        FROM public.order_intents WHERE intent_id = o.intent_id LIMIT 1
+    ) j ON true
+    LEFT JOIN LATERAL (
+        SELECT symbol FROM public.balance_legs
+        WHERE (position_id, tenant_id, venue_id, account_scope)
+            = (j.position_id, j.tenant_id, j.venue_id, j.account_scope)
+        LIMIT 1
+    ) l ON true
     -- A named J in another tenant, venue or account never casts across scope.
     WHERE (j.intent_id IS NULL
            OR (j.tenant_id, j.venue_id, j.account_scope) = (o.tenant_id, o.venue_id, o.account_scope))
