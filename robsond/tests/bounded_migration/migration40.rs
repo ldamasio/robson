@@ -4,7 +4,7 @@ use std::{borrow::Cow, time::Instant};
 use anyhow::Result;
 use robson_testkit::db_proxy::{DbProxy, ProxyMode};
 use serde_json::{json, Value};
-use sqlx::{migrate::Migrator, postgres::PgSslMode, PgPool};
+use sqlx::{postgres::PgSslMode, PgPool};
 
 use super::{
     super::stages::{self, Edge, Stage},
@@ -198,9 +198,16 @@ impl Fixture {
         .await??;
         assert_eq!(proxy.stats().statements, before, "retirement flushed SQL");
         timeout(ACQUIRE_BOUND, observer.lock()).await??;
-        let (observer_pid, observer_birth): (i32, String) = sqlx::query_as("SELECT pg_backend_pid(),backend_start::text FROM pg_stat_activity WHERE pid=pg_backend_pid()")
-            .fetch_one(&mut observer).await?;
-        assert_eq!(acquired_key(&mut observer, observer_pid, &observer_birth).await?, key);
+        let same: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_locks
+            WHERE pid=pg_backend_pid() AND locktype='advisory' AND granted AND objsubid=1
+            AND classid::bigint=$1 AND objid::bigint=$2)",
+        )
+        .bind(key.0)
+        .bind(key.1)
+        .fetch_one(&mut observer)
+        .await?;
+        assert!(same, "observer must acquire the exact retired adapter's advisory key");
         let actual_catalog: Value = sqlx::query_scalar(CATALOG).fetch_one(&mut observer).await?;
         let mut actual_history: Vec<MigrationRow> =
             sqlx::query_as(HISTORY).fetch_all(&mut observer).await?;
