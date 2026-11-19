@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 use super::{bootstrap::issue, completion, snapshot::get, BudgetError, Trace};
 
+const MAX_EXAMINED: i64 = 1_000_000;
+
 #[derive(Debug, PartialEq, Eq)]
 struct Page {
     examined: Vec<Uuid>,
@@ -81,7 +83,7 @@ fn decode(
         .ok()
         .and_then(|len| prior.checked_add(len))
         .ok_or(BudgetError::Invalid)?;
-    if examined.len() > 1000 || !(0..=1_000_000).contains(&total) {
+    if examined.len() > 1000 || !(0..=MAX_EXAMINED).contains(&total) {
         return Err(BudgetError::Invalid);
     }
     let page = Page {

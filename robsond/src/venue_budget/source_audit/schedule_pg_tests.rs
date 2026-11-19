@@ -223,19 +223,15 @@ async fn generated_same_cursor_competitors_commit_one_native_checkpoint(
     Ok(())
 }
 
-#[sqlx::test(migrations = "../migrations")]
-#[ignore = "requires DATABASE_URL"]
-async fn real_generation_change_after_the_old_page_refuses_its_checkpoint(
-    pool: PgPool,
-) -> anyhow::Result<()> {
-    initialize(&pool).await?;
-    seed(&pool, &[(5, "binance:usdm")]).await?;
+async fn held_old_page(pool: &PgPool, cancel: bool) -> anyhow::Result<()> {
+    initialize(pool).await?;
+    seed(pool, &[(5, "binance:usdm")]).await?;
     let envelope = envelope()?;
     let trace = Trace::default();
-    let old = start(&pool, Uuid::now_v7(), envelope, &trace)
+    let old = start(pool, Uuid::now_v7(), envelope, &trace)
         .await
         .map_err(|e| anyhow!("{e:?}"))?;
-    let wire = Wire::new(&pool, "audit-old-page").await?;
+    let wire = Wire::new(pool, "audit-old-page").await?;
     let mut hold = pool.begin().await?;
     sqlx::raw_sql("LOCK TABLE submit_attempts IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *hold)
@@ -246,20 +242,37 @@ async fn real_generation_change_after_the_old_page_refuses_its_checkpoint(
     // Its Execute ordinal is therefore one after the last issued execution.
     let blocked = tokio::select! {
         result = &mut work => anyhow::bail!("old page completed before gate: {result:?}"),
-        result = wire.blocked(&pool, holder, 2) => result?,
+        result = wire.blocked(pool, holder, 2) => result?,
     };
     let mut control = wire.proxy.control(blocked.identity, false).map_err(|e| anyhow!("{e:?}"))?;
     let mut gate = control
         .arm(blocked.statement + 1, ControlBoundary::BeforeCommandComplete)
         .map_err(|e| anyhow!("{e:?}"))?;
     hold.rollback().await?;
+    let hit = tokio::select! {
+        result = &mut work => anyhow::bail!("audit ended before actual page gate: {result:?}"),
+        result = timeout(Duration::from_millis(350), gate.held()) => result?.map_err(|e| anyhow!("{e:?}"))?,
+    };
+    ensure!(hit.record.ordinal == Some(3) && hit.record.event == DiagnosticEvent::Complete);
+    ensure!(wire.proxy.data_rows() == 2, "settings and old bound page reached the wire");
+    if cancel {
+        drop(work);
+        wire.retires(pool, &blocked).await?;
+        let state = gate.snapshot();
+        ensure!(
+            state.closed
+                && state.client_loss == Some(ClientLoss::Read)
+                && state.proof_valid
+                && !state.released
+        );
+        ensure!(wire.proxy.query_trace_dropped() == 0 && wire.proxy.query_trace().len() == 3);
+        final_row(pool, old, None, 0).await?;
+        drop(gate);
+        ensure!(control.close().await.map_err(|e| anyhow!("{e:?}"))? == state);
+        return Ok(());
+    }
     let actor = async {
-        let hit = timeout(Duration::from_millis(350), gate.held())
-            .await?
-            .map_err(|e| anyhow!("{e:?}"))?;
-        ensure!(hit.record.ordinal == Some(3) && hit.record.event == DiagnosticEvent::Complete);
-        ensure!(wire.proxy.data_rows() == 2, "settings and old bound page both reached the wire");
-        let new = start(&pool, Uuid::now_v7(), envelope, &trace)
+        let new = start(pool, Uuid::now_v7(), envelope, &trace)
             .await
             .map_err(|e| anyhow!("{e:?}"))?;
         ensure!(new.generation == old.generation + 1);
@@ -272,17 +285,33 @@ async fn real_generation_change_after_the_old_page_refuses_its_checkpoint(
         "old snapshot must lose CAS after generation swap: {outcome:?}"
     );
     let new = successor?;
-    wire.retires(&pool, &blocked).await?;
-    final_row(&pool, old, None, 0).await?;
-    final_row(&pool, new, None, 0).await?;
-    ensure!(venue(&pool).await?.1 == Some(new.audit));
+    wire.retires(pool, &blocked).await?;
+    final_row(pool, old, None, 0).await?;
+    final_row(pool, new, None, 0).await?;
+    ensure!(venue(pool).await?.1 == Some(new.audit));
     let Pass::Checkpointed(current) =
-        pass(&pool, new, &trace).await.map_err(|e| anyhow!("{e:?}"))?
+        pass(pool, new, &trace).await.map_err(|e| anyhow!("{e:?}"))?
     else {
         anyhow::bail!("successor did not checkpoint")
     };
-    final_row(&pool, current, Some(Uuid::from_u128(5)), 1).await?;
+    final_row(pool, current, Some(Uuid::from_u128(5)), 1).await?;
     Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn real_generation_change_after_the_old_page_refuses_its_checkpoint(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    held_old_page(&pool, false).await
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn cancellation_before_checkpoint_keeps_the_previous_audit(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    held_old_page(&pool, true).await
 }
 
 async fn held_commit(pool: &PgPool, cancel: bool) -> anyhow::Result<()> {

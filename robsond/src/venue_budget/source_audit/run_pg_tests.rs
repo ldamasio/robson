@@ -163,6 +163,18 @@ async fn global_checkpoints_advance_once_per_acknowledged_pass(pool: PgPool) -> 
         ensure!(trace.issued() == 10, "one pass is exactly five executions");
         assert_indexed_page(&pool, first).await?;
         // A wrong expected cursor is refused without a write.
+        let capped = Run { examined: MAX_EXAMINED, ..first };
+        let before = trace.issued();
+        let overflow = pass(&pool, capped, &trace).await;
+        ensure!(matches!(
+            overflow,
+            Err(run::Fault {
+                phase: run::Phase::Page,
+                error: BudgetError::Invalid,
+                ..
+            })
+        ));
+        ensure!(trace.issued() == before, "a 1,001st page is refused before I/O");
         let wrong = Run {
             cursor: Some(Uuid::from_u128(500)),
             examined: 501,

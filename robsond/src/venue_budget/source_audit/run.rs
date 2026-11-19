@@ -7,7 +7,7 @@ use sqlx::{postgres::PgRow, ConnectOptions, PgConnection, PgPool, Row};
 use tokio::time::{timeout_at, Instant};
 use uuid::Uuid;
 
-use super::{decode, Page};
+use super::{decode, Page, MAX_EXAMINED};
 use crate::venue_budget::{bootstrap::issue, completion, snapshot::get, BudgetError, Trace};
 
 const VENUE: &str = "binance:spot";
@@ -303,7 +303,7 @@ pub(super) async fn pass(pool: &PgPool, run: Run, trace: &Trace) -> Result<Pass,
     };
     if run.audit.is_nil()
         || run.generation < 0
-        || !(0..=1_000_000).contains(&run.examined)
+        || !(0..=MAX_EXAMINED).contains(&run.examined)
         || run.cursor.is_some_and(|c| c > high_water)
         || run.cursor.is_none() != (run.examined == 0)
     {
@@ -312,6 +312,11 @@ pub(super) async fn pass(pool: &PgPool, run: Run, trace: &Trace) -> Result<Pass,
     if run.cursor == Some(high_water) {
         return Ok(Pass::Exhausted);
     }
+    if run.examined == MAX_EXAMINED {
+        // Exactly 1,000 full passes cannot authorize a 1,001st page.
+        return Err(fault(Phase::Page, BudgetError::Invalid));
+    }
+
     let deadline = run.envelope.transaction().map_err(|e| fault(Phase::Connect, e))?;
     let mut step = Step {
         phase: Phase::Connect,
