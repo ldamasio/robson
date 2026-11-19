@@ -43,6 +43,8 @@ pub(crate) struct PendingTime {
     charge: Option<PendingCharge>,
 }
 
+pub(crate) struct PendingCommission(PendingTime);
+
 impl Drop for PendingTime {
     fn drop(&mut self) {
         if let Some(charge) = self.charge.take() {
@@ -105,9 +107,28 @@ impl SharedBudget {
         deadline: TickCapture,
     ) -> Result<PendingTime, BudgetError> {
         let mut state = self.0.lock().map_err(|_| BudgetError::Invalid)?;
+        self.reserve_steady(&mut state, now, deadline, 1)
+    }
+
+    pub(crate) fn try_reserve_commission(
+        &self,
+        now: TickCapture,
+        deadline: TickCapture,
+    ) -> Result<PendingCommission, BudgetError> {
+        let mut state = self.0.try_lock().map_err(|_| BudgetError::Deferred)?;
+        self.reserve_steady(&mut state, now, deadline, 20).map(PendingCommission)
+    }
+
+    fn reserve_steady(
+        &self,
+        state: &mut State,
+        now: TickCapture,
+        deadline: TickCapture,
+        weight: u32,
+    ) -> Result<PendingTime, BudgetError> {
         Self::check(&state, now)?;
         let daily = UnqualifiedDailyCount(state.daily);
-        let cost = RequestCostCandidate::new(1, 0).map_err(|_| BudgetError::Invalid)?;
+        let cost = RequestCostCandidate::new(weight, 0).map_err(|_| BudgetError::Invalid)?;
         let charge = state
             .model
             .reserve_normal(now, cost, Class::Steady, deadline, daily)
@@ -131,6 +152,49 @@ impl SharedBudget {
             return Err(BudgetError::Deferred);
         }
         Ok(())
+    }
+
+    /// The caller already holds the clock gate. This method never acquires
+    /// that gate or waits while holding the budget gate.
+    pub(crate) fn poll_commission_first(
+        &self,
+        pending: &mut PendingCommission,
+        clock: &NativeClock,
+        epoch: uuid::Uuid,
+        admit_clock: impl FnOnce() -> Result<TickCapture, BudgetError>,
+        poll: impl FnOnce() -> std::task::Poll<reqwest::Result<reqwest::Response>>,
+    ) -> Result<(TickCapture, std::task::Poll<reqwest::Result<reqwest::Response>>), BudgetError> {
+        if !Arc::ptr_eq(&self.0, &pending.0.owner.0) {
+            return Err(BudgetError::Invalid);
+        }
+        let mut state = self.0.try_lock().map_err(|_| BudgetError::Deferred)?;
+        let now = admit_clock()?;
+        Self::check(&state, now)?;
+        let next = state.handoffs.checked_add(1).ok_or(BudgetError::Invalid)?;
+        let charge = pending.0.charge.take().ok_or(BudgetError::Invalid)?;
+        if let Err((error, charge)) = state.model.handoff(charge, now) {
+            let _ = state.model.cancel(charge);
+            return Err(transition(error));
+        }
+        state.handoffs = next;
+        let result = poll();
+        Self::observe_head(&mut state, &result, clock, epoch);
+        Ok((now, result))
+    }
+
+    fn observe_head(
+        state: &mut State,
+        result: &std::task::Poll<reqwest::Result<reqwest::Response>>,
+        clock: &NativeClock,
+        epoch: uuid::Uuid,
+    ) {
+        if let std::task::Poll::Ready(Ok(response)) = result {
+            state.heads.observe(
+                response.status().as_u16(),
+                response.headers(),
+                clock.wall_bracket(epoch).ok(),
+            );
+        }
     }
 
     /// The send poll and actual head observation share the same short lock
@@ -171,13 +235,7 @@ impl SharedBudget {
             state.handoffs = next;
         }
         let result = poll();
-        if let std::task::Poll::Ready(Ok(response)) = &result {
-            state.heads.observe(
-                response.status().as_u16(),
-                response.headers(),
-                clock.wall_bracket(epoch).ok(),
-            );
-        }
+        Self::observe_head(&mut state, &result, clock, epoch);
         Ok(result)
     }
 

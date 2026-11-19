@@ -20,6 +20,7 @@
 //! 2026-11-11 and 2026-11-13 (design note v16 §2, F13–F17, F22, F23, F25).
 
 mod cache;
+mod commission_send;
 mod costs;
 mod exchange;
 mod market_data;
@@ -32,6 +33,7 @@ mod time;
 mod trades;
 mod trading;
 
+pub use commission_send::{PreparedSpotCommission, SignedSpotCommission};
 pub use exchange::{BinanceSpotAdapter, SPOT_FINALITY};
 pub use market_data::{BinanceSpotTradeFeed, SPOT_MARKET_WS_ENDPOINT};
 pub use ohlcv::BinanceSpotOhlcv;

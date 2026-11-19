@@ -18,7 +18,7 @@ const CONFIRM: &str = concat!(
     include_str!("result_binding.sql"),
     "SELECT EXISTS(SELECT 1 FROM exact_replay) AS exact_result",
 );
-const MAX_PAYLOAD_BYTES: usize = 16_384;
+pub(super) const MAX_PAYLOAD_BYTES: usize = 16_384;
 
 #[derive(Debug, Clone)]
 pub(super) struct PreparedSnapshot {

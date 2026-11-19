@@ -26,6 +26,8 @@ use crate::{
 };
 
 mod clock_state;
+mod commission;
+pub(crate) use commission::CommissionPreparation;
 mod jobs;
 mod lifecycle;
 mod metrics;
@@ -37,6 +39,7 @@ pub(crate) use lifecycle::ClockClosing;
 struct Published {
     id: Uuid,
     arithmetic: SampleArithmetic,
+    u2: i128,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -292,7 +295,7 @@ impl ClockOwner {
         state.faults = 0;
         state.active_faults = 0;
         metrics::faults(0, 0);
-        let published = Published { id, arithmetic };
+        let published = Published { id, arithmetic, u2: numbers.u2 };
         let published_id = published.id;
         state.published = Some(published);
         Ok(published_id)

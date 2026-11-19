@@ -963,6 +963,33 @@ mod tests;
     violations
 }
 
+fn prepared_commission_mutation_violations(text: &str) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    // The companion ::bind_spot_commission signer is pinned separately with
+    // the other exact transport bodies in binance_rest.rs.
+    const EXACT_FIXED_TRANSPORT: &str =
+        "f70bc51cf7f518ca300eac8ab67efd4ae8cf7204090546f88e78b246c4f10065";
+    if hex::encode(Sha256::digest(text.as_bytes())) == EXACT_FIXED_TRANSPORT {
+        Vec::new()
+    } else {
+        vec!["changes the fixed signed Spot commission transport".into()]
+    }
+}
+
+#[test]
+fn the_commission_transport_allowance_rejects_changed_send_or_client() {
+    let original = include_str!("commission_send.rs");
+    assert!(prepared_commission_mutation_violations(original).is_empty());
+    for (before, after) in [
+        ("single_shot()?", "reqwest::Client::new()"),
+        ("bind_spot_commission", "bind_spot_order"),
+        ("self.request.send()", "{ self.request.try_clone().unwrap().send(); self.request.send() }"),
+    ] {
+        assert!(original.contains(before));
+        assert!(!prepared_commission_mutation_violations(&original.replacen(before, after, 1)).is_empty());
+    }
+}
+
 #[test]
 fn the_clock_transport_allowance_rejects_changed_target_and_extra_transport() {
     let approved = include_str!("time.rs");
@@ -1129,12 +1156,15 @@ fn the_mutation_checker_refuses_every_way_around_the_ledger() {
 fn the_spot_module_sends_orders_only_through_the_ledger_and_reads_no_configuration() {
     let sources = spot_production_sources();
     let time = spot_dir().join("time.rs");
+    let commission = spot_dir().join("commission_send.rs");
     let root = spot_dir().join("mod.rs");
     assert!(sources.len() >= 7, "{} production sources", sources.len());
     for (path, text) in &sources {
         let file = path.file_name().unwrap().to_string_lossy().into_owned();
         let violations = if path == &time {
             prepared_time_mutation_violations(text)
+        } else if path == &commission {
+            prepared_commission_mutation_violations(text)
         } else {
             let permitted: &[&str] = if path == &root {
                 &["pub use time::PreparedSpotTime;"]
