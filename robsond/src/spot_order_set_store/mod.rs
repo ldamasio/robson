@@ -141,8 +141,9 @@ mod tests {
     ) -> Result<()> {
         let venue = VenueId::new(VenueId::BINANCE_SPOT);
         let wrong_venue = VenueId::new("binance:usdm");
+        let tenant_id = Uuid::now_v7();
         let binding = ExpectedGeneration {
-            tenant_id: Uuid::now_v7(),
+            tenant_id,
             venue: &venue,
             account_scope: "fixture-generation",
             generation_id: Uuid::now_v7(),
