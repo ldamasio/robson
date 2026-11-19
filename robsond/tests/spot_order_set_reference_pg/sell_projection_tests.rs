@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 #[path = "../venue_ledger_schema/empty_budget.rs"]
 mod empty_budget;
+#[path = "initialization_tests.rs"]
+mod initialization;
 
 const HOT: &str = include_str!("bounded_order_set.sql");
 
