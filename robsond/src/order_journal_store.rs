@@ -10,6 +10,12 @@ use std::time::{Duration, Instant};
 mod balance;
 #[path = "order_journal_readiness.rs"]
 mod readiness;
+#[allow(
+    dead_code,
+    reason = "local atomic storage primitive awaiting bounded Spot owner"
+)]
+#[path = "order_journal_transition.rs"]
+mod transition;
 
 use async_trait::async_trait;
 use chrono::Utc;
