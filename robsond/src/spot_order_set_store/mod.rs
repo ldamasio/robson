@@ -5,6 +5,7 @@ use sqlx::PgConnection;
 use tracing::Instrument as _;
 use uuid::Uuid;
 
+mod cold_audit;
 mod cold_source;
 pub(crate) mod warm;
 
