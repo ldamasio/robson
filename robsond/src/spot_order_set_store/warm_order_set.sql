@@ -29,6 +29,10 @@ SELECT g.generation_id, g.process_epoch, g.source_audit_id, a.version AS account
 FROM public.spot_order_set_generation AS g
 JOIN public.accounting_state AS a
     ON (a.tenant_id, a.venue_id) = (g.tenant_id, g.venue_id)
+JOIN LATERAL (
+    SELECT epoch_id, clean_stop_at FROM public.process_epochs
+    WHERE tenant_id = g.tenant_id ORDER BY epoch_seq DESC LIMIT 1
+) epoch ON epoch.epoch_id = g.process_epoch AND epoch.clean_stop_at IS NULL
 JOIN public.balance_legs AS l
     ON (l.tenant_id, l.venue_id, l.account_scope, l.position_id, l.symbol)
         = (g.tenant_id, g.venue_id, g.account_scope, $7, $8)

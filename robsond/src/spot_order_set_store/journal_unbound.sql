@@ -16,6 +16,10 @@ WITH journal AS MATERIALIZED (
     FROM public.order_intents j
     JOIN public.spot_order_set_generation g
       ON (g.tenant_id, g.venue_id, g.account_scope) = (j.tenant_id, j.venue_id, j.account_scope)
+    JOIN LATERAL (
+        SELECT epoch_id, clean_stop_at FROM public.process_epochs
+        WHERE tenant_id = g.tenant_id ORDER BY epoch_seq DESC LIMIT 1
+    ) epoch ON epoch.epoch_id = g.process_epoch AND epoch.clean_stop_at IS NULL
     WHERE j.intent_id = $7 AND (j.tenant_id, j.venue_id, j.account_scope) = ($1, 'binance:spot', $2)
       AND (g.generation_id, g.process_epoch, g.source_audit_id) = ($3, $4, $5)
       AND g.accounting_version = $6::bigint - 1

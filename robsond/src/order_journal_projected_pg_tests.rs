@@ -610,3 +610,55 @@ async fn persisted_order_set_journal_two_writers_preserve_members_and_version(
     eprintln!("Persisted journal native concurrent interleavings: 16 seeded cases, 96 writes, 32 verified clocked writes with attempts");
     Ok(())
 }
+
+// An actual old startup source write is a witness to exact refusal
+// once the new epoch is durably visible without moving accounting version.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn persisted_order_set_journal_old_writer_refuses_after_same_version_native_startup(
+    pool: PgPool,
+) -> Result<()> {
+    use crate::spot_order_set_store::{observe_generation, ExpectedGeneration};
+
+    let generation = seed_generation(&pool).await?;
+    let writer = PgJournalBackend::new(&pool, generation.tenant_id)
+        .with_order_set_projection(generation.clone());
+    let batch = sell();
+    insist(writer.commit(&batch).await)?;
+    let version = fields(&pool, &generation).await?;
+    let venue = VenueId::new(VenueId::BINANCE_SPOT);
+    let binding = ExpectedGeneration {
+        tenant_id: generation.tenant_id,
+        venue: &venue,
+        account_scope: &generation.account_scope,
+        generation_id: generation.generation_id,
+        process_epoch: generation.process_epoch,
+        source_audit_id: generation.source_audit_id,
+    };
+    let mut reader = pool.connect_options().connect().await?;
+    ensure!(observe_generation(&mut reader, binding).await?.is_some());
+    let original: Option<i64> =
+        sqlx::query_scalar("SELECT uncertain_generation FROM order_intents WHERE intent_id=$1")
+            .bind(batch.intent.intent_id)
+            .fetch_one(&pool)
+            .await?;
+    ensure!(original.is_none() && version.0 == version.1);
+
+    let newer =
+        crate::process_epoch::start_epoch(&pool, generation.tenant_id, "old-startup-path").await?;
+    ensure!(newer.epoch.epoch_id != generation.process_epoch);
+    let changed: Option<i64> =
+        sqlx::query_scalar("SELECT uncertain_generation FROM order_intents WHERE intent_id=$1")
+            .bind(batch.intent.intent_id)
+            .fetch_one(&pool)
+            .await?;
+    ensure!(changed.is_some(), "actual prior Spot intent must be stamped by startup");
+    ensure!(fields(&pool, &generation).await? == version);
+    ensure!(observe_generation(&mut reader, binding).await?.is_none());
+    let refused = sell();
+    ensure!(matches!(writer.commit(&refused).await, Err(CommitFailure::Known(_))));
+    ensure!(fields(&pool, &generation).await? == version);
+    ensure!(!j_present(&pool, refused.intent.intent_id).await?);
+    eprintln!("Native later startup stamped the source at the same version; exact old reader and writer refused");
+    Ok(())
+}

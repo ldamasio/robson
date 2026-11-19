@@ -148,15 +148,17 @@ INSERT INTO spot_order_set_cancel_groups
    pending_count,conflict_count,terminal_mask)
 SELECT $1,'binance:spot',$2,generation,$4,$5,$6,23+noise,24+noise,true FROM revisions";
 
-fn projection_nodes<'a>(node: &'a serde_json::Value, found: &mut Vec<&'a serde_json::Value>) {
-    if node["Relation Name"].as_str().is_some_and(|name| {
-        name.starts_with("spot_order_set_") && name != "spot_order_set_generation"
-    }) {
+fn plan_nodes<'a>(
+    node: &'a serde_json::Value,
+    matches_relation: &impl Fn(&str) -> bool,
+    found: &mut Vec<&'a serde_json::Value>,
+) {
+    if node["Relation Name"].as_str().is_some_and(matches_relation) {
         found.push(node);
     }
     if let Some(children) = node["Plans"].as_array() {
         for child in children {
-            projection_nodes(child, found);
+            plan_nodes(child, matches_relation, found);
         }
     }
 }
@@ -170,15 +172,23 @@ async fn persisted_warm_order_set_native_same_snapshot_scope_and_absence(
     let foreign = Uuid::now_v7();
     let position = Uuid::now_v7();
     let venue = VenueId::new(VenueId::BINANCE_SPOT);
+    sqlx::query(
+        "INSERT INTO process_epochs(epoch_id,tenant_id,clean_stop_at,marker_version,binary_version)
+         SELECT md5($1::text||n)::uuid,$1,now(),$2,'warm-historical'
+         FROM generate_series(1,4096) n",
+    )
+    .bind(tenant)
+    .bind(crate::process_epoch::MARKER_VERSION)
+    .execute(&pool)
+    .await?;
+    sqlx::raw_sql("ANALYZE process_epochs").execute(&pool).await?;
+    let started = crate::process_epoch::start_epoch(&pool, tenant, "warm-native").await?;
     let expected = ExpectedGeneration {
         tenant_id: tenant,
         venue: &venue,
         account_scope: ACCOUNT,
         generation_id: Uuid::now_v7(),
-        process_epoch: crate::process_epoch::start_epoch(&pool, tenant, "warm-native")
-            .await?
-            .epoch
-            .epoch_id,
+        process_epoch: started.epoch.epoch_id,
         source_audit_id: Uuid::now_v7(),
     };
     let store = actual_leg(&pool, tenant, &venue, position).await?;
@@ -361,7 +371,11 @@ async fn persisted_warm_order_set_native_same_snapshot_scope_and_absence(
             .await?;
     ensure!(plan[0]["Plan"]["Actual Rows"] == 1);
     let mut leaves = Vec::new();
-    projection_nodes(&plan[0]["Plan"], &mut leaves);
+    plan_nodes(
+        &plan[0]["Plan"],
+        &|name| name.starts_with("spot_order_set_") && name != "spot_order_set_generation",
+        &mut leaves,
+    );
     ensure!(
         leaves.len() == 8
             && leaves.iter().all(|node| {
@@ -372,7 +386,16 @@ async fn persisted_warm_order_set_native_same_snapshot_scope_and_absence(
             }),
         "each of eight projected facts must be an exact one-row native probe: {plan}"
     );
-    eprintln!("Warm Spot native one wire, eight exact indexed leaf probes, 4096 alternate generations each");
+    let mut epoch_nodes = Vec::new();
+    plan_nodes(&plan[0]["Plan"], &|name| name == "process_epochs", &mut epoch_nodes);
+    ensure!(
+        epoch_nodes.len() == 1
+            && epoch_nodes[0]["Index Name"] == "idx_process_epochs_tenant_seq"
+            && epoch_nodes[0]["Actual Rows"] == 1
+            && epoch_nodes[0]["Actual Loops"] == 1,
+        "latest epoch must use its descending native index: {plan}"
+    );
+    eprintln!("Warm Spot native one wire, eight exact indexed leaf probes and one latest epoch, 4096 alternatives each");
 
     for candidate_id in [None, Some("991101"), Some("991102")] {
         let f = observe_warm(&mut plain, WarmKeys { candidate_id, ..keys })
@@ -430,5 +453,53 @@ async fn persisted_warm_order_set_native_same_snapshot_scope_and_absence(
         .await
         .map_err(|e| anyhow::anyhow!("real source invalidates generation: {e:?}"))?;
     ensure!(observe_warm(&mut plain, keys).await?.is_none());
+    sqlx::query(
+        "UPDATE spot_order_set_generation g SET accounting_version=a.version
+         FROM accounting_state a WHERE (a.tenant_id,a.venue_id)=(g.tenant_id,g.venue_id)
+           AND (g.tenant_id,g.venue_id,g.account_scope)=($1,'binance:spot',$2)",
+    )
+    .bind(tenant)
+    .bind(ACCOUNT)
+    .execute(&pool)
+    .await?;
+    ensure!(observe_warm(&mut plain, keys).await?.is_some());
+    crate::process_epoch::mark_clean_stop(&pool, started.epoch)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    ensure!(observe_warm(&mut plain, keys).await?.is_none());
+    ensure!(super::super::observe_generation(&mut plain, expected).await?.is_none());
+
+    // Seed a replacement structural binding in the fixture, then leave its
+    // real epoch open and start a still newer process.
+    let replacement = crate::process_epoch::start_epoch(&pool, tenant, "warm-replacement").await?;
+    sqlx::query(
+        "UPDATE spot_order_set_generation SET process_epoch=$3
+         WHERE (tenant_id,venue_id,account_scope)=($1,'binance:spot',$2)",
+    )
+    .bind(tenant)
+    .bind(ACCOUNT)
+    .bind(replacement.epoch.epoch_id)
+    .execute(&pool)
+    .await?;
+    let replacement_keys = WarmKeys {
+        binding: ExpectedGeneration {
+            process_epoch: replacement.epoch.epoch_id,
+            ..expected
+        },
+        ..keys
+    };
+    let before = observe_warm(&mut plain, replacement_keys)
+        .await?
+        .context("current replacement")?;
+    let newer = crate::process_epoch::start_epoch(&pool, tenant, "warm-newer").await?;
+    ensure!(newer.epoch.epoch_id != replacement.epoch.epoch_id);
+    let version_after: i64 = sqlx::query_scalar(
+        "SELECT version FROM accounting_state WHERE tenant_id=$1 AND venue_id='binance:spot'",
+    )
+    .bind(tenant)
+    .fetch_one(&pool)
+    .await?;
+    ensure!(version_after == before.accounting_version);
+    ensure!(observe_warm(&mut plain, replacement_keys).await?.is_none());
     Ok(())
 }

@@ -93,6 +93,10 @@ const READ: &str = "SELECT g.generation_id,g.process_epoch,g.source_audit_id,g.a
     FROM public.spot_order_set_generation g
     JOIN public.accounting_state a
       ON (a.tenant_id,a.venue_id)=(g.tenant_id,g.venue_id)
+    JOIN LATERAL (
+        SELECT epoch_id,clean_stop_at FROM public.process_epochs
+        WHERE tenant_id=g.tenant_id ORDER BY epoch_seq DESC LIMIT 1
+    ) epoch ON epoch.epoch_id=g.process_epoch AND epoch.clean_stop_at IS NULL
     WHERE (g.tenant_id,g.venue_id,g.account_scope)=($1,$2,$3)
       AND (g.generation_id,g.process_epoch,g.source_audit_id)=($4,$5,$6)
       AND g.accounting_version=a.version";
@@ -142,7 +146,14 @@ mod tests {
             venue: &venue,
             account_scope: "fixture-generation",
             generation_id: Uuid::now_v7(),
-            process_epoch: Uuid::now_v7(),
+            process_epoch: crate::process_epoch::start_epoch(
+                &pool,
+                tenant_id,
+                "native-order-set-generation",
+            )
+            .await?
+            .epoch
+            .epoch_id,
             source_audit_id: Uuid::now_v7(),
         };
         // Structural native fixture: no cold source or writer authority is issued.
