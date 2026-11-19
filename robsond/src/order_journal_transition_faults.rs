@@ -1,4 +1,4 @@
-use std::{cell::RefCell, time::Duration};
+use std::{cell::RefCell, future::Future, time::Duration};
 
 use anyhow::Result;
 use robson_exec::order_journal::{JournalBackend, JournalBatch, OutcomeRow, VenueOutcome};
@@ -36,6 +36,24 @@ fn pause() -> (RefCell<Option<Pause>>, oneshot::Receiver<()>, oneshot::Sender<()
     let (reached, wait) = oneshot::channel();
     let (resume, release) = oneshot::channel();
     (RefCell::new(Some(Pause { reached, release })), wait, resume)
+}
+
+pub(super) async fn blackhole_commit<T>(
+    apply: impl Future<Output = T>,
+    proxy: &DbProxy,
+) -> Result<T> {
+    let (slot, reached, release) = pause();
+    let apply = PAUSE.scope(slot, apply);
+    let intercept = async {
+        timeout(Duration::from_millis(400), reached).await??;
+        proxy.set_mode(ProxyMode::Blackhole);
+        release.send(()).map_err(|_| anyhow::anyhow!("commit paused writer retired"))?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (outcome, interception) = tokio::join!(apply, intercept);
+    interception?;
+    proxy.set_mode(ProxyMode::Sever);
+    Ok(outcome)
 }
 
 pub(super) struct Wire {

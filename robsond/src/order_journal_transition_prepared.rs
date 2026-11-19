@@ -2,7 +2,7 @@
 //! first-cancel writer. A prepared value grants no venue route, R1/R3 policy
 //! verdict, runtime readiness or authority to send. Its accounting version is
 //! enforced only by the writer's own locked comparison before either insert.
-use std::{collections::HashSet, ptr, sync::Mutex, time::Duration};
+use std::{ptr, time::Duration};
 
 use anyhow::{anyhow, ensure, Result};
 use chrono::{DateTime, Utc};
@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use self::ready::{initialize, statement, Keys, ProjectionReady, ReplayOrder, ORDER_SET_COLUMNS};
 use super::{
-    faults::{durable, Wire},
+    faults::{blackhole_commit, durable, Wire},
     positive::migrate_fixture,
     ExpectedTransition, StoredFirstCancel, TransitionWrite,
 };
@@ -93,6 +93,7 @@ struct InitializedTarget {
     unbound_sell_conflicts: i64,
     stop_id: Option<String>,
     stop_phase: Option<String>,
+    stop_status: Option<String>,
     exact_stop_identity: bool,
     target_tenant: Option<Uuid>,
     target_position: Option<Uuid>,
@@ -122,7 +123,6 @@ enum Refusal {
 struct FirstCancelBridge<'a> {
     ready: &'a ProjectionReady,
     backend: &'a PgJournalBackend,
-    consumed: Mutex<HashSet<Uuid>>,
 }
 
 /// Created only from a completed initialized read. Not Clone, Copy or
@@ -139,29 +139,9 @@ struct PreparedFirstCancel<'a> {
     expected_transition: ExpectedTransition,
 }
 
-fn same_intent(left: &IntentRow, right: &IntentRow) -> bool {
-    left.intent_id == right.intent_id
-        && left.venue_id == right.venue_id
-        && left.account_scope == right.account_scope
-        && left.client_order_id == right.client_order_id
-        && left.position_id == right.position_id
-        && left.kind == right.kind
-        && left.cancels_order_id == right.cancels_order_id
-        && left.params == right.params
-        && left.created_at == right.created_at
-}
-
 impl<'a> FirstCancelBridge<'a> {
     fn new(ready: &'a ProjectionReady, backend: &'a PgJournalBackend) -> Self {
-        Self {
-            ready,
-            backend,
-            consumed: Mutex::new(HashSet::new()),
-        }
-    }
-
-    fn consumed(&self, intent: Uuid) -> bool {
-        self.consumed.lock().expect("bridge consumption lock").contains(&intent)
+        Self { ready, backend }
     }
 
     async fn prepare<'b>(
@@ -181,7 +161,7 @@ impl<'a> FirstCancelBridge<'a> {
         {
             return Err(Refusal::Input);
         }
-        if self.consumed(intent.intent_id) {
+        if self.ready.cancel_consumed(intent) {
             return Err(Refusal::Spent);
         }
         let keys = Keys {
@@ -212,6 +192,8 @@ impl<'a> FirstCancelBridge<'a> {
         let target_intent = row.target_intent.ok_or(Refusal::Target)?;
         if row.stop_id.as_deref() != Some(original)
             || row.stop_phase.as_deref() != Some("live")
+            || row.stop_status.as_deref().map(OrderPhase::from_binance_spot_status)
+                != Some(OrderPhase::Live)
             || !row.exact_stop_identity
             || row.target_tenant != Some(self.backend.tenant_id)
             || row.target_position != Some(position)
@@ -271,18 +253,13 @@ impl PreparedFirstCancel<'_> {
     ) -> Result<StoredFirstCancel, Refusal> {
         if !ptr::addr_eq(self.bridge, bridge)
             || self.generation != bridge.ready.generation()
-            || !same_intent(self.intent, intent)
+            || self.intent != intent
             || intent.position_id != Some(self.position_id)
             || intent.cancels_order_id.as_deref() != Some(self.original)
         {
             return Err(Refusal::Mismatch);
         }
-        if !bridge
-            .consumed
-            .lock()
-            .expect("bridge consumption lock")
-            .insert(intent.intent_id)
-        {
+        if !bridge.ready.consume_cancel(intent) {
             return Err(Refusal::Spent);
         }
         bridge
@@ -650,6 +627,21 @@ async fn prepared_first_cancel_bridge_refuses_before_the_writer(pool: PgPool) ->
     pending.commit(&journal_batch(pending.cancel())).await?;
     let terminal = ProtectedLeg::admit(&pool).await?;
     let untracked = ProtectedLeg::admit(&pool).await?;
+    let corrupt = ProtectedLeg::admit(&pool).await?;
+    // Deliberately bypass the canonical record writer for this corruption control.
+    let affected = sqlx::query(
+        "UPDATE venue_orders SET status='CANCELED'
+        WHERE (tenant_id,venue_id,account_scope,symbol,exchange_order_id)=($1,$2,$3,$4,$5)
+          AND phase='live' AND status='NEW'",
+    )
+    .bind(corrupt.tenant)
+    .bind(VENUE)
+    .bind(&corrupt.account)
+    .bind(SYMBOL)
+    .bind(STOP)
+    .execute(&pool)
+    .await?;
+    assert_eq!(affected.rows_affected(), 1);
     let ready = initialize(&pool, ReplayOrder::TargetsFirst, None).await?;
     // Post-initialization canonical writes are visible to the projection.
     terminal
@@ -725,12 +717,15 @@ async fn prepared_first_cancel_bridge_refuses_before_the_writer(pool: PgPool) ->
         (&pending, Refusal::Conflicts),
         (&terminal, Refusal::Target),
         (&untracked, Refusal::Conflicts),
+        (&corrupt, Refusal::Target),
     ] {
+        let before = durable(&pool, other.tenant).await?;
         let wire = Wire::new(&pool, other.tenant).await?;
         let intent = other.cancel();
         let bridge = FirstCancelBridge::new(&ready, &wire.store);
         assert_eq!(bridge.prepare(&intent, SYMBOL).await.err(), Some(refusal));
         assert_trace(&wire, &[READ]);
+        assert_eq!(durable(&pool, other.tenant).await?, before);
     }
 
     // A prepared value refuses another intent, another bridge on the same
@@ -756,13 +751,24 @@ async fn prepared_first_cancel_bridge_refuses_before_the_writer(pool: PgPool) ->
             .await;
         assert_eq!(result, Err(Refusal::Mismatch));
         assert_eq!(wire.proxy.query_trace().len(), read);
-        assert!(!bridge.consumed(base.intent_id));
+        assert!(!ready.cancel_consumed(&base));
     }
     assert!(
         twin_wire.proxy.query_trace().is_empty() && foreign_wire.proxy.query_trace().len() == 1
     );
     assert_eq!(durable(&pool, leg.tenant).await?, before);
-    eprintln!("SPOT_PREPARED_FIRST_CANCEL refusals=before_writer foreign_generation=empty mismatches=before_sql");
+    let lost_read = Wire::new(&pool, leg.tenant).await?;
+    lost_read
+        .proxy
+        .set_mode(ProxyMode::DropAutocommitAckOf("spot_shadow_initialization"));
+    let missing = FirstCancelBridge::new(&ready, &lost_read.store);
+    assert!(matches!(missing.prepare(&base, SYMBOL).await, Err(Refusal::Read(_))));
+    assert_eq!(lost_read.proxy.autocommit_acks_dropped(), 1);
+    assert_trace(&lost_read, &[READ]);
+    lost_read.retires(&pool).await?;
+    assert!(!ready.cancel_consumed(&base));
+    assert_eq!(durable(&pool, leg.tenant).await?, before);
+    eprintln!("SPOT_PREPARED_FIRST_CANCEL refusals=before_writer foreign_generation=empty mismatches=before_sql lost_read=refused");
     Ok(())
 }
 
@@ -777,10 +783,11 @@ async fn prepared_first_cancel_generated_canonical_race_is_fenced(pool: PgPool) 
     });
     // None: no writer between read and lock. Some(action): one canonical
     // accounting-first journal, rejected attempt or venue writer.
-    let schedule = cases(proptest::option::of(0_u8..3), 8)
+    let generated = cases(proptest::option::of(0_u8..3), 8)
         .new_tree(&mut runner)
         .map_err(|error| anyhow!("schedule generation: {error:?}"))?
         .current();
+    let schedule: Vec<_> = [None, Some(0), Some(1), Some(2)].into_iter().chain(generated).collect();
     let mut legs = Vec::new();
     for _ in &schedule {
         legs.push(ProtectedLeg::admit(&pool).await?);
@@ -827,11 +834,11 @@ async fn prepared_first_cancel_generated_canonical_race_is_fenced(pool: PgPool) 
             before,
             "a stale write left J or transition rows"
         );
-        assert!(bridge.consumed(intent.intent_id));
+        assert!(ready.cancel_consumed(&intent));
         assert_eq!(bridge.prepare(&intent, SYMBOL).await.err(), Some(Refusal::Spent));
     }
     eprintln!(
-        "SPOT_PREPARED_FIRST_CANCEL generated_cases={} fenced={fenced} seed=2026111903",
+        "SPOT_PREPARED_FIRST_CANCEL cases={} fenced={fenced} journal_attempt_venue=covered seed=2026111903",
         schedule.len()
     );
     Ok(())
@@ -863,15 +870,51 @@ async fn prepared_first_cancel_lost_commit_is_never_replayed(pool: PgPool) -> Re
     assert_eq!(actual["version"], version + 1);
     assert_eq!(actual["cancels"].as_array().map(Vec::len), Some(1));
     assert_eq!(actual["transitions"].as_array().map(Vec::len), Some(1));
-    // The consumed request refuses without reading; a fresh bridge reads the
-    // durable journal and refuses as spent.
+    // The owning generation remembers the request across bridge recreation.
     let traced = wire.proxy.query_trace().len();
     assert_eq!(bridge.prepare(&intent, SYMBOL).await.err(), Some(Refusal::Spent));
     assert_eq!(wire.proxy.query_trace().len(), traced);
     let fresh_wire = Wire::new(&pool, leg.tenant).await?;
     let fresh = FirstCancelBridge::new(&ready, &fresh_wire.store);
     assert_eq!(fresh.prepare(&intent, SYMBOL).await.err(), Some(Refusal::Spent));
+    assert_trace(&fresh_wire, &[]);
     assert_eq!(durable(&pool, leg.tenant).await?, actual);
     eprintln!("SPOT_PREPARED_FIRST_CANCEL lost_ack=uncertain replayed=false");
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn prepared_first_cancel_unanswered_commit_blocks_new_reader(pool: PgPool) -> Result<()> {
+    fixture(&pool).await?;
+    let leg = ProtectedLeg::admit(&pool).await?;
+    let ready = initialize(&pool, ReplayOrder::MembersFirst, None).await?;
+    let wire = Wire::new(&pool, leg.tenant).await?;
+    let bridge = FirstCancelBridge::new(&ready, &wire.store);
+    let intent = leg.cancel();
+    let before = durable(&pool, leg.tenant).await?;
+    let prepared = bridge.prepare(&intent, SYMBOL).await.map_err(|r| anyhow!("{r:?}"))?;
+    let result = blackhole_commit(
+        prepared.write(&bridge, &intent, TransitionKind::Replace, Decimal::new(96, 0), "no-answer"),
+        &wire.proxy,
+    )
+    .await?;
+    assert!(matches!(result, Err(Refusal::Write(CommitFailure::Uncertain(_)))), "{result:?}");
+    wire.retires(&pool).await?;
+    assert_eq!(durable(&pool, leg.tenant).await?, before);
+    drop(bridge);
+
+    let next_wire = Wire::new(&pool, leg.tenant).await?;
+    let next = FirstCancelBridge::new(&ready, &next_wire.store);
+    let alias = IntentRow {
+        intent_id: Uuid::now_v7(),
+        ..intent.clone()
+    };
+    for request in [&intent, &alias] {
+        assert_eq!(next.prepare(request, SYMBOL).await.err(), Some(Refusal::Spent));
+    }
+    assert_trace(&next_wire, &[]);
+    assert_eq!(durable(&pool, leg.tenant).await?, before);
+    eprintln!("SPOT_PREPARED_FIRST_CANCEL unanswered_commit=uncertain durable_change=false new_reader_replay=false");
     Ok(())
 }

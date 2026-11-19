@@ -2,9 +2,10 @@
 //! initialized read. Mounted by path in the reference target and in the
 //! private first-cancel writer tests. It owns no runtime authority: a ready
 //! value is created only by a completed fenced initialization below.
-use std::time::Duration;
+use std::{collections::HashSet, sync::Mutex, time::Duration};
 
 use anyhow::{anyhow, ensure, Context};
+use robson_exec::order_journal::IntentRow;
 use sqlx::{
     postgres::{PgArguments, PgRow},
     query::QueryAs,
@@ -70,11 +71,42 @@ pub(super) struct Keys<'a> {
 pub(super) struct ProjectionReady {
     generation: Uuid,
     database: String,
+    consumed_cancels: Mutex<ConsumedCancels>,
+}
+
+#[derive(Debug, Default)]
+struct ConsumedCancels {
+    ids: HashSet<Uuid>,
+    clients: HashSet<(String, String, String)>,
+}
+
+fn client_key(intent: &IntentRow) -> (String, String, String) {
+    (
+        intent.venue_id.clone(),
+        intent.account_scope.clone(),
+        intent.client_order_id.clone(),
+    )
 }
 
 impl ProjectionReady {
     pub(super) fn generation(&self) -> Uuid {
         self.generation
+    }
+
+    pub(super) fn cancel_consumed(&self, intent: &IntentRow) -> bool {
+        let registry = self.consumed_cancels.lock().expect("fixture cancel registry");
+        registry.ids.contains(&intent.intent_id) || registry.clients.contains(&client_key(intent))
+    }
+
+    pub(super) fn consume_cancel(&self, intent: &IntentRow) -> bool {
+        let client = client_key(intent);
+        let mut registry = self.consumed_cancels.lock().expect("fixture cancel registry");
+        if registry.ids.contains(&intent.intent_id) || registry.clients.contains(&client) {
+            return false;
+        }
+        registry.ids.insert(intent.intent_id);
+        registry.clients.insert(client);
+        true
     }
 
     /// Binds `$1..$9` of a `statement` to this exact generation.
@@ -195,7 +227,11 @@ pub(super) async fn initialize_at(
     let deadline = Instant::now() + limit;
     let generation = Uuid::now_v7();
     let database = pool.connect_options().get_database().context("fixture database")?.to_owned();
-    let ready = ProjectionReady { generation, database };
+    let ready = ProjectionReady {
+        generation,
+        database,
+        consumed_cancels: Mutex::default(),
+    };
     let mut commit_started = false;
     let initialize = async {
         let mut conn = own_connection(pool).await?;
