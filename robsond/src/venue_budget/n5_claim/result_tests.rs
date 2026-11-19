@@ -227,6 +227,75 @@ async fn exact_success_replay_requires_original_bytes_even_at_equal_normalized_h
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
+async fn success_replay_refuses_other_tenant_scope_or_uid(pool: PgPool) {
+    let request = success(initial_result(&pool).await);
+    let measured = Measured::start(&pool).await;
+    assert!(matches!(publish(&measured, request.clone()).await, Ok(Publication::Published)));
+    let persisted = unchanged_row(&pool).await;
+    let original = request.snapshot.as_ref().unwrap();
+    let account = original.evidence.account();
+    let commission: SpotCommission = serde_json::from_slice(&original.payload).unwrap();
+    for (index, (tenant, scope, uid)) in [
+        (Uuid::now_v7(), account.scope(), account.uid()),
+        (account.tenant(), "other-scope", account.uid()),
+        (account.tenant(), account.scope(), account.uid() - 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let other = CostIdentity::new(
+            tenant,
+            account.venue().clone(),
+            scope.to_owned(),
+            uid,
+            account.symbol().clone(),
+        )
+        .unwrap();
+        let evidence = commission.cost_candidate(other, original.evidence.as_of()).unwrap();
+        let mut wrong = request.clone();
+        wrong.snapshot.as_mut().unwrap().evidence = evidence.evidence().clone();
+        assert!(matches!(publish(&measured, wrong).await, Ok(Publication::Refused)));
+        let count = 4 + 3 * (index as u64 + 1);
+        let wire = measured.wire(count, index as u64 + 2, 1);
+        assert_claim_sql(&wire[wire.len() - 3..], false);
+        assert_eq!(unchanged_row(&pool).await, persisted);
+    }
+    measured.retired(&pool, 4).await;
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn unknown_result_keeps_original_snapshot_and_replays_only_exactly(pool: PgPool) {
+    let mut request = initial_result(&pool).await;
+    request.conclusion = ClaimResult::Unknown;
+    request.handoff = Some(offset(request.claim.identity.captured, 5, 123));
+    let inherited = snapshot(&pool).await;
+    let measured = Measured::start(&pool).await;
+    assert!(matches!(publish(&measured, request.clone()).await, Ok(Publication::Published)));
+    let (class, handoff): (String, String) = sqlx::query_as(
+        "SELECT result_class, handoff_tick::text FROM n5_refresh_state WHERE symbol=$1",
+    )
+    .bind(&request.key.symbol)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(class, "unknown");
+    assert_eq!(handoff, request.handoff.unwrap().nanoseconds().to_string());
+    assert_eq!(snapshot(&pool).await, inherited);
+    let persisted = unchanged_row(&pool).await;
+    assert!(matches!(publish(&measured, request.clone()).await, Ok(Publication::Replayed)));
+    request.handoff = None;
+    assert!(matches!(publish(&measured, request).await, Ok(Publication::Refused)));
+    measured.retired(&pool, 3).await;
+    let wire = measured.wire(11, 3, 2);
+    assert_claim_sql(&wire[..4], true);
+    assert_claim_sql(&wire[4..8], true);
+    assert_claim_sql(&wire[8..], false);
+    assert_eq!(unchanged_row(&pool).await, persisted);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
 async fn terminal_non_success_preserves_snapshot_and_late_replay_cannot_overwrite(pool: PgPool) {
     let mut request = initial_result(&pool).await;
     let earlier_snapshot = snapshot(&pool).await;
@@ -665,6 +734,33 @@ async fn assert_model_receipt(
     }
 }
 
+async fn advance_past_unacknowledged_result(
+    pool: &PgPool,
+    current: &ResultRequest,
+    previous_snapshot: &mut String,
+) -> ClaimObservation {
+    let unacknowledged = success(current.clone());
+    let measured = Measured::start(pool).await;
+    measured.proxy.set_mode(ProxyMode::DropCommitAck);
+    let Ok(Publication::Uncertain(original)) = publish(&measured, unacknowledged.clone()).await
+    else {
+        panic!("scheduled result must lose the answer to its actual COMMIT");
+    };
+    assert_eq!(measured.proxy.stats().commit_acks_dropped, 1);
+    assert_model_receipt(pool, &unacknowledged, previous_snapshot).await;
+
+    let next = stored_claim(pool, advance_from(&unacknowledged, true)).await;
+    let advanced = unchanged_row(pool).await;
+    assert!(!confirm_result_once(&measured.pool, original, &measured.trace).await.unwrap());
+    assert!(matches!(scheduled_result(pool, unacknowledged, 0).await, Publication::Refused));
+    assert_eq!(unchanged_row(pool).await, advanced);
+    assert_eq!(snapshot(pool).await, *previous_snapshot);
+    assert_native_claim(pool, next.revision, &next.identity).await;
+    measured.retired(pool, 2).await;
+    assert_confirm_sql(&measured.wire(5, 2, 1)[4]);
+    next
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn generated_interleavings_keep_one_terminal_result_per_claim(pool: PgPool) {
@@ -761,5 +857,14 @@ async fn generated_interleavings_keep_one_terminal_result_per_claim(pool: PgPool
         assert!(matches!(scheduled_result(&pool, stale, 0).await, Publication::Refused));
         assert_eq!(unchanged_row(&pool).await, advanced);
         current.claim = next;
+
+        // Insert a bounded no-answer schedule whenever the generated claim and
+        // publication ranks coincide, and once unconditionally for coverage.
+        if case == 0 || (allow_advance && delay_advance == delay_different) {
+            let next =
+                advance_past_unacknowledged_result(&pool, &current, &mut previous_snapshot).await;
+            assert_eq!(next.revision, current.claim.revision + 1);
+            current.claim = next;
+        }
     }
 }
