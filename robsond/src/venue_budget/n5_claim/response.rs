@@ -143,6 +143,22 @@ fn response_time(
     Some((observed, as_of))
 }
 
+fn commission_evidence(
+    bytes: &[u8],
+    expected: &CostIdentity,
+    as_of: DateTime<Utc>,
+) -> Result<EvidenceIdentity, ClaimResult> {
+    let parsed: SpotCommission =
+        serde_json::from_slice(bytes).map_err(|_| ClaimResult::InvalidPayload)?;
+    parsed
+        .cost_candidate(expected.clone(), as_of)
+        .map(|candidate| candidate.evidence().clone())
+        .map_err(|error| match error {
+            CostError::FeePolicyMismatch => ClaimResult::PolicyMismatch,
+            _ => ClaimResult::InvalidPayload,
+        })
+}
+
 pub(super) fn prepare_response(
     body: &[u8],
     original: RawClockCapture,
@@ -158,13 +174,7 @@ pub(super) fn prepare_response(
     let mut decoder = serde_json::Deserializer::from_slice(body);
     let commission = object(&mut decoder).map_err(|_| ClaimResult::InvalidPayload)?;
     decoder.end().map_err(|_| ClaimResult::InvalidPayload)?;
-    let parsed: SpotCommission =
-        serde_json::from_slice(body).map_err(|_| ClaimResult::InvalidPayload)?;
-    let candidate =
-        parsed.cost_candidate(expected.clone(), as_of).map_err(|error| match error {
-            CostError::FeePolicyMismatch => ClaimResult::PolicyMismatch,
-            _ => ClaimResult::InvalidPayload,
-        })?;
+    let evidence = commission_evidence(body, expected, as_of)?;
     let payload = serde_json::to_vec(&RetainedReceipt {
         format_version: RECEIPT_FORMAT_VERSION,
         original: original.into(),
@@ -174,11 +184,7 @@ pub(super) fn prepare_response(
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err(ClaimResult::InvalidPayload);
     }
-    Ok(PreparedSnapshot {
-        evidence: candidate.evidence().clone(),
-        observed,
-        payload,
-    })
+    Ok(PreparedSnapshot { evidence, observed, payload })
 }
 
 /// Cold decode of one immutable retained receipt. The caller binds the
@@ -219,13 +225,8 @@ pub(super) fn decode_retained(
     let (observed, as_of) = response_time(original, handoff)?;
     // Round-trip equality makes these bytes the retained commission object itself.
     let commission = serde_json::to_vec(&receipt.commission).ok()?;
-    let parsed: SpotCommission = serde_json::from_slice(&commission).ok()?;
-    let candidate = parsed.cost_candidate(expected.clone(), as_of).ok()?;
-    Some(RetainedResponse {
-        original,
-        observed,
-        evidence: candidate.evidence().clone(),
-    })
+    let evidence = commission_evidence(&commission, expected, as_of).ok()?;
+    Some(RetainedResponse { original, observed, evidence })
 }
 
 #[cfg(test)]
