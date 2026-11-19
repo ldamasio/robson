@@ -38,8 +38,9 @@ pub use exchange::{BinanceSpotAdapter, SPOT_FINALITY};
 pub use market_data::{BinanceSpotTradeFeed, SPOT_MARKET_WS_ENDPOINT};
 pub use ohlcv::BinanceSpotOhlcv;
 pub use records::{
-    SpotAccount, SpotAccountBalance, SpotCommission, SpotCommissionDiscount, SpotCommissionRates,
-    SpotOrderRecord,
+    decode_open_order_lists, SpotAccount, SpotAccountBalance, SpotCommission,
+    SpotCommissionDiscount, SpotCommissionRates, SpotOpenOrderList, SpotOrderListError,
+    SpotOrderListMember, SpotOrderRecord,
 };
 pub use rest::{SpotOrderRef, SpotRead, SpotReadError, SpotRestReader};
 pub use rules::{SpotLotFilter, SpotNotionalFilter, SpotPriceFilter, SpotSymbolRules};

@@ -24,7 +24,7 @@ use serde::{de::DeserializeOwned, Deserialize};
 use thiserror::Error;
 
 use super::{
-    records::{self, SpotAccount, SpotCommission, SpotOrderRecord},
+    records::{self, SpotAccount, SpotCommission, SpotOpenOrderList, SpotOrderRecord},
     rules::{self, SpotSymbolRules},
     trades::{
         self, SpotTradePage, SpotTradeSet, SpotTradesQuery, SpotTradesRead, MY_TRADES_MAX_PAGES,
@@ -301,12 +301,20 @@ impl SpotRestReader {
         records::parse_orders(&body)
     }
 
-    /// How many order lists are open on the account
-    /// ([`SpotRead::OPEN_ORDER_LISTS`]). Robson places none, so only the
-    /// count is read.
-    pub async fn open_order_list_count(&self) -> Result<usize, SpotReadError> {
+    /// Every order list open on the account, with each list's ID, raw
+    /// symbol and member references ([`SpotRead::OPEN_ORDER_LISTS`]).
+    /// Descriptive only: the legacy body is buffered whole before the
+    /// decoder sees it, so its length is the envelope (no C8 claim).
+    pub async fn open_order_lists(&self) -> Result<Vec<SpotOpenOrderList>, SpotReadError> {
         let body = self.read(SpotRead::OPEN_ORDER_LISTS, vec![]).await?;
-        records::parse_order_list_count(&body)
+        records::parse_open_order_lists(&body)
+    }
+
+    /// How many order lists are open on the account
+    /// ([`SpotRead::OPEN_ORDER_LISTS`]): the same one read, decoded whole,
+    /// so an ambiguous list fails the count. Robson places none.
+    pub async fn open_order_list_count(&self) -> Result<usize, SpotReadError> {
+        Ok(self.open_order_lists().await?.len())
     }
 
     /// One order's full record ([`SpotRead::ORDER`]). A record on another

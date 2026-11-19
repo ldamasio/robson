@@ -158,11 +158,155 @@ pub struct SpotCommission {
     pub discount: SpotCommissionDiscount,
 }
 
-/// What is read of an open order list: that it exists.
-#[derive(Deserialize)]
-struct OrderListHead {
-    #[serde(rename = "orderListId")]
-    _order_list_id: i64,
+/// One member of an open order list, its identity as the venue gives it
+/// (`GET /api/v3/openOrderList`, F23; L4680-L4716).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotOrderListMember {
+    /// Raw, case kept.
+    pub symbol: String,
+    /// The native order ID, as [`SpotOrderRecord::order_id`].
+    pub order_id: u64,
+    /// Raw, case kept.
+    pub client_order_id: String,
+}
+
+/// One open order list: its native ID, raw symbol and member references.
+/// Descriptive only: no account coherence, eligibility or scope is implied
+/// (8k-1). A symbol Robson does not trade is kept for later classification.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotOpenOrderList {
+    /// The native list ID. The validated decoder refuses the `-1` sentinel.
+    pub order_list_id: i64,
+    /// Raw, case kept.
+    pub symbol: String,
+    /// Members in the venue's order. The validated decoder requires a member.
+    pub orders: Vec<SpotOrderListMember>,
+}
+
+/// Why open order lists were refused. No variant carries input text beyond
+/// a validated ID, and nothing of the input is kept on refusal.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SpotOrderListError {
+    /// The input exceeds the caller's byte envelope; nothing was parsed.
+    #[error("open order lists: {len} bytes exceed the {limit}-byte envelope")]
+    Oversize { len: usize, limit: usize },
+    /// Not the documented shape: a required field is missing, repeated or of
+    /// another type, or the JSON is incomplete.
+    #[error("open order lists: malformed ({0})")]
+    Malformed(String),
+    /// A negative list ID, the "no list" sentinel among them.
+    #[error("open order lists: negative orderListId {0}")]
+    NegativeListId(i64),
+    #[error("open order lists: orderListId {0} is listed twice")]
+    DuplicateList(i64),
+    #[error("open order lists: list {0} has no member orders")]
+    NoMembers(i64),
+    /// An empty, whitespace or control-character symbol or client ID.
+    #[error("open order lists: list {list_id} has an invalid {field}")]
+    InvalidIdentity { list_id: i64, field: &'static str },
+    /// A member on another symbol than its list.
+    #[error("open order lists: list {0} has a member on another symbol")]
+    SymbolDisagreement(i64),
+    /// The same `(symbol, orderId)` or `(symbol, clientOrderId)` twice,
+    /// whether repeated or conflicting.
+    #[error("open order lists: list {list_id} repeats or conflicts on order {order_id}")]
+    DuplicateMember { list_id: i64, order_id: u64 },
+    /// Validation memory could not be reserved.
+    #[error("open order lists: allocation refused")]
+    Allocation,
+}
+
+impl From<SpotOrderListError> for SpotReadError {
+    fn from(error: SpotOrderListError) -> Self {
+        match error {
+            SpotOrderListError::Oversize { .. } | SpotOrderListError::Malformed(_) => {
+                Self::Parse(error.to_string())
+            },
+            _ => Self::Inconsistent(error.to_string()),
+        }
+    }
+}
+
+fn valid_identity(text: &str) -> bool {
+    !text.is_empty() && !text.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Decode a completed `GET /api/v3/openOrderList` body held within the
+/// caller's `max_bytes` envelope: synchronous, no I/O, all or nothing.
+///
+/// The length is checked before any parse. Every list and member is then
+/// validated in one pass; one hash entry per list ID and two per member
+/// (its order ID and its client ID, each under its raw symbol), reserved
+/// checked. Retained identity text is copied from the input, so it never
+/// exceeds `body.len()`. The envelope is the caller's: it does not by itself
+/// bound how the body was received (no C8 transport claim).
+pub fn decode_open_order_lists(
+    body: &str,
+    max_bytes: usize,
+) -> Result<Vec<SpotOpenOrderList>, SpotOrderListError> {
+    if body.len() > max_bytes {
+        return Err(SpotOrderListError::Oversize { len: body.len(), limit: max_bytes });
+    }
+    let lists: Vec<SpotOpenOrderList> = serde_json::from_str(body).map_err(|e| {
+        // Category and position only: a serde message may quote the input.
+        SpotOrderListError::Malformed(format!(
+            "{:?} at line {} column {}",
+            e.classify(),
+            e.line(),
+            e.column()
+        ))
+    })?;
+    let members: usize = lists
+        .iter()
+        .try_fold(0usize, |sum, list| sum.checked_add(list.orders.len()))
+        .ok_or(SpotOrderListError::Allocation)?;
+    let mut list_ids = HashSet::new();
+    list_ids.try_reserve(lists.len()).map_err(|_| SpotOrderListError::Allocation)?;
+    let mut by_order_id: HashSet<(&str, u64)> = HashSet::new();
+    by_order_id.try_reserve(members).map_err(|_| SpotOrderListError::Allocation)?;
+    let mut by_client_id: HashSet<(&str, &str)> = HashSet::new();
+    by_client_id.try_reserve(members).map_err(|_| SpotOrderListError::Allocation)?;
+    for list in &lists {
+        let list_id = list.order_list_id;
+        if list_id < 0 {
+            return Err(SpotOrderListError::NegativeListId(list_id));
+        }
+        if !list_ids.insert(list_id) {
+            return Err(SpotOrderListError::DuplicateList(list_id));
+        }
+        if !valid_identity(&list.symbol) {
+            return Err(SpotOrderListError::InvalidIdentity { list_id, field: "symbol" });
+        }
+        if list.orders.is_empty() {
+            return Err(SpotOrderListError::NoMembers(list_id));
+        }
+        for member in &list.orders {
+            let field = if !valid_identity(&member.symbol) {
+                Some("member symbol")
+            } else if !valid_identity(&member.client_order_id) {
+                Some("clientOrderId")
+            } else {
+                None
+            };
+            if let Some(field) = field {
+                return Err(SpotOrderListError::InvalidIdentity { list_id, field });
+            }
+            if member.symbol != list.symbol {
+                return Err(SpotOrderListError::SymbolDisagreement(list_id));
+            }
+            let order_id = member.order_id;
+            let symbol = member.symbol.as_str();
+            if !by_order_id.insert((symbol, order_id))
+                || !by_client_id.insert((symbol, member.client_order_id.as_str()))
+            {
+                return Err(SpotOrderListError::DuplicateMember { list_id, order_id });
+            }
+        }
+    }
+    drop((by_order_id, by_client_id));
+    Ok(lists)
 }
 
 pub(super) fn parse_account(body: &str) -> Result<SpotAccount, SpotReadError> {
@@ -189,9 +333,15 @@ pub(super) fn parse_order(body: &str) -> Result<SpotOrderRecord, SpotReadError> 
     parse_json("order", body)
 }
 
+/// The open order lists of a body the legacy transport already buffered
+/// whole: its own length is the envelope, which bounds nothing it received.
+pub(super) fn parse_open_order_lists(body: &str) -> Result<Vec<SpotOpenOrderList>, SpotReadError> {
+    Ok(decode_open_order_lists(body, body.len())?)
+}
+
+#[cfg(test)]
 pub(super) fn parse_order_list_count(body: &str) -> Result<usize, SpotReadError> {
-    let lists: Vec<OrderListHead> = parse_json("open order lists", body)?;
-    Ok(lists.len())
+    Ok(parse_open_order_lists(body)?.len())
 }
 
 pub(super) fn parse_commission(body: &str, pair: &str) -> Result<SpotCommission, SpotReadError> {

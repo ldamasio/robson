@@ -2,15 +2,22 @@
 //! and the live BTCUSDT `exchangeInfo` (`testdata/sources.json` says where
 //! each fixture comes from).
 
+use std::collections::HashSet;
+
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::{
-    records::{parse_account, parse_commission, parse_order, parse_order_list_count, parse_orders},
+    decode_open_order_lists,
+    records::{
+        parse_account, parse_commission, parse_open_order_lists, parse_order,
+        parse_order_list_count, parse_orders,
+    },
     rules::parse_symbol_rules,
-    SpotLotFilter, SpotReadError, SpotSymbolRules, SpotTrade,
+    SpotLotFilter, SpotOpenOrderList, SpotOrderListError, SpotOrderListMember, SpotReadError,
+    SpotSymbolRules, SpotTrade,
 };
 
 const EXCHANGE_INFO: &str = include_str!("testdata/exchange_info_btcusdt.json");
@@ -355,10 +362,310 @@ fn open_orders_parse_as_documented_and_may_be_empty() {
 }
 
 #[test]
-fn only_the_open_order_list_count_is_read() {
+fn the_open_order_list_count_counts_validated_lists() {
     assert_eq!(parse_order_list_count(OPEN_ORDER_LIST).unwrap(), 1);
     assert_eq!(parse_order_list_count("[]").unwrap(), 0);
     assert!(matches!(parse_order_list_count("[{}]"), Err(SpotReadError::Parse(_))));
+}
+
+/// The fixture's list with `edit` applied, as a one-list body.
+fn order_list(edit: impl FnOnce(&mut Value)) -> String {
+    let mut lists = value(OPEN_ORDER_LIST);
+    edit(&mut lists[0]);
+    lists.to_string()
+}
+
+fn decode(body: &str) -> Result<Vec<SpotOpenOrderList>, SpotOrderListError> {
+    decode_open_order_lists(body, body.len())
+}
+
+fn member(symbol: &str, order_id: u64, client_order_id: &str) -> SpotOrderListMember {
+    SpotOrderListMember {
+        symbol: symbol.into(),
+        order_id,
+        client_order_id: client_order_id.into(),
+    }
+}
+
+/// Every `(list, member)` identity, order-free.
+fn identities(lists: &[SpotOpenOrderList]) -> HashSet<(i64, String, SpotOrderListMember)> {
+    lists
+        .iter()
+        .flat_map(|list| {
+            list.orders.iter().map(|m| (list.order_list_id, list.symbol.clone(), m.clone()))
+        })
+        .collect()
+}
+
+#[test]
+fn an_open_order_list_keeps_its_raw_identity_as_documented() {
+    assert_eq!(decode(OPEN_ORDER_LIST).unwrap(), [SpotOpenOrderList {
+        order_list_id: 31,
+        symbol: "LTCBTC".into(),
+        orders: vec![
+            member("LTCBTC", 4, "r3EH2N76dHfLoSZWIUw1bT"),
+            member("LTCBTC", 5, "Cv1SnyPD3qhqpbjpYEHbd2"),
+        ],
+    }]);
+    assert!(decode("[]").unwrap().is_empty());
+    assert_eq!(
+        parse_open_order_lists(OPEN_ORDER_LIST).unwrap(),
+        decode(OPEN_ORDER_LIST).unwrap()
+    );
+}
+
+/// Full 64-bit member IDs, the largest list ID and a symbol Robson does not
+/// trade, case kept, are retained for later classification.
+#[test]
+fn full_width_ids_and_unfamiliar_symbols_are_kept_exactly() {
+    let body = order_list(|list| {
+        list["orderListId"] = json!(i64::MAX);
+        list["symbol"] = json!("abcXyz");
+        list["orders"] = json!([
+            {"symbol": "abcXyz", "orderId": u64::MAX, "clientOrderId": "a.B:c/d_e-F"},
+            {"symbol": "abcXyz", "orderId": 0, "clientOrderId": "Z"},
+        ]);
+    });
+    let lists = decode(&body).unwrap();
+    assert_eq!((lists[0].order_list_id, lists[0].symbol.as_str()), (i64::MAX, "abcXyz"));
+    assert_eq!(lists[0].orders, [
+        member("abcXyz", u64::MAX, "a.B:c/d_e-F"),
+        member("abcXyz", 0, "Z")
+    ]);
+    // One past the edge, negative and fractional IDs are no member ID.
+    for id in ["18446744073709551616", "-1", "4.0", "\"4\"", "1e3"] {
+        let body = OPEN_ORDER_LIST.replace("\"orderId\": 4,", &format!("\"orderId\": {id},"));
+        assert_ne!(body, OPEN_ORDER_LIST);
+        assert!(matches!(decode(&body), Err(SpotOrderListError::Malformed(_))), "{id}");
+    }
+}
+
+#[test]
+fn a_missing_repeated_or_mistyped_required_field_is_malformed() {
+    let refused: Vec<String> = vec![
+        order_list(|l| drop(l.as_object_mut().unwrap().remove("orderListId"))),
+        order_list(|l| drop(l.as_object_mut().unwrap().remove("symbol"))),
+        order_list(|l| drop(l.as_object_mut().unwrap().remove("orders"))),
+        order_list(|l| drop(l["orders"][0].as_object_mut().unwrap().remove("symbol"))),
+        order_list(|l| drop(l["orders"][0].as_object_mut().unwrap().remove("orderId"))),
+        order_list(|l| drop(l["orders"][1].as_object_mut().unwrap().remove("clientOrderId"))),
+        order_list(|l| l["orderListId"] = json!(null)),
+        order_list(|l| l["symbol"] = json!(7)),
+        order_list(|l| l["orders"] = json!({})),
+        order_list(|l| l["orders"][0]["clientOrderId"] = json!(null)),
+        OPEN_ORDER_LIST
+            .replace("\"orderListId\": 31,", "\"orderListId\": 31, \"orderListId\": 32,"),
+        OPEN_ORDER_LIST.replace("\"orderId\": 5,", "\"orderId\": 5, \"orderId\": 6,"),
+        "{}".into(),
+        "".into(),
+        "[null]".into(),
+    ];
+    for body in &refused {
+        let error = decode(body).unwrap_err();
+        assert!(matches!(error, SpotOrderListError::Malformed(_)), "{body}: {error:?}");
+        assert!(matches!(parse_open_order_lists(body), Err(SpotReadError::Parse(_))));
+    }
+    // No prefix of a complete answer decodes.
+    let whole = OPEN_ORDER_LIST.trim_end();
+    for end in 0..whole.len() {
+        assert!(decode(&whole[..end]).is_err(), "a {end}-byte prefix decoded");
+    }
+    assert!(decode(whole).is_ok());
+}
+
+#[test]
+fn an_ambiguous_or_invalid_identity_is_refused_typed() {
+    let other_list = |id: i64, order_id: u64, client: &str| {
+        json!({"orderListId": id, "symbol": "LTCBTC",
+               "orders": [{"symbol": "LTCBTC", "orderId": order_id, "clientOrderId": client}]})
+    };
+    let two_lists = |second: Value| {
+        let mut lists = value(OPEN_ORDER_LIST);
+        lists.as_array_mut().unwrap().push(second);
+        lists.to_string()
+    };
+    let cases: Vec<(String, SpotOrderListError)> = vec![
+        (
+            order_list(|l| l["orderListId"] = json!(-1)),
+            SpotOrderListError::NegativeListId(-1),
+        ),
+        (two_lists(other_list(31, 9, "x9")), SpotOrderListError::DuplicateList(31)),
+        (order_list(|l| l["orders"] = json!([])), SpotOrderListError::NoMembers(31)),
+        (order_list(|l| l["symbol"] = json!("")), SpotOrderListError::InvalidIdentity {
+            list_id: 31,
+            field: "symbol",
+        }),
+        (
+            order_list(|l| l["orders"][0]["symbol"] = json!("LTC BTC")),
+            SpotOrderListError::InvalidIdentity { list_id: 31, field: "member symbol" },
+        ),
+        (
+            order_list(|l| l["orders"][1]["clientOrderId"] = json!("")),
+            SpotOrderListError::InvalidIdentity { list_id: 31, field: "clientOrderId" },
+        ),
+        (
+            order_list(|l| l["orders"][1]["clientOrderId"] = json!("a\u{0}b")),
+            SpotOrderListError::InvalidIdentity { list_id: 31, field: "clientOrderId" },
+        ),
+        (
+            order_list(|l| l["orders"][1]["symbol"] = json!("ltcbtc")),
+            SpotOrderListError::SymbolDisagreement(31),
+        ),
+        // The same member twice.
+        (
+            order_list(|l| l["orders"][1] = l["orders"][0].clone()),
+            SpotOrderListError::DuplicateMember { list_id: 31, order_id: 4 },
+        ),
+        // One order ID, two client IDs.
+        (
+            order_list(|l| l["orders"][1]["orderId"] = json!(4)),
+            SpotOrderListError::DuplicateMember { list_id: 31, order_id: 4 },
+        ),
+        // One client ID, two order IDs.
+        (
+            order_list(|l| l["orders"][1]["clientOrderId"] = json!("r3EH2N76dHfLoSZWIUw1bT")),
+            SpotOrderListError::DuplicateMember { list_id: 31, order_id: 5 },
+        ),
+        // A member claimed by two lists.
+        (two_lists(other_list(32, 5, "x5")), SpotOrderListError::DuplicateMember {
+            list_id: 32,
+            order_id: 5,
+        }),
+    ];
+    for (body, expected) in &cases {
+        assert_eq!(decode(body).as_ref(), Err(expected), "{body}");
+        let mapped = parse_open_order_lists(body).unwrap_err();
+        assert!(matches!(mapped, SpotReadError::Inconsistent(_)), "{mapped:?}");
+        assert!(!mapped.to_string().contains("r3EH2N76") && !mapped.to_string().contains("x5"));
+    }
+    // The same order ID on another symbol is another order.
+    let mut lists = value(OPEN_ORDER_LIST);
+    lists.as_array_mut().unwrap().push(json!({"orderListId": 32, "symbol": "BNBBTC",
+        "orders": [{"symbol": "BNBBTC", "orderId": 4, "clientOrderId": "r3EH2N76dHfLoSZWIUw1bT"}]}));
+    assert_eq!(decode(&lists.to_string()).unwrap().len(), 2);
+}
+
+/// Every order of three lists, members included, decodes to one identity
+/// set; every one-field corruption of every order decodes to nothing.
+#[test]
+fn permutations_agree_and_no_corruption_decodes() {
+    let lists = vec![
+        value(OPEN_ORDER_LIST)[0].clone(),
+        json!({"orderListId": 0, "symbol": "BNBBTC", "orders": [
+            {"symbol": "BNBBTC", "orderId": 4, "clientOrderId": "b4"},
+            {"symbol": "BNBBTC", "orderId": u64::MAX, "clientOrderId": "bMax"}]}),
+        json!({"orderListId": 77, "symbol": "xyzUSDT", "orders": [
+            {"symbol": "xyzUSDT", "orderId": 9, "clientOrderId": "c9"},
+            {"symbol": "xyzUSDT", "orderId": 10, "clientOrderId": "c10"},
+            {"symbol": "xyzUSDT", "orderId": 11, "clientOrderId": "c11"}]}),
+    ];
+    let corruptions: Vec<fn(&mut Value)> = vec![
+        |l: &mut Value| l["orderListId"] = json!(-1),
+        |l: &mut Value| l["orderListId"] = json!("31"),
+        |l: &mut Value| l["symbol"] = json!(""),
+        |l: &mut Value| l["symbol"] = json!("OTHER"),
+        |l: &mut Value| l["orders"] = json!([]),
+        |l: &mut Value| drop(l.as_object_mut().unwrap().remove("orders")),
+        |l: &mut Value| l["orders"][0]["orderId"] = json!(-4),
+        |l: &mut Value| l["orders"][0]["orderId"] = l["orders"][1]["orderId"].clone(),
+        |l: &mut Value| l["orders"][0]["clientOrderId"] = l["orders"][1]["clientOrderId"].clone(),
+        |l: &mut Value| l["orders"][0]["clientOrderId"] = json!(" "),
+        |l: &mut Value| l["orders"][1]["symbol"] = json!("ELSE"),
+        |l: &mut Value| drop(l["orders"][1].as_object_mut().unwrap().remove("orderId")),
+    ];
+    let orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [
+        2, 1, 0,
+    ]];
+    let mut expected = None;
+    for order in orders {
+        for reverse_members in [false, true] {
+            let permuted: Vec<Value> = order
+                .iter()
+                .map(|&i| {
+                    let mut list = lists[i].clone();
+                    if reverse_members {
+                        list["orders"].as_array_mut().unwrap().reverse();
+                    }
+                    list
+                })
+                .collect();
+            let body = Value::Array(permuted.clone()).to_string();
+            let set = identities(&decode(&body).unwrap());
+            assert_eq!(set.len(), 7);
+            assert_eq!(expected.get_or_insert_with(|| set.clone()), &set);
+            for target in 0..permuted.len() {
+                for corrupt in &corruptions {
+                    let mut bad = permuted.clone();
+                    corrupt(&mut bad[target]);
+                    let body = Value::Array(bad).to_string();
+                    assert!(decode(&body).is_err(), "{body}");
+                }
+            }
+        }
+    }
+}
+
+/// A 64 KiB local test envelope, at its edge and one byte over. Not the C8
+/// transport bound: only the caller's length check.
+#[test]
+fn the_byte_envelope_is_checked_before_parsing() {
+    const ENVELOPE: usize = 64 * 1024;
+    let mut items: Vec<String> = Vec::new();
+    let mut len = 2; // "[" and "]"
+    for i in 0u64.. {
+        let item = format!(
+            r#"{{"orderListId":{i},"symbol":"S{i}","orders":[{{"symbol":"S{i}","orderId":{},"clientOrderId":"c{i}a"}},{{"symbol":"S{i}","orderId":{},"clientOrderId":"c{i}b"}}]}}"#,
+            u64::MAX - 2 * i,
+            u64::MAX - 2 * i - 1
+        );
+        let extra = item.len() + usize::from(!items.is_empty());
+        if len + extra > ENVELOPE {
+            break;
+        }
+        len += extra;
+        items.push(item);
+    }
+    let mut body = format!("[{}]", items.join(","));
+    body.push_str(&" ".repeat(ENVELOPE - body.len()));
+    assert_eq!(body.len(), ENVELOPE);
+
+    let lists = decode_open_order_lists(&body, ENVELOPE).unwrap();
+    let members: usize = lists.iter().map(|list| list.orders.len()).sum();
+    assert_eq!((lists.len(), members), (items.len(), 2 * items.len()));
+    assert!(lists.len() > 200, "{} lists", lists.len());
+    let retained: usize = lists
+        .iter()
+        .map(|list| {
+            list.symbol.len()
+                + list
+                    .orders
+                    .iter()
+                    .map(|m| m.symbol.len() + m.client_order_id.len())
+                    .sum::<usize>()
+        })
+        .sum();
+    assert!(retained <= body.len(), "{retained} retained of {}", body.len());
+    assert_eq!(identities(&lists).len(), members);
+
+    // One byte over, by length or by envelope, parses nothing.
+    let over = format!("{body} ");
+    assert_eq!(
+        decode_open_order_lists(&over, ENVELOPE),
+        Err(SpotOrderListError::Oversize { len: ENVELOPE + 1, limit: ENVELOPE })
+    );
+    assert_eq!(
+        decode_open_order_lists(&body, ENVELOPE - 1),
+        Err(SpotOrderListError::Oversize { len: ENVELOPE, limit: ENVELOPE - 1 })
+    );
+    // Oversize wins even over garbage: the check is before the parse.
+    assert!(matches!(
+        decode_open_order_lists("{not json", 3),
+        Err(SpotOrderListError::Oversize { len: 9, limit: 3 })
+    ));
+    assert!(
+        matches!(parse_open_order_lists(&over), Ok(_)),
+        "legacy envelope is the body itself"
+    );
 }
 
 #[test]
