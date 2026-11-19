@@ -100,17 +100,17 @@ pub(super) enum Phase {
 /// Terminal inconsistency proven by the bounded fresh validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Inconsistency {
-    /// A clock lacks its source, intent or charge, or disagrees with them.
+    /// The whole clock key set differs from the canonical Spot keys.
     Clock,
-    /// Whole charge population differs from the fully matched clock count.
-    ChargeCount,
+    /// The whole charge key set differs from the canonical Spot keys.
+    ChargeKeys,
 }
 
 impl Inconsistency {
     fn reason(self) -> &'static str {
         match self {
             Self::Clock => "terminal_clock_inconsistent",
-            Self::ChargeCount => "terminal_charge_count_mismatch",
+            Self::ChargeKeys => "terminal_charge_key_mismatch",
         }
     }
 }
@@ -119,6 +119,7 @@ impl Inconsistency {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Witness {
     pub(super) source: i64,
+    pub(super) spot: i64,
     pub(super) clocks: i64,
     pub(super) charges: i64,
 }
@@ -536,22 +537,23 @@ fn locked_binding(row: &PgRow, run: &Run) -> Result<bool, BudgetError> {
 /// Decodes the terminal row. `None` is a non-current binding with no write;
 /// every other disagreement is untrusted and returns an error.
 fn terminal_row(row: &PgRow, run: &Run) -> Result<Option<Terminal>, BudgetError> {
-    if row.len() != 19 {
+    if row.len() != 20 {
         return Err(BudgetError::Invalid);
     }
     let witness = Witness {
         source: get(row, "source_count")?,
+        spot: get(row, "spot_count")?,
         clocks: get(row, "clock_count")?,
         charges: get(row, "charge_count")?,
     };
-    let above: i64 = get(row, "above_clocks")?;
-    let bad: i64 = get(row, "bad_clocks")?;
-    // Every overflow sentinel must be absent before any count is compared.
+    let clock_match: bool = get(row, "clock_match")?;
+    let charge_match: bool = get(row, "charge_match")?;
     if [witness.source, witness.clocks, witness.charges]
         .iter()
         .any(|count| !(0..=MAX_EXAMINED).contains(count))
-        || !(0..=witness.clocks).contains(&above)
-        || !(0..=witness.clocks).contains(&bad)
+        || !(0..=witness.source).contains(&witness.spot)
+        || (clock_match && witness.clocks != witness.spot)
+        || (charge_match && witness.charges != witness.spot)
     {
         return Err(BudgetError::Invalid);
     }
@@ -560,15 +562,14 @@ fn terminal_row(row: &PgRow, run: &Run) -> Result<Option<Terminal>, BudgetError>
         1 => {},
         _ => return Err(BudgetError::Invalid),
     }
-    // A changed in-range cut or an above-high-water clock is never a verdict.
-    if witness.source != run.examined || above != 0 {
+    // A changed in-range global cut cannot be reused by terminal validation.
+    if witness.source != run.examined {
         return Err(BudgetError::Invalid);
     }
-    let expected = if bad > 0 {
+    let expected = if !clock_match {
         Some(Inconsistency::Clock)
-    } else if witness.charges != witness.clocks {
-        // Inclusion plus equal cardinality is the reverse charge coverage.
-        Some(Inconsistency::ChargeCount)
+    } else if !charge_match {
+        Some(Inconsistency::ChargeKeys)
     } else {
         None
     };

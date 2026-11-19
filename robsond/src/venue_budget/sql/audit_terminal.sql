@@ -5,68 +5,40 @@
 -- fresh snapshot; then at most one guarded terminal UPDATE. No repair.
 -- Exactly one row/result.
 WITH source AS MATERIALIZED (
-    SELECT a.attempt_id FROM submit_attempts a
-    WHERE a.attempt_id <= $3::uuid
-    ORDER BY a.attempt_id LIMIT 1000001
-), clock AS MATERIALIZED (
-    SELECT c.attempt_id,c.intent_id,c.tenant_id,c.venue_id,c.attempt_created_at,
-           c.budget_clock_domain,c.budget_created_tick,c.budget_recorded_at
-    FROM spot_intent_clock c
-    ORDER BY c.attempt_id LIMIT 1000001
-), charge AS MATERIALIZED (
-    -- Whole population: cancels and retired tombstones included, no filter.
-    SELECT d.attempt_id FROM budget_daily_charges d
-    ORDER BY d.attempt_id LIMIT 1000001
-), counts AS MATERIALIZED (
-    SELECT (SELECT count(*) FROM source) AS source_count,
-           (SELECT count(*) FROM clock) AS clock_count,
-           (SELECT count(*) FROM charge) AS charge_count
-), checked AS MATERIALIZED (
-    -- At most three keyed counterpart probes per clock; only when not overflowed.
-    SELECT p.attempt_id IS NOT NULL AND (p.attempt_id <= $3::uuid) IS NOT TRUE AS above,
-           (p.attempt_id IS NULL OR i.intent_id IS NULL OR d.attempt_id IS NULL
-            OR c.venue_id<>'binance:spot' OR p.venue_id<>'binance:spot'
-            OR ROW(i.venue_id,i.account_scope,i.client_order_id)
-                 IS DISTINCT FROM ROW(p.venue_id,p.account_scope,p.client_order_id)
-            OR ROW(c.tenant_id,c.venue_id,c.attempt_created_at)
-                 IS DISTINCT FROM ROW(i.tenant_id,p.venue_id,p.created_at)
-            OR ROW(d.venue_id,d.tenant_id,d.intent_id,d.account_scope,d.client_order_id,d.kind,
-                   d.source_created_at,d.budget_clock_domain,d.budget_created_tick,d.budget_recorded_at,d.daily_units)
-                 IS DISTINCT FROM ROW(p.venue_id,i.tenant_id,i.intent_id,p.account_scope,p.client_order_id,i.kind,
-                   p.created_at,c.budget_clock_domain,c.budget_created_tick,c.budget_recorded_at,
-                   CASE WHEN i.kind='cancel' THEN 0::smallint ELSE 1::smallint END)) IS TRUE AS bad
-    FROM clock c
-    LEFT JOIN LATERAL (
-        SELECT a.attempt_id,a.venue_id,a.account_scope,a.client_order_id,a.created_at
-        FROM submit_attempts a WHERE a.attempt_id=c.attempt_id LIMIT 1
-    ) p ON true
-    LEFT JOIN LATERAL (
-        SELECT o.intent_id,o.tenant_id,o.venue_id,o.account_scope,o.client_order_id,o.kind
-        FROM order_intents o WHERE o.intent_id=c.intent_id LIMIT 1
-    ) i ON true
-    LEFT JOIN LATERAL (
-        SELECT q.attempt_id,q.venue_id,q.tenant_id,q.intent_id,q.account_scope,q.client_order_id,
-               q.kind,q.source_created_at,q.budget_clock_domain,q.budget_created_tick,
-               q.budget_recorded_at,q.daily_units
-        FROM budget_daily_charges q WHERE q.attempt_id=c.attempt_id LIMIT 1
-    ) d ON true
-    WHERE (SELECT GREATEST(source_count,clock_count,charge_count) FROM counts) <= 1000000
+    -- Keep one slot for each global source row before applying Spot scope.
+    SELECT ARRAY(
+        SELECT CASE WHEN a.venue_id='binance:spot' THEN a.attempt_id END
+        FROM submit_attempts a WHERE a.attempt_id <= $3::uuid
+        ORDER BY a.attempt_id LIMIT 1000001
+    ) AS all_keys
+), key_sets AS MATERIALIZED (
+    SELECT cardinality(s.all_keys)::bigint AS source_count,
+           array_remove(s.all_keys, NULL::uuid) AS spot_keys,
+           ARRAY(SELECT c.attempt_id FROM spot_intent_clock c
+                 ORDER BY c.attempt_id LIMIT 1000001) AS clock_keys,
+           ARRAY(SELECT d.attempt_id FROM budget_daily_charges d
+                 ORDER BY d.attempt_id LIMIT 1000001) AS charge_keys
+    FROM source s
 ), verdict AS MATERIALIZED (
-    SELECT n.source_count,n.clock_count,n.charge_count,
-           (SELECT count(*) FILTER (WHERE above) FROM checked) AS above_clocks,
-           (SELECT count(*) FILTER (WHERE bad AND NOT above) FROM checked) AS bad_clocks
-    FROM counts n
+    -- The same fenced forward lineage already verified the full row for
+    -- every Spot key. The whole ordered key sets close both inverse edges.
+    SELECT k.source_count,cardinality(k.spot_keys)::bigint AS spot_count,
+           cardinality(k.clock_keys)::bigint AS clock_count,
+           cardinality(k.charge_keys)::bigint AS charge_count,
+           k.spot_keys=k.clock_keys AS clock_match,
+           k.spot_keys=k.charge_keys AS charge_match
+    FROM key_sets k
 ), decided AS MATERIALIZED (
     SELECT v.*,
            CASE WHEN GREATEST(v.source_count,v.clock_count,v.charge_count) > 1000000
-                  OR v.source_count <> $4::bigint OR v.above_clocks > 0 THEN NULL
-                WHEN v.bad_clocks > 0 THEN 'failed'
-                WHEN v.charge_count <> v.clock_count THEN 'failed'
+                  OR v.source_count <> $4::bigint THEN NULL
+                WHEN NOT v.clock_match THEN 'failed'
+                WHEN NOT v.charge_match THEN 'failed'
                 ELSE 'complete' END AS status,
            CASE WHEN GREATEST(v.source_count,v.clock_count,v.charge_count) > 1000000
-                  OR v.source_count <> $4::bigint OR v.above_clocks > 0 THEN NULL
-                WHEN v.bad_clocks > 0 THEN 'terminal_clock_inconsistent'
-                WHEN v.charge_count <> v.clock_count THEN 'terminal_charge_count_mismatch'
+                  OR v.source_count <> $4::bigint THEN NULL
+                WHEN NOT v.clock_match THEN 'terminal_clock_inconsistent'
+                WHEN NOT v.charge_match THEN 'terminal_charge_key_mismatch'
                 ELSE NULL END AS reason
     FROM verdict v
 ), venue AS MATERIALIZED (
@@ -86,7 +58,7 @@ WITH source AS MATERIALIZED (
     RETURNING s.audit_id,s.venue_id,s.quiescence_generation,s.high_water,s.cursor,s.examined_count,
               s.status,s.failure_reason,s.completed_at,s.completed_at=CURRENT_TIMESTAMP AS server_completed
 )
-SELECT x.source_count,x.clock_count,x.charge_count,x.above_clocks,x.bad_clocks,
+SELECT x.source_count,x.spot_count,x.clock_count,x.charge_count,x.clock_match,x.charge_match,
        x.status AS verdict,x.reason AS verdict_reason,
        (SELECT count(*) FROM venue) AS bindings,
        (SELECT count(*) FROM moved) AS moved,

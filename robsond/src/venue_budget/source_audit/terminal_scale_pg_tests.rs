@@ -1,5 +1,5 @@
 //! End-to-end timing through the healthy historical envelope on disposable PG.
-use crate::venue_budget::source_audit::run::{finish_audit, Terminal};
+use crate::venue_budget::source_audit::run::{finish_audit, Terminal, TERMINAL};
 
 use super::*;
 
@@ -65,6 +65,62 @@ async fn seed_full_history(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn profile_terminal_populations(pool: &PgPool, run: Run) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    let initialization: Uuid = sqlx::query_scalar(
+        "SELECT initialization_id FROM budget_venue_state WHERE venue_id='binance:spot'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let explain = format!("EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT JSON) {TERMINAL}");
+    let plan: serde_json::Value = sqlx::query_scalar(&explain)
+        .bind(run.audit)
+        .bind(run.generation)
+        .bind(run.high_water)
+        .bind(run.examined)
+        .bind(initialization)
+        .fetch_one(&mut *tx)
+        .await?;
+    // The audited row is already complete. This separate native profile
+    // observes the unchanged population expressions and rolls back.
+    tx.rollback().await?;
+    fn rows_of(node: &serde_json::Value, index: &str) -> Option<i64> {
+        if node["Index Name"] == index {
+            return node["Actual Rows"].as_i64();
+        }
+        node["Plans"].as_array()?.iter().find_map(|p| rows_of(p, index))
+    }
+    let root = &plan[0]["Plan"];
+    for key in [
+        "submit_attempts_pkey",
+        "spot_intent_clock_pkey",
+        "budget_daily_charges_pkey",
+    ] {
+        ensure!(rows_of(root, key) == Some(SOURCE_ROWS), "{key} actual terminal population");
+    }
+    eprintln!("C2_FULL_TERMINAL_PLAN {plan}");
+
+    let (keys, _) = TERMINAL
+        .split_once("), verdict AS MATERIALIZED (")
+        .ok_or_else(|| anyhow!("actual terminal population SQL"))?;
+    let keys = keys.replace("$3::uuid", "$1::uuid");
+    let probe = format!(
+        "{keys}) SELECT pg_column_size(s.all_keys),pg_column_size(k.spot_keys),
+        pg_column_size(k.clock_keys),pg_column_size(k.charge_keys)
+        FROM key_sets k CROSS JOIN source s"
+    );
+    let bytes: (i32, i32, i32, i32) =
+        sqlx::query_as(&probe).bind(run.high_water).fetch_one(pool).await?;
+    ensure!([bytes.0, bytes.1, bytes.2, bytes.3]
+        .into_iter()
+        .all(|n| (16_000_000..=16_125_064).contains(&n)));
+    eprintln!(
+        "C2_FULL_ARRAY_PAYLOAD_BYTES source={} spot={} clock={} charge={}",
+        bytes.0, bytes.1, bytes.2, bytes.3
+    );
+    Ok(())
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires isolated PG and a million-row measurement run"]
 async fn measured_million_row_cold_terminal_envelope(pool: PgPool) -> anyhow::Result<()> {
@@ -111,5 +167,5 @@ async fn measured_million_row_cold_terminal_envelope(pool: PgPool) -> anyhow::Re
     ensure!(trace.issued() == 5010 && elapsed < Duration::from_secs(60));
     ensure!(terminal_elapsed < Duration::from_secs(2));
     ensure!(durable(&pool, audit).await?.3 == "complete");
-    Ok(())
+    profile_terminal_populations(&pool, run).await
 }

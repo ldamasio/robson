@@ -13,21 +13,76 @@ async fn lock_original_venue(
     Ok(lock)
 }
 
-async fn terminal_status(pool: &PgPool, original: Run, status: &str) -> anyhow::Result<()> {
-    let observed = durable(pool, original.audit).await?;
-    ensure!(
-        observed == (original.generation, original.cursor, original.examined, status.to_owned(),),
-        "durable status for {}: {observed:?}",
-        original.audit
-    );
-    let completed: bool = sqlx::query_scalar(
-        "SELECT (completed_at IS NOT NULL) AND failure_reason IS NULL FROM budget_source_audits WHERE audit_id=$1",
+async fn terminal_status(
+    pool: &PgPool,
+    original: Run,
+    status: &str,
+) -> anyhow::Result<Option<chrono::DateTime<Utc>>> {
+    let row = sqlx::query(
+        "SELECT audit_id,venue_id,quiescence_generation,high_water,cursor,examined_count,
+                status,started_at,completed_at,failure_reason
+         FROM budget_source_audits WHERE audit_id=$1",
     )
     .bind(original.audit)
     .fetch_one(pool)
     .await?;
-    ensure!(completed == (status == "complete"));
-    Ok(())
+    let identity: (Uuid, String, i64, Option<Uuid>, Option<Uuid>, i64, String) = (
+        row.try_get(0)?,
+        row.try_get(1)?,
+        row.try_get(2)?,
+        row.try_get(3)?,
+        row.try_get(4)?,
+        row.try_get(5)?,
+        row.try_get(6)?,
+    );
+    ensure!(
+        identity
+            == (
+                original.audit,
+                "binance:spot".to_owned(),
+                original.generation,
+                original.high_water,
+                original.cursor,
+                original.examined,
+                status.to_owned(),
+            ),
+        "durable audit tuple: {identity:?}"
+    );
+    let started: chrono::DateTime<Utc> = row.try_get(7)?;
+    let completed: Option<chrono::DateTime<Utc>> = row.try_get(8)?;
+    ensure!(row.try_get::<Option<String>, _>(9)?.is_none());
+    ensure!(completed.is_some() == (status == "complete"));
+    ensure!(completed.is_none_or(|at| at >= started));
+    Ok(completed)
+}
+
+async fn populate_terminal_cut(pool: &PgPool) -> anyhow::Result<()> {
+    let tenant = seed(
+        pool,
+        &[
+            (1, "binance:spot"),
+            (3, "binance:spot"),
+            (5, "binance:usdm"),
+        ],
+    )
+    .await?;
+    project_healthy_spot(pool, tenant).await
+}
+
+async fn last_checkpoint(pool: &PgPool, trace: &Trace) -> anyhow::Result<Run> {
+    let initial = start(pool, Uuid::now_v7(), envelope()?, trace)
+        .await
+        .map_err(|err| anyhow!("{err:?}"))?;
+    let result = pass(pool, initial, trace).await;
+    let Ok(Pass::Checkpointed(run)) = result else {
+        anyhow::bail!("expected a native populated checkpoint: {result:?}");
+    };
+    ensure!(
+        run.high_water == Some(Uuid::from_u128(5))
+            && run.cursor == run.high_water
+            && run.examined == 3
+    );
+    Ok(run)
 }
 
 fn commit_sent(trace: &[String]) -> bool {
@@ -38,11 +93,9 @@ fn commit_sent(trace: &[String]) -> bool {
 
 async fn cut_terminal(pool: &PgPool, cancel: bool) -> anyhow::Result<()> {
     initialize(pool).await?;
+    populate_terminal_cut(pool).await?;
     let trace = Trace::default();
-    let old = start(pool, Uuid::now_v7(), envelope()?, &trace)
-        .await
-        .map_err(|e| anyhow!("{e:?}"))?;
-    ensure!(old.high_water.is_none());
+    let old = last_checkpoint(pool, &trace).await?;
     let wire = Wire::new(pool, "audit-terminal-cut").await?;
     let hold = lock_original_venue(pool).await?;
     let mut hold = hold;
@@ -68,7 +121,7 @@ async fn cut_terminal(pool: &PgPool, cancel: bool) -> anyhow::Result<()> {
             && hit.record.event == DiagnosticEvent::Complete
     );
     let expected_status = if cancel { "running" } else { "complete" };
-    terminal_status(pool, old, expected_status).await?;
+    let expected_completion = terminal_status(pool, old, expected_status).await?;
     if cancel {
         drop(work);
     } else {
@@ -80,7 +133,7 @@ async fn cut_terminal(pool: &PgPool, cancel: bool) -> anyhow::Result<()> {
     }
     wire.retires(pool, &original).await?;
     let snapshot = closed_by_client(&gate).await?;
-    terminal_status(pool, old, expected_status).await?;
+    ensure!(terminal_status(pool, old, expected_status).await? == expected_completion);
     let mut free = pool.begin().await?;
     sqlx::query("SELECT 1 FROM budget_venue_state WHERE venue_id='binance:spot' FOR UPDATE NOWAIT")
         .fetch_one(&mut *free)
@@ -116,9 +169,7 @@ async fn withheld_terminal_commit_ack_does_not_produce_completion_receipt(
 
 async fn generation_cut(pool: &PgPool, replacement_first: bool, jitter: u64) -> anyhow::Result<()> {
     let trace = Trace::default();
-    let old = start(pool, Uuid::now_v7(), envelope()?, &trace)
-        .await
-        .map_err(|e| anyhow!("{e:?}"))?;
+    let old = last_checkpoint(pool, &trace).await?;
     let successor_id = Uuid::now_v7();
     let wire = Wire::new(pool, "audit-terminal-race").await?;
     let successor_wire = Wire::new(pool, "audit-terminal-successor").await?;
@@ -174,18 +225,22 @@ async fn generation_cut(pool: &PgPool, replacement_first: bool, jitter: u64) -> 
         (terminal, new.map_err(|e| anyhow!("{e:?}"))?)
     };
     wire.retires(pool, &original).await?;
-    let expect = if replacement_first {
+    if replacement_first {
         ensure!(matches!(terminal, Ok(Terminal::Stale)), "superseded terminal: {terminal:?}");
-        "running"
+        ensure!(terminal_status(pool, old, "running").await?.is_none());
     } else {
+        let Ok(Terminal::Complete(receipt)) = terminal else {
+            anyhow::bail!("initial terminal winner: {terminal:?}");
+        };
+        ensure!(terminal_status(pool, old, "complete").await? == Some(receipt.completed_at));
         ensure!(
-            matches!(terminal, Ok(Terminal::Complete(_))),
-            "initial terminal winner: {terminal:?}"
+            receipt.audit == old.audit
+                && receipt.high_water == old.high_water
+                && receipt.generation == old.generation
+                && receipt.examined == old.examined
         );
-        "complete"
-    };
-    terminal_status(pool, old, expect).await?;
-    terminal_status(pool, new, "running").await?;
+    }
+    ensure!(terminal_status(pool, new, "running").await?.is_none());
     let (_, active_audit, active_generation) = venue(pool).await?;
     ensure!(active_audit == Some(successor_id) && active_generation == old.generation + 1);
     ensure!(new.audit == successor_id && new.generation == active_generation);
@@ -198,6 +253,7 @@ async fn generated_terminal_and_generation_replacement_obey_the_durable_oracle(
     pool: PgPool,
 ) -> anyhow::Result<()> {
     initialize(&pool).await?;
+    populate_terminal_cut(&pool).await?;
     let mut rng = TestRunner::new(Config {
         rng_seed: RngSeed::Fixed(2026111910),
         failure_persistence: None,
