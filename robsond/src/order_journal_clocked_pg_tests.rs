@@ -21,11 +21,14 @@ use crate::venue_budget::{fixture, Trace};
 
 #[path = "order_journal_clocked_capacity_pg_tests.rs"]
 mod capacity;
+#[path = "order_journal_clocked_history_pg_tests.rs"]
+mod history;
 
 struct Scope {
     tenant: Uuid,
     epoch: Uuid,
     clock: NativeClock,
+    start: crate::process_epoch::EpochStart,
 }
 
 async fn scope(pool: &PgPool) -> anyhow::Result<Scope> {
@@ -34,6 +37,10 @@ async fn scope(pool: &PgPool) -> anyhow::Result<Scope> {
     fixture::prepare(pool, &clock, Instant::now() + Duration::from_secs(2), &trace)
         .await
         .map_err(|error| anyhow!("budget fixture: {error:?}"))?;
+    tenant_scope(pool, clock).await
+}
+
+async fn tenant_scope(pool: &PgPool, clock: NativeClock) -> anyhow::Result<Scope> {
     let tenant = Uuid::now_v7();
     let start = crate::process_epoch::start_epoch(pool, tenant, "j2b-clocked-journal").await?;
     sqlx::query(
@@ -47,6 +54,7 @@ async fn scope(pool: &PgPool) -> anyhow::Result<Scope> {
         tenant,
         epoch: start.epoch.epoch_id,
         clock,
+        start,
     })
 }
 
@@ -271,6 +279,12 @@ async fn mismatched_evidence_refuses_before_sql(pool: PgPool) -> anyhow::Result<
     let result = backend.commit_clocked(&foreign, &input).await;
     ensure!(refused(&result), "wrong epoch refuses: {result:?}");
     ensure!(intents(&pool, foreign.intent.intent_id).await? == 0, "nothing written");
+
+    let (malformed, mut input) = one(&scope, "j2b-malformed-bracket")?;
+    input.attempts[0].capture.after_ns = robson_exec::clock_records::TICK_MAX + 1;
+    let result = backend.commit_clocked(&malformed, &input).await;
+    ensure!(refused(&result), "out-of-range bracket refuses: {result:?}");
+    ensure!(intents(&pool, malformed.intent.intent_id).await? == 0, "nothing written");
     Ok(())
 }
 
@@ -306,12 +320,7 @@ LANGUAGE sql VOLATILE AS $fn$
         $18,$19,$20,$21,$22,$23) r
 $fn$"#;
 
-#[sqlx::test(migrations = "../migrations")]
-#[ignore = "requires DATABASE_URL"]
-async fn a_corrupted_completed_receipt_is_refused_before_commit(
-    pool: PgPool,
-) -> anyhow::Result<()> {
-    let scope = scope(&pool).await?;
+async fn wrap_real_helper(pool: &PgPool, wrapper: &str) -> anyhow::Result<()> {
     // Preserve the original M38 function and corrupt only its returned
     // client identity. The production-style call remains schema-qualified.
     sqlx::query(
@@ -320,9 +329,19 @@ async fn a_corrupted_completed_receipt_is_refused_before_commit(
             integer[],numeric[],uuid[],bigint[],integer[],numeric[],numeric[],text[],uuid[],bigint[],integer[])
          RENAME TO j2b_fixture_original_insert_clocks",
     )
-    .execute(&pool)
+    .execute(pool)
     .await?;
-    sqlx::query(CORRUPTING_WRAPPER).execute(&pool).await?;
+    sqlx::query(wrapper).execute(pool).await?;
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_corrupted_completed_receipt_is_refused_before_commit(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let scope = scope(&pool).await?;
+    wrap_real_helper(&pool, CORRUPTING_WRAPPER).await?;
     let backend = PgJournalBackend::new(&pool, scope.tenant);
     let (batch, input) = one(&scope, "j2b-corrupt")?;
     let result = backend.commit_clocked(&batch, &input).await;

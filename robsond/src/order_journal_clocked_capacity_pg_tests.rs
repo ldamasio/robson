@@ -5,23 +5,6 @@ use super::*;
 
 const VENUE: &str = "binance:spot";
 
-async fn second_scope(pool: &PgPool) -> anyhow::Result<Scope> {
-    let tenant = Uuid::now_v7();
-    let start = crate::process_epoch::start_epoch(pool, tenant, "j2b-capacity-second").await?;
-    sqlx::query(
-        "INSERT INTO accounting_state(tenant_id,venue_id,budget_model)
-         VALUES($1,'binance:spot','net_from_start_non_expanding_v1')",
-    )
-    .bind(tenant)
-    .execute(pool)
-    .await?;
-    Ok(Scope {
-        tenant,
-        epoch: start.epoch.epoch_id,
-        clock: NativeClock::initialize()?,
-    })
-}
-
 async fn seed_with_one_unit_left(pool: &PgPool, tenant: Uuid) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query(
@@ -90,6 +73,18 @@ async fn stored(pool: &PgPool, batch: &JournalBatch) -> anyhow::Result<(i64, i64
     .await?)
 }
 
+async fn versions(pool: &PgPool, a: Uuid, b: Uuid) -> anyhow::Result<(i64, i64)> {
+    Ok(sqlx::query_as(
+        "SELECT (SELECT version FROM accounting_state WHERE tenant_id=$1 AND venue_id=$3),
+                (SELECT version FROM accounting_state WHERE tenant_id=$2 AND venue_id=$3)",
+    )
+    .bind(a)
+    .bind(b)
+    .bind(VENUE)
+    .fetch_one(pool)
+    .await?)
+}
+
 async fn writer(pool: &PgPool, tenant: Uuid) -> anyhow::Result<(PgJournalBackend, i32)> {
     let dedicated_pool = PgPoolOptions::new()
         .max_connections(1)
@@ -128,7 +123,8 @@ async fn wait_on(
 
 async fn run_schedule(pool: &PgPool, first_writer: usize) -> anyhow::Result<()> {
     let a = scope(pool).await?;
-    let b = second_scope(pool).await?;
+    let b = tenant_scope(pool, NativeClock::initialize()?).await?;
+    let before = versions(pool, a.tenant, b.tenant).await?;
     let tenants = [&a, &b];
     seed_with_one_unit_left(pool, a.tenant).await?;
 
@@ -184,6 +180,16 @@ async fn run_schedule(pool: &PgPool, first_writer: usize) -> anyhow::Result<()> 
     ensure!(stored(pool, winner).await? == (1, 1, 1, 1), "winner landed atomically");
     ensure!(stored(pool, loser).await? == (0, 0, 0, 0), "all loser writes rolled back");
     ensure!(active_units(pool).await? == 10000, "venue reached exactly 10000");
+
+    let after_commit = if winning_scope.tenant == a.tenant {
+        (before.0 + 1, before.1)
+    } else {
+        (before.0, before.1 + 1)
+    };
+    ensure!(
+        versions(pool, a.tenant, b.tenant).await? == after_commit,
+        "the loser also rolled back the accounting version"
+    );
 
     let backend = PgJournalBackend::new(pool, winning_scope.tenant);
     let (mut cancel, mut cancel_input) = one(winning_scope, "j2b-race-cancel")?;
