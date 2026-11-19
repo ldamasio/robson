@@ -95,7 +95,7 @@ impl Fixture {
             .port(proxy.addr().port())
             .ssl_mode(PgSslMode::Disable);
         let mut adapter = BoundedMigration::connect(&proxied).await?;
-        let (pid, birth) = sqlx::query_as("SELECT pg_backend_pid(),backend_start::text FROM pg_stat_activity WHERE pid=pg_backend_pid()")
+        let (pid, birth): (i32, String) = sqlx::query_as("SELECT pg_backend_pid(),backend_start::text FROM pg_stat_activity WHERE pid=pg_backend_pid()")
             .fetch_one(adapter.connection()?).await?;
         sqlx::query("SELECT set_config('lock_timeout','310ms',false),set_config('statement_timeout','410ms',false),set_config('idle_in_transaction_session_timeout','510ms',false)")
             .execute(adapter.connection()?).await?;
@@ -198,7 +198,7 @@ impl Fixture {
         .await??;
         assert_eq!(proxy.stats().statements, before, "retirement flushed SQL");
         timeout(ACQUIRE_BOUND, observer.lock()).await??;
-        let (observer_pid, observer_birth) = sqlx::query_as("SELECT pg_backend_pid(),backend_start::text FROM pg_stat_activity WHERE pid=pg_backend_pid()")
+        let (observer_pid, observer_birth): (i32, String) = sqlx::query_as("SELECT pg_backend_pid(),backend_start::text FROM pg_stat_activity WHERE pid=pg_backend_pid()")
             .fetch_one(&mut observer).await?;
         assert_eq!(acquired_key(&mut observer, observer_pid, &observer_birth).await?, key);
         let actual_catalog: Value = sqlx::query_scalar(CATALOG).fetch_one(&mut observer).await?;
