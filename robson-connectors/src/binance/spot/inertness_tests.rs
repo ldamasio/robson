@@ -757,7 +757,15 @@ fn nothing_outside_the_spot_module_names_it() {
     let fixture_isolated = isolated_observation_fixture(&owner, &fixture, &references);
     let daemon_dir = workspace.join("robsond/src");
     let n5_dir = daemon_dir.join("venue_budget/n5_claim");
+    let connector_dir = crate_dir().join("src");
     let fixtures = [
+        (
+            connector_dir.as_path(),
+            "spot_inventory_wire_tests.rs",
+            "binance_rest.rs",
+            "spot_inventory_wire_tests",
+            "#![cfg(test)]\n",
+        ),
         (
             daemon_dir.as_path(),
             "order_journal_physical_recovery_pg_tests.rs",
