@@ -2,6 +2,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, ensure, Context};
+use robson_exec::order_journal::JournalBatch;
 use robson_testkit::db_proxy::ProxyMode;
 use sqlx::{ConnectOptions, Executor, PgConnection};
 use tokio::time::{timeout_at, Instant};
@@ -181,6 +182,14 @@ async fn check(
     Ok(hot)
 }
 
+async fn journal_commit(journal: &PgJournalBackend, batch: &JournalBatch) -> anyhow::Result<()> {
+    journal
+        .commit(batch)
+        .await
+        .map_err(|failure| anyhow!("fixture journal commit: {failure:?}"))?;
+    Ok(())
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires isolated PostgreSQL"]
 async fn fenced_initialization_replays_existing_journal_and_venue_state(
@@ -193,16 +202,16 @@ async fn fenced_initialization_replays_existing_journal_and_venue_state(
 
     let terminal = batch(s, IntentKind::Exit, None);
     let terminal_link = linked_sell(&f, &terminal.intent);
-    journal.commit(&terminal).await?;
-    journal.commit(&batch(s, IntentKind::Cancel, Some("100"))).await?;
+    journal_commit(&journal, &terminal).await?;
+    journal_commit(&journal, &batch(s, IntentKind::Cancel, Some("100"))).await?;
     let mut final_order = zero_execution_order("100", "CANCELED", OrderPhase::Terminal);
     final_order.client_order_id = terminal_link.client_order_id.clone();
     f.ledger.record_order(&final_order, &terminal_link, seen(2)).await?;
-    journal.commit(&batch(s, IntentKind::Cancel, Some("100"))).await?;
+    journal_commit(&journal, &batch(s, IntentKind::Cancel, Some("100"))).await?;
 
     let pending = batch(s, IntentKind::Exit, None);
     let pending_link = linked_sell(&f, &pending.intent);
-    journal.commit(&pending).await?;
+    journal_commit(&journal, &pending).await?;
     let mut open_order = zero_execution_order("101", "NEW", OrderPhase::Live);
     open_order.client_order_id = pending_link.client_order_id.clone();
     f.ledger.record_order(&open_order, &pending_link, seen(3)).await?;
@@ -216,7 +225,7 @@ async fn fenced_initialization_replays_existing_journal_and_venue_state(
         venue_outcome: Some(VenueOutcome::Rejected),
         ..OutcomeRow::default()
     });
-    journal.commit(&rejected).await?;
+    journal_commit(&journal, &rejected).await?;
     f.ledger
         .record_order(&zero_execution_order("102", "NEW", OrderPhase::Live), &unowned(), seen(4))
         .await?;
@@ -275,7 +284,7 @@ async fn fenced_initialization_refuses_conflict_and_retires_failed_replay(
     let s = scope(&f);
     let journal = PgJournalBackend::new(&pool, s.tenant);
     let pending = batch(s, IntentKind::Exit, None);
-    journal.commit(&pending).await?;
+    journal_commit(&journal, &pending).await?;
 
     let mut writer = pool.begin().await?;
     sqlx::query(
