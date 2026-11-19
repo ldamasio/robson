@@ -968,7 +968,7 @@ fn prepared_commission_mutation_violations(text: &str) -> Vec<String> {
     // The companion ::bind_spot_commission signer is pinned separately with
     // the other exact transport bodies in binance_rest.rs.
     const EXACT_FIXED_TRANSPORT: &str =
-        "f70bc51cf7f518ca300eac8ab67efd4ae8cf7204090546f88e78b246c4f10065";
+        "db1d5c686bca0ac2fda8a858bb8c8049504fb4907beb03cefcf59e23bd11834b";
     if hex::encode(Sha256::digest(text.as_bytes())) == EXACT_FIXED_TRANSPORT {
         Vec::new()
     } else {
@@ -983,7 +983,7 @@ fn the_commission_transport_allowance_rejects_changed_send_or_client() {
     for (before, after) in [
         ("single_shot()?", "reqwest::Client::new()"),
         ("bind_spot_commission", "bind_spot_order"),
-        ("self.request.send()", "{ self.request.try_clone().unwrap().send(); self.request.send() }"),
+        ("self.transport.execute(self.request)", "self.transport.clone().execute(self.request)"),
     ] {
         assert!(original.contains(before));
         assert!(!prepared_commission_mutation_violations(&original.replacen(before, after, 1)).is_empty());

@@ -278,7 +278,7 @@ impl BinanceRestClient {
         transport: Client,
         symbol: &str,
         timestamp_ms: i64,
-    ) -> Result<RequestBuilder, BinanceRestError> {
+    ) -> Result<(Client, reqwest::Request), BinanceRestError> {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
 
@@ -297,7 +297,11 @@ impl BinanceRestClient {
             self.endpoint_base_url(ENDPOINT),
             ENDPOINT,
         );
-        Ok(transport.get(url).header("X-MBX-APIKEY", &self.api_key))
+        let (transport, request) =
+            transport.get(url).header("X-MBX-APIKEY", &self.api_key).build_split();
+        let request = request
+            .map_err(|_| BinanceRestError::Refused("commission request construction failed".into()))?;
+        Ok((transport, request))
     }
 
     /// Send one request and read its body under one bound for both
@@ -2286,6 +2290,18 @@ mod tests {
         &code[start..end]
     }
 
+    #[tokio::test]
+    async fn commission_signer_rejects_a_stored_builder_error_before_send() {
+        let client = BinanceRestClient::new("invalid\nfixture-key".into(), "fixture-secret".into());
+        let result = client.bind_spot_commission(single_shot().unwrap(), "BTCUSDT", 1_800_000_000_000);
+        match result {
+            Err(BinanceRestError::Refused(detail)) => {
+                assert_eq!(detail, "commission request construction failed");
+            }
+            _ => panic!("an invalid fixture header should fail before constructing a send future"),
+        }
+    }
+
     /// ADR-0056 step 8c-3: signed/mutation helpers retain their original pins.
     /// The extracted unmeasured legacy answer retains its complete baseline
     /// body; only its signature name is normalized. The measured dispatch is
@@ -2295,7 +2311,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let goldens = [
             ("    fn build_signed_query(", BUILD_SIGNED_QUERY),
-            ("    pub(crate) fn bind_spot_commission(", "36809f9e478f6f2ca4de74095786ba2740e8f7e971ffa7413b2c04687d4d6357"),
+            ("    pub(crate) fn bind_spot_commission(", "a1c0ee8006959b079a865bd367aa591229781bf02ab3870c799e92a377667c87"),
             ("    async fn legacy_answer(&self, request: RequestBuilder)", ANSWER),
             ("    async fn exchange(&self, request: RequestBuilder)", EXCHANGE),
             ("    fn pass_gate(&self, method: &str, endpoint: &str)", PASS_GATE),

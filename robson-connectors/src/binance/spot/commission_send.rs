@@ -2,7 +2,7 @@
 
 use std::{future::Future, sync::Arc};
 
-use reqwest::{Client, RequestBuilder, Response};
+use reqwest::{Client, Request, Response};
 use robson_domain::Symbol;
 
 use crate::binance_rest::{single_shot, BinanceRestClient, BinanceRestError};
@@ -14,7 +14,8 @@ pub struct PreparedSpotCommission {
 }
 
 pub struct SignedSpotCommission {
-    request: RequestBuilder,
+    transport: Client,
+    request: Request,
 }
 
 impl BinanceRestClient {
@@ -32,14 +33,14 @@ impl BinanceRestClient {
 
 impl PreparedSpotCommission {
     pub fn sign(self, timestamp_ms: i64) -> Result<SignedSpotCommission, BinanceRestError> {
-        let request =
+        let (transport, request) =
             self.signer.bind_spot_commission(self.transport, &self.symbol, timestamp_ms)?;
-        Ok(SignedSpotCommission { request })
+        Ok(SignedSpotCommission { transport, request })
     }
 }
 
 impl SignedSpotCommission {
     pub fn send(self) -> impl Future<Output = reqwest::Result<Response>> + Send {
-        self.request.send()
+        self.transport.execute(self.request)
     }
 }

@@ -35,7 +35,9 @@ use crate::{
 };
 
 use super::super::{ClaimIdentity, ClaimResult, FrequencyKey, PriorClaim, PriorEligibility, Trace};
-use super::{content_digest, CommissionOwner, CostIdentity, RefreshOutcome};
+use super::{
+    content_digest, CommissionOwner, CostIdentity, RefreshOutcome, VerifiedCommissionAccount,
+};
 
 const PAIR: &str = "BTCUSDT";
 const NO_CLOCK_PAIR: &str = "ETHUSDT";
@@ -57,6 +59,7 @@ const COMMISSION: &str = r#"{
 
 #[derive(Debug)]
 enum Request {
+    Account,
     Time,
     Commission {
         pair: String,
@@ -148,6 +151,28 @@ async fn serve(
             "200 OK",
             String::new(),
             format!(r#"{{"serverTime":{arrived_ms}}}"#),
+        )
+    } else if let Some(query) = start
+        .strip_prefix("GET /api/v3/account?")
+        .and_then(|line| line.strip_suffix(" HTTP/1.1"))
+    {
+        ensure!(keys.next() == Some(API_KEY) && keys.next().is_none(), "one fixture key header");
+        let (payload, signature) = query.split_once("&signature=").context("account signature")?;
+        ensure!(signature == fixture_signature(payload), "account signature of exact parameters");
+        ensure!(
+            payload
+                .strip_prefix("timestamp=")
+                .context("account timestamp")?
+                .parse::<i64>()?
+                > 0
+        );
+        (
+            Request::Account,
+            "200 OK",
+            String::new(),
+            format!(
+                r#"{{"uid":{UID},"canTrade":false,"accountType":"SPOT","permissions":["SPOT"],"balances":[]}}"#
+            ),
         )
     } else {
         ensure!(keys.next() == Some(API_KEY) && keys.next().is_none(), "one fixture key header");
@@ -567,23 +592,50 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
         API_KEY.to_owned(),
         std::str::from_utf8(API_SECRET)?.to_owned(),
     ));
+    let expected = account(tenant, PAIR)?;
+    let verified =
+        VerifiedCommissionAccount::verified_loopback(expected.clone(), Arc::clone(&client))
+            .await
+            .map_err(|error| anyhow!("verified loopback account: {error:?}"))?;
+    let signer_binding = verified.binding;
     let mut owner = ClockOwner::controlled(
         Arc::clone(&clock),
-        client,
+        Arc::clone(&client),
         ClockSampleStore::from_committed_epoch(&pool, tenant, &start),
         budget.clone(),
         tenant,
         start.epoch.epoch_id,
     )
     .map_err(|error| anyhow!("fixture clock owner: {error:?}"))?;
-    let signer_binding = Uuid::now_v7();
+
+    let other_signer = Arc::new(BinanceRestClient::with_harness_base_url(
+        wire.origin.clone(),
+        API_KEY.to_owned(),
+        std::str::from_utf8(API_SECRET)?.to_owned(),
+    ));
+    let mut denied = None;
+    ensure!(owner
+        .prepare_commission(
+            &expected,
+            &other_signer,
+            &mut denied,
+            Instant::now() + Duration::from_secs(1)
+        )
+        .await
+        .is_err());
+    ensure!(
+        denied.is_none() && wire.count()? == 1,
+        "different signer never prepares or sends"
+    );
+    println!("N5 fixture account verification uses one separate signed account request");
 
     count_store_wire(
         &pool,
         &mut CommissionOwner {
             clock: &owner,
-            account: account(tenant, NO_CLOCK_PAIR)?,
-            signer_binding,
+            account: verified
+                .with_symbol(account(tenant, NO_CLOCK_PAIR)?.symbol().clone())
+                .map_err(|error| anyhow!("same verified account: {error:?}"))?,
             preparation: None,
         },
         no_clock,
@@ -593,7 +645,7 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
     )
     .await?;
     no_snapshot(&pool, NO_CLOCK_PAIR, "no_send", false).await?;
-    ensure!(budget.handoffs() == Ok(0) && wire.count()? == 0, "C8 not published yet");
+    ensure!(budget.handoffs() == Ok(0) && wire.count()? == 1, "C8 not published yet");
 
     let sample = owner
         .run_cycle()
@@ -608,13 +660,13 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
     .bind(tenant)
     .fetch_one(&pool)
     .await?;
-    ensure!(stored_sample && budget.handoffs() == Ok(1) && wire.count()? == 1);
+    ensure!(stored_sample && budget.handoffs() == Ok(1) && wire.count()? == 2);
 
-    let expected = account(tenant, PAIR)?;
     let mut commission = CommissionOwner {
         clock: &owner,
-        account: expected.clone(),
-        signer_binding,
+        account: verified
+            .with_symbol(expected.symbol().clone())
+            .map_err(|error| anyhow!("same verified account: {error:?}"))?,
         preparation: None,
     };
     count_store_wire(
@@ -628,7 +680,7 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
     .await?;
     let claim_wall_ms =
         verify_persisted_success(&pool, &expected, start.epoch, &clock, signer_binding).await?;
-    ensure!(budget.handoffs() == Ok(2) && wire.count()? == 2, "one signed commission");
+    ensure!(budget.handoffs() == Ok(2) && wire.count()? == 3, "one signed commission");
     count_store_wire(
         &pool,
         &mut commission,
@@ -639,7 +691,7 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
     )
     .await?;
     ensure!(
-        budget.handoffs() == Ok(2) && wire.count()? == 2,
+        budget.handoffs() == Ok(2) && wire.count()? == 3,
         "stale claim cannot send again"
     );
 
@@ -647,8 +699,9 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
         &pool,
         &mut CommissionOwner {
             clock: &owner,
-            account: account(tenant, REDIRECT_PAIR)?,
-            signer_binding,
+            account: verified
+                .with_symbol(account(tenant, REDIRECT_PAIR)?.symbol().clone())
+                .map_err(|error| anyhow!("same verified account: {error:?}"))?,
             preparation: None,
         },
         redirect,
@@ -660,10 +713,10 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
     no_snapshot(&pool, REDIRECT_PAIR, "unknown", true).await?;
     ensure!(budget.handoffs() == Ok(3));
     let observed = wire.finish().await?;
-    let [Request::Time, Request::Commission { pair, signed_ms, arrived_ms }, Request::Commission { pair: declined, .. }] =
+    let [Request::Account, Request::Time, Request::Commission { pair, signed_ms, arrived_ms }, Request::Commission { pair: declined, .. }] =
         observed.as_slice()
     else {
-        return Err(anyhow!("expected one TIME and two commission connections without redirect"));
+        return Err(anyhow!("expected one account verification, one TIME and two commission connections without redirect"));
     };
     ensure!(pair == PAIR && declined == REDIRECT_PAIR);
     ensure!(

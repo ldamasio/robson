@@ -55,8 +55,12 @@ impl ClockOwner {
         self.epoch
     }
 
-    pub(crate) fn commission_cancelled(&self) -> &CancellationToken {
-        &self.cancel
+    pub(crate) fn is_commission_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    pub(crate) async fn commission_cancelled(&self) {
+        self.cancel.cancelled().await;
     }
 
     pub(crate) fn commission_capture(&self) -> Result<RawClockCapture, TimeError> {
@@ -83,10 +87,12 @@ impl ClockOwner {
     pub(crate) async fn prepare_commission(
         &self,
         account: &CostIdentity,
+        verified_client: &Arc<BinanceRestClient>,
         slot: &mut Option<CommissionPreparation>,
         deadline: Instant,
     ) -> Result<PreparedSpotCommission, TimeError> {
         if slot.is_some()
+            || !Arc::ptr_eq(&self.client, verified_client)
             || account.tenant() != self.tenant
             || account.venue().as_str() != "binance:spot"
         {

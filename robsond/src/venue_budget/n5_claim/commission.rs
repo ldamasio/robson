@@ -1,10 +1,10 @@
 //! Owned N5 attempt for the controlled loopback composition. The production
 //! startup factory has no constructor for this owner.
 
-use std::{future::poll_fn, task::Poll, time::Duration};
+use std::{future::poll_fn, sync::Arc, task::Poll, time::Duration};
 
 use chrono::{DateTime, Utc};
-use robson_connectors::binance::spot::PreparedSpotCommission;
+use robson_connectors::{binance::spot::PreparedSpotCommission, BinanceRestClient};
 use robson_exec::balance_costs::CostIdentity;
 use sha2::{Digest, Sha256};
 use tokio::time::{timeout_at, Instant};
@@ -28,9 +28,59 @@ const WIRE_LIMIT: Duration = Duration::from_secs(10);
 
 struct CommissionOwner<'a> {
     clock: &'a ClockOwner,
-    account: CostIdentity,
-    signer_binding: uuid::Uuid,
+    account: VerifiedCommissionAccount,
     preparation: Option<CommissionPreparation>,
+}
+
+struct VerifiedCommissionAccount {
+    identity: CostIdentity,
+    client: Arc<BinanceRestClient>,
+    binding: uuid::Uuid,
+}
+
+#[cfg(all(test, feature = "crash-points"))]
+impl VerifiedCommissionAccount {
+    /// Verify the fixture UID with the same signed client used by the owner.
+    /// Tenant and scope are the explicit trusted local fixture contract.
+    async fn verified_loopback(
+        identity: CostIdentity,
+        client: Arc<BinanceRestClient>,
+    ) -> Result<Self, TimeError> {
+        if identity.venue().as_str() != "binance:spot" {
+            return Err(TimeError::Native);
+        }
+        let response = timeout_at(
+            Instant::now() + WIRE_LIMIT,
+            robson_connectors::binance::spot::SpotRestReader::new(Arc::clone(&client)).account(),
+        )
+        .await
+        .map_err(|_| TimeError::Expired)?
+        .map_err(|_| TimeError::Transport)?;
+        if response.uid != identity.uid() {
+            return Err(TimeError::Venue);
+        }
+        Ok(Self {
+            identity,
+            client,
+            binding: uuid::Uuid::now_v7(),
+        })
+    }
+
+    fn with_symbol(&self, symbol: robson_domain::Symbol) -> Result<Self, TimeError> {
+        let identity = CostIdentity::new(
+            self.identity.tenant(),
+            self.identity.venue().clone(),
+            self.identity.scope().to_owned(),
+            self.identity.uid(),
+            symbol,
+        )
+        .map_err(|_| TimeError::Native)?;
+        Ok(Self {
+            identity,
+            client: Arc::clone(&self.client),
+            binding: self.binding,
+        })
+    }
 }
 
 struct OriginalAttempt {
@@ -94,13 +144,18 @@ impl CommissionOwner<'_> {
         parent_deadline: Instant,
         trace: &Trace,
     ) -> Result<RefreshOutcome, RefreshError> {
-        if self.signer_binding.is_nil() || self.account.symbol().as_pair() != key.symbol {
+        if self.account.identity.symbol().as_pair() != key.symbol {
             return Err(BudgetError::Invalid.into());
         }
         let deadline = parent_deadline.min(Instant::now() + REFRESH_LIMIT);
         let prepared = self
             .clock
-            .prepare_commission(&self.account, &mut self.preparation, deadline)
+            .prepare_commission(
+                &self.account.identity,
+                &self.account.client,
+                &mut self.preparation,
+                deadline,
+            )
             .await?;
         let pending = self.clock.reserve_commission(deadline)?;
         let captured = self.clock.commission_capture()?;
@@ -112,7 +167,7 @@ impl CommissionOwner<'_> {
         let next = ClaimIdentity {
             claim_id: uuid::Uuid::now_v7(),
             owner: self.clock.commission_epoch(),
-            digest: content_digest(&self.account, self.signer_binding, &key.symbol),
+            digest: content_digest(&self.account.identity, self.account.binding, &key.symbol),
             captured: captured.end_tick().map_err(|_| BudgetError::Invalid)?,
             audit_at,
         };
@@ -129,7 +184,9 @@ impl CommissionOwner<'_> {
         };
         let attempt = OriginalAttempt { key, claim: original, prepared };
         let wire_deadline = deadline.min(Instant::now() + WIRE_LIMIT);
-        let result = attempt.observe(self.clock, &self.account, pending, wire_deadline).await;
+        let result = attempt
+            .observe(self.clock, &self.account.identity, pending, wire_deadline)
+            .await;
         match publish_result(pool, result, deadline, trace).await? {
             Publication::Published | Publication::Replayed => Ok(RefreshOutcome::Published),
             Publication::Refused => Ok(RefreshOutcome::ResultRefused),
@@ -167,7 +224,7 @@ impl OriginalAttempt {
             conclusion: ClaimResult::NoSend,
             snapshot: None,
         };
-        if clock.commission_cancelled().is_cancelled() || Instant::now() >= deadline {
+        if clock.is_commission_cancelled() || Instant::now() >= deadline {
             return result;
         }
         let Ok(signing) = clock.commission_signing_time() else {
@@ -180,7 +237,7 @@ impl OriginalAttempt {
         let mut receipt = None;
         let request = async {
             let answer = poll_fn(|cx| {
-                if clock.commission_cancelled().is_cancelled() || Instant::now() >= deadline {
+                if clock.is_commission_cancelled() || Instant::now() >= deadline {
                     return Poll::Ready(Err(ClaimResult::Unknown));
                 }
                 let next = if receipt.is_none() {
@@ -212,7 +269,7 @@ impl OriginalAttempt {
         };
         let conclusion = tokio::select! {
             biased;
-            _ = clock.commission_cancelled().cancelled() => Err(ClaimResult::Unknown),
+            _ = clock.commission_cancelled() => Err(ClaimResult::Unknown),
             answer = timeout_at(deadline, request) => answer.unwrap_or(Err(ClaimResult::Unknown)),
         };
         if let Some(receipt) = receipt {
