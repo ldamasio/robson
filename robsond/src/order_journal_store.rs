@@ -17,6 +17,9 @@ mod clocked;
 #[cfg(test)]
 #[path = "order_journal_clocked_pg_tests.rs"]
 mod clocked_pg_tests;
+#[cfg(test)]
+#[path = "order_journal_projected_pg_tests.rs"]
+mod projected_pg_tests;
 #[path = "order_journal_readiness.rs"]
 mod readiness;
 #[allow(
@@ -31,16 +34,18 @@ use chrono::Utc;
 use robson_exec::{
     gate::Incident,
     order_journal::{
-        CommitFailure, JournalBackend, JournalBatch, ReleaseCounts, ReleaseRecord,
+        CommitFailure, IntentKind, JournalBackend, JournalBatch, ReleaseCounts, ReleaseRecord,
         StreamSuspensionRow,
     },
     venue::VenueId,
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
-use sqlx::{pool::PoolConnection, postgres::PgPoolOptions, Connection, PgPool, Postgres};
+use sqlx::{pool::PoolConnection, postgres::PgPoolOptions, Connection, PgPool, Postgres, Row};
 use tracing::Instrument as _;
 use uuid::Uuid;
+
+use crate::spot_order_set_store::{maintain_unbound_journal, JournalGeneration};
 
 /// The journal's own pool, so order writes never queue behind the daemon's.
 const JOURNAL_POOL_CONNECTIONS: u32 = 2;
@@ -75,6 +80,8 @@ pub struct PgJournalBackend {
     daemon_pool: PgPool,
     tenant_id: Uuid,
     ready_wait: Duration,
+    /// Private opt-in journal maintenance; `None` keeps the legacy statements.
+    order_set_projection: Option<JournalGeneration>,
 }
 
 impl PgJournalBackend {
@@ -92,6 +99,7 @@ impl PgJournalBackend {
             daemon_pool: daemon_pool.clone(),
             tenant_id,
             ready_wait: JOURNAL_READY_WAIT,
+            order_set_projection: None,
         }
     }
 
@@ -99,6 +107,85 @@ impl PgJournalBackend {
     pub fn with_ready_wait(mut self, ready_wait: Duration) -> Self {
         self.ready_wait = ready_wait;
         self
+    }
+
+    /// Opt one exact owner into journal maintenance. No daemon, operator or
+    /// release path calls this.
+    #[allow(dead_code, reason = "private isolated integration only")]
+    pub(crate) fn with_order_set_projection(mut self, generation: JournalGeneration) -> Self {
+        self.order_set_projection = Some(generation);
+        self
+    }
+
+    /// The opted-in binding, refused before any SQL unless the batch is the
+    /// one supported shape: an accounting-first Spot Protection/Exit intent
+    /// without admission, in the bound tenant and account scope.
+    fn projection_for(
+        &self,
+        batch: &JournalBatch,
+    ) -> Result<Option<&JournalGeneration>, CommitFailure> {
+        let Some(generation) = &self.order_set_projection else {
+            return Ok(None);
+        };
+        let refuse =
+            |why: &str| Err(CommitFailure::Known(format!("order-set journal refused: {why}")));
+        let intent = &batch.intent;
+        if !generation.is_valid()
+            || generation.tenant_id != self.tenant_id
+            || intent.intent_id.is_nil()
+        {
+            return refuse("invalid binding");
+        }
+        if intent.venue_id != VenueId::BINANCE_SPOT {
+            return refuse("not a Spot intent");
+        }
+        if intent.account_scope != generation.account_scope {
+            return refuse("another account scope");
+        }
+        let Some(balance) = &batch.balance else {
+            return refuse("not an accounting-first batch");
+        };
+        if balance.admission.is_some() {
+            return refuse("admission is not supported");
+        }
+        if !matches!(intent.kind, IntentKind::Protection | IntentKind::Exit) {
+            return refuse("unsupported intent kind");
+        }
+        Ok(Some(generation))
+    }
+
+    /// The one maintenance statement after the original source effects, in
+    /// the same transaction and under the original deadline.
+    async fn maintain_order_set(
+        &self,
+        generation: &JournalGeneration,
+        batch: &JournalBatch,
+        version: i64,
+        prior_member_expected: bool,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        started: Instant,
+        bound: Duration,
+    ) -> Result<(), CommitFailure> {
+        let maintained = maintain_unbound_journal(
+            &mut **tx,
+            generation,
+            version,
+            &batch.intent,
+            prior_member_expected,
+        )
+        .await
+        .map_err(|e| CommitFailure::Known(e.to_string()))?;
+        if maintained != Some(version) {
+            return Err(CommitFailure::Known(
+                "order-set journal refused: stale generation or nonmatching source".to_owned(),
+            ));
+        }
+        if started.elapsed() >= bound {
+            return Err(CommitFailure::Known(
+                "order-set journal deadline before COMMIT".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Probe until the journal answers or says its schema is missing. A probe
@@ -132,8 +219,10 @@ impl PgJournalBackend {
         &self,
         batch: &JournalBatch,
         tx: &mut sqlx::Transaction<'_, Postgres>,
-    ) -> Result<(), CommitFailure> {
-        self.write_routed(batch, tx, None).await.map(drop)
+    ) -> Result<bool, CommitFailure> {
+        self.write_routed(batch, tx, None)
+            .await
+            .map(|(_, prior_member_expected)| prior_member_expected)
     }
 
     /// The journal's statements. A prepared clocked route writes its clock row
@@ -143,12 +232,12 @@ impl PgJournalBackend {
         batch: &JournalBatch,
         tx: &mut sqlx::Transaction<'_, Postgres>,
         clock: Option<&clocked::Prepared>,
-    ) -> Result<Vec<clocked::ClockReceipt>, CommitFailure> {
+    ) -> Result<(Vec<clocked::ClockReceipt>, bool), CommitFailure> {
         let known = |error: sqlx::Error| CommitFailure::Known(error.to_string());
         let intent = &batch.intent;
+        let projected = self.order_set_projection.is_some();
         // The no-op update returns the row that owns the id, ours or not.
-        let owner = sqlx::query_scalar::<_, Uuid>(
-            r#"
+        let ordinary_intent = r#"
             INSERT INTO order_intents (
                 intent_id, tenant_id, venue_id, account_scope, client_order_id, position_id,
                 kind, cancels_order_id, params, created_at
@@ -156,35 +245,48 @@ impl PgJournalBackend {
             ON CONFLICT (venue_id, account_scope, client_order_id)
             DO UPDATE SET client_order_id = order_intents.client_order_id
             RETURNING intent_id
-            "#,
-        )
-        .bind(intent.intent_id)
-        .bind(self.tenant_id)
-        .bind(&intent.venue_id)
-        .bind(&intent.account_scope)
-        .bind(&intent.client_order_id)
-        .bind(intent.position_id)
-        .bind(intent.kind.as_str())
-        .bind(&intent.cancels_order_id)
-        .bind(&intent.params)
-        .bind(intent.created_at)
-        .fetch_one(&mut **tx)
-        .instrument(
-            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
-        )
-        .await
-        .map_err(known)?;
-        if owner != intent.intent_id {
+            "#;
+        let projected_intent;
+        let intent_sql = if projected {
+            let before = include_str!("spot_order_set_store/journal_before_write.sql");
+            projected_intent = format!(
+                "{before}, written AS ({ordinary_intent})
+                 SELECT written.intent_id, EXISTS (SELECT 1 FROM prior_member) AS prior_member_expected
+                 FROM written"
+            );
+            projected_intent.as_str()
+        } else {
+            ordinary_intent
+        };
+        let written = sqlx::query(intent_sql)
+            .bind(intent.intent_id)
+            .bind(self.tenant_id)
+            .bind(&intent.venue_id)
+            .bind(&intent.account_scope)
+            .bind(&intent.client_order_id)
+            .bind(intent.position_id)
+            .bind(intent.kind.as_str())
+            .bind(&intent.cancels_order_id)
+            .bind(&intent.params)
+            .bind(intent.created_at)
+            .fetch_one(&mut **tx)
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+            )
+            .await
+            .map_err(known)?;
+        if written.try_get::<Uuid, _>("intent_id").map_err(known)? != intent.intent_id {
             return Err(CommitFailure::IdSpent);
         }
+        let prior_member_expected =
+            projected && written.try_get("prior_member_expected").map_err(known)?;
 
         if !batch.attempts.is_empty() {
             let ids: Vec<Uuid> = batch.attempts.iter().map(|a| a.attempt_id).collect();
             let created: Vec<_> = batch.attempts.iter().map(|a| a.created_at).collect();
             let rejected: Vec<_> = batch.attempts.iter().map(|a| a.rejected_at).collect();
             // Rule 1: `rejected` absorbs `started`, in whichever order they land.
-            sqlx::query(
-                r#"
+            let ordinary_attempts = r#"
                 INSERT INTO submit_attempts (
                     attempt_id, venue_id, account_scope, client_order_id, state, created_at,
                     rejected_at
@@ -199,8 +301,20 @@ impl PgJournalBackend {
                                    OR EXCLUDED.state = 'rejected'
                                  THEN 'rejected' ELSE 'started' END,
                     rejected_at = COALESCE(submit_attempts.rejected_at, EXCLUDED.rejected_at)
-                "#,
-            )
+                "#;
+            let projected_attempts;
+            let attempt_sql = if projected {
+                projected_attempts = format!(
+                    "{ordinary_attempts}
+                     WHERE (submit_attempts.venue_id, submit_attempts.account_scope,
+                            submit_attempts.client_order_id)
+                         = (excluded.venue_id, excluded.account_scope, excluded.client_order_id)"
+                );
+                projected_attempts.as_str()
+            } else {
+                ordinary_attempts
+            };
+            let attempts = sqlx::query(attempt_sql)
             .bind(&ids)
             .bind(&intent.venue_id)
             .bind(&intent.account_scope)
@@ -226,6 +340,12 @@ impl PgJournalBackend {
                 }
                 known(error)
             })?;
+            if projected && attempts.rows_affected() != ids.len() as u64 {
+                return Err(CommitFailure::Known(
+                    "order-set journal refused: submit attempt belongs to another intent"
+                        .to_owned(),
+                ));
+            }
         }
 
         if let Some(outcome) = &batch.outcome {
@@ -255,10 +375,12 @@ impl PgJournalBackend {
             .await
             .map_err(known)?;
         }
-        if batch.balance.is_some() {
-            return Box::pin(self.write_balance(batch, tx, clock)).await;
-        }
-        Ok(Vec::new())
+        let receipts = if batch.balance.is_some() {
+            Box::pin(self.write_balance(batch, tx, clock)).await?
+        } else {
+            Vec::new()
+        };
+        Ok((receipts, prior_member_expected))
     }
 }
 
@@ -266,8 +388,10 @@ impl PgJournalBackend {
 impl JournalBackend for PgJournalBackend {
     async fn commit(&self, batch: &JournalBatch) -> Result<(), CommitFailure> {
         let started = Instant::now();
-        if batch.balance.is_some() {
-            return Box::pin(self.commit_balance(batch, started)).await;
+        let projection = self.projection_for(batch)?;
+        if let Some(balance) = &batch.balance {
+            return Box::pin(self.commit_balance(batch, started, balance.commit_bound, projection))
+                .await;
         }
         if batch.intent.venue_id == VenueId::BINANCE_SPOT {
             return Err(CommitFailure::Known(

@@ -6,7 +6,7 @@ use sqlx::{Connection, Postgres, Transaction};
 use tracing::Instrument as _;
 
 use super::PgJournalBackend;
-use crate::ledger_connection::LedgerConnection;
+use crate::{ledger_connection::LedgerConnection, spot_order_set_store::JournalGeneration};
 
 fn known(error: sqlx::Error) -> CommitFailure {
     CommitFailure::Known(error.to_string())
@@ -28,6 +28,8 @@ impl PgJournalBackend {
         &self,
         batch: &JournalBatch,
         started: Instant,
+        bound: Duration,
+        projection: Option<&JournalGeneration>,
     ) -> Result<(), CommitFailure> {
         let connection = self.pool.acquire().await.map_err(known)?;
         let mut write = LedgerConnection::new(connection);
@@ -41,8 +43,26 @@ impl PgJournalBackend {
             )
             .await
             .map_err(known)?;
-        Box::pin(self.prepare_balance(batch, &mut tx, started)).await?;
-        self.write(batch, &mut tx).await?;
+        let version = Box::pin(self.prepare_accounting_write(
+            &batch.intent.venue_id,
+            bound,
+            &mut tx,
+            started,
+        ))
+        .await?;
+        let prior_member_expected = self.write(batch, &mut tx).await?;
+        if let Some(generation) = projection {
+            Box::pin(self.maintain_order_set(
+                generation,
+                batch,
+                version,
+                prior_member_expected,
+                &mut tx,
+                started,
+                bound,
+            ))
+            .await?;
+        }
         // Preserve J's existing conservative COMMIT classification.
         tx.commit()
             .instrument(
@@ -51,20 +71,6 @@ impl PgJournalBackend {
             .await
             .map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
         write.finished = true;
-        Ok(())
-    }
-
-    pub(super) async fn prepare_balance(
-        &self,
-        batch: &JournalBatch,
-        tx: &mut Transaction<'_, Postgres>,
-        started: Instant,
-    ) -> Result<(), CommitFailure> {
-        let Some(balance) = &batch.balance else {
-            return Ok(());
-        };
-        self.prepare_accounting_write(&batch.intent.venue_id, balance.commit_bound, tx, started)
-            .await?;
         Ok(())
     }
 

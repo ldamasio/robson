@@ -412,6 +412,11 @@ impl PgJournalBackend {
     ) -> Result<Vec<ClockReceipt>, CommitFailure> {
         let known = |error: sqlx::Error| CommitFailure::Known(error.to_string());
         let prepared = self.prepare_clocked(batch, input)?;
+        // Checked on the input itself: a batch without attempts has no capture.
+        let projection = self.projection_for(batch)?;
+        if projection.is_some_and(|generation| generation.process_epoch != input.process_epoch) {
+            return Err(refused("process epoch is not the order-set binding's"));
+        }
         if Instant::now() >= deadline {
             return Err(refused("deadline before connection acquisition"));
         }
@@ -428,9 +433,27 @@ impl PgJournalBackend {
             )
             .await
             .map_err(known)?;
-        Box::pin(self.prepare_accounting_write(&batch.intent.venue_id, bound, &mut tx, started))
+        let version = Box::pin(self.prepare_accounting_write(
+            &batch.intent.venue_id,
+            bound,
+            &mut tx,
+            started,
+        ))
+        .await?;
+        let (receipts, prior_member_expected) =
+            Box::pin(self.write_routed(batch, &mut tx, Some(&prepared))).await?;
+        if let Some(generation) = projection {
+            Box::pin(self.maintain_order_set(
+                generation,
+                batch,
+                version,
+                prior_member_expected,
+                &mut tx,
+                started,
+                bound,
+            ))
             .await?;
-        let receipts = Box::pin(self.write_routed(batch, &mut tx, Some(&prepared))).await?;
+        }
         // Same-poll expiry: a completed receipt past the deadline never commits.
         if Instant::now() >= deadline {
             return Err(CommitFailure::Known("clocked journal deadline before COMMIT".to_owned()));

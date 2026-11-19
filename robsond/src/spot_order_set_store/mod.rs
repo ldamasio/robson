@@ -1,8 +1,63 @@
 //! Coherent read of a persisted order-set generation identity.
 //! Exact source and writer qualification belongs to the order-set owner.
-use robson_exec::venue::VenueId;
+use robson_exec::{order_journal::IntentRow, venue::VenueId};
 use sqlx::PgConnection;
+use tracing::Instrument as _;
 use uuid::Uuid;
+
+mod cold_source;
+
+/// Private opt-in owner and structural binding for journal maintenance. Only
+/// an isolated integration supplies one; it confers no readiness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JournalGeneration {
+    pub(crate) tenant_id: Uuid,
+    pub(crate) account_scope: String,
+    pub(crate) generation_id: Uuid,
+    pub(crate) process_epoch: Uuid,
+    pub(crate) source_audit_id: Uuid,
+}
+
+impl JournalGeneration {
+    pub(crate) fn is_valid(&self) -> bool {
+        !(self.account_scope.trim().is_empty()
+            || self.tenant_id.is_nil()
+            || self.generation_id.is_nil()
+            || self.process_epoch.is_nil()
+            || self.source_audit_id.is_nil())
+    }
+}
+
+const JOURNAL_UNBOUND: &str = include_str!("journal_unbound.sql");
+
+/// One statement on the caller's transaction, after its original intent and
+/// attempt effects and under its accounting lock. `version` is the one that
+/// transaction's accounting write returned. No row is a refusal.
+pub(crate) async fn maintain_unbound_journal(
+    connection: &mut PgConnection,
+    generation: &JournalGeneration,
+    version: i64,
+    intent: &IntentRow,
+    prior_member_expected: bool,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(JOURNAL_UNBOUND)
+        .bind(generation.tenant_id)
+        .bind(&generation.account_scope)
+        .bind(generation.generation_id)
+        .bind(generation.process_epoch)
+        .bind(generation.source_audit_id)
+        .bind(version)
+        .bind(intent.intent_id)
+        .bind(&intent.client_order_id)
+        .bind(intent.position_id)
+        .bind(intent.kind.as_str())
+        .bind(prior_member_expected)
+        .fetch_optional(connection)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
+        .await
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExpectedGeneration<'a> {
