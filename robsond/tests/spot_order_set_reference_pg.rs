@@ -172,13 +172,30 @@ async fn refuses_invalid_admission_and_wrong_journal_route(pool: PgPool) {
         Scope { venue: "other-venue", ..s },
         Scope { account: "other-account", ..s },
     ] {
-        let mut row = batch(wrong, IntentKind::Exit, None);
-        // Deliberately create the historical/conflicting shape M31 permits.
-        row.balance = None;
-        PgJournalBackend::new(&pool, wrong.tenant).commit(&row).await.unwrap();
+        let row = batch(wrong, IntentKind::Exit, None).intent;
+        // The current writer refuses unflagged Spot mutations. Seed the old
+        // M31 shape directly in the fixture to exercise the reader's refusal.
+        sqlx::query(
+            "INSERT INTO order_intents
+               (intent_id, tenant_id, venue_id, account_scope, client_order_id,
+                position_id, kind, params, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        )
+        .bind(row.intent_id)
+        .bind(wrong.tenant)
+        .bind(&row.venue_id)
+        .bind(&row.account_scope)
+        .bind(&row.client_order_id)
+        .bind(row.position_id)
+        .bind(row.kind.as_str())
+        .bind(&row.params)
+        .bind(row.created_at)
+        .execute(&pool)
+        .await
+        .unwrap();
         assert!(matches!(audit(&pool, s).await, Err(Refusal::JournalRoute)));
         sqlx::query("DELETE FROM order_intents WHERE intent_id=$1")
-            .bind(row.intent.intent_id)
+            .bind(row.intent_id)
             .execute(&pool)
             .await
             .unwrap();
