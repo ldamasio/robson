@@ -411,6 +411,19 @@ fn initializer_backend(proxy: &DbProxy) -> anyhow::Result<i32> {
     session.pid.context("native initializer PID")
 }
 
+async fn unbound_sell_identities(pool: &PgPool, s: Scope) -> anyhow::Result<Vec<(Uuid, bool)>> {
+    Ok(sqlx::query_as(
+        "SELECT intent_id, conflict FROM sell_shadow_intents
+         WHERE (scope_tenant,scope_venue,scope_account)=($1,$2,$3)
+           AND scope_kind='unbound' AND scope_symbol IS NULL AND potential ORDER BY intent_id",
+    )
+    .bind(s.tenant)
+    .bind(s.venue)
+    .bind(s.account)
+    .fetch_all(pool)
+    .await?)
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires isolated PostgreSQL"]
 async fn fenced_initialization_replays_existing_journal_and_venue_state(
@@ -699,6 +712,9 @@ async fn generated_history(
         (a.unbound_sell, a.unbound_sell_conflicts, b.unbound_sell) == (1, 0, 0),
         "pre-leg SELL remains a blocker only for its actual accounting owner"
     );
+    let pre_leg_member = [(pre_leg.intent.intent_id, false)];
+    ensure!(unbound_sell_identities(pool, first).await? == pre_leg_member);
+    ensure!(unbound_sell_identities(pool, second).await?.is_empty());
     let coverage: serde_json::Value =
         sqlx::query_scalar("SELECT coverage FROM spot_shadow_initialization WHERE generation=$1")
             .bind(ready.generation)
@@ -734,6 +750,8 @@ async fn generated_history(
         committed_event(&fixtures[owner], &journals[owner], event % 4, index).await?;
         check(pool, &ready, first).await?;
         check(pool, &ready, second).await?;
+        ensure!(unbound_sell_identities(pool, first).await? == pre_leg_member);
+        ensure!(unbound_sell_identities(pool, second).await?.is_empty());
     }
     eprintln!("SPOT_FENCED_INIT histories={history} base_cancels={cancels} owners=2 seed={seed} cutpoint={cutpoint} init_wire_frames={init_frames} hot_sql=1 old_snapshot_missed_late=true all_events_match=true coverage={coverage}");
     Ok(())
