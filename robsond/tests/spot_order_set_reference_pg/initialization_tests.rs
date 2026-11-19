@@ -10,7 +10,7 @@ use proptest::{
 use robson_exec::order_journal::JournalBatch;
 use robson_testkit::db_proxy::ProxyMode;
 use sqlx::{ConnectOptions, Executor, PgConnection};
-use tokio::time::{timeout_at, Instant};
+use tokio::time::{timeout, timeout_at, Instant};
 
 use super::sell_nested_work_tests::seed_history;
 use super::{
@@ -179,9 +179,13 @@ async fn check(
     s: Scope,
 ) -> anyhow::Result<InitializedOrderSet> {
     let hot = ready.read(pool, s, None).await?.context("exact initialized order set")?;
-    let cold = audit(pool, s)
-        .await
-        .map_err(|error| anyhow!("exhaustive reference: {error:?}"))?;
+    // This is the existing separate ceiling for the exhaustive scale witness.
+    let cold = timeout(Duration::from_secs(30), async {
+        crate::reader::Snapshot::open(pool, s).await?.finish().await
+    })
+    .await
+    .context("exhaustive initialization oracle deadline")?
+    .map_err(|error| anyhow!("exhaustive reference: {error:?}"))?;
     ensure!(hot.facts.position_id == s.position && hot.facts.accounting_version == cold.version);
     ensure!(hot.facts.sells() == cold_sells(&cold));
     ensure!(hot.facts.cancels() == cold_cancels(&cold));
@@ -429,6 +433,9 @@ async fn generated_history(
             .await?;
     ensure!(!stale_visible, "the obsolete early transaction misses the second owner");
     obsolete.rollback().await?;
+    sqlx::raw_sql("ANALYZE order_intents; ANALYZE venue_orders; ANALYZE submit_attempts;")
+        .execute(pool)
+        .await?;
 
     let (proxy, actor) = through_proxy_limit(pool, 1).await;
     proxy.enable_query_trace(32);
