@@ -598,7 +598,7 @@ fn isolated_test_fixture(
     owner_path: &Path,
 ) -> bool {
     let parent_cfg = cfg.replacen("#![", "#[", 1);
-    let gate = format!("{parent_cfg}#[path = \"{name}\"]\nmod {module};");
+    let gate = format!("{parent_cfg}#[path = \"{name}\"]\n{module};");
     fixture.starts_with(cfg)
         && owner.matches(&gate).count() == 1
         && owner.matches(name).count() == 1
@@ -687,7 +687,7 @@ fn commission_allowance_admits_only_its_named_owner_and_test_gates() {
             gate,
             fixture,
             "commission_tests.rs",
-            "tests",
+            "mod tests",
             cfg,
             references,
             &owner,
@@ -758,7 +758,22 @@ fn nothing_outside_the_spot_module_names_it() {
     let daemon_dir = workspace.join("robsond/src");
     let n5_dir = daemon_dir.join("venue_budget/n5_claim");
     let connector_dir = crate_dir().join("src");
+    let clock_dir = daemon_dir.join("venue_clock_owner");
     let fixtures = [
+        (
+            connector_dir.as_path(),
+            "inventory_loopback.rs",
+            "lib.rs",
+            "pub mod inventory_loopback",
+            "#![cfg(any(test, feature = \"crash-points\"))]\n",
+        ),
+        (
+            clock_dir.as_path(),
+            "c8_account_http.rs",
+            "pg_tests.rs",
+            "mod c8_account_http",
+            "#![cfg(all(test, feature = \"crash-points\"))]\n",
+        ),
         (
             connector_dir.as_path(),
             "spot_inventory_wire_tests.rs",
@@ -770,21 +785,21 @@ fn nothing_outside_the_spot_module_names_it() {
             daemon_dir.as_path(),
             "order_journal_physical_recovery_pg_tests.rs",
             "order_journal_projected_pg_tests.rs",
-            "physical_recovery",
+            "mod physical_recovery",
             "#![cfg(test)]\n",
         ),
         (
             n5_dir.as_path(),
             "commission_tests.rs",
             "commission.rs",
-            "tests",
+            "mod tests",
             "#![cfg(all(test, feature = \"crash-points\"))]\n",
         ),
         (
             n5_dir.as_path(),
             "result_tests.rs",
             "tests.rs",
-            "result_tests",
+            "mod result_tests",
             "#![cfg(test)]\n",
         ),
     ];

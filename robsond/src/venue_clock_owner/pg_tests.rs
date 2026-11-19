@@ -10,6 +10,10 @@ use crate::{
 #[path = "pg_tests/http.rs"]
 mod http;
 
+#[cfg(all(test, feature = "crash-points"))]
+#[path = "c8_account_http.rs"]
+mod c8_account_http;
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Result<()> {
@@ -20,6 +24,8 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
     let mut epoch = None;
     let mut owner = None;
     let mut http = None;
+    let mut account_http = None;
+    let mut account_slot: Option<inventory::AccountPreparation> = None;
     let primary = timeout_at(body_deadline, async {
         ensure!(matches!(bootstrap::production_input(), Err(BudgetError::PrerequisiteRefusal)));
         let clock = Arc::new(NativeClock::initialize()?);
@@ -61,6 +67,8 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
             "SELECT count(*) FROM clock_samples WHERE process_epoch=$1",
         ).bind(start.epoch.epoch_id).fetch_one(&pool).await?;
         ensure!(initial == 0, "no initial sample row");
+        ensure!(matches!(owner.commission_signing_time(), Err(TimeError::Native)),
+            "ACCOUNT has no signing authority before a positively published sample");
         ensure!(matches!(owner.run_cycle().await, Err(TimeError::Budget(BudgetError::Deferred))),
             "no TIME before the real unclean barrier");
         ensure!(budget.handoffs().map_err(|e| anyhow!("handoffs: {e:?}"))? == 0);
@@ -95,6 +103,71 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
             .published.as_ref().is_some_and(|p| p.id == sample), "actual publication before Closing");
         ensure!(!owner.state.lock().map_err(|_| anyhow!("state lock poisoned"))?.closing,
             "positive path remains open until the real stop");
+
+        // C8 ACCOUNT-only, no capital: the same owner, SharedBudget and
+        // positively read-back publication. Listener setup is fixture work.
+        account_http = Some(c8_account_http::AccountFixture::start(
+            body_deadline + crate::stop::StopTimings::default().deadline,
+        ).await?);
+        let venue = account_http.as_ref().context("owned ACCOUNT fixture")?;
+        let read_deadline = Instant::now() + Duration::from_secs(10);
+        let claim = clock.capture()?;
+        let mut pending = owner.reserve_account(read_deadline)
+            .map_err(|e| anyhow!("ACCOUNT reserve: {e:?}"))?;
+        let prepared = owner.prepare_account(&mut account_slot, read_deadline).await
+            .map_err(|e| anyhow!("ACCOUNT preparation: {e:?}"))?;
+        ensure!(account_slot.is_none(), "completed preparation consumed");
+        let signed = owner.commission_signing_time().map_err(|e| anyhow!("signing: {e:?}"))?;
+        ensure!(budget.handoffs().map_err(|e| anyhow!("handoffs: {e:?}"))? == 1);
+        ensure!(venue.connections() == 0, "nothing sent before the admitted first poll");
+        let admitted = owner.read_account(&signed, &mut pending, claim, prepared, venue.port, read_deadline)
+            .await.map_err(|e| anyhow!("ACCOUNT read: {e:?}"))?;
+        ensure!(admitted.sample == sample, "EOF receipt judged on the same published sample");
+        ensure!(admitted.send.epoch == start.epoch.epoch_id
+            && admitted.receive.epoch == start.epoch.epoch_id
+            && admitted.send.wall_agrees(&admitted.receive)?
+            && admitted.receive.end_tick()?.elapsed_since(&admitted.send.end_tick()?).is_ok(),
+            "original first poll and EOF brackets share the committed epoch and ordered TIME");
+        ensure!(venue.signing_stamp()? == signed.timestamp_ms(), "actual wire stamp is the original signed one");
+        ensure!(budget.handoffs().map_err(|e| anyhow!("handoffs: {e:?}"))? == 2,
+            "TIME 1 + ACCOUNT 1 handoffs on the one SharedBudget");
+        ensure!(venue.connections() == 1 && fixture.connections() == 1,
+            "one physical ACCOUNT connection, no further TIME");
+        drop(pending);
+        ensure!(budget.handoffs().map_err(|e| anyhow!("handoffs: {e:?}"))? == 2,
+            "a consumed reservation refunds nothing and sends nothing");
+        let probe_tick = clock.capture()?;
+        let probe_due = after(probe_tick, Duration::from_secs(1)).map_err(|e| anyhow!("{e:?}"))?;
+        let mut probes = Vec::new();
+        for _ in 0..18 {
+            probes.push(budget.try_reserve_account(probe_tick, probe_due)
+                .map_err(|e| anyhow!("steady ACCOUNT budget probe: {e:?}"))?);
+        }
+        let mut time_probes = Vec::new();
+        for _ in 0..19 {
+            time_probes.push(budget.try_reserve_time(probe_tick, probe_due)
+                .map_err(|e| anyhow!("steady TIME budget probe: {e:?}"))?);
+        }
+        ensure!(matches!(budget.try_reserve_time(probe_tick, probe_due), Err(BudgetError::Deferred)),
+            "TIME and ACCOUNT charged exactly 21 of the common 400 steady weight");
+        drop(time_probes);
+        drop(probes);
+        // Receipt refusals: superseded generation or sample are never borrowed.
+        let generation = owner.state.lock().map_err(|_| anyhow!("state lock poisoned"))?.generation;
+        for (g, s, refused) in [
+            (generation, sample, false),
+            (generation + 1, sample, true),
+            (generation, Uuid::now_v7(), true),
+        ] {
+            let raw = owner.state.lock().map_err(|_| anyhow!("state lock poisoned"))?
+                .capture_native(&clock, start.epoch.epoch_id).map_err(|e| anyhow!("{e:?}"))?;
+            let handoff = raw.end_tick()?;
+            let mark = inventory::AccountMark { generation: g, sample: s, raw, handoff };
+            let receipt = owner.account_receipt(&mark);
+            ensure!(receipt.is_err() == refused, "receipt control {g}/{s}: {receipt:?}");
+        }
+        ensure!(venue.connections() == 1 && budget.handoffs()
+            .map_err(|e| anyhow!("handoffs: {e:?}"))? == 2, "receipt checks send nothing");
         Ok::<_, anyhow::Error>(())
     }).await.map_err(|_| anyhow!("150s fixture body ceiling elapsed")).and_then(|r| r);
 
@@ -103,6 +176,10 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
     // The happy path stays open until run_stop_with_clock invalidates it.
     let asked_at = Instant::now();
     let deadline = asked_at + crate::stop::StopTimings::default().deadline;
+    // The test-owned ACCOUNT preparation retires on every path, before the
+    // owner's worker permit is needed by its own retirement.
+    let account_retired =
+        timeout_at(deadline, ClockOwner::retire_account(&mut account_slot)).await;
     let closing = owner.take().map(|owner| {
         // No await or spawned owner can advance this original baseline.
         let expected_handoffs = owner.budget.handoffs();
@@ -115,6 +192,9 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
         (closing, state, budget, expected_handoffs)
     });
     let mut failures = Vec::new();
+    if !matches!(account_retired, Ok(true)) {
+        failures.push(format!("ACCOUNT preparation retirement: {account_retired:?}"));
+    }
     if let Some((closing, state, budget, expected_handoffs)) = closing {
         let result =
             close_owner(&closing, &state, &budget, expected_handoffs, epoch.as_ref(), asked_at)
@@ -127,6 +207,11 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
     if let Some(http) = http.take() {
         if let Err(e) = http.finish(deadline).await {
             failures.push(format!("HTTP retirement: {e:#}"));
+        }
+    }
+    if let Some(account_http) = account_http.take() {
+        if let Err(e) = account_http.finish(deadline).await {
+            failures.push(format!("ACCOUNT HTTP retirement: {e:#}"));
         }
     }
     // Check the real marker even when the primary sample path failed.

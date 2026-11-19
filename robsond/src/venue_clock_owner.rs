@@ -28,6 +28,8 @@ use crate::{
 mod clock_state;
 mod commission;
 pub(crate) use commission::CommissionPreparation;
+#[cfg(all(test, feature = "crash-points"))]
+mod inventory;
 mod jobs;
 mod lifecycle;
 mod metrics;

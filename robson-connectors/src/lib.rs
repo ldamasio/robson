@@ -9,6 +9,9 @@
 pub mod binance;
 pub mod binance_rest;
 pub mod binance_ws;
+#[cfg(any(test, feature = "crash-points"))]
+#[path = "inventory_loopback.rs"]
+pub mod inventory_loopback;
 
 // Re-exports
 pub use binance_rest::{

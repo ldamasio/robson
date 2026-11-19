@@ -17,7 +17,7 @@ pub(crate) type CommissionPreparation =
     JoinHandle<Result<PreparedSpotCommission, BinanceRestError>>;
 
 pub(crate) struct CommissionSigningTime {
-    state: Arc<Mutex<ClockState>>,
+    pub(super) state: Arc<Mutex<ClockState>>,
     generation: u64,
     sample: Uuid,
     capture: RawClockCapture,
@@ -161,41 +161,51 @@ impl ClockOwner {
             pending,
             &self.clock,
             self.epoch,
-            || {
-                if state.closing || self.cancel.is_cancelled() {
-                    return Err(BudgetError::Closing);
-                }
-                if Instant::now() >= deadline {
-                    return Err(BudgetError::Expired);
-                }
-                if state.generation != signed.generation || signed.capture.epoch != self.epoch {
-                    return Err(BudgetError::Deferred);
-                }
-                let poll_mark = state
-                    .capture_native(&self.clock, self.epoch)
-                    .map_err(|_| BudgetError::Invalid)?;
-                let sample = state
-                    .published
-                    .as_ref()
-                    .filter(|s| s.id == signed.sample)
-                    .ok_or(BudgetError::Deferred)?;
-                let h = poll_mark.end_tick().map_err(|_| BudgetError::Invalid)?;
-                let elapsed = h.elapsed_since(&claim).map_err(|_| BudgetError::Invalid)?;
-                if elapsed > HANDOFF_LIMIT || Instant::now() >= deadline {
-                    return Err(BudgetError::Expired);
-                }
-                if sample.arithmetic.fits_capture(&poll_mark) != Ok(true)
-                    || signed.capture.wall_agrees(&poll_mark) != Ok(true)
-                    || wall_ns(&poll_mark)
-                        .and_then(|wall| window_allows(signed.timestamp_ms, wall, sample.u2))
-                        != Some(true)
-                {
-                    return Err(BudgetError::Deferred);
-                }
-                Ok(h)
-            },
+            || self.admit_signed(&mut state, signed, claim, deadline).map(|(h, _)| h),
             poll,
         )
+    }
+
+    /// The original signed first-poll clock admission, run by the budget core
+    /// under the held clock guard. Returns the end tick and the actual native
+    /// poll mark it was judged on.
+    pub(super) fn admit_signed(
+        &self,
+        state: &mut ClockState,
+        signed: &CommissionSigningTime,
+        claim: TickCapture,
+        deadline: Instant,
+    ) -> Result<(TickCapture, RawClockCapture), BudgetError> {
+        if state.closing || self.cancel.is_cancelled() {
+            return Err(BudgetError::Closing);
+        }
+        if Instant::now() >= deadline {
+            return Err(BudgetError::Expired);
+        }
+        if state.generation != signed.generation || signed.capture.epoch != self.epoch {
+            return Err(BudgetError::Deferred);
+        }
+        let poll_mark =
+            state.capture_native(&self.clock, self.epoch).map_err(|_| BudgetError::Invalid)?;
+        let sample = state
+            .published
+            .as_ref()
+            .filter(|s| s.id == signed.sample)
+            .ok_or(BudgetError::Deferred)?;
+        let h = poll_mark.end_tick().map_err(|_| BudgetError::Invalid)?;
+        let elapsed = h.elapsed_since(&claim).map_err(|_| BudgetError::Invalid)?;
+        if elapsed > HANDOFF_LIMIT || Instant::now() >= deadline {
+            return Err(BudgetError::Expired);
+        }
+        if sample.arithmetic.fits_capture(&poll_mark) != Ok(true)
+            || signed.capture.wall_agrees(&poll_mark) != Ok(true)
+            || wall_ns(&poll_mark)
+                .and_then(|wall| window_allows(signed.timestamp_ms, wall, sample.u2))
+                != Some(true)
+        {
+            return Err(BudgetError::Deferred);
+        }
+        Ok((h, poll_mark))
     }
 
     pub(crate) fn poll_commission_again(

@@ -45,6 +45,9 @@ pub(crate) struct PendingTime {
 
 pub(crate) struct PendingCommission(PendingTime);
 
+#[cfg(all(test, feature = "crash-points"))]
+pub(crate) struct PendingAccount(PendingTime);
+
 impl Drop for PendingTime {
     fn drop(&mut self) {
         if let Some(charge) = self.charge.take() {
@@ -164,14 +167,32 @@ impl SharedBudget {
         admit_clock: impl FnOnce() -> Result<TickCapture, BudgetError>,
         poll: impl FnOnce() -> std::task::Poll<reqwest::Result<reqwest::Response>>,
     ) -> Result<(TickCapture, std::task::Poll<reqwest::Result<reqwest::Response>>), BudgetError> {
-        if !Arc::ptr_eq(&self.0, &pending.0.owner.0) {
+        let admit = || admit_clock().map(|h| (h, ()));
+        self.poll_reserved_first(&mut pending.0, clock, epoch, admit, poll)
+            .map(|(now, (), result)| (now, result))
+    }
+
+    /// The shared reserved first poll: owner check, budget gate, the caller's
+    /// clock admission, budget check, charge handoff, poll and head
+    /// observation, in that order and under one budget guard. The admission
+    /// mark is returned as produced, never reconstructed.
+    fn poll_reserved_first<M>(
+        &self,
+        pending: &mut PendingTime,
+        clock: &NativeClock,
+        epoch: uuid::Uuid,
+        admit_clock: impl FnOnce() -> Result<(TickCapture, M), BudgetError>,
+        poll: impl FnOnce() -> std::task::Poll<reqwest::Result<reqwest::Response>>,
+    ) -> Result<(TickCapture, M, std::task::Poll<reqwest::Result<reqwest::Response>>), BudgetError>
+    {
+        if !Arc::ptr_eq(&self.0, &pending.owner.0) {
             return Err(BudgetError::Invalid);
         }
         let mut state = self.0.try_lock().map_err(|_| BudgetError::Deferred)?;
-        let now = admit_clock()?;
+        let (now, mark) = admit_clock()?;
         Self::check(&state, now)?;
         let next = state.handoffs.checked_add(1).ok_or(BudgetError::Invalid)?;
-        let charge = pending.0.charge.take().ok_or(BudgetError::Invalid)?;
+        let charge = pending.charge.take().ok_or(BudgetError::Invalid)?;
         if let Err((error, charge)) = state.model.handoff(charge, now) {
             let _ = state.model.cancel(charge);
             return Err(transition(error));
@@ -179,7 +200,32 @@ impl SharedBudget {
         state.handoffs = next;
         let result = poll();
         Self::observe_head(&mut state, &result, clock, epoch);
-        Ok((now, result))
+        Ok((now, mark, result))
+    }
+
+    /// Test-only C8 ACCOUNT reservation: weight 20, the same Steady class,
+    /// non-blocking gate and checks as commission, under its own type.
+    #[cfg(all(test, feature = "crash-points"))]
+    pub(crate) fn try_reserve_account(
+        &self,
+        now: TickCapture,
+        deadline: TickCapture,
+    ) -> Result<PendingAccount, BudgetError> {
+        let mut state = self.0.try_lock().map_err(|_| BudgetError::Deferred)?;
+        self.reserve_steady(&mut state, now, deadline, 20).map(PendingAccount)
+    }
+
+    #[cfg(all(test, feature = "crash-points"))]
+    pub(crate) fn poll_account_first<M>(
+        &self,
+        pending: &mut PendingAccount,
+        clock: &NativeClock,
+        epoch: uuid::Uuid,
+        admit_clock: impl FnOnce() -> Result<(TickCapture, M), BudgetError>,
+        poll: impl FnOnce() -> std::task::Poll<reqwest::Result<reqwest::Response>>,
+    ) -> Result<(TickCapture, M, std::task::Poll<reqwest::Result<reqwest::Response>>), BudgetError>
+    {
+        self.poll_reserved_first(&mut pending.0, clock, epoch, admit_clock, poll)
     }
 
     fn observe_head(

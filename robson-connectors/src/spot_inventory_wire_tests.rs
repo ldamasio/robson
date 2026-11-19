@@ -4,9 +4,7 @@
 
 use std::{future::Future, time::Duration};
 
-use hmac::{Hmac, Mac};
-use reqwest::{Client, StatusCode};
-use sha2::Sha256;
+use reqwest::StatusCode;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -14,100 +12,21 @@ use tokio::{
     time::timeout,
 };
 
-use super::{single_shot, BinanceRestError};
+use super::BinanceRestError;
+use crate::inventory_loopback::{
+    account_uid, prepare, InventoryRead, LOOPBACK_BODY_LIMIT, LOOPBACK_KEY as KEY,
+    LOOPBACK_SECRET as SECRET, LOOPBACK_UID,
+};
 
 const ACCOUNT: &str = include_str!("binance/spot/testdata/account.json");
 const OPEN_ORDERS: &str = include_str!("binance/spot/testdata/open_orders.json");
 const OPEN_ORDER_LIST: &str = include_str!("binance/spot/testdata/open_order_list.json");
 
-const KEY: &str = "c8-synthetic-key";
-const SECRET: &str = "c8-synthetic-secret";
 const STAMP: i64 = 1_800_000_000_000;
 const EXPECTED_SIGNATURE: &str = "5240291be8a1f9092fc18756b920e57afd279112d735c2e1100014969556c238";
 const STEP: Duration = Duration::from_secs(5);
 const OUTER: Duration = Duration::from_secs(20);
 const QUIET: Duration = Duration::from_millis(250);
-
-/// The closed set of inventory reads: fixed paths and weights, no parameter
-/// but the caller's timestamp.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InventoryRead {
-    Account,
-    AllOpenOrders,
-    OpenOrderLists,
-}
-
-impl InventoryRead {
-    const ALL: [Self; 3] = [Self::Account, Self::AllOpenOrders, Self::OpenOrderLists];
-
-    fn path(self) -> &'static str {
-        match self {
-            Self::Account => "/api/v3/account",
-            Self::AllOpenOrders => "/api/v3/openOrders",
-            Self::OpenOrderLists => "/api/v3/openOrderList",
-        }
-    }
-
-    fn weight(self) -> u32 {
-        match self {
-            Self::Account => 20,
-            Self::AllOpenOrders => 80,
-            Self::OpenOrderLists => 6,
-        }
-    }
-}
-
-/// One read with its own single-shot transport; moved into [`Self::sign`].
-struct PreparedRead {
-    read: InventoryRead,
-    transport: Client,
-}
-
-/// One signed request bound to its transport; moved into [`Self::send`].
-struct SignedRead {
-    transport: Client,
-    request: reqwest::Request,
-}
-
-fn prepare(read: InventoryRead) -> Result<PreparedRead, BinanceRestError> {
-    Ok(PreparedRead { read, transport: single_shot()? })
-}
-
-impl PreparedRead {
-    /// The canonical HMAC GET of the commission binder, with the immutable
-    /// caller timestamp as its only parameter.
-    fn sign(self, port: u16, timestamp_ms: i64) -> Result<SignedRead, BinanceRestError> {
-        if timestamp_ms <= 0 {
-            return Err(BinanceRestError::Refused("invalid inventory timestamp".into()));
-        }
-        let endpoint = self.read.path();
-        let query = format!("timestamp={timestamp_ms}");
-        let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes())
-            .map_err(|e| BinanceRestError::SignatureError(format!("HMAC error: {e}")))?;
-        mac.update(query.as_bytes());
-        let signature = hex::encode(mac.finalize().into_bytes());
-        let url = format!("http://127.0.0.1:{port}{endpoint}?{query}&signature={signature}",);
-        let (transport, request) =
-            self.transport.get(url).header("X-MBX-APIKEY", KEY).build_split();
-        let request = request.map_err(|_| {
-            BinanceRestError::Refused("inventory request construction failed".into())
-        })?;
-        Ok(SignedRead { transport, request })
-    }
-}
-
-impl SignedRead {
-    /// One request, sent when first polled; the original head, body unread.
-    fn send(self) -> impl Future<Output = Result<reqwest::Response, BinanceRestError>> {
-        let SignedRead { transport, request } = self;
-        async move {
-            transport
-                .execute(request)
-                .await
-                .map_err(|e| BinanceRestError::RequestFailed(e.without_url().to_string()))
-        }
-    }
-}
 
 async fn bounded<F: Future>(test: F) -> F::Output {
     timeout(OUTER, test).await.expect("outer test deadline")
@@ -343,4 +262,31 @@ async fn a_redirect_is_the_answer_and_is_not_followed() {
         }
     })
     .await;
+}
+
+#[test]
+fn the_account_decode_is_strict_bounded_and_returns_only_the_uid() {
+    let synthetic = format!(
+        "{{\"canTrade\":false,\"accountType\":\"SPOT\",\"permissions\":[],\"balances\":[],\"uid\":{LOOPBACK_UID}}}"
+    );
+    assert_eq!(account_uid(synthetic.as_bytes()).unwrap(), LOOPBACK_UID);
+    assert_eq!(account_uid(ACCOUNT.as_bytes()).unwrap(), 354937868);
+    let cut = &synthetic.as_bytes()[..synthetic.len() - 1];
+    let trailing = format!("{synthetic} {{}}");
+    let negative = synthetic.replace(&LOOPBACK_UID.to_string(), "-1");
+    let mistyped = synthetic.replace("\"canTrade\":false", "\"canTrade\":\"false\"");
+    let missing = synthetic.replace("\"balances\":[],", "");
+    let mut long = synthetic.clone().into_bytes();
+    long.resize(LOOPBACK_BODY_LIMIT + 1, b' ');
+    for body in [
+        cut,
+        trailing.as_bytes(),
+        negative.as_bytes(),
+        mistyped.as_bytes(),
+        missing.as_bytes(),
+        b"[]".as_slice(),
+        long.as_slice(),
+    ] {
+        assert!(matches!(account_uid(body), Err(BinanceRestError::Refused(_))));
+    }
 }
