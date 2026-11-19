@@ -319,6 +319,44 @@ async fn first_cancel_deadline_before_commit_discards_the_owned_connection(
 
 #[sqlx::test(migrations = false)]
 #[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn first_cancel_barrier_and_expired_timer_ready_together_forbid_commit(
+    pool: PgPool,
+) -> Result<()> {
+    migrate_fixture(&pool).await?;
+    let leg = PositiveLeg::admit(&pool).await?;
+    let version = leg.accounting_version(&pool).await?;
+    let before = durable(&pool, leg.tenant).await?;
+    let intent = leg.cancel_intent();
+    let wire = Wire::new(&pool, leg.tenant).await?;
+    let (slot, reached, release) = pause();
+    let apply = PAUSE
+        .scope(slot, wire.store.commit_first_cancel(&intent, request(Uuid::now_v7(), version)));
+    tokio::pin!(apply);
+    tokio::select! {
+        result = &mut apply => anyhow::bail!("unexpected completion before COMMIT barrier: {result:?}"),
+        reached = timeout(Duration::from_millis(400), reached) => reached??,
+    }
+    wire.assert_prefix(5);
+    // Keep the driver future unpolled while the real transaction stays open.
+    // At the next poll both its barrier and outer timeout are ready.
+    tokio::time::sleep(COMMIT_BOUND + Duration::from_millis(10)).await;
+    release
+        .send(())
+        .map_err(|_| anyhow::anyhow!("writer stopped before resumption"))?;
+    let result = apply.await;
+    assert_eq!(
+        result,
+        Err(CommitFailure::Known(DEADLINE_BEFORE_COMMIT.into())),
+        "first_cancel_barrier_and_expired_timer_ready_together_forbid_commit"
+    );
+    wire.retires(&pool).await?;
+    wire.assert_prefix(5);
+    assert_eq!(durable(&pool, leg.tenant).await?, before);
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
 async fn first_cancel_fresh_claim_refuses_spent_id_and_already_bound_open_row(
     pool: PgPool,
 ) -> Result<()> {

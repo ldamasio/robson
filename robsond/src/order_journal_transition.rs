@@ -40,6 +40,8 @@ struct StoredFirstCancel {
     accounting_version: i64,
 }
 
+const DEADLINE_BEFORE_COMMIT: &str = "first-cancel deadline expired before COMMIT";
+
 const INSERT_CANCEL: &str = "
     INSERT INTO order_intents
         (intent_id, tenant_id, venue_id, account_scope, client_order_id, position_id,
@@ -165,6 +167,11 @@ impl PgJournalBackend {
             }
             #[cfg(test)]
             faults::before_commit().await;
+            // timeout_at polls the operation before its timer. If SQL and the
+            // deadline became ready together, do not enter COMMIT.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(CommitFailure::Known(DEADLINE_BEFORE_COMMIT.into()));
+            }
             commit_started = true;
             tx.commit()
                 .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64))
@@ -186,9 +193,7 @@ impl PgJournalBackend {
             Err(_) if commit_started => Err(CommitFailure::Uncertain(
                 "first-cancel commit did not answer within its bound".into(),
             )),
-            Err(_) => {
-                Err(CommitFailure::Known("first-cancel deadline expired before COMMIT".into()))
-            },
+            Err(_) => Err(CommitFailure::Known(DEADLINE_BEFORE_COMMIT.into())),
         }
     }
 }
