@@ -101,16 +101,25 @@
                + d.conflict_delta AS conflict_next
     FROM cancel_counts d
     CROSS JOIN gen g
-    LEFT JOIN public.spot_order_set_cancel_legs l
-      ON d.kind = 'leg'
-     AND (l.tenant_id, l.venue_id, l.account_scope, l.generation_id, l.symbol, l.position_id)
-       = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.symbol, d.position_id)
-    LEFT JOIN public.spot_order_set_cancel_ungroupable x
-      ON d.kind = 'ungroupable'
-     AND (x.tenant_id, x.venue_id, x.account_scope, x.generation_id, x.symbol, x.position_id)
-       = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.symbol, d.position_id)
-    LEFT JOIN public.spot_order_set_cancel_unbound u
-      ON d.kind = 'unbound'
-     AND (u.tenant_id, u.venue_id, u.account_scope, u.generation_id)
-       = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id)
+    LEFT JOIN LATERAL (
+        SELECT tenant_id, active_count, conflict_count
+        FROM public.spot_order_set_cancel_legs
+        WHERE d.kind = 'leg'
+          AND (tenant_id, venue_id, account_scope, generation_id, symbol, position_id)
+            = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.symbol, d.position_id)
+        LIMIT 1) l ON true
+    LEFT JOIN LATERAL (
+        SELECT tenant_id, active_count, conflict_count
+        FROM public.spot_order_set_cancel_ungroupable
+        WHERE d.kind = 'ungroupable'
+          AND (tenant_id, venue_id, account_scope, generation_id, symbol, position_id)
+            = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.symbol, d.position_id)
+        LIMIT 1) x ON true
+    LEFT JOIN LATERAL (
+        SELECT tenant_id, active_count, conflict_count
+        FROM public.spot_order_set_cancel_unbound
+        WHERE d.kind = 'unbound'
+          AND (tenant_id, venue_id, account_scope, generation_id)
+            = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id)
+        LIMIT 1) u ON true
 )

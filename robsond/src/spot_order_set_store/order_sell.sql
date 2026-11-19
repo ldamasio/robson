@@ -133,16 +133,25 @@
                + d.conflict_delta AS conflict_next
     FROM sell_counts d
     CROSS JOIN gen g
-    LEFT JOIN public.spot_order_set_sell_legs l
-      ON d.kind = 'leg'
-     AND (l.tenant_id, l.venue_id, l.account_scope, l.generation_id, l.symbol, l.position_id)
-       = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.symbol, d.position_id)
-    LEFT JOIN public.spot_order_set_sell_symbols y
-      ON d.kind = 'symbol'
-     AND (y.tenant_id, y.venue_id, y.account_scope, y.generation_id, y.symbol)
-       = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.symbol)
-    LEFT JOIN public.spot_order_set_sell_unbound u
-      ON d.kind = 'unbound'
-     AND (u.tenant_id, u.venue_id, u.account_scope, u.generation_id)
-       = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id)
+    LEFT JOIN LATERAL (
+        SELECT tenant_id, potential_count, conflict_count
+        FROM public.spot_order_set_sell_legs
+        WHERE d.kind = 'leg'
+          AND (tenant_id, venue_id, account_scope, generation_id, symbol, position_id)
+            = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.symbol, d.position_id)
+        LIMIT 1) l ON true
+    LEFT JOIN LATERAL (
+        SELECT tenant_id, potential_count, conflict_count
+        FROM public.spot_order_set_sell_symbols
+        WHERE d.kind = 'symbol'
+          AND (tenant_id, venue_id, account_scope, generation_id, symbol)
+            = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.symbol)
+        LIMIT 1) y ON true
+    LEFT JOIN LATERAL (
+        SELECT tenant_id, potential_count, conflict_count
+        FROM public.spot_order_set_sell_unbound
+        WHERE d.kind = 'unbound'
+          AND (tenant_id, venue_id, account_scope, generation_id)
+            = (g.tenant_id, g.venue_id, g.account_scope, g.generation_id)
+        LIMIT 1) u ON true
 )
