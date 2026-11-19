@@ -14,13 +14,13 @@ use super::ClockSampleStore;
     dead_code,
     reason = "shared integration fixture keeps its other cases intact"
 )]
-#[path = "../../tests/venue_ledger_orders/fixture.rs"]
+#[path = "../venue_ledger_orders/fixture.rs"]
 mod order_fixture;
 #[allow(
     dead_code,
     reason = "shared integration fixture keeps its other cases intact"
 )]
-#[path = "../../tests/venue_ledger_schema/fixture.rs"]
+#[path = "../venue_ledger_schema/fixture.rs"]
 mod schema_fixture;
 use order_fixture::{record, seen, Fixture as OrderFixture};
 use schema_fixture::{constraint, execute, refused, Fixture as SchemaFixture};

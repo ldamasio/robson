@@ -4,9 +4,9 @@
 //! Lexical regression checks over the workspace's Rust sources as they are on
 //! disk, backed by a review of each part's diff and call paths (a name split
 //! across lines, generated code or a file these filters skip can escape them):
-//! - nothing outside `binance/spot/` reaches this module, names a type it
-//!   defines or names a spot endpoint, so no production path, factory included,
-//!   can construct its reader, feed, klines, rules cache or venue;
+//! - outside `binance/spot/`, the exact controlled clock allowance is the
+//!   only production reference. No production path, factory included, can
+//!   construct the reader, feed, klines, rules cache or venue;
 //! - readers, rules projection and cache implement no port. The exact named
 //!   input boundaries may import 8g1a's pure scalar parser; the cache may not.
 //!   8b's feed and klines additionally import exactly the existing items of the
@@ -22,14 +22,16 @@
 //!   `submit`'s arguments would pass them; review establishes the lazy path. No
 //!   spot file calls the non-answer forms (`.post(`, `post_signed(`,
 //!   `delete_signed(`), names the gate, or holds an HTTP client;
-//! - every read goes through the client's spot read helpers, encoded and
-//!   single-shot, from the reader (`rest.rs`) and the klines (`ohlcv.rs`,
-//!   public only); no spot file names a legacy GET helper (8c-3, round 2);
+//! - the reader (`rest.rs`) and klines (`ohlcv.rs`, public only) use the
+//!   client's encoded, single-shot spot read helpers. The clock has the
+//!   unsigned TIME request described below. No spot file names a legacy GET
+//!   helper (8c-3, round 2);
 //! - they read no configuration and name no testnet host.
 //!
 //! `robsond`'s venue tests check the other half: the factory still refuses
 //! `binance_spot`, builds no spot venue, and builds no feed on the spot stream
-//! base.
+//! base. The bounded clock owner and receiver have a separate, exact
+//! allowance for one unsigned TIME request.
 
 use std::{
     fs,
@@ -531,9 +533,82 @@ fn the_observation_fixture_exception_requires_its_test_gate_and_only_include() {
     ));
 }
 
+fn clock_references(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|line| {
+        has_word(line, "PreparedSpotTime")
+            || has_word(line, "prepare_spot_time")
+            || line.contains("/api/v3/time")
+    })
+}
+
+fn outside_spot_violations(path: &Path, text: &str, names: &[String]) -> Vec<String> {
+    let allowed_clock_references: &[&str] = match path.to_str() {
+        Some("robsond/src/venue_clock_http.rs") => &[
+            "use robson_connectors::binance::spot::PreparedSpotTime;",
+            "prepared: PreparedSpotTime,",
+        ],
+        Some("robsond/src/venue_clock_owner.rs") => &[
+            "use robson_connectors::{binance::spot::PreparedSpotTime, BinanceRestClient, BinanceRestError};",
+            "preparation: Option<JoinHandle<Result<PreparedSpotTime, BinanceRestError>>>,",
+            "client.prepare_spot_time()",
+        ],
+        Some("robsond/src/venue_clock_owner/pg_tests/http.rs") => {
+            &[r#"ensure!(request.lines().next() == Some("GET /api/v3/time HTTP/1.1"));"#]
+        }
+        _ => &[],
+    };
+    let mut found = Vec::new();
+    if !clock_references(text).eq(allowed_clock_references.iter().copied()) {
+        found.push("uses Spot TIME outside its approved source lines".into());
+    }
+
+    // Remove only the approved import. The rest of each clock file still
+    // goes through the same reachability, endpoint and type checks.
+    let without_import;
+    let text = match allowed_clock_references.first() {
+        Some(import) if import.starts_with("use ") => {
+            without_import = text.replacen(*import, "", 1);
+            &without_import
+        },
+        _ => text,
+    };
+    if reaches_spot(text) {
+        found.push("reaches binance::spot".into());
+    }
+    if names_spot_endpoint(text) {
+        found.push("names a spot endpoint".into());
+    }
+    for name in names.iter().filter(|name| has_word(text, name)) {
+        found.push(format!("names {name}"));
+    }
+    found
+}
+
+#[test]
+fn the_clock_allowance_keeps_other_spot_paths_and_time_callers_closed() {
+    let names = spot_type_names();
+    let workspace = crate_dir().parent().unwrap();
+    let clock = Path::new("robsond/src/venue_clock_owner.rs");
+    let owner = fs::read_to_string(workspace.join(clock)).unwrap();
+    assert!(outside_spot_violations(clock, &owner, &names).is_empty());
+    let outside = Path::new("robsond/src/venue.rs");
+    for extra in [
+        "use robson_connectors::binance::spot::PreparedSpotTime;",
+        "client.prepare_spot_time();",
+        "binance::spot::build_venue();",
+        r#"transport.get("/api/v3/time");"#,
+    ] {
+        assert!(!outside_spot_violations(outside, extra, &names).is_empty(), "{extra}");
+        assert!(
+            !outside_spot_violations(clock, &format!("{owner}\n{extra}"), &names).is_empty(),
+            "{extra}",
+        );
+    }
+}
+
 /// SD12 points 2 and 4: every production path outside `binance/spot/` remains
-/// scanned. The sole exact fixture exception requires its test-only gate and
-/// sole inclusion site before its Spot pagination control is admitted.
+/// scanned. The pagination fixture exception requires its test-only gate and
+/// sole inclusion site.
 #[test]
 fn nothing_outside_the_spot_module_names_it() {
     let workspace = crate_dir().parent().unwrap();
@@ -569,17 +644,13 @@ fn nothing_outside_the_spot_module_names_it() {
     for path in &outside {
         if path.ends_with("robsond/src/operation_observation_http_tests.rs") {
             assert!(fixture_isolated, "observation fixture is not uniquely test-gated");
+            assert!(clock_references(&fixture).next().is_none());
             continue;
         }
         let text = fs::read_to_string(path).unwrap();
-        if reaches_spot(&text) {
-            found.push(format!("{}: reaches binance::spot", path.display()));
-        }
-        if names_spot_endpoint(&text) {
-            found.push(format!("{}: names a spot endpoint", path.display()));
-        }
-        for name in names.iter().filter(|name| has_word(&text, name)) {
-            found.push(format!("{}: names {name}", path.display()));
+        let relative = path.strip_prefix(workspace).unwrap();
+        for violation in outside_spot_violations(relative, &text, &names) {
+            found.push(format!("{}: {violation}", path.display()));
         }
     }
     assert!(found.is_empty(), "the spot read side is reachable: {found:#?}");
@@ -853,6 +924,63 @@ fn mutation_violations(file: &str, text: &str) -> Vec<String> {
     violations
 }
 
+fn prepared_time_mutation_violations(text: &str) -> Vec<String> {
+    // The narrow type allowance is bound to the complete transport shape:
+    // one opaque builder, one unsigned GET from the single-shot client and
+    // one consuming send that returns the response head untouched.
+    const APPROVED_TRANSPORT: &str = r#"
+use reqwest::{RequestBuilder, Response};
+use crate::binance_rest::{single_shot, BinanceRestClient, BinanceRestError};
+const ENDPOINT: &str = "/api/v3/time";
+pub struct PreparedSpotTime {
+    request: RequestBuilder,
+}
+impl BinanceRestClient {
+    pub fn prepare_spot_time(&self) -> Result<PreparedSpotTime, BinanceRestError> {
+        let transport = single_shot()?;
+        let url = format!("{}{}", self.endpoint_base_url(ENDPOINT), ENDPOINT);
+        Ok(PreparedSpotTime { request: transport.get(url) })
+    }
+}
+impl PreparedSpotTime {
+    pub async fn send(self) -> reqwest::Result<Response> {
+        self.request.send().await
+    }
+}
+#[cfg(test)]
+#[path = "time_tests.rs"]
+mod tests;
+"#;
+    let narrowed = text.replacen("use reqwest::{RequestBuilder, Response};", "", 1).replacen(
+        "-> reqwest::Result<Response>",
+        "-> Result<Response>",
+        1,
+    );
+    let mut violations = mutation_violations("time.rs", &narrowed);
+    if !code_only(text).split_whitespace().eq(APPROVED_TRANSPORT.split_whitespace()) {
+        violations.push("changes the approved unsigned Spot TIME transport".into());
+    }
+    violations
+}
+
+#[test]
+fn the_clock_transport_allowance_rejects_changed_target_and_extra_transport() {
+    let approved = include_str!("time.rs");
+    assert!(prepared_time_mutation_violations(approved).is_empty());
+    for (before, after) in [
+        ("/api/v3/time", "/api/v3/order"),
+        ("single_shot()?", "reqwest::Client::new()"),
+        ("transport.get(url)", "transport.post(url)"),
+        ("transport.get(url)", "transport.get(url).header(\"X-MBX-APIKEY\", key)"),
+        ("self.request.send().await", "another.send().await?; self.request.send().await"),
+    ] {
+        assert!(approved.contains(before), "negative control must change the source: {before}");
+        let changed = approved.replacen(before, after, 1);
+        assert!(!prepared_time_mutation_violations(&changed).is_empty(), "{after}");
+    }
+    assert!(!mutation_violations("rest.rs", approved).is_empty());
+}
+
 /// How `text`, the spot production file `file`, could read other than
 /// through the client's spot read helpers (encoded, single-shot): a legacy
 /// GET helper by name, which signs raw values and follows redirects, or a
@@ -1000,10 +1128,26 @@ fn the_mutation_checker_refuses_every_way_around_the_ledger() {
 #[test]
 fn the_spot_module_sends_orders_only_through_the_ledger_and_reads_no_configuration() {
     let sources = spot_production_sources();
+    let time = spot_dir().join("time.rs");
+    let root = spot_dir().join("mod.rs");
     assert!(sources.len() >= 7, "{} production sources", sources.len());
     for (path, text) in &sources {
         let file = path.file_name().unwrap().to_string_lossy().into_owned();
-        let violations = mutation_violations(&file, text);
+        let violations = if path == &time {
+            prepared_time_mutation_violations(text)
+        } else {
+            let permitted: &[&str] = if path == &root {
+                &["pub use time::PreparedSpotTime;"]
+            } else {
+                &[]
+            };
+            assert!(
+                clock_references(text).eq(permitted.iter().copied()),
+                "{} uses Spot TIME outside its approved source lines",
+                path.display(),
+            );
+            mutation_violations(&file, text)
+        };
         assert!(violations.is_empty(), "{}: {violations:?}", path.display());
         for configuration in ["env::var", "std::env", "ROBSON_", "dotenv"] {
             assert!(!text.contains(configuration), "{} reads {configuration}", path.display());
