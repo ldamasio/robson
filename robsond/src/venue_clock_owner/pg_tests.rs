@@ -26,6 +26,8 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
     let mut http = None;
     let mut account_http = None;
     let mut account_slot: Option<inventory::AccountPreparation> = None;
+    let mut supersession_http = [None, None];
+    let mut supersession_slots = [None, None];
     let primary = timeout_at(body_deadline, async {
         ensure!(matches!(bootstrap::production_input(), Err(BudgetError::PrerequisiteRefusal)));
         let clock = Arc::new(NativeClock::initialize()?);
@@ -154,9 +156,11 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
         drop(time_probes);
         drop(probes);
         commission_admission_precedence(owner, &clock)?;
-        for replace_generation in [false, true] {
-            supersession_during_account_body(owner, &clock, replace_generation, body_deadline)
-                .await?;
+        for (i, replace_generation) in [false, true].into_iter().enumerate() {
+            supersession_during_account_body(
+                owner, &clock, replace_generation, body_deadline,
+                &mut supersession_http[i], &mut supersession_slots[i],
+            ).await?;
         }
         ensure!(venue.connections() == 1 && budget.handoffs()
             .map_err(|e| anyhow!("handoffs: {e:?}"))? == 4,
@@ -174,6 +178,18 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
     // owner's worker permit is needed by its own retirement.
     let account_retired =
         timeout_at(deadline, ClockOwner::retire_account(&mut account_slot)).await;
+    let mut supersession_errors = Vec::new();
+    for (fixture, slot) in supersession_http.into_iter().zip(&mut supersession_slots) {
+        if let Some(fixture) = fixture {
+            if let Err(error) = fixture.finish(deadline).await {
+                supersession_errors.push(format!("supersession listener retirement: {error}"));
+            }
+        }
+        let retired = timeout_at(deadline, ClockOwner::retire_account(slot)).await;
+        if !matches!(retired, Ok(true)) {
+            supersession_errors.push(format!("supersession preparation retirement: {retired:?}"));
+        }
+    }
     let closing = owner.take().map(|owner| {
         // No await or spawned owner can advance this original baseline.
         let expected_handoffs = owner.budget.handoffs();
@@ -185,7 +201,7 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
         let closing = owner.spawn();
         (closing, state, budget, expected_handoffs)
     });
-    let mut failures = Vec::new();
+    let mut failures = supersession_errors;
     if !matches!(account_retired, Ok(true)) {
         failures.push(format!("ACCOUNT preparation retirement: {account_retired:?}"));
     }
@@ -291,14 +307,18 @@ async fn supersession_during_account_body(
     clock: &NativeClock,
     replace_generation: bool,
     fixture_deadline: Instant,
+    fixture_slot: &mut Option<c8_account_http::AccountFixture>,
+    slot: &mut Option<inventory::AccountPreparation>,
 ) -> anyhow::Result<()> {
     let due = (Instant::now() + Duration::from_secs(5)).min(fixture_deadline);
-    let mut slot = None;
-    let (venue, head, release) = c8_account_http::AccountFixture::held_body(due).await?;
+    ensure!(fixture_slot.is_none() && slot.is_none());
+    let (venue, head, release) =
+        c8_account_http::AccountFixture::held_body(fixture_deadline).await?;
+    let venue = fixture_slot.insert(venue);
     let work = async {
         let claim = clock.capture()?;
         let mut pending = owner.reserve_account(due).map_err(|e| anyhow!("{e:?}"))?;
-        let prepared = owner.prepare_account(&mut slot, due).await.map_err(|e| anyhow!("{e:?}"))?;
+        let prepared = owner.prepare_account(slot, due).await.map_err(|e| anyhow!("{e:?}"))?;
         let signed = owner.commission_signing_time().map_err(|e| anyhow!("{e:?}"))?;
         let original = {
             let state = owner.state.lock().map_err(|_| anyhow!("clock lock"))?;
@@ -329,12 +349,7 @@ async fn supersession_during_account_body(
         ensure!(venue.connections() == 1, "one real charged ACCOUNT without retry");
         Ok::<_, anyhow::Error>(())
     };
-    let result = timeout_at(due, work).await.context("ACCOUNT supersession deadline");
-    let retired = timeout_at(fixture_deadline, ClockOwner::retire_account(&mut slot)).await;
-    let finished = venue.finish(fixture_deadline).await;
-    ensure!(matches!(retired, Ok(true)), "ACCOUNT supersession preparation must retire");
-    result??;
-    finished
+    timeout_at(due, work).await.context("ACCOUNT supersession deadline")?
 }
 
 async fn close_owner(
