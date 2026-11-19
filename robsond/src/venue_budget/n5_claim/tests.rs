@@ -625,3 +625,6 @@ async fn postgres_lock_and_statement_timeouts_hard_retire(pool: PgPool) {
         .any(|record| { record.sqlstate == Some(*b"57014") }));
     assert_eq!(unchanged_row(&pool).await, previous_row);
 }
+
+#[path = "result_tests.rs"]
+mod result_tests;

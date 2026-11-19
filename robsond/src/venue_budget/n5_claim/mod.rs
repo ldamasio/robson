@@ -19,12 +19,24 @@ const SETTINGS: &str = include_str!("../sql/settings.sql");
 const CLAIM: &str = include_str!("claim.sql");
 const CONFIRM: &str = include_str!("confirm.sql");
 
+mod result;
+
 #[derive(Clone, Debug)]
 pub(crate) struct FrequencyKey {
     pub(crate) symbol: String,
     pub(crate) initialization_id: Uuid,
     pub(crate) recovery_generation: i64,
     pub(crate) registration_id: Uuid,
+}
+
+impl FrequencyKey {
+    fn is_valid(&self) -> bool {
+        !self.symbol.is_empty()
+            && self.symbol.len() <= 64
+            && !self.initialization_id.is_nil()
+            && !self.registration_id.is_nil()
+            && self.recovery_generation >= 0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,13 +129,16 @@ pub(crate) struct Confirmation {
     deadline: Instant,
 }
 
+fn valid_audit_at(audit_at: DateTime<Utc>) -> bool {
+    let subsec = audit_at.timestamp_subsec_nanos();
+    subsec < 1_000_000_000 && subsec % 1_000 == 0
+}
+
 fn valid_identity(identity: &ClaimIdentity) -> bool {
-    let subsec = identity.audit_at.timestamp_subsec_nanos();
     !identity.claim_id.is_nil()
         && !identity.owner.is_nil()
         && identity.captured.nanoseconds() <= TICK_MAX as u128
-        && subsec < 1_000_000_000
-        && subsec % 1_000 == 0
+        && valid_audit_at(identity.audit_at)
 }
 
 /// Check the shape and exact native arithmetic before sending SQL. PostgreSQL
@@ -133,11 +148,7 @@ fn eligibility_floor(request: &ClaimRequest) -> Result<u128, BudgetError> {
     let prior = &request.prior;
     let next = &request.next;
     let start = prior.identity.captured;
-    if key.symbol.is_empty()
-        || key.symbol.len() > 64
-        || key.initialization_id.is_nil()
-        || key.registration_id.is_nil()
-        || key.recovery_generation < 0
+    if !key.is_valid()
         || !(1..i64::MAX).contains(&prior.revision)
         || !valid_identity(&prior.identity)
         || !valid_identity(next)
