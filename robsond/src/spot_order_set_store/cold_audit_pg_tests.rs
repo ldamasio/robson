@@ -1415,3 +1415,232 @@ async fn cold_generation_install_refuses_same_version_epoch_drift(pool: PgPool) 
     ensure!(prior && r2_leaf_counts(&pool, request.scope.tenant_id, None).await? == [0; 10]);
     Ok(())
 }
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_install_issues_sixteen_commands_and_fresh_readback(
+    pool: PgPool,
+) -> Result<()> {
+    r2_install_wire(&pool, false).await
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_install_lost_ack_retires_and_withholds_handoff(
+    pool: PgPool,
+) -> Result<()> {
+    r2_install_wire(&pool, true).await
+}
+
+async fn r2_install_wire(pool: &PgPool, lose_ack: bool) -> Result<()> {
+    use robson_testkit::db_proxy::{DbProxy, ProxyMode};
+    use sqlx::postgres::{PgPoolOptions, PgSslMode};
+    let (request, old, _) = r2_install_fixture(pool).await?;
+    let cut = capture(pool, &request, deadline())
+        .await
+        .map_err(|e| anyhow!("owner cut: {e:?}"))?;
+    let opts = pool.connect_options();
+    let upstream = tokio::net::lookup_host((opts.get_host(), opts.get_port()))
+        .await?
+        .next()
+        .ok_or_else(|| anyhow!("local PG16 upstream"))?;
+    ensure!(upstream.ip().is_loopback());
+    let proxy = DbProxy::start(upstream).await?;
+    let proxied = PgPoolOptions::new()
+        .max_connections(1)
+        .test_before_acquire(false)
+        .connect_with(
+            opts.as_ref()
+                .clone()
+                .host("127.0.0.1")
+                .port(proxy.addr().port())
+                .ssl_mode(PgSslMode::Disable),
+        )
+        .await?;
+    let (pid, birth): (i32, String) = sqlx::query_as(
+        "SELECT pid,backend_start::text FROM pg_stat_activity WHERE pid=pg_backend_pid()",
+    )
+    .fetch_one(&proxied)
+    .await?;
+    proxy.enable_exact_query_trace(24);
+    let baseline = proxy.stats();
+    if lose_ack {
+        proxy.set_mode(ProxyMode::DropCommitAckOf("position_hints_complete = true"));
+    }
+    let mut fence = FixtureFence::matching(request.restore);
+    let installed = install(&proxied, &cut, &mut fence, deadline()).await;
+    let trace = proxy.query_trace();
+    let after = proxy.stats();
+    let expected = if lose_ack { 16 } else { 18 };
+    ensure!(
+        trace.len() == expected
+            && proxy.query_trace_dropped() == 0
+            && after.statements == baseline.statements + expected as u64,
+        "native install wire: {trace:?}"
+    );
+    ensure!(
+        trace[0] == "BEGIN"
+            && trace[1].contains("set_config('lock_timeout','20ms',true)")
+            && trace[2].contains("FOR UPDATE")
+            && trace[3].contains("latest_epoch_live")
+    );
+    ensure!(trace[4..14]
+        .iter()
+        .zip(R2_LEAVES)
+        .all(|(sql, table)| sql.contains(&format!("INSERT INTO public.spot_order_set_{table}"))));
+    ensure!(trace[14].contains("position_hints_complete = true") && trace[15] == "COMMIT");
+    if lose_ack {
+        ensure!(matches!(installed, Err(InstallRefusal::CommitUncertain(_))));
+        ensure!(
+            after.commit_acks_dropped == baseline.commit_acks_dropped + 1
+                && fence.seen == [FencePhase::BeforeRead, FencePhase::BeforePublish]
+        );
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let original:bool=sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND backend_start::text=$2)"
+                ).bind(pid).bind(&birth).fetch_one(pool).await?;
+                if !original { return Ok::<(),sqlx::Error>(()); }
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+        }).await??;
+        let (new, complete): (Uuid, bool) = sqlx::query_as(
+            "SELECT generation_id,position_hints_complete FROM public.spot_order_set_generation
+             WHERE (tenant_id,venue_id,account_scope)=($1,'binance:spot',$2)",
+        )
+        .bind(request.scope.tenant_id)
+        .bind(request.scope.account_scope)
+        .fetch_one(pool)
+        .await?;
+        ensure!(complete && new != old.0);
+        ensure!(
+            r2_leaf_counts(pool, request.scope.tenant_id, Some(new)).await?
+                == [2, 1, 1, 1, 1, 6, 3, 1, 1, 1]
+        );
+    } else {
+        installed.map_err(|e| anyhow!("local wire install: {e:?}"))?;
+        ensure!(
+            after.connections == baseline.connections + 1
+                && trace[16].contains("latest_epoch_live")
+                && trace[17].contains("jsonb_build_array")
+                && fence.seen
+                    == [
+                        FencePhase::BeforeRead,
+                        FencePhase::BeforePublish,
+                        FencePhase::AfterReadback
+                    ]
+        );
+    }
+    proxied.close().await;
+    eprintln!("Cold installer PG16 actual commands inside transaction=16 independent readback={} lost_ack={lose_ack}",expected-16);
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_install_refuses_changed_or_surplus_leaf_sets(pool: PgPool) -> Result<()> {
+    let (request, old, _) = r2_install_fixture(&pool).await?;
+    let cut = capture(&pool, &request, deadline())
+        .await
+        .map_err(|e| anyhow!("owner cut: {e:?}"))?;
+    for (label, table, timing, body, compare_at_publish) in [
+        (
+            "fabricated original position",
+            "cancel_members",
+            "BEFORE",
+            "NEW.source_position='99000000-0000-0000-0000-000000000001'; RETURN NEW;",
+            false,
+        ),
+        (
+            "missing native terminal mask",
+            "cancel_groups",
+            "BEFORE",
+            "NEW.terminal_mask=false; RETURN NEW;",
+            false,
+        ),
+        (
+            "extra row inserted behind RETURNING",
+            "cancel_groups",
+            "AFTER",
+            "IF NEW.target_id='912304' THEN
+                INSERT INTO public.spot_order_set_cancel_groups
+                    (tenant_id,venue_id,account_scope,generation_id,symbol,position_id,target_id,
+                     pending_count,conflict_count,terminal_mask)
+                  VALUES(NEW.tenant_id,NEW.venue_id,NEW.account_scope,NEW.generation_id,NEW.symbol,
+                         NEW.position_id,'999',0,0,false);
+             END IF; RETURN NEW;",
+            true,
+        ),
+        (
+            "older inserted leaf changed behind RETURNING",
+            "cancel_groups",
+            "AFTER",
+            "UPDATE public.spot_order_set_sell_unbound SET potential_count=99
+              WHERE (tenant_id,venue_id,account_scope,generation_id)
+                =(NEW.tenant_id,NEW.venue_id,NEW.account_scope,NEW.generation_id);
+             RETURN NEW;",
+            true,
+        ),
+    ] {
+        let trigger = format!(
+            "CREATE FUNCTION cold_install_leaf_mutant() RETURNS trigger LANGUAGE plpgsql AS
+             $$ BEGIN {body} END $$;
+             CREATE TRIGGER cold_install_leaf_mutant {timing} INSERT ON public.spot_order_set_{table}
+             FOR EACH ROW EXECUTE FUNCTION cold_install_leaf_mutant()"
+        );
+        sqlx::raw_sql(&trigger).execute(&pool).await?;
+        let mut fence = FixtureFence::matching(request.restore);
+        let refused = install(&pool, &cut, &mut fence, deadline()).await;
+        if compare_at_publish {
+            ensure!(matches!(refused, Err(InstallRefusal::Publish)), "{label}: {refused:?}");
+        } else {
+            ensure!(matches!(refused, Err(InstallRefusal::Leaves(_))), "{label}: {refused:?}");
+        }
+        let marker: bool = sqlx::query_scalar(
+            "SELECT position_hints_complete FROM spot_order_set_generation WHERE generation_id=$1",
+        )
+        .bind(old.0)
+        .fetch_one(&pool)
+        .await?;
+        ensure!(!marker && r2_leaf_counts(&pool, request.scope.tenant_id, None).await? == [0; 10]);
+        sqlx::raw_sql(&format!(
+            "DROP TRIGGER cold_install_leaf_mutant ON public.spot_order_set_{table};
+              DROP FUNCTION cold_install_leaf_mutant()"
+        ))
+        .execute(&pool)
+        .await?;
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_owner_caps_full_pager_with_no_false_terminal(pool: PgPool) -> Result<()> {
+    let tenant = setup(&pool).await?;
+    let epoch = crate::process_epoch::start_epoch(&pool, tenant, "bounded-full-page")
+        .await?
+        .epoch
+        .epoch_id;
+    seed(&pool, tenant, 1, 63).await?;
+    let version: i64 = sqlx::query_scalar(
+        "SELECT version FROM accounting_state WHERE tenant_id=$1 AND venue_id='binance:spot'",
+    )
+    .bind(tenant)
+    .fetch_one(&pool)
+    .await?;
+    let request = r2_request(tenant, epoch, version, R2_UID);
+    let exact = capture(&pool, &request, deadline())
+        .await
+        .map_err(|e| anyhow!("63 eligible rows per family: {e:?}"))?;
+    ensure!(
+        exact.receipt.statements == 38
+            && exact.receipt.families.iter().all(|f| f.rows == 63 && f.pages == 8)
+    );
+    seed(&pool, tenant, 64, 64).await?;
+    let cut = capture(&pool, &request, deadline()).await;
+    ensure!(matches!(
+        cut,
+        Err(ColdAuditRefusal::Sink { family: Family::Intents, .. })
+            | Err(ColdAuditRefusal::PageBudget { family: Family::Intents, .. })
+    ));
+    Ok(())
+}
