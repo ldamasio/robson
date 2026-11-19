@@ -17,7 +17,7 @@ pub(crate) struct CodecError;
 
 pub(crate) use super::order_columns::ORDER_COLUMNS;
 
-pub(super) fn decimal(n: i128, lo: i128, hi: i128) -> Result<Decimal, CodecError> {
+pub(crate) fn decimal(n: i128, lo: i128, hi: i128) -> Result<Decimal, CodecError> {
     if !(lo..=hi).contains(&n) {
         return Err(CodecError);
     }
@@ -31,7 +31,7 @@ pub(super) fn metadata(scale: Option<i32>, fits: Option<bool>) -> Result<(), Cod
     Ok(())
 }
 
-pub(super) fn integer(row: &PgRow, name: &str, lo: i128, hi: i128) -> Result<i128, CodecError> {
+pub(crate) fn integer(row: &PgRow, name: &str, lo: i128, hi: i128) -> Result<i128, CodecError> {
     // Read original server metadata BEFORE Decimal normalization/rescaling.
     metadata(
         row.try_get(format!("{name}_scale").as_str()).map_err(|_| CodecError)?,

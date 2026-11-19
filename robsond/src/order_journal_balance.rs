@@ -95,12 +95,18 @@ impl PgJournalBackend {
         &self,
         batch: &JournalBatch,
         tx: &mut Transaction<'_, Postgres>,
-    ) -> Result<(), CommitFailure> {
+        clock: Option<&super::clocked::Prepared>,
+    ) -> Result<Vec<super::clocked::ClockReceipt>, CommitFailure> {
         let Some(balance) = &batch.balance else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let intent = &batch.intent;
-        if !batch.attempts.is_empty() {
+        let mut receipts = Vec::new();
+        if let Some(clock) = clock {
+            // Replaces the five-field insert: inserting a NULL clock first
+            // would make the immutable row conflict with the receipt.
+            receipts = Box::pin(self.insert_clocks(batch, clock, tx)).await?;
+        } else if !batch.attempts.is_empty() {
             let ids: Vec<_> = batch.attempts.iter().map(|attempt| attempt.attempt_id).collect();
             let created: Vec<_> = batch.attempts.iter().map(|attempt| attempt.created_at).collect();
             sqlx::query(
@@ -127,7 +133,7 @@ impl PgJournalBackend {
                 .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
                 .await.map_err(known)?;
         }
-        Ok(())
+        Ok(receipts)
     }
 }
 

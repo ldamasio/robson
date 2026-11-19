@@ -8,6 +8,15 @@ use std::time::{Duration, Instant};
 
 #[path = "order_journal_balance.rs"]
 mod balance;
+#[allow(
+    dead_code,
+    reason = "private clocked Spot route awaiting the native capture and readiness owner"
+)]
+#[path = "order_journal_clocked.rs"]
+mod clocked;
+#[cfg(test)]
+#[path = "order_journal_clocked_pg_tests.rs"]
+mod clocked_pg_tests;
 #[path = "order_journal_readiness.rs"]
 mod readiness;
 #[allow(
@@ -124,6 +133,17 @@ impl PgJournalBackend {
         batch: &JournalBatch,
         tx: &mut sqlx::Transaction<'_, Postgres>,
     ) -> Result<(), CommitFailure> {
+        self.write_routed(batch, tx, None).await.map(drop)
+    }
+
+    /// The journal's statements. A prepared clocked route writes its clock row
+    /// with the one migration-38 helper instead of the five-field insert.
+    async fn write_routed(
+        &self,
+        batch: &JournalBatch,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        clock: Option<&clocked::Prepared>,
+    ) -> Result<Vec<clocked::ClockReceipt>, CommitFailure> {
         let known = |error: sqlx::Error| CommitFailure::Known(error.to_string());
         let intent = &batch.intent;
         // The no-op update returns the row that owns the id, ours or not.
@@ -236,9 +256,9 @@ impl PgJournalBackend {
             .map_err(known)?;
         }
         if batch.balance.is_some() {
-            Box::pin(self.write_balance(batch, tx)).await?;
+            return Box::pin(self.write_balance(batch, tx, clock)).await;
         }
-        Ok(())
+        Ok(Vec::new())
     }
 }
 
