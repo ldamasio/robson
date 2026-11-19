@@ -504,10 +504,9 @@ fn trade_ledger_has_no_production_callers() {
                 visit(&path);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
                 let source = std::fs::read_to_string(&path).unwrap();
-                let production = source.split("#[cfg(test)]").next().unwrap();
                 for method in [".record_trades(", ".touch_checked("] {
                     assert!(
-                        !production.contains(method),
+                        !source.contains(method),
                         "trade ledger activated in {}",
                         path.display()
                     );

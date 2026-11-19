@@ -910,9 +910,8 @@ fn order_ledger_has_no_production_callers() {
             }
             if path.extension().is_some_and(|ext| ext == "rs") {
                 let source = std::fs::read_to_string(&path).unwrap();
-                let production = source.split("#[cfg(test)]").next().unwrap();
                 assert!(
-                    !production.contains(".record_order("),
+                    !source.contains(".record_order("),
                     "ledger order writer activated in {}",
                     path.display()
                 );
