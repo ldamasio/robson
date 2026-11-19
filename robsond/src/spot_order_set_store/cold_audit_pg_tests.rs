@@ -181,6 +181,14 @@ async fn cold_spot_audit_snapshot_survives_real_publication_across_families(
 ) -> Result<()> {
     let tenant = setup(&pool).await?;
     seed(&pool, tenant, 1, 8).await?;
+    // A real READ COMMITTED control keeps the first native page at eight,
+    // then can mix in the two later rows on another family.
+    let mut control = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY")
+        .execute(&mut *control)
+        .await?;
+    let first_control = read_intent_page(&mut control, SCOPE, tenant, None).await?;
+    ensure!(first_control.full && first_control.rows.len() == 8);
     let (observed, wait) = oneshot::channel();
     let (release, resume) = oneshot::channel();
     let mut keys = Keys::default();
@@ -201,6 +209,9 @@ async fn cold_spot_audit_snapshot_survives_real_publication_across_families(
     let receipt = receipt.map_err(|error| anyhow!("original audit: {error:?}"))?;
     ensure!(receipt.families.iter().all(|f| f.rows == 8));
     expected(&keys, 8)?;
+    let control_last = read_attempt_page(&mut control, SCOPE, tenant, Some("008")).await?;
+    ensure!(control_last.rows.len() == 2 && control_last.rows[0].client_order_id == "009");
+    control.rollback().await?;
     let mut fresh = Keys::default();
     let receipt = audit_cold_sources(&pool, scope(tenant), BUDGET, deadline(), &mut fresh)
         .await
@@ -315,12 +326,14 @@ async fn cold_spot_audit_cancelled_source_query_retires_original_backend(
     ).fetch_one(&proxied).await?;
     let (observed, wait) = oneshot::channel();
     let (release, resume) = oneshot::channel();
+    proxy.enable_exact_query_trace(32);
+    let task_pool = proxied.clone();
     let job = tokio::spawn(async move {
         PAUSE_AFTER_INTENTS
             .scope(
                 RefCell::new(Some((observed, resume))),
                 audit_cold_sources(
-                    &proxied,
+                    &task_pool,
                     scope(tenant),
                     BUDGET,
                     deadline(),
@@ -361,7 +374,141 @@ async fn cold_spot_audit_cancelled_source_query_retires_original_backend(
         }
         Ok::<_,sqlx::Error>(())
     }).await??;
+    let replacement: (i32,String) = sqlx::query_as(
+        "SELECT pg_backend_pid(),backend_start::text FROM pg_stat_activity WHERE pid=pg_backend_pid()",
+    ).fetch_one(&proxied).await?;
+    ensure!(replacement != (pid, birth));
+    ensure!(proxied.size() == 1 && proxy.stats().connections >= 2);
+    ensure!(proxy.query_trace().iter().all(|q| !q.trim_start().starts_with("ROLLBACK")));
     lock.rollback().await?;
-    ensure!(proxy.stats().connections >= 1);
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_spot_audit_seeded_external_publication_never_mixes_scopes(
+    pool: PgPool,
+) -> Result<()> {
+    use proptest::{
+        strategy::{Strategy, ValueTree},
+        test_runner::{Config, RngSeed, TestRunner},
+    };
+    let tenant = setup(&pool).await?;
+    let mut runner = TestRunner::new(Config {
+        rng_seed: RngSeed::Fixed(0xbc2510b7),
+        failure_persistence: None,
+        ..Config::default()
+    });
+    let scenarios = (1_i64..=2, 0_u64..=3500);
+    let mut previous = 0_i64;
+    for _ in 0..7 {
+        let (additional, delay) =
+            scenarios.new_tree(&mut runner).expect("bounded publication schedule").current();
+        let (observed, wait) = oneshot::channel();
+        let (release, resume) = oneshot::channel();
+        let mut keys = Keys::default();
+        let old = PAUSE_AFTER_INTENTS.scope(
+            RefCell::new(Some((observed, resume))),
+            audit_cold_sources(&pool, scope(tenant), BUDGET, deadline(), &mut keys),
+        );
+        let next = async {
+            wait.await?;
+            tokio::time::sleep(Duration::from_micros(delay)).await;
+            seed(&pool, tenant, previous + 1, previous + additional).await?;
+            release.send(()).map_err(|_| anyhow!("old audit stopped"))?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let (receipt, published) = tokio::join!(old, next);
+        published?;
+        let observed = receipt.map_err(|error| anyhow!("generated audit: {error:?}"))?;
+        ensure!(observed.tenant_id == tenant && observed.account_scope == SCOPE);
+        ensure!(observed.families.iter().all(|family| family.rows == previous as u64));
+        expected(&keys, previous as u64)?;
+        previous += additional;
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_spot_audit_typed_deadline_on_running_snapshot(pool: PgPool) -> Result<()> {
+    let tenant = setup(&pool).await?;
+    let (observed, wait) = oneshot::channel();
+    let (_keep_blocked, resume) = oneshot::channel();
+    let mut keys = Keys::default();
+    let start = Instant::now();
+    let pending = PAUSE_AFTER_INTENTS.scope(
+        RefCell::new(Some((observed, resume))),
+        audit_cold_sources(
+            &pool,
+            scope(tenant),
+            BUDGET,
+            start + Duration::from_millis(250),
+            &mut keys,
+        ),
+    );
+    let (outcome, reached) = tokio::join!(pending, wait);
+    reached?;
+    ensure!(matches!(outcome, Err(ColdAuditRefusal::Deadline(Stage::Page(Family::Intents)))));
+    ensure!(Instant::now().saturating_duration_since(start) >= Duration::from_millis(250));
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_spot_audit_refuses_stale_and_missing_current_admission(pool: PgPool) -> Result<()> {
+    let tenant = setup(&pool).await?;
+    seed(&pool, tenant, 1, 1).await?;
+    let position = Uuid::from_u128(101);
+    let old = Uuid::now_v7();
+    let next = Uuid::now_v7();
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id='binance:spot'")
+        .bind(tenant).execute(&mut *tx).await?;
+    sqlx::query(
+        "SELECT balance_leg_admit($1,'binance:spot',$2,'BTCUSDT',$3,$4,'2026-11-01',
+            10,10,2,10,0.001,'base','fixture',now(),'fixture',1,1,100,0.1,10,90,now(),false)",
+    )
+    .bind(tenant)
+    .bind(SCOPE)
+    .bind(position)
+    .bind(old)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let matched =
+        audit_cold_sources(&pool, scope(tenant), BUDGET, deadline(), &mut Keys::default()).await;
+    ensure!(matched.is_ok(), "{matched:?}");
+
+    let mut changed = pool.begin().await?;
+    sqlx::query(
+        "UPDATE balance_leg_admissions SET superseded_at=now(),superseded_by=$2 WHERE entry_intent_id=$1",
+    ).bind(old).bind(next).execute(&mut *changed).await?;
+    sqlx::query(
+        "INSERT INTO balance_leg_admissions
+         SELECT (jsonb_populate_record(NULL::public.balance_leg_admissions,
+           to_jsonb(a)||jsonb_build_object('entry_intent_id',$2::uuid,
+                                      'superseded_at',NULL,'superseded_by',NULL))).*
+         FROM public.balance_leg_admissions a WHERE a.entry_intent_id=$1",
+    )
+    .bind(old)
+    .bind(next)
+    .execute(&mut *changed)
+    .await?;
+    changed.commit().await?;
+    let stale =
+        audit_cold_sources(&pool, scope(tenant), BUDGET, deadline(), &mut Keys::default()).await;
+    ensure!(matches!(stale,Err(ColdAuditRefusal::Row{family:Family::Routes,
+        reason:RowDefect::Route(RouteDefect::StaleLegPointer),key:SourceKey::Route(p),..}) if p==position));
+
+    // The native FK still validates its historical row. A malformed
+    // supersession chain leaves no independently discoverable current row.
+    sqlx::query(
+        "UPDATE balance_leg_admissions SET superseded_at=now(),superseded_by=$2 WHERE entry_intent_id=$1",
+    ).bind(next).bind(old).execute(&pool).await?;
+    let missing =
+        audit_cold_sources(&pool, scope(tenant), BUDGET, deadline(), &mut Keys::default()).await;
+    ensure!(matches!(missing,Err(ColdAuditRefusal::Row{family:Family::Routes,
+        reason:RowDefect::Route(RouteDefect::LegWithoutAdmission),key:SourceKey::Route(p),..}) if p==position));
     Ok(())
 }
