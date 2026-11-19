@@ -8,6 +8,8 @@
 )]
 #[path = "venue_ledger_orders/fixture.rs"]
 mod fixture;
+#[path = "spot_order_set_reference_pg/cancel_shadow_tests.rs"]
+mod cancel_shadow_tests;
 #[path = "spot_order_set_reference_pg/reader.rs"]
 mod reader;
 
