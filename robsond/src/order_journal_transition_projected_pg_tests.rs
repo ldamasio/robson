@@ -321,32 +321,56 @@ async fn projected_first_cancel_rejects_wrong_scope_and_obsolete_epochs(
         ensure!(wire.proxy.query_trace().is_empty());
     }
     ensure!(durable(&pool, leg.tenant).await? == before);
-    let original_epoch = binding.process_epoch;
-    let store = PgJournalBackend::new(&pool, leg.tenant).with_order_set_projection(binding);
-    for phase in ["ended", "superseded"] {
-        if phase == "ended" {
-            sqlx::query(
-                "UPDATE process_epochs SET clean_stop_at=now(),marker_version=$2 WHERE epoch_id=$1",
-            )
-            .bind(original_epoch)
-            .bind(crate::process_epoch::MARKER_VERSION)
-            .execute(&pool)
+    let mismatched_epoch =
+        PgJournalBackend::new(&pool, leg.tenant).with_order_set_projection(JournalGeneration {
+            process_epoch: Uuid::now_v7(),
+            ..binding.clone()
+        });
+    ensure!(matches!(
+        mismatched_epoch.commit_first_cancel(&cancel, request(transition, version)).await,
+        Err(CommitFailure::Known(reason)) if reason.contains("stale generation")
+    ));
+    ensure!(durable(&pool, leg.tenant).await? == before);
+
+    sqlx::query(
+        "UPDATE process_epochs SET clean_stop_at=now(),marker_version=$2 WHERE epoch_id=$1",
+    )
+    .bind(binding.process_epoch)
+    .bind(crate::process_epoch::MARKER_VERSION)
+    .execute(&pool)
+    .await?;
+    let ended = PgJournalBackend::new(&pool, leg.tenant).with_order_set_projection(binding);
+    ensure!(matches!(
+        ended.commit_first_cancel(&cancel, request(transition, version)).await,
+        Err(CommitFailure::Known(reason)) if reason.contains("stale generation")
+    ));
+    ensure!(durable(&pool, leg.tenant).await? == before);
+    assert_no_projection(&pool, leg.tenant, cancel.intent_id).await?;
+
+    // Use a separate tenant so the original writer in this case is still
+    // open. An implementation checking only clean_stop_at must fail here.
+    let old_leg = PositiveLeg::admit(&pool).await?;
+    let old_cancel = old_leg.cancel_intent();
+    let old_version = old_leg.accounting_version(&pool).await?;
+    let old =
+        bind_generation(&pool, old_leg.tenant, &old_cancel.account_scope, old_version).await?;
+    let next =
+        crate::process_epoch::start_epoch(&pool, old_leg.tenant, "first-cancel-successor").await?;
+    ensure!(next.predecessor_epoch_id == Some(old.process_epoch));
+    let open: bool =
+        sqlx::query_scalar("SELECT clean_stop_at IS NULL FROM process_epochs WHERE epoch_id=$1")
+            .bind(old.process_epoch)
+            .fetch_one(&pool)
             .await?;
-        } else {
-            let next =
-                crate::process_epoch::start_epoch(&pool, leg.tenant, "first-cancel-successor")
-                    .await?;
-            ensure!(next.predecessor_epoch_id == Some(original_epoch));
-        }
-        let stable = durable(&pool, leg.tenant).await?;
-        ensure!(matches!(
-            store.commit_first_cancel(&cancel, request(transition, version)).await,
-            Err(CommitFailure::Known(reason)) if reason.contains("stale generation")
-        ));
-        ensure!(durable(&pool, leg.tenant).await? == stable);
-    }
-    ensure!(leg.accounting_version(&pool).await? == version);
-    assert_no_projection(&pool, leg.tenant, cancel.intent_id).await
+    ensure!(open && old_leg.accounting_version(&pool).await? == old_version);
+    let stable = durable(&pool, old_leg.tenant).await?;
+    let superseded = PgJournalBackend::new(&pool, old_leg.tenant).with_order_set_projection(old);
+    ensure!(matches!(
+        superseded.commit_first_cancel(&old_cancel, request(Uuid::now_v7(), old_version)).await,
+        Err(CommitFailure::Known(reason)) if reason.contains("stale generation")
+    ));
+    ensure!(durable(&pool, old_leg.tenant).await? == stable);
+    assert_no_projection(&pool, old_leg.tenant, old_cancel.intent_id).await
 }
 
 async fn assert_no_projection(pool: &PgPool, tenant: Uuid, cancel: Uuid) -> Result<()> {
