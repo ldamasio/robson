@@ -23,8 +23,8 @@ macro_rules! audit_page {
         )
     };
 }
-const FIRST_PAGE: &str = audit_page!("../sql/source_page_first.sql");
-const NEXT_PAGE: &str = audit_page!("../sql/source_page_next.sql");
+pub(super) const FIRST_PAGE: &str = audit_page!("../sql/source_page_first.sql");
+pub(super) const NEXT_PAGE: &str = audit_page!("../sql/source_page_next.sql");
 
 /// The exact persisted binding last confirmed by an acknowledged COMMIT.
 #[derive(Debug, PartialEq, Eq)]

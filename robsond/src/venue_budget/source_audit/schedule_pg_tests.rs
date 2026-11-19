@@ -206,6 +206,18 @@ async fn generated_same_cursor_competitors_commit_one_native_checkpoint(
         ensure!((winner.cursor, winner.examined) == expected);
         final_row(&pool, base, expected.0, expected.1).await?;
         ensure!(venue(&pool).await?.1 == Some(base.audit));
+        if case % 2 == 1 {
+            // Reverse of the held-old-page case: checkpoint wins before setup.
+            let newer = start(&pool, Uuid::now_v7(), envelope()?, &Trace::default())
+                .await
+                .map_err(|e| anyhow!("{e:?}"))?;
+            ensure!(newer.generation == base.generation + 1);
+            ensure!(pass(&pool, winner, &Trace::default()).await == Ok(Pass::Stale));
+            final_row(&pool, base, expected.0, expected.1).await?;
+            final_row(&pool, newer, None, 0).await?;
+            ensure!(venue(&pool).await?.1 == Some(newer.audit));
+        }
+
         eprintln!("C2_CAS_GENERATED case={case} peer_ms={peer_ms} release_ms={release_ms}");
     }
     Ok(())
@@ -230,13 +242,15 @@ async fn real_generation_change_after_the_old_page_refuses_its_checkpoint(
         .await?;
     let holder = holder_pid(&mut hold).await?;
     let mut work = Box::pin(pass(&wire.pool, old, &trace));
+    // PostgreSQL takes the source-table lock while parsing the prepared page.
+    // Its Execute ordinal is therefore one after the last issued execution.
     let blocked = tokio::select! {
         result = &mut work => anyhow::bail!("old page completed before gate: {result:?}"),
-        result = wire.blocked(&pool, holder, 3) => result?,
+        result = wire.blocked(&pool, holder, 2) => result?,
     };
     let mut control = wire.proxy.control(blocked.identity, false).map_err(|e| anyhow!("{e:?}"))?;
     let mut gate = control
-        .arm(blocked.statement, ControlBoundary::BeforeCommandComplete)
+        .arm(blocked.statement + 1, ControlBoundary::BeforeCommandComplete)
         .map_err(|e| anyhow!("{e:?}"))?;
     hold.rollback().await?;
     let actor = async {
@@ -321,7 +335,16 @@ async fn held_commit(pool: &PgPool, cancel: bool) -> anyhow::Result<()> {
         );
     }
     wire.retires(pool, &original).await?;
-    let observed = gate.snapshot();
+    let observed = timeout(Duration::from_secs(1), async {
+        loop {
+            let state = gate.snapshot();
+            if state.closed {
+                break state;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await?;
     ensure!(
         observed.closed
             && observed.client_loss == Some(ClientLoss::Read)
@@ -330,6 +353,15 @@ async fn held_commit(pool: &PgPool, cancel: bool) -> anyhow::Result<()> {
         "original client retirement: {observed:?}"
     );
     final_row(pool, run, cursor, count).await?;
+    let mut locks = pool.begin().await?;
+    sqlx::query("SELECT 1 FROM budget_venue_state WHERE venue_id='binance:spot' FOR UPDATE NOWAIT")
+        .fetch_one(&mut *locks)
+        .await?;
+    sqlx::query("SELECT 1 FROM budget_source_audits WHERE audit_id=$1 FOR UPDATE NOWAIT")
+        .bind(run.audit)
+        .fetch_one(&mut *locks)
+        .await?;
+    locks.rollback().await?;
     let trace = wire.proxy.query_trace();
     ensure!(wire.proxy.query_trace_dropped() == 0 && trace.len() == target as usize);
     let commit_sent = trace

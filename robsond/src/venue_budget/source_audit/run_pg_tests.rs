@@ -7,7 +7,7 @@ use chrono::Utc;
 use robson_exec::venue_clock::NativeClock;
 
 use super::{
-    run::{pass, start, Discrepancy, Envelope, Pass, Run},
+    run::{pass, start, Discrepancy, Envelope, Pass, Run, FIRST_PAGE, NEXT_PAGE},
     *,
 };
 
@@ -65,6 +65,33 @@ async fn seed(pool: &PgPool, rows: &[(u128, &str)]) -> anyhow::Result<Uuid> {
     Ok(tenant)
 }
 
+async fn assert_indexed_page(pool: &PgPool, run: Run) -> anyhow::Result<()> {
+    let (statement, high) = (
+        if run.cursor.is_some() {
+            NEXT_PAGE
+        } else {
+            FIRST_PAGE
+        },
+        run.high_water.ok_or_else(|| anyhow!("fixture high-water"))?,
+    );
+    let explain = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {statement}");
+    let mut query = sqlx::query_scalar::<_, serde_json::Value>(&explain).bind(high);
+    if let Some(cursor) = run.cursor {
+        query = query.bind(cursor);
+    }
+    let document = query.fetch_one(pool).await?;
+    fn actual_index_rows(node: &serde_json::Value) -> Option<u64> {
+        if node["Index Name"] == "submit_attempts_pkey" && node["Alias"] == "a" {
+            return node["Actual Rows"].as_u64();
+        }
+        node["Plans"].as_array()?.iter().find_map(actual_index_rows)
+    }
+    let observed = actual_index_rows(&document[0]["Plan"]);
+    ensure!(observed == Some(1000), "actual bounded global PK access: {observed:?}");
+    eprintln!("C2_GLOBAL_PK_PLAN cursor={:?} index_rows={observed:?}", run.cursor);
+    Ok(())
+}
+
 fn envelope() -> anyhow::Result<Envelope> {
     Envelope::new(Instant::now() + Duration::from_secs(20)).map_err(|e| anyhow!("{e:?}"))
 }
@@ -116,12 +143,14 @@ async fn global_checkpoints_advance_once_per_acknowledged_pass(pool: PgPool) -> 
             .collect();
         let tenant = seed(&pool, &source).await?;
         project_healthy_spot(&pool, tenant).await?;
+        sqlx::query("ANALYZE submit_attempts").execute(&pool).await?;
         let trace = Trace::default();
         let envelope = envelope()?;
         let audit = Uuid::now_v7();
         let run = start(&pool, audit, envelope, &trace).await.map_err(|e| anyhow!("{e:?}"))?;
         ensure!(trace.issued() == 5, "setup is exactly five executions");
         ensure!(run.generation == generation + 1 && run.high_water == Some(Uuid::from_u128(2000)));
+        assert_indexed_page(&pool, run).await?;
         let (state, bound, _) = venue(&pool).await?;
         ensure!(state == "complete" && bound == Some(audit) && prior != Some(audit));
         ensure!(durable(&pool, prior.ok_or(anyhow!("fixture audit"))?).await?.3 == "complete");
@@ -132,6 +161,7 @@ async fn global_checkpoints_advance_once_per_acknowledged_pass(pool: PgPool) -> 
         };
         ensure!(first.cursor == Some(Uuid::from_u128(999)) && first.examined == 1000);
         ensure!(trace.issued() == 10, "one pass is exactly five executions");
+        assert_indexed_page(&pool, first).await?;
         // A wrong expected cursor is refused without a write.
         let wrong = Run {
             cursor: Some(Uuid::from_u128(500)),
