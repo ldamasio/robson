@@ -3,9 +3,9 @@ use super::super::result::{
     confirm_result_once, publish_result, PreparedSnapshot, Publication, ResultRequest,
 };
 use super::{
-    assert_claim_sql, assert_confirm_sql, claim, deadline, seed, snapshot, tick, unchanged_row,
-    BudgetError, ClaimIdentity, ClaimObservation, ClaimOutcome, ClaimRequest, ClaimResult,
-    ClockDomain, Measured, PriorClaim, PriorEligibility, ProxyMode, Trace, DAY,
+    assert_claim_sql, assert_confirm_sql, assert_native_claim, claim, deadline, seed, snapshot,
+    tick, unchanged_row, BudgetError, ClaimIdentity, ClaimObservation, ClaimOutcome, ClaimRequest,
+    ClaimResult, ClockDomain, Measured, PriorClaim, PriorEligibility, ProxyMode, Trace, DAY,
 };
 use chrono::{DateTime, Utc};
 use robson_connectors::binance::spot::SpotCommission;
@@ -387,12 +387,7 @@ async fn lost_result_commit_ack_allows_one_exact_positive_confirmation(pool: PgP
     assert_confirm_sql(&measured.wire(5, 2, 1)[4]);
 }
 
-#[sqlx::test(migrations = "../migrations")]
-#[ignore = "requires DATABASE_URL"]
-async fn absent_result_confirmation_can_precede_original_commit(pool: PgPool) {
-    let request = success(initial_result(&pool).await);
-    let unpublished = unchanged_row(&pool).await;
-    let measured = Measured::start(&pool).await;
+async fn defer_result_commit(pool: &PgPool) -> sqlx::Transaction<'_, sqlx::Postgres> {
     // A deferred trigger stalls the native COMMIT after the update receipt.
     sqlx::raw_sql(
         "CREATE FUNCTION n5_result_test_block_commit() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -401,7 +396,7 @@ async fn absent_result_confirmation_can_precede_original_commit(pool: PgPool) {
          CREATE CONSTRAINT TRIGGER n5_result_test_block_commit AFTER UPDATE ON n5_refresh_state
          DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION n5_result_test_block_commit();",
     )
-    .execute(&pool)
+    .execute(pool)
     .await
     .unwrap();
     let mut blocker = pool.begin().await.unwrap();
@@ -409,6 +404,17 @@ async fn absent_result_confirmation_can_precede_original_commit(pool: PgPool) {
         .execute(&mut *blocker)
         .await
         .unwrap();
+
+    blocker
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn absent_result_confirmation_can_precede_original_commit(pool: PgPool) {
+    let request = success(initial_result(&pool).await);
+    let unpublished = unchanged_row(&pool).await;
+    let measured = Measured::start(&pool).await;
+    let blocker = defer_result_commit(&pool).await;
 
     let sever_pending_commit = async {
         timeout(Duration::from_millis(900), async {
@@ -514,4 +520,246 @@ async fn result_timeouts_retire_native_backends_without_finalizing(pool: PgPool)
         .iter()
         .any(|record| { record.sqlstate == Some(*b"57014") }));
     assert_eq!(unchanged_row(&pool).await, unpublished);
+}
+
+async fn observe_native_block(
+    pool: &PgPool,
+    measured: &Measured,
+    blocking_pid: i32,
+    at_commit: bool,
+) -> (i32, String) {
+    timeout(Duration::from_millis(250), async {
+        loop {
+            let pid = measured
+                .proxy
+                .diagnostic_identities()
+                .unwrap()
+                .iter()
+                .find_map(|identity| identity.pid);
+            if let Some(pid) = pid {
+                let event: Option<String> = sqlx::query_scalar(
+                    "SELECT wait_event FROM pg_stat_activity
+                     WHERE pid = $1 AND datname = current_database() AND state = 'active'
+                       AND $2 = ANY(pg_blocking_pids(pid)) AND wait_event_type = 'Lock'
+                       AND (($3::boolean AND wait_event = 'advisory' AND query = 'COMMIT')
+                            OR (NOT $3 AND wait_event IN ('transactionid', 'tuple')))",
+                )
+                .bind(pid)
+                .bind(blocking_pid)
+                .bind(at_commit)
+                .fetch_optional(pool)
+                .await
+                .unwrap();
+                if let Some(event) = event {
+                    return (pid, event);
+                }
+            }
+            sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("native lock wait not witnessed (blocking pid {blocking_pid})"))
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn precommit_snapshot_equal_loser_refuses_before_independent_replay(pool: PgPool) {
+    let request = success(initial_result(&pool).await);
+    let winner = Measured::start(&pool).await;
+    let loser = Measured::start(&pool).await;
+    let mut blocker = defer_result_commit(&pool).await;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+    let run_loser_after_winner_updates = async {
+        let (winner_pid, winner_wait) =
+            observe_native_block(&pool, &winner, blocker_pid, true).await;
+        assert_claim_sql(&winner.wire(4, 1, 1), true);
+
+        let release_after_loser_takes_its_snapshot = async {
+            let (loser_pid, loser_wait) =
+                observe_native_block(&pool, &loser, winner_pid, false).await;
+            assert_claim_sql(&loser.wire(3, 1, 0), false);
+            blocker.commit().await.unwrap();
+            println!(
+                "N5 result race winner_pid={winner_pid} winner_wait={winner_wait} \
+                 loser_pid={loser_pid} loser_wait={loser_wait}"
+            );
+        };
+        let (outcome, ()) =
+            tokio::join!(publish(&loser, request.clone()), release_after_loser_takes_its_snapshot);
+        outcome
+    };
+
+    let (first, concurrent_equal) =
+        tokio::join!(publish(&winner, request.clone()), run_loser_after_winner_updates);
+    assert!(matches!(first, Ok(Publication::Published)), "{first:?}");
+    assert!(matches!(concurrent_equal, Ok(Publication::Refused)), "{concurrent_equal:?}");
+    winner.retired(&pool, 1).await;
+    loser.retired(&pool, 1).await;
+    winner.wire(4, 1, 1);
+    loser.wire(3, 1, 0);
+
+    assert_native_receipt(&pool, &request).await;
+    let persisted = unchanged_row(&pool).await;
+    assert!(matches!(publish(&loser, request).await, Ok(Publication::Replayed)));
+    loser.retired(&pool, 2).await;
+    assert_claim_sql(&loser.wire(7, 2, 1)[3..], true);
+    assert_eq!(unchanged_row(&pool).await, persisted);
+}
+
+fn advance_from(prior: &ResultRequest, settled: bool) -> ClaimRequest {
+    let tick = prior.claim.identity.captured;
+    let threshold = prior
+        .handoff
+        .map_or_else(|| offset(tick, DAY + 60, 0), |handoff| offset(handoff, DAY, 0));
+    ClaimRequest {
+        key: prior.key.clone(),
+        prior: PriorClaim {
+            revision: prior.claim.revision,
+            identity: prior.claim.identity.clone(),
+            eligibility: PriorEligibility::SameDomain,
+            handoff: prior.handoff,
+            result: settled.then_some(prior.conclusion),
+        },
+        next: ClaimIdentity {
+            claim_id: Uuid::now_v7(),
+            owner: Uuid::now_v7(),
+            digest: [0x83; 32],
+            captured: threshold,
+            audit_at: prior.claim.identity.audit_at + chrono::Duration::days(1),
+        },
+    }
+}
+
+async fn scheduled_result(pool: &PgPool, request: ResultRequest, delay: u64) -> Publication {
+    sleep(Duration::from_millis(delay)).await;
+    publish_result(pool, request, deadline(), &Trace::default()).await.unwrap()
+}
+
+async fn assert_model_receipt(
+    pool: &PgPool,
+    winner: &ResultRequest,
+    previous_snapshot: &mut String,
+) {
+    if winner.snapshot.is_some() {
+        assert_native_receipt(pool, winner).await;
+        *previous_snapshot = snapshot(pool).await;
+    } else {
+        let (revision, claim, result, cleared): (i64, Uuid, String, i32) = sqlx::query_as(
+            "SELECT revision, claim_id, result_class, num_nulls(handoff_domain, handoff_tick)
+             FROM n5_refresh_state
+             WHERE venue_id='binance:spot' AND symbol=$1 AND descriptor='commission'",
+        )
+        .bind(&winner.key.symbol)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(revision, winner.claim.revision);
+        assert_eq!(claim, winner.claim.identity.claim_id);
+        assert_eq!(result, "no_send");
+        assert_eq!(cleared, 2);
+        assert_eq!(snapshot(pool).await, *previous_snapshot);
+    }
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn generated_interleavings_keep_one_terminal_result_per_claim(pool: PgPool) {
+    use proptest::{
+        array::uniform4,
+        prelude::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+
+    let mut current = initial_result(&pool).await;
+    let mut previous_snapshot = snapshot(&pool).await;
+    let mut runner = TestRunner::deterministic();
+    let schedules = (uniform4(0_u64..8), any::<bool>(), any::<bool>());
+    for case in 0..16 {
+        let (
+            [delay_first, delay_duplicate, delay_different, delay_advance],
+            different_success,
+            allow_advance,
+        ) = schedules.new_tree(&mut runner).unwrap().current();
+        let first = success(current.clone());
+        let different = if different_success {
+            success(current.clone())
+        } else {
+            current.clone()
+        };
+        let race_advance = async {
+            if !allow_advance {
+                return ClaimOutcome::Refused;
+            }
+            sleep(Duration::from_millis(delay_advance)).await;
+            claim(&pool, advance_from(&current, false), deadline(), &Trace::default())
+                .await
+                .unwrap()
+        };
+        let (first_outcome, duplicate_outcome, different_outcome, advancement) = tokio::join!(
+            scheduled_result(&pool, first.clone(), delay_first),
+            scheduled_result(&pool, first.clone(), delay_duplicate),
+            scheduled_result(&pool, different.clone(), delay_different),
+            race_advance,
+        );
+        let outcomes = [first_outcome, duplicate_outcome, different_outcome];
+
+        let (next, stale) = match advancement {
+            ClaimOutcome::Stored(next) => {
+                for outcome in &outcomes {
+                    assert!(matches!(outcome, Publication::Refused), "case {case}: {outcomes:?}");
+                }
+                (next, first)
+            },
+            ClaimOutcome::Refused => {
+                let published: Vec<_> = outcomes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, outcome)| {
+                        matches!(outcome, Publication::Published).then_some(index)
+                    })
+                    .collect();
+                assert_eq!(published.len(), 1, "case {case}: {outcomes:?}");
+                let different_won = published[0] == 2;
+                for (index, outcome) in outcomes.iter().enumerate() {
+                    match outcome {
+                        Publication::Published | Publication::Refused => {},
+                        Publication::Replayed => {
+                            assert_eq!(index == 2, different_won, "case {case}")
+                        },
+                        Publication::Uncertain(_) => panic!("case {case}: unexpected ACK loss"),
+                    }
+                }
+                let (winner, rival) = if different_won {
+                    (different, first)
+                } else {
+                    (first, different)
+                };
+                assert_model_receipt(&pool, &winner, &mut previous_snapshot).await;
+                let terminal = unchanged_row(&pool).await;
+                assert!(matches!(
+                    scheduled_result(&pool, winner.clone(), 0).await,
+                    Publication::Replayed,
+                ));
+                assert!(matches!(scheduled_result(&pool, rival, 0).await, Publication::Refused));
+                assert_eq!(unchanged_row(&pool).await, terminal);
+
+                let next = stored_claim(&pool, advance_from(&winner, true)).await;
+                (next, winner)
+            },
+            ClaimOutcome::Uncertain(_) => panic!("case {case}: unexpected claim ACK loss"),
+        };
+
+        assert_eq!(next.revision, current.claim.revision + 1);
+        assert_native_claim(&pool, next.revision, &next.identity).await;
+        assert_eq!(snapshot(&pool).await, previous_snapshot);
+        let advanced = unchanged_row(&pool).await;
+        assert!(matches!(scheduled_result(&pool, stale, 0).await, Publication::Refused));
+        assert_eq!(unchanged_row(&pool).await, advanced);
+        current.claim = next;
+    }
 }
