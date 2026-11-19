@@ -1,6 +1,6 @@
 //! Descriptive global source-page observation. Never a complete audit, fencing
 //! proof, catalog result, clock qualification or production readiness input.
-use sqlx::{ConnectOptions, PgPool, Row};
+use sqlx::{postgres::PgRow, ConnectOptions, PgPool, Row};
 use tokio::time::{timeout_at, Instant};
 use uuid::Uuid;
 
@@ -58,52 +58,7 @@ async fn observe(
         if row.len() != 8 {
             return Err(BudgetError::Invalid);
         }
-        let page = Page {
-            examined: get(&row, "examined")?,
-            spot: get(&row, "spot")?,
-            missing_intent: get(&row, "missing_intent")?,
-            missing_clock: get(&row, "missing_clock")?,
-            missing_charge: get(&row, "missing_charge")?,
-            mismatched: get(&row, "mismatched")?,
-            cancels: get(&row, "cancels")?,
-            legacy_null: get(&row, "legacy_null")?,
-        };
-        if page.examined.len() > 1000
-            || !page.examined.windows(2).all(|ids| ids[0] < ids[1])
-            || page
-                .examined
-                .iter()
-                .any(|id| *id > high_water || cursor.is_some_and(|c| *id <= c))
-        {
-            return Err(BudgetError::Invalid);
-        }
-        for ids in [
-            &page.spot,
-            &page.missing_intent,
-            &page.missing_clock,
-            &page.missing_charge,
-            &page.mismatched,
-            &page.cancels,
-            &page.legacy_null,
-        ] {
-            if !ids.windows(2).all(|ids| ids[0] < ids[1])
-                || ids.iter().any(|id| page.examined.binary_search(id).is_err())
-            {
-                return Err(BudgetError::Invalid);
-            }
-        }
-        for ids in [
-            &page.missing_intent,
-            &page.missing_clock,
-            &page.missing_charge,
-            &page.mismatched,
-            &page.cancels,
-            &page.legacy_null,
-        ] {
-            if ids.iter().any(|id| page.spot.binary_search(id).is_err()) {
-                return Err(BudgetError::Invalid);
-            }
-        }
+        let page = decode(&row, cursor, high_water, 0)?;
         if Instant::now() >= deadline {
             return Err(BudgetError::Expired);
         }
@@ -113,5 +68,77 @@ async fn observe(
     timeout_at(deadline, work).await.map_err(|_| BudgetError::Expired)?
 }
 
+/// The 8 page fields of one fully completed row. `prior` is the count already
+/// examined; the aggregate cap is checked before any subset is decoded.
+fn decode(
+    row: &PgRow,
+    cursor: Option<Uuid>,
+    high_water: Uuid,
+    prior: i64,
+) -> Result<Page, BudgetError> {
+    let examined: Vec<Uuid> = get(row, "examined")?;
+    let total = i64::try_from(examined.len())
+        .ok()
+        .and_then(|len| prior.checked_add(len))
+        .ok_or(BudgetError::Invalid)?;
+    if examined.len() > 1000 || !(0..=1_000_000).contains(&total) {
+        return Err(BudgetError::Invalid);
+    }
+    let page = Page {
+        examined,
+        spot: get(row, "spot")?,
+        missing_intent: get(row, "missing_intent")?,
+        missing_clock: get(row, "missing_clock")?,
+        missing_charge: get(row, "missing_charge")?,
+        mismatched: get(row, "mismatched")?,
+        cancels: get(row, "cancels")?,
+        legacy_null: get(row, "legacy_null")?,
+    };
+    if !page.examined.windows(2).all(|ids| ids[0] < ids[1])
+        || page
+            .examined
+            .iter()
+            .any(|id| *id > high_water || cursor.is_some_and(|c| *id <= c))
+    {
+        return Err(BudgetError::Invalid);
+    }
+    for ids in [
+        &page.spot,
+        &page.missing_intent,
+        &page.missing_clock,
+        &page.missing_charge,
+        &page.mismatched,
+        &page.cancels,
+        &page.legacy_null,
+    ] {
+        if !ids.windows(2).all(|ids| ids[0] < ids[1])
+            || ids.iter().any(|id| page.examined.binary_search(id).is_err())
+        {
+            return Err(BudgetError::Invalid);
+        }
+    }
+    for ids in [
+        &page.missing_intent,
+        &page.missing_clock,
+        &page.missing_charge,
+        &page.mismatched,
+        &page.cancels,
+        &page.legacy_null,
+    ] {
+        if ids.iter().any(|id| page.spot.binary_search(id).is_err()) {
+            return Err(BudgetError::Invalid);
+        }
+    }
+    Ok(page)
+}
+
+// Private durable running/failed audit controller. No runtime entry exists.
+#[path = "source_audit/run.rs"]
+mod run;
+
+#[cfg(test)]
 #[path = "source_audit/pg_tests.rs"]
 mod pg_tests;
+#[cfg(test)]
+#[path = "source_audit/run_pg_tests.rs"]
+mod run_pg_tests;
