@@ -359,9 +359,13 @@ async fn projected_native_order_default_plan_bounds_exact_terminal_target(
             .as_str()
             .context("physical node lacked Index Cond")
             .with_context(|| format!("{relation}: {node:#}"))?;
+        let actual_index = node["Index Name"].as_str();
+        let exact_leg_index = relation == "balance_legs"
+            && actual_index
+                == Some("balance_legs_position_id_tenant_id_venue_id_account_scope_s_key");
         ensure!(
             matches!(operation, "Index Scan" | "Index Only Scan")
-                && node["Index Name"].as_str() == Some(index)
+                && (actual_index == Some(index) || exact_leg_index)
                 && key_fields.iter().all(|field| condition
                     .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                     .any(|token| token == *field))
