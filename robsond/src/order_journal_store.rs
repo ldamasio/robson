@@ -45,7 +45,9 @@ use sqlx::{pool::PoolConnection, postgres::PgPoolOptions, Connection, PgPool, Po
 use tracing::Instrument as _;
 use uuid::Uuid;
 
-use crate::spot_order_set_store::{maintain_unbound_journal, JournalGeneration};
+use crate::spot_order_set_store::{
+    maintain_cancel_outcome, maintain_unbound_journal, JournalGeneration, JournalPrior,
+};
 
 /// The journal's own pool, so order writes never queue behind the daemon's.
 const JOURNAL_POOL_CONNECTIONS: u32 = 2;
@@ -117,9 +119,10 @@ impl PgJournalBackend {
         self
     }
 
-    /// The opted-in binding, refused before any SQL unless the batch is the
-    /// one supported shape: an accounting-first Spot Protection/Exit intent
-    /// without admission, in the bound tenant and account scope.
+    /// The opted-in binding, refused before any SQL unless the batch is one
+    /// supported shape in the bound tenant and account scope, accounting-first
+    /// and without admission: a Spot Protection/Exit intent, or the outcome of
+    /// one previously persisted grouped Cancel with no attempts.
     fn projection_for(
         &self,
         batch: &JournalBatch,
@@ -148,8 +151,26 @@ impl PgJournalBackend {
         if balance.admission.is_some() {
             return refuse("admission is not supported");
         }
-        if !matches!(intent.kind, IntentKind::Protection | IntentKind::Exit) {
-            return refuse("unsupported intent kind");
+        match intent.kind {
+            IntentKind::Protection | IntentKind::Exit => {},
+            // Never a first cancel: that has its own covered transaction.
+            IntentKind::Cancel => {
+                if batch.outcome.is_none() || !batch.attempts.is_empty() {
+                    return refuse("cancel without exactly an outcome");
+                }
+                if intent.position_id.is_none_or(|position| position.is_nil()) {
+                    return refuse("cancel without a position");
+                }
+                let canonical = intent.cancels_order_id.as_deref().is_some_and(|target| {
+                    target
+                        .parse::<robson_exec::venue_ledger::VenueIntId>()
+                        .is_ok_and(|parsed| parsed.to_string() == target)
+                });
+                if !canonical {
+                    return refuse("cancel without a canonical target");
+                }
+            },
+            _ => return refuse("unsupported intent kind"),
         }
         Ok(Some(generation))
     }
@@ -161,19 +182,39 @@ impl PgJournalBackend {
         generation: &JournalGeneration,
         batch: &JournalBatch,
         version: i64,
-        prior_member_expected: bool,
+        prior: JournalPrior,
         tx: &mut sqlx::Transaction<'_, Postgres>,
         started: Instant,
         bound: Duration,
     ) -> Result<(), CommitFailure> {
-        let maintained = maintain_unbound_journal(
-            &mut **tx,
-            generation,
-            version,
-            &batch.intent,
-            prior_member_expected,
-        )
-        .await
+        let maintained = match (&batch.intent.kind, prior) {
+            (IntentKind::Protection | IntentKind::Exit, JournalPrior::Sell { member_expected }) => {
+                maintain_unbound_journal(
+                    &mut **tx,
+                    generation,
+                    version,
+                    &batch.intent,
+                    member_expected,
+                )
+                .await
+            },
+            (IntentKind::Cancel, JournalPrior::Cancel { pending, conflict }) => {
+                maintain_cancel_outcome(
+                    &mut **tx,
+                    generation,
+                    version,
+                    &batch.intent,
+                    pending,
+                    conflict,
+                )
+                .await
+            },
+            _ => {
+                return Err(CommitFailure::Known(
+                    "order-set journal refused: unsupported route".to_owned(),
+                ))
+            },
+        }
         .map_err(|e| CommitFailure::Known(e.to_string()))?;
         if maintained != Some(version) {
             return Err(CommitFailure::Known(
@@ -219,10 +260,8 @@ impl PgJournalBackend {
         &self,
         batch: &JournalBatch,
         tx: &mut sqlx::Transaction<'_, Postgres>,
-    ) -> Result<bool, CommitFailure> {
-        self.write_routed(batch, tx, None)
-            .await
-            .map(|(_, prior_member_expected)| prior_member_expected)
+    ) -> Result<JournalPrior, CommitFailure> {
+        self.write_routed(batch, tx, None).await.map(|(_, prior)| prior)
     }
 
     /// The journal's statements. A prepared clocked route writes its clock row
@@ -232,10 +271,11 @@ impl PgJournalBackend {
         batch: &JournalBatch,
         tx: &mut sqlx::Transaction<'_, Postgres>,
         clock: Option<&clocked::Prepared>,
-    ) -> Result<(Vec<clocked::ClockReceipt>, bool), CommitFailure> {
+    ) -> Result<(Vec<clocked::ClockReceipt>, JournalPrior), CommitFailure> {
         let known = |error: sqlx::Error| CommitFailure::Known(error.to_string());
         let intent = &batch.intent;
         let projected = self.order_set_projection.is_some();
+        let projected_cancel = projected && intent.kind == IntentKind::Cancel;
         // The no-op update returns the row that owns the id, ours or not.
         let ordinary_intent = r#"
             INSERT INTO order_intents (
@@ -247,7 +287,18 @@ impl PgJournalBackend {
             RETURNING intent_id
             "#;
         let projected_intent;
-        let intent_sql = if projected {
+        let intent_sql = if projected_cancel {
+            // Exact prior J identity and contribution; no row is a fresh intent.
+            let before = include_str!("spot_order_set_store/journal_cancel_before_write.sql");
+            projected_intent = format!(
+                "{before}, written AS ({ordinary_intent})
+                 SELECT written.intent_id, prior_cancel.intent_id IS NOT NULL AS prior_found,
+                        coalesce(prior_cancel.pending, false) AS prior_pending,
+                        coalesce(prior_cancel.conflict, false) AS prior_conflict
+                 FROM written LEFT JOIN prior_cancel ON true"
+            );
+            projected_intent.as_str()
+        } else if projected {
             let before = include_str!("spot_order_set_store/journal_before_write.sql");
             projected_intent = format!(
                 "{before}, written AS ({ordinary_intent})
@@ -278,8 +329,22 @@ impl PgJournalBackend {
         if written.try_get::<Uuid, _>("intent_id").map_err(known)? != intent.intent_id {
             return Err(CommitFailure::IdSpent);
         }
-        let prior_member_expected =
-            projected && written.try_get("prior_member_expected").map_err(known)?;
+        let prior = if projected_cancel {
+            if !written.try_get::<bool, _>("prior_found").map_err(known)? {
+                return Err(CommitFailure::Known(
+                    "order-set journal refused: no persisted cancel intent".to_owned(),
+                ));
+            }
+            JournalPrior::Cancel {
+                pending: written.try_get("prior_pending").map_err(known)?,
+                conflict: written.try_get("prior_conflict").map_err(known)?,
+            }
+        } else {
+            JournalPrior::Sell {
+                member_expected: projected
+                    && written.try_get("prior_member_expected").map_err(known)?,
+            }
+        };
 
         if !batch.attempts.is_empty() {
             let ids: Vec<Uuid> = batch.attempts.iter().map(|a| a.attempt_id).collect();
@@ -349,7 +414,7 @@ impl PgJournalBackend {
         }
 
         if let Some(outcome) = &batch.outcome {
-            sqlx::query(
+            let affected = sqlx::query(
                 r#"
                 UPDATE order_intents SET
                     venue_outcome = COALESCE(venue_outcome, $2),
@@ -374,13 +439,18 @@ impl PgJournalBackend {
             )
             .await
             .map_err(known)?;
+            if projected_cancel && affected.rows_affected() != 1 {
+                return Err(CommitFailure::Known(
+                    "order-set journal refused: cancel outcome did not affect one row".to_owned(),
+                ));
+            }
         }
         let receipts = if batch.balance.is_some() {
             Box::pin(self.write_balance(batch, tx, clock)).await?
         } else {
             Vec::new()
         };
-        Ok((receipts, prior_member_expected))
+        Ok((receipts, prior))
     }
 }
 

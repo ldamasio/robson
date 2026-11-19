@@ -440,18 +440,14 @@ impl PgJournalBackend {
             started,
         ))
         .await?;
-        let (receipts, prior_member_expected) =
+        // A zero-attempt Cancel outcome prepared no rows: no clock helper call
+        // and the existing empty receipts.
+        let (receipts, prior) =
             Box::pin(self.write_routed(batch, &mut tx, Some(&prepared))).await?;
         if let Some(generation) = projection {
-            Box::pin(self.maintain_order_set(
-                generation,
-                batch,
-                version,
-                prior_member_expected,
-                &mut tx,
-                started,
-                bound,
-            ))
+            Box::pin(
+                self.maintain_order_set(generation, batch, version, prior, &mut tx, started, bound),
+            )
             .await?;
         }
         // Same-poll expiry: a completed receipt past the deadline never commits.

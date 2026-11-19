@@ -30,6 +30,49 @@ impl JournalGeneration {
 }
 
 const JOURNAL_UNBOUND: &str = include_str!("journal_unbound.sql");
+const JOURNAL_CANCEL_OUTCOME: &str = include_str!("journal_cancel_outcome.sql");
+
+/// The existing contribution captured in the original intent upsert's
+/// snapshot, typed by the opted route it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JournalPrior {
+    /// Unbound SELL activity, as journal_before_write.sql reads it.
+    Sell { member_expected: bool },
+    /// One preexisting grouped cancel, as journal_cancel_before_write.sql
+    /// reads it. Absent J is a fresh intent and refuses.
+    Cancel { pending: bool, conflict: bool },
+}
+
+/// One statement on the caller's transaction for the outcome of one
+/// previously persisted grouped cancel. Same contract as
+/// [`maintain_unbound_journal`]: no row is a refusal.
+pub(crate) async fn maintain_cancel_outcome(
+    connection: &mut PgConnection,
+    generation: &JournalGeneration,
+    version: i64,
+    intent: &IntentRow,
+    prior_pending: bool,
+    prior_conflict: bool,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(JOURNAL_CANCEL_OUTCOME)
+        .bind(generation.tenant_id)
+        .bind(&generation.account_scope)
+        .bind(generation.generation_id)
+        .bind(generation.process_epoch)
+        .bind(generation.source_audit_id)
+        .bind(version)
+        .bind(intent.intent_id)
+        .bind(&intent.client_order_id)
+        .bind(intent.position_id)
+        .bind(&intent.cancels_order_id)
+        .bind(prior_pending)
+        .bind(prior_conflict)
+        .fetch_optional(connection)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
+        .await
+}
 
 /// One statement on the caller's transaction, after its original intent and
 /// attempt effects and under its accounting lock. `version` is the one that

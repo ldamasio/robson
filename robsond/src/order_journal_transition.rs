@@ -251,3 +251,7 @@ mod prepared;
 #[cfg(test)]
 #[path = "order_journal_transition_projected_pg_tests.rs"]
 mod projected;
+
+#[cfg(test)]
+#[path = "order_journal_grouped_cancel_pg_tests.rs"]
+mod projected_outcome;

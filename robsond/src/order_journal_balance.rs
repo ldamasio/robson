@@ -50,17 +50,11 @@ impl PgJournalBackend {
             started,
         ))
         .await?;
-        let prior_member_expected = self.write(batch, &mut tx).await?;
+        let prior = self.write(batch, &mut tx).await?;
         if let Some(generation) = projection {
-            Box::pin(self.maintain_order_set(
-                generation,
-                batch,
-                version,
-                prior_member_expected,
-                &mut tx,
-                started,
-                bound,
-            ))
+            Box::pin(
+                self.maintain_order_set(generation, batch, version, prior, &mut tx, started, bound),
+            )
             .await?;
         }
         // Preserve J's existing conservative COMMIT classification.
