@@ -5,16 +5,17 @@
     SELECT c.tenant_id, c.venue_id, c.account_scope, c.generation_id, c.intent_id,
            c.j_leg_symbol AS symbol,
            CASE WHEN c.j_leg_symbol IS NOT NULL THEN c.j_position END AS position_id,
-           c.j_target AS target_id,
+           c.j_target AS target_id, c.j_position AS source_position, c.position_hints_complete,
            -- A linked prior row already disputed J; otherwise the journal facts.
            c.prior_linked OR NOT c.j_not_sent OR NOT c.j_no_answer AS p_pending,
            c.prior_linked OR (c.j_not_sent AND NOT c.j_no_answer) AS p_conflict,
            m.intent_id IS NOT NULL AS stored,
            m.symbol AS s_symbol, m.position_id AS s_position, m.target_id AS s_target,
+           m.source_position AS s_source,
            coalesce(m.pending, false) AS s_pending, coalesce(m.conflict, false) AS s_conflict
     FROM links c
     LEFT JOIN LATERAL (
-        SELECT intent_id, symbol, position_id, target_id, pending, conflict FROM public.spot_order_set_cancel_members
+        SELECT intent_id, symbol, position_id, source_position, target_id, pending, conflict FROM public.spot_order_set_cancel_members
         WHERE (tenant_id, venue_id, account_scope, generation_id, intent_id)
             = (c.tenant_id, c.venue_id, c.account_scope, c.generation_id, c.intent_id)
         LIMIT 1
@@ -26,8 +27,11 @@
            m.stored
                AND (m.s_symbol, m.s_position, m.s_target)
                    IS NOT DISTINCT FROM (m.symbol, m.position_id, m.target_id)
+               AND (m.s_source IS NOT DISTINCT FROM m.source_position
+                    OR (NOT m.position_hints_complete AND m.s_source IS NULL))
                AND (m.s_pending, m.s_conflict) = (m.p_pending, m.p_conflict) AS ok,
-           NOT (m.s_pending AND m.s_conflict) AS touch,
+           (NOT (m.s_pending AND m.s_conflict)
+               OR m.s_source IS DISTINCT FROM m.source_position) AS touch,
            (NOT m.s_pending)::integer AS pending_delta,
            (NOT m.s_conflict)::integer AS conflict_delta
     FROM cancel_member m

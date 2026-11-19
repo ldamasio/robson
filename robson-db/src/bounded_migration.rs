@@ -28,6 +28,7 @@ const VERSION41: i64 = 20240101000041;
 const VERSION42: i64 = 20240101000042;
 const VERSION43: i64 = 20240101000043;
 const VERSION44: i64 = 20240101000044;
+const VERSION45: i64 = 20240101000045;
 const APPLY_BOUND: Duration = Duration::from_millis(200);
 const ACQUIRE_BOUND: Duration = Duration::from_secs(5);
 
@@ -301,6 +302,10 @@ fn contract44() -> Option<&'static Migration> {
     crate::MIGRATOR.iter().find(|migration| migration.version == VERSION44)
 }
 
+fn contract45() -> Option<&'static Migration> {
+    crate::MIGRATOR.iter().find(|migration| migration.version == VERSION45)
+}
+
 /// Only this crate's tests may route a non-embedded version-39 source (the
 /// acceptance suite's private ordinary witnesses) through SQLx's own path.
 const ORDINARY39: bool = cfg!(test);
@@ -403,6 +408,15 @@ fn preflight44(migration: &Migration) -> Result<(), MigrateError> {
         "$migration44$",
         "migration44 must run inside one SQLx transaction",
         "migration44 must be one top-level DO statement",
+    )
+}
+
+fn preflight45(migration: &Migration) -> Result<(), MigrateError> {
+    preflight_delegated_do(
+        migration,
+        "$migration45$",
+        "migration45 must run inside one SQLx transaction",
+        "migration45 must be one top-level DO statement",
     )
 }
 
@@ -532,6 +546,16 @@ impl Migrate for BoundedMigration {
                     migration,
                     preflight44(migration),
                     "migration44 whole-apply deadline exceeded",
+                )
+                .await
+            } else if migration.version == VERSION45 {
+                if !contract45().is_some_and(|expected| matches_embedded(migration, expected)) {
+                    return Err(refusal("migration45 contract mismatch"));
+                }
+                self.apply_delegated(
+                    migration,
+                    preflight45(migration),
+                    "migration45 whole-apply deadline exceeded",
                 )
                 .await
             } else if route39(migration, contract39(), ORDINARY39)? {

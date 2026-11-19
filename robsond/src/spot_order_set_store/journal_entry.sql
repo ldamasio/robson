@@ -27,6 +27,7 @@ WITH entry AS MATERIALIZED (
     WHERE j.intent_id = $7 AND (j.tenant_id, j.venue_id, j.account_scope) = ($1, 'binance:spot', $2)
       AND (g.generation_id, g.process_epoch, g.source_audit_id) = ($3, $4, $5)
       AND g.accounting_version = $6::bigint - 1
+      AND g.position_hints_complete
       AND j.client_order_id = $8 AND j.position_id = $9 AND l.symbol = $10
       AND j.kind = 'entry'
       -- No linked outcome: an Entry outcome can change a CANCEL mask.
@@ -63,4 +64,5 @@ WHERE (g.tenant_id, g.venue_id, g.account_scope, g.generation_id)
     = (e.tenant_id, e.venue_id, e.account_scope, e.generation_id)
   AND (g.process_epoch, g.source_audit_id) = ($4, $5)
   AND g.accounting_version = $6::bigint - 1
+  AND g.position_hints_complete
 RETURNING g.accounting_version

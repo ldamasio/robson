@@ -1,5 +1,5 @@
-//! Provisional native admission tests. The CANCEL hint schema is created only
-//! in isolated PG16; these tests never establish reconstruction provenance.
+//! Native tests use explicit synthetic completeness. They do not establish
+//! reconstruction provenance or give runtime authority.
 use std::sync::Arc;
 
 use robson_exec::order_journal::AdmissionRow;
@@ -43,11 +43,13 @@ async fn arm(pool: &PgPool, g: &JournalGeneration) -> Result<JournalBatch> {
     Ok(batch)
 }
 
-async fn hint_schema(pool: &PgPool) -> Result<()> {
-    sqlx::raw_sql(include_str!("../tests/spot_entry_hint_fixture.sql"))
+async fn seed_entry_generation(pool: &PgPool) -> Result<JournalGeneration> {
+    let generation = seed_generation(pool).await?;
+    sqlx::query("UPDATE spot_order_set_generation SET position_hints_complete = true WHERE generation_id = $1")
+        .bind(generation.generation_id)
         .execute(pool)
         .await?;
-    Ok(())
+    Ok(generation)
 }
 
 async fn assert_current(
@@ -81,9 +83,8 @@ async fn assert_current(
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires isolated PostgreSQL DATABASE_URL"]
 async fn projected_entry_real_birth_native_clock_and_exact_replay(pool: PgPool) -> Result<()> {
-    hint_schema(&pool).await?;
     let clock = native_clock(&pool).await?;
-    let b = seed_generation(&pool).await?;
+    let b = seed_entry_generation(&pool).await?;
     let start = fields(&pool, &b).await?.0;
     let mut j = arm(&pool, &b).await?;
     let stored = PgJournalBackend::new(&pool, b.tenant_id).with_order_set_projection(b.clone());
@@ -106,8 +107,7 @@ async fn projected_entry_real_birth_native_clock_and_exact_replay(pool: PgPool) 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires isolated PostgreSQL DATABASE_URL"]
 async fn projected_entry_refuses_an_inactive_original_cancel_hint(pool: PgPool) -> Result<()> {
-    hint_schema(&pool).await?;
-    let b = seed_generation(&pool).await?;
+    let b = seed_entry_generation(&pool).await?;
     let j = arm(&pool, &b).await?;
     let position = j.intent.position_id.unwrap();
     let earlier = Uuid::now_v7();
@@ -142,8 +142,7 @@ async fn projected_entry_refuses_an_inactive_original_cancel_hint(pool: PgPool) 
 async fn projected_entry_original_ack_loss_and_linked_replay_preserve_native_identity(
     pool: PgPool,
 ) -> Result<()> {
-    hint_schema(&pool).await?;
-    let g = seed_generation(&pool).await?;
+    let g = seed_entry_generation(&pool).await?;
     let j = arm(&pool, &g).await?;
     let position = j.intent.position_id.unwrap();
     let before = fields(&pool, &g).await?.0;
@@ -181,8 +180,7 @@ async fn projected_entry_original_ack_loss_and_linked_replay_preserve_native_ide
 async fn projected_entry_retains_active_unbound_sell_until_exact_repair(
     pool: PgPool,
 ) -> Result<()> {
-    hint_schema(&pool).await?;
-    let g = seed_generation(&pool).await?;
+    let g = seed_entry_generation(&pool).await?;
     let j = arm(&pool, &g).await?;
     let writer = PgJournalBackend::new(&pool, g.tenant_id).with_order_set_projection(g.clone());
     let mut unresolved = sell();
@@ -204,7 +202,6 @@ async fn projected_entry_competing_births_publish_one_current_admission(
         strategy::{Strategy, ValueTree},
         test_runner::{Config, RngSeed, TestRunner},
     };
-    hint_schema(&pool).await?;
     let mut runner = TestRunner::new(Config {
         rng_seed: RngSeed::Fixed(0xb5bcb71d),
         failure_persistence: None,
@@ -213,7 +210,7 @@ async fn projected_entry_competing_births_publish_one_current_admission(
     let phases = (0_u64..=1800, 0_u64..=1800);
     for i in 0..16 {
         let (a_delay, b_delay) = phases.new_tree(&mut runner).expect("bounded schedule").current();
-        let g = seed_generation(&pool).await?;
+        let g = seed_entry_generation(&pool).await?;
         let start = fields(&pool, &g).await?.0;
         let a = arm(&pool, &g).await?;
         let mut b = a.clone();
@@ -272,8 +269,7 @@ async fn projected_entry_competing_births_publish_one_current_admission(
 async fn projected_entry_local_hints_do_not_use_foreign_or_unknown_position(
     pool: PgPool,
 ) -> Result<()> {
-    hint_schema(&pool).await?;
-    let g = seed_generation(&pool).await?;
+    let g = seed_entry_generation(&pool).await?;
     let j = arm(&pool, &g).await?;
     let position = j.intent.position_id.unwrap();
     for (a_scope, tenant, generation, source) in [
@@ -301,8 +297,7 @@ async fn projected_entry_local_hints_do_not_use_foreign_or_unknown_position(
 async fn projected_entry_rejects_unsupported_payload_and_preserves_exact_current_terms(
     pool: PgPool,
 ) -> Result<()> {
-    hint_schema(&pool).await?;
-    let g = seed_generation(&pool).await?;
+    let g = seed_entry_generation(&pool).await?;
     let j = arm(&pool, &g).await?;
     let initial = fields(&pool, &g).await?;
     let writer = PgJournalBackend::new(&pool, g.tenant_id).with_order_set_projection(g.clone());
@@ -341,9 +336,8 @@ async fn projected_entry_rejects_unsupported_payload_and_preserves_exact_current
 async fn projected_entry_rolls_back_real_clocked_admission_when_projection_refuses(
     pool: PgPool,
 ) -> Result<()> {
-    hint_schema(&pool).await?;
     let clock = native_clock(&pool).await?;
-    let g = seed_generation(&pool).await?;
+    let g = seed_entry_generation(&pool).await?;
     let mut j = arm(&pool, &g).await?;
     let input = clocked_attempt(&clock, &g, &mut j)?;
     let id = j.intent.intent_id;
@@ -389,8 +383,7 @@ async fn projected_entry_rolls_back_real_clocked_admission_when_projection_refus
 async fn projected_entry_reads_both_original_hints_by_exact_default_plans(
     pool: PgPool,
 ) -> Result<()> {
-    hint_schema(&pool).await?;
-    let g = seed_generation(&pool).await?;
+    let g = seed_entry_generation(&pool).await?;
     let j = arm(&pool, &g).await?;
     let writer = PgJournalBackend::new(&pool, g.tenant_id).with_order_set_projection(g.clone());
     insist(writer.commit(&j).await)?;
@@ -486,5 +479,19 @@ async fn projected_entry_reads_both_original_hints_by_exact_default_plans(
         ensure!(node["Rows Removed by Filter"].as_u64().unwrap_or_default() == 0);
     }
     eprintln!("Each original Entry hint uses one exact native index probe after 8,192 rows of scope-local noise");
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_entry_closes_legacy_generation_even_without_hint_rows(
+    pool: PgPool,
+) -> Result<()> {
+    let g = seed_generation(&pool).await?;
+    let j = arm(&pool, &g).await?;
+    let writer = PgJournalBackend::new(&pool, g.tenant_id).with_order_set_projection(g.clone());
+    let before = fields(&pool, &g).await?;
+    ensure!(matches!(writer.commit(&j).await, Err(CommitFailure::Known(_))));
+    ensure!(!j_present(&pool, j.intent.intent_id).await? && fields(&pool, &g).await? == before);
     Ok(())
 }

@@ -3,7 +3,7 @@
 -- Exact keys only: no sibling member is read or written.
 WITH cancel AS MATERIALIZED (
     SELECT j.intent_id, j.tenant_id, j.venue_id, j.account_scope, j.position_id,
-           j.cancels_order_id AS target_id, l.symbol, g.generation_id,
+           j.cancels_order_id AS target_id, l.symbol, g.generation_id, g.position_hints_complete,
            named.named_rows > 0
                OR (j.not_sent AND (j.venue_outcome IS NOT NULL OR j.venue_evidence IS NOT NULL))
                AS conflict,
@@ -60,6 +60,7 @@ WITH cancel AS MATERIALIZED (
     -- The exact persisted member must equal the contribution captured before
     -- the source write, and its group mask must agree with the native proof.
     SELECT e.*,
+           m.source_position AS prior_source_position,
            p.pending_count, p.conflict_count AS group_conflict_count,
            l.active_count AS leg_active_count, l.conflict_count AS leg_conflict_count,
            e.pending::integer - $11::boolean::integer AS pending_delta,
@@ -75,6 +76,8 @@ WITH cancel AS MATERIALIZED (
       ON (l.tenant_id, l.venue_id, l.account_scope, l.generation_id, l.symbol, l.position_id)
        = (e.tenant_id, e.venue_id, e.account_scope, e.generation_id, e.symbol, e.position_id)
     WHERE (m.symbol, m.position_id, m.target_id) = (e.symbol, e.position_id, e.target_id)
+      AND (m.source_position IS NOT DISTINCT FROM e.position_id
+           OR (NOT e.position_hints_complete AND m.source_position IS NULL))
       AND (m.pending, m.conflict) = ($11::boolean, $12::boolean)
       AND p.terminal_mask = e.terminal_proof
       AND p.pending_count >= m.pending::integer
@@ -83,7 +86,9 @@ WITH cancel AS MATERIALIZED (
     -- A terminal group keeps pending evidence with no active contribution;
     -- conflict counts on the leg independently of the mask.
     SELECT p.*,
-           p.pending_delta <> 0 OR p.conflict_delta <> 0 AS member_changed,
+           p.pending_delta <> 0 OR p.conflict_delta <> 0 AS group_changed,
+           (p.pending_delta <> 0 OR p.conflict_delta <> 0
+               OR p.prior_source_position IS DISTINCT FROM p.position_id) AS member_changed,
            CASE WHEN p.terminal_proof THEN 0 ELSE p.pending_delta END AS active_delta
     FROM prior p
 ), leg_next AS MATERIALIZED (
@@ -101,11 +106,12 @@ WITH cancel AS MATERIALIZED (
       AND coalesce(c.leg_conflict_count, 0) + c.conflict_delta >= 0
 ), member_write AS (
     UPDATE public.spot_order_set_cancel_members m
-    SET pending = c.pending, conflict = c.conflict
+    SET pending = c.pending, conflict = c.conflict, source_position = c.position_id
     FROM leg_next c
     WHERE (m.tenant_id, m.venue_id, m.account_scope, m.generation_id, m.intent_id)
         = (c.tenant_id, c.venue_id, c.account_scope, c.generation_id, c.intent_id)
       AND (m.pending, m.conflict) = ($11::boolean, $12::boolean)
+      AND m.source_position IS NOT DISTINCT FROM c.prior_source_position
       AND c.member_changed
     RETURNING m.intent_id
 ), group_write AS (
@@ -117,7 +123,7 @@ WITH cancel AS MATERIALIZED (
         = (c.tenant_id, c.venue_id, c.account_scope, c.generation_id, c.symbol, c.position_id, c.target_id)
       AND (p.pending_count, p.conflict_count, p.terminal_mask)
         = (c.pending_count, c.group_conflict_count, c.terminal_proof)
-      AND c.member_changed
+      AND c.group_changed
     RETURNING p.target_id
 ), leg_write AS (
     -- An absent leg stays absent unless this member changes it; an explicit
@@ -142,6 +148,6 @@ WHERE (g.tenant_id, g.venue_id, g.account_scope, g.generation_id)
     = (c.tenant_id, c.venue_id, c.account_scope, c.generation_id)
   AND g.accounting_version = $6::bigint - 1
   AND (SELECT count(*) FROM member_write) = c.member_changed::integer
-  AND (SELECT count(*) FROM group_write) = c.member_changed::integer
+  AND (SELECT count(*) FROM group_write) = c.group_changed::integer
   AND (SELECT count(*) FROM leg_write) = c.leg_changed::integer
 RETURNING g.accounting_version

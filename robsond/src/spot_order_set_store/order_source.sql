@@ -9,7 +9,7 @@
 -- partial unique key and the touched member/aggregate rows. No row is a
 -- refusal; the caller then rolls back every native write.
 WITH gen AS MATERIALIZED (
-    SELECT g.tenant_id, g.venue_id, g.account_scope, g.generation_id
+    SELECT g.tenant_id, g.venue_id, g.account_scope, g.generation_id, g.position_hints_complete
     FROM public.spot_order_set_generation g
     JOIN LATERAL (
         SELECT epoch_id, clean_stop_at FROM public.process_epochs
@@ -22,6 +22,7 @@ WITH gen AS MATERIALIZED (
     SELECT g.generation_id, o.tenant_id, o.venue_id, o.account_scope, o.symbol,
            o.exchange_order_id, o.owner, o.intent_id, o.position_id, o.kind, o.side,
            o.phase, o.status, o.client_order_id,
+           g.position_hints_complete,
            j.intent_id IS NOT NULL AS has_j, j.kind AS j_kind, j.position_id AS j_position,
            j.client_order_id AS j_client, j.not_sent AS j_not_sent,
            j.venue_outcome IS NOT DISTINCT FROM 'rejected' AS j_rejected,

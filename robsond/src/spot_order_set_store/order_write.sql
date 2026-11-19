@@ -67,13 +67,13 @@
     RETURNING 1
 ), cancel_member_update AS (
     UPDATE public.spot_order_set_cancel_members m
-    SET pending = true, conflict = true
+    SET pending = true, conflict = true, source_position = p.source_position
     FROM cancel_member_plan p, verdict v
     WHERE v.ok AND p.touch AND p.stored
       AND (m.tenant_id, m.venue_id, m.account_scope, m.generation_id, m.intent_id)
         = (p.tenant_id, p.venue_id, p.account_scope, p.generation_id, p.intent_id)
-      AND (m.symbol, m.position_id, m.target_id, m.pending, m.conflict)
-          IS NOT DISTINCT FROM (p.s_symbol, p.s_position, p.s_target, p.s_pending, p.s_conflict)
+      AND (m.symbol, m.position_id, m.target_id, m.source_position, m.pending, m.conflict)
+          IS NOT DISTINCT FROM (p.s_symbol, p.s_position, p.s_target, p.s_source, p.s_pending, p.s_conflict)
     RETURNING 1
 ), cancel_group_update AS (
     UPDATE public.spot_order_set_cancel_groups t

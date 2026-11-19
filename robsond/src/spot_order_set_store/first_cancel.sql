@@ -54,10 +54,10 @@ WITH cancel AS MATERIALIZED (
 ), member_write AS (
     INSERT INTO public.spot_order_set_cancel_members (
         tenant_id, venue_id, account_scope, generation_id, intent_id, symbol, position_id,
-        target_id, pending, conflict
+        source_position, target_id, pending, conflict
     )
     SELECT tenant_id, venue_id, account_scope, generation_id, intent_id, symbol, position_id,
-           target_id, true, false
+           position_id, target_id, true, false
     FROM prior
     ON CONFLICT (tenant_id, venue_id, account_scope, generation_id, intent_id) DO NOTHING
     RETURNING intent_id

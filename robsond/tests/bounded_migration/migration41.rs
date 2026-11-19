@@ -107,11 +107,28 @@ impl Fixture {
             VERSION42 => "CREATE TABLE public.spot_order_set_sell_legs",
             VERSION43 => "CREATE TABLE public.spot_order_set_cancel_members",
             VERSION44 => "CREATE TABLE public.spot_order_set_cancel_unbound",
+            VERSION45 => {
+                "ALTER TABLE public.spot_order_set_cancel_members ADD COLUMN source_position"
+            },
             unexpected => panic!("unexpected fixture migration {unexpected}"),
         }
     }
 
     async fn table_exists(&mut self) -> Result<bool> {
+        if self.migration.version == VERSION45 {
+            let schema: (bool, bool, bool) = sqlx::query_as(
+                "SELECT to_regclass('public.idx_spot_cancel_unbound_original_position') IS NOT NULL,
+                    EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='public.spot_order_set_cancel_members'::regclass
+                           AND attname='source_position' AND NOT attisdropped),
+                    EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='public.spot_order_set_generation'::regclass
+                           AND attname='position_hints_complete' AND NOT attisdropped)",
+            ).fetch_one(&mut self.observer).await?;
+            ensure!(
+                schema.0 == schema.1 && schema.1 == schema.2,
+                "partial metadata migration: {schema:?}"
+            );
+            return Ok(schema.0);
+        }
         let table = self.first_create().trim_start_matches("CREATE TABLE ");
         Ok(sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(table)
@@ -188,6 +205,9 @@ impl Fixture {
             ensure!(elapsed >= 0, "attested elapsed metadata");
         } else {
             ensure!(elapsed == -1, "lost COMMIT ACK must precede elapsed update");
+        }
+        if self.migration.version == VERSION45 {
+            return Ok(());
         }
         let leaves: &[&str] = match self.migration.version {
             VERSION42 => &["sell_legs", "sell_symbols", "sell_unbound"],
@@ -711,4 +731,79 @@ async fn migration44_lost_ddl_ack_leaves_three_preceding_migrations(pool: PgPool
     .await?;
     ensure!(present, "three preceding exact migrations remain after M44 rolls back");
     Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn migration45_preserves_legacy_hints_as_incomplete(pool: PgPool) -> Result<()> {
+    let migration = contract45().expect("exact embedded M45");
+    let mut f = Fixture::for_migration(&pool, migration).await?;
+    let tenant = Uuid::now_v7();
+    let generation = Uuid::now_v7();
+    let intent = Uuid::now_v7();
+    let predecessors = sqlx::query_as::<_, (i64, Vec<u8>)>(
+        "SELECT version,checksum FROM _sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO spot_order_set_generation(tenant_id,venue_id,account_scope,generation_id)
+         VALUES($1,'binance:spot','existing',$2)",
+    )
+    .bind(tenant)
+    .bind(generation)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO spot_order_set_cancel_members(tenant_id,venue_id,account_scope,generation_id,intent_id,pending,conflict)
+         VALUES($1,'binance:spot','existing',$2,$3,false,false)",
+    ).bind(tenant).bind(generation).bind(intent).execute(&pool).await?;
+
+    f.adapter.apply(migration).await?;
+    ensure!(f.adapter.status() == (Status { phase: Phase::Restored, failure: None }));
+    f.assert_wire(7);
+    f.assert_landed(true).await?;
+    let observed: (bool, Option<Uuid>, bool, bool) = sqlx::query_as(
+        "SELECT g.position_hints_complete,m.source_position,m.pending,m.conflict
+         FROM spot_order_set_generation g JOIN spot_order_set_cancel_members m
+         USING(tenant_id,venue_id,account_scope,generation_id)
+         WHERE g.tenant_id=$1 AND m.intent_id=$2",
+    )
+    .bind(tenant)
+    .bind(intent)
+    .fetch_one(&pool)
+    .await?;
+    ensure!(observed == (false, None, false, false));
+    let unchanged = sqlx::query_as::<_, (i64, Vec<u8>)>(
+        "SELECT version,checksum FROM _sqlx_migrations WHERE version<$1 ORDER BY version",
+    )
+    .bind(VERSION45)
+    .fetch_all(&pool)
+    .await?;
+    ensure!(predecessors == unchanged);
+    let settings: (i32, String, String, String) =
+        sqlx::query_as(SETTINGS).fetch_one(f.adapter.connection()?).await?;
+    ensure!(settings == (f.pid, "310ms".into(), "410ms".into(), "510ms".into()));
+    f.adapter.unlock().await?;
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn migration45_lost_ddl_ack_leaves_no_partial_metadata(pool: PgPool) -> Result<()> {
+    lost(
+        Fixture::for_migration(&pool, contract45().expect("exact embedded M45")).await?,
+        false,
+    )
+    .await
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn migration45_lost_commit_ack_leaves_exact_metadata(pool: PgPool) -> Result<()> {
+    lost(
+        Fixture::for_migration(&pool, contract45().expect("exact embedded M45")).await?,
+        true,
+    )
+    .await
 }
