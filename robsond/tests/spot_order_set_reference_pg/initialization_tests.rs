@@ -92,6 +92,16 @@ async fn measure_candidate_read(
     )
     .execute(pool)
     .await?;
+    let (venue_rows, intent_rows, active_members, cancel_groups): (i64, i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT (SELECT count(*) FROM venue_orders),
+                    (SELECT count(*) FROM order_intents),
+                    (SELECT count(*) FROM sell_shadow_orders),
+                    (SELECT count(*) FROM cancel_shadow_groups)",
+        )
+        .fetch_one(pool)
+        .await?;
+    ensure!(venue_rows >= history && intent_rows >= history && cancel_groups >= history);
     let sql = candidate_statement();
     let explain = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}");
     for (candidate, present) in [("1000", true), ("99000001", false)] {
@@ -112,18 +122,28 @@ async fn measure_candidate_read(
             .await?;
         let plan = &physical.plan[0]["Plan"];
         ensure!(plan["Actual Rows"].as_u64() == Some(1));
-        for relation in ["venue_orders", "order_intents", "sell_shadow_orders", "cancel_shadow_groups"] {
+        for (relation, inventory) in [
+            ("venue_orders", venue_rows),
+            ("order_intents", intent_rows),
+            ("sell_shadow_orders", active_members),
+            ("cancel_shadow_groups", cancel_groups),
+        ] {
             let mut nodes = Vec::new();
             relation_nodes(plan, relation, &mut nodes);
             ensure!(nodes.len() == 1, "expected one {relation} probe: {plan}");
             let node = nodes[0];
             let loops = node["Actual Loops"].as_u64().context("native probe loops")?;
             let rows = node["Actual Rows"].as_u64().context("native probe rows")?;
-            ensure!(loops <= 1 && rows <= 1, "{relation}: {node}");
-            if history >= 512 && loops != 0 {
+            ensure!(loops <= 1, "{relation}: {node}");
+            let removed = node["Rows Removed by Filter"].as_u64().unwrap_or(0)
+                + node["Rows Removed by Index Recheck"].as_u64().unwrap_or(0);
+            if inventory >= 512 && loops != 0 {
                 ensure!(node["Index Cond"].is_string(), "expected indexed {relation}: {node}");
-                ensure!(node["Rows Removed by Filter"].as_u64().unwrap_or(0) == 0, "{node}");
-                ensure!(node["Rows Removed by Index Recheck"].as_u64().unwrap_or(0) == 0, "{node}");
+                ensure!(rows <= 1 && removed == 0, "{relation}: {node}");
+            } else {
+                // Terminal SELL history is absent from the member table.
+                // On tiny physical relations PostgreSQL can choose a scan.
+                ensure!(rows + removed <= u64::try_from(inventory)?, "{relation}: {node}");
             }
         }
         for relation in ["cancel_shadow_members", "sell_shadow_intents", "submit_attempts"] {
@@ -131,7 +151,12 @@ async fn measure_candidate_read(
             relation_nodes(plan, relation, &mut nodes);
             ensure!(nodes.is_empty(), "unexpected historical {relation} read: {plan}");
         }
-        eprintln!("SPOT_INIT_CANDIDATE_WORK history={history} present={present} wire=1 plan={}", physical.plan);
+        eprintln!(
+            "SPOT_INIT_CANDIDATE_WORK history={history} present={present} wire=1
+             venue_rows={venue_rows} intent_rows={intent_rows} active_members={active_members}
+             cancel_groups={cancel_groups} plan={}",
+            physical.plan
+        );
     }
     Ok(())
 }
@@ -716,11 +741,6 @@ async fn generated_history(
     let read_start = proxy.stats().statements;
     ensure!(ready.read(&actor, second, None).await?.is_some());
     ensure!(proxy.stats().statements - read_start == 1);
-    let groups: i64 = sqlx::query_scalar("SELECT count(*) FROM cancel_shadow_groups WHERE tenant_id=$1")
-        .bind(first.tenant)
-        .fetch_one(pool)
-        .await?;
-    ensure!(groups >= history, "fixture must seed distinct historical cancel groups");
     measure_candidate_read(pool, &actor, &proxy, &ready, first, history).await?;
     actor.close().await;
     ensure!(
