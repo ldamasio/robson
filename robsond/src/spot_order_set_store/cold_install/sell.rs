@@ -43,7 +43,7 @@ pub(super) struct SellProjection<'a> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(super) enum SellBuildRefusal {
+pub(in crate::spot_order_set_store) enum SellBuildRefusal {
     DuplicateSource,
     InvalidScopedSource,
     LeafBudget,

@@ -1205,6 +1205,8 @@ async fn cold_generation_install_publishes_ten_complete_leaf_sets(pool: PgPool) 
         install(&pool, &cut, &mut fence, deadline()).await,
         Err(InstallRefusal::AnchorChanged)
     ));
+    r2_reconstruction_reference(&pool, g).await?;
+    r2_replay_inactive_cancel(&pool, g, inactive).await?;
     Ok(())
 }
 
@@ -1246,6 +1248,166 @@ async fn cold_generation_install_refuses_missing_physical_leaf_write(pool: PgPoo
     ensure!(matches!(
         install(&pool, &cut, &mut fence, deadline()).await,
         Err(InstallRefusal::Leaves(_))
+    ));
+    let prior:bool=sqlx::query_scalar(
+         "SELECT EXISTS(SELECT 1 FROM spot_order_set_generation WHERE generation_id=$1 AND NOT position_hints_complete)")
+        .bind(old.0).fetch_one(&pool).await?;
+    ensure!(prior && r2_leaf_counts(&pool, request.scope.tenant_id, None).await? == [0; 10]);
+    Ok(())
+}
+async fn r2_reconstruction_reference(
+    pool: &PgPool,
+    generation: &super::super::JournalGeneration,
+) -> Result<()> {
+    for order in ["members_first", "targets_first"] {
+        let mut tx = pool.begin().await?;
+        sqlx::raw_sql(include_str!("../../tests/spot_order_set_reference_pg/sell_shadow.sql"))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::raw_sql(include_str!("../../tests/spot_order_set_reference_pg/cancel_shadow.sql"))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT set_config('robson_test.replay_cancel_order',$1,true)")
+            .bind(order)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::raw_sql(include_str!(
+            "../../tests/spot_order_set_reference_pg/initialization_replay.sql"
+        ))
+        .execute(&mut *tx)
+        .await?;
+
+        let reference_id = Uuid::now_v7();
+        let moved = sqlx::query(
+            "UPDATE public.spot_order_set_generation SET generation_id=$4
+            WHERE (tenant_id,venue_id,account_scope,generation_id)=($1,'binance:spot',$2,$3)",
+        )
+        .bind(generation.tenant_id)
+        .bind(&generation.account_scope)
+        .bind(generation.generation_id)
+        .bind(reference_id)
+        .execute(&mut *tx)
+        .await?;
+        ensure!(moved.rows_affected() == 1);
+        let stored: Uuid =
+            sqlx::query_scalar(include_str!("../../tests/venue_ledger_orders/oracle_seed.sql"))
+                .bind(generation.tenant_id)
+                .bind(&generation.account_scope)
+                .bind(reference_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        ensure!(stored == reference_id);
+
+        for leaf in R2_LEAVES {
+            let normalize = match leaf {
+                "sell_intents" | "sell_orders" => "AND (potential OR conflict)",
+                "sell_legs" | "sell_symbols" | "sell_unbound" => {
+                    "AND (potential_count<>0 OR conflict_count<>0)"
+                },
+                "cancel_groups" => "AND (pending_count<>0 OR conflict_count<>0 OR terminal_mask)",
+                "cancel_legs" | "cancel_unbound" | "cancel_ungroupable" => {
+                    "AND (active_count<>0 OR conflict_count<>0)"
+                },
+                "cancel_members" => "",
+                _ => unreachable!("fixed independent ten-leaf witness"),
+            };
+            let sql=format!(
+                "WITH actual AS MATERIALIZED (
+                    SELECT to_jsonb(t)-'generation_id' AS row
+                    FROM public.spot_order_set_{leaf} AS t
+                    WHERE (tenant_id,venue_id,account_scope,generation_id)=($1,'binance:spot',$2,$3) {normalize}
+                ), expected AS MATERIALIZED (
+                    SELECT to_jsonb(t)-'generation_id' AS row
+                    FROM public.spot_order_set_{leaf} AS t
+                    WHERE (tenant_id,venue_id,account_scope,generation_id)=($1,'binance:spot',$2,$4) {normalize}
+                )
+                SELECT count(*) FROM (
+                   (SELECT row FROM actual EXCEPT ALL SELECT row FROM expected)
+                   UNION ALL
+                   (SELECT row FROM expected EXCEPT ALL SELECT row FROM actual)
+                ) differences"
+            );
+            let different: i64 = sqlx::query_scalar(&sql)
+                .bind(generation.tenant_id)
+                .bind(&generation.account_scope)
+                .bind(generation.generation_id)
+                .bind(reference_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            ensure!(different == 0, "{order} {leaf}: {different} differing scoped rows");
+        }
+        tx.rollback().await?;
+    }
+    Ok(())
+}
+
+async fn r2_replay_inactive_cancel(
+    pool: &PgPool,
+    g: &super::super::JournalGeneration,
+    original: Uuid,
+) -> Result<()> {
+    use robson_exec::order_journal::{
+        BalanceBatch, IntentKind, IntentRow, JournalBackend, JournalBatch, OutcomeRow,
+    };
+    let (position_id, created_at): (Option<Uuid>, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "SELECT position_id,created_at FROM public.order_intents WHERE intent_id=$1",
+    )
+    .bind(original)
+    .fetch_one(pool)
+    .await?;
+    let batch = JournalBatch {
+        intent: IntentRow {
+            intent_id: original,
+            venue_id: "binance:spot".into(),
+            account_scope: g.account_scope.clone(),
+            client_order_id: original.to_string(),
+            position_id,
+            kind: IntentKind::Cancel,
+            cancels_order_id: Some("912309".into()),
+            params: serde_json::json!({}),
+            created_at,
+        },
+        attempts: vec![],
+        outcome: Some(OutcomeRow { not_sent: true, ..OutcomeRow::default() }),
+        balance: Some(BalanceBatch {
+            admission: None,
+            handed_off: false,
+            commit_bound: Duration::from_millis(500),
+        }),
+    };
+    let store = crate::order_journal_store::PgJournalBackend::new(pool, g.tenant_id)
+        .with_order_set_projection(g.clone());
+    let before: (i64,i64,bool)=sqlx::query_as(
+       "SELECT pending_count, conflict_count, terminal_mask FROM public.spot_order_set_cancel_groups
+        WHERE generation_id=$1 AND target_id='912309'"
+    ).bind(g.generation_id).fetch_one(pool).await?;
+    store
+        .commit(&batch)
+        .await
+        .map_err(|e| anyhow!("real grouped inactive replay: {e:?}"))?;
+    let after: (i64,i64,bool)=sqlx::query_as(
+       "SELECT pending_count, conflict_count, terminal_mask FROM public.spot_order_set_cancel_groups
+        WHERE generation_id=$1 AND target_id='912309'"
+    ).bind(g.generation_id).fetch_one(pool).await?;
+    ensure!(before == after && after == (0, 0, false));
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_install_refuses_same_version_epoch_drift(pool: PgPool) -> Result<()> {
+    let (request, old, _) = r2_install_fixture(&pool).await?;
+    let cut = capture(&pool, &request, deadline())
+        .await
+        .map_err(|e| anyhow!("owner cut: {e:?}"))?;
+    let epoch =
+        crate::process_epoch::start_epoch(&pool, request.scope.tenant_id, "install-stale-source")
+            .await?;
+    ensure!(epoch.epoch.epoch_id != request.epoch);
+    let mut fence = FixtureFence::matching(request.restore);
+    ensure!(matches!(
+        install(&pool, &cut, &mut fence, deadline()).await,
+        Err(InstallRefusal::Anchor(ColdAuditRefusal::Anchor(AnchorDefect::Epoch)))
     ));
     let prior:bool=sqlx::query_scalar(
          "SELECT EXISTS(SELECT 1 FROM spot_order_set_generation WHERE generation_id=$1 AND NOT position_hints_complete)")

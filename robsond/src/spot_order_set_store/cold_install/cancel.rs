@@ -62,7 +62,7 @@ pub(super) struct CancelLeaves<'a> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(super) enum CancelRebuildError {
+pub(in crate::spot_order_set_store) enum CancelRebuildError {
     SourceRowLimit,
     ForeignSource,
     DuplicateSource(&'static str),

@@ -77,7 +77,7 @@ pub(super) struct LeafScope<'a> {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum LeafError {
+pub(in crate::spot_order_set_store) enum LeafError {
     #[error("cold leaf serialization exceeded its bound")]
     Budget,
     #[error("cold leaf exact comparison failed on {0}")]
