@@ -543,6 +543,12 @@ fn clock_references(text: &str) -> impl Iterator<Item = &str> {
 
 fn n5_reference_lines(path: &Path) -> &'static [&'static str] {
     match path.to_str() {
+        Some("robson-exec/src/balance_costs/terms.rs") =>
+            &[r#"const API_SOURCE: &str = "binance:spot /api/v3/account/commission";"#],
+        Some("robson-testkit/src/fake_spot_venue_tests.rs") => &[
+            r#"let (status, _) = get(&venue, "/api/v3/account/commission", "symbol=BTCUSDT&timestamp=1").await;"#,
+            r#"&& unserved[1].starts_with("GET /api/v3/account/commission?")"#,
+        ],
         Some("robson-connectors/src/binance_rest.rs") => &[
             r#"const ENDPOINT: &str = "/api/v3/account/commission";"#,
             r#"let result = client.bind_spot_commission(single_shot().unwrap(), "BTCUSDT", 1_800_000_000_000);"#,
