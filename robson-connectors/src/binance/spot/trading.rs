@@ -56,7 +56,6 @@ use serde::Deserialize;
 use tracing::warn;
 
 use super::{
-    exchange::order_phase,
     records::known_quote_qty,
     rest::{parse_json, SpotReadError},
 };
@@ -352,7 +351,7 @@ fn read_answer(
         protection_kind: (answer.order_type == "STOP_LOSS")
             .then_some(ProtectionKind::MarketOnTrigger),
         status: answer.status.clone(),
-        phase: order_phase(&answer.status),
+        phase: OrderPhase::from_binance_spot_status(&answer.status),
         orig_qty: answer.orig_qty,
         executed_qty: answer.executed_qty,
         cumulative_quote_qty: answer.cummulative_quote_qty,
@@ -777,7 +776,7 @@ fn cancel_answer(
         protection_kind: (parsed.order_type == "STOP_LOSS")
             .then_some(ProtectionKind::MarketOnTrigger),
         order_type: parsed.order_type,
-        phase: order_phase(&parsed.status),
+        phase: OrderPhase::from_binance_spot_status(&parsed.status),
         status: parsed.status,
         orig_qty: parsed.orig_qty,
         executed_qty: parsed.executed_qty,

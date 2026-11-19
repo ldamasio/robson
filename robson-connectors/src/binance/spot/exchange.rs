@@ -212,8 +212,6 @@ fn rules_error(error: SpotRulesError) -> ExecError {
     }
 }
 
-pub(super) use robson_exec::venue::binance_spot_order_phase as order_phase;
-
 /// The venue's record of `order`, as given: its quantities must be
 /// consistent (`0 ≤ executedQty ≤ origQty`), or the answer is no evidence.
 fn venue_record(order: SpotOrderRecord) -> Result<VenueOrderRecord, ExecError> {
@@ -236,7 +234,7 @@ fn venue_record(order: SpotOrderRecord) -> Result<VenueOrderRecord, ExecError> {
         protection_kind: (order.order_type == "STOP_LOSS")
             .then_some(ProtectionKind::MarketOnTrigger),
         order_type: order.order_type,
-        phase: order_phase(&order.status),
+        phase: OrderPhase::from_binance_spot_status(&order.status),
         status: order.status,
         orig_qty: order.orig_qty,
         executed_qty: order.executed_qty,
