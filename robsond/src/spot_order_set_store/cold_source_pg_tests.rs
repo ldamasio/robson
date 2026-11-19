@@ -432,3 +432,83 @@ async fn persisted_cold_source_index_and_owner_boundary(pool: PgPool) -> Result<
     eprintln!("Cold Spot native six plans verified, all three sources preserve owner mismatch at row 9, noise after 8192");
     Ok(())
 }
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_spot_native_intent_pages_preserve_original_cancel_targets(
+    pool: PgPool,
+) -> Result<()> {
+    let tenant = Uuid::now_v7();
+    let foreign = Uuid::now_v7();
+    let first = Uuid::now_v7();
+    let late = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO public.order_intents
+            (tenant_id,venue_id,account_scope,client_order_id,intent_id,position_id,
+             kind,cancels_order_id,params,created_at,not_sent)
+         SELECT CASE WHEN n=10 THEN $3 ELSE $2 END,'binance:spot',$1,lpad(n::text,8,'0'),
+                md5($1||'J'||n)::uuid,CASE WHEN n=1 THEN $4 WHEN n=9 THEN $5 END,
+                CASE WHEN n IN (1,8,9,10) THEN 'cancel' ELSE 'exit' END,
+                CASE WHEN n=1 THEN '4100001' WHEN n=8 THEN '04100008'
+                     WHEN n=9 THEN '4100009' ELSE NULL END,
+                '{}'::jsonb,now(),n=1
+         FROM generate_series(1,10)n",
+    )
+    .bind(SCOPE)
+    .bind(tenant)
+    .bind(foreign)
+    .bind(first)
+    .bind(late)
+    .execute(&pool)
+    .await?;
+    let mut original = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *original)
+        .await?;
+    let head = read_intent_page(&mut original, SCOPE, tenant, None).await?;
+    ensure!(head.full && head.rows.len() == 8);
+    ensure!(
+        head.rows[0].kind == "cancel"
+            && head.rows[0].not_sent
+            && head.rows[0].position_id == Some(first)
+            && head.rows[0].cancels_order_id.as_deref() == Some("4100001")
+            && head.rows[0].canonical_cancel_target.as_deref() == Some("4100001")
+    );
+    ensure!(
+        head.rows[7].cancels_order_id.as_deref() == Some("04100008")
+            && head.rows[7].canonical_cancel_target.is_none()
+            && head.rows[7].position_id.is_none()
+    );
+    let cursor = head.rows[7].client_order_id.as_str();
+
+    sqlx::query(
+        "UPDATE public.order_intents SET cancels_order_id='4100099'
+         WHERE venue_id='binance:spot' AND account_scope=$1 AND client_order_id='00000009'",
+    )
+    .bind(SCOPE)
+    .execute(&pool)
+    .await?;
+    let old = read_intent_page(&mut original, SCOPE, tenant, Some(cursor)).await?;
+    ensure!(!old.full && old.rows.len() == 2);
+    ensure!(
+        old.rows[0].position_id == Some(late)
+            && old.rows[0].owner_matches
+            && !old.rows[0].not_sent
+            && old.rows[0].cancels_order_id.as_deref() == Some("4100009")
+            && old.rows[0].canonical_cancel_target.as_deref() == Some("4100009")
+    );
+    ensure!(
+        !old.rows[1].owner_matches
+            && old.rows[1].tenant_id == foreign
+            && old.rows[1].cancels_order_id.is_none()
+            && old.rows[1].canonical_cancel_target.is_none()
+    );
+    let terminal =
+        read_intent_page(&mut original, SCOPE, tenant, Some(&old.rows[1].client_order_id)).await?;
+    ensure!(!terminal.full && terminal.rows.is_empty());
+    original.commit().await?;
+    let mut observer = pool.acquire().await?;
+    let current = read_intent_page(&mut observer, SCOPE, tenant, Some(cursor)).await?;
+    ensure!(current.rows[0].position_id == Some(late));
+    ensure!(current.rows[0].canonical_cancel_target.as_deref() == Some("4100099"));
+    Ok(())
+}

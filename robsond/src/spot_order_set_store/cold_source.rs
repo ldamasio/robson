@@ -9,16 +9,22 @@ pub(crate) const PAGE_LIMIT: usize = 8;
 
 // $1 account_scope, $2 expected tenant; continuation $3 last client_order_id.
 pub(crate) const INTENTS_FIRST: &str = "SELECT b.client_order_id,b.intent_id,b.tenant_id,b.tenant_id=$2 AS owner_matches,
-       b.position_id,b.kind,b.venue_outcome,b.not_sent,b.venue_evidence_present,b.disposition_kind,b.created_at
-    FROM (SELECT client_order_id,intent_id,tenant_id,position_id,kind,venue_outcome,not_sent,
+       b.position_id,b.kind,b.cancels_order_id,
+       CASE WHEN b.kind='cancel' AND public.ledger_canonical_id(b.cancels_order_id)
+            THEN b.cancels_order_id END AS canonical_cancel_target,
+       b.venue_outcome,b.not_sent,b.venue_evidence_present,b.disposition_kind,b.created_at
+    FROM (SELECT client_order_id,intent_id,tenant_id,position_id,kind,cancels_order_id,venue_outcome,not_sent,
                  venue_evidence IS NOT NULL AS venue_evidence_present,disposition_kind,created_at
             FROM public.order_intents
            WHERE venue_id='binance:spot' AND account_scope=$1
            ORDER BY client_order_id LIMIT 8) b
     ORDER BY b.client_order_id";
 pub(crate) const INTENTS_NEXT: &str = "SELECT b.client_order_id,b.intent_id,b.tenant_id,b.tenant_id=$2 AS owner_matches,
-       b.position_id,b.kind,b.venue_outcome,b.not_sent,b.venue_evidence_present,b.disposition_kind,b.created_at
-    FROM (SELECT client_order_id,intent_id,tenant_id,position_id,kind,venue_outcome,not_sent,
+       b.position_id,b.kind,b.cancels_order_id,
+       CASE WHEN b.kind='cancel' AND public.ledger_canonical_id(b.cancels_order_id)
+            THEN b.cancels_order_id END AS canonical_cancel_target,
+       b.venue_outcome,b.not_sent,b.venue_evidence_present,b.disposition_kind,b.created_at
+    FROM (SELECT client_order_id,intent_id,tenant_id,position_id,kind,cancels_order_id,venue_outcome,not_sent,
                  venue_evidence IS NOT NULL AS venue_evidence_present,disposition_kind,created_at
             FROM public.order_intents
            WHERE venue_id='binance:spot' AND account_scope=$1 AND client_order_id>$3
@@ -154,6 +160,10 @@ pub(crate) struct IntentSource {
     pub(crate) owner_matches: bool,
     pub(crate) position_id: Option<Uuid>,
     pub(crate) kind: String,
+    /// Original J target, including malformed historical text.
+    pub(crate) cancels_order_id: Option<String>,
+    /// Qualified via the same native function used by CANCEL projection.
+    pub(crate) canonical_cancel_target: Option<String>,
     pub(crate) venue_outcome: Option<String>,
     pub(crate) not_sent: bool,
     pub(crate) venue_evidence_present: bool,
