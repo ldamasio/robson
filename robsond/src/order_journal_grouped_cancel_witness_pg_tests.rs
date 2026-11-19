@@ -153,6 +153,36 @@ async fn projected_grouped_cancel_refuses_wrong_aggregate_or_required_projection
         rejected_at: None,
     });
     ensure!(matches!(ledger.commit(&attempted).await, Err(CommitFailure::Known(_))));
+
+    let mut with_admission = batch.clone();
+    let admission = robson_exec::order_journal::AdmissionRow {
+        position_id: batch.intent.position_id.unwrap(),
+        symbol: SYMBOL.to_owned(),
+        decided_month: chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+        taker_bps: Decimal::new(10, 0),
+        gap_bps: Decimal::new(10, 0),
+        notional_margin_bps: Decimal::new(2, 0),
+        min_notional: Decimal::new(10, 0),
+        lot_step: Decimal::new(1, 3),
+        fee_asset_policy: "base".to_owned(),
+        envelope_source: "isolated-positive-admission-shape".to_owned(),
+        envelope_as_of: batch.intent.created_at,
+        envelope_hash: "fixture".to_owned(),
+        planned_qty: Decimal::ONE,
+        requested_qty: Decimal::ONE,
+        reference_price: Decimal::new(100, 0),
+        remainder_reserve: Decimal::new(1, 1),
+        admission_charge: Decimal::new(10, 0),
+        initial_trigger: Decimal::new(90, 0),
+    };
+    with_admission.balance.as_mut().unwrap().admission = Some(std::sync::Arc::new(admission));
+    let mut wire = Wire::new(&pool, b.tenant_id).await?;
+    wire.store.order_set_projection = Some(b.clone());
+    ensure!(matches!(
+        wire.store.commit(&with_admission).await,
+        Err(CommitFailure::Known(reason)) if reason.contains("admission is not supported")
+    ));
+    ensure!(wire.proxy.query_trace().is_empty());
     for (fault,repair,key) in [
         ("UPDATE spot_order_set_cancel_members SET target_id='999' WHERE intent_id=$1",
          "UPDATE spot_order_set_cancel_members SET target_id='4100001' WHERE intent_id=$1",id),
