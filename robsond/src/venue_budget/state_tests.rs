@@ -218,3 +218,32 @@ fn a_foreign_reservation_is_invalid_and_never_polled() {
     assert!(matches!(result, Err(BudgetError::Invalid)) && !polled);
     assert_eq!((owner.handoffs().unwrap(), other.handoffs().unwrap()), (0, 0));
 }
+
+#[cfg(feature = "crash-points")]
+#[test]
+fn dropped_unpolled_weight_is_refunded_and_handed_off_weight_remains_charged() {
+    let clock = NativeClock::initialize().unwrap();
+    for redeemed in [false, true] {
+        let budget = numerical_state(true);
+        let (now, due) = (tick(120), tick(130));
+        let mut pending = budget.try_reserve_account(now, due).unwrap();
+        if redeemed {
+            budget.poll_account_first(
+                &mut pending,
+                &clock,
+                Uuid::from_u128(3),
+                || Ok((now, ())),
+                || std::task::Poll::Pending,
+            ).unwrap();
+        }
+        drop(pending);
+        let used = usize::from(redeemed);
+        let full: Vec<_> = (used..20)
+            .map(|_| budget.try_reserve_account(now, due).unwrap())
+            .collect();
+        assert!(matches!(budget.try_reserve_account(now, due), Err(BudgetError::Deferred)));
+        drop(full);
+        assert!(budget.try_reserve_account(now, due).is_ok());
+        assert_eq!(budget.handoffs().unwrap(), used as u64);
+    }
+}

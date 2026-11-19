@@ -137,7 +137,8 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
         ensure!(budget.handoffs().map_err(|e| anyhow!("handoffs: {e:?}"))? == 2,
             "a consumed reservation refunds nothing and sends nothing");
         let probe_tick = clock.capture()?;
-        let probe_due = after(probe_tick, Duration::from_secs(1)).map_err(|e| anyhow!("{e:?}"))?;
+        let probe_due = crate::venue_clock_owner::after(probe_tick, Duration::from_secs(1))
+            .map_err(|e| anyhow!("{e:?}"))?;
         let mut probes = Vec::new();
         for _ in 0..18 {
             probes.push(budget.try_reserve_account(probe_tick, probe_due)
@@ -152,22 +153,15 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
             "TIME and ACCOUNT charged exactly 21 of the common 400 steady weight");
         drop(time_probes);
         drop(probes);
-        // Receipt refusals: superseded generation or sample are never borrowed.
-        let generation = owner.state.lock().map_err(|_| anyhow!("state lock poisoned"))?.generation;
-        for (g, s, refused) in [
-            (generation, sample, false),
-            (generation + 1, sample, true),
-            (generation, Uuid::now_v7(), true),
-        ] {
-            let raw = owner.state.lock().map_err(|_| anyhow!("state lock poisoned"))?
-                .capture_native(&clock, start.epoch.epoch_id).map_err(|e| anyhow!("{e:?}"))?;
-            let handoff = raw.end_tick()?;
-            let mark = inventory::AccountMark { generation: g, sample: s, raw, handoff };
-            let receipt = owner.account_receipt(&mark);
-            ensure!(receipt.is_err() == refused, "receipt control {g}/{s}: {receipt:?}");
+        commission_admission_precedence(owner, &clock)?;
+        for replace_generation in [false, true] {
+            supersession_during_account_body(owner, &clock, replace_generation, body_deadline)
+                .await?;
         }
         ensure!(venue.connections() == 1 && budget.handoffs()
-            .map_err(|e| anyhow!("handoffs: {e:?}"))? == 2, "receipt checks send nothing");
+            .map_err(|e| anyhow!("handoffs: {e:?}"))? == 4,
+            "one TIME, one accepted ACCOUNT and two charged rejected ACCOUNT reads");
+        eprintln!("C8_ACCOUNT_GUARDED time=1 account=3 accepted=1 superseded=2 weight_first_two=21 no_venue_orders=true");
         Ok::<_, anyhow::Error>(())
     }).await.map_err(|_| anyhow!("150s fixture body ceiling elapsed")).and_then(|r| r);
 
@@ -242,6 +236,105 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
         (Ok(()), Err(c)) => Err(c),
         (Err(p), Err(c)) => Err(anyhow!("primary: {p:#}; cleanup: {c:#}")),
     }
+}
+
+fn commission_admission_precedence(
+    owner: &ClockOwner,
+    clock: &NativeClock,
+) -> anyhow::Result<()> {
+    let due = Instant::now() + Duration::from_secs(3);
+    let old = owner.budget.start().map_err(|e| anyhow!("{e:?}"))?;
+    let fresh = clock.capture()?;
+    let signed = owner.commission_signing_time().map_err(|e| anyhow!("{e:?}"))?;
+    let mut pending = owner.reserve_commission(due).map_err(|e| anyhow!("{e:?}"))?;
+    let mut foreign = owner.commission_signing_time().map_err(|e| anyhow!("{e:?}"))?;
+    let generation = owner.state.lock().map_err(|_| anyhow!("clock lock"))?.generation;
+    foreign.state = Arc::new(Mutex::new(ClockState {
+        generation,
+        closing: false,
+        published: None,
+        start: old,
+        last_valid: None,
+        faults: 0,
+        active_faults: 0,
+    }));
+    // The real budget gate is closed to steady work by a waiting protection.
+    // The generated budget tests independently cover the recorded 429 latch.
+    let waiting = owner.budget.protective_waiter().map_err(|e| anyhow!("{e:?}"))?;
+    for (proof, claim, deadline, expected) in [
+        (&foreign, old, Instant::now(), BudgetError::Invalid),
+        (&signed, old, due, BudgetError::Expired),
+        (&signed, fresh, due, BudgetError::Deferred),
+    ] {
+        let result = owner.poll_commission_first(proof, &mut pending, claim, deadline, || {
+            panic!("refused Commission must not poll")
+        });
+        ensure!(matches!(result, Err(error) if error == expected));
+    }
+    owner.state.lock().map_err(|_| anyhow!("clock lock"))?.generation = generation + 1;
+    let results = [Instant::now(), due].map(|deadline| {
+        owner.poll_commission_first(&signed, &mut pending, old, deadline, || {
+            panic!("stale Commission must not poll")
+        })
+    });
+    owner.state.lock().map_err(|_| anyhow!("clock lock"))?.generation = generation;
+    ensure!(matches!(results, [Err(BudgetError::Expired), Err(BudgetError::Deferred)]),
+        "command deadline precedes generation, which precedes claim age");
+    drop(waiting);
+    drop(pending);
+    ensure!(owner.budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 2);
+    Ok(())
+}
+
+async fn supersession_during_account_body(
+    owner: &ClockOwner,
+    clock: &NativeClock,
+    replace_generation: bool,
+    fixture_deadline: Instant,
+) -> anyhow::Result<()> {
+    let due = (Instant::now() + Duration::from_secs(5)).min(fixture_deadline);
+    let mut slot = None;
+    let (venue, head, release) = c8_account_http::AccountFixture::held_body(due).await?;
+    let work = async {
+        let claim = clock.capture()?;
+        let mut pending = owner.reserve_account(due).map_err(|e| anyhow!("{e:?}"))?;
+        let prepared = owner.prepare_account(&mut slot, due).await.map_err(|e| anyhow!("{e:?}"))?;
+        let signed = owner.commission_signing_time().map_err(|e| anyhow!("{e:?}"))?;
+        let original = {
+            let state = owner.state.lock().map_err(|_| anyhow!("clock lock"))?;
+            (state.generation, state.published.as_ref().context("positive sample")?.id)
+        };
+        let intervene = async {
+            head.await.context("ACCOUNT response head")?;
+            {
+                let mut state = owner.state.lock().map_err(|_| anyhow!("clock lock"))?;
+                if replace_generation {
+                    state.generation = original.0 + 1;
+                } else {
+                    state.published.as_mut().context("positive sample")?.id = Uuid::now_v7();
+                }
+            }
+            release.send(()).map_err(|_| anyhow!("ACCOUNT body release"))?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let read = owner.read_account(&signed, &mut pending, claim, prepared, venue.port, due);
+        let (result, intervention) = tokio::join!(read, intervene);
+        {
+            let mut state = owner.state.lock().map_err(|_| anyhow!("clock lock"))?;
+            state.generation = original.0;
+            state.published.as_mut().context("positive sample retained")?.id = original.1;
+        }
+        intervention?;
+        ensure!(matches!(result, Err(TimeError::Native)), "original receipt superseded at EOF");
+        ensure!(venue.connections() == 1, "one real charged ACCOUNT without retry");
+        Ok::<_, anyhow::Error>(())
+    };
+    let result = timeout_at(due, work).await.context("ACCOUNT supersession deadline");
+    let retired = timeout_at(fixture_deadline, ClockOwner::retire_account(&mut slot)).await;
+    let finished = venue.finish(fixture_deadline).await;
+    ensure!(matches!(retired, Ok(true)), "ACCOUNT supersession preparation must retire");
+    result??;
+    finished
 }
 
 async fn close_owner(

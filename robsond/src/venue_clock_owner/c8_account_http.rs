@@ -7,6 +7,7 @@ use anyhow::{anyhow, ensure, Context};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    sync::oneshot,
 };
 
 use super::*;
@@ -24,6 +25,22 @@ pub(super) struct AccountFixture {
 
 impl AccountFixture {
     pub(super) async fn start(deadline: Instant) -> anyhow::Result<Self> {
+        Self::with_gate(deadline, None).await
+    }
+
+    pub(super) async fn held_body(
+        deadline: Instant,
+    ) -> anyhow::Result<(Self, oneshot::Receiver<()>, oneshot::Sender<()>)> {
+        let (head, seen) = oneshot::channel();
+        let (release, ready) = oneshot::channel();
+        let fixture = Self::with_gate(deadline, Some((head, ready))).await?;
+        Ok((fixture, seen, release))
+    }
+
+    async fn with_gate(
+        deadline: Instant,
+        mut body_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    ) -> anyhow::Result<Self> {
         use robson_connectors::inventory_loopback::{LOOPBACK_KEY, LOOPBACK_UID};
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
@@ -73,8 +90,13 @@ impl AccountFixture {
                         let body = format!(
                             "{{\"canTrade\":false,\"accountType\":\"SPOT\",\"permissions\":[],\"balances\":[],\"uid\":{LOOPBACK_UID}}}"
                         );
-                        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                        socket.write_all(response.as_bytes()).await?;
+                        let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        socket.write_all(head.as_bytes()).await?;
+                        if let Some((sent, ready)) = body_gate.take() {
+                            sent.send(()).map_err(|_| anyhow!("missing body controller"))?;
+                            ready.await.context("missing body release")?;
+                        }
+                        socket.write_all(body.as_bytes()).await?;
                         socket.shutdown().await?;
                         Ok::<_, anyhow::Error>(())
                     };

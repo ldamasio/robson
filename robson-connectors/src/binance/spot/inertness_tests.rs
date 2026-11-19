@@ -778,7 +778,7 @@ fn nothing_outside_the_spot_module_names_it() {
             connector_dir.as_path(),
             "spot_inventory_wire_tests.rs",
             "binance_rest.rs",
-            "spot_inventory_wire_tests",
+            "mod spot_inventory_wire_tests",
             "#![cfg(test)]\n",
         ),
         (
