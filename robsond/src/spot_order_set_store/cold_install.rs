@@ -26,21 +26,21 @@ const LOCK: &str = "SELECT version FROM public.accounting_state
 const INSTALL: &str = include_str!("cold_install/publish.sql");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum FencePhase {
+pub(crate) enum FencePhase {
     BeforeRead,
     BeforePublish,
     AfterReadback,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct FenceReceipt {
-    pub(super) restore: RestoreIdentity,
-    pub(super) owner: Uuid,
+pub(crate) struct FenceReceipt {
+    pub(crate) restore: RestoreIdentity,
+    pub(crate) owner: Uuid,
 }
 
 /// The disposable physical coordinator answers with the exact current
 /// supervised operation and owner. The database anchor alone grants nothing.
-pub(super) trait ClosedWriterFence {
+pub(crate) trait ClosedWriterFence {
     async fn check(
         &mut self,
         restore: RestoreIdentity,
@@ -50,10 +50,10 @@ pub(super) trait ClosedWriterFence {
 }
 
 #[derive(Debug)]
-pub(super) struct FixtureFenceError;
+pub(crate) struct FixtureFenceError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Stage {
+pub(crate) enum Stage {
     Fence,
     Acquire,
     Setup,
@@ -66,7 +66,7 @@ pub(super) enum Stage {
 }
 
 #[derive(Debug)]
-pub(super) enum InstallRefusal {
+pub(crate) enum InstallRefusal {
     FixtureFence(Stage),
     Deadline(Stage),
     Sell(sell::SellBuildRefusal),
@@ -81,13 +81,13 @@ pub(super) enum InstallRefusal {
 }
 
 #[derive(Debug)]
-pub(super) struct Installed {
-    pub(super) generation: JournalGeneration,
-    pub(super) accounting_version: i64,
-    pub(super) restore: RestoreIdentity,
+pub(crate) struct Installed {
+    pub(crate) generation: JournalGeneration,
+    pub(crate) accounting_version: i64,
+    pub(crate) restore: RestoreIdentity,
 }
 
-pub(super) async fn install(
+pub(crate) async fn install(
     pool: &PgPool,
     cut: &ColdOwnerCut,
     fence: &mut impl ClosedWriterFence,

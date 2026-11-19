@@ -7,8 +7,11 @@ use uuid::Uuid;
 
 mod cold_audit;
 #[cfg(test)]
-mod cold_install;
+pub(crate) mod cold_install;
+#[cfg(not(test))]
 mod cold_owner;
+#[cfg(test)]
+pub(crate) mod cold_owner;
 mod cold_source;
 pub(crate) mod warm;
 
@@ -327,4 +330,15 @@ mod tests {
         );
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(crate) mod physical_fixture {
+    pub(crate) use super::{
+        cold_audit::{
+            audit_cold_sources, ColdAuditRefusal, ColdAuditScope, ColdSourceSink, Family,
+            PageBudget, SinkFull, SourceKey,
+        },
+        cold_source::{AttemptSource, IntentSource, OrderSource, RouteClass, RouteSource},
+    };
 }

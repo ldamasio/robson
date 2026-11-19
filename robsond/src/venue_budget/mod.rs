@@ -50,3 +50,6 @@ mod source_audit;
 // Direct SQL migration38 store-guard behavior controls; TEST-ONLY.
 #[cfg(test)]
 mod store_guard_pg_tests;
+
+#[cfg(test)]
+pub(crate) use source_audit::physical_recovery;

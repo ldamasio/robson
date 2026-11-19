@@ -20,17 +20,17 @@ const ROWS: usize = 63;
 const BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct RestoreIdentity {
-    pub(super) operation: Uuid,
-    pub(super) target: Uuid,
+pub(crate) struct RestoreIdentity {
+    pub(crate) operation: Uuid,
+    pub(crate) target: Uuid,
 }
 
-pub(super) struct OwnerRequest<'a> {
-    pub(super) scope: ColdAuditScope<'a>,
-    pub(super) expected_uid: &'a str,
-    pub(super) epoch: Uuid,
-    pub(super) accounting_version: i64,
-    pub(super) restore: RestoreIdentity,
+pub(crate) struct OwnerRequest<'a> {
+    pub(crate) scope: ColdAuditScope<'a>,
+    pub(crate) expected_uid: &'a str,
+    pub(crate) epoch: Uuid,
+    pub(crate) accounting_version: i64,
+    pub(crate) restore: RestoreIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,29 +127,29 @@ pub(super) async fn read_anchor(
 }
 
 #[derive(Debug)]
-pub(super) struct ColdOwnerCut {
+pub(crate) struct ColdOwnerCut {
     pub(super) anchor: ObservedAnchor,
-    pub(super) receipt: ColdSourceReceipt,
+    pub(crate) receipt: ColdSourceReceipt,
     pub(super) restore: RestoreIdentity,
     rows: CapturedRows,
 }
 
 impl ColdOwnerCut {
-    pub(super) fn intents(&self) -> &[IntentSource] {
+    pub(crate) fn intents(&self) -> &[IntentSource] {
         &self.rows.intents
     }
-    pub(super) fn attempts(&self) -> &[AttemptSource] {
+    pub(crate) fn attempts(&self) -> &[AttemptSource] {
         &self.rows.attempts
     }
-    pub(super) fn orders(&self) -> &[OrderSource] {
+    pub(crate) fn orders(&self) -> &[OrderSource] {
         &self.rows.orders
     }
-    pub(super) fn routes(&self) -> &[RouteSource] {
+    pub(crate) fn routes(&self) -> &[RouteSource] {
         &self.rows.routes
     }
 }
 
-pub(super) async fn capture(
+pub(crate) async fn capture(
     pool: &PgPool,
     request: &OwnerRequest<'_>,
     deadline: Instant,

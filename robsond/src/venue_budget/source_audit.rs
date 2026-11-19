@@ -144,3 +144,7 @@ mod pg_tests;
 #[cfg(test)]
 #[path = "source_audit/run_pg_tests.rs"]
 mod run_pg_tests;
+
+#[cfg(test)]
+#[path = "source_audit/physical_recovery.rs"]
+pub(crate) mod physical_recovery;
