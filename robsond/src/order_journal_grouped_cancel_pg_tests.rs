@@ -508,3 +508,6 @@ async fn projected_grouped_cancel_refuses_missing_native_write_and_obsolete_epoc
     );
     Ok(())
 }
+
+#[path = "order_journal_grouped_cancel_witness_pg_tests.rs"]
+mod witness;
