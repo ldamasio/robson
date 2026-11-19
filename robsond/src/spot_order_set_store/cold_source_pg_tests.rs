@@ -66,7 +66,7 @@ async fn seed(pool: &PgPool, account: &str, owns: Uuid, foreign: Uuid, total: u3
     Ok(())
 }
 
-fn plan_leaves<'a>(node: &'a Value, relation: &str, found: &mut Vec<&'a Value>) {
+pub(super) fn plan_leaves<'a>(node: &'a Value, relation: &str, found: &mut Vec<&'a Value>) {
     if node["Relation Name"] == relation {
         found.push(node);
     }
