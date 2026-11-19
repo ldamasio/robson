@@ -6,8 +6,8 @@ use std::time::Duration;
 use anyhow::{anyhow, ensure, Result};
 use robson_exec::order_journal::{CommitFailure, JournalBatch};
 use robson_testkit::db_proxy::{
-    ControlBoundary, ControlHit, DbProxy, DiagnosticEvent, DiagnosticIdentity, DiagnosticPhase,
-    SqlCategory,
+    ClientLoss, ControlBoundary, ControlHit, DbProxy, DiagnosticEvent, DiagnosticIdentity,
+    DiagnosticPhase, SqlCategory,
 };
 use sqlx::{
     postgres::{PgPoolOptions, PgSslMode},
@@ -264,8 +264,8 @@ struct Observed {
     trace: Vec<String>,
 }
 
-/// One full clocked route through the gate. The gate is dropped only after
-/// the writer returns; its original backend must then retire by itself.
+/// One full clocked route through the gate. Observe the writer's own socket
+/// close, retired backend, freed locks and replacement before any gate drop.
 async fn gated(
     pool: &PgPool,
     scope: &Scope,
@@ -301,18 +301,33 @@ async fn gated(
     let (result, observed) = tokio::join!(wire.store.commit_clocked(&batch, &input), observe);
     let elapsed = started.elapsed();
     let (hit, rows_at_hit, locks_free_while_held, durable_while_held) = observed?;
-    ensure!(!armed.snapshot().released, "{gate:?} held message never forwarded");
-    drop(armed);
     wire.retires(pool).await?;
+    let retired = timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = armed.snapshot();
+            if snapshot.closed {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await?;
+    ensure!(
+        retired.client_loss == Some(ClientLoss::Read) && retired.proof_valid && !retired.released,
+        "{gate:?} the client's socket closed with a valid unreleased gate: {retired:?}"
+    );
+    ensure!(wire.proxy.query_trace_dropped() == 0, "fault trace complete before replacement");
+    let trace = wire.proxy.query_trace();
+    ensure!(
+        locks_free(pool, scope.tenant).await? == (true, true),
+        "{gate:?} both locks released before gate teardown"
+    );
+    slot_available(wire).await?;
+    drop(armed);
     let closed = timeout(Duration::from_secs(1), lease.close())
         .await?
         .map_err(|e| anyhow!("close: {e:?}"))?;
-    ensure!(
-        closed.closed && !closed.released,
-        "{gate:?} control closed unreleased: {closed:?}"
-    );
-    ensure!(wire.proxy.query_trace_dropped() == 0, "fault trace complete");
-    let trace = wire.proxy.query_trace();
+    ensure!(closed == retired, "{gate:?} teardown did not cause retirement");
     Ok(Observed {
         hit,
         rows_at_hit,
@@ -440,11 +455,7 @@ async fn pre_commit(pool: PgPool, gate: Gate) -> Result<()> {
         version(&pool, scope.tenant).await? == before,
         "{gate:?} accounting version unchanged"
     );
-    ensure!(
-        locks_free(&pool, scope.tenant).await? == (true, true),
-        "{gate:?} both locks released"
-    );
-    slot_available(&wire).await
+    Ok(())
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -491,5 +502,5 @@ async fn lost_commit_acknowledgement_is_uncertain_and_durable(pool: PgPool) -> R
         "the independent owner observes one intent, attempt, clock and charge"
     );
     ensure!(version(&pool, scope.tenant).await? == before + 1, "one accounting version");
-    slot_available(&wire).await
+    Ok(())
 }
