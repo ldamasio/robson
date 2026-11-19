@@ -383,3 +383,108 @@ async fn projected_entry_rolls_back_real_clocked_admission_when_projection_refus
     );
     assert_current(&pool, &g, &j, initial.0 + 1).await
 }
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_entry_reads_both_original_hints_by_exact_default_plans(
+    pool: PgPool,
+) -> Result<()> {
+    hint_schema(&pool).await?;
+    let g = seed_generation(&pool).await?;
+    let j = arm(&pool, &g).await?;
+    let writer = PgJournalBackend::new(&pool, g.tenant_id).with_order_set_projection(g.clone());
+    insist(writer.commit(&j).await)?;
+    let current = fields(&pool, &g).await?.0;
+    // These entries are physical plan noise, not a source reconstruction.
+    // The membership and cold proof live in the other native fixtures.
+    sqlx::query(
+        "WITH k AS MATERIALIZED (
+           SELECT md5('hint-j-'||i)::uuid AS id,md5('hint-pos-'||i)::uuid AS pos
+           FROM generate_series(1,8192)i
+         ), sell AS (
+           INSERT INTO public.spot_order_set_sell_intents
+             (tenant_id,venue_id,account_scope,generation_id,intent_id,scope_kind,potential,conflict,source_position)
+           SELECT $1,'binance:spot',$2,$3,id,'unbound',true,false,pos FROM k
+         )
+         INSERT INTO public.spot_order_set_cancel_members
+             (tenant_id,venue_id,account_scope,generation_id,intent_id,target_id,pending,conflict,source_position)
+         SELECT $1,'binance:spot',$2,$3,id,'4100001',false,false,pos FROM k",
+    ).bind(g.tenant_id).bind(&g.account_scope).bind(g.generation_id).execute(&pool).await?;
+    sqlx::raw_sql(
+        "ANALYZE public.spot_order_set_sell_intents; ANALYZE public.spot_order_set_cancel_members",
+    )
+    .execute(&pool)
+    .await?;
+
+    let pos = j.intent.position_id.unwrap();
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id='binance:spot'")
+        .bind(g.tenant_id).execute(&mut *tx).await?;
+    let sql = format!(
+        "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) {}",
+        crate::spot_order_set_store::JOURNAL_ENTRY,
+    );
+    let raw: serde_json::Value = sqlx::query_scalar(&sql)
+        .bind(g.tenant_id)
+        .bind(&g.account_scope)
+        .bind(g.generation_id)
+        .bind(g.process_epoch)
+        .bind(g.source_audit_id)
+        .bind(current + 1)
+        .bind(j.intent.intent_id)
+        .bind(&j.intent.client_order_id)
+        .bind(pos)
+        .bind(SYMBOL)
+        .bind(true)
+        .fetch_one(&mut *tx)
+        .await?;
+    let next: i64 = sqlx::query_scalar(
+        "SELECT accounting_version FROM spot_order_set_generation WHERE generation_id=$1",
+    )
+    .bind(g.generation_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    ensure!(next == current + 1);
+    tx.rollback().await?;
+    assert_current(&pool, &g, &j, current).await?;
+
+    fn scans<'a>(node: &'a serde_json::Value, rel: &str, out: &mut Vec<&'a serde_json::Value>) {
+        if node["Relation Name"] == rel && node["Actual Loops"].as_u64().unwrap_or_default() > 0 {
+            out.push(node);
+        }
+        if let Some(children) = node["Plans"].as_array() {
+            for child in children {
+                scans(child, rel, out);
+            }
+        }
+    }
+    for (rel, index) in [
+        ("spot_order_set_sell_intents", "spot_order_set_sell_intents_unbound_hint"),
+        ("spot_order_set_cancel_members", "idx_spot_cancel_unbound_original_position"),
+    ] {
+        let mut nodes = Vec::new();
+        scans(&raw[0]["Plan"], rel, &mut nodes);
+        ensure!(nodes.len() == 1, "unbounded or vacant {rel}: {raw}");
+        let node = nodes[0];
+        let condition = node["Index Cond"].as_str().context("complete hint index condition")?;
+        ensure!(
+            node["Index Name"] == index && node["Actual Loops"] == 1 && node["Actual Rows"] == 0,
+            "{node}"
+        );
+        ensure!(
+            [
+                "tenant_id",
+                "venue_id",
+                "account_scope",
+                "generation_id",
+                "source_position"
+            ]
+            .iter()
+            .all(|key| condition.contains(key)),
+            "{condition}"
+        );
+        ensure!(node["Rows Removed by Filter"].as_u64().unwrap_or_default() == 0);
+    }
+    eprintln!("Each original Entry hint uses one exact native index probe after 8,192 rows of scope-local noise");
+    Ok(())
+}

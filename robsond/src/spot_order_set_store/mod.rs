@@ -32,7 +32,7 @@ impl JournalGeneration {
 
 const JOURNAL_UNBOUND: &str = include_str!("journal_unbound.sql");
 const JOURNAL_CANCEL_OUTCOME: &str = include_str!("journal_cancel_outcome.sql");
-const JOURNAL_ENTRY: &str = include_str!("journal_entry.sql");
+pub(crate) const JOURNAL_ENTRY: &str = include_str!("journal_entry.sql");
 
 /// The existing contribution captured in the original intent upsert's
 /// snapshot, typed by the opted route it belongs to.
