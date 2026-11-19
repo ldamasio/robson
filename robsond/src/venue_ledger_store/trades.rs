@@ -12,6 +12,7 @@ use robson_exec::{
 };
 use rust_decimal::Decimal;
 use sqlx::{postgres::PgRow, Connection, PgConnection, Postgres, Row, Transaction};
+use tracing::Instrument as _;
 
 use super::{
     backend, commit_error,
@@ -23,10 +24,12 @@ const FILL_COLUMNS: &str = "f.trade_id AS fill_trade_id,f.exchange_order_id AS f
     f.tenant_id AS fill_tenant_id,f.price AS fill_price,f.qty AS fill_qty,
     f.quote_qty AS fill_quote_qty,f.commission AS fill_commission,
     f.commission_asset AS fill_asset,f.trade_time AS fill_time,f.recorded_at AS fill_recorded_at";
+const TRADE_GENERATION: &str = include_str!("../spot_order_set_store/trade_generation.sql");
 
 impl PgVenueLedger {
     /// One page, at most 1,000 trades and ten statements. A duplicate page
     /// without cursor progress is one read, no bump, and no rotation update.
+    /// An opted changed page adds one exact generation statement.
     pub async fn record_trades(
         &self,
         key: &OrderKey,
@@ -39,6 +42,12 @@ impl PgVenueLedger {
                 return Err(LedgerError::InvalidEvidence("trade page exceeds 1000 rows".into()));
             }
             let ids: Vec<String>=page.trades.iter().map(|fill| fill.trade_id.parse::<VenueIntId>().map(|id| id.to_string())).collect::<Result<_,_>>()?;
+            if let Some(generation)=&self.trade_projection {
+                if !generation.is_valid() || generation.tenant_id!=self.tenant_id
+                    || key.venue.as_str()!=VenueId::BINANCE_SPOT || generation.account_scope!=key.account_scope {
+                    return Err(LedgerError::Invariant("trade projection scope mismatch".into()));
+                }
+            }
             let connection=self.pool.acquire().await.map_err(backend)?;
             let mut held=LedgerConnection::new(connection);
             let (before,existing)=self.read_trade_context(held.connection(),key,&ids).await?;
@@ -51,9 +60,17 @@ impl PgVenueLedger {
             let mut tx=held.connection().begin().await.map_err(backend)?;
             self.timeouts(&mut tx).await?;
             self.statement();
-            let bump=sqlx::query("UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id=$2")
-                .bind(self.tenant_id).bind(key.venue.as_str()).execute(&mut *tx).await.map_err(backend)?;
-            if bump.rows_affected()!=1 {return Err(LedgerError::NoAccountingRow);}
+            // The opted branch only adds RETURNING; legacy keeps its statement.
+            let version=if self.trade_projection.is_some() {
+                let version=sqlx::query_scalar::<_,i64>("UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id=$2 RETURNING version")
+                    .bind(self.tenant_id).bind(key.venue.as_str()).fetch_optional(&mut *tx).await.map_err(backend)?;
+                Some(version.ok_or(LedgerError::NoAccountingRow)?)
+            } else {
+                let bump=sqlx::query("UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id=$2")
+                    .bind(self.tenant_id).bind(key.venue.as_str()).execute(&mut *tx).await.map_err(backend)?;
+                if bump.rows_affected()!=1 {return Err(LedgerError::NoAccountingRow);}
+                None
+            };
             let locked=self.read_order_context(&mut tx,key,None,true).await?.order.ok_or(LedgerError::UnknownOrder)?;
             let existing=self.read_existing_fills(&mut tx,key,&ids).await?;
             let planned=plan_trades(&locked,self.tenant_id,page,&existing,recorded_at)?;
@@ -85,6 +102,21 @@ impl PgVenueLedger {
                     .bind(planned.consumed_delta).bind(position_id).bind(self.tenant_id).bind(key.venue.as_str())
                     .execute(&mut *tx).await.map_err(order_error)?;
                 if leg.rows_affected()!=1 {return Err(LedgerError::Invariant("trade leg disappeared".into()));}
+            }
+            if let (Some(generation),Some(version))=(&self.trade_projection,version) {
+                // Membership inputs are untouched by trade pages: one exact
+                // version CAS. A refusal returns unfinished, so the guard
+                // retires the connection and rolls back every native write.
+                self.statement();
+                let advanced=sqlx::query_scalar::<_,i64>(TRADE_GENERATION)
+                    .bind(generation.tenant_id).bind(&generation.account_scope).bind(generation.generation_id)
+                    .bind(generation.process_epoch).bind(generation.source_audit_id).bind(version)
+                    .fetch_optional(&mut *tx)
+                    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
+                    .await.map_err(backend)?;
+                if advanced!=Some(version) {
+                    return Err(LedgerError::Invariant("trade projection generation refused".into()));
+                }
             }
             self.statement();
             committing.store(true,Ordering::Relaxed);
