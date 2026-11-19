@@ -2,11 +2,17 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, ensure, Context};
+use proptest::{
+    collection::vec as events,
+    strategy::{Strategy, ValueTree},
+    test_runner::{Config, RngSeed, TestRunner},
+};
 use robson_exec::order_journal::JournalBatch;
 use robson_testkit::db_proxy::ProxyMode;
 use sqlx::{ConnectOptions, Executor, PgConnection};
 use tokio::time::{timeout_at, Instant};
 
+use super::sell_nested_work_tests::seed_history;
 use super::{
     audit, batch, cold_cancels, cold_sells, empty_budget, linked_sell, scope, seen,
     through_proxy_limit, unowned, zero_execution_order, AttemptRow, Fixture, Hot, IntentKind,
@@ -239,7 +245,10 @@ async fn fenced_initialization_replays_existing_journal_and_venue_state(
         generation: Uuid::now_v7(),
         database: ready.database.clone(),
     };
-    ensure!(wrong.read(&pool, s, None).await?.is_none());
+    ensure!(
+        wrong.read(&pool, s, None).await?.is_none(),
+        "wrong generation must withhold the initialized order set"
+    );
     let (proxy, measured) = through_proxy_limit(&pool, 1).await;
     let before = proxy.stats().statements;
     ensure!(ready.read(&measured, s, None).await?.is_some());
@@ -321,5 +330,203 @@ async fn fenced_initialization_refuses_conflict_and_retires_failed_replay(
     ensure!(cold_sells(&still_canonical).leg.active == 1);
     let ready = initialize(&pool, ReplayOrder::TargetsFirst, None).await?;
     ensure!(check(&pool, &ready, s).await?.facts.leg_sell == 1);
+    Ok(())
+}
+
+async fn committed_event(
+    fixture: &Fixture,
+    journal: &PgJournalBackend,
+    action: u8,
+    index: usize,
+) -> anyhow::Result<()> {
+    let s = scope(fixture);
+    match action {
+        0 => journal_commit(journal, &batch(s, IntentKind::Exit, None)).await?,
+        1 => journal_commit(journal, &batch(s, IntentKind::Cancel, Some("1000"))).await?,
+        2 => {
+            let mut event = batch(s, IntentKind::Exit, None);
+            event.attempts.push(AttemptRow {
+                attempt_id: Uuid::now_v7(),
+                created_at: seen(601).at,
+                rejected_at: (index % 2 == 0).then_some(seen(602).at),
+            });
+            event.outcome = Some(OutcomeRow {
+                venue_outcome: Some(VenueOutcome::Rejected),
+                ..OutcomeRow::default()
+            });
+            journal_commit(journal, &event).await?;
+        },
+        3 => {
+            let id = (10_000 + index).to_string();
+            fixture
+                .ledger
+                .record_order(
+                    &zero_execution_order(&id, "NEW", OrderPhase::Live),
+                    &unowned(),
+                    seen(603),
+                )
+                .await?;
+        },
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+async fn generated_history(
+    pool: &PgPool,
+    history: i64,
+    cancels: usize,
+    seed: u64,
+    order: ReplayOrder,
+) -> anyhow::Result<()> {
+    empty_budget::initialize(pool, seen(0).at).await?;
+    let fixtures = [Fixture::new(pool).await, Fixture::new(pool).await];
+    ensure!(fixtures[0].tenant != fixtures[1].tenant);
+    let [first, second] = fixtures.each_ref().map(scope);
+    let journals = [
+        PgJournalBackend::new(pool, first.tenant),
+        PgJournalBackend::new(pool, second.tenant),
+    ];
+    seed_history(&fixtures[0], &journals[0], first, history).await;
+    for _ in 0..cancels {
+        journal_commit(&journals[0], &batch(first, IntentKind::Cancel, Some("1000"))).await?;
+    }
+    let mut pre_leg = batch(first, IntentKind::Exit, None);
+    pre_leg.intent.position_id = Some(Uuid::now_v7());
+    journal_commit(&journals[0], &pre_leg).await?;
+    let config = Config {
+        rng_seed: RngSeed::Fixed(seed),
+        failure_persistence: None,
+        ..Config::default()
+    };
+    let mut runner = TestRunner::new(config);
+    let schedule = (events(0_u8..8, 8), 2_usize..7)
+        .new_tree(&mut runner)
+        .map_err(|error| anyhow!("event generation: {error:?}"))?
+        .current();
+    let (events, cutpoint) = schedule;
+    for (index, &event) in events[..cutpoint].iter().enumerate() {
+        let owner = usize::from(event / 4);
+        committed_event(&fixtures[owner], &journals[owner], event % 4, index).await?;
+    }
+
+    // Witness the stale-view failure of the earlier proposed cutpoint.
+    // Owner B commits while A's earlier REPEATABLE READ view is open.
+    let mut obsolete = pool.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").await?;
+    let _: i64 = sqlx::query_scalar(
+        "SELECT version FROM accounting_state WHERE tenant_id=$1 AND venue_id=$2",
+    )
+    .bind(first.tenant)
+    .bind(first.venue)
+    .fetch_one(&mut *obsolete)
+    .await?;
+    let late = batch(second, IntentKind::Exit, None);
+    journal_commit(&journals[1], &late).await?;
+    let stale_visible: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT FROM order_intents WHERE intent_id=$1)")
+            .bind(late.intent.intent_id)
+            .fetch_one(&mut *obsolete)
+            .await?;
+    ensure!(!stale_visible, "the obsolete early transaction misses the second owner");
+    obsolete.rollback().await?;
+
+    let (proxy, actor) = through_proxy_limit(pool, 1).await;
+    proxy.enable_query_trace(32);
+    let baseline = proxy.stats().statements;
+    let ready = initialize(&actor, order, None).await?;
+    let init_frames = proxy.stats().statements - baseline;
+    ensure!(init_frames == 10 && proxy.query_trace_dropped() == 0);
+    let a = check(pool, &ready, first).await?;
+    let b = check(pool, &ready, second).await?;
+    ensure!(b.facts.leg_sell >= 1 && a.facts.grouped_cancel == 0);
+    ensure!(
+        (a.unbound_sell, a.unbound_sell_conflicts, b.unbound_sell) == (1, 0, 0),
+        "pre-leg SELL remains a blocker only for its actual accounting owner"
+    );
+    let coverage: serde_json::Value =
+        sqlx::query_scalar("SELECT coverage FROM spot_shadow_initialization WHERE generation=$1")
+            .bind(ready.generation)
+            .fetch_one(pool)
+            .await?;
+    let cancel_count = coverage["cancel_members"].as_u64().context("native cancel coverage")?;
+    ensure!(cancel_count >= cancels as u64);
+    ensure!(coverage["sell_natives"].as_i64().context("native SELL coverage")? >= history);
+    let read_start = proxy.stats().statements;
+    ensure!(ready.read(&actor, second, None).await?.is_some());
+    ensure!(proxy.stats().statements - read_start == 1);
+    actor.close().await;
+    ensure!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT
+        NOT EXISTS(SELECT FROM pg_locks WHERE relation='order_intents'::regclass
+                   AND mode='AccessExclusiveLock' AND granted)"
+        )
+        .fetch_one(pool)
+        .await?
+    );
+    for (index, &event) in events.iter().enumerate().skip(cutpoint) {
+        let owner = usize::from(event / 4);
+        committed_event(&fixtures[owner], &journals[owner], event % 4, index).await?;
+        check(pool, &ready, first).await?;
+        check(pool, &ready, second).await?;
+    }
+    eprintln!("SPOT_FENCED_INIT histories={history} base_cancels={cancels} owners=2 seed={seed} cutpoint={cutpoint} init_wire_frames={init_frames} hot_sql=1 old_snapshot_missed_late=true all_events_match=true coverage={coverage}");
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL"]
+async fn fenced_initialization_generated_small_history(pool: PgPool) -> anyhow::Result<()> {
+    generated_history(&pool, 2, 2, 2026111901, ReplayOrder::TargetsFirst).await
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL"]
+async fn fenced_initialization_generated_large_history(pool: PgPool) -> anyhow::Result<()> {
+    generated_history(&pool, 512, 48, 2026111902, ReplayOrder::MembersFirst).await
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL"]
+async fn fenced_initialization_never_adopts_a_different_accounting_owner(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    empty_budget::initialize(&pool, seen(0).at).await?;
+    let original = Fixture::new(&pool).await;
+    let foreign = Fixture::new(&pool).await;
+    ensure!(original.tenant != foreign.tenant);
+    let original_scope = scope(&original);
+    let exit = batch(original_scope, IntentKind::Exit, None);
+    journal_commit(&PgJournalBackend::new(&pool, original.tenant), &exit).await?;
+    let link = linked_sell(&foreign, &exit.intent);
+    let mut claimed = zero_execution_order("100", "NEW", OrderPhase::Live);
+    claimed.client_order_id = link.client_order_id.clone();
+    match foreign.ledger.record_order(&claimed, &link, seen(2)).await {
+        Err(error) => {
+            let leaked: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT FROM venue_orders WHERE intent_id=$1)")
+                    .bind(exit.intent.intent_id)
+                    .fetch_one(&pool)
+                    .await?;
+            ensure!(!leaked);
+            let ready = initialize(&pool, ReplayOrder::MembersFirst, None).await?;
+            ensure!(check(&pool, &ready, original_scope).await?.facts.leg_sell == 1);
+            ensure!(check(&pool, &ready, scope(&foreign)).await?.facts.leg_sell == 0);
+            eprintln!("SPOT_FENCED_INIT cross_owner=native_refused disposition={error:?}");
+        },
+        Ok(record) => {
+            ensure!(record.changed);
+            let failure = initialize(&pool, ReplayOrder::MembersFirst, None).await.unwrap_err();
+            ensure!(failure
+                .to_string()
+                .contains("replay cannot reconcile across accounting owners"));
+            let generation: Option<String> =
+                sqlx::query_scalar("SELECT to_regclass('spot_shadow_initialization')::text")
+                    .fetch_one(&pool)
+                    .await?;
+            ensure!(generation.is_none());
+            eprintln!("SPOT_FENCED_INIT cross_owner=historical_conflict_refused");
+        },
+    }
     Ok(())
 }

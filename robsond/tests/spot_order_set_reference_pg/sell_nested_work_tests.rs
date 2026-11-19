@@ -121,7 +121,7 @@ impl Sample {
     }
 }
 
-async fn seed_history(f: &Fixture, journal: &PgJournalBackend, s: Scope, history: i64) {
+pub(super) async fn seed_history(f: &Fixture, journal: &PgJournalBackend, s: Scope, history: i64) {
     for offset in 0..history {
         let mut exit = batch(s, IntentKind::Exit, None);
         exit.attempts.push(AttemptRow {
