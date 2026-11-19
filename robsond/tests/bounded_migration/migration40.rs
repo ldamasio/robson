@@ -1,5 +1,5 @@
 //! Native M40 controls. A local test database is created for each case.
-use std::{borrow::Cow, time::Instant};
+use std::time::Instant;
 
 use anyhow::Result;
 use robson_testkit::db_proxy::{DbProxy, ProxyMode};
@@ -58,14 +58,6 @@ fn migration() -> &'static Migration {
     contract40().unwrap()
 }
 
-async fn through39(pool: &PgPool) -> Result<()> {
-    let mut inventory = sqlx::migrate!("../migrations");
-    inventory.migrations =
-        Cow::Owned(inventory.iter().filter(|m| m.version < VERSION40).cloned().collect());
-    inventory.run(pool).await?;
-    Ok(())
-}
-
 async fn acquired_key(connection: &mut PgConnection, pid: i32, birth: &str) -> Result<AdvisoryKey> {
     let keys: Vec<AdvisoryKey> = sqlx::query_as(
         "SELECT l.classid::bigint,l.objid::bigint FROM pg_locks l JOIN pg_stat_activity a USING(pid) WHERE l.pid=$1 AND a.backend_start::text=$2 AND a.datname=current_database() AND a.state='idle' AND a.xact_start IS NULL AND l.locktype='advisory' AND l.granted AND l.objsubid=1",
@@ -86,7 +78,7 @@ impl Fixture {
             .next()
             .ok_or_else(|| anyhow::anyhow!("no local test address"))?;
         anyhow::ensure!(upstream.ip().is_loopback(), "M40 fixture requires local PostgreSQL");
-        through39(pool).await?;
+        through(VERSION39).run(pool).await?;
         let proxy = DbProxy::start(upstream).await?;
         let proxied = options
             .as_ref()

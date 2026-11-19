@@ -68,7 +68,8 @@ async fn the_ledger_schema_installs_fresh(pool: PgPool) {
         20240101000036,
         20240101000037,
         20240101000038,
-        20240101000039
+        20240101000039,
+        20240101000040
     ]);
     let f = Fixture::new_for_all_rows(&pool).await.unwrap();
     f.all_rows(&pool).await.unwrap();
