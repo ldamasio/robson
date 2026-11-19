@@ -160,68 +160,74 @@ fn code_only(text: &str) -> String {
 const PORT_ITEMS: [(&str, &[&str]); 4] = [
     ("market_data.rs", &["TradeFeedMessage", "TradeFeedPort", "TradeStream"]),
     ("ohlcv.rs", &["CandleInterval", "ExecError", "OhlcvPort"]),
-    ("exchange.rs", &[
-        "ExecError",
-        "OrderResult",
-        "gate::OperationGate",
-        "order_journal::OrderJournal",
-        "ports::OpenOrderRecord",
-        "ports::TradeFill",
-        "ports::UserTradeRecord",
-        "quantize",
-        "venue::AccountKind",
-        "venue::AccountOpenOrder",
-        "venue::AccountPort",
-        "venue::CancelAnswer",
-        "venue::Cash",
-        "venue::EntryOrReduce",
-        "venue::ExecutionCostEnvelope",
-        "venue::FundingPort",
-        "venue::GovernedInventory",
-        "venue::Holding",
-        "venue::InventoryObservation",
-        "venue::InventoryPort",
-        "venue::Mark",
-        "venue::MarketKind",
-        "venue::OrderLookup",
-        "venue::OrderObservation",
-        "venue::OrderPhase",
-        "venue::OrderRef",
-        "venue::PlacedStop",
-        "venue::PositionAccountPort",
-        "venue::ProtectionKind",
-        "venue::ReplaceOutcome",
-        "venue::ReplacementProtocol",
-        "venue::SettlementPort",
-        "venue::SettlementRecord",
-        "venue::StopCancelOutcome",
-        "venue::StopParams",
-        "venue::StopRef",
-        "venue::SubmitAttemptLedger",
-        "venue::TradePage",
-        "venue::TradingPort",
-        "venue::Venue",
-        "venue::VenueCapabilities",
-        "venue::VenueFinalityRule",
-        "venue::VenueId",
-        "venue::VenueOrderRecord",
-        "venue::replace_cancel_then_place",
-    ]),
-    ("trading.rs", &[
-        "ExecError",
-        "OrderResult",
-        "ports::FeeEvidence",
-        "ports::FeeGap",
-        "ports::OrderEvidence",
-        "ports::TradeFill",
-        "venue::CancelAnswer",
-        "venue::OrderPhase",
-        "venue::PlacedStop",
-        "venue::ProtectionKind",
-        "venue::StopRef",
-        "venue::SubmitAttemptLedger",
-        "venue::VenueOrderRecord",
-    ]),
+    (
+        "exchange.rs",
+        &[
+            "ExecError",
+            "OrderResult",
+            "gate::OperationGate",
+            "order_journal::OrderJournal",
+            "ports::OpenOrderRecord",
+            "ports::TradeFill",
+            "ports::UserTradeRecord",
+            "quantize",
+            "venue::AccountKind",
+            "venue::AccountOpenOrder",
+            "venue::AccountPort",
+            "venue::CancelAnswer",
+            "venue::Cash",
+            "venue::EntryOrReduce",
+            "venue::ExecutionCostEnvelope",
+            "venue::FundingPort",
+            "venue::GovernedInventory",
+            "venue::Holding",
+            "venue::InventoryObservation",
+            "venue::InventoryPort",
+            "venue::Mark",
+            "venue::MarketKind",
+            "venue::OrderLookup",
+            "venue::OrderObservation",
+            "venue::OrderPhase",
+            "venue::OrderRef",
+            "venue::PlacedStop",
+            "venue::PositionAccountPort",
+            "venue::ProtectionKind",
+            "venue::ReplaceOutcome",
+            "venue::ReplacementProtocol",
+            "venue::SettlementPort",
+            "venue::SettlementRecord",
+            "venue::StopCancelOutcome",
+            "venue::StopParams",
+            "venue::StopRef",
+            "venue::SubmitAttemptLedger",
+            "venue::TradePage",
+            "venue::TradingPort",
+            "venue::Venue",
+            "venue::VenueCapabilities",
+            "venue::VenueFinalityRule",
+            "venue::VenueId",
+            "venue::VenueOrderRecord",
+            "venue::replace_cancel_then_place",
+        ],
+    ),
+    (
+        "trading.rs",
+        &[
+            "ExecError",
+            "OrderResult",
+            "ports::FeeEvidence",
+            "ports::FeeGap",
+            "ports::OrderEvidence",
+            "ports::TradeFill",
+            "venue::CancelAnswer",
+            "venue::OrderPhase",
+            "venue::PlacedStop",
+            "venue::ProtectionKind",
+            "venue::StopRef",
+            "venue::SubmitAttemptLedger",
+            "venue::VenueOrderRecord",
+        ],
+    ),
 ];
 
 /// The paths a `use` group names, nested groups flattened: `{A, b::{C, D}}`
@@ -522,10 +528,11 @@ fn the_observation_fixture_exception_requires_its_test_gate_and_only_include() {
         std::slice::from_ref(&owner)
     ));
     assert!(!isolated_observation_fixture(gate, "", std::slice::from_ref(&owner)));
-    assert!(!isolated_observation_fixture(gate, fixture, &[
-        owner.clone(),
-        PathBuf::from("robsond/src/main.rs")
-    ]));
+    assert!(!isolated_observation_fixture(
+        gate,
+        fixture,
+        &[owner.clone(), PathBuf::from("robsond/src/main.rs")]
+    ));
     assert!(!isolated_observation_fixture(
         &format!("{gate}\ninclude!(\"operation_observation_http_tests.rs\");"),
         fixture,
@@ -539,6 +546,64 @@ fn clock_references(text: &str) -> impl Iterator<Item = &str> {
             || has_word(line, "prepare_spot_time")
             || line.contains("/api/v3/time")
     })
+}
+
+fn n5_reference_lines(path: &Path) -> &'static [&'static str] {
+    match path.to_str() {
+        Some("robson-connectors/src/binance_rest.rs") => &[
+            r#"const ENDPOINT: &str = "/api/v3/account/commission";"#,
+            r#"let result = client.bind_spot_commission(single_shot().unwrap(), "BTCUSDT", 1_800_000_000_000);"#,
+        ],
+        Some("robsond/src/venue_clock_owner/commission.rs") => &[
+            "use robson_connectors::binance::spot::PreparedSpotCommission;",
+            "JoinHandle<Result<PreparedSpotCommission, BinanceRestError>>;",
+            ") -> Result<PreparedSpotCommission, TimeError> {",
+            "client.prepare_spot_commission(&symbol)",
+        ],
+        Some("robsond/src/venue_budget/n5_claim/commission.rs") => &[
+            "use robson_connectors::{binance::spot::PreparedSpotCommission, BinanceRestClient};",
+            "prepared: PreparedSpotCommission,",
+            r#"b"GET /api/v3/account/commission".as_slice(),"#,
+        ],
+        Some("robsond/src/venue_budget/n5_claim/response.rs") => &[
+            "use robson_connectors::binance::spot::SpotCommission;",
+            "let parsed: SpotCommission =",
+        ],
+        _ => &[],
+    }
+}
+
+fn strip_n5_references(path: &Path, text: &str) -> String {
+    let mut allowed = n5_reference_lines(path).to_vec();
+    text.lines()
+        .filter(|line| {
+            if let Some(i) = allowed.iter().position(|expected| *expected == line.trim()) {
+                allowed.remove(i);
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn isolated_n5_fixture(
+    owner: &str,
+    fixture: &str,
+    name: &str,
+    module: &str,
+    cfg: &str,
+    reference_paths: &[PathBuf],
+    owner_path: &Path,
+) -> bool {
+    let parent_cfg = cfg.replacen("#![", "#[", 1);
+    let gate = format!("{parent_cfg}#[path = \"{name}\"]\nmod {module};");
+    fixture.starts_with(cfg)
+        && owner.matches(&gate).count() == 1
+        && owner.matches(name).count() == 1
+        && reference_paths.len() == 1
+        && reference_paths[0].as_path() == owner_path
 }
 
 fn outside_spot_violations(path: &Path, text: &str, names: &[String]) -> Vec<String> {
@@ -572,8 +637,22 @@ fn outside_spot_violations(path: &Path, text: &str, names: &[String]) -> Vec<Str
         },
         _ => text,
     };
+    let text = strip_n5_references(path, text);
+    let text = text.as_str();
     if reaches_spot(text) {
         found.push("reaches binance::spot".into());
+    }
+    if [
+        "PreparedSpotCommission",
+        "SignedSpotCommission",
+        "prepare_spot_commission",
+    ]
+    .iter()
+    .any(|name| has_word(text, name))
+        || text.contains("/api/v3/account/commission")
+        || text.contains(".bind_spot_commission(")
+    {
+        found.push("names a Spot commission path outside its approved source lines".into());
     }
     if names_spot_endpoint(text) {
         found.push("names a spot endpoint".into());
@@ -582,6 +661,35 @@ fn outside_spot_violations(path: &Path, text: &str, names: &[String]) -> Vec<Str
         found.push(format!("names {name}"));
     }
     found
+}
+
+#[test]
+fn commission_allowance_admits_only_its_named_owner_and_test_gates() {
+    let paths = [
+        "robsond/src/venue_clock_owner/commission.rs",
+        "robsond/src/venue_budget/n5_claim/commission.rs",
+        "robsond/src/venue_budget/n5_claim/response.rs",
+    ];
+    let names = spot_type_names();
+    let other = Path::new("robsond/src/venue.rs");
+    for owner in paths.map(Path::new) {
+        let exact = n5_reference_lines(owner).join("\n");
+        assert!(outside_spot_violations(owner, &exact, &names).is_empty());
+        assert!(!outside_spot_violations(other, &exact, &names).is_empty());
+        assert!(!outside_spot_violations(owner, &format!("{exact}\n{exact}"), &names).is_empty());
+    }
+
+    let cfg = "#![cfg(all(test, feature = \"crash-points\"))]\n";
+    let gate = "#[cfg(all(test, feature = \"crash-points\"))]\n#[path = \"commission_tests.rs\"]\nmod tests;";
+    let owner = PathBuf::from(paths[1]);
+    let check = |gate, fixture, references: &[PathBuf]| {
+        isolated_n5_fixture(gate, fixture, "commission_tests.rs", "tests", cfg, references, &owner)
+    };
+    let only = std::slice::from_ref(&owner);
+    assert!(check(gate, cfg, only));
+    assert!(!check(gate, "", only));
+    assert!(!check(gate.split_once('\n').unwrap().1, cfg, only));
+    assert!(!check(gate, cfg, &[owner.clone(), other.to_owned()]));
 }
 
 #[test]
@@ -639,9 +747,36 @@ fn nothing_outside_the_spot_module_names_it() {
         fs::read_to_string(workspace.join("robsond/src/operation_observation_http_tests.rs"))
             .unwrap();
     let fixture_isolated = isolated_observation_fixture(&owner, &fixture, &references);
+    let n5_dir = workspace.join("robsond/src/venue_budget/n5_claim");
+    for (name, owner_name, module, cfg) in [
+        (
+            "commission_tests.rs",
+            "commission.rs",
+            "tests",
+            "#![cfg(all(test, feature = \"crash-points\"))]\n",
+        ),
+        ("result_tests.rs", "tests.rs", "result_tests", "#![cfg(test)]\n"),
+    ] {
+        let owner_path = n5_dir.join(owner_name);
+        let owner = fs::read_to_string(&owner_path).unwrap();
+        let fixture = fs::read_to_string(n5_dir.join(name)).unwrap();
+        let inclusion = format!("\"{name}\"");
+        let references: Vec<_> = outside
+            .iter()
+            .filter(|path| fs::read_to_string(path).unwrap().contains(&inclusion))
+            .cloned()
+            .collect();
+        assert!(
+            isolated_n5_fixture(&owner, &fixture, name, module, cfg, &references, &owner_path),
+            "N5 fixture {name} is not uniquely test-gated"
+        );
+    }
     let names = spot_type_names();
     let mut found = Vec::new();
     for path in &outside {
+        if path == &n5_dir.join("commission_tests.rs") || path == &n5_dir.join("result_tests.rs") {
+            continue;
+        }
         if path.ends_with("robsond/src/operation_observation_http_tests.rs") {
             assert!(fixture_isolated, "observation fixture is not uniquely test-gated");
             assert!(clock_references(&fixture).next().is_none());
@@ -983,10 +1118,14 @@ fn the_commission_transport_allowance_rejects_changed_send_or_client() {
     for (before, after) in [
         ("single_shot()?", "reqwest::Client::new()"),
         ("bind_spot_commission", "bind_spot_order"),
-        ("self.transport.execute(self.request)", "self.transport.clone().execute(self.request)"),
+        (
+            "self.transport.execute(self.request)",
+            "self.transport.clone().execute(self.request)",
+        ),
     ] {
         assert!(original.contains(before));
-        assert!(!prepared_commission_mutation_violations(&original.replacen(before, after, 1)).is_empty());
+        assert!(!prepared_commission_mutation_violations(&original.replacen(before, after, 1))
+            .is_empty());
     }
 }
 

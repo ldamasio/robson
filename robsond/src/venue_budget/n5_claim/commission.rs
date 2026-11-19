@@ -38,51 +38,6 @@ struct VerifiedCommissionAccount {
     binding: uuid::Uuid,
 }
 
-#[cfg(all(test, feature = "crash-points"))]
-impl VerifiedCommissionAccount {
-    /// Verify the fixture UID with the same signed client used by the owner.
-    /// Tenant and scope are the explicit trusted local fixture contract.
-    async fn verified_loopback(
-        identity: CostIdentity,
-        client: Arc<BinanceRestClient>,
-    ) -> Result<Self, TimeError> {
-        if identity.venue().as_str() != "binance:spot" {
-            return Err(TimeError::Native);
-        }
-        let response = timeout_at(
-            Instant::now() + WIRE_LIMIT,
-            robson_connectors::binance::spot::SpotRestReader::new(Arc::clone(&client)).account(),
-        )
-        .await
-        .map_err(|_| TimeError::Expired)?
-        .map_err(|_| TimeError::Transport)?;
-        if response.uid != identity.uid() {
-            return Err(TimeError::Venue);
-        }
-        Ok(Self {
-            identity,
-            client,
-            binding: uuid::Uuid::now_v7(),
-        })
-    }
-
-    fn with_symbol(&self, symbol: robson_domain::Symbol) -> Result<Self, TimeError> {
-        let identity = CostIdentity::new(
-            self.identity.tenant(),
-            self.identity.venue().clone(),
-            self.identity.scope().to_owned(),
-            self.identity.uid(),
-            symbol,
-        )
-        .map_err(|_| TimeError::Native)?;
-        Ok(Self {
-            identity,
-            client: Arc::clone(&self.client),
-            binding: self.binding,
-        })
-    }
-}
-
 struct OriginalAttempt {
     key: FrequencyKey,
     claim: ClaimObservation,

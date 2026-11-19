@@ -1,3 +1,5 @@
+#![cfg(all(test, feature = "crash-points"))]
+
 //! Native test composition with a real loopback venue and a disposable SQLx database.
 //! The registered prior claims are fixture data, not startup or recovery evidence.
 
@@ -22,7 +24,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     task::JoinHandle,
-    time::{sleep, timeout, Instant},
+    time::{sleep, timeout, timeout_at, Instant},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -30,6 +32,7 @@ use uuid::Uuid;
 use crate::{
     process_epoch::{self, Epoch},
     venue_budget::{self, bootstrap, restore, state::SharedBudget},
+    venue_clock_http::TimeError,
     venue_clock_owner::ClockOwner,
     venue_clock_store::ClockSampleStore,
 };
@@ -37,7 +40,52 @@ use crate::{
 use super::super::{ClaimIdentity, ClaimResult, FrequencyKey, PriorClaim, PriorEligibility, Trace};
 use super::{
     content_digest, CommissionOwner, CostIdentity, RefreshOutcome, VerifiedCommissionAccount,
+    WIRE_LIMIT,
 };
+
+impl VerifiedCommissionAccount {
+    /// Verify the fixture UID with the same signed client used by the owner.
+    /// Tenant and scope are the explicit trusted local fixture contract.
+    async fn verified_loopback(
+        identity: CostIdentity,
+        client: Arc<BinanceRestClient>,
+    ) -> Result<Self, TimeError> {
+        if identity.venue().as_str() != "binance:spot" {
+            return Err(TimeError::Native);
+        }
+        let response = timeout_at(
+            Instant::now() + WIRE_LIMIT,
+            robson_connectors::binance::spot::SpotRestReader::new(Arc::clone(&client)).account(),
+        )
+        .await
+        .map_err(|_| TimeError::Expired)?
+        .map_err(|_| TimeError::Transport)?;
+        if response.uid != identity.uid() {
+            return Err(TimeError::Venue);
+        }
+        Ok(Self {
+            identity,
+            client,
+            binding: uuid::Uuid::now_v7(),
+        })
+    }
+
+    fn with_symbol(&self, symbol: robson_domain::Symbol) -> Result<Self, TimeError> {
+        let identity = CostIdentity::new(
+            self.identity.tenant(),
+            self.identity.venue().clone(),
+            self.identity.scope().to_owned(),
+            self.identity.uid(),
+            symbol,
+        )
+        .map_err(|_| TimeError::Native)?;
+        Ok(Self {
+            identity,
+            client: Arc::clone(&self.client),
+            binding: self.binding,
+        })
+    }
+}
 
 const PAIR: &str = "BTCUSDT";
 const NO_CLOCK_PAIR: &str = "ETHUSDT";

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Native witnesses for the dormant result sink and its exact persisted receipt.
 use super::super::result::{
     confirm_result_once, publish_result, PreparedSnapshot, Publication, ResultRequest,
