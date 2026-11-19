@@ -264,3 +264,56 @@ async fn native_shadow_write_work_small(pool: PgPool) {
 async fn native_shadow_write_work_large(pool: PgPool) {
     measure(pool, 512, 48).await;
 }
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL"]
+async fn member_arbiter_preserves_exact_noop_and_identity_refusal(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let s = scope(&f);
+    install(&pool).await;
+    let journal = PgJournalBackend::new(&pool, s.tenant);
+    let cancel = batch(s, IntentKind::Cancel, Some(TARGET));
+    journal.commit(&cancel).await.unwrap();
+    let other_target = "800002";
+    for parameter in [TARGET, other_target] {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM accounting_state WHERE tenant_id=$1 AND venue_id=$2 FOR UPDATE")
+            .bind(s.tenant)
+            .bind(s.venue)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let observe = sqlx::query(
+            "SELECT cancel_shadow_sync_member(jsonb_populate_record(j,
+               jsonb_build_object('cancels_order_id', $2::text)))
+             FROM order_intents j WHERE j.intent_id=$1",
+        )
+        .bind(cancel.intent.intent_id)
+        .bind(parameter)
+        .execute(&mut *tx)
+        .await;
+
+        if parameter == TARGET {
+            observe.unwrap();
+            let mutations: i64 = sqlx::query_scalar("SELECT cancel_shadow_member_writes()")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(mutations, 0, "equal replay must not physically update a member");
+        } else {
+            let error = observe.unwrap_err();
+            let database = error.as_database_error().unwrap();
+            assert_eq!(database.code().as_deref(), Some("P0001"));
+            assert_eq!(database.message(), "test shadow requires a stable cancel identity");
+        }
+        tx.rollback().await.unwrap();
+    }
+    let target: String =
+        sqlx::query_scalar("SELECT target_id FROM cancel_shadow_members WHERE intent_id=$1")
+            .bind(cancel.intent.intent_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(target, TARGET);
+    assert_eq!(hot_query(s, None).fetch_one(&pool).await.unwrap().grouped_cancel, 1);
+}
