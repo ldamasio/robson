@@ -17,7 +17,7 @@ use rust_decimal::Decimal;
 use tokio::time::timeout;
 
 use self::ready::{
-    initialize, initialize_at, probe, statement, Keys, ProjectionReady, ReplayOrder, Stage,
+    initialize, initialize_at, probe, relation_nodes, statement, Keys, ProjectionReady, ReplayOrder, Stage,
     ORDER_SET_COLUMNS,
 };
 use super::sell_nested_work_tests::seed_history;
@@ -61,23 +61,6 @@ fn candidate_statement() -> String {
     )
 }
 
-#[derive(sqlx::FromRow)]
-struct Explain {
-    #[sqlx(rename = "QUERY PLAN")]
-    plan: serde_json::Value,
-}
-
-fn relation_nodes<'a>(node: &'a serde_json::Value, name: &str, out: &mut Vec<&'a serde_json::Value>) {
-    if node["Relation Name"] == name {
-        out.push(node);
-    }
-    if let Some(children) = node["Plans"].as_array() {
-        for child in children {
-            relation_nodes(child, name, out);
-        }
-    }
-}
-
 async fn measure_candidate_read(
     pool: &PgPool,
     actor: &PgPool,
@@ -103,7 +86,6 @@ async fn measure_candidate_read(
         .await?;
     ensure!(venue_rows >= history && intent_rows >= history && cancel_groups >= history);
     let sql = candidate_statement();
-    let explain = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}");
     for (candidate, present) in [("1000", true), ("99000001", false)] {
         let before = proxy.stats().statements;
         let read: CandidateOrderSet = ready
@@ -116,11 +98,8 @@ async fn measure_candidate_read(
         ensure!(read.target_cancel_terminal == present.then_some(true));
 
         // EXPLAIN executes independently of the application wire measurement.
-        let physical: Explain = ready
-            .query_as(&explain, keys(scope), Some(candidate))
-            .fetch_one(pool)
-            .await?;
-        let plan = &physical.plan[0]["Plan"];
+        let physical = ready.explain(pool, &sql, keys(scope), candidate).await?;
+        let plan = &physical[0]["Plan"];
         ensure!(plan["Actual Rows"].as_u64() == Some(1));
         for (relation, inventory) in [
             ("venue_orders", venue_rows),
@@ -155,7 +134,7 @@ async fn measure_candidate_read(
             "SPOT_INIT_CANDIDATE_WORK history={history} present={present} wire=1
              venue_rows={venue_rows} intent_rows={intent_rows} active_members={active_members}
              cancel_groups={cancel_groups} plan={}",
-            physical.plan
+            physical
         );
     }
     Ok(())

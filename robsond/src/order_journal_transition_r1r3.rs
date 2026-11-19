@@ -14,7 +14,9 @@ use robson_exec::{
     },
     order_journal::{IntentKind, COMMIT_BOUND},
     venue::{OrderPhase, VenueId},
-    venue_ledger::{LedgerError, LegOrderKind, OrderKey, OrderOwner, StoredOrder, VenueIntId},
+    venue_ledger::{
+        LedgerError, LegOrderKind, OrderKey, OrderLink, OrderOwner, StoredOrder, VenueIntId,
+    },
 };
 use robson_testkit::db_proxy::ProxyMode;
 use rust_decimal::Decimal;
@@ -24,8 +26,8 @@ use uuid::Uuid;
 use super::{
     assert_trace, fixture, journal_batch, order,
     ready::{
-        initialize, statement, Keys, ProjectionReady, ReplayOrder, CANDIDATE_COLUMNS,
-        CANDIDATE_JOINS,
+        initialize, relation_nodes, statement, Keys, ProjectionReady, ReplayOrder,
+        CANDIDATE_COLUMNS, CANDIDATE_JOINS,
     },
     ProtectedLeg, Wire, READ, STOP, SYMBOL, VENUE,
 };
@@ -801,5 +803,119 @@ async fn local_r1_r3_snapshot_is_bound_to_its_read_and_version(pool: PgPool) -> 
     let after = observe(&ready, &pool, &leg).await?;
     assert_eq!(after, second);
     eprintln!("SPOT_LOCAL_R1_R3 stale_version=kept foreign_owner=refused lost_read=no_snapshot");
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn local_r1_r3_typed_read_stays_keyed_at_history_and_membership_scale(
+    pool: PgPool,
+) -> Result<()> {
+    fixture(&pool).await?;
+    let leg = ProtectedLeg::admit(&pool).await?;
+    let unrelated = ProtectedLeg::admit(&pool).await?;
+    record_partition(&pool, &leg, Decimal::from(10), true, false).await?;
+    for index in 0..512 {
+        let target = (100_000 + index).to_string();
+        let exit = leg.intent(IntentKind::Exit, None);
+        leg.commit(&journal_batch(exit.clone())).await?;
+        let link = OrderLink {
+            venue: VenueId::new(VENUE),
+            account_scope: leg.account.clone(),
+            owner: OrderOwner::Leg {
+                intent_id: exit.intent_id,
+                position_id: leg.position,
+                kind: LegOrderKind::Sell,
+            },
+            client_order_id: exit.client_order_id,
+        };
+        let mut terminal = order(&target, &link.client_order_id, "CANCELED", OrderPhase::Terminal);
+        terminal.order_type = "MARKET".into();
+        terminal.protection_kind = None;
+        terminal.stop_price = None;
+        leg.record(&terminal, &link, 20 + i64::try_from(index)?).await?;
+        let cancel = leg.intent(IntentKind::Cancel, Some(&target));
+        leg.commit(&journal_batch(cancel)).await?;
+        unrelated.canonical_mutation(2, index).await?;
+    }
+    let ready = initialize(&pool, ReplayOrder::TargetsFirst, None).await?;
+    sqlx::raw_sql("ANALYZE venue_orders, order_intents, sell_shadow_orders, cancel_shadow_groups")
+        .execute(&pool)
+        .await?;
+    let (venue_rows, journal_rows, member_rows, cancel_groups): (i64, i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT (SELECT count(*) FROM venue_orders),
+                    (SELECT count(*) FROM order_intents),
+                    (SELECT count(*) FROM sell_shadow_orders),
+                    (SELECT count(*) FROM cancel_shadow_groups)",
+        )
+        .fetch_one(&pool)
+        .await?;
+    ensure!(
+        venue_rows >= 1024 && journal_rows >= 1024 && member_rows >= 512 && cancel_groups >= 512
+    );
+    let sql = policy_statement();
+    let keys = Keys {
+        tenant: leg.tenant,
+        venue: VENUE,
+        account: &leg.account,
+        position: leg.position,
+        symbol: SYMBOL,
+    };
+    for (candidate, present) in [(STOP, true), ("92000001", false)] {
+        let wire = Wire::new(&pool, leg.tenant).await?;
+        let observed = evaluate(&ready, &wire.store, &leg.account, leg.position, SYMBOL, candidate)
+            .await
+            .map_err(|error| anyhow!("dense policy snapshot: {error:?}"))?;
+        assert_trace(&wire, &[READ]);
+        assert_eq!(wire.proxy.query_trace(), [sql.clone()]);
+        if present {
+            assert_eq!(observed.r3, protected(10, FeeEvidence::FinalCommission));
+        } else {
+            assert_eq!(observed.r3, R3::Unresolved(Unresolved::Candidate));
+            assert_ne!(observed.r1, R1::Clear);
+        }
+        let physical = ready.explain(&pool, &sql, keys, candidate).await?;
+        let plan = &physical[0]["Plan"];
+        ensure!(plan["Actual Rows"].as_u64() == Some(1));
+        for (relation, expected_probes) in [
+            ("venue_orders", 2),
+            ("order_intents", 2),
+            ("sell_shadow_orders", 1),
+            ("cancel_shadow_groups", 1),
+        ] {
+            let mut probes = Vec::new();
+            relation_nodes(plan, relation, &mut probes);
+            ensure!(!probes.is_empty() && probes.len() <= expected_probes, "{relation}: {plan}");
+            for node in probes {
+                let loops =
+                    node["Actual Loops"].as_u64().ok_or_else(|| anyhow!("missing loops"))?;
+                let rows = node["Actual Rows"].as_u64().ok_or_else(|| anyhow!("missing rows"))?;
+                ensure!(loops <= 1 && rows <= 1, "{relation}: {node}");
+                if loops == 1 {
+                    ensure!(node["Index Cond"].is_string(), "{relation}: {node}");
+                    ensure!(node["Rows Removed by Filter"].as_u64().unwrap_or(0) == 0, "{node}");
+                    ensure!(
+                        node["Rows Removed by Index Recheck"].as_u64().unwrap_or(0) == 0,
+                        "{node}"
+                    );
+                }
+            }
+        }
+        for relation in [
+            "cancel_shadow_members",
+            "sell_shadow_intents",
+            "submit_attempts",
+        ] {
+            let mut probes = Vec::new();
+            relation_nodes(plan, relation, &mut probes);
+            ensure!(probes.is_empty(), "historical read of {relation}: {plan}");
+        }
+        eprintln!(
+            "SPOT_R1_R3_TYPED_WORK present={present} wire=1 venue_rows={venue_rows}
+             journal_rows={journal_rows} member_rows={member_rows} cancel_groups={cancel_groups}
+             plan={physical}"
+        );
+    }
     Ok(())
 }

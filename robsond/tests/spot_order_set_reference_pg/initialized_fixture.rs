@@ -78,6 +78,21 @@ pub(super) struct Keys<'a> {
     pub(super) symbol: &'a str,
 }
 
+pub(super) fn relation_nodes<'a>(
+    node: &'a serde_json::Value,
+    name: &str,
+    out: &mut Vec<&'a serde_json::Value>,
+) {
+    if node["Relation Name"] == name {
+        out.push(node);
+    }
+    if let Some(children) = node["Plans"].as_array() {
+        for child in children {
+            relation_nodes(child, name, out);
+        }
+    }
+}
+
 /// An initialized generation. Neither clonable nor constructible outside this
 /// module; it is kept until its owner drops it and is never re-initialized.
 #[derive(Debug)]
@@ -133,6 +148,25 @@ impl ProjectionReady {
         T: for<'r> FromRow<'r, PgRow>,
     {
         bound(sql, keys, candidate, self.generation, &self.database)
+    }
+
+    pub(super) async fn explain(
+        &self,
+        pool: &PgPool,
+        sql: &str,
+        keys: Keys<'_>,
+        candidate: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        #[derive(sqlx::FromRow)]
+        struct Explain {
+            #[sqlx(rename = "QUERY PLAN")]
+            plan: serde_json::Value,
+        }
+
+        let explain = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}");
+        let physical: Explain =
+            self.query_as(&explain, keys, Some(candidate)).fetch_one(pool).await?;
+        Ok(physical.plan)
     }
 
     /// Negative control: the same statement under a generation that was
