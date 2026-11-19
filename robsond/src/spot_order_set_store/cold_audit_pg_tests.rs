@@ -15,16 +15,31 @@ const BUDGET: PageBudget = PageBudget {
     routes: 2,
 };
 
-type Pause = (oneshot::Sender<()>, oneshot::Receiver<()>);
-
-tokio::task_local! {
-    static PAUSE_AFTER_INTENTS: RefCell<Option<Pause>>;
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum Boundary {
+    BeforeAcquire,
+    AfterIntents,
+    AfterAttempts,
+    AfterOrders,
+    AfterRoutes,
 }
 
-pub(super) async fn after_intents() {
-    if let Ok(Some((reached, resume))) =
-        PAUSE_AFTER_INTENTS.try_with(|slot| slot.borrow_mut().take())
-    {
+type Pause = (Boundary, oneshot::Sender<()>, oneshot::Receiver<()>);
+
+tokio::task_local! {
+    static SNAPSHOT_PAUSE: RefCell<Option<Pause>>;
+}
+
+pub(super) async fn pause_at(current: Boundary) {
+    let pause = SNAPSHOT_PAUSE.try_with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(boundary, _, _)| *boundary == current) {
+            slot.take()
+        } else {
+            None
+        }
+    });
+    if let Ok(Some((_, reached, resume))) = pause {
         let _ = reached.send(());
         let _ = resume.await;
     }
@@ -192,8 +207,8 @@ async fn cold_spot_audit_snapshot_survives_real_publication_across_families(
     let (observed, wait) = oneshot::channel();
     let (release, resume) = oneshot::channel();
     let mut keys = Keys::default();
-    let old = PAUSE_AFTER_INTENTS.scope(
-        RefCell::new(Some((observed, resume))),
+    let old = SNAPSHOT_PAUSE.scope(
+        RefCell::new(Some((Boundary::AfterIntents, observed, resume))),
         audit_cold_sources(&pool, scope(tenant), BUDGET, deadline(), &mut keys),
     );
     let next = async {
@@ -329,9 +344,9 @@ async fn cold_spot_audit_cancelled_source_query_retires_original_backend(
     proxy.enable_exact_query_trace(32);
     let task_pool = proxied.clone();
     let job = tokio::spawn(async move {
-        PAUSE_AFTER_INTENTS
+        SNAPSHOT_PAUSE
             .scope(
-                RefCell::new(Some((observed, resume))),
+                RefCell::new(Some((Boundary::AfterIntents, observed, resume))),
                 audit_cold_sources(
                     &task_pool,
                     scope(tenant),
@@ -400,15 +415,24 @@ async fn cold_spot_audit_seeded_external_publication_never_mixes_scopes(
         ..Config::default()
     });
     let scenarios = (1_i64..=2, 0_u64..=3500);
+    let order = (0_usize..5).new_tree(&mut runner).expect("bounded order").current();
+    let mut boundaries = [
+        Boundary::BeforeAcquire,
+        Boundary::AfterIntents,
+        Boundary::AfterAttempts,
+        Boundary::AfterOrders,
+        Boundary::AfterRoutes,
+    ];
+    boundaries.rotate_left(order);
     let mut previous = 0_i64;
-    for _ in 0..7 {
+    for boundary in boundaries {
         let (additional, delay) =
             scenarios.new_tree(&mut runner).expect("bounded publication schedule").current();
         let (observed, wait) = oneshot::channel();
         let (release, resume) = oneshot::channel();
         let mut keys = Keys::default();
-        let old = PAUSE_AFTER_INTENTS.scope(
-            RefCell::new(Some((observed, resume))),
+        let old = SNAPSHOT_PAUSE.scope(
+            RefCell::new(Some((boundary, observed, resume))),
             audit_cold_sources(&pool, scope(tenant), BUDGET, deadline(), &mut keys),
         );
         let next = async {
@@ -422,8 +446,14 @@ async fn cold_spot_audit_seeded_external_publication_never_mixes_scopes(
         published?;
         let observed = receipt.map_err(|error| anyhow!("generated audit: {error:?}"))?;
         ensure!(observed.tenant_id == tenant && observed.account_scope == SCOPE);
-        ensure!(observed.families.iter().all(|family| family.rows == previous as u64));
-        expected(&keys, previous as u64)?;
+        let expected_count = previous
+            + if boundary == Boundary::BeforeAcquire {
+                additional
+            } else {
+                0
+            };
+        ensure!(observed.families.iter().all(|family| family.rows == expected_count as u64));
+        expected(&keys, expected_count as u64)?;
         previous += additional;
     }
     Ok(())
@@ -437,8 +467,8 @@ async fn cold_spot_audit_typed_deadline_on_running_snapshot(pool: PgPool) -> Res
     let (_keep_blocked, resume) = oneshot::channel();
     let mut keys = Keys::default();
     let start = Instant::now();
-    let pending = PAUSE_AFTER_INTENTS.scope(
-        RefCell::new(Some((observed, resume))),
+    let pending = SNAPSHOT_PAUSE.scope(
+        RefCell::new(Some((Boundary::AfterIntents, observed, resume))),
         audit_cold_sources(
             &pool,
             scope(tenant),

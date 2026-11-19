@@ -174,6 +174,9 @@ async fn traverse(
     sink: &mut impl ColdSourceSink,
     stage: &mut Stage,
 ) -> Result<ColdSourceReceipt, ColdAuditRefusal> {
+    #[cfg(test)]
+    tests::pause_at(tests::Boundary::BeforeAcquire).await;
+
     let connection = pool.acquire().await.map_err(db(Stage::Acquire))?;
     let mut owned = LedgerConnection::new(connection);
     *stage = Stage::Setup;
@@ -232,7 +235,7 @@ async fn traverse(
     }
 
     #[cfg(test)]
-    tests::after_intents().await;
+    tests::pause_at(tests::Boundary::AfterIntents).await;
 
     *stage = Stage::Page(Family::Attempts);
     let mut attempts = Walk::new(Family::Attempts, budget.attempts);
@@ -255,6 +258,9 @@ async fn traverse(
             break;
         }
     }
+
+    #[cfg(test)]
+    tests::pause_at(tests::Boundary::AfterAttempts).await;
 
     *stage = Stage::Page(Family::Orders);
     let mut orders = Walk::new(Family::Orders, budget.orders);
@@ -282,6 +288,9 @@ async fn traverse(
         }
     }
 
+    #[cfg(test)]
+    tests::pause_at(tests::Boundary::AfterOrders).await;
+
     *stage = Stage::Page(Family::Routes);
     let mut routes = Walk::new(Family::Routes, budget.routes);
     loop {
@@ -305,6 +314,9 @@ async fn traverse(
             break;
         }
     }
+
+    #[cfg(test)]
+    tests::pause_at(tests::Boundary::AfterRoutes).await;
 
     *stage = Stage::Commit;
     tx.commit().await.map_err(db(Stage::Commit))?;
