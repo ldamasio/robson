@@ -1,7 +1,8 @@
 //! Owned migration adapter. Only the private embedded38 contract selects the
 //! bounded path; tests may override it with a private synthetic fixture. The
-//! exact embedded39 migration takes a second, delegated bounded path; any
-//! other version-39 source is refused outside this crate's tests.
+//! exact embedded39 and embedded40 migrations use a delegated bounded path.
+//! Other version-39 sources are refused outside this crate's tests, and every
+//! other version-40 source is refused.
 use std::{future::Future, pin::Pin, time::Duration};
 
 use sqlx::{
@@ -22,6 +23,7 @@ mod tests;
 type MigrationFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, MigrateError>> + Send + 'a>>;
 const VERSION: i64 = 20240101000038;
 const VERSION39: i64 = 20240101000039;
+const VERSION40: i64 = 20240101000040;
 const APPLY_BOUND: Duration = Duration::from_millis(200);
 const ACQUIRE_BOUND: Duration = Duration::from_secs(5);
 
@@ -224,7 +226,20 @@ impl BoundedMigration {
     /// the single original statement, metadata INSERT, COMMIT, elapsed UPDATE)
     /// runs unchanged on this same owned session between install and restore.
     async fn apply39(&mut self, migration: &Migration) -> Result<Duration, MigrateError> {
-        let preflight = preflight39(migration);
+        self.apply_delegated(
+            migration,
+            preflight39(migration),
+            "migration39 whole-apply deadline exceeded",
+        )
+        .await
+    }
+
+    async fn apply_delegated(
+        &mut self,
+        migration: &Migration,
+        preflight: Result<(), MigrateError>,
+        deadline_error: &'static str,
+    ) -> Result<Duration, MigrateError> {
         let mut owned = self.take()?;
         preflight?;
         let result = timeout(APPLY_BOUND, async {
@@ -252,7 +267,7 @@ impl BoundedMigration {
             Ok::<_, MigrateError>(elapsed)
         })
         .await
-        .map_err(|_| refusal("migration39 whole-apply deadline exceeded"))??;
+        .map_err(|_| refusal(deadline_error))??;
         self.connection = Some(owned.finish());
         Ok(result)
     }
@@ -260,6 +275,10 @@ impl BoundedMigration {
 
 fn contract39() -> Option<&'static Migration> {
     crate::MIGRATOR.iter().find(|migration| migration.version == VERSION39)
+}
+
+fn contract40() -> Option<&'static Migration> {
+    crate::MIGRATOR.iter().find(|migration| migration.version == VERSION40)
 }
 
 /// Only this crate's tests may route a non-embedded version-39 source (the
@@ -285,15 +304,17 @@ fn route39(
 /// Only the exact embedded39 identity selects the bounded39 path. The
 /// production runner passes exactly that inventory.
 fn selects39(migration: &Migration, expected: Option<&Migration>) -> bool {
-    expected.is_some_and(|expected| {
-        migration.version == VERSION39
-            && expected.version == VERSION39
-            && migration.description == expected.description
-            && migration.sql == expected.sql
-            && migration.checksum == expected.checksum
-            && migration.migration_type == expected.migration_type
-            && migration.no_tx == expected.no_tx
-    })
+    migration.version == VERSION39
+        && expected.is_some_and(|expected| matches_embedded(migration, expected))
+}
+
+fn matches_embedded(migration: &Migration, expected: &Migration) -> bool {
+    migration.version == expected.version
+        && migration.description == expected.description
+        && migration.sql == expected.sql
+        && migration.checksum == expected.checksum
+        && migration.migration_type == expected.migration_type
+        && migration.no_tx == expected.no_tx
 }
 
 /// PG12 has no per-command statement timer inside a multi-command simple
@@ -316,6 +337,23 @@ fn preflight39(migration: &Migration) -> Result<(), MigrateError> {
         .sum();
     if !sql.ends_with(';') || semicolons != 1 {
         return Err(refusal("migration39 must be one top-level statement"));
+    }
+    Ok(())
+}
+
+fn preflight40(migration: &Migration) -> Result<(), MigrateError> {
+    if migration.no_tx || migration.migration_type != MigrationType::Simple {
+        return Err(refusal("migration40 must run inside one SQLx transaction"));
+    }
+    // The first matching dollar delimiter ends the PostgreSQL DO body. No
+    // SQL or comments may precede or follow the canonical wrapper.
+    let body = migration
+        .sql
+        .trim_end()
+        .strip_prefix("DO $migration40$\n")
+        .and_then(|sql| sql.strip_suffix("\n$migration40$;"));
+    if body.is_none_or(|body| body.is_empty() || body.contains("$migration40$")) {
+        return Err(refusal("migration40 must be one top-level DO statement"));
     }
     Ok(())
 }
@@ -374,6 +412,16 @@ impl Migrate for BoundedMigration {
         Box::pin(async move {
             if migration.version == VERSION {
                 self.apply38(migration).await
+            } else if migration.version == VERSION40 {
+                if !contract40().is_some_and(|expected| matches_embedded(migration, expected)) {
+                    return Err(refusal("migration40 contract mismatch"));
+                }
+                self.apply_delegated(
+                    migration,
+                    preflight40(migration),
+                    "migration40 whole-apply deadline exceeded",
+                )
+                .await
             } else if route39(migration, contract39(), ORDINARY39)? {
                 self.apply39(migration).await
             } else {
