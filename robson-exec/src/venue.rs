@@ -519,6 +519,16 @@ pub enum OrderPhase {
     Unknown,
 }
 
+/// Binance Spot lifecycle classification from the exact venue status.
+/// Unrecognized statuses (including `PENDING_CANCEL`) remain unknown.
+pub fn binance_spot_order_phase(status: &str) -> OrderPhase {
+    match status {
+        "NEW" | "PARTIALLY_FILLED" | "PENDING_NEW" => OrderPhase::Live,
+        "FILLED" | "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" | "REJECTED" => OrderPhase::Terminal,
+        _ => OrderPhase::Unknown,
+    }
+}
+
 /// The venue's own record of one order, as one answer gave it (ADR-0056 step
 /// 8, design §3.6): what a balance account's evidence rests on. Quantities are
 /// the venue's; nothing here is derived from fills or fees.
@@ -1308,6 +1318,25 @@ mod replace_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binance_spot_phase_uses_the_exact_status() {
+        for status in ["NEW", "PARTIALLY_FILLED", "PENDING_NEW"] {
+            assert_eq!(binance_spot_order_phase(status), OrderPhase::Live);
+        }
+        for status in [
+            "FILLED",
+            "CANCELED",
+            "EXPIRED",
+            "EXPIRED_IN_MATCH",
+            "REJECTED",
+        ] {
+            assert_eq!(binance_spot_order_phase(status), OrderPhase::Terminal);
+        }
+        for status in ["PENDING_CANCEL", "not-recognized", "filled", "FILLED ", ""] {
+            assert_eq!(binance_spot_order_phase(status), OrderPhase::Unknown);
+        }
+    }
 
     const RULE: VenueFinalityRule = VenueFinalityRule::EveryAttemptRejected;
 
