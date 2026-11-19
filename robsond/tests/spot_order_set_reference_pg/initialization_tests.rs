@@ -54,6 +54,88 @@ struct CandidateOrderSet {
     target_cancel_terminal: Option<bool>,
 }
 
+fn candidate_statement() -> String {
+    statement(
+        &format!("{ORDER_SET_COLUMNS}, {}", ready::CANDIDATE_COLUMNS),
+        ready::CANDIDATE_JOINS,
+    )
+}
+
+#[derive(sqlx::FromRow)]
+struct Explain {
+    #[sqlx(rename = "QUERY PLAN")]
+    plan: serde_json::Value,
+}
+
+fn relation_nodes<'a>(node: &'a serde_json::Value, name: &str, out: &mut Vec<&'a serde_json::Value>) {
+    if node["Relation Name"] == name {
+        out.push(node);
+    }
+    if let Some(children) = node["Plans"].as_array() {
+        for child in children {
+            relation_nodes(child, name, out);
+        }
+    }
+}
+
+async fn measure_candidate_read(
+    pool: &PgPool,
+    actor: &PgPool,
+    proxy: &DbProxy,
+    ready: &ProjectionReady,
+    scope: Scope,
+    history: i64,
+) -> anyhow::Result<()> {
+    // Default PostgreSQL plans, measured after collecting real fixture statistics.
+    sqlx::raw_sql(
+        "ANALYZE venue_orders, order_intents, sell_shadow_orders, cancel_shadow_groups",
+    )
+    .execute(pool)
+    .await?;
+    let sql = candidate_statement();
+    let explain = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}");
+    for (candidate, present) in [("1000", true), ("99000001", false)] {
+        let before = proxy.stats().statements;
+        let read: CandidateOrderSet = ready
+            .query_as(&sql, keys(scope), Some(candidate))
+            .fetch_one(actor)
+            .await?;
+        ensure!(proxy.stats().statements - before == 1);
+        ensure!(proxy.query_trace().last() == Some(&sql));
+        ensure!(read.set.facts.stop_id.as_deref() == present.then_some(candidate));
+        ensure!(read.target_cancel_terminal == present.then_some(true));
+
+        // EXPLAIN executes independently of the application wire measurement.
+        let physical: Explain = ready
+            .query_as(&explain, keys(scope), Some(candidate))
+            .fetch_one(pool)
+            .await?;
+        let plan = &physical.plan[0]["Plan"];
+        ensure!(plan["Actual Rows"].as_u64() == Some(1));
+        for relation in ["venue_orders", "order_intents", "sell_shadow_orders", "cancel_shadow_groups"] {
+            let mut nodes = Vec::new();
+            relation_nodes(plan, relation, &mut nodes);
+            ensure!(nodes.len() == 1, "expected one {relation} probe: {plan}");
+            let node = nodes[0];
+            let loops = node["Actual Loops"].as_u64().context("native probe loops")?;
+            let rows = node["Actual Rows"].as_u64().context("native probe rows")?;
+            ensure!(loops <= 1 && rows <= 1, "{relation}: {node}");
+            if history >= 512 && loops != 0 {
+                ensure!(node["Index Cond"].is_string(), "expected indexed {relation}: {node}");
+                ensure!(node["Rows Removed by Filter"].as_u64().unwrap_or(0) == 0, "{node}");
+                ensure!(node["Rows Removed by Index Recheck"].as_u64().unwrap_or(0) == 0, "{node}");
+            }
+        }
+        for relation in ["cancel_shadow_members", "sell_shadow_intents", "submit_attempts"] {
+            let mut nodes = Vec::new();
+            relation_nodes(plan, relation, &mut nodes);
+            ensure!(nodes.is_empty(), "unexpected historical {relation} read: {plan}");
+        }
+        eprintln!("SPOT_INIT_CANDIDATE_WORK history={history} present={present} wire=1 plan={}", physical.plan);
+    }
+    Ok(())
+}
+
 fn keys(s: Scope) -> Keys<'static> {
     Keys {
         tenant: s.tenant,
@@ -369,10 +451,7 @@ async fn fenced_initialization_replays_existing_journal_and_venue_state(
     let decoy = ready.read(&pool, s, Some("101")).await?.context("non-stop candidate")?;
     ensure!(decoy.facts.stop_id.as_deref() == Some("101") && !decoy.facts.exact_stop_identity);
 
-    let sql = statement(
-        &format!("{ORDER_SET_COLUMNS}, {}", ready::CANDIDATE_COLUMNS),
-        ready::CANDIDATE_JOINS,
-    );
+    let sql = candidate_statement();
     let (proxy, measured) = through_proxy_limit(&pool, 1).await;
     let before = proxy.stats().statements;
     let own: CandidateOrderSet = ready
@@ -544,6 +623,10 @@ async fn generated_history(
         PgJournalBackend::new(pool, second.tenant),
     ];
     seed_history(&fixtures[0], &journals[0], first, history).await;
+    for target in 1001..1000 + history {
+        journal_commit(&journals[0], &batch(first, IntentKind::Cancel, Some(&target.to_string())))
+            .await?;
+    }
     for _ in 0..cancels {
         journal_commit(&journals[0], &batch(first, IntentKind::Cancel, Some("1000"))).await?;
     }
@@ -633,6 +716,12 @@ async fn generated_history(
     let read_start = proxy.stats().statements;
     ensure!(ready.read(&actor, second, None).await?.is_some());
     ensure!(proxy.stats().statements - read_start == 1);
+    let groups: i64 = sqlx::query_scalar("SELECT count(*) FROM cancel_shadow_groups WHERE tenant_id=$1")
+        .bind(first.tenant)
+        .fetch_one(pool)
+        .await?;
+    ensure!(groups >= history, "fixture must seed distinct historical cancel groups");
+    measure_candidate_read(pool, &actor, &proxy, &ready, first, history).await?;
     actor.close().await;
     ensure!(
         sqlx::query_scalar::<_, bool>(
