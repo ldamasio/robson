@@ -9,7 +9,7 @@ use proptest::{
 };
 use robson_exec::{
     venue::OrderPhase,
-    venue_ledger::{LedgerError, OrderKey},
+    venue_ledger::{LedgerError, OrderKey, OrderOwner},
 };
 use robson_testkit::db_proxy::ProxyMode;
 use rust_decimal::Decimal;
@@ -22,7 +22,7 @@ use crate::{process_epoch, spot_order_set_store::JournalGeneration};
 #[allow(dead_code)]
 #[path = "support.rs"]
 mod support;
-use support::{at, page, snapshot, through_proxy, Fixture, SYMBOL};
+use support::{at, page, seen, snapshot, through_proxy, Fixture, SYMBOL};
 
 async fn migrate(pool: &PgPool) -> Result<()> {
     let options = pool.connect_options();
@@ -32,7 +32,17 @@ async fn migrate(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-async fn generation(pool: &PgPool, fixture: &Fixture, version: i64) -> Result<JournalGeneration> {
+async fn generation(pool: &PgPool, fixture: &Fixture) -> Result<(JournalGeneration, i64)> {
+    let native = fixture.ledger(pool);
+    let other = native
+        .record_order(
+            &fixture.record(2, Decimal::ZERO, OrderPhase::Live),
+            &fixture.link(2, OrderOwner::Discovered),
+            seen(),
+        )
+        .await?;
+    ensure!(other.changed);
+    let version = fixture.version(pool).await;
     let start =
         process_epoch::start_epoch(pool, fixture.tenant, "projected-trades-fixture").await?;
     let binding = JournalGeneration {
@@ -50,20 +60,28 @@ async fn generation(pool: &PgPool, fixture: &Fixture, version: i64) -> Result<Jo
     .bind(binding.tenant_id).bind(&binding.account_scope).bind(binding.generation_id)
     .bind(binding.process_epoch).bind(binding.source_audit_id).bind(version)
     .execute(pool).await?;
-    // The fixture's live SELL is leg-owned but has no matching J row.
-    sqlx::query(
-        "INSERT INTO spot_order_set_sell_legs
-            (tenant_id,venue_id,account_scope,generation_id,symbol,position_id,potential_count,conflict_count)
-         VALUES ($1,'binance:spot',$2,$3,$4,$5,1,1)",
-    )
-    .bind(binding.tenant_id).bind(&binding.account_scope).bind(binding.generation_id)
-    .bind(SYMBOL).bind(fixture.position).execute(pool).await?;
-    Ok(binding)
+    // A leg-owned live SELL without J, a discovered SELL by symbol, an
+    // unresolved unbound SELL, and all three native cancel scope shapes.
+    sqlx::query(include_str!("projected_seed.sql"))
+        .bind(binding.tenant_id)
+        .bind(&binding.account_scope)
+        .bind(binding.generation_id)
+        .bind(fixture.position)
+        .bind(SYMBOL)
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .execute(pool)
+        .await?;
+    Ok((binding, version))
 }
 
 async fn membership(pool: &PgPool) -> Result<Vec<String>> {
     let mut result = Vec::new();
     for table in [
+        "spot_order_set_sell_intents",
+        "spot_order_set_sell_orders",
         "spot_order_set_sell_legs",
         "spot_order_set_sell_symbols",
         "spot_order_set_sell_unbound",
@@ -78,6 +96,7 @@ async fn membership(pool: &PgPool) -> Result<Vec<String>> {
         ))
         .fetch_all(pool)
         .await?;
+        ensure!(!values.is_empty(), "missing fixture evidence in {table}");
         result.extend(values.into_iter().map(|value| format!("{table}/{value}")));
     }
     Ok(result)
@@ -113,8 +132,7 @@ async fn projected_trade_peer_cases_keep_atomic_versions_and_membership(
     migrate(&pool).await?;
     let f = Fixture::new(&pool).await;
     let key = f.seed_order(&pool, 1, Decimal::ZERO, OrderPhase::Live).await;
-    let version = f.version(&pool).await;
-    let binding = generation(&pool, &f, version).await?;
+    let (binding, version) = generation(&pool, &f).await?;
     let mut committed = 0;
     let original_members = membership(&pool).await?;
     let mut runner = TestRunner::new(Config {
@@ -127,6 +145,10 @@ async fn projected_trade_peer_cases_keep_atomic_versions_and_membership(
     for case in 0..24 {
         let (a_wait, b_wait, duplicate) =
             schedules.new_tree(&mut runner).expect("bounded schedule").current();
+        ensure!(
+            observe(&pool, &f, &key).await?
+                == (version + committed, committed, Decimal::from(committed))
+        );
         let a = 2 * case + 1;
         let b = a + u64::from(!duplicate);
         let writer = |id, delay| {
@@ -174,8 +196,7 @@ async fn projected_trade_refused_generation_rolls_back_fills_and_ledger(
     migrate(&pool).await?;
     let f = Fixture::new(&pool).await;
     let key = f.seed_order(&pool, 1, Decimal::ZERO, OrderPhase::Live).await;
-    let version = f.version(&pool).await;
-    let binding = generation(&pool, &f, version).await?;
+    let (binding, version) = generation(&pool, &f).await?;
     let original_members = membership(&pool).await?;
     let before = snapshot(&pool).await;
     let foreign = f.ledger(&pool).with_trade_order_set_projection(JournalGeneration {
@@ -187,6 +208,20 @@ async fn projected_trade_refused_generation_rolls_back_fills_and_ledger(
         Err(LedgerError::Invariant(reason)) if reason.contains("scope mismatch")
     ));
     ensure!(foreign.statements_total() == 0);
+    sqlx::raw_sql(
+        "CREATE FUNCTION trade_probe_hold_leg() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN PERFORM pg_advisory_xact_lock(719353); RETURN NEW; END $$;
+         CREATE TRIGGER trade_probe_hold_leg AFTER UPDATE OF consumed_cum ON balance_legs
+         FOR EACH ROW EXECUTE FUNCTION trade_probe_hold_leg()",
+    )
+    .execute(&pool)
+    .await?;
+    let mut runner = TestRunner::new(Config {
+        rng_seed: RngSeed::Fixed(0x518c9730),
+        failure_persistence: None,
+        ..Config::default()
+    });
+    let schedule = (0_u64..=2500, 0_u64..=2500, proptest::bool::ANY);
     for remove_row in [false, true] {
         if remove_row {
             sqlx::query("DELETE FROM spot_order_set_generation WHERE generation_id=$1")
@@ -197,15 +232,79 @@ async fn projected_trade_refused_generation_rolls_back_fills_and_ledger(
             sqlx::query("UPDATE spot_order_set_generation SET accounting_version=accounting_version-1 WHERE generation_id=$1")
                 .bind(binding.generation_id).execute(&pool).await?;
         }
-        let ledger = f.ledger(&pool).with_trade_order_set_projection(binding.clone());
-        ensure!(matches!(
-            ledger.record_trades(&key, &page(1, Decimal::ONE), at()).await,
-            Err(LedgerError::Invariant(reason)) if reason.contains("generation refused")
-        ));
-        ensure!(ledger.statements_total() == 10, "fixture never reached the exact CAS");
-        ensure!(snapshot(&pool).await == before);
-        ensure!(membership(&pool).await? == original_members);
+        let expected = (!remove_row).then_some(version - 1);
+        let inspect =
+            async || -> Result<()> {
+                let generation_version: Option<i64> = sqlx::query_scalar(
+                "SELECT accounting_version FROM spot_order_set_generation WHERE generation_id=$1",
+            )
+            .bind(binding.generation_id).fetch_optional(&pool).await?;
+                ensure!(generation_version == expected);
+                ensure!(snapshot(&pool).await == before);
+                ensure!(membership(&pool).await? == original_members);
+                Ok(())
+            };
+        for case in 0..8 {
+            let (a_delay, b_delay, duplicate) =
+                schedule.new_tree(&mut runner).expect("bounded schedule").current();
+            inspect().await?;
+            let mut guard = pool.acquire().await?;
+            sqlx::query("SELECT pg_advisory_lock(719353)").execute(&mut *guard).await?;
+            let a = f.ledger(&pool).with_trade_order_set_projection(binding.clone());
+            let b = f.ledger(&pool).with_trade_order_set_projection(binding.clone());
+            let writer = |ledger: super::PgVenueLedger, id, delay| {
+                let key = &key;
+                async move {
+                    tokio::time::sleep(Duration::from_micros(delay)).await;
+                    let outcome = ledger.record_trades(key, &page(id, Decimal::ONE), at()).await;
+                    (outcome, ledger.statements_total())
+                }
+            };
+            let witness = async {
+                tokio::time::timeout(Duration::from_millis(200), async {
+                    loop {
+                        let blocked: bool = sqlx::query_scalar(
+                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                              WHERE datname=current_database() AND pid<>pg_backend_pid()
+                                AND query LIKE 'UPDATE balance_legs SET consumed_cum%'
+                                AND wait_event='advisory')",
+                        )
+                        .fetch_one(&pool)
+                        .await?;
+                        if blocked {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(3)).await;
+                    }
+                    Ok::<_, sqlx::Error>(())
+                })
+                .await??;
+                // At least one transaction already inserted a fill and
+                // updated its order and leg while the observer sees the prior state.
+                let seen = inspect().await;
+                let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(719353)")
+                    .fetch_one(&mut *guard)
+                    .await?;
+                ensure!(unlocked);
+                seen
+            };
+            let (left, right, seen) = tokio::join!(
+                writer(a, 2 * case + 1, a_delay),
+                writer(b, 2 * case + 1 + u64::from(!duplicate), b_delay),
+                witness,
+            );
+            seen?;
+            for (result, statements) in [left, right] {
+                ensure!(matches!(
+                    result,
+                    Err(LedgerError::Invariant(reason)) if reason.contains("generation refused")
+                ));
+                ensure!(statements == 10, "fixture never reached the exact CAS");
+            }
+            inspect().await?;
+        }
     }
+    eprintln!("Projected trade refusal: 16 seeded native concurrent cases held before CAS, with witnessed old snapshots");
     Ok(())
 }
 
@@ -215,8 +314,7 @@ async fn projected_trade_duplicate_replans_after_real_accounting_lock(pool: PgPo
     migrate(&pool).await?;
     let f = Fixture::new(&pool).await;
     let key = f.seed_order(&pool, 1, Decimal::ZERO, OrderPhase::Live).await;
-    let version = f.version(&pool).await;
-    let binding = generation(&pool, &f, version).await?;
+    let (binding, version) = generation(&pool, &f).await?;
     let original_members = membership(&pool).await?;
     let mut barrier = pool.begin().await?;
     sqlx::query("SELECT version FROM accounting_state WHERE tenant_id=$1 AND venue_id='binance:spot' FOR NO KEY UPDATE")
@@ -274,8 +372,7 @@ async fn projected_trade_lost_commit_requires_retirement_then_observes_accepted_
     migrate(&pool).await?;
     let f = Fixture::new(&pool).await;
     let key = f.seed_order(&pool, 1, Decimal::ZERO, OrderPhase::Live).await;
-    let version = f.version(&pool).await;
-    let binding = generation(&pool, &f, version).await?;
+    let (binding, version) = generation(&pool, &f).await?;
     let original_members = membership(&pool).await?;
     let (proxy, proxied) = through_proxy(&pool, 1).await;
     let (pid, birth): (i32, String) = sqlx::query_as(
