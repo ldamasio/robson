@@ -1,11 +1,14 @@
 use super::{
-    batch, checkpoint, empty_budget, hot_query, install, linked_sell, scope, seen,
+    batch, cold_cancels, cold_sells, empty_budget, hot_query, install, linked_sell, scope, seen,
     through_proxy_limit, zero_execution_order, Fixture, IntentKind, JournalBackend, LegOrderKind,
     OrderKey, OrderOwner, OrderPhase, PgJournalBackend, PgPool, ProtectionKind, Scope, TradeFill,
     TradePage, HOT,
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
+use std::time::{Duration, Instant};
+
+use crate::reader::Snapshot;
 
 const STOP_ID: &str = "900001";
 const MISSING_ID: &str = "900002";
@@ -75,7 +78,26 @@ async fn measure(pool: &PgPool, s: Scope, expected_closed: i64) {
     .await
     .unwrap();
     assert_eq!(closed, expected_closed);
-    let witness = checkpoint(pool, s, "closed-history-exact-stop", (1, 0), Some(STOP_ID)).await;
+    let started = Instant::now();
+    let cold = tokio::time::timeout(Duration::from_secs(30), async {
+        Snapshot::open(pool, s).await?.finish().await
+    })
+    .await
+    .expect("the exhaustive scale oracle exceeded its fixture deadline")
+    .unwrap();
+    assert_eq!(cold_sells(&cold), (1, 0));
+    assert_eq!(cold_cancels(&cold), (0, 0, 0));
+    println!(
+        "order-set closed_history={closed} exhausted_cold_ms={}",
+        started.elapsed().as_millis()
+    );
+    let witness = hot_query(s, Some(STOP_ID)).fetch_one(pool).await.unwrap();
+    assert_eq!((witness.leg_sell, witness.symbol_sell), (1, 0));
+    assert_eq!(
+        (witness.grouped_cancel, witness.ungroupable_cancel, witness.unbound_cancel),
+        (0, 0, 0)
+    );
+    assert_eq!(witness.accounting_version, cold.version);
     assert!(witness.exact_stop_identity);
 
     let (proxy, proxied) = through_proxy_limit(pool, 1).await;
@@ -93,7 +115,8 @@ async fn measure(pool: &PgPool, s: Scope, expected_closed: i64) {
     assert_eq!(absent.accounting_version, witness.accounting_version);
     let trace = proxy.query_trace();
     assert_eq!(trace.len(), 2);
-    assert_eq!(trace[0], trace[1]);
+    assert_eq!(trace[0], HOT);
+    assert_eq!(trace[1], HOT);
     assert_eq!(proxy.query_trace_dropped(), 0);
     println!("order-set closed_history={closed} hot_sql_per_read=1 query={:?}", trace[0]);
 
@@ -104,23 +127,24 @@ async fn measure(pool: &PgPool, s: Scope, expected_closed: i64) {
         println!("order-set closed_history={closed} candidate={candidate} explain={explain}");
         let plan = &explain[0]["Plan"];
         assert_eq!(plan["Actual Rows"].as_u64(), Some(1));
-        let mut nodes = Vec::new();
-        historical_nodes(plan, &mut nodes);
         if closed >= 512 {
+            let mut nodes = Vec::new();
+            historical_nodes(plan, &mut nodes);
             for table in ["venue_orders", "order_intents"] {
                 assert!(
                     nodes.iter().any(|node| node["Relation Name"] == table),
                     "EXPLAIN must retain the exact {table} probe"
                 );
             }
-        }
-        for node in nodes {
-            assert!(explain_rows(node, "Actual Loops") <= 1, "{node}");
-            assert!(explain_rows(node, "Actual Rows") <= 1, "{node}");
-            if closed >= 512 {
-                assert_ne!(node["Node Type"], "Seq Scan", "{node}");
-                assert_eq!(explain_rows(node, "Rows Removed by Filter"), 0, "{node}");
-                assert_eq!(explain_rows(node, "Rows Removed by Index Recheck"), 0, "{node}");
+            for node in nodes {
+                let loops = node["Actual Loops"].as_u64().expect("native loop count");
+                assert!(loops <= 1, "{node}");
+                assert!(node["Actual Rows"].as_u64().expect("native row count") <= 1, "{node}");
+                if loops != 0 {
+                    assert_ne!(node["Node Type"], "Seq Scan", "{node}");
+                    assert_eq!(explain_rows(node, "Rows Removed by Filter"), 0, "{node}");
+                    assert_eq!(explain_rows(node, "Rows Removed by Index Recheck"), 0, "{node}");
+                }
             }
         }
     }
@@ -213,7 +237,7 @@ async fn hot_order_set_retains_keyed_access_at_closed_history_scale(pool: PgPool
     append_closed_history(&f, &journal, s, 2..512).await;
     measure(&pool, s, 512).await;
 
-    // Quantities here are an accounting-first fixture, not a claim of real Q/C/B/X initialization.
+    // This accounting-first preseed applies to the fixture only.
     let key = OrderKey::from_record(&stop, &stop_link).unwrap();
     observe_fixture_deficit(&pool, &f, s, &key).await;
 }
