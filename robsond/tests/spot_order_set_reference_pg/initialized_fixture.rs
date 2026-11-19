@@ -38,6 +38,19 @@ pub(super) const ORDER_SET_COLUMNS: &str = "hot.*,
     coalesce(u.potential_sell, 0::bigint) AS unbound_sell,
     coalesce(u.conflict_count, 0::bigint) AS unbound_sell_conflicts";
 
+/// The R1/R3 candidate's own SELL membership and target cancel group, each by
+/// its full primary key. A null `$6` matches neither; aggregates stay as-is.
+pub(super) const CANDIDATE_COLUMNS: &str = "m.scope_kind AS candidate_scope,
+    m.scope_position AS candidate_position, m.potential AS candidate_potential,
+    m.conflict AS candidate_conflict, cg.pending_count AS target_cancel_pending,
+    cg.conflict_count AS target_cancel_conflicts, cg.terminal_mask AS target_cancel_terminal";
+pub(super) const CANDIDATE_JOINS: &str = "LEFT JOIN sell_shadow_orders m
+           ON (m.tenant_id,m.venue_id,m.account_scope,m.symbol,m.exchange_order_id)
+            = ($1,$2,$3,$5,$6::text)
+         LEFT JOIN cancel_shadow_groups cg
+           ON (cg.tenant_id,cg.venue_id,cg.account_scope,cg.symbol,cg.position_id,cg.target_id)
+            = ($1,$2,$3,$5,$4,$6::text)";
+
 /// The one exact initialized read. `$1..$6` are the bounded order-set keys,
 /// `$7..$9` the generation, database and revision. The two aggregate
 /// namespaces and generation come from exact keys; a missing generation

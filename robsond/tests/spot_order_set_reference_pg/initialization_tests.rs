@@ -40,6 +40,20 @@ struct InitializedOrderSet {
     unbound_sell_conflicts: i64,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct CandidateOrderSet {
+    #[sqlx(flatten)]
+    set: InitializedOrderSet,
+    base_commission_final: bool,
+    candidate_scope: Option<String>,
+    candidate_position: Option<Uuid>,
+    candidate_potential: Option<bool>,
+    candidate_conflict: Option<bool>,
+    target_cancel_pending: Option<i64>,
+    target_cancel_conflicts: Option<i64>,
+    target_cancel_terminal: Option<bool>,
+}
+
 fn keys(s: Scope) -> Keys<'static> {
     Keys {
         tenant: s.tenant,
@@ -354,6 +368,49 @@ async fn fenced_initialization_replays_existing_journal_and_venue_state(
     );
     let decoy = ready.read(&pool, s, Some("101")).await?.context("non-stop candidate")?;
     ensure!(decoy.facts.stop_id.as_deref() == Some("101") && !decoy.facts.exact_stop_identity);
+
+    let sql = statement(
+        &format!("{ORDER_SET_COLUMNS}, {}", ready::CANDIDATE_COLUMNS),
+        ready::CANDIDATE_JOINS,
+    );
+    let (proxy, measured) = through_proxy_limit(&pool, 1).await;
+    let before = proxy.stats().statements;
+    let own: CandidateOrderSet = ready
+        .query_as(&sql, keys(s), Some("103"))
+        .fetch_optional(&measured)
+        .await?
+        .context("exact candidate membership")?;
+    ensure!(proxy.stats().statements - before == 1, "one keyed candidate read");
+    measured.close().await;
+    let recorded_fee_final: bool =
+        sqlx::query_scalar("SELECT base_commission_final FROM balance_legs WHERE position_id=$1")
+            .bind(s.position)
+            .fetch_one(&pool)
+            .await?;
+    ensure!(
+        own.set.facts.exact_stop_identity
+            && own.base_commission_final == recorded_fee_final
+            && own.candidate_scope.as_deref() == Some("leg")
+            && own.candidate_position == Some(s.position)
+            && own.candidate_potential == Some(true)
+            && own.candidate_conflict == Some(false)
+            && own.target_cancel_pending.is_none()
+            && own.target_cancel_conflicts.is_none()
+            && own.target_cancel_terminal.is_none(),
+        "own live stop is exactly one nonconflicting leg member with no target cancel"
+    );
+    journal_commit(&journal, &batch(s, IntentKind::Cancel, Some("103"))).await?;
+    let cancelled: CandidateOrderSet = ready
+        .query_as(&sql, keys(s), Some("103"))
+        .fetch_optional(&pool)
+        .await?
+        .context("candidate under a target cancel")?;
+    ensure!(
+        cancelled.target_cancel_pending.is_some_and(|pending| pending > 0)
+            && cancelled.target_cancel_conflicts == Some(0)
+            && cancelled.target_cancel_terminal == Some(false),
+        "an outstanding target cancel is visible on the candidate's own key"
+    );
     Ok(())
 }
 

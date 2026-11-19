@@ -2,7 +2,7 @@
 -- Test fixtures are initialized before enabled writes. An empty summary here
 -- does not supply evidence of initialization or any runtime authority.
 SELECT l.position_id, a.version AS accounting_version,
-       l.gross_qty, l.acquisition_cost, l.base_commission, l.executable_qty,
+       l.gross_qty, l.acquisition_cost, l.base_commission, l.base_commission_final, l.executable_qty,
        l.consumed_cum, l.target_trigger,
        coalesce(sl.potential_sell, 0::bigint) AS leg_sell,
        coalesce(sl.conflict_count, 0::bigint) AS leg_sell_conflicts,
