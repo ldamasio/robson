@@ -9,16 +9,20 @@
        AND NOT EXISTS (SELECT 1 FROM sell_intent_plan WHERE NOT ok)
        AND NOT EXISTS (SELECT 1 FROM cancel_member_plan WHERE NOT ok)
        AND NOT EXISTS (SELECT 1 FROM cancel_group_plan WHERE NOT ok)
-       AND NOT EXISTS (SELECT 1 FROM sell_aggregates WHERE potential_next < 0 OR conflict_next < 0)
-       AND NOT EXISTS (SELECT 1 FROM cancel_aggregates WHERE active_next < 0 OR conflict_next < 0)
+       AND NOT EXISTS (
+           SELECT 1 FROM sell_aggregates WHERE prior_potential < required_potential
+                OR prior_conflict < required_conflict OR potential_next < 0 OR conflict_next < 0)
+       AND NOT EXISTS (
+           SELECT 1 FROM cancel_aggregates WHERE prior_active < required_active
+                OR prior_conflict < required_conflict OR active_next < 0 OR conflict_next < 0)
        AS ok
 ), planned AS MATERIALIZED (
     SELECT (SELECT count(*) FROM sell_order_plan WHERE touch)
          + (SELECT count(*) FROM sell_intent_plan WHERE touch)
          + (SELECT count(*) FROM cancel_member_plan WHERE touch)
          + (SELECT count(*) FROM cancel_group_plan WHERE touch)
-         + (SELECT count(*) FROM sell_aggregates)
-         + (SELECT count(*) FROM cancel_aggregates) AS planned_rows
+         + (SELECT count(*) FROM sell_aggregates WHERE touch)
+         + (SELECT count(*) FROM cancel_aggregates WHERE touch) AS planned_rows
 ), sell_order_update AS (
     UPDATE public.spot_order_set_sell_orders m
     SET scope_kind = p.n_kind, scope_symbol = p.n_symbol, scope_position = p.n_position,
@@ -71,16 +75,6 @@
       AND (m.symbol, m.position_id, m.target_id, m.pending, m.conflict)
           IS NOT DISTINCT FROM (p.s_symbol, p.s_position, p.s_target, p.s_pending, p.s_conflict)
     RETURNING 1
-), cancel_member_insert AS (
-    INSERT INTO public.spot_order_set_cancel_members (
-        tenant_id, venue_id, account_scope, generation_id, intent_id, symbol, position_id,
-        target_id, pending, conflict
-    )
-    SELECT p.tenant_id, p.venue_id, p.account_scope, p.generation_id, p.intent_id, p.symbol,
-           p.position_id, p.target_id, true, true
-    FROM cancel_member_plan p, verdict v
-    WHERE v.ok AND p.touch AND NOT p.stored
-    RETURNING 1
 ), cancel_group_update AS (
     UPDATE public.spot_order_set_cancel_groups t
     SET pending_count = p.pending_next, conflict_count = p.conflict_next, terminal_mask = p.final_mask
@@ -105,7 +99,7 @@
     UPDATE public.spot_order_set_sell_legs t
     SET potential_count = p.potential_next, conflict_count = p.conflict_next
     FROM sell_aggregates p, verdict v
-    WHERE v.ok AND p.kind = 'leg' AND p.stored
+    WHERE v.ok AND p.touch AND p.kind = 'leg' AND p.stored
       AND (t.tenant_id, t.venue_id, t.account_scope, t.generation_id, t.symbol, t.position_id)
         = (p.tenant_id, p.venue_id, p.account_scope, p.generation_id, p.symbol, p.position_id)
       AND (t.potential_count, t.conflict_count) = (p.prior_potential, p.prior_conflict)
@@ -118,13 +112,13 @@
     SELECT p.tenant_id, p.venue_id, p.account_scope, p.generation_id, p.symbol, p.position_id,
            p.potential_next, p.conflict_next
     FROM sell_aggregates p, verdict v
-    WHERE v.ok AND p.kind = 'leg' AND NOT p.stored
+    WHERE v.ok AND p.touch AND p.kind = 'leg' AND NOT p.stored
     RETURNING 1
 ), sell_symbol_update AS (
     UPDATE public.spot_order_set_sell_symbols t
     SET potential_count = p.potential_next, conflict_count = p.conflict_next
     FROM sell_aggregates p, verdict v
-    WHERE v.ok AND p.kind = 'symbol' AND p.stored
+    WHERE v.ok AND p.touch AND p.kind = 'symbol' AND p.stored
       AND (t.tenant_id, t.venue_id, t.account_scope, t.generation_id, t.symbol)
         = (p.tenant_id, p.venue_id, p.account_scope, p.generation_id, p.symbol)
       AND (t.potential_count, t.conflict_count) = (p.prior_potential, p.prior_conflict)
@@ -136,13 +130,13 @@
     SELECT p.tenant_id, p.venue_id, p.account_scope, p.generation_id, p.symbol,
            p.potential_next, p.conflict_next
     FROM sell_aggregates p, verdict v
-    WHERE v.ok AND p.kind = 'symbol' AND NOT p.stored
+    WHERE v.ok AND p.touch AND p.kind = 'symbol' AND NOT p.stored
     RETURNING 1
 ), sell_unbound_update AS (
     UPDATE public.spot_order_set_sell_unbound t
     SET potential_count = p.potential_next, conflict_count = p.conflict_next
     FROM sell_aggregates p, verdict v
-    WHERE v.ok AND p.kind = 'unbound' AND p.stored
+    WHERE v.ok AND p.touch AND p.kind = 'unbound' AND p.stored
       AND (t.tenant_id, t.venue_id, t.account_scope, t.generation_id)
         = (p.tenant_id, p.venue_id, p.account_scope, p.generation_id)
       AND (t.potential_count, t.conflict_count) = (p.prior_potential, p.prior_conflict)
@@ -154,13 +148,13 @@
     SELECT p.tenant_id, p.venue_id, p.account_scope, p.generation_id,
            p.potential_next, p.conflict_next
     FROM sell_aggregates p, verdict v
-    WHERE v.ok AND p.kind = 'unbound' AND NOT p.stored
+    WHERE v.ok AND p.touch AND p.kind = 'unbound' AND NOT p.stored
     RETURNING 1
 ), cancel_leg_update AS (
     UPDATE public.spot_order_set_cancel_legs t
     SET active_count = p.active_next, conflict_count = p.conflict_next
     FROM cancel_aggregates p, verdict v
-    WHERE v.ok AND p.kind = 'leg' AND p.stored
+    WHERE v.ok AND p.touch AND p.kind = 'leg' AND p.stored
       AND (t.tenant_id, t.venue_id, t.account_scope, t.generation_id, t.symbol, t.position_id)
         = (p.tenant_id, p.venue_id, p.account_scope, p.generation_id, p.symbol, p.position_id)
       AND (t.active_count, t.conflict_count) = (p.prior_active, p.prior_conflict)
@@ -173,13 +167,13 @@
     SELECT p.tenant_id, p.venue_id, p.account_scope, p.generation_id, p.symbol, p.position_id,
            p.active_next, p.conflict_next
     FROM cancel_aggregates p, verdict v
-    WHERE v.ok AND p.kind = 'leg' AND NOT p.stored
+    WHERE v.ok AND p.touch AND p.kind = 'leg' AND NOT p.stored
     RETURNING 1
 ), cancel_ungroupable_update AS (
     UPDATE public.spot_order_set_cancel_ungroupable t
     SET active_count = p.active_next, conflict_count = p.conflict_next
     FROM cancel_aggregates p, verdict v
-    WHERE v.ok AND p.kind = 'ungroupable' AND p.stored
+    WHERE v.ok AND p.touch AND p.kind = 'ungroupable' AND p.stored
       AND (t.tenant_id, t.venue_id, t.account_scope, t.generation_id, t.symbol, t.position_id)
         = (p.tenant_id, p.venue_id, p.account_scope, p.generation_id, p.symbol, p.position_id)
       AND (t.active_count, t.conflict_count) = (p.prior_active, p.prior_conflict)
@@ -192,13 +186,13 @@
     SELECT p.tenant_id, p.venue_id, p.account_scope, p.generation_id, p.symbol, p.position_id,
            p.active_next, p.conflict_next
     FROM cancel_aggregates p, verdict v
-    WHERE v.ok AND p.kind = 'ungroupable' AND NOT p.stored
+    WHERE v.ok AND p.touch AND p.kind = 'ungroupable' AND NOT p.stored
     RETURNING 1
 ), cancel_unbound_update AS (
     UPDATE public.spot_order_set_cancel_unbound t
     SET active_count = p.active_next, conflict_count = p.conflict_next
     FROM cancel_aggregates p, verdict v
-    WHERE v.ok AND p.kind = 'unbound' AND p.stored
+    WHERE v.ok AND p.touch AND p.kind = 'unbound' AND p.stored
       AND (t.tenant_id, t.venue_id, t.account_scope, t.generation_id)
         = (p.tenant_id, p.venue_id, p.account_scope, p.generation_id)
       AND (t.active_count, t.conflict_count) = (p.prior_active, p.prior_conflict)
@@ -210,12 +204,12 @@
     SELECT p.tenant_id, p.venue_id, p.account_scope, p.generation_id,
            p.active_next, p.conflict_next
     FROM cancel_aggregates p, verdict v
-    WHERE v.ok AND p.kind = 'unbound' AND NOT p.stored
+    WHERE v.ok AND p.touch AND p.kind = 'unbound' AND NOT p.stored
     RETURNING 1
 ), written AS (
     SELECT 1 FROM sell_order_update UNION ALL SELECT 1 FROM sell_order_insert
     UNION ALL SELECT 1 FROM sell_intent_update UNION ALL SELECT 1 FROM sell_intent_insert
-    UNION ALL SELECT 1 FROM cancel_member_update UNION ALL SELECT 1 FROM cancel_member_insert
+    UNION ALL SELECT 1 FROM cancel_member_update
     UNION ALL SELECT 1 FROM cancel_group_update UNION ALL SELECT 1 FROM cancel_group_insert
     UNION ALL SELECT 1 FROM sell_leg_update UNION ALL SELECT 1 FROM sell_leg_insert
     UNION ALL SELECT 1 FROM sell_symbol_update UNION ALL SELECT 1 FROM sell_symbol_insert

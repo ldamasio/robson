@@ -20,11 +20,10 @@
 ), cancel_member_plan AS MATERIALIZED (
     -- This native row names the cancel: pending and conflict for that J only.
     SELECT m.*,
-           CASE WHEN m.stored
-                THEN (m.s_symbol, m.s_position, m.s_target)
-                         IS NOT DISTINCT FROM (m.symbol, m.position_id, m.target_id)
-                     AND (m.s_pending, m.s_conflict) = (m.p_pending, m.p_conflict)
-                ELSE NOT (m.p_pending OR m.p_conflict) END AS ok,
+           m.stored
+               AND (m.s_symbol, m.s_position, m.s_target)
+                   IS NOT DISTINCT FROM (m.symbol, m.position_id, m.target_id)
+               AND (m.s_pending, m.s_conflict) = (m.p_pending, m.p_conflict) AS ok,
            NOT (m.s_pending AND m.s_conflict) AS touch,
            (NOT m.s_pending)::integer AS pending_delta,
            (NOT m.s_conflict)::integer AS conflict_delta
@@ -34,19 +33,23 @@
     SELECT d.symbol, d.position_id, d.target_id,
            sum(d.pending_delta)::bigint AS pending_delta,
            sum(d.conflict_delta)::bigint AS conflict_delta,
+           sum(d.required_pending)::bigint AS required_pending,
+           sum(d.required_conflict)::bigint AS required_conflict,
            bool_or(d.mask_prior) AS mask_prior, bool_or(d.mask_next) AS mask_next
     FROM (
         SELECT symbol, position_id, target_id, pending_delta, conflict_delta,
-               NULL::boolean, NULL::boolean
+               s_pending::integer, s_conflict::integer, NULL::boolean, NULL::boolean
         FROM cancel_member_plan
-        WHERE touch AND position_id IS NOT NULL AND target_id IS NOT NULL
+        WHERE position_id IS NOT NULL AND target_id IS NOT NULL
         UNION ALL
-        SELECT symbol, position_id, exchange_order_id, 0, 0, mask_prior, mask_next
+        SELECT symbol, position_id, exchange_order_id, 0, 0, 0, 0, mask_prior, mask_next
         FROM links WHERE owner = 'leg' AND position_id IS NOT NULL
-    ) d(symbol, position_id, target_id, pending_delta, conflict_delta, mask_prior, mask_next)
+    ) d(symbol, position_id, target_id, pending_delta, conflict_delta,
+        required_pending, required_conflict, mask_prior, mask_next)
     GROUP BY d.symbol, d.position_id, d.target_id
 ), cancel_groups AS MATERIALIZED (
     SELECT g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.*,
+           d.active_delta <> 0 OR d.conflict_delta <> 0 AS touch,
            p.target_id IS NOT NULL AS stored,
            coalesce(p.pending_count, 0) AS prior_pending,
            coalesce(p.conflict_count, 0) AS prior_conflict,
@@ -63,6 +66,7 @@
     -- The target's prior mask follows the locked native row, not the stored one.
     SELECT p.*,
            (p.mask_prior IS NULL OR p.prior_mask = p.mask_prior)
+               AND p.prior_pending >= p.required_pending AND p.prior_conflict >= p.required_conflict
                AND p.pending_next >= 0 AND p.conflict_next >= 0 AS ok,
            p.pending_delta <> 0 OR p.conflict_delta <> 0 OR p.final_mask <> p.prior_mask AS touch,
            (CASE WHEN p.final_mask THEN 0 ELSE p.pending_next END)
@@ -71,19 +75,25 @@
 ), cancel_counts AS MATERIALIZED (
     -- Leg aggregates from at most two groups; one ungroupable or unbound bucket.
     SELECT d.kind, d.symbol, d.position_id,
-           sum(d.active)::bigint AS active_delta, sum(d.conflict)::bigint AS conflict_delta
+           sum(d.active)::bigint AS active_delta, sum(d.conflict)::bigint AS conflict_delta,
+           sum(d.required_active)::bigint AS required_active,
+           sum(d.required_conflict)::bigint AS required_conflict
     FROM (
-        SELECT 'leg', symbol, position_id, active_delta, conflict_delta
-        FROM cancel_group_plan WHERE touch
+        SELECT 'leg', symbol, position_id, active_delta, conflict_delta,
+               CASE WHEN prior_mask THEN 0 ELSE prior_pending END, prior_conflict
+        FROM cancel_group_plan
         UNION ALL
         SELECT CASE WHEN position_id IS NULL THEN 'unbound' ELSE 'ungroupable' END,
-               symbol, position_id, pending_delta::bigint, conflict_delta::bigint
-        FROM cancel_member_plan WHERE touch AND (position_id IS NULL OR target_id IS NULL)
-    ) d(kind, symbol, position_id, active, conflict)
+               symbol, position_id, pending_delta::bigint, conflict_delta::bigint,
+               s_pending::integer::bigint, s_conflict::integer::bigint
+        FROM cancel_member_plan WHERE position_id IS NULL OR target_id IS NULL
+    ) d(kind, symbol, position_id, active, conflict, required_active, required_conflict)
     GROUP BY d.kind, d.symbol, d.position_id
     HAVING sum(d.active) <> 0 OR sum(d.conflict) <> 0
+        OR sum(d.required_active) <> 0 OR sum(d.required_conflict) <> 0
 ), cancel_aggregates AS MATERIALIZED (
     SELECT g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.*,
+           d.active_delta <> 0 OR d.conflict_delta <> 0 AS touch,
            coalesce(l.tenant_id, x.tenant_id, u.tenant_id) IS NOT NULL AS stored,
            coalesce(l.active_count, x.active_count, u.active_count, 0) AS prior_active,
            coalesce(l.conflict_count, x.conflict_count, u.conflict_count, 0) AS prior_conflict,

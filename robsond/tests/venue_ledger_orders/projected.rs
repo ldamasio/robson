@@ -524,3 +524,84 @@ async fn projected_native_order_concurrent_changes_keep_versions_and_memberships
     }
     Ok(())
 }
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_native_order_requires_inactive_cancel_and_exact_journal_owner(
+    pool: PgPool,
+) -> Result<()> {
+    let f = setup(&pool).await?;
+    let cancel = Uuid::now_v7();
+    journal(&pool, &f, cancel, "order-1", "cancel", Some(f.position), Some("1"), true).await?;
+    let exit = Uuid::now_v7();
+    journal(&pool, &f, exit, "order-2", "exit", Some(f.position), None, false).await?;
+    let b = generation(&pool, &f).await?;
+    let ledger = f.ledger(&pool).with_native_order_set_projection(b.clone());
+    exact_reference(&pool, &b).await?;
+    let before = snapshot(&pool).await;
+    let v = version(&pool, &b).await?;
+
+    sqlx::query("DELETE FROM spot_order_set_cancel_members WHERE intent_id=$1")
+        .bind(cancel)
+        .execute(&pool)
+        .await?;
+    ensure!(matches!(
+        ledger
+            .record_order(
+                &f.record(1, Decimal::ZERO, OrderPhase::Live),
+                &linked(&f, 1, cancel),
+                seen()
+            )
+            .await,
+        Err(LedgerError::Invariant(_))
+    ));
+    ensure!(snapshot(&pool).await == before && version(&pool, &b).await? == v);
+    sqlx::query(
+        "INSERT INTO spot_order_set_cancel_members (
+          tenant_id,venue_id,account_scope,generation_id,intent_id,symbol,position_id,target_id,pending,conflict)
+         SELECT tenant_id,venue_id,account_scope,$2,intent_id,symbol,position_id,target_id,pending,conflict
+         FROM cancel_shadow_members WHERE intent_id=$1",
+    )
+    .bind(cancel).bind(b.generation_id).execute(&pool).await?;
+
+    sqlx::query("UPDATE spot_order_set_sell_intents SET source_position=$2 WHERE intent_id=$1")
+        .bind(exit)
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await?;
+    ensure!(matches!(
+        ledger
+            .record_order(
+                &f.record(2, Decimal::ZERO, OrderPhase::Live),
+                &linked(&f, 2, exit),
+                seen()
+            )
+            .await,
+        Err(LedgerError::Invariant(_))
+    ));
+    ensure!(snapshot(&pool).await == before && version(&pool, &b).await? == v);
+    sqlx::query("UPDATE spot_order_set_sell_intents SET source_position=$2 WHERE intent_id=$1")
+        .bind(exit)
+        .bind(f.position)
+        .execute(&pool)
+        .await?;
+    exact_reference(&pool, &b).await?;
+    write(
+        &pool,
+        &ledger,
+        &b,
+        &f.record(1, Decimal::ZERO, OrderPhase::Live),
+        &linked(&f, 1, cancel),
+        seen(),
+    )
+    .await?;
+    write(
+        &pool,
+        &ledger,
+        &b,
+        &f.record(2, Decimal::ZERO, OrderPhase::Live),
+        &linked(&f, 2, exit),
+        seen(),
+    )
+    .await
+}

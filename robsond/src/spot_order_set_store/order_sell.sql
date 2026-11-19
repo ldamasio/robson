@@ -92,27 +92,38 @@
                AS touch
     FROM sell_intent_class i
 ), sell_counts AS MATERIALIZED (
-    -- Signed deltas summed per exact bucket before any write: at most four.
+    -- Old members establish a minimum for each exact prior bucket even
+    -- when another delta cancels the net movement or this write is numeric.
     SELECT d.kind, d.symbol, d.position_id,
-           sum(d.potential)::bigint AS potential_delta, sum(d.conflict)::bigint AS conflict_delta
+           sum(d.potential)::bigint AS potential_delta, sum(d.conflict)::bigint AS conflict_delta,
+           sum(d.required_potential)::bigint AS required_potential,
+           sum(d.required_conflict)::bigint AS required_conflict
     FROM (
-        SELECT s_kind, s_symbol, s_position, -s_potential::integer, -s_conflict::integer
+        SELECT s_kind, s_symbol, s_position,
+               CASE WHEN touch THEN -s_potential::integer ELSE 0 END,
+               CASE WHEN touch THEN -s_conflict::integer ELSE 0 END,
+               s_potential::integer, s_conflict::integer
+        FROM sell_order_plan
+        UNION ALL
+        SELECT n_kind, n_symbol, n_position, n_potential::integer, n_conflict::integer, 0, 0
         FROM sell_order_plan WHERE touch
         UNION ALL
-        SELECT n_kind, n_symbol, n_position, n_potential::integer, n_conflict::integer
-        FROM sell_order_plan WHERE touch
+        SELECT s_kind, s_symbol, s_position,
+               CASE WHEN touch THEN -s_potential::integer ELSE 0 END,
+               CASE WHEN touch THEN -s_conflict::integer ELSE 0 END,
+               s_potential::integer, s_conflict::integer
+        FROM sell_intent_plan
         UNION ALL
-        SELECT s_kind, s_symbol, s_position, -s_potential::integer, -s_conflict::integer
+        SELECT n_kind, n_symbol, n_position, n_active::integer, n_active::integer, 0, 0
         FROM sell_intent_plan WHERE touch
-        UNION ALL
-        SELECT n_kind, n_symbol, n_position, n_active::integer, n_active::integer
-        FROM sell_intent_plan WHERE touch
-    ) d(kind, symbol, position_id, potential, conflict)
+    ) d(kind, symbol, position_id, potential, conflict, required_potential, required_conflict)
     WHERE d.kind <> 'none'
     GROUP BY d.kind, d.symbol, d.position_id
     HAVING sum(d.potential) <> 0 OR sum(d.conflict) <> 0
+        OR sum(d.required_potential) <> 0 OR sum(d.required_conflict) <> 0
 ), sell_aggregates AS MATERIALIZED (
     SELECT g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.*,
+           d.potential_delta <> 0 OR d.conflict_delta <> 0 AS touch,
            coalesce(l.tenant_id, y.tenant_id, u.tenant_id) IS NOT NULL AS stored,
            coalesce(l.potential_count, y.potential_count, u.potential_count, 0) AS prior_potential,
            coalesce(l.conflict_count, y.conflict_count, u.conflict_count, 0) AS prior_conflict,
