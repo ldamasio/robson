@@ -1,6 +1,7 @@
 use std::{cell::RefCell, time::Duration};
 
 use anyhow::Result;
+use robson_exec::order_journal::{JournalBackend, JournalBatch, OutcomeRow, VenueOutcome};
 use robson_testkit::db_proxy::{DbProxy, ProxyMode};
 use serde_json::{json, Value};
 use sqlx::{
@@ -150,6 +151,55 @@ fn request(transition: Uuid, version: i64) -> TransitionWrite<'static> {
         expected_accounting_version: version,
         expected_transition: ExpectedTransition::New(transition),
     }
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn spot_unflagged_backend_refuses_before_sql(pool: PgPool) -> Result<()> {
+    migrate_fixture(&pool).await?;
+    let leg = PositiveLeg::admit(&pool).await?;
+    let saved = leg.cancel_intent();
+    PgJournalBackend::new(&pool, leg.tenant)
+        .commit_first_cancel(&saved, request(Uuid::now_v7(), leg.accounting_version(&pool).await?))
+        .await
+        .expect("flagged atomic fixture must persist");
+    let before = durable(&pool, leg.tenant).await?;
+    let wire = Wire::new(&pool, leg.tenant).await?;
+
+    let linked = leg.cancel_intent();
+    assert!(linked.position_id.is_some());
+    let unlinked = IntentRow { position_id: None, ..leg.cancel_intent() };
+    for (intent, outcome) in [
+        (linked, None),
+        (unlinked, None),
+        (
+            saved,
+            Some(OutcomeRow {
+                venue_outcome: Some(VenueOutcome::Success),
+                ..OutcomeRow::default()
+            }),
+        ),
+    ] {
+        let result = wire
+            .store
+            .commit(&JournalBatch {
+                intent,
+                attempts: Vec::new(),
+                outcome,
+                balance: None,
+            })
+            .await;
+        let after = durable(&pool, leg.tenant).await?;
+        assert_eq!(after["version"], before["version"], "fixture retained accounting version");
+        assert_eq!(after, before, "unflagged Spot mutation changed the journal at its old version");
+        assert!(
+            matches!(result, Err(CommitFailure::Known(ref reason))
+            if reason == "Spot journal mutations require accounting-first storage"),
+            "{result:?}"
+        );
+        wire.assert_prefix(0);
+    }
+    Ok(())
 }
 
 #[sqlx::test(migrations = false)]

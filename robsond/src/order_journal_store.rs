@@ -25,6 +25,7 @@ use robson_exec::{
         CommitFailure, JournalBackend, JournalBatch, ReleaseCounts, ReleaseRecord,
         StreamSuspensionRow,
     },
+    venue::VenueId,
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -247,6 +248,11 @@ impl JournalBackend for PgJournalBackend {
         let started = Instant::now();
         if batch.balance.is_some() {
             return Box::pin(self.commit_balance(batch, started)).await;
+        }
+        if batch.intent.venue_id == VenueId::BINANCE_SPOT {
+            return Err(CommitFailure::Known(
+                "Spot journal mutations require accounting-first storage".to_owned(),
+            ));
         }
         let known = |e: sqlx::Error| CommitFailure::Known(e.to_string());
         let connection = self.pool.acquire().await.map_err(known)?;
