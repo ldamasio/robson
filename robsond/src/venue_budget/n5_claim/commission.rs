@@ -259,3 +259,7 @@ async fn receive_response(
     }
     prepare_response(&body, original, account, receipt.at)
 }
+
+#[cfg(all(test, feature = "crash-points"))]
+#[path = "commission_tests.rs"]
+mod tests;
