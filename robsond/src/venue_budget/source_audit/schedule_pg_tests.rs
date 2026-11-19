@@ -13,6 +13,9 @@ use tokio::time::timeout;
 use super::super::run::{Fault, Phase};
 use super::*;
 
+#[path = "terminal_schedule_pg_tests.rs"]
+mod terminal;
+
 struct Wire {
     proxy: DbProxy,
     pool: PgPool,

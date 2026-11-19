@@ -14,6 +14,12 @@ use super::{
 #[path = "schedule_pg_tests.rs"]
 mod schedule;
 
+#[path = "terminal_pg_tests.rs"]
+mod terminal;
+
+#[path = "terminal_scale_pg_tests.rs"]
+mod terminal_scale;
+
 async fn project_healthy_spot(pool: &PgPool, tenant: Uuid) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO accounting_state(tenant_id,venue_id,budget_model)

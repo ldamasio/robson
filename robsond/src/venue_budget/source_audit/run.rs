@@ -1,8 +1,10 @@
-//! Private durable running/failed source audit. Never a completed audit,
-//! fencing proof, BootstrapInput or readiness. Callers must already own the
-//! external quiescence barrier; nothing here manufactures or checks it.
+//! Private durable running/failed/terminal source audit. A completed audit is
+//! local evidence only, never fencing proof, BootstrapInput or readiness.
+//! Callers must already own the external quiescence barrier; nothing here
+//! manufactures or checks it.
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, ConnectOptions, PgConnection, PgPool, Row};
 use tokio::time::{timeout_at, Instant};
 use uuid::Uuid;
@@ -25,6 +27,7 @@ macro_rules! audit_page {
 }
 pub(super) const FIRST_PAGE: &str = audit_page!("../sql/source_page_first.sql");
 pub(super) const NEXT_PAGE: &str = audit_page!("../sql/source_page_next.sql");
+pub(super) const TERMINAL: &str = include_str!("../sql/audit_terminal.sql");
 
 /// The exact persisted binding last confirmed by an acknowledged COMMIT.
 #[derive(Debug, PartialEq, Eq)]
@@ -90,7 +93,56 @@ pub(super) enum Phase {
     Setup,
     Page,
     Checkpoint,
+    Terminal,
     Commit,
+}
+
+/// Terminal inconsistency proven by the bounded fresh validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Inconsistency {
+    /// A clock lacks its source, intent or charge, or disagrees with them.
+    Clock,
+    /// Whole charge population differs from the fully matched clock count.
+    ChargeCount,
+}
+
+impl Inconsistency {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Clock => "terminal_clock_inconsistent",
+            Self::ChargeCount => "terminal_charge_count_mismatch",
+        }
+    }
+}
+
+/// Independently capped scalar witnesses of the terminal statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Witness {
+    pub(super) source: i64,
+    pub(super) clocks: i64,
+    pub(super) charges: i64,
+}
+
+/// Local descriptive receipt of one acknowledged terminal COMMIT. Never
+/// fencing proof, catalog result, BootstrapInput or readiness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Receipt {
+    pub(super) audit: Uuid,
+    pub(super) generation: i64,
+    pub(super) high_water: Option<Uuid>,
+    pub(super) examined: i64,
+    pub(super) completed_at: DateTime<Utc>,
+    pub(super) witness: Witness,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Terminal {
+    /// Acknowledged COMMIT of `complete` with server completed_at, NULL reason.
+    Complete(Receipt),
+    /// Acknowledged COMMIT of one bounded `failed`; prior cursor/count kept.
+    Failed(Inconsistency, Receipt),
+    /// Binding or audit row was not current; nothing was written.
+    Stale,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,6 +449,168 @@ pub(super) async fn pass(pool: &PgPool, run: Run, trace: &Trace) -> Result<Pass,
     // A lost/late COMMIT reply is uncertain: no cursor, no retry, no cleanup.
     let result = timeout_at(deadline, work).await;
     result.unwrap_or_else(|_| Err(expired(&step)))
+}
+
+/// Five executions: BEGIN, settings, venue lock, bounded terminal validation
+/// with its guarded UPDATE, COMMIT. The input must be the empty setup run or
+/// the last acknowledged checkpoint whose cursor equals its high-water; any
+/// fault abandons it. Only the private audit and native fixtures call this.
+pub(super) async fn finish_audit(
+    pool: &PgPool,
+    run: Run,
+    trace: &Trace,
+) -> Result<Terminal, Fault> {
+    let fault = |phase, error| Fault { phase, audit: Some(run.audit), error };
+    if run.audit.is_nil()
+        || run.generation < 0
+        || run.cursor != run.high_water
+        || !(0..=MAX_EXAMINED).contains(&run.examined)
+        || run.high_water.is_none() != (run.examined == 0)
+    {
+        return Err(fault(Phase::Terminal, BudgetError::Invalid));
+    }
+    let deadline = run.envelope.transaction().map_err(|e| fault(Phase::Connect, e))?;
+    let mut step = Step {
+        phase: Phase::Connect,
+        audit: Some(run.audit),
+        trace,
+        deadline,
+    };
+    let work = async {
+        let mut connection = begin(pool, &mut step).await?;
+        step.at(Phase::Lock)?;
+        // Same venue-before-audit order as setup; held until COMMIT/drop.
+        let locked = completion::one(
+            &mut connection,
+            sqlx::query(include_str!("../sql/lock.sql")).bind(VENUE),
+        )
+        .await
+        .map_err(|e| step.fault(e))?;
+        if get::<String>(&locked, "venue_id").map_err(|e| step.fault(e))? != VENUE {
+            return Err(step.fault(BudgetError::Invalid));
+        }
+        if !locked_binding(&locked, &run).map_err(|e| step.fault(e))? {
+            return Ok(Terminal::Stale);
+        }
+        // Success is restricted to the same already completed initialization.
+        let initialization = (get::<String>(&locked, "initialization_state")
+            .map_err(|e| step.fault(e))?
+            == "complete")
+            .then(|| get::<Option<Uuid>>(&locked, "initialization_id"))
+            .transpose()
+            .map_err(|e| step.fault(e))?
+            .flatten()
+            .filter(|id| !id.is_nil())
+            .ok_or_else(|| step.fault(BudgetError::Invalid))?;
+        step.at(Phase::Terminal)?;
+        let row = completion::one(
+            &mut connection,
+            sqlx::query(TERMINAL)
+                .bind(run.audit)
+                .bind(run.generation)
+                .bind(run.high_water)
+                .bind(run.examined)
+                .bind(initialization),
+        )
+        .await
+        .map_err(|e| step.fault(e))?;
+        let Some(outcome) = terminal_row(&row, &run).map_err(|e| step.fault(e))? else {
+            // No write by this owner; the session is just dropped.
+            return Ok(Terminal::Stale);
+        };
+        commit(&mut connection, &mut step).await?;
+        Ok(outcome)
+    };
+    // A lost/late COMMIT reply is uncertain: no receipt, retry or cleanup.
+    let result = timeout_at(deadline, work).await;
+    result.unwrap_or_else(|_| Err(expired(&step)))
+}
+
+/// The locked venue row still carries the run's exact audit binding.
+fn locked_binding(row: &PgRow, run: &Run) -> Result<bool, BudgetError> {
+    Ok(get::<Option<Uuid>>(row, "audit_id")? == Some(run.audit)
+        && get::<i64>(row, "quiescence_generation")? == run.generation
+        && get::<Option<Uuid>>(row, "source_high_water")? == run.high_water)
+}
+
+/// Decodes the terminal row. `None` is a non-current binding with no write;
+/// every other disagreement is untrusted and returns an error.
+fn terminal_row(row: &PgRow, run: &Run) -> Result<Option<Terminal>, BudgetError> {
+    if row.len() != 19 {
+        return Err(BudgetError::Invalid);
+    }
+    let witness = Witness {
+        source: get(row, "source_count")?,
+        clocks: get(row, "clock_count")?,
+        charges: get(row, "charge_count")?,
+    };
+    let above: i64 = get(row, "above_clocks")?;
+    let bad: i64 = get(row, "bad_clocks")?;
+    // Every overflow sentinel must be absent before any count is compared.
+    if [witness.source, witness.clocks, witness.charges]
+        .iter()
+        .any(|count| !(0..=MAX_EXAMINED).contains(count))
+        || !(0..=witness.clocks).contains(&above)
+        || !(0..=witness.clocks).contains(&bad)
+    {
+        return Err(BudgetError::Invalid);
+    }
+    match get::<i64>(row, "bindings")? {
+        0 => return Ok(None),
+        1 => {},
+        _ => return Err(BudgetError::Invalid),
+    }
+    // A changed in-range cut or an above-high-water clock is never a verdict.
+    if witness.source != run.examined || above != 0 {
+        return Err(BudgetError::Invalid);
+    }
+    let expected = if bad > 0 {
+        Some(Inconsistency::Clock)
+    } else if witness.charges != witness.clocks {
+        // Inclusion plus equal cardinality is the reverse charge coverage.
+        Some(Inconsistency::ChargeCount)
+    } else {
+        None
+    };
+    let (status, reason) = match expected {
+        None => ("complete", None),
+        Some(kind) => ("failed", Some(kind.reason())),
+    };
+    if get::<Option<String>>(row, "verdict")?.as_deref() != Some(status)
+        || get::<Option<String>>(row, "verdict_reason")?.as_deref() != reason
+    {
+        return Err(BudgetError::Invalid);
+    }
+    match get::<i64>(row, "moved")? {
+        0 => return Ok(None),
+        1 => {},
+        _ => return Err(BudgetError::Invalid),
+    }
+    let completed_at: Option<DateTime<Utc>> = get(row, "completed_at")?;
+    if get::<Option<Uuid>>(row, "audit_id")? != Some(run.audit)
+        || get::<Option<String>>(row, "venue_id")?.as_deref() != Some(VENUE)
+        || get::<Option<i64>>(row, "quiescence_generation")? != Some(run.generation)
+        || get::<Option<Uuid>>(row, "high_water")? != run.high_water
+        || get::<Option<Uuid>>(row, "cursor")? != run.high_water
+        || get::<Option<i64>>(row, "examined_count")? != Some(run.examined)
+        || get::<Option<String>>(row, "status")?.as_deref() != Some(status)
+        || get::<Option<String>>(row, "failure_reason")?.as_deref() != reason
+        || get::<Option<bool>>(row, "server_completed")? != Some(true)
+    {
+        return Err(BudgetError::Invalid);
+    }
+    let receipt = Receipt {
+        audit: run.audit,
+        generation: run.generation,
+        high_water: run.high_water,
+        examined: run.examined,
+        completed_at: completed_at.ok_or(BudgetError::Invalid)?,
+        witness,
+    };
+    Ok(Some(match expected {
+        None => Terminal::Complete(receipt),
+        Some(kind) => Terminal::Failed(kind, receipt),
+    }))
 }
 
 /// Exact current persisted binding equals the caller's acknowledged run.
