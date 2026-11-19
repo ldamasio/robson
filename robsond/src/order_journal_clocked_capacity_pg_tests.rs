@@ -1,4 +1,8 @@
 //! Native M38 global venue contention through two independent J2b writers.
+use proptest::{
+    strategy::{Strategy, ValueTree},
+    test_runner::{Config, RngSeed, TestRunner},
+};
 use sqlx::postgres::PgPoolOptions;
 
 use super::*;
@@ -121,7 +125,21 @@ async fn wait_on(
     }
 }
 
-async fn run_schedule(pool: &PgPool, first_writer: usize) -> anyhow::Result<()> {
+async fn run_schedule(
+    pool: &PgPool,
+    first_writer: usize,
+    same_account: bool,
+    seed: u64,
+) -> anyhow::Result<()> {
+    let mut generator = TestRunner::new(Config {
+        rng_seed: RngSeed::Fixed(seed),
+        failure_persistence: None,
+        ..Config::default()
+    });
+    let (before_peer, before_release) = (0_u64..10, 0_u64..10)
+        .new_tree(&mut generator)
+        .map_err(|error| anyhow!("capacity schedule: {error:?}"))?
+        .current();
     let a = scope(pool).await?;
     let b = tenant_scope(pool, NativeClock::initialize()?).await?;
     let before = versions(pool, a.tenant, b.tenant).await?;
@@ -141,7 +159,11 @@ async fn run_schedule(pool: &PgPool, first_writer: usize) -> anyhow::Result<()> 
     let (backend1, pid1) = writer(pool, tenants[1 - first_writer].tenant).await?;
     ensure!(pid0 != pid1 && pid0 != holder && pid1 != holder, "three separate connections");
     let (batch0, input0) = one(tenants[first_writer], "j2b-race-first-arrival")?;
-    let (batch1, input1) = one(tenants[1 - first_writer], "j2b-race-second-arrival")?;
+    let (mut batch1, mut input1) = one(tenants[1 - first_writer], "j2b-race-second-arrival")?;
+    if !same_account {
+        batch1.intent.account_scope = "j2b-capacity-other-account".to_owned();
+        input1.attempts[0].account_scope = batch1.intent.account_scope.clone();
+    }
     let mut entered0 = Box::pin(backend0.commit_clocked(&batch0, &input0));
     let mut entered1 = Box::pin(backend1.commit_clocked(&batch1, &input1));
 
@@ -150,11 +172,13 @@ async fn run_schedule(pool: &PgPool, first_writer: usize) -> anyhow::Result<()> 
         early = &mut entered0 => anyhow::bail!("first writer finished behind held venue row: {early:?}"),
         observed = wait_on(pool, pid0, holder, None, witness_deadline) => observed?,
     }
+    tokio::time::sleep(Duration::from_millis(before_peer)).await;
     tokio::select! {
         early = &mut entered0 => anyhow::bail!("first writer did not remain queued: {early:?}"),
         early = &mut entered1 => anyhow::bail!("second writer finished behind held venue row: {early:?}"),
         observed = wait_on(pool, pid1, holder, Some(pid0), witness_deadline) => observed?,
     }
+    tokio::time::sleep(Duration::from_millis(before_release)).await;
     hold.rollback().await?;
     let (result0, result1) = tokio::join!(entered0, entered1);
     let (winning_scope, winner, winner_input, receipt, loser, failure) = match (result0, result1) {
@@ -212,17 +236,28 @@ async fn run_schedule(pool: &PgPool, first_writer: usize) -> anyhow::Result<()> 
     );
     ensure!(stored(pool, &cancel).await? == (1, 1, 1, 1), "one durable cancel");
     ensure!(active_units(pool).await? == 10000, "cancel/replay add no active unit");
+    eprintln!(
+        "J2B_RACE seed={seed} first_writer={first_writer} same_account={same_account} peer_delay_ms={before_peer} release_delay_ms={before_release} active=10000 loser_rows=0"
+    );
     Ok(())
 }
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn first_tenant_reaches_the_shared_venue_lock_first(pool: PgPool) -> anyhow::Result<()> {
-    run_schedule(&pool, 0).await
+    run_schedule(&pool, 0, true, 2026111906).await
 }
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn second_tenant_reaches_the_shared_venue_lock_first(pool: PgPool) -> anyhow::Result<()> {
-    run_schedule(&pool, 1).await
+    run_schedule(&pool, 1, true, 2026111907).await
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn venue_capacity_is_shared_across_distinct_account_scopes(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    run_schedule(&pool, 0, false, 2026111908).await
 }

@@ -18,6 +18,9 @@ use uuid::Uuid;
 
 use super::{one, scope, PgJournalBackend, Scope};
 
+#[path = "order_journal_clocked_work_pg_tests.rs"]
+mod work;
+
 const HELPER: &str = "SELECT * FROM public.budget_insert_clocks(";
 
 /// One proxied, one-slot writer pool whose connection was opened after
@@ -35,6 +38,7 @@ struct Wire {
 struct Route {
     helper: u64,
     commit: u64,
+    data_rows: u64,
 }
 
 impl Wire {
@@ -127,6 +131,7 @@ impl Wire {
     /// Commit one healthy batch and locate the unique helper and COMMIT.
     async fn calibrate(&self, scope: &Scope) -> Result<Route> {
         let base = self.last_ordinal()?;
+        let rows_before = self.proxy.data_rows();
         self.proxy.enable_exact_query_trace(32);
         let (batch, input) = one(scope, "j2b-wire-calibrate")?;
         let receipts = self.store.commit_clocked(&batch, &input).await;
@@ -154,7 +159,11 @@ impl Wire {
             "helper precedes the final COMMIT: {trace:?}"
         );
         ensure!(self.identity().is_ok(), "calibration kept the original connection");
-        Ok(Route { helper, commit })
+        Ok(Route {
+            helper,
+            commit,
+            data_rows: self.proxy.data_rows() - rows_before,
+        })
     }
 
     async fn retires(&self, observer: &PgPool) -> Result<()> {
@@ -218,15 +227,24 @@ async fn version(pool: &PgPool, tenant: Uuid) -> Result<i64> {
     .await?)
 }
 
-/// Whether the accounting row lock is free to the independent owner now.
-async fn lock_free(pool: &PgPool, tenant: Uuid) -> Result<bool> {
-    let probe = sqlx::query(
+/// An independent write-lock probe on the original owner's two row locks.
+async fn locks_free(pool: &PgPool, tenant: Uuid) -> Result<(bool, bool)> {
+    let accounting = sqlx::query(
         "SELECT 1 FROM accounting_state WHERE tenant_id=$1 AND venue_id='binance:spot'
         FOR UPDATE NOWAIT",
     )
     .bind(tenant)
     .fetch_one(pool)
     .await;
+    let venue = sqlx::query(
+        "SELECT 1 FROM budget_venue_state WHERE venue_id='binance:spot' FOR UPDATE NOWAIT",
+    )
+    .fetch_one(pool)
+    .await;
+    Ok((lock_free(accounting)?, lock_free(venue)?))
+}
+
+fn lock_free(probe: Result<sqlx::postgres::PgRow, sqlx::Error>) -> Result<bool> {
     match probe {
         Ok(_) => Ok(true),
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03") => Ok(false),
@@ -238,7 +256,7 @@ struct Observed {
     hit: ControlHit,
     rows_at_hit: u64,
     rows_before: u64,
-    lock_free_while_held: bool,
+    locks_free_while_held: (bool, bool),
     durable_while_held: (i64, i64, i64, i64),
     result: Result<Vec<super::ClockReceipt>, CommitFailure>,
     elapsed: Duration,
@@ -276,13 +294,13 @@ async fn gated(
             .map_err(|_| anyhow!("{gate:?} target never reached"))?
             .map_err(|e| anyhow!("held: {e:?}"))?;
         let rows_at_hit = wire.proxy.data_rows();
-        let lock_free_while_held = lock_free(pool, scope.tenant).await?;
+        let locks_free_while_held = locks_free(pool, scope.tenant).await?;
         let durable_while_held = durable(pool, &batch).await?;
-        Ok::<_, anyhow::Error>((hit, rows_at_hit, lock_free_while_held, durable_while_held))
+        Ok::<_, anyhow::Error>((hit, rows_at_hit, locks_free_while_held, durable_while_held))
     };
     let (result, observed) = tokio::join!(wire.store.commit_clocked(&batch, &input), observe);
     let elapsed = started.elapsed();
-    let (hit, rows_at_hit, lock_free_while_held, durable_while_held) = observed?;
+    let (hit, rows_at_hit, locks_free_while_held, durable_while_held) = observed?;
     ensure!(!armed.snapshot().released, "{gate:?} held message never forwarded");
     drop(armed);
     wire.retires(pool).await?;
@@ -293,12 +311,13 @@ async fn gated(
         closed.closed && !closed.released,
         "{gate:?} control closed unreleased: {closed:?}"
     );
+    ensure!(wire.proxy.query_trace_dropped() == 0, "fault trace complete");
     let trace = wire.proxy.query_trace();
     Ok(Observed {
         hit,
         rows_at_hit,
         rows_before,
-        lock_free_while_held,
+        locks_free_while_held,
         durable_while_held,
         result,
         elapsed,
@@ -358,13 +377,14 @@ fn targeted(wire: &Wire, route: &Route, observed: &Observed, gate: Gate) -> Resu
         Gate::HelperRow => ensure!(
             hit.boundary == ControlBoundary::BeforeCommandComplete
                 && hit.complete.is_none()
-                && observed.rows_at_hit > observed.rows_before,
+                && observed.rows_at_hit - observed.rows_before == route.data_rows,
             "DataRow forwarded, CommandComplete held: {hit:?}"
         ),
         Gate::HelperComplete => ensure!(
             hit.boundary == ControlBoundary::BeforeReady
                 && hit.record.event == DiagnosticEvent::Ready
-                && hit.record.transaction == Some(b'T'),
+                && hit.record.transaction == Some(b'T')
+                && observed.rows_at_hit - observed.rows_before == route.data_rows,
             "CommandComplete forwarded, in-transaction Ready held: {hit:?}"
         ),
         Gate::CommitAck => ensure!(
@@ -405,8 +425,8 @@ async fn pre_commit(pool: PgPool, gate: Gate) -> Result<()> {
         observed.elapsed
     );
     ensure!(
-        !observed.lock_free_while_held,
-        "{gate:?} the open transaction held the accounting row"
+        observed.locks_free_while_held == (false, false),
+        "{gate:?} the open transaction held both accounting and global venue rows"
     );
     ensure!(
         observed.durable_while_held == (0, 0, 0, 0),
@@ -420,7 +440,10 @@ async fn pre_commit(pool: PgPool, gate: Gate) -> Result<()> {
         version(&pool, scope.tenant).await? == before,
         "{gate:?} accounting version unchanged"
     );
-    ensure!(lock_free(&pool, scope.tenant).await?, "{gate:?} accounting lock released");
+    ensure!(
+        locks_free(&pool, scope.tenant).await? == (true, true),
+        "{gate:?} both locks released"
+    );
     slot_available(&wire).await
 }
 
@@ -459,8 +482,8 @@ async fn lost_commit_acknowledgement_is_uncertain_and_durable(pool: PgPool) -> R
     );
     // The server applied COMMIT before its CommandComplete was held.
     ensure!(
-        observed.lock_free_while_held,
-        "COMMIT released the accounting row before its ack"
+        observed.locks_free_while_held == (true, true),
+        "COMMIT released both rows before its ack"
     );
     ensure!(observed.durable_while_held == (1, 1, 1, 1), "durable while the ack was held");
     ensure!(
