@@ -11,8 +11,9 @@ use chrono::{DateTime, Utc};
 use robson_exec::{
     balance_liability::{
         order_facts, partition_facts, FactError, FeeEvidence, RecordedPartition, Remainder,
+        TransitionKind,
     },
-    order_journal::{IntentKind, COMMIT_BOUND},
+    order_journal::{CommitFailure, IntentKind, COMMIT_BOUND},
     venue::{OrderPhase, VenueId},
     venue_ledger::{
         LedgerError, LegOrderKind, OrderKey, OrderLink, OrderOwner, StoredOrder, VenueIntId,
@@ -29,11 +30,11 @@ use super::{
         initialize, relation_nodes, statement, Keys, ProjectionReady, ReplayOrder,
         CANDIDATE_COLUMNS, CANDIDATE_JOINS,
     },
-    ProtectedLeg, Wire, READ, STOP, SYMBOL, VENUE,
+    FirstCancelBridge, ProtectedLeg, Wire, READ, STOP, SYMBOL, VENUE,
 };
 use crate::{
-    order_journal_store::PgJournalBackend, venue_clock_store::codec::ORDER_COLUMNS,
-    venue_ledger_store::decode_order_row,
+    ledger_connection::LedgerConnection, order_journal_store::PgJournalBackend,
+    venue_clock_store::codec::ORDER_COLUMNS, venue_ledger_store::decode_order_row,
 };
 
 /// The accepted order-set aggregates without `hot.*`, so that the exact
@@ -247,9 +248,15 @@ async fn evaluate<'owner>(
         symbol,
     };
     let sql = policy_statement();
-    let read = ready
-        .query_as::<PolicyRead>(&sql, keys, Some(original))
-        .fetch_optional(&backend.pool);
+    let read = async {
+        let mut connection = LedgerConnection::new(backend.pool.acquire().await?);
+        let row = ready
+            .query_as::<PolicyRead>(&sql, keys, Some(original))
+            .fetch_optional(connection.connection())
+            .await?;
+        connection.finished = true;
+        Ok::<_, sqlx::Error>(row)
+    };
     let row = tokio::time::timeout(COMMIT_BOUND, read)
         .await
         .map_err(|_| NoSnapshot::Read)?
@@ -416,18 +423,6 @@ fn classify(
     let Some(target_active) = target_cancel_active(columns) else {
         return R3::Unresolved(U::CancelGroup);
     };
-    if order.phase == OrderPhase::Terminal {
-        if member != Membership::NotMember {
-            return R3::Unresolved(U::Membership);
-        }
-        if target_active > 0 {
-            return R3::TargetCancel;
-        }
-        return R3::Terminal {
-            status: order.status.clone(),
-            executed: order.executed_cum,
-        };
-    }
     let (Some(gross), Some(base_fee), Some(owned)) =
         (columns.gross_qty, columns.base_commission, columns.executable_qty)
     else {
@@ -451,6 +446,18 @@ fn classify(
         Remainder::Quantity(remainder) => remainder,
         Remainder::Deficit { excess } => return R3::Deficit { excess },
     };
+    if order.phase == OrderPhase::Terminal {
+        if member != Membership::NotMember {
+            return R3::Unresolved(U::Membership);
+        }
+        if target_active > 0 {
+            return R3::TargetCancel;
+        }
+        return R3::Terminal {
+            status: order.status.clone(),
+            executed: order.executed_cum,
+        };
+    }
     if member != Membership::ExactLive {
         return R3::Unresolved(U::Membership);
     }
@@ -565,8 +572,6 @@ async fn local_r1_r3_classifies_initialized_order_set_cells(pool: PgPool) -> Res
     let a = ProtectedLeg::admit(&pool).await?;
     let b = ProtectedLeg::admit_stop(&pool, Some(&a), "4100002", "NEW", Decimal::ZERO).await?;
     a.commit(&journal_batch(a.intent(IntentKind::Exit, None))).await?;
-    let cancelled = ProtectedLeg::admit(&pool).await?;
-    cancelled.commit(&journal_batch(cancelled.cancel())).await?;
     let pending = ProtectedLeg::admit_stop(&pool, None, STOP, "PENDING_NEW", Decimal::ZERO).await?;
     let unknown =
         ProtectedLeg::admit_stop(&pool, None, STOP, "PENDING_CANCEL", Decimal::ZERO).await?;
@@ -577,33 +582,32 @@ async fn local_r1_r3_classifies_initialized_order_set_cells(pool: PgPool) -> Res
     let terminal = ProtectedLeg::admit(&pool).await?;
     let terminal_fill =
         ProtectedLeg::admit_stop(&pool, None, STOP, "CANCELED", Decimal::ONE).await?;
+    let terminal_deficit =
+        ProtectedLeg::admit_stop(&pool, None, STOP, "CANCELED", Decimal::ONE).await?;
+    let terminal_missing =
+        ProtectedLeg::admit_stop(&pool, None, STOP, "CANCELED", Decimal::ZERO).await?;
     let unrecorded = ProtectedLeg::admit(&pool).await?;
     let short = ProtectedLeg::admit(&pool).await?;
     let symbol = ProtectedLeg::admit(&pool).await?;
     symbol.canonical_mutation(2, 0).await?;
     let closed = ProtectedLeg::admit(&pool).await?;
     let provisional = ProtectedLeg::admit(&pool).await?;
-    let miscounted = ProtectedLeg::admit(&pool).await?;
-    miscounted
-        .commit(&journal_batch(miscounted.intent(IntentKind::Exit, None)))
-        .await?;
     let contradicted = ProtectedLeg::admit(&pool).await?;
     for leg in [
         &a,
         &b,
-        &cancelled,
         &pending,
         &unknown,
         &executing,
         &terminal,
         &terminal_fill,
         &symbol,
-        &miscounted,
         &contradicted,
     ] {
         record_partition(&pool, leg, ten, true, false).await?;
     }
     record_partition(&pool, &deficit, Decimal::new(5, 1), true, false).await?;
+    record_partition(&pool, &terminal_deficit, Decimal::new(5, 1), true, false).await?;
     record_partition(&pool, &short, Decimal::from(9), true, false).await?;
     record_partition(&pool, &closed, ten, true, true).await?;
     record_partition(&pool, &provisional, ten, false, false).await?;
@@ -630,28 +634,6 @@ async fn local_r1_r3_classifies_initialized_order_set_cells(pool: PgPool) -> Res
             2,
         )
         .await?;
-    // Corruption control: remove the own stop's member and its unit, so the
-    // one remaining leg count is the exit journal, not the candidate.
-    sqlx::query(
-        "DELETE FROM sell_shadow_orders
-        WHERE (tenant_id,venue_id,account_scope,symbol,exchange_order_id)=($1,$2,$3,$4,$5)",
-    )
-    .bind(miscounted.tenant)
-    .bind(VENUE)
-    .bind(&miscounted.account)
-    .bind(SYMBOL)
-    .bind(STOP)
-    .execute(&pool)
-    .await?;
-    sqlx::query("SELECT sell_shadow_bump('leg',$1,$2,$3,$4,$5,-1,0)")
-        .bind(miscounted.tenant)
-        .bind(VENUE)
-        .bind(&miscounted.account)
-        .bind(SYMBOL)
-        .bind(miscounted.position)
-        .execute(&pool)
-        .await?;
-
     // Independently reasoned from the source rows written above.
     use Unresolved as U;
     let final_fee = FeeEvidence::FinalCommission;
@@ -660,8 +642,6 @@ async fn local_r1_r3_classifies_initialized_order_set_cells(pool: PgPool) -> Res
         ("leg_b_positive", &b, R1::Clear, protected(10, final_fee)),
         // Exact own stop plus own unresolved exit: two leg members, one other.
         ("leg_a_unresolved_exit", &a, R1::Held(Hold::LegSell), R3::Held(Hold::LegSell)),
-        // The only cancel targets the candidate itself.
-        ("target_cancel", &cancelled, R1::Held(Hold::TargetCancel), R3::TargetCancel),
         ("pending_new", &pending, R1::Held(Hold::CandidateStop), R3::Pending),
         ("partially_filled", &executing, R1::Held(Hold::CandidateStop), R3::Executing),
         ("unknown_status", &unknown, R1::Unresolved, R3::Unresolved(U::Phase)),
@@ -687,6 +667,18 @@ async fn local_r1_r3_classifies_initialized_order_set_cells(pool: PgPool) -> Res
             },
         ),
         (
+            "terminal_deficit",
+            &terminal_deficit,
+            R1::Unresolved,
+            R3::Deficit { excess: Decimal::new(5, 1) },
+        ),
+        (
+            "terminal_unrecorded",
+            &terminal_missing,
+            R1::Unresolved,
+            R3::Unresolved(U::Quantity),
+        ),
+        (
             "unrecorded_quantities",
             &unrecorded,
             R1::Unresolved,
@@ -708,17 +700,10 @@ async fn local_r1_r3_classifies_initialized_order_set_cells(pool: PgPool) -> Res
             R1::Clear,
             protected(10, FeeEvidence::ProvisionalBound),
         ),
-        // Aggregate of one, but the counted member is the exit journal.
-        (
-            "wrong_one_in_count",
-            &miscounted,
-            R1::Held(Hold::LegSell),
-            R3::Unresolved(U::Membership),
-        ),
         // A live phase with a terminal status.
         ("contradicted_phase", &contradicted, R1::Unresolved, R3::Unresolved(U::Phase)),
     ];
-    let cell_count = cells.len() + 1;
+    let cell_count = cells.len() + 4;
     for (name, leg, r1, r3) in cells {
         let facts = observe(&ready, &pool, leg).await?;
         assert_eq!((facts.r1, &facts.r3), (r1, &r3), "{name}");
@@ -726,9 +711,6 @@ async fn local_r1_r3_classifies_initialized_order_set_cells(pool: PgPool) -> Res
         assert_eq!(facts.accounting_version, leg.version(&pool).await?, "{name}");
         assert_eq!((facts.tenant, facts.position), (leg.tenant, leg.position));
         assert_eq!(facts.key.exchange_order_id.to_string(), leg.stop);
-        if name == "wrong_one_in_count" {
-            assert_eq!((facts.leg_sell, facts.member), (1, Membership::NotMember));
-        }
         if name == "leg_b_positive" {
             assert_eq!(facts.owner, Some(leg.stop_link.owner.clone()));
             assert_eq!((facts.leg_sell, facts.member), (1, Membership::ExactLive));
@@ -739,7 +721,111 @@ async fn local_r1_r3_classifies_initialized_order_set_cells(pool: PgPool) -> Res
     let foreign_stop = observe_as(&ready, &pool, &b, b.position, &a.stop).await?;
     assert_eq!(foreign_stop.r3, R3::Unresolved(U::Identity));
     assert_ne!(foreign_stop.r1, R1::Clear);
-    eprintln!("SPOT_LOCAL_R1_R3 cells={cell_count} hot_sql=1 positive=leg_b wrong_one_in_count=unresolved");
+
+    // An unattributable same-account SELL holds both legs of that account,
+    // while another exact account observes its own protection normally.
+    let mut pre_leg = a.intent(IntentKind::Exit, None);
+    pre_leg.position_id = Some(Uuid::now_v7());
+    a.commit(&journal_batch(pre_leg)).await?;
+    let held = observe(&ready, &pool, &b).await?;
+    assert_eq!((held.r1, held.r3), (R1::Held(Hold::AccountSell), R3::Held(Hold::AccountSell)));
+    let other = observe(&ready, &pool, &provisional).await?;
+    assert_eq!(other.r3, protected(10, FeeEvidence::ProvisionalBound));
+
+    let mut orphan_cancel = provisional.cancel();
+    orphan_cancel.position_id = None;
+    provisional.commit(&journal_batch(orphan_cancel)).await?;
+    let held = observe(&ready, &pool, &provisional).await?;
+    assert_eq!(
+        (held.r1, held.r3),
+        (R1::Held(Hold::UnboundCancel), R3::Held(Hold::UnboundCancel))
+    );
+    eprintln!("SPOT_LOCAL_R1_R3 cells={cell_count} hot_sql=1 positive=leg_b");
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn local_r1_r3_rejects_wrong_single_member(pool: PgPool) -> Result<()> {
+    fixture(&pool).await?;
+    let leg = ProtectedLeg::admit(&pool).await?;
+    record_partition(&pool, &leg, Decimal::from(10), true, false).await?;
+    let ready = initialize(&pool, ReplayOrder::MembersFirst, None).await?;
+    let good = observe(&ready, &pool, &leg).await?;
+    assert_eq!(good.r3, protected(10, FeeEvidence::FinalCommission));
+    leg.commit(&journal_batch(leg.intent(IntentKind::Exit, None))).await?;
+    let both = observe(&ready, &pool, &leg).await?;
+    assert_eq!((both.leg_sell, both.r3), (2, R3::Held(Hold::LegSell)));
+
+    // Corrupt only the fixture observer. The own native stop remains valid,
+    // but the only counted member now belongs to the other journal intent.
+    let mut tx = pool.begin().await?;
+    let removed = sqlx::query(
+        "DELETE FROM sell_shadow_orders
+        WHERE (tenant_id,venue_id,account_scope,symbol,exchange_order_id)=($1,$2,$3,$4,$5)",
+    )
+    .bind(leg.tenant)
+    .bind(VENUE)
+    .bind(&leg.account)
+    .bind(SYMBOL)
+    .bind(STOP)
+    .execute(&mut *tx)
+    .await?;
+    ensure!(removed.rows_affected() == 1);
+    sqlx::query("SELECT sell_shadow_bump('leg',$1,$2,$3,$4,$5,-1,0)")
+        .bind(leg.tenant)
+        .bind(VENUE)
+        .bind(&leg.account)
+        .bind(SYMBOL)
+        .bind(leg.position)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    let observed = observe(&ready, &pool, &leg).await?;
+    assert_eq!(observed.leg_sell, 1);
+    assert_eq!(
+        (observed.r1, observed.r3),
+        (R1::Held(Hold::LegSell), R3::Unresolved(Unresolved::Membership)),
+        "wrong_one_in_count"
+    );
+    assert_eq!(observed.member, Membership::NotMember);
+    eprintln!("SPOT_LOCAL_R1_R3 wrong_one_in_count=unresolved");
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn local_r1_r3_rejects_active_target_cancel(pool: PgPool) -> Result<()> {
+    fixture(&pool).await?;
+    let leg = ProtectedLeg::admit(&pool).await?;
+    record_partition(&pool, &leg, Decimal::from(10), true, false).await?;
+    let ready = initialize(&pool, ReplayOrder::MembersFirst, None).await?;
+    let good = observe(&ready, &pool, &leg).await?;
+    assert_eq!(good.r3, protected(10, FeeEvidence::FinalCommission));
+    leg.commit(&journal_batch(leg.cancel())).await?;
+    let pending = observe(&ready, &pool, &leg).await?;
+    assert_eq!(
+        (pending.r1, pending.r3),
+        (R1::Held(Hold::TargetCancel), R3::TargetCancel),
+        "active_target_cancel"
+    );
+    leg.record(
+        &order(STOP, &leg.stop_client, "CANCELED", OrderPhase::Terminal),
+        &leg.stop_link,
+        2,
+    )
+    .await?;
+    let terminal = observe(&ready, &pool, &leg).await?;
+    assert_eq!(terminal.r1, R1::Clear);
+    assert_eq!(
+        terminal.r3,
+        R3::Terminal {
+            status: "CANCELED".into(),
+            executed: Decimal::ZERO
+        }
+    );
+    eprintln!("SPOT_LOCAL_R1_R3 active_target_cancel=held native_terminal=discharged");
     Ok(())
 }
 
@@ -755,8 +841,28 @@ async fn local_r1_r3_snapshot_is_bound_to_its_read_and_version(pool: PgPool) -> 
     let first = observe(&ready, &pool, &leg).await?;
     assert_eq!(first.r3, protected(10, FeeEvidence::FinalCommission));
     let kept = first.clone();
+    let writer = Wire::new(&pool, leg.tenant).await?;
+    let bridge = FirstCancelBridge::new(&ready, &writer.store);
+    let cancel = leg.cancel();
+    let prepared = bridge.prepare(&cancel, SYMBOL).await.map_err(|error| anyhow!("{error:?}"))?;
+    assert_eq!(prepared.observed_accounting_version, first.accounting_version);
     // A canonical source write moves the version; old facts keep theirs.
     leg.canonical_mutation(0, 0).await?;
+    let outcome = super::durable(&pool, leg.tenant).await?;
+    let refused = prepared
+        .write(&bridge, &cancel, TransitionKind::Replace, Decimal::from(90), "stale snapshot")
+        .await;
+    assert_eq!(
+        refused,
+        Err(super::Refusal::Write(CommitFailure::Known(
+            "stale first-cancel accounting version".into()
+        )))
+    );
+    let mut commands = vec![READ];
+    commands.extend(super::WRITER_FENCE);
+    assert_trace(&writer, &commands);
+    writer.retires(&pool).await?;
+    assert_eq!(super::durable(&pool, leg.tenant).await?, outcome);
     let second = observe(&ready, &pool, &leg).await?;
     assert!(second.accounting_version > first.accounting_version);
     assert_eq!(second.r3, R3::Held(Hold::LegSell));
@@ -800,9 +906,20 @@ async fn local_r1_r3_snapshot_is_bound_to_its_read_and_version(pool: PgPool) -> 
     assert_eq!(lost.proxy.autocommit_acks_dropped(), 1);
     assert_trace(&lost, &[READ]);
     lost.retires(&pool).await?;
+
+    // The original client must physically retire after a read deadline even
+    // when the transport remains connected and has no response to forward.
+    let silent = Wire::new(&pool, leg.tenant).await?;
+    silent.proxy.set_mode(ProxyMode::Blackhole);
+    let started = tokio::time::Instant::now();
+    let refused =
+        evaluate(&ready, &silent.store, &leg.account, leg.position, SYMBOL, &leg.stop).await;
+    assert_eq!(refused, Err(NoSnapshot::Read));
+    assert!(started.elapsed() >= COMMIT_BOUND);
+    silent.retires(&pool).await?;
     let after = observe(&ready, &pool, &leg).await?;
     assert_eq!(after, second);
-    eprintln!("SPOT_LOCAL_R1_R3 stale_version=kept foreign_owner=refused lost_read=no_snapshot");
+    eprintln!("SPOT_LOCAL_R1_R3 stale_version=kept stale_writer=refused foreign_owner=refused lost_read=no_snapshot timed_out_owner=retired");
     Ok(())
 }
 
