@@ -287,6 +287,67 @@ async fn cancel_shadow_keeps_wrong_targets_and_contradictions_unresolved(pool: P
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
+async fn cancel_shadow_keeps_evidence_only_no_send_conflicts(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let s = scope(&f);
+    let journal = PgJournalBackend::new(&pool, s.tenant);
+    install(&pool).await;
+
+    let mut cancels = pending_cancels(&journal, s, "700", 1).await;
+    let contradictory = OutcomeRow {
+        not_sent: true,
+        venue_evidence: Some(serde_json::json!({"opaque_fixture_evidence": "retained"})),
+        ..OutcomeRow::default()
+    };
+    cancels[0].outcome = Some(contradictory.clone());
+    for _ in 0..2 {
+        journal.commit(&cancels[0]).await.unwrap();
+        assert_eq!(group(&pool, s, "700").await, (1, 1, false));
+        assert_leg(&pool, s, (1, 1)).await;
+    }
+    let id = cancels[0].intent.intent_id;
+    let raw: bool = sqlx::query_scalar(
+        "SELECT not_sent AND venue_outcome IS NULL AND venue_evidence IS NOT NULL
+         FROM order_intents WHERE intent_id=$1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(raw);
+
+    let original = batch(s, IntentKind::Exit, None);
+    journal.commit(&original).await.unwrap();
+    let link = linked_sell(&f, &original.intent);
+    let mut terminal = zero_execution_order("700", "CANCELED", OrderPhase::Terminal);
+    terminal.client_order_id = link.client_order_id.clone();
+    f.ledger.record_order(&terminal, &link, seen(1)).await.unwrap();
+    assert_eq!(group(&pool, s, "700").await, (1, 1, true));
+    assert_eq!(members(&pool, s, "700").await, [(id, true, true)]);
+    assert_leg(&pool, s, (0, 1)).await;
+
+    let mut unbound = batch(s, IntentKind::Cancel, Some("700"));
+    unbound.intent.position_id = None;
+    unbound.outcome = Some(OutcomeRow { not_sent: true, ..OutcomeRow::default() });
+    journal.commit(&unbound).await.unwrap();
+    assert!(!audit(&pool, s).await.unwrap().ambiguous_unbound);
+    unbound.outcome = Some(contradictory);
+    journal.commit(&unbound).await.unwrap();
+    assert!(audit(&pool, s).await.unwrap().ambiguous_unbound);
+    let unresolved: (Option<Uuid>, Option<String>, bool, bool) = sqlx::query_as(
+        "SELECT position_id, symbol, pending, conflict
+         FROM cancel_shadow_members WHERE intent_id=$1",
+    )
+    .bind(unbound.intent.intent_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unresolved, (None, None, true, true));
+    assert_leg(&pool, s, (0, 1)).await;
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
 async fn cancel_shadow_rolls_back_and_preserves_uncertain_commit_semantics(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let s = scope(&f);

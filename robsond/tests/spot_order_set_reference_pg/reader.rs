@@ -4,8 +4,10 @@ use uuid::Uuid;
 const PAGE_SIZE: usize = 2;
 const PAGE: &str = r#"
 SELECT i.intent_id, i.kind,
-       i.not_sent AND i.venue_outcome IS NULL AND n.intent_id IS NULL AS no_send,
-       (i.not_sent AND (i.venue_outcome IS NOT NULL OR n.intent_id IS NOT NULL))
+        i.not_sent AND i.venue_outcome IS NULL AND i.venue_evidence IS NULL
+          AND n.intent_id IS NULL AS no_send,
+        (i.not_sent AND (i.venue_outcome IS NOT NULL OR i.venue_evidence IS NOT NULL
+                       OR n.intent_id IS NOT NULL))
          OR (n.intent_id IS NOT NULL AND NOT COALESCE(
               n.tenant_id=$1 AND n.venue_id=$2 AND n.account_scope=$3 AND n.symbol=$5
                AND n.position_id=$4 AND n.owner='leg' AND n.client_order_id=i.client_order_id
@@ -311,7 +313,7 @@ impl Snapshot {
             "SELECT EXISTS(SELECT 1 FROM order_intents i
              WHERE i.tenant_id=$1 AND i.venue_id=$2 AND i.account_scope=$3
                AND i.position_id IS NULL AND i.kind='cancel'
-               AND (NOT i.not_sent OR i.venue_outcome IS NOT NULL
+                AND (NOT i.not_sent OR i.venue_outcome IS NOT NULL OR i.venue_evidence IS NOT NULL
                     OR EXISTS(SELECT 1 FROM venue_orders o WHERE o.intent_id=i.intent_id)))",
         )
         .bind(self.scope.tenant)
