@@ -34,6 +34,21 @@ CREATE TABLE cancel_shadow_legs (
     PRIMARY KEY (tenant_id, venue_id, account_scope, symbol, position_id)
 );
 
+CREATE TABLE cancel_shadow_unbound (
+    tenant_id uuid NOT NULL, venue_id text NOT NULL, account_scope text NOT NULL,
+    active_count bigint NOT NULL CHECK (active_count >= 0),
+    conflict_count bigint NOT NULL CHECK (conflict_count >= 0),
+    PRIMARY KEY (tenant_id, venue_id, account_scope)
+);
+
+CREATE TABLE cancel_shadow_ungroupable (
+    tenant_id uuid NOT NULL, venue_id text NOT NULL, account_scope text NOT NULL,
+    symbol text NOT NULL, position_id uuid NOT NULL,
+    active_count bigint NOT NULL CHECK (active_count >= 0),
+    conflict_count bigint NOT NULL CHECK (conflict_count >= 0),
+    PRIMARY KEY (tenant_id, venue_id, account_scope, symbol, position_id)
+);
+
 CREATE TABLE cancel_shadow_terminal_work (
     work_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id uuid NOT NULL, venue_id text NOT NULL, account_scope text NOT NULL,
@@ -124,6 +139,8 @@ DECLARE
     has_named_row boolean;
     is_pending boolean;
     is_conflict boolean;
+    pending_delta bigint;
+    conflict_delta bigint;
 BEGIN
     SELECT l.symbol INTO k.symbol FROM balance_legs l
     WHERE (l.position_id, l.tenant_id, l.venue_id, l.account_scope)
@@ -158,11 +175,36 @@ BEGIN
     ON CONFLICT (intent_id) DO UPDATE
     SET pending = excluded.pending, conflict = excluded.conflict;
 
-    -- Undefined scope remains an explicit uncertainty in the member row.
-    IF k.position_id IS NOT NULL AND k.symbol IS NOT NULL AND k.target_id IS NOT NULL THEN
-        PERFORM cancel_shadow_adjust(k,
-            is_pending::integer - coalesce(prior.pending::integer, 0),
-            is_conflict::integer - coalesce(prior.conflict::integer, 0), NULL);
+    pending_delta := is_pending::integer - coalesce(prior.pending::integer, 0);
+    conflict_delta := is_conflict::integer - coalesce(prior.conflict::integer, 0);
+    IF pending_delta = 0 AND conflict_delta = 0 THEN
+        RETURN;
+    END IF;
+
+    IF k.position_id IS NULL OR k.symbol IS NULL THEN
+        -- A raw target ID does not supply a symbol or authorize attribution.
+        UPDATE cancel_shadow_unbound AS a
+        SET active_count = a.active_count + pending_delta,
+            conflict_count = a.conflict_count + conflict_delta
+        WHERE (a.tenant_id, a.venue_id, a.account_scope)
+            = (k.tenant_id, k.venue_id, k.account_scope);
+        IF NOT FOUND THEN
+            INSERT INTO cancel_shadow_unbound
+            VALUES (k.tenant_id, k.venue_id, k.account_scope, pending_delta, conflict_delta);
+        END IF;
+    ELSIF k.target_id IS NULL THEN
+        UPDATE cancel_shadow_ungroupable AS l
+        SET active_count = l.active_count + pending_delta,
+            conflict_count = l.conflict_count + conflict_delta
+        WHERE (l.tenant_id, l.venue_id, l.account_scope, l.symbol, l.position_id)
+            = (k.tenant_id, k.venue_id, k.account_scope, k.symbol, k.position_id);
+        IF NOT FOUND THEN
+            INSERT INTO cancel_shadow_ungroupable
+            VALUES (k.tenant_id, k.venue_id, k.account_scope, k.symbol, k.position_id,
+                    pending_delta, conflict_delta);
+        END IF;
+    ELSE
+        PERFORM cancel_shadow_adjust(k, pending_delta, conflict_delta, NULL);
     END IF;
 END;
 $$;
