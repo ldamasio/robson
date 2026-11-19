@@ -6,6 +6,7 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 mod cold_source;
+pub(crate) mod warm;
 
 /// Private opt-in owner and structural binding for journal maintenance. Only
 /// an isolated integration supplies one; it confers no readiness.
@@ -69,6 +70,17 @@ pub(crate) struct ExpectedGeneration<'a> {
     pub(crate) source_audit_id: Uuid,
 }
 
+impl ExpectedGeneration<'_> {
+    pub(crate) fn is_valid(&self) -> bool {
+        !(self.venue.as_str() != VenueId::BINANCE_SPOT
+            || self.account_scope.trim().is_empty()
+            || self.tenant_id.is_nil()
+            || self.generation_id.is_nil()
+            || self.process_epoch.is_nil()
+            || self.source_audit_id.is_nil())
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ObservedGeneration {
     pub(crate) generation_id: Uuid,
@@ -89,13 +101,7 @@ pub(crate) async fn observe_generation(
     connection: &mut PgConnection,
     expected: ExpectedGeneration<'_>,
 ) -> Result<Option<ObservedGeneration>, sqlx::Error> {
-    if expected.venue.as_str() != VenueId::BINANCE_SPOT
-        || expected.account_scope.trim().is_empty()
-        || expected.tenant_id.is_nil()
-        || expected.generation_id.is_nil()
-        || expected.process_epoch.is_nil()
-        || expected.source_audit_id.is_nil()
-    {
+    if !expected.is_valid() {
         return Ok(None);
     }
     let row = sqlx::query_as::<_, (Uuid, Uuid, Uuid, i64)>(READ)
