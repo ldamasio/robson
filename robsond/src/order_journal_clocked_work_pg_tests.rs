@@ -50,7 +50,12 @@ async fn journal_wire_and_nested_work_are_separately_measured(pool: PgPool) -> R
         let executions = wire.proxy.stats().statements - before;
         let parses = wire.proxy.prepared_statement_parses() - before_parses;
         ensure!(wire.proxy.query_trace_dropped() == 0 && executions == 7);
-        ensure!(trace.len() == 7 && trace[0] == "BEGIN" && is_commit(&trace[6]));
+        let begin = if clocked {
+            "BEGIN ISOLATION LEVEL READ COMMITTED"
+        } else {
+            "BEGIN"
+        };
+        ensure!(trace.len() == 7 && trace[0] == begin && is_commit(&trace[6]));
         ensure!(trace[5].trim_start().starts_with(if clocked {
             HELPER
         } else {

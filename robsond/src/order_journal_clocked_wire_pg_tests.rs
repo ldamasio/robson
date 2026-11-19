@@ -504,3 +504,38 @@ async fn lost_commit_acknowledgement_is_uncertain_and_durable(pool: PgPool) -> R
     ensure!(version(&pool, scope.tenant).await? == before + 1, "one accounting version");
     Ok(())
 }
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn clocked_transaction_declares_read_committed_despite_session_default(
+    pool: PgPool,
+) -> Result<()> {
+    let scope = scope(&pool).await?;
+    let wire = Wire::new(&pool, scope.tenant).await?;
+    let writer = &wire.store.pool;
+    sqlx::query("SET default_transaction_isolation TO 'repeatable read'")
+        .execute(writer)
+        .await?;
+    let session_default: String = sqlx::query_scalar("SHOW default_transaction_isolation")
+        .fetch_one(writer)
+        .await?;
+    ensure!(session_default == "repeatable read");
+    wire.proxy.enable_exact_query_trace(12);
+    let (batch, input) = one(&scope, "j2b-isolation")?;
+    let result = wire.store.commit_clocked(&batch, &input).await;
+    ensure!(
+        result.as_ref().is_ok_and(|r| r.len() == 1 && r[0].daily_units == 1),
+        "the real M38 projection accepted the clocked transaction: {result:?}"
+    );
+    let trace = wire.proxy.query_trace();
+    ensure!(
+        wire.proxy.query_trace_dropped() == 0
+            && trace.len() == 7
+            && trace[0] == "BEGIN ISOLATION LEVEL READ COMMITTED"
+            && trace[5].trim_start().starts_with(HELPER)
+            && is_commit(&trace[6]),
+        "explicit transaction isolation replaced BEGIN in the same seven statements: {trace:?}"
+    );
+    ensure!(wire.identity().is_ok(), "the original session was retained");
+    Ok(())
+}

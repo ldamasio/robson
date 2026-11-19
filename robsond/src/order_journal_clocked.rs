@@ -422,7 +422,7 @@ impl PgJournalBackend {
         }
         let mut tx = write
             .connection()
-            .begin()
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
             .instrument(
                 tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
             )
