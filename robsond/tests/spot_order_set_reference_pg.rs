@@ -2,6 +2,8 @@
 //! authority.
 #![cfg(feature = "postgres")]
 
+#[path = "spot_order_set_reference_pg/cancel_shadow_tests.rs"]
+mod cancel_shadow_tests;
 #[allow(
     dead_code,
     reason = "shared ledger fixture includes controls for other targets"
@@ -10,6 +12,8 @@
 mod fixture;
 #[path = "spot_order_set_reference_pg/reader.rs"]
 mod reader;
+#[path = "spot_order_set_reference_pg/sell_projection_tests.rs"]
+mod sell_projection_tests;
 
 use std::time::Duration;
 
