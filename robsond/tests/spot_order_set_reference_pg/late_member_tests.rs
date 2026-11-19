@@ -6,7 +6,11 @@ use robson_exec::{
     venue::VenueId,
 };
 use rust_decimal_macros::dec;
-use sqlx::{types::chrono::NaiveDate, PgConnection};
+use sqlx::{
+    pool::PoolConnection,
+    types::chrono::{DateTime, NaiveDate, Utc},
+    PgConnection, Postgres,
+};
 
 use super::*;
 
@@ -219,5 +223,228 @@ async fn exact_late_sell_member_moves_only_the_identified_native_leg(
     eprintln!("SPOT-LATE-MEMBER repair_one_wire journal_bound_ms=500 work={measured:?}");
     drop(actor);
     actor_pool.close().await;
+    Ok(())
+}
+
+type Backend = (i32, DateTime<Utc>);
+
+async fn backend(conn: &mut PgConnection) -> anyhow::Result<Backend> {
+    Ok(sqlx::query_as(
+        "SELECT pid,backend_start FROM pg_stat_activity
+         WHERE pid=pg_backend_pid() AND datname=current_database()",
+    )
+    .fetch_one(conn)
+    .await?)
+}
+
+/// Blockers of one exact backend while it lock-waits inside the repair statement.
+async fn repair_blockers(pool: &PgPool, who: Backend) -> anyhow::Result<Option<Vec<i32>>> {
+    Ok(sqlx::query_scalar(
+        "SELECT pg_blocking_pids(a.pid) FROM pg_stat_activity a
+         WHERE a.pid=$1 AND a.backend_start=$2 AND a.datname=current_database()
+           AND a.state='active' AND a.wait_event_type='Lock' AND a.query=$3",
+    )
+    .bind(who.0)
+    .bind(who.1)
+    .bind(REPAIR)
+    .fetch_optional(pool)
+    .await?)
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL"]
+async fn exact_late_sell_member_competing_repairs_serialize_once(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    empty_budget::initialize(&pool, seen(0).at).await?;
+    let fixture = Fixture::new(&pool).await;
+    let owner = scope(&fixture);
+    let journal = PgJournalBackend::new(&pool, owner.tenant);
+    let late = Scope { position: Uuid::now_v7(), ..owner };
+    let missing = Scope { position: Uuid::now_v7(), ..owner };
+    let first = batch(late, IntentKind::Exit, None);
+    let other = batch(missing, IntentKind::Exit, None);
+    let first_id = first.intent.intent_id;
+    let other_id = other.intent.intent_id;
+    bounded_write(&journal, &first).await?;
+    bounded_write(&journal, &other).await?;
+
+    let ready = initialize(&pool, ReplayOrder::TargetsFirst, None).await?;
+    let generation = ready.generation();
+    let before = exact_unbound(vec![first_id, other_id]);
+    admit_late_leg(&fixture, &journal, late).await?;
+    let warm = ready
+        .read(&pool, late, None)
+        .await?
+        .context("fenced warm late leg after admission")?;
+    let cold = audit(&pool, late).await.map_err(|e| anyhow!("cold late ledger: {e:?}"))?;
+    ensure!(
+        cold.version == warm.facts.accounting_version
+            && warm.facts.leg_sell == 0
+            && warm.unbound_sell == 2
+            && unbound_sell_identities(&pool, owner).await? == before,
+        "before the race both original holds remain"
+    );
+
+    let mut contenders: Vec<(PoolConnection<Postgres>, Backend)> = Vec::new();
+    for _ in 0..2 {
+        let mut conn = pool.acquire().await?;
+        sqlx::query("SELECT set_config('robson_test.sell_shadow_trace','on',false)")
+            .execute(&mut *conn)
+            .await?;
+        let id = backend(&mut conn).await?;
+        contenders.push((conn, id));
+    }
+    let (mut b, b_id) = contenders.pop().context("second contender")?;
+    let (mut a, a_id) = contenders.pop().context("first contender")?;
+    ensure!(a_id.0 != b_id.0, "contenders are distinct native sessions");
+
+    let mut holder = pool.begin().await?;
+    let holder_id = backend(&mut holder).await?;
+    sqlx::query("SELECT 1 FROM accounting_state WHERE tenant_id=$1 AND venue_id=$2 FOR UPDATE")
+        .bind(owner.tenant)
+        .bind(owner.venue)
+        .fetch_one(&mut *holder)
+        .await?;
+
+    let observe_and_release = async {
+        let queue = [holder_id.0, a_id.0, b_id.0];
+        let observed = timeout(Duration::from_millis(350), async {
+            loop {
+                let a_waits = repair_blockers(&pool, a_id).await?;
+                let b_waits = repair_blockers(&pool, b_id).await?;
+                if let (Some(x), Some(y)) = (a_waits, b_waits) {
+                    let queued = |own: i32, by: &[i32]| {
+                        !by.is_empty() && by.iter().all(|pid| *pid != own && queue.contains(pid))
+                    };
+                    if queued(a_id.0, &x)
+                        && queued(b_id.0, &y)
+                        && (x.contains(&holder_id.0) || y.contains(&holder_id.0))
+                    {
+                        break anyhow::Ok((x, y));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .context("both contenders never observed queued behind the holder");
+        holder.rollback().await?;
+        observed?
+    };
+    // Each repair has the original 500ms ceiling from its first poll,
+    // including the witnessed lock wait. No detached repair survives the test.
+    let (observed, a_done, b_done) = tokio::join!(
+        observe_and_release,
+        repair(&mut a, late, first_id),
+        repair(&mut b, late, first_id)
+    );
+    let (a_waits, b_waits) = observed?;
+    ensure!(a_done? && b_done?, "both competing repairs acknowledge idempotently");
+
+    let repaired = check(&pool, &ready, late).await?;
+    let after_cold = audit(&pool, late).await.map_err(|e| anyhow!("cold after race: {e:?}"))?;
+    ensure!(
+        repaired.facts.leg_sell == 1
+            && repaired.unbound_sell == 1
+            && repaired.facts.accounting_version == cold.version
+            && after_cold.version == cold.version
+            && cold_sells(&after_cold).leg.active == 1
+            && ready.generation() == generation
+            && unbound_sell_identities(&pool, owner).await? == exact_unbound(vec![other_id]),
+        "the race moves only the target once and the other hold survives"
+    );
+    let measured: Vec<(i32, i32, i32)> = sqlx::query_as(
+        "SELECT probes,member_rows,aggregate_rows FROM sell_shadow_work
+         WHERE source='late_exact_repair' ORDER BY work_id",
+    )
+    .fetch_all(&pool)
+    .await?;
+    ensure!(
+        measured == [(7, 1, 2)],
+        "exactly one membership/aggregate move under race: {measured:?}"
+    );
+    eprintln!(
+        "SPOT-LATE-MEMBER competing_repairs holder={} a={a_waits:?} b={b_waits:?} work={measured:?}",
+        holder_id.0
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL"]
+async fn exact_late_sell_member_native_arrival_owns_the_same_member(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    use robson_exec::venue_ledger::OrderLink;
+
+    empty_budget::initialize(&pool, seen(0).at).await?;
+    let fixture = Fixture::new(&pool).await;
+    let owner = scope(&fixture);
+    let late = Scope { position: Uuid::now_v7(), ..owner };
+    let journal = PgJournalBackend::new(&pool, owner.tenant);
+    let sell = batch(late, IntentKind::Exit, None);
+    let intent = sell.intent.intent_id;
+    bounded_write(&journal, &sell).await?;
+
+    let ready = initialize(&pool, ReplayOrder::TargetsFirst, None).await?;
+    let generation = ready.generation();
+    let original = check(&pool, &ready, owner).await?;
+    ensure!(original.unbound_sell == 1);
+    admit_late_leg(&fixture, &journal, late).await?;
+    let warm = ready.read(&pool, late, None).await?.context("warm late leg")?;
+    ensure!(warm.unbound_sell == 1 && warm.facts.leg_sell == 0);
+
+    let key = "992001";
+    let mut observed = zero_execution_order(key, "NEW", OrderPhase::Live);
+    observed.client_order_id.clone_from(&sell.intent.client_order_id);
+    let link = OrderLink {
+        owner: OrderOwner::Leg {
+            position_id: late.position,
+            intent_id: intent,
+            kind: LegOrderKind::Sell,
+        },
+        client_order_id: sell.intent.client_order_id.clone(),
+        account_scope: late.account.to_owned(),
+        ..unowned()
+    };
+    ensure!(
+        fixture.ledger.record_order(&observed, &link, seen(1)).await?.changed,
+        "native ledger must commit exact SELL arrival"
+    );
+    let now = check(&pool, &ready, late).await?;
+    let durable: (Uuid, Uuid, String, String) = sqlx::query_as(
+        "SELECT intent_id,position_id,side,owner FROM venue_orders
+         WHERE (tenant_id,venue_id,account_scope,symbol,exchange_order_id)=($1,$2,$3,$4,$5)",
+    )
+    .bind(owner.tenant)
+    .bind(owner.venue)
+    .bind(owner.account)
+    .bind(late.symbol)
+    .bind(key)
+    .fetch_one(&pool)
+    .await?;
+    ensure!(durable == (intent, late.position, "SELL".into(), "leg".into()));
+    ensure!(
+        now.unbound_sell == 0
+            && now.facts.leg_sell == 1
+            && unbound_sell_identities(&pool, owner).await?.is_empty(),
+        "exact native arrival moves the same liability without duplication"
+    );
+    let mut c = pool.acquire().await?;
+    ensure!(
+        !repair(&mut c, late, intent).await?,
+        "an already native-owned order must have no remaining active journal member to repair"
+    );
+    let stayed = check(&pool, &ready, late).await?;
+    ensure!(
+        stayed.unbound_sell == 0
+            && stayed.facts.leg_sell == 1
+            && stayed.facts.accounting_version == now.facts.accounting_version
+            && ready.generation() == generation
+    );
+    eprintln!(
+        "SPOT-LATE-MEMBER exact_native_arrival intent={intent} native={key} duplicate_members=0"
+    );
     Ok(())
 }
