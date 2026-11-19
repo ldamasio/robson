@@ -84,4 +84,3 @@ LEFT JOIN active a ON k.venue_id = 'binance:spot' AND k.descriptor = 'commission
 -- Preserve the revision for every key but gate the wide row without a second lookup.
 LEFT JOIN LATERAL (SELECT s.* WHERE a.symbol IS NOT NULL) AS s_active ON true
 ORDER BY k.venue_id, k.symbol, k.descriptor
-
