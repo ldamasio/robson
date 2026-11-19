@@ -1644,3 +1644,103 @@ async fn cold_generation_owner_caps_full_pager_with_no_false_terminal(pool: PgPo
     ));
     Ok(())
 }
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_install_entry_uses_real_rebuilt_position_hints(
+    pool: PgPool,
+) -> Result<()> {
+    use robson_exec::order_journal::{CommitFailure, JournalBackend};
+    let (request, _, _) = r2_install_fixture(&pool).await?;
+    let recoverable_hint = Uuid::now_v7();
+    let old_cancel = Uuid::now_v7();
+    sqlx::query(
+      "INSERT INTO public.order_intents
+       (intent_id,tenant_id,venue_id,account_scope,client_order_id,position_id,kind,params,created_at,not_sent)
+       VALUES($1,$2,'binance:spot',$3,$1::uuid::text,$4,'cancel','{}',now(),true)"
+    ).bind(old_cancel).bind(request.scope.tenant_id).bind(SCOPE).bind(recoverable_hint)
+      .execute(&pool).await?;
+    let cut = capture(&pool, &request, deadline())
+        .await
+        .map_err(|e| anyhow!("owner cut: {e:?}"))?;
+    let mut fence = FixtureFence::matching(request.restore);
+    let installed = install(&pool, &cut, &mut fence, deadline())
+        .await
+        .map_err(|e| anyhow!("install: {e:?}"))?;
+    let g = installed.generation;
+    let evidence:(Option<Uuid>,Option<Uuid>,bool,bool)=sqlx::query_as(
+        "SELECT source_position,position_id,pending,conflict FROM public.spot_order_set_cancel_members
+         WHERE (tenant_id,venue_id,account_scope,generation_id,intent_id)=($1,'binance:spot',$2,$3,$4)"
+    ).bind(g.tenant_id).bind(SCOPE).bind(g.generation_id).bind(old_cancel).fetch_one(&pool).await?;
+    ensure!(evidence == (Some(recoverable_hint), None, false, false));
+    let writer = crate::order_journal_store::PgJournalBackend::new(&pool, g.tenant_id)
+        .with_order_set_projection(g.clone());
+    let fresh = r2_local_entry(&pool, &g, Uuid::now_v7()).await?;
+    writer.commit(&fresh).await.map_err(|e| anyhow!("fresh native Entry: {e:?}"))?;
+    let refused = r2_local_entry(&pool, &g, recoverable_hint).await?;
+    ensure!(matches!(writer.commit(&refused).await, Err(CommitFailure::Known(_))));
+    let observed:(i64,bool,bool,bool)=sqlx::query_as(
+       "SELECT accounting_version,position_hints_complete,
+            EXISTS(SELECT 1 FROM public.balance_legs WHERE admission_intent_id=$2 AND position_id=$3),
+            EXISTS(SELECT 1 FROM public.order_intents WHERE intent_id=$4)
+        FROM public.spot_order_set_generation WHERE generation_id=$1"
+    ).bind(g.generation_id).bind(fresh.intent.intent_id).bind(fresh.intent.position_id)
+     .bind(refused.intent.intent_id).fetch_one(&pool).await?;
+    ensure!(observed == (request.accounting_version + 1, true, true, false), "{observed:?}");
+    Ok(())
+}
+
+async fn r2_local_entry(
+    pool: &PgPool,
+    g: &super::super::JournalGeneration,
+    position: Uuid,
+) -> Result<robson_exec::order_journal::JournalBatch> {
+    use chrono::{NaiveDate, Utc};
+    use robson_exec::order_journal::{
+        AdmissionRow, BalanceBatch, IntentKind, IntentRow, JournalBatch,
+    };
+    use rust_decimal::Decimal;
+    use std::sync::Arc;
+    let ledger = crate::venue_ledger_store::PgVenueLedger::new(pool, g.tenant_id);
+    let venue = robson_exec::venue::VenueId::new("binance:spot");
+    let id = Uuid::now_v7();
+    ledger.insert_route(position, &venue, &g.account_scope, Utc::now()).await?;
+    Ok(JournalBatch {
+        intent: IntentRow {
+            intent_id: id,
+            venue_id: "binance:spot".into(),
+            account_scope: g.account_scope.clone(),
+            client_order_id: id.to_string(),
+            position_id: Some(position),
+            kind: IntentKind::Entry,
+            cancels_order_id: None,
+            params: serde_json::json!({}),
+            created_at: Utc::now(),
+        },
+        attempts: vec![],
+        outcome: None,
+        balance: Some(BalanceBatch {
+            admission: Some(Arc::new(AdmissionRow {
+                position_id: position,
+                symbol: R2_SYMBOL.to_owned(),
+                decided_month: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+                taker_bps: Decimal::new(10, 0),
+                gap_bps: Decimal::new(10, 0),
+                notional_margin_bps: Decimal::new(2, 0),
+                min_notional: Decimal::new(10, 0),
+                lot_step: Decimal::new(1, 3),
+                fee_asset_policy: "base".into(),
+                envelope_source: "isolated-cold-entry".into(),
+                envelope_as_of: Utc::now(),
+                envelope_hash: "fixture".into(),
+                planned_qty: Decimal::ONE,
+                requested_qty: Decimal::ONE,
+                reference_price: Decimal::new(100, 0),
+                remainder_reserve: Decimal::new(1, 1),
+                admission_charge: Decimal::new(10, 0),
+                initial_trigger: Decimal::new(90, 0),
+            })),
+            handed_off: false,
+            commit_bound: Duration::from_millis(500),
+        }),
+    })
+}

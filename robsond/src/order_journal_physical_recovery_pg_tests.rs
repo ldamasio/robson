@@ -539,6 +539,11 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     let as_role: String =
         sqlx::query_scalar("SELECT current_user::text").fetch_one(&candidate).await?;
     ensure!(as_role == new_role);
+    if std::env::var("ROBSON_PHYSICAL_FAULT").as_deref() == Ok("post-admit-eof") {
+        // The supervisor already verified the new role and will close the
+        // HBA before destroying the exact restored fixture.
+        std::process::exit(68);
+    }
     let current = PgJournalBackend {
         pool: candidate.clone(),
         daemon_pool: restore.clone(),
