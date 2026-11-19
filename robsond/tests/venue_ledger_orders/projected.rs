@@ -399,11 +399,13 @@ async fn projected_native_order_checks_exact_prior_and_rolls_back_rejected_chang
         ),
     ] {
         sqlx::raw_sql(fault).execute(&pool).await?;
+        let projected_before = projection_snapshot(&pool,&b).await?;
         ensure!(matches!(
             ledger.record_order(&terminal,&link,later(1)).await,
             Err(LedgerError::Invariant(_))
         ), "fault did not refuse {fault}");
         ensure!(snapshot(&pool).await==before && version(&pool,&b).await?==v);
+        ensure!(projection_snapshot(&pool,&b).await? == projected_before);
         sqlx::raw_sql(repair).execute(&pool).await?;
         exact_reference(&pool,&b).await?;
     }
@@ -435,7 +437,7 @@ async fn projected_native_order_commit_loss_has_one_atomic_publication(pool: PgP
     ));
     let trace = proxy.query_trace();
     ensure!(proxy.stats().commit_acks_dropped == 1);
-    ensure!(trace.len() <= 9 && trace.last().is_some_and(|cmd| cmd == "COMMIT"), "{trace:?}");
+    ensure!(trace.len() == 8 && trace.last().is_some_and(|cmd| cmd == "COMMIT"), "{trace:?}");
     ensure!(trace.iter().filter(|cmd| cmd.contains("spot_order_set_generation")).count() == 1);
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -726,4 +728,112 @@ async fn projected_native_order_caller_abort_revokes_held_native_writer(
     ensure!(unlocked);
     ensure!(proxy.stats().connections >= 1);
     Ok(())
+}
+
+async fn projection_snapshot(pool: &PgPool, b: &JournalGeneration) -> Result<Vec<Vec<String>>> {
+    let mut tables = Vec::new();
+    for name in [
+        "generation",
+        "sell_intents",
+        "sell_orders",
+        "sell_legs",
+        "sell_symbols",
+        "sell_unbound",
+        "cancel_members",
+        "cancel_groups",
+        "cancel_legs",
+        "cancel_ungroupable",
+        "cancel_unbound",
+    ] {
+        let states = sqlx::query_scalar::<_, String>(&format!(
+            "SELECT row_to_json(q)::text FROM spot_order_set_{name} q
+             WHERE q.generation_id=$1 ORDER BY row_to_json(q)::text"
+        ))
+        .bind(b.generation_id)
+        .fetch_all(pool)
+        .await?;
+        tables.push(states);
+    }
+    Ok(tables)
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_native_order_checks_old_counts_even_with_zero_or_positive_net_delta(
+    pool: PgPool,
+) -> Result<()> {
+    let f = setup(&pool).await?;
+    let original = Uuid::now_v7();
+    let arriving = Uuid::now_v7();
+    let malformed_cancel = Uuid::now_v7();
+    journal(&pool, &f, original, "order-1", "exit", Some(f.position), None, false).await?;
+    journal(&pool, &f, arriving, "order-2", "exit", Some(f.position), None, false).await?;
+    journal(
+        &pool,
+        &f,
+        malformed_cancel,
+        "order-3",
+        "cancel",
+        Some(f.position),
+        Some("1"),
+        false,
+    )
+    .await?;
+    let first = f.record(1, Decimal::ZERO, OrderPhase::Live);
+    let linked_first = linked(&f, 1, original);
+    ensure!(f.ledger(&pool).record_order(&first, &linked_first, seen()).await?.changed);
+    let b = generation(&pool, &f).await?;
+    let ledger = f.ledger(&pool).with_native_order_set_projection(b.clone());
+    exact_reference(&pool, &b).await?;
+
+    let numeric = f.record(1, Decimal::ONE, OrderPhase::Live);
+    let fresh = f.record(2, Decimal::ZERO, OrderPhase::Live);
+    let named = f.record(3, Decimal::ZERO, OrderPhase::Live);
+    let next_link = linked(&f, 2, arriving);
+    let cancel_link = linked(&f, 3, malformed_cancel);
+    for (fault, repair, order, link) in [
+        (
+            "UPDATE spot_order_set_sell_legs SET potential_count=0",
+            "UPDATE spot_order_set_sell_legs SET potential_count=2",
+            &numeric,
+            &linked_first,
+        ),
+        (
+            "UPDATE spot_order_set_sell_legs SET potential_count=0",
+            "UPDATE spot_order_set_sell_legs SET potential_count=2",
+            &fresh,
+            &next_link,
+        ),
+        (
+            "UPDATE spot_order_set_cancel_groups SET pending_count=0 WHERE target_id='1'",
+            "UPDATE spot_order_set_cancel_groups SET pending_count=1 WHERE target_id='1'",
+            &named,
+            &cancel_link,
+        ),
+        (
+            "UPDATE spot_order_set_cancel_legs SET active_count=0",
+            "UPDATE spot_order_set_cancel_legs SET active_count=1",
+            &named,
+            &cancel_link,
+        ),
+    ] {
+        sqlx::raw_sql(fault).execute(&pool).await?;
+        let projection = projection_snapshot(&pool, &b).await?;
+        let native = snapshot(&pool).await;
+        ensure!(
+            matches!(
+                ledger.record_order(order,link,later(1)).await,
+                Err(LedgerError::Invariant(reason)) if reason.contains("projection membership refused")
+            ),
+            "expected prior undercount refusal: {fault}"
+        );
+        ensure!(
+            snapshot(&pool).await == native && projection_snapshot(&pool, &b).await? == projection
+        );
+        sqlx::raw_sql(repair).execute(&pool).await?;
+        exact_reference(&pool, &b).await?;
+    }
+    write(&pool, &ledger, &b, &numeric, &linked_first, later(2)).await?;
+    write(&pool, &ledger, &b, &fresh, &next_link, later(3)).await?;
+    write(&pool, &ledger, &b, &named, &cancel_link, later(4)).await
 }
