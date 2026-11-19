@@ -19,6 +19,7 @@ const SETTINGS: &str = include_str!("../sql/settings.sql");
 const CLAIM: &str = include_str!("claim.sql");
 const CONFIRM: &str = include_str!("confirm.sql");
 
+mod cold_load;
 mod commission;
 mod response;
 mod result;

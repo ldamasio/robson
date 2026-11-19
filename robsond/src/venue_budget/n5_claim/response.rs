@@ -5,9 +5,9 @@ use std::{fmt, marker::PhantomData};
 use chrono::{DateTime, Utc};
 use robson_connectors::binance::spot::SpotCommission;
 use robson_exec::{
-    balance_costs::{CostError, CostIdentity},
+    balance_costs::{CostError, CostIdentity, EvidenceIdentity},
     clock_records::RawClockCapture,
-    venue_clock::TickCapture,
+    venue_clock::{ClockDomain, TickCapture},
 };
 use serde::{
     de::{value::MapAccessDeserializer, MapAccess, Visitor},
@@ -85,14 +85,14 @@ struct Discount {
     discount: String,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct RetainedReceipt {
     format_version: u16,
     original: OriginalMark,
     commission: FeeFields,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct OriginalMark {
     epoch: Uuid,
     boot: Uuid,
@@ -178,6 +178,53 @@ pub(super) fn prepare_response(
         evidence: candidate.evidence().clone(),
         observed,
         payload,
+    })
+}
+
+/// Cold decode of one immutable retained receipt. The caller binds the
+/// original epoch, domain, oldest tick, as-of, and hash to its own columns.
+#[derive(Debug, Clone)]
+pub(super) struct RetainedResponse {
+    pub(super) original: RawClockCapture,
+    pub(super) observed: TickCapture,
+    pub(super) evidence: EvidenceIdentity,
+}
+
+pub(super) fn decode_retained(
+    payload: &[u8],
+    expected: &CostIdentity,
+    handoff: TickCapture,
+) -> Option<RetainedResponse> {
+    if payload.is_empty() || payload.len() > MAX_PAYLOAD_BYTES {
+        return None;
+    }
+    // Derived fields reject repeated keys; only the writer's exact compact output
+    // round-trips, so foreign, reordered, escaped, or padded spellings fail here.
+    let receipt: RetainedReceipt = serde_json::from_slice(payload).ok()?;
+    if receipt.format_version != RECEIPT_FORMAT_VERSION
+        || serde_json::to_vec(&receipt).ok()? != payload
+    {
+        return None;
+    }
+    let mark = &receipt.original;
+    let tick = |text: &str| text.parse::<i128>().ok().filter(|n| n.to_string() == text);
+    let original = RawClockCapture {
+        epoch: mark.epoch,
+        wall_seconds: mark.wall_seconds,
+        wall_nanoseconds: mark.wall_nanoseconds,
+        domain: ClockDomain::new(mark.boot, mark.offset_seconds, mark.offset_nanoseconds).ok()?,
+        before_ns: tick(&mark.before_ns)?,
+        after_ns: tick(&mark.after_ns)?,
+    };
+    let (observed, as_of) = response_time(original, handoff)?;
+    // Round-trip equality makes these bytes the retained commission object itself.
+    let commission = serde_json::to_vec(&receipt.commission).ok()?;
+    let parsed: SpotCommission = serde_json::from_slice(&commission).ok()?;
+    let candidate = parsed.cost_candidate(expected.clone(), as_of).ok()?;
+    Some(RetainedResponse {
+        original,
+        observed,
+        evidence: candidate.evidence().clone(),
     })
 }
 

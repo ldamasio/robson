@@ -233,6 +233,47 @@ fn assert_claim_sql(sql: &[String], committed: bool) {
     }
 }
 
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL"]
+async fn cold_raw_read_projects_only_active_claim_columns(pool: PgPool) {
+    let seeded = seed(&pool, true).await;
+    let measured = Measured::start(&pool).await;
+    let active = std::slice::from_ref(&seeded.key.symbol);
+    let rows = super::cold_load::read_rows(&measured.pool, active, deadline(), &measured.trace)
+        .await
+        .unwrap();
+    let [row] = rows.as_slice() else {
+        panic!("expected one registered key");
+    };
+    assert!(row.get::<bool, _>("active"));
+    assert!(!row.get::<bool, _>("invalid_active_projection"));
+    assert_eq!(row.get::<Uuid, _>("claim_id"), seeded.prior.identity.claim_id);
+    assert_eq!(row.get::<String, _>("snapshot_uid"), u64::MAX.to_string());
+    assert_eq!(row.get::<Vec<u8>, _>("snapshot_payload"), SNAPSHOT);
+
+    let rows = super::cold_load::read_rows(
+        &measured.pool,
+        &["NOTREGISTERED".to_owned()],
+        deadline(),
+        &measured.trace,
+    )
+    .await
+    .unwrap();
+    let [row] = rows.as_slice() else {
+        panic!("the compact manifest row was lost");
+    };
+    assert!(!row.get::<bool, _>("active"));
+    assert_eq!(row.get::<i64, _>("state_revision"), seeded.prior.revision);
+    assert!(row.get::<Option<Uuid>, _>("claim_id").is_none());
+    assert!(row.get::<Option<Vec<u8>>, _>("snapshot_payload").is_none());
+
+    let sql = measured.wire(2, 2, 0);
+    assert!(sql
+        .iter()
+        .all(|sql| sql.starts_with("-- A SINGLE ANCHORED READ") && sql.contains("LIMIT 4097")));
+    measured.retired(&pool, 2).await;
+}
+
 fn assert_observation(actual: &ClaimObservation, revision: i64, identity: &ClaimIdentity) {
     assert_eq!(actual.revision, revision);
     assert_eq!(actual.identity.claim_id, identity.claim_id);

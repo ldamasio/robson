@@ -143,3 +143,42 @@ fn malformed_or_incomparable_response_marks_produce_no_snapshot() {
     )
     .is_some());
 }
+
+#[test]
+fn retained_receipt_decodes_only_the_exact_writer_output() {
+    let (raw, expected, handoff) = attempt();
+    let snapshot = prepare_response(FEE_RESPONSE.as_bytes(), raw, &expected, handoff).unwrap();
+    let decoded = decode_retained(&snapshot.payload, &expected, handoff).unwrap();
+    assert_eq!(decoded.original, raw);
+    assert_eq!(decoded.observed, snapshot.observed);
+    assert_eq!(decoded.evidence, snapshot.evidence);
+    let stored = std::str::from_utf8(&snapshot.payload).unwrap();
+    let mut padded = snapshot.payload.clone();
+    padded.push(b' ');
+    let pretty =
+        serde_json::to_vec_pretty(&serde_json::from_slice::<Value>(&snapshot.payload).unwrap())
+            .unwrap();
+    let version = r#""format_version":1"#;
+    let before = r#""before_ns":"20000000000""#;
+    for invalid in [
+        Vec::new(),
+        padded,
+        pretty,
+        vec![b' '; MAX_PAYLOAD_BYTES + 1],
+        stored.replace(version, r#""format_version":2"#).into_bytes(),
+        stored.replace(version, r#""format_version":1,"format_version":1"#).into_bytes(),
+        stored.replace(version, r#""format_version":1,"extra":0"#).into_bytes(),
+        stored.replace(r#""epoch""#, r#""\u0065poch""#).into_bytes(),
+        stored.replace(before, r#""before_ns":"020000000000""#).into_bytes(),
+        stored.replace(before, r#""before_ns":"+20000000000""#).into_bytes(),
+        stored.replace(before, r#""before_ns":20000000000"#).into_bytes(),
+        stored
+            .replace(r#""maker":"0.0010""#, r#""maker":"0.0010","maker":"0.0010""#)
+            .into_bytes(),
+        stored.replace("ETHUSDT", "BTCUSDT").into_bytes(),
+    ] {
+        assert!(decode_retained(&invalid, &expected, handoff).is_none());
+    }
+    let later = TickCapture::new(raw.domain, 21, 0).unwrap();
+    assert!(decode_retained(&snapshot.payload, &expected, later).is_none());
+}
