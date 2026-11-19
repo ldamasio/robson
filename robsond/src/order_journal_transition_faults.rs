@@ -38,16 +38,16 @@ fn pause() -> (RefCell<Option<Pause>>, oneshot::Receiver<()>, oneshot::Sender<()
     (RefCell::new(Some(Pause { reached, release })), wait, resume)
 }
 
-struct Wire {
-    proxy: DbProxy,
-    store: PgJournalBackend,
+pub(super) struct Wire {
+    pub(super) proxy: DbProxy,
+    pub(super) store: PgJournalBackend,
     pid: i32,
     birth: String,
     baseline: u64,
 }
 
 impl Wire {
-    async fn new(pool: &PgPool, tenant: Uuid) -> Result<Self> {
+    pub(super) async fn new(pool: &PgPool, tenant: Uuid) -> Result<Self> {
         let options = pool.connect_options();
         let upstream = tokio::net::lookup_host((options.get_host(), options.get_port()))
             .await?
@@ -110,7 +110,7 @@ impl Wire {
         }
     }
 
-    async fn retires(&self, observer: &PgPool) -> Result<()> {
+    pub(super) async fn retires(&self, observer: &PgPool) -> Result<()> {
         timeout(Duration::from_secs(2), async {
             loop {
                 let present: bool = sqlx::query_scalar("SELECT EXISTS(
@@ -127,7 +127,7 @@ impl Wire {
     }
 }
 
-async fn durable(pool: &PgPool, tenant: Uuid) -> Result<Value> {
+pub(super) async fn durable(pool: &PgPool, tenant: Uuid) -> Result<Value> {
     Ok(sqlx::query_scalar(
         "SELECT jsonb_build_object('version',(SELECT version FROM accounting_state
           WHERE tenant_id=$1 AND venue_id=$2),

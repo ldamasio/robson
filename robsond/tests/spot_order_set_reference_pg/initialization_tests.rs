@@ -14,86 +14,23 @@ use robson_exec::{
 };
 use robson_testkit::db_proxy::{DbProxy, ProxyMode};
 use rust_decimal::Decimal;
-use sqlx::{ConnectOptions, Executor, PgConnection};
-use tokio::{
-    sync::oneshot,
-    time::{timeout, timeout_at, Instant},
-};
+use tokio::time::timeout;
 
+use self::ready::{
+    initialize, initialize_at, probe, statement, Keys, ProjectionReady, ReplayOrder, Stage,
+    ORDER_SET_COLUMNS,
+};
 use super::sell_nested_work_tests::seed_history;
 use super::{
     audit, batch, cancel_conflict, cold_cancels, cold_sells, empty_budget, linked_sell, scope,
     seen, terminal, through_proxy_limit, unowned, zero_execution_order, AttemptRow, Fixture, Hot,
     IntentKind, JournalBackend, OrderPhase, OutcomeRow, PgJournalBackend, PgPool, Scope, Uuid,
-    VenueOutcome, HOT,
+    VenueOutcome,
 };
 use crate::fixture::retired;
 
-const FIXTURE_REVISION: &str = "e3322d200cccf21eed13d6b3f4a3ebfbff1f835e";
-const FENCE: &str = "LOCK TABLE accounting_state, leg_routes, balance_legs, order_intents,
-                    submit_attempts, venue_orders IN ACCESS EXCLUSIVE MODE NOWAIT";
-const CONFIGURE: &str = "SELECT set_config('lock_timeout','100ms',true),
-                         set_config('statement_timeout','2s',true),
-                         set_config('idle_in_transaction_session_timeout','2s',true)";
-const GENERATION_DDL: &str = "CREATE TABLE spot_shadow_initialization (
-        generation uuid PRIMARY KEY, fixture_database name NOT NULL, fixture_revision text NOT NULL,
-        coverage jsonb NOT NULL)";
-const INITIALIZATION_ACK: &str = "SELECT EXISTS (SELECT FROM spot_shadow_initialization
-       WHERE generation=$1 AND fixture_database=current_database()
-         AND fixture_database=$2::name AND fixture_revision=$3)";
-const REPLAY: &str = include_str!("initialization_replay.sql");
-
-#[derive(Debug)]
-struct ProjectionReady {
-    generation: Uuid,
-    database: String,
-}
-
-#[derive(Clone, Copy)]
-enum ReplayOrder {
-    MembersFirst,
-    TargetsFirst,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Stage {
-    BeforeFence,
-    AfterFence,
-    BeforeConfirmation,
-}
-
-struct InitProbe {
-    stage: Stage,
-    entered: oneshot::Sender<()>,
-    proceed: oneshot::Receiver<()>,
-}
-
-fn probe(stage: Stage) -> (InitProbe, oneshot::Receiver<()>, oneshot::Sender<()>) {
-    let (enter, entered) = oneshot::channel();
-    let (proceed, release) = oneshot::channel();
-    (InitProbe { stage, entered: enter, proceed: release }, entered, proceed)
-}
-
-async fn pause(probe: &mut Option<InitProbe>, stage: Stage) -> anyhow::Result<()> {
-    if probe.as_ref().is_some_and(|value| value.stage == stage) {
-        let value = probe.take().context("initializer staging control")?;
-        value
-            .entered
-            .send(())
-            .map_err(|_| anyhow!("missing initializer stage observer"))?;
-        value.proceed.await?;
-    }
-    Ok(())
-}
-
-impl ReplayOrder {
-    fn name(self) -> &'static str {
-        match self {
-            Self::MembersFirst => "members_first",
-            Self::TargetsFirst => "targets_first",
-        }
-    }
-}
+#[path = "initialized_fixture.rs"]
+mod ready;
 
 #[derive(Debug, sqlx::FromRow)]
 struct InitializedOrderSet {
@@ -103,6 +40,16 @@ struct InitializedOrderSet {
     unbound_sell_conflicts: i64,
 }
 
+fn keys(s: Scope) -> Keys<'static> {
+    Keys {
+        tenant: s.tenant,
+        venue: s.venue,
+        account: s.account,
+        position: s.position,
+        symbol: s.symbol,
+    }
+}
+
 impl ProjectionReady {
     async fn read(
         &self,
@@ -110,119 +57,17 @@ impl ProjectionReady {
         s: Scope,
         stop: Option<&str>,
     ) -> anyhow::Result<Option<InitializedOrderSet>> {
-        // The two aggregate namespaces and generation come from exact keys.
-        // A missing generation suppresses the entire row, including zeroes.
-        let sql = format!(
-            "SELECT hot.*, coalesce(u.potential_sell, 0::bigint) AS unbound_sell,
-                    coalesce(u.conflict_count, 0::bigint) AS unbound_sell_conflicts
-             FROM spot_shadow_initialization g
-             CROSS JOIN LATERAL ({HOT} AND g.generation=$7 OFFSET 0) hot
-             LEFT JOIN sell_shadow_unbound u
-               ON (u.tenant_id,u.venue_id,u.account_scope)=($1,$2,$3)
-             WHERE g.generation=$7 AND g.fixture_database=current_database()
-               AND g.fixture_database=$8::name AND g.fixture_revision=$9"
-        );
-        let facts = sqlx::query_as(&sql)
-            .bind(s.tenant)
-            .bind(s.venue)
-            .bind(s.account)
-            .bind(s.position)
-            .bind(s.symbol)
-            .bind(stop)
-            .bind(self.generation)
-            .bind(&self.database)
-            .bind(FIXTURE_REVISION)
-            .fetch_optional(pool)
-            .await?;
-        Ok(facts)
+        let sql = statement(ORDER_SET_COLUMNS, "");
+        Ok(self.query_as(&sql, keys(s), stop).fetch_optional(pool).await?)
     }
-}
 
-async fn own_connection(pool: &PgPool) -> anyhow::Result<PgConnection> {
-    Ok(pool.connect_options().connect().await?)
-}
-
-async fn initialize(
-    pool: &PgPool,
-    replay_order: ReplayOrder,
-    fail_member: Option<&str>,
-) -> anyhow::Result<ProjectionReady> {
-    initialize_at(pool, replay_order, fail_member, Duration::from_secs(5), None).await
-}
-
-async fn initialize_at(
-    pool: &PgPool,
-    replay_order: ReplayOrder,
-    fail_member: Option<&str>,
-    limit: Duration,
-    mut probe: Option<InitProbe>,
-) -> anyhow::Result<ProjectionReady> {
-    let deadline = Instant::now() + limit;
-    let generation = Uuid::now_v7();
-    let database = pool.connect_options().get_database().context("fixture database")?.to_owned();
-    let ready = ProjectionReady { generation, database };
-    let mut commit_started = false;
-    let initialize = async {
-        let mut conn = own_connection(pool).await?;
-        sqlx::raw_sql("BEGIN ISOLATION LEVEL READ COMMITTED").execute(&mut conn).await?;
-        sqlx::query(CONFIGURE).execute(&mut conn).await?;
-        pause(&mut probe, Stage::BeforeFence).await?;
-        // The first relation reference locks the full exact source set. All
-        // data reads and observer DDL are below this cutpoint.
-        sqlx::raw_sql(FENCE).execute(&mut conn).await?;
-        pause(&mut probe, Stage::AfterFence).await?;
-        sqlx::raw_sql(include_str!("cancel_shadow.sql")).execute(&mut conn).await?;
-        sqlx::raw_sql(include_str!("sell_shadow.sql")).execute(&mut conn).await?;
-        sqlx::raw_sql(GENERATION_DDL).execute(&mut conn).await?;
-        if let Some(member) = fail_member {
-            sqlx::query("INSERT INTO sell_shadow_fail_member (member_key) VALUES ($1)")
-                .bind(member)
-                .execute(&mut conn)
-                .await?;
-        }
-        sqlx::query("SELECT set_config('robson_test.replay_cancel_order',$1,true)")
-            .bind(replay_order.name())
-            .execute(&mut conn)
-            .await?;
-        sqlx::raw_sql(REPLAY).execute(&mut conn).await?;
-        sqlx::query(
-            "INSERT INTO spot_shadow_initialization VALUES (
-            $1,current_database(),$2,current_setting('robson_test.replay_coverage',true)::jsonb)",
-        )
-        .bind(ready.generation)
-        .bind(FIXTURE_REVISION)
-        .execute(&mut conn)
-        .await?;
-        commit_started = true;
-        let completed = conn.execute(sqlx::raw_sql("COMMIT")).await?;
-        ensure!(completed.rows_affected() == 0);
-        anyhow::Ok(())
-    };
-    let failure = match timeout_at(deadline, initialize).await {
-        Ok(Ok(())) => return Ok(ready),
-        Ok(Err(error)) => error,
-        Err(_) => anyhow!("Spot initialization deadline"),
-    };
-    if !commit_started {
-        return Err(failure);
-    }
-    // The original raw connection was retired before any exact observation.
-    // Absence here is unresolved, which never opens a generation or retries it.
-    let confirmation = timeout_at(deadline, async {
-        pause(&mut probe, Stage::BeforeConfirmation).await?;
-        let mut conn = own_connection(pool).await?;
-        let observed: bool = sqlx::query_scalar(INITIALIZATION_ACK)
-            .bind(ready.generation)
-            .bind(&ready.database)
-            .bind(FIXTURE_REVISION)
-            .fetch_one(&mut conn)
-            .await?;
-        anyhow::Ok(observed)
-    })
-    .await;
-    match confirmation {
-        Ok(Ok(true)) => Ok(ready),
-        _ => Err(failure.context("Spot initialization commit unresolved")),
+    async fn foreign_read(
+        &self,
+        pool: &PgPool,
+        s: Scope,
+    ) -> anyhow::Result<Option<InitializedOrderSet>> {
+        let sql = statement(ORDER_SET_COLUMNS, "");
+        Ok(self.foreign_query_as(&sql, keys(s), None).fetch_optional(pool).await?)
     }
 }
 
@@ -469,12 +314,8 @@ async fn fenced_initialization_replays_existing_journal_and_venue_state(
     ensure!((existing.facts.leg_sell, existing.facts.symbol_sell) == (1, 1));
     ensure!(existing.facts.grouped_cancel == 0);
     ensure!(existing.unbound_sell == 0 && existing.unbound_sell_conflicts == 0);
-    let wrong = ProjectionReady {
-        generation: Uuid::now_v7(),
-        database: ready.database.clone(),
-    };
     ensure!(
-        wrong.read(&pool, s, None).await?.is_none(),
+        ready.foreign_read(&pool, s).await?.is_none(),
         "wrong generation must withhold the initialized order set"
     );
     let (proxy, measured) = through_proxy_limit(&pool, 1).await;
@@ -717,7 +558,7 @@ async fn generated_history(
     ensure!(unbound_sell_identities(pool, second).await?.is_empty());
     let coverage: serde_json::Value =
         sqlx::query_scalar("SELECT coverage FROM spot_shadow_initialization WHERE generation=$1")
-            .bind(ready.generation)
+            .bind(ready.generation())
             .fetch_one(pool)
             .await?;
     let cancel_count = coverage["cancel_members"].as_u64().context("native cancel coverage")?;
