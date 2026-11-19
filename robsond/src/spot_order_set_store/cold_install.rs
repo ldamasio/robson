@@ -33,6 +33,8 @@ pub(crate) enum FencePhase {
     BeforeRead,
     BeforePublish,
     AfterReadback,
+    BeforeSourceAudit,
+    AfterSourceAudit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

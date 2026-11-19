@@ -308,6 +308,9 @@ impl ClosedWriterFence for Channel {
             FencePhase::BeforeRead => "fence_before_install",
             FencePhase::BeforePublish => "fence_before_publish",
             FencePhase::AfterReadback => "fence_after_readback",
+            FencePhase::BeforeSourceAudit | FencePhase::AfterSourceAudit => {
+                return Err(FixtureFenceError);
+            },
         };
         let approved = self
             .phase_at(

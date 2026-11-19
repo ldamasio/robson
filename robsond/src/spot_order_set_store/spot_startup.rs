@@ -74,6 +74,7 @@ pub(crate) enum StartupStage {
     BeforeCapture,
     Capture,
     Install,
+    SourceAudit,
     Admit,
 }
 
@@ -87,6 +88,7 @@ pub(crate) enum StartupRefusal {
     Epoch(DaemonError),
     Capture(ColdAuditRefusal),
     Install(InstallRefusal),
+    SourceAudit(crate::venue_budget::BudgetError),
     /// The successor login is the installer's, absent, or not the session.
     Login,
     /// The installed generation is missing or stale for the writer.
@@ -364,6 +366,22 @@ impl<S: SpotSupervisor> InstalledSpot<S> {
 
     pub(crate) fn supervisor(&mut self) -> &mut S {
         &mut self.held.supervisor
+    }
+
+    /// Preflight only. The same writer closure covers both sides of the
+    /// descriptive audit. It confers no C2/2b or venue authority.
+    pub(crate) async fn audit_source_for_preflight(
+        &mut self,
+    ) -> Result<crate::venue_budget::source_audit::DescriptiveAudit, StartupRefusal> {
+        use crate::venue_budget::source_audit::describe_existing_source;
+
+        let stage = StartupStage::SourceAudit;
+        self.held.check(FencePhase::BeforeSourceAudit, stage).await?;
+        let audit = describe_existing_source(&self.held.pool, self.held.deadline)
+            .await
+            .map_err(StartupRefusal::SourceAudit)?;
+        self.held.check(FencePhase::AfterSourceAudit, stage).await?;
+        Ok(audit)
     }
 
     /// The pinned successor, authenticated on one bounded connection: its
