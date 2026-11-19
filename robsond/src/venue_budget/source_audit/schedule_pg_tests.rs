@@ -4,7 +4,8 @@ use proptest::{
     test_runner::{Config, RngSeed, TestRunner},
 };
 use robson_testkit::db_proxy::{
-    ClientLoss, ControlBoundary, DbProxy, DiagnosticEvent, DiagnosticIdentity,
+    ClientLoss, ControlBoundary, ControlGate, ControlSnapshot, DbProxy, DiagnosticEvent,
+    DiagnosticIdentity,
 };
 use sqlx::postgres::{PgPoolOptions, PgSslMode};
 use tokio::time::timeout;
@@ -106,6 +107,26 @@ impl Wire {
         .await??;
         Ok(())
     }
+}
+
+async fn closed_by_client(gate: &ControlGate<'_>) -> anyhow::Result<ControlSnapshot> {
+    let snapshot = timeout(Duration::from_secs(1), async {
+        loop {
+            let state = gate.snapshot();
+            if state.closed {
+                break state;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await?;
+    ensure!(
+        snapshot.client_loss == Some(ClientLoss::Read)
+            && snapshot.proof_valid
+            && !snapshot.released,
+        "closed by the original client while the gate remained unreleased: {snapshot:?}"
+    );
+    Ok(snapshot)
 }
 
 async fn final_row(
@@ -258,13 +279,7 @@ async fn held_old_page(pool: &PgPool, cancel: bool) -> anyhow::Result<()> {
     if cancel {
         drop(work);
         wire.retires(pool, &blocked).await?;
-        let state = gate.snapshot();
-        ensure!(
-            state.closed
-                && state.client_loss == Some(ClientLoss::Read)
-                && state.proof_valid
-                && !state.released
-        );
+        let state = closed_by_client(&gate).await?;
         ensure!(wire.proxy.query_trace_dropped() == 0 && wire.proxy.query_trace().len() == 3);
         final_row(pool, old, None, 0).await?;
         drop(gate);
@@ -364,23 +379,7 @@ async fn held_commit(pool: &PgPool, cancel: bool) -> anyhow::Result<()> {
         );
     }
     wire.retires(pool, &original).await?;
-    let observed = timeout(Duration::from_secs(1), async {
-        loop {
-            let state = gate.snapshot();
-            if state.closed {
-                break state;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await?;
-    ensure!(
-        observed.closed
-            && observed.client_loss == Some(ClientLoss::Read)
-            && observed.proof_valid
-            && !observed.released,
-        "original client retirement: {observed:?}"
-    );
+    let observed = closed_by_client(&gate).await?;
     final_row(pool, run, cursor, count).await?;
     let mut locks = pool.begin().await?;
     sqlx::query("SELECT 1 FROM budget_venue_state WHERE venue_id='binance:spot' FOR UPDATE NOWAIT")
