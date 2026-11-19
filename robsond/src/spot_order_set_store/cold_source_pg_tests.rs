@@ -77,7 +77,7 @@ fn plan_leaves<'a>(node: &'a Value, relation: &str, found: &mut Vec<&'a Value>) 
     }
 }
 
-fn bounded_leaf(
+pub(super) fn bounded_leaf(
     plan: &Value,
     relation: &str,
     indexes: &[&str],
