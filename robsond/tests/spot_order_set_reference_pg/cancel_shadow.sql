@@ -65,17 +65,6 @@ CREATE FUNCTION cancel_shadow_member_writes() RETURNS bigint LANGUAGE sql AS $$
                     '0')::bigint;
 $$;
 
-CREATE FUNCTION cancel_shadow_observe_member() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
-    PERFORM set_config('robson_test.cancel_shadow_member_writes',
-                       (cancel_shadow_member_writes() + 1)::text, true);
-    RETURN NULL;
-END;
-$$;
-
-CREATE TRIGGER cancel_shadow_observe_member AFTER INSERT OR UPDATE OR DELETE
-    ON cancel_shadow_members FOR EACH ROW EXECUTE FUNCTION cancel_shadow_observe_member();
-
 CREATE FUNCTION cancel_shadow_adjust(
     k cancel_shadow_key, pending_delta bigint, conflict_delta bigint, next_mask boolean
 ) RETURNS cancel_shadow_work LANGUAGE plpgsql AS $$
@@ -132,53 +121,32 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION cancel_shadow_sync_member(i order_intents) RETURNS void LANGUAGE plpgsql AS $$
+CREATE FUNCTION cancel_shadow_refuse_identity() RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'test shadow requires a stable cancel identity';
+END;
+$$;
+
+CREATE FUNCTION cancel_shadow_observe_member() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
-    prior cancel_shadow_members%ROWTYPE;
     k cancel_shadow_key;
-    has_named_row boolean;
-    is_pending boolean;
-    is_conflict boolean;
     pending_delta bigint;
     conflict_delta bigint;
 BEGIN
-    SELECT l.symbol INTO k.symbol FROM balance_legs l
-    WHERE (l.position_id, l.tenant_id, l.venue_id, l.account_scope)
-        = (i.position_id, i.tenant_id, i.venue_id, i.account_scope);
-    k.tenant_id := i.tenant_id;
-    k.venue_id := i.venue_id;
-    k.account_scope := i.account_scope;
-    k.position_id := i.position_id;
-    IF ledger_canonical_id(i.cancels_order_id) THEN
-        k.target_id := i.cancels_order_id;
+    PERFORM set_config('robson_test.cancel_shadow_member_writes',
+                       (cancel_shadow_member_writes() + 1)::text, true);
+    IF TG_OP = 'DELETE' THEN
+        RETURN NULL;
     END IF;
 
-    SELECT EXISTS (SELECT 1 FROM venue_orders o WHERE o.intent_id = i.intent_id)
-        INTO has_named_row;
-    is_conflict := has_named_row
-        OR (i.not_sent AND (i.venue_outcome IS NOT NULL OR i.venue_evidence IS NOT NULL));
-    is_pending := NOT i.not_sent OR is_conflict;
-    SELECT m.* INTO prior FROM cancel_shadow_members m WHERE m.intent_id = i.intent_id;
-    IF FOUND THEN
-        IF (prior.tenant_id, prior.venue_id, prior.account_scope, prior.symbol,
-            prior.position_id, prior.target_id) IS DISTINCT FROM
-           (k.tenant_id, k.venue_id, k.account_scope, k.symbol, k.position_id, k.target_id) THEN
-            RAISE EXCEPTION 'test shadow requires a stable cancel identity';
-        END IF;
-        IF (prior.pending, prior.conflict) = (is_pending, is_conflict) THEN
-            RETURN;
-        END IF;
-    END IF;
-    INSERT INTO cancel_shadow_members
-    VALUES (i.intent_id, k.tenant_id, k.venue_id, k.account_scope, k.symbol,
-            k.position_id, k.target_id, is_pending, is_conflict)
-    ON CONFLICT (intent_id) DO UPDATE
-    SET pending = excluded.pending, conflict = excluded.conflict;
-
-    pending_delta := is_pending::integer - coalesce(prior.pending::integer, 0);
-    conflict_delta := is_conflict::integer - coalesce(prior.conflict::integer, 0);
+    k := ROW(NEW.tenant_id, NEW.venue_id, NEW.account_scope, NEW.symbol,
+             NEW.position_id, NEW.target_id)::cancel_shadow_key;
+    pending_delta := NEW.pending::integer
+        - CASE WHEN TG_OP = 'UPDATE' THEN OLD.pending::integer ELSE 0 END;
+    conflict_delta := NEW.conflict::integer
+        - CASE WHEN TG_OP = 'UPDATE' THEN OLD.conflict::integer ELSE 0 END;
     IF pending_delta = 0 AND conflict_delta = 0 THEN
-        RETURN;
+        RETURN NULL;
     END IF;
 
     IF k.position_id IS NULL OR k.symbol IS NULL THEN
@@ -206,6 +174,53 @@ BEGIN
     ELSE
         PERFORM cancel_shadow_adjust(k, pending_delta, conflict_delta, NULL);
     END IF;
+    RETURN NULL;
+END;
+$$;
+
+-- Only physical writes reach the observer. The primary-key arbiter owns the
+-- prior member, and this observer propagates its exact OLD/NEW delta.
+CREATE TRIGGER cancel_shadow_observe_member AFTER INSERT OR UPDATE OR DELETE
+    ON cancel_shadow_members FOR EACH ROW EXECUTE FUNCTION cancel_shadow_observe_member();
+
+CREATE FUNCTION cancel_shadow_sync_member(i order_intents) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    k cancel_shadow_key;
+    has_named_row boolean;
+    is_pending boolean;
+    is_conflict boolean;
+BEGIN
+    SELECT l.symbol INTO k.symbol FROM balance_legs l
+    WHERE (l.position_id, l.tenant_id, l.venue_id, l.account_scope)
+        = (i.position_id, i.tenant_id, i.venue_id, i.account_scope);
+    k.tenant_id := i.tenant_id;
+    k.venue_id := i.venue_id;
+    k.account_scope := i.account_scope;
+    k.position_id := i.position_id;
+    IF ledger_canonical_id(i.cancels_order_id) THEN
+        k.target_id := i.cancels_order_id;
+    END IF;
+
+    SELECT EXISTS (SELECT 1 FROM venue_orders o WHERE o.intent_id = i.intent_id)
+        INTO has_named_row;
+    is_conflict := has_named_row
+        OR (i.not_sent AND (i.venue_outcome IS NOT NULL OR i.venue_evidence IS NOT NULL));
+    is_pending := NOT i.not_sent OR is_conflict;
+    INSERT INTO cancel_shadow_members AS prior
+    VALUES (i.intent_id, k.tenant_id, k.venue_id, k.account_scope, k.symbol,
+            k.position_id, k.target_id, is_pending, is_conflict)
+    ON CONFLICT (intent_id) DO UPDATE
+    SET pending = excluded.pending, conflict = excluded.conflict
+    -- Check identity before considering a status no-op. A changed identity
+    -- must refuse even when the incoming status is identical.
+    WHERE CASE WHEN (prior.tenant_id, prior.venue_id, prior.account_scope, prior.symbol,
+                     prior.position_id, prior.target_id) IS DISTINCT FROM
+                    (excluded.tenant_id, excluded.venue_id, excluded.account_scope, excluded.symbol,
+                     excluded.position_id, excluded.target_id)
+               THEN cancel_shadow_refuse_identity()
+               ELSE (prior.pending, prior.conflict)
+                    IS DISTINCT FROM (excluded.pending, excluded.conflict)
+          END;
 END;
 $$;
 
