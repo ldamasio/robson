@@ -32,10 +32,14 @@ const SCOPED: &str = "SELECT a.version, g.accounting_version,
         = ($1,'binance:spot',$2,$3)";
 
 async fn seed_generation(pool: &PgPool) -> Result<JournalGeneration> {
+    seed_generation_for(pool, ACCOUNT).await
+}
+
+async fn seed_generation_for(pool: &PgPool, account_scope: &str) -> Result<JournalGeneration> {
     let tenant_id = Uuid::now_v7();
     let generation = JournalGeneration {
         tenant_id,
-        account_scope: ACCOUNT.to_owned(),
+        account_scope: account_scope.to_owned(),
         generation_id: Uuid::now_v7(),
         process_epoch: crate::process_epoch::start_epoch(pool, tenant_id, "projected-journal")
             .await?
@@ -55,7 +59,7 @@ async fn seed_generation(pool: &PgPool) -> Result<JournalGeneration> {
         "INSERT INTO spot_order_set_generation
          (tenant_id,venue_id,account_scope,generation_id,process_epoch,source_audit_id,accounting_version)
          VALUES ($1,'binance:spot',$2,$3,$4,$5,$6)",
-    ).bind(tenant_id).bind(ACCOUNT).bind(generation.generation_id)
+    ).bind(tenant_id).bind(account_scope).bind(generation.generation_id)
         .bind(generation.process_epoch).bind(generation.source_audit_id).bind(version)
         .execute(pool).await?;
     Ok(generation)

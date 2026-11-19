@@ -27,6 +27,9 @@ const INSTALL: &str = include_str!("cold_install/publish.sql");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FencePhase {
+    /// The supervised startup's checks, before its epoch and its cut.
+    BeforeEpoch,
+    BeforeCapture,
     BeforeRead,
     BeforePublish,
     AfterReadback,

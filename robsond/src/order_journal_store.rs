@@ -46,8 +46,8 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::spot_order_set_store::{
-    maintain_cancel_outcome, maintain_entry_admission, maintain_unbound_journal, JournalGeneration,
-    JournalPrior,
+    maintain_cancel_outcome, maintain_entry_admission, maintain_unbound_journal,
+    spot_startup::SpotReady, JournalGeneration, JournalPrior,
 };
 
 /// The journal's own pool, so order writes never queue behind the daemon's.
@@ -103,6 +103,20 @@ impl PgJournalBackend {
             tenant_id,
             ready_wait: JOURNAL_READY_WAIT,
             order_set_projection: None,
+        }
+    }
+
+    /// The supervised Spot backend: orders and a release both on the admitted
+    /// writer, bound to its installed generation. The installer's pool never
+    /// reaches it.
+    #[allow(dead_code, reason = "no production supervisor yet")]
+    pub(crate) fn supervised(ready: &SpotReady) -> Self {
+        Self {
+            pool: ready.writer().clone(),
+            daemon_pool: ready.writer().clone(),
+            tenant_id: ready.generation().tenant_id,
+            ready_wait: JOURNAL_READY_WAIT,
+            order_set_projection: Some(ready.generation().clone()),
         }
     }
 
