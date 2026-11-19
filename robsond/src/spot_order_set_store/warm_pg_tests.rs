@@ -181,8 +181,17 @@ async fn persisted_warm_order_set_native_same_snapshot_scope_and_absence(
     .bind(crate::process_epoch::MARKER_VERSION)
     .execute(&pool)
     .await?;
-    sqlx::raw_sql("ANALYZE process_epochs").execute(&pool).await?;
     let started = crate::process_epoch::start_epoch(&pool, tenant, "warm-native").await?;
+    // Put other tenants after the desired epoch in the global sequence, so
+    // an unscoped backwards walk would inspect thousands of unrelated rows.
+    sqlx::query(
+        "INSERT INTO process_epochs(epoch_id,tenant_id,binary_version)
+         SELECT md5('foreign-epoch-'||n)::uuid,md5('foreign-tenant-'||n)::uuid,'warm-other'
+         FROM generate_series(1,4096) n",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::raw_sql("ANALYZE process_epochs").execute(&pool).await?;
     let expected = ExpectedGeneration {
         tenant_id: tenant,
         venue: &venue,
@@ -391,8 +400,10 @@ async fn persisted_warm_order_set_native_same_snapshot_scope_and_absence(
     ensure!(
         epoch_nodes.len() == 1
             && epoch_nodes[0]["Index Name"] == "idx_process_epochs_tenant_seq"
+            && epoch_nodes[0]["Index Cond"].as_str().is_some()
             && epoch_nodes[0]["Actual Rows"] == 1
-            && epoch_nodes[0]["Actual Loops"] == 1,
+            && epoch_nodes[0]["Actual Loops"] == 1
+            && epoch_nodes[0]["Rows Removed by Filter"].as_u64().unwrap_or(0) == 0,
         "latest epoch must use its descending native index: {plan}"
     );
     eprintln!("Warm Spot native one wire, eight exact indexed leaf probes and one latest epoch, 4096 alternatives each");
