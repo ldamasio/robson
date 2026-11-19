@@ -37,6 +37,8 @@ mod credential_store;
 mod error;
 mod memory;
 #[cfg(feature = "postgres")]
+pub mod native_n5;
+#[cfg(feature = "postgres")]
 mod postgres;
 mod repository;
 

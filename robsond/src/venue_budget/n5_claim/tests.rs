@@ -242,14 +242,14 @@ async fn cold_raw_read_projects_only_active_claim_columns(pool: PgPool) {
     let rows = super::cold_load::read_rows(&measured.pool, active, deadline(), &measured.trace)
         .await
         .unwrap();
-    let [row] = rows.as_slice() else {
+    let [row] = rows.rows() else {
         panic!("expected one registered key");
     };
-    assert!(row.get::<bool, _>("active"));
-    assert!(!row.get::<bool, _>("invalid_active_projection"));
-    assert_eq!(row.get::<Uuid, _>("claim_id"), seeded.prior.identity.claim_id);
-    assert_eq!(row.get::<String, _>("snapshot_uid"), u64::MAX.to_string());
-    assert_eq!(row.get::<Vec<u8>, _>("snapshot_payload"), SNAPSHOT);
+    assert!(row.try_get::<bool>("active").unwrap());
+    assert!(!row.try_get::<bool>("invalid_active_projection").unwrap());
+    assert_eq!(row.try_get::<Uuid>("claim_id").unwrap(), seeded.prior.identity.claim_id);
+    assert_eq!(row.try_get::<String>("snapshot_uid").unwrap(), u64::MAX.to_string());
+    assert_eq!(row.try_get::<Vec<u8>>("snapshot_payload").unwrap(), SNAPSHOT);
 
     let rows = super::cold_load::read_rows(
         &measured.pool,
@@ -259,13 +259,13 @@ async fn cold_raw_read_projects_only_active_claim_columns(pool: PgPool) {
     )
     .await
     .unwrap();
-    let [row] = rows.as_slice() else {
+    let [row] = rows.rows() else {
         panic!("the compact manifest row was lost");
     };
-    assert!(!row.get::<bool, _>("active"));
-    assert_eq!(row.get::<i64, _>("state_revision"), seeded.prior.revision);
-    assert!(row.get::<Option<Uuid>, _>("claim_id").is_none());
-    assert!(row.get::<Option<Vec<u8>>, _>("snapshot_payload").is_none());
+    assert!(!row.try_get::<bool>("active").unwrap());
+    assert_eq!(row.try_get::<i64>("state_revision").unwrap(), seeded.prior.revision);
+    assert!(row.try_get::<Option<Uuid>>("claim_id").unwrap().is_none());
+    assert!(row.try_get::<Option<Vec<u8>>>("snapshot_payload").unwrap().is_none());
 
     let sql = measured.wire(2, 2, 0);
     assert!(sql

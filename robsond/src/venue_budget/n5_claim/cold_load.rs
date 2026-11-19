@@ -1,9 +1,5 @@
 //! Read and check dormant N5 history from one bounded registry snapshot.
-use std::{
-    collections::{BTreeMap, HashSet},
-    future::poll_fn,
-    time::Duration,
-};
+use std::{collections::BTreeMap, time::Duration};
 
 use chrono::{DateTime, Utc};
 use robson_exec::{
@@ -12,25 +8,18 @@ use robson_exec::{
     venue::VenueId,
     venue_clock::{ClockDomain, NativeClock, TickCapture},
 };
+use robson_store::native_n5::{self, Observation, ObservedRow, ReadError, MAX_ACTIVE};
 use sha2::{Digest, Sha256};
-use sqlx::{postgres::PgRow, Either, Executor, FromRow, PgPool, Row};
-use tokio::time::{timeout_at, Instant};
+use sqlx::PgPool;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use super::{
-    completion, issue, raw_connection, response::decode_retained, valid_audit_at, valid_identity,
-    BudgetError, ClaimIdentity, ClaimResult, FrequencyKey, PriorClaim, PriorEligibility, Trace,
-    DAY_NS, HANDOFF_NS, STORE_LIMIT,
+    response::decode_retained, valid_audit_at, valid_identity, BudgetError, ClaimIdentity,
+    ClaimResult, FrequencyKey, PriorClaim, PriorEligibility, Trace, DAY_NS, HANDOFF_NS,
+    STORE_LIMIT,
 };
 
-const SQL: &str = include_str!("cold_load.sql");
-const MAX_KEYS: usize = 4096;
-const MAX_ROWS: usize = MAX_KEYS + 1;
-const MAX_ACTIVE: usize = 64;
-const MAX_BYTES: usize = 8 * 1024 * 1024;
-const MAX_COMPACT_WIRE_BYTES: usize = 1536;
-const MAX_ACTIVE_METADATA_WIRE_BYTES: usize = 1024;
-const MAX_MESSAGE_METADATA_WIRE_BYTES: usize = 8192;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 const CLAIM_CLOCK: [&str; 5] = [
     "claim_kind",
@@ -54,19 +43,7 @@ const SNAPSHOT_CLOCK: [&str; 5] = [
     "snapshot_tick",
 ];
 
-// The 55-column binary DataRow has 227 bytes of framing. The largest compact
-// values are bounded by 86 root bytes, 236 registration bytes, and 22 state
-// bytes. Active rows add at most 549 bytes of metadata and 16 KiB of payload.
-// The reserves below also cover message descriptions and completion. The
-// lifetime sentinel counts as a compact row.
-const _: () = assert!(
-    MAX_ROWS * MAX_COMPACT_WIRE_BYTES
-        + MAX_ACTIVE * (MAX_ACTIVE_METADATA_WIRE_BYTES + super::result::MAX_PAYLOAD_BYTES)
-        + MAX_MESSAGE_METADATA_WIRE_BYTES
-        <= MAX_BYTES
-);
-
-#[derive(Debug, FromRow)]
+#[derive(Debug)]
 struct Registry {
     root_id: i16,
     schema_version: i16,
@@ -80,7 +57,24 @@ struct Registry {
     recovery_state: String,
 }
 
-#[derive(Debug, FromRow)]
+impl Registry {
+    fn from_observed(row: &ObservedRow) -> Result<Self, BudgetError> {
+        Ok(Self {
+            root_id: read(row, "root_id")?,
+            schema_version: read(row, "schema_version")?,
+            manifest_version: read(row, "manifest_version")?,
+            manifest_revision: read(row, "manifest_revision")?,
+            initialized: read(row, "initialized")?,
+            registered_count: read(row, "registered_count")?,
+            canonical_digest: read(row, "canonical_digest")?,
+            initialization_id: read(row, "initialization_id")?,
+            recovery_generation: read(row, "recovery_generation")?,
+            recovery_state: read(row, "recovery_state")?,
+        })
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct Registration {
     pub(super) venue_id: String,
     pub(super) symbol: String,
@@ -93,6 +87,18 @@ pub(super) struct Registration {
 }
 
 impl Registration {
+    fn from_observed(row: &ObservedRow) -> Result<Self, BudgetError> {
+        Ok(Self {
+            venue_id: read(row, "venue_id")?,
+            symbol: read(row, "symbol")?,
+            descriptor: read(row, "descriptor")?,
+            key_registry: read(row, "key_registry")?,
+            registration_id: read(row, "registration_id")?,
+            registered_revision: read(row, "registered_revision")?,
+            registered_at: read(row, "registered_at")?,
+            provenance: read(row, "provenance")?,
+        })
+    }
     fn key(&self) -> (&str, &str, &str) {
         (&self.venue_id, &self.symbol, &self.descriptor)
     }
@@ -170,9 +176,10 @@ pub(super) async fn load(
     }
     let deadline = deadline.min(Instant::now() + STORE_LIMIT);
     let symbols: Vec<_> = requested.keys().cloned().collect();
-    let rows = read_rows(pool, &symbols, deadline, trace).await?;
+    let observation = read_rows(pool, &symbols, deadline, trace).await?;
+    let rows = observation.rows();
     let now = clock.capture().map_err(|_| BudgetError::PrerequisiteRefusal)?;
-    let root = Registry::from_row(&rows[0]).map_err(completion::classify)?;
+    let root = Registry::from_observed(&rows[0])?;
     if root.root_id != 1
         || root.schema_version != 38
         || root.manifest_version != 1
@@ -187,8 +194,8 @@ pub(super) async fn load(
     }
     let mut registrations = Vec::with_capacity(rows.len());
     let mut keys = Vec::with_capacity(expected.len());
-    for row in &rows {
-        let entry = Registration::from_row(row).map_err(completion::classify)?;
+    for row in rows {
+        let entry = Registration::from_observed(row)?;
         let revision: i64 = read(row, "state_revision")?;
         if entry.key_registry != root.root_id
             || entry.registration_id.is_nil()
@@ -230,11 +237,11 @@ pub(super) async fn load(
     Ok(keys)
 }
 
-fn read<'r, T>(row: &'r PgRow, column: &str) -> Result<T, BudgetError>
+fn read<'r, T>(row: &'r ObservedRow, column: &str) -> Result<T, BudgetError>
 where
     T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
 {
-    row.try_get(column).map_err(completion::classify)
+    row.try_get(column).map_err(map_read_error)
 }
 
 fn tick(domain: ClockDomain, value: u128) -> Result<TickCapture, BudgetError> {
@@ -244,7 +251,7 @@ fn tick(domain: ClockDomain, value: u128) -> Result<TickCapture, BudgetError> {
 }
 
 fn read_clock(
-    row: &PgRow,
+    row: &ObservedRow,
     [kind, boot, seconds, nanos, count]: [&str; 5],
 ) -> Result<TickCapture, BudgetError> {
     if read::<&str>(row, kind)? != "boottime" {
@@ -258,7 +265,7 @@ fn read_clock(
 }
 
 fn state(
-    row: &PgRow,
+    row: &ObservedRow,
     revision: i64,
     account: &CostIdentity,
     now: TickCapture,
@@ -338,7 +345,7 @@ fn state(
 }
 
 fn current_receipt(
-    row: &PgRow,
+    row: &ObservedRow,
     account: &CostIdentity,
     prior: &PriorClaim,
     now: TickCapture,
@@ -391,50 +398,22 @@ fn receipt_age(
     Ok(Some(age))
 }
 
+fn map_read_error(error: ReadError) -> BudgetError {
+    match error {
+        ReadError::Invalid => BudgetError::Invalid,
+        ReadError::Backend => BudgetError::Backend,
+        ReadError::Unpublished => BudgetError::Unpublished,
+        ReadError::Expired => BudgetError::Expired,
+    }
+}
+
 pub(super) async fn read_rows(
     pool: &PgPool,
     symbols: &[String],
     deadline: Instant,
     trace: &Trace,
-) -> Result<Vec<PgRow>, BudgetError> {
-    if symbols.is_empty()
-        || symbols.len() > MAX_ACTIVE
-        || symbols.iter().any(|symbol| symbol.is_empty() || symbol.len() > 64)
-        || symbols.iter().collect::<HashSet<_>>().len() != symbols.len()
-    {
-        return Err(BudgetError::Invalid);
-    }
-    let deadline = deadline.min(Instant::now() + STORE_LIMIT);
-    let work = async {
-        if Instant::now() >= deadline {
-            return Err(BudgetError::Expired);
-        }
-        let mut connection = raw_connection(pool).await?;
-        issue(trace, deadline)?;
-        let query = sqlx::query(SQL).bind(symbols);
-        let mut stream = connection.fetch_many(query);
-        let mut rows = Vec::with_capacity(MAX_ROWS);
-        let mut command = None;
-        while let Some(next) = poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
-            match next.map_err(completion::classify)? {
-                Either::Right(row) if command.is_none() && rows.len() < MAX_ROWS => {
-                    rows.push(row);
-                },
-                Either::Left(result) if command.is_none() => {
-                    command = Some(result.rows_affected());
-                },
-                _ => return Err(BudgetError::Unpublished),
-            }
-        }
-        if command != Some(rows.len() as u64) || rows.is_empty() || rows.len() > MAX_KEYS {
-            return Err(BudgetError::Unpublished);
-        }
-        if Instant::now() >= deadline {
-            return Err(BudgetError::Expired);
-        }
-        Ok(rows)
-    };
-    timeout_at(deadline, work).await.map_err(|_| BudgetError::Expired)?
+) -> Result<Observation, BudgetError> {
+    native_n5::read(pool, symbols, deadline, &trace.0).await.map_err(map_read_error)
 }
 
 #[cfg(all(test, feature = "crash-points"))]

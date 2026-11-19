@@ -9,6 +9,13 @@ use sqlx::postgres::PgPoolOptions;
 use tokio::time::{sleep, timeout};
 
 use super::*;
+use robson_store::native_n5::{
+    MAX_ACTIVE_METADATA_WIRE_BYTES, MAX_BYTES, MAX_COMPACT_WIRE_BYTES, MAX_KEYS,
+    MAX_MESSAGE_METADATA_WIRE_BYTES, MAX_ROWS,
+};
+
+const SQL: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../robson-store/src/n5_cold_load.sql"));
 
 fn registration(index: usize) -> Registration {
     Registration {
@@ -139,8 +146,12 @@ pub(in crate::venue_budget::n5_claim) async fn verify_real_receipt_controls(
     let rows = read_rows(pool, std::slice::from_ref(&symbol), deadline(), &trace)
         .await
         .map_err(|err| anyhow!("original receipt controls: {err:?}"))?;
-    let row = rows.iter().find(|row| row.get::<bool, _>("active")).context("active receipt")?;
-    let revision = row.get::<i64, _>("state_revision");
+    let row = rows
+        .rows()
+        .iter()
+        .find(|row| row.try_get::<bool>("active").unwrap())
+        .context("active receipt")?;
+    let revision = row.try_get::<i64>("state_revision")?;
     let now = clock.capture()?;
     let (prior, proven) =
         state(row, revision, identity, now).map_err(|err| anyhow!("current receipt: {err:?}"))?;
@@ -356,15 +367,15 @@ async fn measure(pool: &PgPool, active: usize, registered: usize) -> anyhow::Res
         ensure!(matches!(result, Err(BudgetError::Unpublished)), "4097th key must refuse");
     } else {
         let rows = result.map_err(|err| anyhow!("bounded raw read: {err:?}"))?;
-        ensure!(rows.len() == registered);
+        ensure!(rows.rows().len() == registered);
         let mut retained = 0;
-        for row in rows {
-            if row.try_get::<bool, _>("active")? {
-                let payload = row.try_get::<&[u8], _>("snapshot_payload")?;
+        for row in rows.rows() {
+            if row.try_get::<bool>("active")? {
+                let payload = row.try_get::<&[u8]>("snapshot_payload")?;
                 ensure!(payload.len() == super::super::result::MAX_PAYLOAD_BYTES);
                 retained += 1;
             } else {
-                ensure!(row.try_get::<Option<&[u8]>, _>("snapshot_payload")?.is_none());
+                ensure!(row.try_get::<Option<&[u8]>>("snapshot_payload")?.is_none());
             }
         }
         ensure!(retained == active);
