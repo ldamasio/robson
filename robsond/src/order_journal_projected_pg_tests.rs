@@ -312,7 +312,8 @@ async fn persisted_order_set_journal_lost_commit_proves_original_atomic_state(
         .context("committed generation was not readable before replacement startup")?;
     ensure!(observed.accounting_version == committed.0);
 
-    // Only this test owns the writer handle. Close it before starting the successor.
+    // Only this test owns the writer handle. Close it before starting the
+    // successor.
     stored.pool.close().await;
     let successor =
         crate::process_epoch::start_epoch(&pool, g.tenant_id, "journal-recovery").await?;
