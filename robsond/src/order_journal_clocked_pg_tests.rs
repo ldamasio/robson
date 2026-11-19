@@ -19,6 +19,9 @@ use super::{
 };
 use crate::venue_budget::{fixture, Trace};
 
+#[path = "order_journal_clocked_capacity_pg_tests.rs"]
+mod capacity;
+
 struct Scope {
     tenant: Uuid,
     epoch: Uuid,
