@@ -31,6 +31,8 @@ use crate::fixture::retired;
 
 #[path = "initialized_fixture.rs"]
 mod ready;
+#[path = "late_member_tests.rs"]
+mod late_member_tests;
 
 #[derive(Debug, sqlx::FromRow)]
 struct InitializedOrderSet {
