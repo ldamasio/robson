@@ -77,6 +77,35 @@ fn unowned(record: &VenueOrderRecord) -> StoredOrder {
 }
 
 #[test]
+fn spot_merge_refuses_contradictory_phase_in_new_or_stored_evidence() {
+    let mut incoming = record();
+    incoming.status = "PENDING_CANCEL".into();
+    incoming.phase = OrderPhase::Terminal;
+    let spot = link(OrderOwner::Discovered);
+    assert_eq!(
+        merge_order(None, &incoming, &spot, &at(1), None),
+        Err(LedgerError::InvalidEvidence("incoming Spot phase disagrees with status".into()))
+    );
+
+    let usdm = OrderLink {
+        venue: VenueId::new(VenueId::BINANCE_USDM),
+        ..spot.clone()
+    };
+    assert!(merge_order(None, &incoming, &usdm, &at(1), None).is_ok());
+
+    incoming.phase = OrderPhase::Unknown;
+    let mut stored = merge_order(None, &incoming, &spot, &at(1), None).unwrap().order;
+    assert!(!stored.terminal());
+    assert!(!merge_order(Some(&stored), &incoming, &spot, &at(2), None).unwrap().changed);
+    stored.phase = OrderPhase::Terminal;
+    stored.terminal_seen = Some(at(1));
+    assert_eq!(
+        merge_order(Some(&stored), &incoming, &spot, &at(2), None),
+        Err(LedgerError::InvalidEvidence("stored Spot phase disagrees with status".into()))
+    );
+}
+
+#[test]
 fn non_trigger_zero_stop_price_is_the_omitted_placeholder() {
     for order_type in ["MARKET", "LIMIT", "LIMIT_MAKER"] {
         for phase in [OrderPhase::Live, OrderPhase::Terminal] {

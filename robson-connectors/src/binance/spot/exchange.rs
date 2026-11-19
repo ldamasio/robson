@@ -212,16 +212,7 @@ fn rules_error(error: SpotRulesError) -> ExecError {
     }
 }
 
-/// An order's phase, from its status alone (design §3.4.2; enums.md
-/// L45-L57). `PENDING_CANCEL` is documented as unused (L54) and, like any
-/// other status, is `Unknown`.
-pub(super) fn order_phase(status: &str) -> OrderPhase {
-    match status {
-        "NEW" | "PARTIALLY_FILLED" | "PENDING_NEW" => OrderPhase::Live,
-        "FILLED" | "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" | "REJECTED" => OrderPhase::Terminal,
-        _ => OrderPhase::Unknown,
-    }
-}
+pub(super) use robson_exec::venue::binance_spot_order_phase as order_phase;
 
 /// The venue's record of `order`, as given: its quantities must be
 /// consistent (`0 ≤ executedQty ≤ origQty`), or the answer is no evidence.

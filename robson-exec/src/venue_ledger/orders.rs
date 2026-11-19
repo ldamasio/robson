@@ -8,7 +8,9 @@ use uuid::Uuid;
 use super::{
     exact_add, exact_sub, LedgerError, LegOrderKind, OrderLink, OrderOwner, SeenAt, VenueIntId,
 };
-use crate::venue::{OrderPhase, ProtectionKind, VenueId, VenueOrderRecord};
+use crate::venue::{
+    binance_spot_order_phase, OrderPhase, ProtectionKind, VenueId, VenueOrderRecord,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OrderKey {
@@ -191,6 +193,12 @@ pub fn merge_order(
         return Err(LedgerError::InvalidEvidence("invalid order quantities or identity".into()));
     }
     let key = OrderKey::from_record(record, link)?;
+    let spot = key.venue.as_str() == VenueId::BINANCE_SPOT;
+    if spot && binance_spot_order_phase(&record.status) != record.phase {
+        return Err(LedgerError::InvalidEvidence(
+            "incoming Spot phase disagrees with status".into(),
+        ));
+    }
     let stop_price = stop_price(record)?;
     let mut anomalies = Vec::with_capacity(2);
     let mut adopting = false;
@@ -202,6 +210,11 @@ pub fn merge_order(
             || old.stop_price != stop_price
         {
             return Err(LedgerError::IdentityConflict);
+        }
+        if spot && binance_spot_order_phase(&old.status) != old.phase {
+            return Err(LedgerError::InvalidEvidence(
+                "stored Spot phase disagrees with status".into(),
+            ));
         }
         let mut order = old.clone();
         match (&old.owner, &link.owner) {
