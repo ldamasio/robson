@@ -54,8 +54,11 @@ const SNAPSHOT_CLOCK: [&str; 5] = [
     "snapshot_tick",
 ];
 
-// The caps include protocol framing for the selected fields. Only active keys
-// can add snapshot bytes. The lifetime sentinel counts as a compact row.
+// The 55-column binary DataRow has 227 bytes of framing. The largest compact
+// values are bounded by 86 root bytes, 236 registration bytes, and 22 state
+// bytes. Active rows add at most 549 bytes of metadata and 16 KiB of payload.
+// The reserves below also cover message descriptions and completion. The
+// lifetime sentinel counts as a compact row.
 const _: () = assert!(
     MAX_ROWS * MAX_COMPACT_WIRE_BYTES
         + MAX_ACTIVE * (MAX_ACTIVE_METADATA_WIRE_BYTES + super::result::MAX_PAYLOAD_BYTES)
@@ -363,20 +366,29 @@ fn current_receipt(
     {
         return Err(BudgetError::Invalid);
     }
-    now.elapsed_since(&decoded.original.end_tick().map_err(|_| BudgetError::Invalid)?)
-        .map_err(|_| BudgetError::PrerequisiteRefusal)?;
-    let age = now
-        .elapsed_since(&decoded.observed)
-        .map_err(|_| BudgetError::PrerequisiteRefusal)?;
-    if age.as_nanos() >= DAY_NS {
+    let Some(age) = receipt_age(now, &decoded.original, decoded.observed)? else {
         return Ok(ReceiptState::Stale);
-    }
+    };
     Ok(ReceiptState::Current(ColdReceipt {
         original: decoded.original,
         evidence: decoded.evidence,
         payload_digest: Sha256::digest(payload).into(),
         age,
     }))
+}
+
+fn receipt_age(
+    now: TickCapture,
+    original: &RawClockCapture,
+    first: TickCapture,
+) -> Result<Option<Duration>, BudgetError> {
+    now.elapsed_since(&original.end_tick().map_err(|_| BudgetError::Invalid)?)
+        .map_err(|_| BudgetError::PrerequisiteRefusal)?;
+    let age = now.elapsed_since(&first).map_err(|_| BudgetError::PrerequisiteRefusal)?;
+    if age.as_nanos() >= DAY_NS {
+        return Ok(None);
+    }
+    Ok(Some(age))
 }
 
 pub(super) async fn read_rows(
@@ -424,3 +436,9 @@ pub(super) async fn read_rows(
     };
     timeout_at(deadline, work).await.map_err(|_| BudgetError::Expired)?
 }
+
+#[cfg(all(test, feature = "crash-points"))]
+#[path = "cold_load_tests.rs"]
+mod tests;
+#[cfg(all(test, feature = "crash-points"))]
+pub(super) use tests::verify_real_receipt_controls;

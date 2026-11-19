@@ -86,7 +86,12 @@ SELECT
 FROM (SELECT 1) AS anchor
 LEFT JOIN n5_registry_root r ON r.registry_id = 1
 LEFT JOIN bounded_keys k ON true
-LEFT JOIN n5_refresh_state s USING (venue_id, symbol, descriptor)
+-- The parameterized lookup keeps the state plan under the limited key scan.
+LEFT JOIN LATERAL (
+    SELECT st.* FROM n5_refresh_state st
+    WHERE (st.venue_id, st.symbol, st.descriptor) = (k.venue_id, k.symbol, k.descriptor)
+    OFFSET 0
+) AS s ON true
 LEFT JOIN active a ON k.venue_id = 'binance:spot' AND k.descriptor = 'commission' AND a.symbol = k.symbol
 -- Preserve the revision for every key but gate the wide row without a second lookup.
 LEFT JOIN LATERAL (SELECT s.* WHERE a.symbol IS NOT NULL) AS s_active ON true

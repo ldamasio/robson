@@ -1144,15 +1144,12 @@ mod tests {
             assert_eq!(received.recv().await.unwrap(), b"INSERT\0".to_vec());
             assert_eq!(received.recv().await.unwrap(), b"COMMIT\0".to_vec());
             assert!(read_reply(&mut client).await.is_err());
-            assert_eq!(
-                proxy.stats(),
-                ProxyStats {
-                    connections: 1,
-                    commits: 1,
-                    commit_acks_dropped: 1,
-                    statements: 2,
-                }
-            );
+            assert_eq!(proxy.stats(), ProxyStats {
+                connections: 1,
+                commits: 1,
+                commit_acks_dropped: 1,
+                statements: 2,
+            });
             assert_eq!(proxy.mode(), ProxyMode::Pass);
         })
         .await;
@@ -1251,11 +1248,9 @@ mod tests {
             // Default mode still trims, and forwarded bytes never change.
             for (exact, bodies, trace) in [
                 (false, vec![b" SELECT 4; \0".as_slice()], vec!["SELECT 4"]),
-                (
-                    true,
-                    vec![b" SELECT 5; \0".as_slice(), b"SELECT 6\0x\0".as_slice()],
-                    vec![" SELECT 5; "],
-                ),
+                (true, vec![b" SELECT 5; \0".as_slice(), b"SELECT 6\0x\0".as_slice()], vec![
+                    " SELECT 5; ",
+                ]),
             ] {
                 if exact {
                     proxy.enable_exact_query_trace(2);
@@ -1548,12 +1543,10 @@ mod simple_in_transaction_ack_tests {
                 assert_eq!(proxy.simple_in_transaction_acks_dropped(), 0, "{reply:?}");
                 assert_eq!(proxy.mode(), ARMED, "{reply:?}");
                 // The relay stays open and keeps passing.
-                exchange(
-                    &mut client,
-                    &mut server,
-                    &[(b'Q', b"SELECT 1\0")],
-                    &[(b'C', b"SELECT 1\0"), (b'Z', b"T")],
-                )
+                exchange(&mut client, &mut server, &[(b'Q', b"SELECT 1\0")], &[
+                    (b'C', b"SELECT 1\0"),
+                    (b'Z', b"T"),
+                ])
                 .await;
             }
         })
@@ -1642,12 +1635,10 @@ mod simple_in_transaction_ack_tests {
             }
             assert_eq!(proxy.simple_in_transaction_acks_dropped(), 1);
             for (client, server) in [&mut autocommit, &mut failing, &mut late] {
-                exchange(
-                    client,
-                    server,
-                    &[(b'Q', b"SELECT 1\0")],
-                    &[(b'C', b"SELECT 1\0"), (b'Z', b"I")],
-                )
+                exchange(client, server, &[(b'Q', b"SELECT 1\0")], &[
+                    (b'C', b"SELECT 1\0"),
+                    (b'Z', b"I"),
+                ])
                 .await;
             }
         })

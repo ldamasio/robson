@@ -692,6 +692,7 @@ async fn native_commission_first_poll_and_exact_result(pool: PgPool) -> anyhow::
     ensure!(proxy.data_rows() == 3 && result_bytes > 0 && result_bytes < response_bytes);
     ensure!(response_bytes <= 8 * 1024 * 1024);
     eprintln!("N5_NATIVE_RESTART writer_pid={writer_pid} writer_exit=0 reader_pid={reader_pid} reader_exit=0 sql=1 rows=3 data_row_wire_bytes={result_bytes} total_response_bytes={response_bytes} reader_http=0 age_advanced=true");
+    cold_load::verify_real_receipt_controls(&pool, &account(writer.tenant, PAIR)?).await?;
     Ok(())
 }
 
