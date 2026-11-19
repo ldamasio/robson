@@ -542,3 +542,500 @@ async fn cold_spot_audit_refuses_stale_and_missing_current_admission(pool: PgPoo
         reason:RowDefect::Route(RouteDefect::LegWithoutAdmission),key:SourceKey::Route(p),..}) if p==position));
     Ok(())
 }
+// Append these helpers beneath the isolated cold_audit_pg_tests.rs fixtures.
+// Use its setup(), SCOPE, Result, ensure!, PgPool and Uuid.
+
+const R2_UID: &str = "local-fixture";
+const R2_DECOY_SCOPE: &str = "r2-other-spot-account";
+const R2_DECOY_UID: &str = "r2-other-spot-uid";
+const R2_SYMBOL: &str = "BTCUSDT";
+
+type R2PriorBinding = (Uuid, Uuid, Uuid, i64, bool);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct R2AuditAnchor {
+    tenant: Uuid,
+    current_epoch: Uuid,
+    version: i64,
+    // generation, process epoch, source audit, accounting version, hint marker
+    prior: R2PriorBinding,
+}
+
+async fn r2_seed_decoy_account(pool: &PgPool, tenant: Uuid) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO public.venue_accounts
+          (venue_id,account_scope,tenant_id,uid,bound_at,cutover_id)
+         VALUES ('binance:spot',$1,$2,$3,now(),$4)",
+    )
+    .bind(R2_DECOY_SCOPE)
+    .bind(tenant)
+    .bind(R2_DECOY_UID)
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Call after setup() in a clean native fixture. The copied prior is already
+/// stale at the exact current numeric accounting version.
+async fn r2_seed_copied_anchor(pool: &PgPool, tenant: Uuid) -> Result<R2AuditAnchor> {
+    r2_seed_decoy_account(pool, tenant).await?;
+    let old = crate::process_epoch::start_epoch(pool, tenant, "r2-copied-prior").await?;
+    let version: i64 = sqlx::query_scalar(
+        "SELECT version FROM public.accounting_state WHERE tenant_id=$1 AND venue_id='binance:spot'",
+    )
+    .bind(tenant)
+    .fetch_one(pool)
+    .await?;
+    let prior = (Uuid::now_v7(), old.epoch.epoch_id, Uuid::now_v7(), version, false);
+    sqlx::query(
+        "INSERT INTO public.spot_order_set_generation
+          (tenant_id,venue_id,account_scope,generation_id,process_epoch,source_audit_id,
+           accounting_version,position_hints_complete)
+         VALUES ($1,'binance:spot',$2,$3,$4,$5,$6,$7)",
+    )
+    .bind(tenant)
+    .bind(SCOPE)
+    .bind(prior.0)
+    .bind(prior.1)
+    .bind(prior.2)
+    .bind(prior.3)
+    .bind(prior.4)
+    .execute(pool)
+    .await?;
+    let current = crate::process_epoch::start_epoch(pool, tenant, "r2-before-audit").await?;
+    ensure!(current.predecessor_epoch_id == Some(prior.1));
+    let anchor = R2AuditAnchor {
+        tenant,
+        current_epoch: current.epoch.epoch_id,
+        version,
+        prior,
+    };
+    ensure!(anchor.current_epoch != anchor.prior.1);
+    r2_assert_anchor_oracle(pool, &anchor).await?;
+    Ok(anchor)
+}
+
+/// Call from a separate writer while the audit owner is held at AfterIntents.
+/// The same-version drift includes a new epoch, new complete prior tuple and a
+/// late armed-only route. The root coordinator must withhold install authority.
+async fn r2_publish_after_anchor(
+    pool: &PgPool,
+    before: &R2AuditAnchor,
+) -> Result<(R2AuditAnchor, Uuid)> {
+    let current =
+        crate::process_epoch::start_epoch(pool, before.tenant, "r2-paused-audit-race").await?;
+    ensure!(current.predecessor_epoch_id == Some(before.current_epoch));
+    let prior = (Uuid::now_v7(), before.current_epoch, Uuid::now_v7(), before.version, true);
+    let position = Uuid::from_u128(0xc01d_4001);
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE public.spot_order_set_generation
+         SET generation_id=$3,process_epoch=$4,source_audit_id=$5,position_hints_complete=$6
+         WHERE (tenant_id,venue_id,account_scope,generation_id,process_epoch,source_audit_id,
+                accounting_version,position_hints_complete)
+             = ($1,'binance:spot',$2,$7,$8,$9,$10,$11)",
+    )
+    .bind(before.tenant)
+    .bind(SCOPE)
+    .bind(prior.0)
+    .bind(prior.1)
+    .bind(prior.2)
+    .bind(prior.4)
+    .bind(before.prior.0)
+    .bind(before.prior.1)
+    .bind(before.prior.2)
+    .bind(before.prior.3)
+    .bind(before.prior.4)
+    .execute(&mut *tx)
+    .await?;
+    ensure!(updated.rows_affected() == 1);
+    sqlx::query(
+        "INSERT INTO public.leg_routes(position_id,tenant_id,venue_id,account_scope,routed_at)
+         VALUES ($1,$2,'binance:spot',$3,now())",
+    )
+    .bind(position)
+    .bind(before.tenant)
+    .bind(SCOPE)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let after = R2AuditAnchor {
+        tenant: before.tenant,
+        current_epoch: current.epoch.epoch_id,
+        version: before.version,
+        prior,
+    };
+    r2_assert_anchor_oracle(pool, &after).await?;
+    Ok((after, position))
+}
+
+async fn r2_assert_anchor_oracle(pool: &PgPool, expected: &R2AuditAnchor) -> Result<()> {
+    let accounts: Vec<(String, String, Uuid)> = sqlx::query_as(
+        "SELECT account_scope,uid,tenant_id FROM public.venue_accounts
+         WHERE venue_id='binance:spot' AND account_scope IN ($1,$2) ORDER BY account_scope",
+    )
+    .bind(SCOPE)
+    .bind(R2_DECOY_SCOPE)
+    .fetch_all(pool)
+    .await?;
+    ensure!(accounts.len() == 2);
+    ensure!(accounts.contains(&(SCOPE.into(), R2_UID.into(), expected.tenant)));
+    ensure!(accounts.contains(&(R2_DECOY_SCOPE.into(), R2_DECOY_UID.into(), expected.tenant)));
+    let (version, epoch): (i64, Uuid) = sqlx::query_as(
+        "SELECT a.version,e.epoch_id FROM public.accounting_state a
+         CROSS JOIN LATERAL (
+             SELECT epoch_id,clean_stop_at FROM public.process_epochs
+             WHERE tenant_id=a.tenant_id ORDER BY epoch_seq DESC LIMIT 1
+         ) e WHERE a.tenant_id=$1 AND a.venue_id='binance:spot' AND e.clean_stop_at IS NULL",
+    )
+    .bind(expected.tenant)
+    .fetch_one(pool)
+    .await?;
+    ensure!((version, epoch) == (expected.version, expected.current_epoch));
+    let prior: R2PriorBinding = sqlx::query_as(
+        "SELECT generation_id,process_epoch,source_audit_id,accounting_version,
+                position_hints_complete FROM public.spot_order_set_generation
+         WHERE (tenant_id,venue_id,account_scope)=($1,'binance:spot',$2)",
+    )
+    .bind(expected.tenant)
+    .bind(SCOPE)
+    .fetch_one(pool)
+    .await?;
+    ensure!(prior == expected.prior);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum R2NativeEdge {
+    NamedForeign,
+    ReverseForeign,
+    NamedMissing,
+    ExactPair,
+}
+
+#[derive(Debug)]
+struct R2EdgeWitness {
+    intent: Uuid,
+    client: &'static str,
+    exchange: &'static str,
+    position: Uuid,
+    scoped_intents: i64,
+    scoped_orders: i64,
+    scoped_routes: i64,
+    terminal: bool,
+}
+
+/// One variant per isolated DB after setup() and r2_seed_decoy_account().
+/// Both accounts share the tenant and venue, isolating account-scope checking.
+/// M36's actual leg and native order constraints stay active for every case.
+async fn r2_seed_native_edge(
+    pool: &PgPool,
+    tenant: Uuid,
+    edge: R2NativeEdge,
+) -> Result<R2EdgeWitness> {
+    let (salt, client, exchange, j_scope, o_scope, original_position) = match edge {
+        R2NativeEdge::NamedForeign => {
+            (1, "r2-named-foreign", "912301", Some(R2_DECOY_SCOPE), SCOPE, true)
+        },
+        R2NativeEdge::ReverseForeign => {
+            (2, "r2-reverse-foreign", "912302", Some(SCOPE), R2_DECOY_SCOPE, false)
+        },
+        R2NativeEdge::NamedMissing => (3, "r2-named-missing", "912303", None, SCOPE, false),
+        R2NativeEdge::ExactPair => (4, "r2-exact-pair", "912304", Some(SCOPE), SCOPE, true),
+    };
+    let intent = Uuid::from_u128(0xc01d_4100 + salt);
+    let position = Uuid::from_u128(0xc01d_4200 + salt);
+    let admission = Uuid::from_u128(0xc01d_4300 + salt);
+    // The absent and exact J controls share a qualified native terminal
+    // shape. Only the exact present J can supply a terminal group mask.
+    let terminal = !matches!(edge, R2NativeEdge::ReverseForeign);
+
+    let mut tx = pool.begin().await?;
+    let _: i64 = sqlx::query_scalar(
+        "UPDATE public.accounting_state SET version=version+1
+         WHERE tenant_id=$1 AND venue_id='binance:spot' RETURNING version",
+    )
+    .bind(tenant)
+    .fetch_one(&mut *tx)
+    .await?;
+    if let Some(account) = j_scope {
+        sqlx::query(
+            "INSERT INTO public.order_intents
+              (intent_id,tenant_id,venue_id,account_scope,client_order_id,position_id,kind,params,created_at)
+             VALUES ($1,$2,'binance:spot',$3,$4,$5,'exit','{}',now())",
+        )
+        .bind(intent)
+        .bind(tenant)
+        .bind(account)
+        .bind(client)
+        .bind(original_position.then_some(position))
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO public.leg_routes(position_id,tenant_id,venue_id,account_scope,routed_at)
+         VALUES ($1,$2,'binance:spot',$3,now())",
+    )
+    .bind(position)
+    .bind(tenant)
+    .bind(o_scope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "SELECT public.balance_leg_admit($1,'binance:spot',$2,$3,$4,$5,'2026-11-01',
+         10,10,2,10,0.001,'base','fixture',now(),'r2-edge',1,1,100,0.1,10,90,now(),false)",
+    )
+    .bind(tenant)
+    .bind(o_scope)
+    .bind(R2_SYMBOL)
+    .bind(position)
+    .bind(admission)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO public.venue_orders
+          (tenant_id,venue_id,account_scope,symbol,exchange_order_id,client_order_id,
+           last_client_order_id,owner,intent_id,position_id,kind,side,order_type,orig_qty,
+           status,phase,last_checked_at,live_seen_at,terminal_seen_at)
+         VALUES ($1,'binance:spot',$2,$3,$4,$5,$5,'leg',$6,$7,'sell','SELL','LIMIT',1,
+                 CASE WHEN $8 THEN 'CANCELED' ELSE 'NEW' END,
+                 CASE WHEN $8 THEN 'terminal' ELSE 'live' END,now(),now(),
+                 CASE WHEN $8 THEN now() ELSE NULL END)",
+    )
+    .bind(tenant)
+    .bind(o_scope)
+    .bind(R2_SYMBOL)
+    .bind(exchange)
+    .bind(client)
+    .bind(intent)
+    .bind(position)
+    .bind(terminal)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    let (found_j, found_o, found_terminal): (Option<String>, String, bool) = sqlx::query_as(
+        "SELECT (SELECT account_scope FROM public.order_intents WHERE intent_id=$1),
+                account_scope, terminal FROM public.venue_orders WHERE intent_id=$1",
+    )
+    .bind(intent)
+    .fetch_one(pool)
+    .await?;
+    ensure!((found_j.as_deref(), found_o.as_str(), found_terminal) == (j_scope, o_scope, terminal));
+
+    let (scoped_intents, scoped_orders, scoped_routes): (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM public.order_intents WHERE venue_id='binance:spot' AND account_scope=$1),
+                (SELECT count(*) FROM public.venue_orders WHERE venue_id='binance:spot' AND account_scope=$1),
+                (SELECT count(*) FROM public.leg_routes WHERE venue_id='binance:spot' AND account_scope=$1)",
+    )
+    .bind(SCOPE)
+    .fetch_one(pool)
+    .await?;
+    let local_order = i64::from(o_scope == SCOPE);
+    ensure!(
+        (scoped_intents, scoped_orders, scoped_routes)
+            == (i64::from(j_scope == Some(SCOPE)), local_order, local_order)
+    );
+    Ok(R2EdgeWitness {
+        intent,
+        client,
+        exchange,
+        position,
+        scoped_intents,
+        scoped_orders,
+        scoped_routes,
+        terminal,
+    })
+}
+
+use super::super::cold_owner::{
+    capture, AnchorDefect, OwnerRequest, PriorGeneration, RestoreIdentity,
+};
+use super::super::cold_source::Edge;
+
+fn r2_request<'a>(tenant: Uuid, epoch: Uuid, version: i64, uid: &'a str) -> OwnerRequest<'a> {
+    OwnerRequest {
+        scope: scope(tenant),
+        expected_uid: uid,
+        epoch,
+        accounting_version: version,
+        restore: RestoreIdentity {
+            operation: Uuid::now_v7(),
+            target: Uuid::now_v7(),
+        },
+    }
+}
+
+fn r2_prior(p: R2PriorBinding) -> PriorGeneration {
+    PriorGeneration {
+        generation_id: p.0,
+        process_epoch: Some(p.1),
+        source_audit_id: Some(p.2),
+        accounting_version: Some(p.3),
+        position_hints_complete: p.4,
+    }
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_owner_anchor_stays_with_the_terminal_snapshot(pool: PgPool) -> Result<()> {
+    let tenant = setup(&pool).await?;
+    let before = r2_seed_copied_anchor(&pool, tenant).await?;
+    let request = r2_request(tenant, before.current_epoch, before.version, R2_UID);
+    let wrong = OwnerRequest { expected_uid: R2_DECOY_UID, ..request };
+    ensure!(matches!(
+        capture(&pool, &wrong, deadline()).await,
+        Err(ColdAuditRefusal::AccountUid)
+    ));
+    let (seen, observed) = oneshot::channel();
+    let (released, resume) = oneshot::channel();
+    let cold = SNAPSHOT_PAUSE.scope(
+        RefCell::new(Some((Boundary::AfterIntents, seen, resume))),
+        capture(&pool, &request, deadline()),
+    );
+    let publication = async {
+        observed.await?;
+        let after = r2_publish_after_anchor(&pool, &before).await?;
+        released.send(()).map_err(|_| anyhow!("old snapshot ended prematurely"))?;
+        Ok::<_, anyhow::Error>(after)
+    };
+    let (cut, publication) = tokio::join!(cold, publication);
+    let (after, late) = publication?;
+    let cut = cut.map_err(|e| anyhow!("old snapshot: {e:?}"))?;
+    ensure!(
+        cut.anchor.tenant_id == tenant
+            && cut.anchor.account_scope == SCOPE
+            && cut.anchor.uid == R2_UID
+    );
+    ensure!(
+        cut.anchor.process_epoch == before.current_epoch
+            && cut.anchor.accounting_version == before.version
+            && cut.anchor.prior == Some(r2_prior(before.prior))
+            && cut.restore == request.restore
+    );
+    ensure!(cut.routes().is_empty() && cut.receipt.statements == 10);
+    ensure!(matches!(
+        capture(&pool, &request, deadline()).await,
+        Err(ColdAuditRefusal::Anchor(AnchorDefect::Epoch))
+    ));
+    let later = r2_request(tenant, after.current_epoch, after.version, R2_UID);
+    let current = capture(&pool, &later, deadline())
+        .await
+        .map_err(|e| anyhow!("new snapshot: {e:?}"))?;
+    ensure!(
+        current.anchor.prior == Some(r2_prior(after.prior))
+            && current.anchor.accounting_version == cut.anchor.accounting_version
+            && current.routes().iter().map(|r| r.position_id).collect::<Vec<_>>() == [late]
+    );
+    Ok(())
+}
+
+async fn run_r2_edge(pool: &PgPool, variant: R2NativeEdge) -> Result<()> {
+    let tenant = setup(pool).await?;
+    r2_seed_decoy_account(pool, tenant).await?;
+    let seeded = r2_seed_native_edge(pool, tenant, variant).await?;
+    let epoch = crate::process_epoch::start_epoch(pool, tenant, "named-reverse-edge")
+        .await?
+        .epoch
+        .epoch_id;
+    let version:i64=sqlx::query_scalar("SELECT version FROM public.accounting_state WHERE tenant_id=$1 AND venue_id='binance:spot'")
+        .bind(tenant).fetch_one(pool).await?;
+    let request = r2_request(tenant, epoch, version, R2_UID);
+    let cut = capture(pool, &request, deadline()).await;
+    match variant {
+        R2NativeEdge::NamedForeign => ensure!(matches!(cut,
+            Err(ColdAuditRefusal::Row {family:Family::Orders,reason:RowDefect::ForeignEdge,
+                key:SourceKey::Order {symbol,exchange_order_id},..})
+            if symbol==R2_SYMBOL && exchange_order_id==seeded.exchange)),
+        R2NativeEdge::ReverseForeign => ensure!(matches!(cut,
+            Err(ColdAuditRefusal::Row {family:Family::Intents,reason:RowDefect::ForeignEdge,
+                key:SourceKey::ClientOrder(client),..}) if client==seeded.client)),
+        R2NativeEdge::NamedMissing | R2NativeEdge::ExactPair => {
+            let cut = cut.map_err(|e| anyhow!("native edge {variant:?}: {e:?}"))?;
+            let paired = matches!(variant, R2NativeEdge::ExactPair);
+            ensure!(
+                cut.anchor.prior.is_none()
+                    && cut.receipt.statements == 10
+                    && cut.attempts().is_empty()
+            );
+            ensure!(
+                cut.intents().len() as i64 == seeded.scoped_intents
+                    && cut.routes().len() as i64 == seeded.scoped_routes
+                    && cut.orders().len() as i64 == seeded.scoped_orders
+            );
+            let o = &cut.orders()[0];
+            ensure!(
+                o.exchange_order_id == seeded.exchange
+                    && o.intent_id == Some(seeded.intent)
+                    && o.position_id == Some(seeded.position)
+                    && (o.phase == "terminal") == seeded.terminal
+            );
+            if paired {
+                ensure!(
+                    o.named_edge(tenant, SCOPE) == Edge::InScope
+                        && cut.intents()[0].reverse_edge(tenant, SCOPE) == Edge::InScope
+                );
+            } else {
+                ensure!(o.named_edge(tenant, SCOPE) == Edge::AbsentNamed);
+            }
+        },
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_owner_refuses_cross_scope_named_j(pool: PgPool) -> Result<()> {
+    run_r2_edge(&pool, R2NativeEdge::NamedForeign).await
+}
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_owner_refuses_cross_scope_reverse_order(pool: PgPool) -> Result<()> {
+    run_r2_edge(&pool, R2NativeEdge::ReverseForeign).await
+}
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_owner_retains_native_order_with_original_j_absent(
+    pool: PgPool,
+) -> Result<()> {
+    run_r2_edge(&pool, R2NativeEdge::NamedMissing).await
+}
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_owner_checks_both_halves_of_exact_native_pair(pool: PgPool) -> Result<()> {
+    run_r2_edge(&pool, R2NativeEdge::ExactPair).await
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn cold_generation_owner_rejects_overwidth_raw_key_before_cursor(pool: PgPool) -> Result<()> {
+    let tenant = setup(&pool).await?;
+    let epoch = crate::process_epoch::start_epoch(&pool, tenant, "overwidth")
+        .await?
+        .epoch
+        .epoch_id;
+    sqlx::query(
+        "INSERT INTO public.order_intents
+        (tenant_id,venue_id,account_scope,intent_id,client_order_id,kind,params,created_at)
+        VALUES ($1,'binance:spot',$2,$3,repeat('é',129),'exit','{}',now())",
+    )
+    .bind(tenant)
+    .bind(SCOPE)
+    .bind(Uuid::now_v7())
+    .execute(&pool)
+    .await?;
+    let version:i64=sqlx::query_scalar("SELECT version FROM public.accounting_state WHERE tenant_id=$1 AND venue_id='binance:spot'")
+        .bind(tenant).fetch_one(&pool).await?;
+    let cut = capture(&pool, &r2_request(tenant, epoch, version, R2_UID), deadline()).await;
+    ensure!(matches!(
+        cut,
+        Err(ColdAuditRefusal::Row {
+            family: Family::Intents,
+            reason: RowDefect::OverWidth,
+            last_verified: None,
+            ..
+        })
+    ));
+    Ok(())
+}

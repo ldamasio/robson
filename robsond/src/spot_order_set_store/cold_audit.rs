@@ -6,8 +6,9 @@ use sqlx::{Connection, PgPool, Row};
 use tokio::time::{timeout_at, Instant};
 use uuid::Uuid;
 
+use super::cold_owner::{read_anchor, AnchorDefect, EdgeDefect, ObservedAnchor, OwnerRequest};
 use super::cold_source::{
-    read_attempt_page, read_intent_page, read_order_page, read_route_page, AttemptSource,
+    read_attempt_page, read_intent_page, read_order_page, read_route_page, AttemptSource, Edge,
     IntentSource, OrderSource, RouteClass, RouteDefect, RouteSource, PAGE_LIMIT,
 };
 use crate::ledger_connection::LedgerConnection;
@@ -85,6 +86,12 @@ pub(crate) enum RowDefect {
     /// An attempt with no intent at its exact Spot account key.
     MissingParent,
     Route(RouteDefect),
+    /// A raw text exceeded `TEXT_LIMIT` bytes. The reported key is a clipped
+    /// prefix for diagnosis only; it never became a cursor.
+    OverWidth,
+    /// The other side of a native J/order edge is in another tenant, venue
+    /// or account, whether or not it lies in a scanned page.
+    ForeignEdge,
 }
 
 #[derive(Debug)]
@@ -96,6 +103,10 @@ pub(crate) enum ColdAuditRefusal {
     AccountMissing,
     AccountTenant,
     AccountUid,
+    /// The owner's anchor differs from its exact expectation.
+    Anchor(AnchorDefect),
+    /// The owner's two edge directions disagree within the captured cut.
+    Unproven(EdgeDefect),
     Catalog(String),
     Row {
         family: Family,
@@ -147,6 +158,21 @@ pub(crate) async fn audit_cold_sources(
     deadline: Instant,
     sink: &mut impl ColdSourceSink,
 ) -> Result<ColdSourceReceipt, ColdAuditRefusal> {
+    audit(pool, scope, budget, deadline, sink, None)
+        .await
+        .map(|(receipt, _)| receipt)
+}
+
+/// The one owned traversal. `owner` replaces the account read with the
+/// owner's anchor read and adds edge refusals; statements stay the same.
+pub(super) async fn audit(
+    pool: &PgPool,
+    scope: ColdAuditScope<'_>,
+    budget: PageBudget,
+    deadline: Instant,
+    sink: &mut impl ColdSourceSink,
+    owner: Option<&OwnerRequest<'_>>,
+) -> Result<(ColdSourceReceipt, Option<ObservedAnchor>), ColdAuditRefusal> {
     if scope.tenant_id.is_nil()
         || scope.account_scope.trim().is_empty()
         || [
@@ -161,7 +187,7 @@ pub(crate) async fn audit_cold_sources(
         return Err(ColdAuditRefusal::InvalidRequest);
     }
     let mut stage = Stage::Acquire;
-    match timeout_at(deadline, traverse(pool, scope, budget, sink, &mut stage)).await {
+    match timeout_at(deadline, traverse(pool, scope, budget, sink, &mut stage, owner)).await {
         Ok(result) => result,
         Err(_) => Err(ColdAuditRefusal::Deadline(stage)),
     }
@@ -173,7 +199,8 @@ async fn traverse(
     budget: PageBudget,
     sink: &mut impl ColdSourceSink,
     stage: &mut Stage,
-) -> Result<ColdSourceReceipt, ColdAuditRefusal> {
+    owner: Option<&OwnerRequest<'_>>,
+) -> Result<(ColdSourceReceipt, Option<ObservedAnchor>), ColdAuditRefusal> {
     #[cfg(test)]
     tests::pause_at(tests::Boundary::BeforeAcquire).await;
 
@@ -188,20 +215,29 @@ async fn traverse(
     sqlx::query(LIMITS).execute(&mut *tx).await.map_err(db(Stage::Setup))?;
     let mut statements = 3;
 
+    // The first data read of the snapshot: the account alone, or the account
+    // and the owner's anchor together.
     *stage = Stage::Account;
-    let account = sqlx::query(ACCOUNT)
-        .bind(scope.account_scope)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db(Stage::Account))?
-        .ok_or(ColdAuditRefusal::AccountMissing)?;
+    let anchor = match owner {
+        None => {
+            let account = sqlx::query(ACCOUNT)
+                .bind(scope.account_scope)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db(Stage::Account))?
+                .ok_or(ColdAuditRefusal::AccountMissing)?;
+            if account.get::<Uuid, _>("tenant_id") != scope.tenant_id {
+                return Err(ColdAuditRefusal::AccountTenant);
+            }
+            if account.get::<String, _>("uid").trim().is_empty() {
+                return Err(ColdAuditRefusal::AccountUid);
+            }
+            None
+        },
+        Some(request) => Some(read_anchor(&mut *tx, request).await?),
+    };
     statements += 1;
-    if account.get::<Uuid, _>("tenant_id") != scope.tenant_id {
-        return Err(ColdAuditRefusal::AccountTenant);
-    }
-    if account.get::<String, _>("uid").trim().is_empty() {
-        return Err(ColdAuditRefusal::AccountUid);
-    }
+    let edges = owner.is_some();
 
     *stage = Stage::Catalog;
     let catalog = sqlx::query(CATALOG).fetch_all(&mut *tx).await.map_err(db(Stage::Catalog))?;
@@ -211,7 +247,7 @@ async fn traverse(
             return Err(ColdAuditRefusal::Catalog(row.get("label")));
         }
     }
-    if catalog.len() != 15 {
+    if catalog.len() != 17 {
         return Err(ColdAuditRefusal::Catalog("catalog row count".to_string()));
     }
 
@@ -226,7 +262,15 @@ async fn traverse(
             .map_err(db(*stage))?;
         for row in &page.rows {
             let key = SourceKey::ClientOrder(row.client_order_id.clone());
-            intents.check(key, (!row.owner_matches).then_some(RowDefect::ForeignOwner))?;
+            let defect = if row.wide {
+                Some(RowDefect::OverWidth)
+            } else if !row.owner_matches {
+                Some(RowDefect::ForeignOwner)
+            } else {
+                (edges && row.reverse_edge(tenant, account_scope) == Edge::Foreign)
+                    .then_some(RowDefect::ForeignEdge)
+            };
+            intents.check(key, defect)?;
         }
         intents.deliver(sink.intents(&page.rows))?;
         if intents.page(page.rows.len())? {
@@ -246,7 +290,9 @@ async fn traverse(
             .map_err(db(*stage))?;
         for row in &page.rows {
             let key = SourceKey::ClientOrder(row.client_order_id.clone());
-            let defect = if row.parent_intent_id.is_none() {
+            let defect = if row.wide {
+                Some(RowDefect::OverWidth)
+            } else if row.parent_intent_id.is_none() {
                 Some(RowDefect::MissingParent)
             } else {
                 (!row.owner_matches).then_some(RowDefect::ForeignOwner)
@@ -279,8 +325,17 @@ async fn traverse(
                 symbol: row.symbol.clone(),
                 exchange_order_id: row.exchange_order_id.clone(),
             };
-            // Unowned and uncertain orders stay data for reconstruction.
-            orders.check(key, (!row.owner_matches).then_some(RowDefect::ForeignOwner))?;
+            // Unowned and uncertain orders, and orders naming an absent J,
+            // stay data for reconstruction.
+            let defect = if row.wide {
+                Some(RowDefect::OverWidth)
+            } else if !row.owner_matches {
+                Some(RowDefect::ForeignOwner)
+            } else {
+                (edges && row.named_edge(tenant, account_scope) == Edge::Foreign)
+                    .then_some(RowDefect::ForeignEdge)
+            };
+            orders.check(key, defect)?;
         }
         orders.deliver(sink.orders(&page.rows))?;
         if orders.page(page.rows.len())? {
@@ -302,10 +357,14 @@ async fn traverse(
             .await
             .map_err(db(*stage))?;
         for row in &page.rows {
-            let defect = match row.classify() {
-                RouteClass::Diagnostic(defect) => Some(RowDefect::Route(defect)),
-                // Armed-only and closed legs remain source data.
-                RouteClass::ArmedOnly | RouteClass::Leg { .. } => None,
+            let defect = if row.wide {
+                Some(RowDefect::OverWidth)
+            } else {
+                match row.classify() {
+                    RouteClass::Diagnostic(defect) => Some(RowDefect::Route(defect)),
+                    // Armed-only and closed legs remain source data.
+                    RouteClass::ArmedOnly | RouteClass::Leg { .. } => None,
+                }
             };
             routes.check(SourceKey::Route(row.position_id), defect)?;
         }
@@ -323,13 +382,14 @@ async fn traverse(
     owned.finished = true;
     let walks = [intents, attempts, orders, routes];
     statements += walks.iter().map(|walk| u64::from(walk.pages)).sum::<u64>() + 1;
-    Ok(ColdSourceReceipt {
+    let receipt = ColdSourceReceipt {
         tenant_id: tenant,
         account_scope: account_scope.to_string(),
         families: walks.map(Walk::terminal),
         statements,
         _sealed: (),
-    })
+    };
+    Ok((receipt, anchor))
 }
 
 fn db(stage: Stage) -> impl FnOnce(sqlx::Error) -> ColdAuditRefusal {

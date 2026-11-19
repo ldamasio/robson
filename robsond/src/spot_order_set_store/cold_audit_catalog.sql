@@ -3,16 +3,23 @@
 -- are PostgreSQL's rendering of the M36/M37 definitions and the unmigrated
 -- route index, not a temp-table rendering. One row per label; any false or
 -- missing label refuses. It cannot attest rows restored with checks bypassed.
-WITH expected(label, rel, cols, uniq, pred) AS (VALUES
-    ('intent_key', 'order_intents', ARRAY['venue_id','account_scope','client_order_id'], true, NULL::text),
+-- The two named edge indexes back the J and order pages' post-LIMIT probes.
+WITH expected(label, rel, cols, uniq, pred, name) AS (VALUES
+    ('intent_key', 'order_intents', ARRAY['venue_id','account_scope','client_order_id'], true, NULL::text,
+        NULL::text),
     ('attempt_key', 'submit_attempts', ARRAY['venue_id','account_scope','client_order_id'], true,
-        '(venue_id = ''binance:spot''::text)'),
-    ('order_key', 'venue_orders', ARRAY['venue_id','account_scope','symbol','exchange_order_id'], true, NULL),
+        '(venue_id = ''binance:spot''::text)', NULL),
+    ('order_key', 'venue_orders', ARRAY['venue_id','account_scope','symbol','exchange_order_id'], true, NULL,
+        NULL),
     ('route_key', 'leg_routes', ARRAY['account_scope','position_id'], false,
-        '(venue_id = ''binance:spot''::text)'),
-    ('leg_key', 'balance_legs', ARRAY['position_id'], true, NULL),
-    ('admission_current', 'balance_leg_admissions', ARRAY['position_id'], true, '(superseded_at IS NULL)'),
-    ('account_key', 'venue_accounts', ARRAY['venue_id','account_scope'], true, NULL))
+        '(venue_id = ''binance:spot''::text)', 'idx_leg_routes_spot_scope_position'),
+    ('leg_key', 'balance_legs', ARRAY['position_id'], true, NULL, NULL),
+    ('admission_current', 'balance_leg_admissions', ARRAY['position_id'], true, '(superseded_at IS NULL)',
+        NULL),
+    ('account_key', 'venue_accounts', ARRAY['venue_id','account_scope'], true, NULL, NULL),
+    ('intent_pkey', 'order_intents', ARRAY['intent_id'], true, NULL, 'order_intents_pkey'),
+    ('order_intent_edge', 'venue_orders', ARRAY['intent_id'], true, '(intent_id IS NOT NULL)',
+        'idx_venue_orders_intent'))
 SELECT e.label, EXISTS (
         SELECT 1 FROM pg_index i
           JOIN pg_class ix ON ix.oid = i.indexrelid
@@ -25,7 +32,7 @@ SELECT e.label, EXISTS (
                      JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum ORDER BY k.n)
                = e.cols
            AND pg_get_expr(i.indpred, i.indrelid, false) IS NOT DISTINCT FROM e.pred
-           AND (e.label <> 'route_key' OR ix.relname = 'idx_leg_routes_spot_scope_position')) AS ok
+           AND (e.name IS NULL OR ix.relname = e.name)) AS ok
   FROM expected e
 UNION ALL
 SELECT 'uid_nonblank', EXISTS (
