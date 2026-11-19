@@ -118,10 +118,12 @@ pub(crate) struct Confirmation {
 }
 
 fn valid_identity(identity: &ClaimIdentity) -> bool {
+    let subsec = identity.audit_at.timestamp_subsec_nanos();
     !identity.claim_id.is_nil()
         && !identity.owner.is_nil()
         && identity.captured.nanoseconds() <= TICK_MAX as u128
-        && identity.audit_at.timestamp_subsec_nanos() % 1_000 == 0
+        && subsec < 1_000_000_000
+        && subsec % 1_000 == 0
 }
 
 /// Check the shape and exact native arithmetic before sending SQL. PostgreSQL

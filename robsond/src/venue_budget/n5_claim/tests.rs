@@ -388,6 +388,26 @@ async fn stale_claim_provenance_and_clock_domain_leave_row_unchanged(pool: PgPoo
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires isolated PostgreSQL"]
+async fn refuses_audit_timestamps_that_postgres_would_normalize(pool: PgPool) {
+    let request = seed(&pool, true).await;
+    let previous_row = unchanged_row(&pool).await;
+    let measured = Measured::start(&pool).await;
+    for subsec in [1_000_000_000, 123_456_789] {
+        let audit_at = DateTime::<Utc>::from_timestamp(59, subsec).unwrap();
+        let mut wrong_prior = request.clone();
+        wrong_prior.prior.identity.audit_at = audit_at;
+        let mut wrong_next = request.clone();
+        wrong_next.next.audit_at = audit_at;
+        for wrong in [wrong_prior, wrong_next] {
+            assert!(matches!(measured.claim(wrong, deadline()).await, Err(BudgetError::Invalid)));
+        }
+    }
+    measured.wire(0, 0, 0);
+    assert_eq!(unchanged_row(&pool).await, previous_row);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL"]
 async fn append_preserves_key_and_contenders_share_one_winner(pool: PgPool) {
     let request = seed(&pool, false).await;
     let original_snapshot = snapshot(&pool).await;
