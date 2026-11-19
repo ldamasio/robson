@@ -23,6 +23,8 @@ use crate::venue_budget::{fixture, Trace};
 mod capacity;
 #[path = "order_journal_clocked_history_pg_tests.rs"]
 mod history;
+#[path = "order_journal_clocked_wire_pg_tests.rs"]
+mod wire;
 
 struct Scope {
     tenant: Uuid,
