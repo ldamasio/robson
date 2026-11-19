@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Test-only real Journal/Spot audit composition driven by a disposable PG16
 //! controller.
 use std::{io, os::fd::AsFd, sync::Arc};

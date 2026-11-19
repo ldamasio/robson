@@ -459,6 +459,8 @@ fn a_missing_repeated_or_mistyped_required_field_is_malformed() {
         "{}".into(),
         "".into(),
         "[null]".into(),
+        r#"[[31,"LTCBTC",[{"symbol":"LTCBTC","orderId":4,"clientOrderId":"c4"}]]]"#.into(),
+        r#"[{"orderListId":31,"symbol":"LTCBTC","orders":[["LTCBTC",4,"c4"]]}]"#.into(),
     ];
     for body in &refused {
         let error = decode(body).unwrap_err();

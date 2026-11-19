@@ -5,11 +5,11 @@
 //! A field Binance always shows is required, so a changed shape fails the
 //! read instead of reading as zero; a conditional one is an `Option`.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt, marker::PhantomData};
 
 use robson_exec::balance_costs::exact;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Deserializer};
+use serde::{de, Deserialize, Deserializer};
 
 use super::rest::{parse_json, SpotReadError};
 
@@ -182,6 +182,7 @@ pub struct SpotOpenOrderList {
     /// Raw, case kept.
     pub symbol: String,
     /// Members in the venue's order. The validated decoder requires a member.
+    #[serde(deserialize_with = "object_entries")]
     pub orders: Vec<SpotOrderListMember>,
 }
 
@@ -229,6 +230,59 @@ impl From<SpotOrderListError> for SpotReadError {
     }
 }
 
+struct Object<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct OnlyMap<T>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> de::Visitor<'de> for OnlyMap<T> {
+            type Value = Object<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an order-list object")
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                T::deserialize(de::value::MapAccessDeserializer::new(map)).map(Object)
+            }
+        }
+
+        deserializer.deserialize_map(OnlyMap(PhantomData))
+    }
+}
+
+fn object_entries<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Entries<T>(PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> de::Visitor<'de> for Entries<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an array of order-list objects")
+        }
+
+        fn visit_seq<S: de::SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
+            let mut entries = Vec::new();
+            while let Some(Object(entry)) = seq.next_element()? {
+                entries.try_reserve(1).map_err(|_| de::Error::custom("allocation refused"))?;
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_seq(Entries(PhantomData))
+}
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct OpenOrderListEntries(#[serde(deserialize_with = "object_entries")] Vec<SpotOpenOrderList>);
+
 fn valid_identity(text: &str) -> bool {
     !text.is_empty() && !text.chars().any(|c| c.is_whitespace() || c.is_control())
 }
@@ -249,7 +303,7 @@ pub fn decode_open_order_lists(
     if body.len() > max_bytes {
         return Err(SpotOrderListError::Oversize { len: body.len(), limit: max_bytes });
     }
-    let lists: Vec<SpotOpenOrderList> = serde_json::from_str(body).map_err(|e| {
+    let OpenOrderListEntries(lists) = serde_json::from_str(body).map_err(|e| {
         // Category and position only: a serde message may quote the input.
         SpotOrderListError::Malformed(format!(
             "{:?} at line {} column {}",

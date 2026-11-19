@@ -4,9 +4,9 @@
 //! Lexical regression checks over the workspace's Rust sources as they are on
 //! disk, backed by a review of each part's diff and call paths (a name split
 //! across lines, generated code or a file these filters skip can escape them):
-//! - outside `binance/spot/`, the exact controlled clock allowance is the
-//!   only production reference. No production path, factory included, can
-//!   construct the reader, feed, klines, rules cache or venue;
+//! - outside `binance/spot/`, the exact controlled clock allowance is the only
+//!   production reference. No production path, factory included, can construct
+//!   the reader, feed, klines, rules cache or venue;
 //! - readers, rules projection and cache implement no port. The exact named
 //!   input boundaries may import 8g1a's pure scalar parser; the cache may not.
 //!   8b's feed and klines additionally import exactly the existing items of the
@@ -543,8 +543,9 @@ fn clock_references(text: &str) -> impl Iterator<Item = &str> {
 
 fn n5_reference_lines(path: &Path) -> &'static [&'static str] {
     match path.to_str() {
-        Some("robson-exec/src/balance_costs/terms.rs") =>
-            &[r#"const API_SOURCE: &str = "binance:spot /api/v3/account/commission";"#],
+        Some("robson-exec/src/balance_costs/terms.rs") => {
+            &[r#"const API_SOURCE: &str = "binance:spot /api/v3/account/commission";"#]
+        },
         Some("robson-testkit/src/fake_spot_venue_tests.rs") => &[
             r#"let (status, _) = get(&venue, "/api/v3/account/commission", "symbol=BTCUSDT&timestamp=1").await;"#,
             r#"&& unserved[1].starts_with("GET /api/v3/account/commission?")"#,
@@ -587,7 +588,7 @@ fn strip_n5_references(path: &Path, text: &str) -> String {
         .join("\n")
 }
 
-fn isolated_n5_fixture(
+fn isolated_test_fixture(
     owner: &str,
     fixture: &str,
     name: &str,
@@ -682,7 +683,15 @@ fn commission_allowance_admits_only_its_named_owner_and_test_gates() {
     let gate = "#[cfg(all(test, feature = \"crash-points\"))]\n#[path = \"commission_tests.rs\"]\nmod tests;";
     let owner = PathBuf::from(paths[1]);
     let check = |gate, fixture, references: &[PathBuf]| {
-        isolated_n5_fixture(gate, fixture, "commission_tests.rs", "tests", cfg, references, &owner)
+        isolated_test_fixture(
+            gate,
+            fixture,
+            "commission_tests.rs",
+            "tests",
+            cfg,
+            references,
+            &owner,
+        )
     };
     let only = std::slice::from_ref(&owner);
     assert!(check(gate, cfg, only));
@@ -746,19 +755,35 @@ fn nothing_outside_the_spot_module_names_it() {
         fs::read_to_string(workspace.join("robsond/src/operation_observation_http_tests.rs"))
             .unwrap();
     let fixture_isolated = isolated_observation_fixture(&owner, &fixture, &references);
-    let n5_dir = workspace.join("robsond/src/venue_budget/n5_claim");
-    for (name, owner_name, module, cfg) in [
+    let daemon_dir = workspace.join("robsond/src");
+    let n5_dir = daemon_dir.join("venue_budget/n5_claim");
+    let fixtures = [
         (
+            daemon_dir.as_path(),
+            "order_journal_physical_recovery_pg_tests.rs",
+            "order_journal_projected_pg_tests.rs",
+            "physical_recovery",
+            "#![cfg(test)]\n",
+        ),
+        (
+            n5_dir.as_path(),
             "commission_tests.rs",
             "commission.rs",
             "tests",
             "#![cfg(all(test, feature = \"crash-points\"))]\n",
         ),
-        ("result_tests.rs", "tests.rs", "result_tests", "#![cfg(test)]\n"),
-    ] {
-        let owner_path = n5_dir.join(owner_name);
+        (
+            n5_dir.as_path(),
+            "result_tests.rs",
+            "tests.rs",
+            "result_tests",
+            "#![cfg(test)]\n",
+        ),
+    ];
+    for (dir, name, owner_name, module, cfg) in fixtures {
+        let owner_path = dir.join(owner_name);
         let owner = fs::read_to_string(&owner_path).unwrap();
-        let fixture = fs::read_to_string(n5_dir.join(name)).unwrap();
+        let fixture = fs::read_to_string(dir.join(name)).unwrap();
         let inclusion = format!("\"{name}\"");
         let references: Vec<_> = outside
             .iter()
@@ -766,14 +791,14 @@ fn nothing_outside_the_spot_module_names_it() {
             .cloned()
             .collect();
         assert!(
-            isolated_n5_fixture(&owner, &fixture, name, module, cfg, &references, &owner_path),
-            "N5 fixture {name} is not uniquely test-gated"
+            isolated_test_fixture(&owner, &fixture, name, module, cfg, &references, &owner_path),
+            "fixture {name} is not uniquely test-gated"
         );
     }
     let names = spot_type_names();
     let mut found = Vec::new();
     for path in &outside {
-        if path == &n5_dir.join("commission_tests.rs") || path == &n5_dir.join("result_tests.rs") {
+        if fixtures.iter().any(|(dir, name, ..)| path == &dir.join(name)) {
             continue;
         }
         if path.ends_with("robsond/src/operation_observation_http_tests.rs") {
@@ -1117,10 +1142,14 @@ fn the_commission_transport_allowance_rejects_changed_send_or_client() {
     for (before, after) in [
         ("single_shot()?", "reqwest::Client::new()"),
         ("bind_spot_commission", "bind_spot_order"),
-        ("self.transport.execute(self.request)", "self.transport.clone().execute(self.request)"),
+        (
+            "self.transport.execute(self.request)",
+            "self.transport.clone().execute(self.request)",
+        ),
     ] {
         assert!(original.contains(before));
-        assert!(!prepared_commission_mutation_violations(&original.replacen(before, after, 1)).is_empty());
+        assert!(!prepared_commission_mutation_violations(&original.replacen(before, after, 1))
+            .is_empty());
     }
 }
 
