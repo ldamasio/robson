@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::{CommitFailure, PgJournalBackend};
 use crate::ledger_connection::LedgerConnection;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpectedTransition {
     New(Uuid),
     ExistingOpen(Uuid),
@@ -205,3 +205,7 @@ mod positive;
 #[cfg(test)]
 #[path = "order_journal_transition_faults.rs"]
 mod faults;
+
+#[cfg(test)]
+#[path = "order_journal_transition_prepared.rs"]
+mod prepared;
