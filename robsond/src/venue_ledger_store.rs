@@ -18,6 +18,16 @@ use crate::ledger_connection::LedgerConnection;
 mod orders;
 mod trades;
 
+/// Test-only access to the private venue-order row decoder, for a fixture
+/// statement that selects `ORDER_COLUMNS` under otherwise unused names.
+#[cfg(test)]
+pub(crate) fn decode_order_row(
+    row: &sqlx::postgres::PgRow,
+    tenant: Uuid,
+) -> Result<Option<robson_exec::venue_ledger::StoredOrder>, LedgerError> {
+    orders::decode_order(row, tenant)
+}
+
 const WRITE_BOUND: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]

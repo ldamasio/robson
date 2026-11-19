@@ -45,6 +45,9 @@ mod ready;
 #[path = "../tests/venue_ledger_schema/empty_budget.rs"]
 mod empty_budget;
 
+#[path = "order_journal_transition_r1r3.rs"]
+mod r1r3;
+
 const VENUE: &str = "binance:spot";
 const SYMBOL: &str = "BTCUSDT";
 const STOP: &str = "4100001";
@@ -334,14 +337,32 @@ struct ProtectedLeg {
     journal: PgJournalBackend,
     stop_link: OrderLink,
     stop_client: String,
+    stop: String,
 }
 
 impl ProtectedLeg {
     async fn admit(pool: &PgPool) -> Result<Self> {
-        let tenant = Uuid::now_v7();
+        Self::admit_stop(pool, None, STOP, "NEW", Decimal::ZERO).await
+    }
+
+    /// `sibling` admits a distinct leg on the same accounting owner, account
+    /// and symbol. The stop is recorded at `status` with `executed` filled.
+    async fn admit_stop(
+        pool: &PgPool,
+        sibling: Option<&Self>,
+        stop: &str,
+        status: &str,
+        executed: Decimal,
+    ) -> Result<Self> {
+        let (tenant, account) = match sibling {
+            Some(leg) => (leg.tenant, leg.account.clone()),
+            None => {
+                let tenant = Uuid::now_v7();
+                (tenant, format!("bridge-{tenant}"))
+            },
+        };
         let position = Uuid::now_v7();
         let admission = Uuid::now_v7();
-        let account = format!("bridge-{tenant}");
         let venue = VenueId::new(VENUE);
         let ledger = PgVenueLedger::new(pool, tenant);
         ledger
@@ -394,6 +415,7 @@ impl ProtectedLeg {
                 client_order_id: String::new(),
             },
             stop_client: String::new(),
+            stop: stop.to_owned(),
         };
         let protection = leg.intent(IntentKind::Protection, None);
         leg.commit(&journal_batch(protection.clone())).await?;
@@ -408,8 +430,11 @@ impl ProtectedLeg {
             client_order_id: protection.client_order_id.clone(),
         };
         leg.stop_client = protection.client_order_id;
-        leg.record(&order(STOP, &leg.stop_client, "NEW", OrderPhase::Live), &leg.stop_link, 1)
-            .await?;
+        let mut record =
+            order(stop, &leg.stop_client, status, OrderPhase::from_binance_spot_status(status));
+        record.executed_qty = executed;
+        record.cumulative_quote_qty = Some(executed * Decimal::from(90));
+        leg.record(&record, &leg.stop_link, 1).await?;
         Ok(leg)
     }
 
@@ -441,7 +466,7 @@ impl ProtectedLeg {
     }
 
     fn cancel(&self) -> IntentRow {
-        self.intent(IntentKind::Cancel, Some(STOP))
+        self.intent(IntentKind::Cancel, Some(&self.stop))
     }
 
     async fn commit(&self, batch: &JournalBatch) -> Result<()> {
