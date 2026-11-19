@@ -49,7 +49,6 @@
     GROUP BY d.symbol, d.position_id, d.target_id
 ), cancel_groups AS MATERIALIZED (
     SELECT g.tenant_id, g.venue_id, g.account_scope, g.generation_id, d.*,
-           d.active_delta <> 0 OR d.conflict_delta <> 0 AS touch,
            p.target_id IS NOT NULL AS stored,
            coalesce(p.pending_count, 0) AS prior_pending,
            coalesce(p.conflict_count, 0) AS prior_conflict,

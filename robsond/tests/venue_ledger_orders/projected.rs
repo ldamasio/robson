@@ -605,3 +605,125 @@ async fn projected_native_order_requires_inactive_cancel_and_exact_journal_owner
     )
     .await
 }
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_native_order_refuses_foreign_journal_and_same_version_obsolete_writer(
+    pool: PgPool,
+) -> Result<()> {
+    let f = setup(&pool).await?;
+    let b = generation(&pool, &f).await?;
+    let version_before = version(&pool, &b).await?;
+    let before = snapshot(&pool).await;
+    let ledger = f.ledger(&pool).with_native_order_set_projection(b.clone());
+    let foreign = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO order_intents
+          (intent_id,tenant_id,venue_id,account_scope,client_order_id,position_id,kind,params,created_at)
+         VALUES ($1,$2,'binance:spot','foreign-journal','order-1',$3,'exit','{}',now())",
+    )
+    .bind(foreign).bind(Uuid::now_v7()).bind(f.position).execute(&pool).await?;
+    // The independent oracle deliberately refuses cross-account native linkage
+    // too. Disable only those oracle hooks in this isolated refusal witness,
+    // so they cannot be what aborts the original native statement.
+    sqlx::raw_sql(
+        "ALTER TABLE venue_orders DISABLE TRIGGER sell_shadow_venue;
+         ALTER TABLE venue_orders DISABLE TRIGGER cancel_shadow_venue",
+    )
+    .execute(&pool)
+    .await?;
+    let order = f.record(1, Decimal::ZERO, OrderPhase::Live);
+    let foreign_link = linked(&f, 1, foreign);
+    ensure!(matches!(
+        ledger.record_order(&order,&foreign_link,seen()).await,
+        Err(LedgerError::Invariant(reason)) if reason.contains("projection membership refused")
+    ));
+    ensure!(snapshot(&pool).await == before && version(&pool, &b).await? == version_before);
+
+    let successor = process_epoch::start_epoch(&pool, f.tenant, "native-order-successor").await?;
+    ensure!(successor.predecessor_epoch_id == Some(b.process_epoch));
+    let still_open: bool =
+        sqlx::query_scalar("SELECT clean_stop_at IS NULL FROM process_epochs WHERE epoch_id=$1")
+            .bind(b.process_epoch)
+            .fetch_one(&pool)
+            .await?;
+    ensure!(still_open);
+    let unowned = f.link(1, OrderOwner::Discovered);
+    ensure!(matches!(
+        ledger.record_order(&order,&unowned,seen()).await,
+        Err(LedgerError::Invariant(reason)) if reason.contains("projection membership refused")
+    ));
+    ensure!(snapshot(&pool).await == before && version(&pool, &b).await? == version_before);
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_native_order_caller_abort_revokes_held_native_writer(
+    pool: PgPool,
+) -> Result<()> {
+    use std::time::Duration;
+
+    let f = setup(&pool).await?;
+    let b = generation(&pool, &f).await?;
+    let prior = version(&pool, &b).await?;
+    let before = snapshot(&pool).await;
+    sqlx::raw_sql(
+        "CREATE FUNCTION hold_native_order_projection() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN PERFORM pg_advisory_xact_lock(719361); RETURN NEW; END $$;
+         CREATE TRIGGER hold_native_order_projection AFTER INSERT ON spot_order_set_sell_symbols
+         FOR EACH ROW EXECUTE FUNCTION hold_native_order_projection()",
+    )
+    .execute(&pool)
+    .await?;
+    let mut guard = pool.acquire().await?;
+    sqlx::query("SELECT pg_advisory_lock(719361)").execute(&mut *guard).await?;
+    let (proxy, proxied) = support::through_proxy(&pool, 1).await;
+    let (pid,birth): (i32,String)=sqlx::query_as(
+        "SELECT pg_backend_pid(),backend_start::text FROM pg_stat_activity WHERE pid=pg_backend_pid()",
+    ).fetch_one(&proxied).await?;
+    let ledger = f.ledger(&proxied).with_native_order_set_projection(b.clone());
+    let order = f.record(1, Decimal::ZERO, OrderPhase::Live);
+    let link = f.link(1, OrderOwner::Discovered);
+    let task = tokio::spawn(async move { ledger.record_order(&order, &link, seen()).await });
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let physically_held: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                    WHERE pid=$1 AND backend_start::text=$2 AND wait_event='advisory'
+                      AND query LIKE '%WITH gen AS MATERIALIZED%')",
+            )
+            .bind(pid)
+            .bind(&birth)
+            .fetch_one(&pool)
+            .await?;
+            if physically_held {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        }
+        Ok::<_, sqlx::Error>(())
+    })
+    .await??;
+    ensure!(snapshot(&pool).await == before && version(&pool, &b).await? == prior);
+    task.abort();
+    ensure!(task.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(3),async {
+        loop {
+            let still: bool=sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND backend_start::text=$2)",
+            ).bind(pid).bind(&birth).fetch_one(&pool).await?;
+            if !still {break;}
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        }
+        Ok::<_,sqlx::Error>(())
+    }).await??;
+    ensure!(snapshot(&pool).await == before && version(&pool, &b).await? == prior);
+    exact_reference(&pool, &b).await?;
+    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(719361)")
+        .fetch_one(&mut *guard)
+        .await?;
+    ensure!(unlocked);
+    ensure!(proxy.stats().connections >= 1);
+    Ok(())
+}
