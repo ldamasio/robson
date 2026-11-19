@@ -72,6 +72,10 @@ const ATTACH_TO_OPEN: &str = "
       AND t.first_cancel_intent_id IS NULL AND t.original_target_order_id IS NULL
     RETURNING t.transition_id";
 
+/// One statement after the cancel and transition, under the accounting lock.
+/// No row is a refusal.
+const FIRST_CANCEL_PROJECTION: &str = include_str!("spot_order_set_store/first_cancel.sql");
+
 fn known(error: sqlx::Error) -> CommitFailure {
     CommitFailure::Known(error.to_string())
 }
@@ -115,6 +119,18 @@ impl PgJournalBackend {
             TransitionKind::Flatten => "flatten",
             TransitionKind::Exit => "exit",
         };
+        // `None` keeps the legacy statements. An opted binding is checked
+        // before any connection is acquired.
+        let projection = self.order_set_projection.as_ref();
+        if projection.is_some_and(|generation| {
+            !generation.is_valid()
+                || generation.tenant_id != self.tenant_id
+                || generation.account_scope != intent.account_scope
+        }) {
+            return Err(CommitFailure::Known(
+                "order-set first cancel refused: invalid binding".into(),
+            ));
+        }
 
         let mut commit_started = false;
         let operation = async {
@@ -165,6 +181,28 @@ impl PgJournalBackend {
                     "first-cancel transition is no longer available".into(),
                 ));
             }
+            if let Some(generation) = projection {
+                let projected: Option<i64> = sqlx::query_scalar(FIRST_CANCEL_PROJECTION)
+                    .bind(generation.tenant_id)
+                    .bind(&generation.account_scope)
+                    .bind(generation.generation_id)
+                    .bind(generation.process_epoch)
+                    .bind(generation.source_audit_id)
+                    .bind(version)
+                    .bind(intent.intent_id)
+                    .bind(position)
+                    .bind(original)
+                    .bind(request.symbol)
+                    .fetch_optional(&mut *tx)
+                    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
+                    .await.map_err(known)?;
+                if projected != Some(version) {
+                    return Err(CommitFailure::Known(
+                        "order-set first cancel refused: stale generation or nonmatching source"
+                            .into(),
+                    ));
+                }
+            }
             #[cfg(test)]
             faults::before_commit().await;
             // timeout_at polls the operation before its timer. If SQL and the
@@ -209,3 +247,7 @@ mod faults;
 #[cfg(test)]
 #[path = "order_journal_transition_prepared.rs"]
 mod prepared;
+
+#[cfg(test)]
+#[path = "order_journal_transition_projected_pg_tests.rs"]
+mod projected;
