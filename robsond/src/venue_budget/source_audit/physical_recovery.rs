@@ -168,7 +168,7 @@ pub(crate) async fn bootstrap_empty_budget(
     fresh: &BudgetAuditEvidence,
     clock: &NativeClock,
     deadline: Instant,
-) -> Result<BudgetBootstrapEvidence> {
+) -> Result<(BudgetBootstrapEvidence, crate::venue_budget::BootstrapRows)> {
     timeout_at(deadline, async {
         let (stale_proxy, stale_pool) = wire(pool).await?;
         ensure!(copied_budget_binding(copied) == (fresh.copied_audit, fresh.copied_generation));
@@ -285,7 +285,7 @@ pub(crate) async fn bootstrap_empty_budget(
                 == fresh.started_at
         );
         ensure!(matches!(bootstrap::production_input(), Err(BudgetError::PrerequisiteRefusal)));
-        Ok(BudgetBootstrapEvidence {
+        Ok((BudgetBootstrapEvidence {
             audit: fresh.audit,
             generation: fresh.generation,
             process_epoch,
@@ -296,7 +296,7 @@ pub(crate) async fn bootstrap_empty_budget(
             recorded_at: *recorded_at,
             stale_commands,
             bootstrap_commands,
-        })
+        }, rows))
     })
     .await?
 }

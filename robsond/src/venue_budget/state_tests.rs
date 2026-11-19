@@ -247,3 +247,37 @@ fn dropped_unpolled_weight_is_refunded_and_handed_off_weight_remains_charged() {
         assert_eq!(budget.handoffs().unwrap(), used as u64);
     }
 }
+
+#[cfg(feature = "crash-points")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    #[test]
+    fn each_inventory_endpoint_keeps_its_weight_across_drop_or_handoff(
+        endpoint in 0usize..3,
+        handed_off in any::<bool>(),
+    ) {
+        use robson_connectors::inventory_loopback::InventoryRead;
+        let clock = NativeClock::initialize().unwrap();
+        let budget = numerical_state(true);
+        let (now, due) = (tick(120), tick(130));
+        let read = InventoryRead::ALL[endpoint];
+        let mut reservation = budget.try_reserve_inventory(read, now, due).unwrap();
+        prop_assert_eq!(reservation.read(), read);
+        if handed_off {
+            budget.poll_account_first(&mut reservation, &clock, Uuid::from_u128(3),
+                || Ok((now, ())), || std::task::Poll::Pending).unwrap();
+        }
+        drop(reservation);
+        let remaining = 400 - u32::from(handed_off) * [20, 80, 6][endpoint];
+        let mut probes = Vec::new();
+        for _ in 0..remaining / 20 {
+            probes.push(budget.try_reserve_account(now, due).unwrap());
+        }
+        let mut time = Vec::new();
+        for _ in 0..remaining % 20 {
+            time.push(budget.try_reserve_time(now, due).unwrap());
+        }
+        prop_assert!(matches!(budget.try_reserve_time(now, due), Err(BudgetError::Deferred)));
+        prop_assert_eq!(budget.handoffs().unwrap(), u64::from(handed_off));
+    }
+}

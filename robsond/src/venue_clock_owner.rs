@@ -35,6 +35,8 @@ mod lifecycle;
 mod metrics;
 #[cfg(all(test, feature = "crash-points"))]
 mod pg_tests;
+#[cfg(all(test, feature = "crash-points"))]
+pub(crate) use pg_tests::run_held_inventory_rehearsal;
 mod watchdog;
 pub(crate) use lifecycle::ClockClosing;
 

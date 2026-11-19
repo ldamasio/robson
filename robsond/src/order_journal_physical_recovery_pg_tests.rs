@@ -178,12 +178,12 @@ async fn validate_writer_roles(pool: &PgPool, old: &str, new: &str) -> Result<()
     Ok(())
 }
 
-async fn seed_native_sources(pool: &PgPool, g: &JournalGeneration) -> Result<()> {
+async fn seed_native_sources(pool: &PgPool, g: &JournalGeneration, uid: &str) -> Result<()> {
     let venue = VenueId::new(VenueId::BINANCE_SPOT);
     sqlx::query(
         "INSERT INTO public.venue_accounts(venue_id,account_scope,tenant_id,uid,bound_at,cutover_id)
-         VALUES('binance:spot',$1,$2,'physical-recovery-fixture',now(),$3)",
-    ).bind(&g.account_scope).bind(g.tenant_id).bind(Uuid::now_v7()).execute(pool).await?;
+         VALUES('binance:spot',$1,$2,$3,now(),$4)",
+    ).bind(&g.account_scope).bind(g.tenant_id).bind(uid).bind(Uuid::now_v7()).execute(pool).await?;
     sqlx::query("CREATE INDEX idx_leg_routes_spot_scope_position ON public.leg_routes(account_scope,position_id) WHERE venue_id='binance:spot'")
         .execute(pool).await?;
     let ledger = PgVenueLedger::new(pool, g.tenant_id);
@@ -469,6 +469,26 @@ async fn witness_daemon_start(
 #[sqlx::test(migrations = false)]
 #[ignore = "requires dedicated physical controller and isolated PG16 over loopback"]
 async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Result<()> {
+    physical_spot_restore(pool, false).await
+}
+
+#[cfg(feature = "crash-points")]
+#[sqlx::test(migrations = false)]
+#[ignore = "requires dedicated physical PG16 no-capital controller"]
+async fn physical_spot_no_capital_rehearsal(pool: PgPool) -> Result<()> {
+    physical_spot_restore(pool, true).await
+}
+
+async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
+    #[cfg(not(feature = "crash-points"))]
+    ensure!(!rehearsal, "rehearsal compiler gate");
+    let uid = "physical-recovery-fixture".to_owned();
+    #[cfg(feature = "crash-points")]
+    let uid = if rehearsal {
+        robson_connectors::inventory_loopback::LOOPBACK_UID.to_string()
+    } else {
+        uid
+    };
     let (mut channel, greeting) = Channel::open().await?;
     let old_role = Channel::string(&greeting, "old_user")?;
     let new_role = Channel::string(&greeting, "new_user")?;
@@ -491,7 +511,11 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     .await
     .map_err(|e| anyhow::anyhow!("initialize disposable budget: {e:?}"))?;
     let g = seed_generation_for(&pool, robson_exec::order_journal::DEFAULT_ACCOUNT_SCOPE).await?;
-    seed_native_sources(&pool, &g).await?;
+    seed_native_sources(&pool, &g, &uid).await?;
+    #[cfg(feature = "crash-points")]
+    if rehearsal {
+        crate::venue_budget::n5_claim::rehearsal_c2::seed_manifest(&pool, SYMBOL).await?;
+    }
     validate_writer_roles(&pool, old_role, new_role).await?;
     let before = fields(&pool, &g).await?;
     let proxy = DbProxy::start(server).await?;
@@ -514,10 +538,11 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     ).fetch_one(&old_pool).await?;
     ensure!(user == old_role);
     channel
-        .phase(
+        .phase_at(
             "old_connected",
             json!({"database":db,"pid":pid,"backend_start":birth,
         "current_user":user,"tenant":g.tenant_id}),
+            Instant::now() + if rehearsal { Duration::from_secs(10) } else { PIPE_BOUND },
         )
         .await?;
     if std::env::var("ROBSON_PHYSICAL_FAULT").as_deref() == Ok("eof") {
@@ -650,7 +675,7 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
         matches!(stopped,Err(ColdAuditRefusal::PageBudget {family:Family::Routes,last_key:Some(SourceKey::Route(key))}) if key==Uuid::from_u128(8))
     );
     let mut captured = epoched
-        .capture("physical-recovery-fixture", committed.0)
+        .capture(&uid, committed.0)
         .await
         .map_err(|e| anyhow::anyhow!("supervised Spot capture: {e:?}"))?;
     let cut = captured.cut();
@@ -683,19 +708,29 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
         .map(|(f,name)| json!({"family":name,"rows":f.rows,"pages":f.pages,"last_key":key_value(f.last_key.as_ref())}))
         .collect::<Vec<_>>();
     let statements = receipt.statements;
-    captured
-        .supervisor()
-        .phase(
-            "cold",
-            json!({"tenant":g.tenant_id,"scope":g.account_scope,"epoch":new.epoch.epoch_id,
-        "version":committed.0,"families":families,"statements":statements}),
-        )
-        .await?;
+    let cold_facts = json!({"tenant":g.tenant_id,"scope":g.account_scope,"epoch":new.epoch.epoch_id,
+        "version":committed.0,"families":families,"statements":statements});
+    if rehearsal {
+        captured.supervisor().phase_at("cold", cold_facts, Instant::now() + Duration::from_secs(12)).await?;
+    } else {
+        captured.supervisor().phase("cold", cold_facts).await?;
+    }
+    #[cfg(feature = "crash-points")]
+    if rehearsal {
+        crate::venue_budget::n5_claim::rehearsal_c2::cut_legacy_reason(&restore).await?;
+        captured.supervisor().phase("catalogue_cut", json!({"target_id": restore_identity.target})).await?;
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
     let audit = budget_recovery::audit_empty_budget(&restore, &copied_budget, deadline).await?;
     captured.supervisor().phase("budget",json!({"audit":audit.audit,"quiescence_generation":audit.generation,
         "source":0,"clocks":0,"charges":0,"statements":audit.start_commands+audit.pass_commands+audit.terminal_commands})).await?;
-    let bootstrap = budget_recovery::bootstrap_empty_budget(
+    #[cfg(feature = "crash-points")]
+    if rehearsal {
+        crate::venue_budget::n5_claim::rehearsal_c2::load_fixture_registry(
+            &restore, g.tenant_id, &g.account_scope, uid.parse()?, SYMBOL, &clock, deadline,
+        ).await?;
+    }
+    let (bootstrap, rows) = budget_recovery::bootstrap_empty_budget(
         &restore,
         g.tenant_id,
         &new,
@@ -716,6 +751,24 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     ensure!(observe_generation(&mut reader, binding(&g, &venue)).await?.is_none());
     installed.supervisor().phase("installed",json!({"tenant":g.tenant_id,"scope":g.account_scope,"epoch":successor.process_epoch,
         "version":committed.0,"audit":successor.source_audit_id,"generation":successor.generation_id})).await?;
+    #[cfg(feature = "crash-points")]
+    if rehearsal {
+        installed.supervisor().phase("rehearsal_begin", json!({
+            "epoch": successor.process_epoch, "generation": successor.generation_id,
+        })).await?;
+        let sample = crate::venue_clock_owner::run_held_inventory_rehearsal(
+            &restore, &restored_wire, &new, g.tenant_id, std::sync::Arc::new(clock), rows,
+        ).await?;
+        drop(reader);
+        restore.close().await;
+        installed.supervisor().phase("rehearsal_complete", json!({
+            "epoch": successor.process_epoch, "generation": successor.generation_id,
+            "sample": sample, "handoffs": 4, "weight": 107, "inventory_sql": 0,
+            "uid": uid.parse::<u64>()?,
+        })).await?;
+        return Ok(());
+    }
+    drop(rows);
     let before_admit = restored_wire.query_trace().len();
     let (ready, mut channel) = installed
         .admit()

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, ensure, Context};
+use robson_connectors::inventory_loopback::{InventoryBody, InventoryRead};
 use sqlx::{postgres::PgRow, PgPool, Row};
 
 use super::*;
@@ -106,55 +107,44 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
         ensure!(!owner.state.lock().map_err(|_| anyhow!("state lock poisoned"))?.closing,
             "positive path remains open until the real stop");
 
-        // C8 ACCOUNT-only, no capital: the same owner, SharedBudget and
+        // C8 inventory triple, no capital: the same owner, SharedBudget and
         // positively read-back publication. Listener setup is fixture work.
-        account_http = Some(c8_account_http::AccountFixture::start(
+        account_http = Some(c8_account_http::AccountFixture::triple(
             body_deadline + crate::stop::StopTimings::default().deadline,
         ).await?);
-        let venue = account_http.as_ref().context("owned ACCOUNT fixture")?;
+        let venue = account_http.as_ref().context("owned inventory fixture")?;
         let read_deadline = Instant::now() + Duration::from_secs(10);
         let claim = clock.capture()?;
-        let mut pending = owner.reserve_account(read_deadline)
-            .map_err(|e| anyhow!("ACCOUNT reserve: {e:?}"))?;
-        let prepared = owner.prepare_account(&mut account_slot, read_deadline).await
-            .map_err(|e| anyhow!("ACCOUNT preparation: {e:?}"))?;
-        ensure!(account_slot.is_none(), "completed preparation consumed");
         let signed = owner.commission_signing_time().map_err(|e| anyhow!("signing: {e:?}"))?;
         ensure!(budget.handoffs().map_err(|e| anyhow!("handoffs: {e:?}"))? == 1);
         ensure!(venue.connections() == 0, "nothing sent before the admitted first poll");
-        let admitted = owner.read_account(&signed, &mut pending, claim, prepared, venue.port, read_deadline)
-            .await.map_err(|e| anyhow!("ACCOUNT read: {e:?}"))?;
-        ensure!(admitted.sample == sample, "EOF receipt judged on the same published sample");
-        ensure!(admitted.send.epoch == start.epoch.epoch_id
-            && admitted.receive.epoch == start.epoch.epoch_id
-            && admitted.send.wall_agrees(&admitted.receive)?
-            && admitted.receive.end_tick()?.elapsed_since(&admitted.send.end_tick()?).is_ok(),
-            "original first poll and EOF brackets share the committed epoch and ordered TIME");
-        ensure!(venue.signing_stamp()? == signed.timestamp_ms(), "actual wire stamp is the original signed one");
-        ensure!(budget.handoffs().map_err(|e| anyhow!("handoffs: {e:?}"))? == 2,
-            "TIME 1 + ACCOUNT 1 handoffs on the one SharedBudget");
-        ensure!(venue.connections() == 1 && fixture.connections() == 1,
-            "one physical ACCOUNT connection, no further TIME");
-        drop(pending);
-        ensure!(budget.handoffs().map_err(|e| anyhow!("handoffs: {e:?}"))? == 2,
-            "a consumed reservation refunds nothing and sends nothing");
-        let probe_tick = clock.capture()?;
-        let probe_due = crate::venue_clock_owner::after(probe_tick, Duration::from_secs(1))
-            .map_err(|e| anyhow!("{e:?}"))?;
-        let mut probes = Vec::new();
-        for _ in 0..18 {
-            probes.push(budget.try_reserve_account(probe_tick, probe_due)
-                .map_err(|e| anyhow!("steady ACCOUNT budget probe: {e:?}"))?);
+        let triple = owner
+            .read_inventory_triple(&signed, claim, &mut account_slot, venue.port, read_deadline)
+            .await.map_err(|e| anyhow!("inventory triple: {e:?}"))?;
+        ensure!(account_slot.is_none(), "completed preparations consumed");
+        for (receipt, read) in triple.receipts.iter().zip(InventoryRead::ALL) {
+            ensure!(receipt.read == read && receipt.sample == sample,
+                "each EOF receipt judged on the same published sample");
+            ensure!(receipt.send.epoch == start.epoch.epoch_id
+                && receipt.receive.epoch == start.epoch.epoch_id
+                && receipt.send.wall_agrees(&receipt.receive)?
+                && receipt.receive.end_tick()?.elapsed_since(&receipt.send.end_tick()?).is_ok(),
+                "original first poll and EOF brackets share the committed epoch and ordered TIME");
         }
-        let mut time_probes = Vec::new();
-        for _ in 0..19 {
-            time_probes.push(budget.try_reserve_time(probe_tick, probe_due)
-                .map_err(|e| anyhow!("steady TIME budget probe: {e:?}"))?);
-        }
-        ensure!(matches!(budget.try_reserve_time(probe_tick, probe_due), Err(BudgetError::Deferred)),
-            "TIME and ACCOUNT charged exactly 21 of the common 400 steady weight");
-        drop(time_probes);
-        drop(probes);
+        ClockOwner::check_triple(&triple.receipts)
+            .map_err(|e| anyhow!("triple provenance: {e:?}"))?;
+        ensure!(matches!(&triple.receipts[1].body, InventoryBody::OpenOrders(o)
+                if o.len() == 2 && o.iter().any(|o| o.symbol == "zzzQQQ"))
+            && matches!(&triple.receipts[2].body, InventoryBody::OpenOrderLists(l)
+                if l.len() == 1 && l[0].orders.len() == 1),
+            "every row and raw symbol kept");
+        ensure!(venue.signing_stamps()? == vec![signed.timestamp_ms(); 3],
+            "actual wire stamps are the original signed one");
+        ensure!(budget.handoffs().map_err(|e| anyhow!("handoffs: {e:?}"))? == 4,
+            "TIME 1 + three inventory handoffs on the one SharedBudget");
+        ensure!(venue.connections() == 3 && fixture.connections() == 1,
+            "one physical connection per read, no further TIME");
+        verify_triple_budget(&budget, &clock)?;
         commission_admission_precedence(owner, &clock)?;
         for (i, replace_generation) in [false, true].into_iter().enumerate() {
             supersession_during_account_body(
@@ -162,10 +152,10 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
                 &mut supersession_http[i], &mut supersession_slots[i],
             ).await?;
         }
-        ensure!(venue.connections() == 1 && budget.handoffs()
-            .map_err(|e| anyhow!("handoffs: {e:?}"))? == 4,
-            "one TIME, one accepted ACCOUNT and two charged rejected ACCOUNT reads");
-        eprintln!("C8_ACCOUNT_GUARDED time=1 account=3 accepted=1 superseded=2 weight_first_two=21 no_venue_orders=true");
+        ensure!(venue.connections() == 3 && budget.handoffs()
+            .map_err(|e| anyhow!("handoffs: {e:?}"))? == 6,
+            "one TIME, one accepted triple and two charged rejected ACCOUNT reads");
+        eprintln!("C8_INVENTORY_GUARDED time=1 inventory=3 superseded_account=2 handoffs=6 weight_before_faults=107 weight_total=147 no_venue_orders=true");
         Ok::<_, anyhow::Error>(())
     }).await.map_err(|_| anyhow!("150s fixture body ceiling elapsed")).and_then(|r| r);
 
@@ -254,6 +244,114 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
     }
 }
 
+/// Consumes the actual C2 bootstrap rows from the held physical restore.
+pub(crate) async fn run_held_inventory_rehearsal(
+    pool: &PgPool,
+    wire: &robson_testkit::db_proxy::DbProxy,
+    start: &process_epoch::EpochStart,
+    tenant: Uuid,
+    clock: Arc<NativeClock>,
+    mut rows: venue_budget::BootstrapRows,
+) -> anyhow::Result<Uuid> {
+    let deadline = Instant::now() + Duration::from_secs(135);
+    let mut time_http = None;
+    let mut inventory_http = None;
+    let mut owner = None;
+    let mut slot = None;
+    let primary = timeout_at(deadline, async {
+        ensure!(start.predecessor.unclean_reason().is_some());
+        ensure!(matches!(bootstrap::production_input(), Err(BudgetError::PrerequisiteRefusal)));
+        let restore_trace = Trace::default();
+        restore::existing_pause(pool, tenant, &mut rows, &clock, deadline, &restore_trace)
+            .await.map_err(|e| anyhow!("held pause: {e:?}"))?;
+        ensure!(restore_trace.issued() == 0, "empty fixture has no restored pause");
+        let budget = SharedBudget::from_rows(rows, true).map_err(|e| anyhow!("held budget: {e:?}"))?;
+
+        time_http = Some(http::Fixture::start(deadline).await?);
+        let time = time_http.as_ref().context("owned TIME listener")?;
+        let client = Arc::new(BinanceRestClient::with_harness_base_url(
+            time.base_url.clone(), String::new(), String::new(),
+        ));
+        let store = ClockSampleStore::from_committed_epoch(pool, tenant, start);
+        owner = Some(ClockOwner::controlled(
+            Arc::clone(&clock), client, store, budget.clone(), tenant, start.epoch.epoch_id,
+        ).map_err(|e| anyhow!("held clock owner: {e:?}"))?);
+        let owner = owner.as_mut().context("owned ClockOwner")?;
+        ensure!(matches!(owner.run_cycle().await, Err(TimeError::Budget(BudgetError::Deferred))));
+        ensure!(time.connections() == 0 && budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 0);
+        tokio::time::sleep(Duration::from_secs(120)).await;
+
+        let sample = owner.run_cycle().await.map_err(|e| anyhow!("held TIME: {e:?}"))?;
+        let durable: Vec<(Uuid, i64)> = sqlx::query_as(
+            "SELECT sample_id, server_ms FROM public.clock_samples WHERE tenant_id=$1
+             AND process_epoch=$2 AND venue_id='binance:spot' AND numeric_failures=0 LIMIT 2",
+        ).bind(tenant).bind(start.epoch.epoch_id).fetch_all(pool).await?;
+        ensure!(durable == [(sample, time.server_ms()?)]);
+        ensure!(time.connections() == 1 && budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 1);
+
+        inventory_http = Some(c8_account_http::AccountFixture::triple(deadline).await?);
+        let listener = inventory_http.as_ref().context("owned inventory listener")?;
+        let scan_deadline = deadline.min(Instant::now() + Duration::from_secs(10));
+        let signed = owner.commission_signing_time().map_err(|e| anyhow!("{e:?}"))?;
+        let claim = clock.capture()?;
+        let counters = || (wire.stats().statements, wire.prepared_statement_parses(),
+            wire.query_trace().len(), wire.query_trace_dropped());
+        let previous = counters();
+        ensure!(previous.3 == 0, "bounded restored wire trace");
+        let triple = owner.read_inventory_triple(&signed, claim, &mut slot, listener.port, scan_deadline)
+            .await.map_err(|e| anyhow!("held inventory: {e:?}"))?;
+        ensure!(counters() == previous, "no SQL execution or preparation during inventory");
+        ensure!(triple.receipts.iter().all(|r| r.sample == sample && r.send.epoch == start.epoch.epoch_id));
+        ensure!(listener.connections() == 3 && listener.signing_stamps()? == [signed.timestamp_ms(); 3]);
+        ensure!(budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 4);
+        verify_triple_budget(&budget, &clock)?;
+        Ok::<_, anyhow::Error>(sample)
+    }).await.context("held inventory window");
+
+    let asked_at = Instant::now();
+    let stop_deadline = asked_at + crate::stop::StopTimings::default().deadline;
+    let preparation = timeout_at(stop_deadline, ClockOwner::retire_account(&mut slot)).await;
+    let stopped = if let Some(owner) = owner {
+        if !matches!(&primary, Ok(Ok(_))) {
+            owner.cancel.cancel();
+        }
+        let state = Arc::clone(&owner.state);
+        let budget = owner.budget.clone();
+        let handoffs = budget.handoffs();
+        let closing = owner.spawn();
+        close_owner(&closing, &state, &budget, handoffs, Some(start), asked_at).await
+    } else {
+        Ok(())
+    };
+    let inventory_stopped = if let Some(listener) = inventory_http {
+        listener.finish(stop_deadline).await
+    } else { Ok(()) };
+    let time_stopped = if let Some(listener) = time_http {
+        listener.finish(stop_deadline).await
+    } else { Ok(()) };
+    ensure!(matches!(preparation, Ok(true)), "held inventory preparation not retired");
+    stopped?;
+    inventory_stopped?;
+    time_stopped?;
+    primary?
+}
+
+fn verify_triple_budget(budget: &SharedBudget, clock: &NativeClock) -> anyhow::Result<()> {
+    let now = clock.capture()?;
+    let due = crate::venue_clock_owner::after(now, Duration::from_secs(1)).map_err(|e| anyhow!("{e:?}"))?;
+    let mut account = Vec::new();
+    for _ in 0..14 {
+        account.push(budget.try_reserve_account(now, due).map_err(|e| anyhow!("ACCOUNT capacity: {e:?}"))?);
+    }
+    let mut time = Vec::new();
+    for _ in 0..13 {
+        time.push(budget.try_reserve_time(now, due).map_err(|e| anyhow!("TIME capacity: {e:?}"))?);
+    }
+    ensure!(matches!(budget.try_reserve_time(now, due), Err(BudgetError::Deferred)),
+        "exactly 293 of 400 steady weight remain");
+    Ok(())
+}
+
 fn commission_admission_precedence(
     owner: &ClockOwner,
     clock: &NativeClock,
@@ -298,7 +396,7 @@ fn commission_admission_precedence(
         "command deadline precedes generation, which precedes claim age");
     drop(waiting);
     drop(pending);
-    ensure!(owner.budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 2);
+    ensure!(owner.budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 4);
     Ok(())
 }
 

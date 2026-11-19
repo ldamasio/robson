@@ -45,8 +45,17 @@ pub(crate) struct PendingTime {
 
 pub(crate) struct PendingCommission(PendingTime);
 
+/// Test-only C8 inventory reservation, bound to the one closed read whose
+/// fixed weight it charged.
 #[cfg(all(test, feature = "crash-points"))]
-pub(crate) struct PendingAccount(PendingTime);
+pub(crate) struct PendingAccount(PendingTime, robson_connectors::inventory_loopback::InventoryRead);
+
+#[cfg(all(test, feature = "crash-points"))]
+impl PendingAccount {
+    pub(crate) fn read(&self) -> robson_connectors::inventory_loopback::InventoryRead {
+        self.1
+    }
+}
 
 impl Drop for PendingTime {
     fn drop(&mut self) {
@@ -211,8 +220,22 @@ impl SharedBudget {
         now: TickCapture,
         deadline: TickCapture,
     ) -> Result<PendingAccount, BudgetError> {
+        use robson_connectors::inventory_loopback::InventoryRead;
+        self.try_reserve_inventory(InventoryRead::Account, now, deadline)
+    }
+
+    /// Test-only C8 inventory reservation: the closed read's fixed weight
+    /// (20/80/6), never a caller-chosen one, same Steady checks.
+    #[cfg(all(test, feature = "crash-points"))]
+    pub(crate) fn try_reserve_inventory(
+        &self,
+        read: robson_connectors::inventory_loopback::InventoryRead,
+        now: TickCapture,
+        deadline: TickCapture,
+    ) -> Result<PendingAccount, BudgetError> {
         let mut state = self.0.try_lock().map_err(|_| BudgetError::Deferred)?;
-        self.reserve_steady(&mut state, now, deadline, 20).map(PendingAccount)
+        self.reserve_steady(&mut state, now, deadline, read.weight())
+            .map(|pending| PendingAccount(pending, read))
     }
 
     #[cfg(all(test, feature = "crash-points"))]

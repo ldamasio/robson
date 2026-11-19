@@ -290,3 +290,47 @@ fn the_account_decode_is_strict_bounded_and_returns_only_the_uid() {
         assert!(matches!(account_uid(body), Err(BinanceRestError::Refused(_))));
     }
 }
+
+#[test]
+fn the_inventory_ingress_preserves_keys_and_rejects_untyped_or_conflicting_rows() {
+    use crate::inventory_loopback::{decode, InventoryBody};
+
+    let body = decode(InventoryRead::AllOpenOrders, OPEN_ORDERS.as_bytes()).unwrap();
+    let InventoryBody::OpenOrders(orders) = body else {
+        panic!("expected typed orders");
+    };
+    assert!(!orders.is_empty());
+    let original: serde_json::Value = serde_json::from_str(OPEN_ORDERS).unwrap();
+    assert_eq!(orders[0].symbol, original[0]["symbol"].as_str().unwrap());
+    assert_eq!(orders[0].order_id, original[0]["orderId"].as_u64().unwrap());
+    for key in ["orderId", "clientOrderId"] {
+        let first = original[0].clone();
+        let mut second = first.clone();
+        second[key] = if key == "orderId" {
+            serde_json::json!(987654321)
+        } else {
+            serde_json::json!("distinct_client")
+        };
+        let body = serde_json::to_vec(&vec![first, second]).unwrap();
+        assert!(decode(InventoryRead::AllOpenOrders, &body).is_err());
+    }
+    for malformed in [
+        br#"[[]]"#.as_slice(),
+        br#"[{"symbol":"BTCUSDT","symbol":"BTCUSDT"}]"#.as_slice(),
+        b"[ ".as_slice(),
+    ] {
+        assert!(decode(InventoryRead::AllOpenOrders, malformed).is_err());
+    }
+    let malformed_account =
+        br#"{"uid":1,"accountType":"SPOT","canTrade":false,"permissions":[],"balances":[["BTC","0","0"]]}"#;
+    assert!(decode(InventoryRead::Account, malformed_account).is_err());
+    let bodies = [
+        (InventoryRead::Account, ACCOUNT),
+        (InventoryRead::AllOpenOrders, OPEN_ORDERS),
+        (InventoryRead::OpenOrderLists, OPEN_ORDER_LIST),
+    ];
+    for (read, body) in bodies {
+        assert!(decode(read, body.as_bytes()).is_ok());
+        assert!(decode(read, &vec![b' '; LOOPBACK_BODY_LIMIT + 1]).is_err());
+    }
+}

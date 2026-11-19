@@ -131,7 +131,49 @@ pub fn account_uid(body: &[u8]) -> Result<u64, BinanceRestError> {
     if body.len() > LOOPBACK_BODY_LIMIT {
         return Err(refuse("body over the test bound"));
     }
-    let account: crate::binance::spot::SpotAccount =
-        serde_json::from_slice(body).map_err(|_| refuse("invalid typed account"))?;
+    let text = std::str::from_utf8(body).map_err(|_| refuse("not UTF-8"))?;
+    let account = crate::binance::spot::decode_account(text, LOOPBACK_BODY_LIMIT)
+        .map_err(|_| refuse("invalid typed account"))?;
     Ok(account.uid)
+}
+
+/// One strictly decoded inventory body, typed by the read that fetched it.
+/// Descriptive only: no balance, order or list here carries authority.
+#[derive(Debug)]
+pub enum InventoryBody {
+    Account(crate::binance::spot::SpotAccount),
+    OpenOrders(Vec<crate::binance::spot::SpotOrderRecord>),
+    OpenOrderLists(Vec<crate::binance::spot::SpotOpenOrderList>),
+}
+
+impl InventoryBody {
+    pub fn read(&self) -> InventoryRead {
+        match self {
+            Self::Account(_) => InventoryRead::Account,
+            Self::OpenOrders(_) => InventoryRead::AllOpenOrders,
+            Self::OpenOrderLists(_) => InventoryRead::OpenOrderLists,
+        }
+    }
+}
+
+/// Strict decode of one complete, bounded body by the read that fetched it,
+/// all or nothing. Refusals carry no input text.
+pub fn decode(read: InventoryRead, body: &[u8]) -> Result<InventoryBody, BinanceRestError> {
+    use crate::binance::spot;
+    let refuse = |detail: &str| BinanceRestError::Refused(format!("loopback inventory: {detail}"));
+    if body.len() > LOOPBACK_BODY_LIMIT {
+        return Err(refuse("body over the test bound"));
+    }
+    let text = std::str::from_utf8(body).map_err(|_| refuse("not UTF-8"))?;
+    match read {
+        InventoryRead::Account => spot::decode_account(text, LOOPBACK_BODY_LIMIT)
+            .map(InventoryBody::Account)
+            .map_err(|_| refuse("invalid typed account")),
+        InventoryRead::AllOpenOrders => spot::decode_open_orders(text, LOOPBACK_BODY_LIMIT)
+            .map(InventoryBody::OpenOrders)
+            .map_err(|_| refuse("invalid typed open orders")),
+        InventoryRead::OpenOrderLists => spot::decode_open_order_lists(text, LOOPBACK_BODY_LIMIT)
+            .map(InventoryBody::OpenOrderLists)
+            .map_err(|_| refuse("invalid typed open order lists")),
+    }
 }

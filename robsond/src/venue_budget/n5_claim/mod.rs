@@ -18,6 +18,8 @@ const CLAIM: &str = include_str!("claim.sql");
 const CONFIRM: &str = include_str!("confirm.sql");
 
 mod cold_load;
+#[cfg(all(test, feature = "crash-points"))]
+pub(crate) mod rehearsal_c2;
 mod commission;
 mod response;
 mod result;

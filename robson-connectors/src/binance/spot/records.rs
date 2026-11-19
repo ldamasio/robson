@@ -363,6 +363,105 @@ pub fn decode_open_order_lists(
     Ok(lists)
 }
 
+#[cfg(any(test, feature = "crash-points"))]
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct OpenOrderEntries(#[serde(deserialize_with = "object_entries")] Vec<SpotOrderRecord>);
+
+/// Why a strict inventory body was refused. No variant carries input text
+/// beyond a validated ID.
+#[cfg(any(test, feature = "crash-points"))]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SpotInventoryError {
+    #[error("inventory: {len} bytes exceed the {limit}-byte envelope")]
+    Oversize { len: usize, limit: usize },
+    /// Not one map of the documented shape (positional arrays included), a
+    /// field missing, repeated or of another type, or trailing input.
+    #[error("inventory: malformed ({0})")]
+    Malformed(String),
+    #[error("inventory: an asset is listed twice")]
+    DuplicateAsset,
+    #[error("inventory: order {0} has an invalid identity")]
+    InvalidIdentity(u64),
+    /// The same `(symbol, orderId)` or `(symbol, clientOrderId)` twice.
+    #[error("inventory: order {0} repeats or conflicts")]
+    DuplicateOrder(u64),
+    #[error("inventory: allocation refused")]
+    Allocation,
+}
+
+#[cfg(any(test, feature = "crash-points"))]
+fn malformed(e: serde_json::Error) -> SpotInventoryError {
+    // Category and position only: a serde message may quote the input.
+    SpotInventoryError::Malformed(format!("{:?} at line {} column {}", e.classify(), e.line(), e.column()))
+}
+
+/// Decode a completed `GET /api/v3/account` body within `max_bytes`: one
+/// map only (never a positional array), every asset once. Synchronous, no I/O.
+#[cfg(any(test, feature = "crash-points"))]
+pub fn decode_account(body: &str, max_bytes: usize) -> Result<SpotAccount, SpotInventoryError> {
+    if body.len() > max_bytes {
+        return Err(SpotInventoryError::Oversize { len: body.len(), limit: max_bytes });
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Account {
+        uid: u64,
+        can_trade: bool,
+        account_type: String,
+        permissions: Vec<String>,
+        #[serde(deserialize_with = "object_entries")]
+        balances: Vec<SpotAccountBalance>,
+    }
+
+    let Object(account): Object<Account> = serde_json::from_str(body).map_err(malformed)?;
+    let mut assets = HashSet::new();
+    assets.try_reserve(account.balances.len()).map_err(|_| SpotInventoryError::Allocation)?;
+    if account.balances.iter().any(|b| !assets.insert(b.asset.as_str())) {
+        return Err(SpotInventoryError::DuplicateAsset);
+    }
+    drop(assets);
+    Ok(SpotAccount {
+        uid: account.uid,
+        can_trade: account.can_trade,
+        account_type: account.account_type,
+        permissions: account.permissions,
+        balances: account.balances,
+    })
+}
+
+/// Decode a completed `GET /api/v3/openOrders` body within `max_bytes`: an
+/// array of maps, every row and raw symbol kept, all or nothing. Identity is
+/// unique by `(symbol, orderId)` and by `(symbol, clientOrderId)`; list
+/// references are not resolved here.
+#[cfg(any(test, feature = "crash-points"))]
+pub fn decode_open_orders(
+    body: &str,
+    max_bytes: usize,
+) -> Result<Vec<SpotOrderRecord>, SpotInventoryError> {
+    if body.len() > max_bytes {
+        return Err(SpotInventoryError::Oversize { len: body.len(), limit: max_bytes });
+    }
+    let OpenOrderEntries(orders) = serde_json::from_str(body).map_err(malformed)?;
+    let mut by_order_id: HashSet<(&str, u64)> = HashSet::new();
+    by_order_id.try_reserve(orders.len()).map_err(|_| SpotInventoryError::Allocation)?;
+    let mut by_client_id: HashSet<(&str, &str)> = HashSet::new();
+    by_client_id.try_reserve(orders.len()).map_err(|_| SpotInventoryError::Allocation)?;
+    for order in &orders {
+        let symbol = order.symbol.as_str();
+        if !valid_identity(symbol) || !valid_identity(&order.client_order_id) {
+            return Err(SpotInventoryError::InvalidIdentity(order.order_id));
+        }
+        if !by_order_id.insert((symbol, order.order_id))
+            || !by_client_id.insert((symbol, order.client_order_id.as_str()))
+        {
+            return Err(SpotInventoryError::DuplicateOrder(order.order_id));
+        }
+    }
+    drop((by_order_id, by_client_id));
+    Ok(orders)
+}
+
 pub(super) fn parse_account(body: &str) -> Result<SpotAccount, SpotReadError> {
     let account: SpotAccount = parse_json("account", body)?;
     let twice = {
