@@ -23,7 +23,9 @@ use crate::{error::DaemonError, ledger_connection::LedgerConnection, process_epo
 const INSTALLER: &str = "SELECT current_user::text, session_user::text, current_database()::text,
     inet_server_addr()::text, inet_server_port(), pg_postmaster_start_time()::text,
     c.system_identifier::text, current_setting('data_directory')
-    FROM pg_control_system() c";
+    FROM pg_control_system() c
+    WHERE EXISTS (SELECT 1 FROM public.venue_accounts
+                  WHERE (venue_id, account_scope)=('binance:spot',$2) AND tenant_id=$1)";
 /// The admitted writer's session: what a restricted login can read.
 const WRITER: &str = "SELECT current_user::text, session_user::text, current_database()::text,
     inet_server_addr()::text, inet_server_port(), pg_postmaster_start_time()::text";
@@ -188,7 +190,7 @@ pub(crate) async fn record_epoch<S: SpotSupervisor>(
     let stage = StartupStage::BeforeEpoch;
     let target = supervisor.target().clone();
     if tenant_id.is_nil()
-        || account_scope.trim().is_empty()
+        || account_scope != robson_exec::order_journal::DEFAULT_ACCOUNT_SCOPE
         || target.restore.operation.is_nil()
         || target.restore.target.is_nil()
     {
@@ -201,7 +203,8 @@ pub(crate) async fn record_epoch<S: SpotSupervisor>(
     if receipt.restore != target.restore || receipt.owner.is_nil() {
         return Err(StartupRefusal::Fence(stage));
     }
-    let (installer, cluster) = bounded(stage, deadline, read_installer(&pool)).await??;
+    let (installer, cluster) =
+        bounded(stage, deadline, read_installer(&pool, tenant_id, account_scope)).await??;
     if installer.login != installer.session_login
         || installer.database != target.database
         || installer.postmaster_started != target.postmaster_started
@@ -231,11 +234,17 @@ pub(crate) async fn record_epoch<S: SpotSupervisor>(
     })
 }
 
-async fn read_installer(pool: &PgPool) -> Result<(Session, (String, String)), StartupRefusal> {
+async fn read_installer(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    account_scope: &str,
+) -> Result<(Session, (String, String)), StartupRefusal> {
     let database = |e| StartupRefusal::Database(StartupStage::BeforeEpoch, e);
     let mut owned = LedgerConnection::new(pool.acquire().await.map_err(database)?);
     let (login, session_login, db, address, port, started, system, directory) =
         sqlx::query_as::<_, InstallerRow>(INSTALLER)
+            .bind(tenant_id)
+            .bind(account_scope)
             .fetch_one(owned.connection())
             .await
             .map_err(database)?;

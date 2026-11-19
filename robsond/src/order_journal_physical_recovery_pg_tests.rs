@@ -1,9 +1,10 @@
 //! Test-only real Journal/Spot audit composition driven by a disposable PG16
 //! controller.
-use std::{io, os::fd::AsFd};
+use std::{io, os::fd::AsFd, sync::Arc};
 
 use robson_domain::OrderSide;
 use robson_exec::{
+    order_journal::{IntentSpec, OrderJournal, ReleaseRefusal},
     venue::{OrderPhase, VenueOrderRecord},
     venue_ledger::{OrderLink, OrderOwner, SeenAt},
 };
@@ -350,12 +351,22 @@ impl SpotSupervisor for Channel {
         if let Some(installer) = self.substitute_installer.take() {
             return Ok(installer);
         }
-        let password = Self::string(&permit, "new_password").map_err(|_| FixtureFenceError)?;
+        let (login, password_key) = if std::env::var("ROBSON_PHYSICAL_FAULT").as_deref()
+            == Ok("startup-wrong-restricted-login")
+        {
+            (
+                Self::string(&permit, "probe_user").map_err(|_| FixtureFenceError)?,
+                "probe_password",
+            )
+        } else {
+            (admission.login, "new_password")
+        };
+        let password = Self::string(&permit, password_key).map_err(|_| FixtureFenceError)?;
         let options = self
             .writer_options
             .take()
             .ok_or(FixtureFenceError)?
-            .username(admission.login)
+            .username(login)
             .password(password)
             .ssl_mode(PgSslMode::Disable);
         let pool = PgPoolOptions::new()
@@ -387,7 +398,7 @@ async fn witness_daemon_start(
     ready: crate::spot_order_set_store::spot_startup::SpotReady,
     tenant: Uuid,
     epoch: Uuid,
-) -> Result<()> {
+) -> Result<Arc<OrderJournal>> {
     use robson_connectors::{binance::spot::BinanceSpotAdapter, binance_rest::BinanceRestClient};
     use robson_exec::{StubOhlcv, StubTradeFeed};
 
@@ -426,6 +437,7 @@ async fn witness_daemon_start(
         Arc::new(StubOhlcv::default()),
         ready,
     )?;
+    let journal = daemon.journal_for_startup_witness();
     let refused = Box::pin(daemon.run_until(crate::stop::StopRequest::default())).await;
     ensure!(
         matches!(refused, Err(crate::DaemonError::Config(reason))
@@ -446,7 +458,7 @@ async fn witness_daemon_start(
             .is_err(),
         "Spot attempted wire I/O before C2",
     );
-    Ok(())
+    Ok(journal)
 }
 
 #[sqlx::test(migrations = false)]
@@ -713,8 +725,8 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     );
     let handshake_ms = u64::try_from(handshake_start.elapsed().as_millis())?;
     let candidate = ready.writer().clone();
-    let current = PgJournalBackend::supervised(&ready);
-    witness_daemon_start(restore.clone(), ready, g.tenant_id, successor.process_epoch).await?;
+    let journal =
+        witness_daemon_start(restore.clone(), ready, g.tenant_id, successor.process_epoch).await?;
     // This restricted role deliberately cannot update incidents. The same
     // release using the installer's pool would be able to commit.
     let release = robson_exec::order_journal::ReleaseRecord {
@@ -726,25 +738,34 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
         treatment: "unbooked_accepted",
         decided_at: Utc::now(),
     };
-    let refused = current.release(&release).await;
+    ensure!(journal.gate().generation() == stamp);
+    let refused = journal.release(release).await;
     ensure!(
-        matches!(refused, Err(reason)
+        matches!(refused, Err(ReleaseRefusal::Backend(reason))
         if reason.contains("permission denied") && reason.contains("recovery_incidents")),
         "supervised release did not use the restricted writer"
     );
-    let mut j = sell();
-    j.intent.account_scope = successor.account_scope.clone();
-    insist(current.commit(&j).await)?;
+    // Feed a simulated completion to the journal attached to this daemon.
+    // It adds no attempt, clock, request or ticket.
+    let j = journal.open_intent(IntentSpec {
+        position_id: Some(Uuid::now_v7()),
+        kind: IntentKind::Exit,
+        client_order_id: format!("fixture-{}", Uuid::now_v7().simple()),
+        cancels_order_id: None,
+        params: json!({}),
+    });
+    journal.finish_success(&j, Some(json!({"fixture": true}))).await;
+    ensure!(journal.retry_set_depth() == 0);
     ensure!(fields(&restore, &successor).await? == (committed.0 + 1, committed.1 + 1, 2, 0, 2, 0));
     ensure!(
-        j_present(&restore, j.intent.intent_id).await?
+        j_present(&restore, j.intent_id()).await?
             && j_present(&restore, original.intent.intent_id).await?
     );
     candidate.close().await;
-    drop(current);
+    drop(journal);
     drop(reader);
     restore.close().await;
-    channel.phase("successor",json!({"generation":successor.generation_id,"version":committed.0+1,"intent":j.intent.intent_id,
+    channel.phase("successor",json!({"generation":successor.generation_id,"version":committed.0+1,"intent":j.intent_id(),
         "startup_identity_queries":installer_checks,"successor_verification_queries":admitted_checks.len(),
         "handshake_ms":handshake_ms,"daemon_gate_verified":true,"release_login_verified":true,
         "venue_wire_observed":cfg!(feature = "crash-points")})).await?;

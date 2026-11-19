@@ -787,6 +787,11 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
 }
 
 impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
+    #[cfg(all(test, feature = "postgres"))]
+    pub(crate) fn journal_for_startup_witness(&self) -> Arc<OrderJournal> {
+        Arc::clone(&self.order_journal)
+    }
+
     /// Set where older unfinished funding sagas are recovered when the venue
     /// has no funding surface.
     pub fn with_funding_recovery_route(mut self, route: Option<Arc<E>>) -> Self {
