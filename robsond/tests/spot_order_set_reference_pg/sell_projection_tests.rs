@@ -390,3 +390,6 @@ async fn sell_projection_matches_cold_after_flagged_and_native_writes(pool: PgPo
     assert_eq!(proxy.query_trace_dropped(), 0);
     println!("order-set exact/absent controls execute one statement each");
 }
+
+#[path = "sell_scale_tests.rs"]
+mod sell_scale_tests;
