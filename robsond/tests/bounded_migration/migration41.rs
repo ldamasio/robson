@@ -242,6 +242,16 @@ impl Fixture {
             ("accounting_version", "bigint", false),
         ]
         .map(|(n, t, r)| (n.to_owned(), t.to_owned(), r));
+        let mut expected = expected.to_vec();
+        let original_hints_landed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version=$1 AND success)",
+        )
+        .bind(VERSION45)
+        .fetch_one(&mut self.observer)
+        .await?;
+        if original_hints_landed {
+            expected.push(("position_hints_complete".to_owned(), "boolean".to_owned(), true));
+        }
         ensure!(columns == expected);
         let constraints: (i64, i64, i64) = sqlx::query_as(
             "SELECT count(*) FILTER (WHERE contype='p'),

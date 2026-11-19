@@ -44,7 +44,7 @@ async fn assert_indexes(observer: &mut PgConnection) -> Result<String> {
         .bind(&names)
         .fetch_all(&mut *observer)
         .await?;
-    ensure!(indexes.len() == 12, "actual index inventory: {indexes:?}");
+    ensure!(indexes.len() == 13, "actual index inventory: {indexes:?}");
     let generation_key = SCOPE[..3].to_vec();
     for (table, tail) in LEAVES {
         let name = format!("spot_order_set_{table}");
@@ -75,8 +75,8 @@ async fn assert_indexes(observer: &mut PgConnection) -> Result<String> {
     }));
     let (relation, hint, _, unique, method, cols, predicate) = indexes
         .iter()
-        .find(|entry| !entry.2)
-        .context("missing single native hint index")?;
+        .find(|entry| entry.1 == "spot_order_set_sell_intents_unbound_hint")
+        .context("missing native SELL hint index")?;
     let expected: Vec<_> = SCOPE.into_iter().chain(["source_position", "intent_id"]).collect();
     ensure!(
         relation == "spot_order_set_sell_intents"
@@ -84,6 +84,21 @@ async fn assert_indexes(observer: &mut PgConnection) -> Result<String> {
             && method == "btree"
             && cols == &expected
             && predicate.is_some()
+    );
+    ensure!(
+        indexes
+            .iter()
+            .any(|(relation, name, primary, unique, method, cols, predicate)| {
+                relation == "spot_order_set_cancel_members"
+                    && name == "idx_spot_cancel_unbound_original_position"
+                    && !primary
+                    && !unique
+                    && method == "btree"
+                    && cols == &expected
+                    && predicate.as_deref()
+                        == Some("((position_id IS NULL) AND (source_position IS NOT NULL))")
+            }),
+        "missing exact native CANCEL hint index"
     );
     let flags: (i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid
@@ -136,7 +151,7 @@ async fn migration41_expanded_keys_and_late_hint_page_follow_native_index(
     ensure!(!history.is_empty());
     let slot = f.adapter.gate.clone();
     let mut stage = Some(stages::arm(&slot, Stage::Restore, Edge::AfterReturn)?);
-    f.proxy.enable_exact_query_trace(40);
+    f.proxy.enable_exact_query_trace(50);
     let before = f.proxy.stats().statements;
     let observer = &mut f.observer;
     let pid = f.pid;
@@ -146,7 +161,7 @@ async fn migration41_expanded_keys_and_late_hint_page_follow_native_index(
                      WHERE l.pid=$1 AND l.locktype='advisory' AND l.granted AND l.objsubid=1),
                     ARRAY(SELECT version FROM _sqlx_migrations
                           WHERE version >= $2 ORDER BY version)";
-        let versions = [VERSION41, VERSION42, VERSION43, VERSION44];
+        let versions = [VERSION41, VERSION42, VERSION43, VERSION44, VERSION45];
         let mut original_key = None;
         for completed in 1..=versions.len() {
             let (hit, release) = stage.take().context("official migrate restore stage")?;
@@ -168,21 +183,22 @@ async fn migration41_expanded_keys_and_late_hint_page_follow_native_index(
     };
     let (run, evidence) = tokio::join!(
         crate::MIGRATOR.run_direct(&mut f.adapter),
-        timeout(Duration::from_millis(950), assert_stage),
+        timeout(Duration::from_millis(1150), assert_stage),
     );
     run?;
-    evidence.context("four native schema/advisory witness stages")??;
+    evidence.context("five native schema/advisory witness stages")??;
     let trace = f.proxy.query_trace();
     let statements = f.proxy.stats().statements - before;
-    ensure!(statements == 35 && trace.len() == 35 && f.proxy.query_trace_dropped() == 0);
+    ensure!(statements == 42 && trace.len() == 42 && f.proxy.query_trace_dropped() == 0);
     ensure!(trace[1] == "SELECT pg_advisory_lock($1)");
     ensure!(
         trace[7].trim() == migration().sql.trim()
             && trace[14].trim() == projection_migration().sql.trim()
             && trace[21].trim() == cancel_migration().sql.trim()
             && trace[28].trim() == cancel_unbound_migration().sql.trim()
+            && trace[35].trim() == contract45().context("exact M45")?.sql.trim()
     );
-    ensure!(trace[34] == "SELECT pg_advisory_unlock($1)");
+    ensure!(trace[41] == "SELECT pg_advisory_unlock($1)");
     let after = sqlx::query_as::<_, (i64, String, String, bool, Vec<u8>, i64)>(OLD)
         .bind(VERSION41)
         .fetch_all(&mut f.observer)
@@ -195,9 +211,11 @@ async fn migration41_expanded_keys_and_late_hint_page_follow_native_index(
     f.assert_landed(true).await?;
     f.migration = cancel_unbound_migration();
     f.assert_landed(true).await?;
+    f.migration = contract45().context("exact M45")?;
+    f.assert_landed(true).await?;
     let index = assert_indexes(&mut f.observer).await?;
     holder.rollback().await?;
-    eprintln!("M41/M42/M43/M44 bounded native official runner physical_sql={statements} native_same_key=true old_relation_lock_held=true");
+    eprintln!("M41/M42/M43/M44/M45 bounded native official runner physical_sql={statements} native_same_key=true old_relation_lock_held=true");
     let t = Uuid::now_v7();
     let generation = Uuid::now_v7();
     let position = Uuid::now_v7();
