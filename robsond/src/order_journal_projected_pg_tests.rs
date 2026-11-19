@@ -265,6 +265,8 @@ async fn persisted_order_set_journal_refusal_or_native_projection_failure_rolls_
 async fn persisted_order_set_journal_lost_commit_proves_original_atomic_state(
     pool: PgPool,
 ) -> Result<()> {
+    use crate::spot_order_set_store::{observe_generation, ExpectedGeneration};
+
     let g = seed_generation(&pool).await?;
     let (stored, proxy, pid, birth) = proxied_journal(&pool, &g).await?;
     proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE public.spot_order_set_generation g"));
@@ -272,6 +274,8 @@ async fn persisted_order_set_journal_lost_commit_proves_original_atomic_state(
     let j = sell();
     ensure!(matches!(stored.commit(&j).await, Err(CommitFailure::Uncertain(_))));
     ensure!(proxy.stats().commit_acks_dropped == 1);
+    // Local recovery evidence. Deployment fencing and physical restore require
+    // their own witnesses. Wait for the exact original server session first.
     native_retired(&pool, pid, &birth).await?;
     let trace = proxy.query_trace();
     ensure!(
@@ -279,9 +283,51 @@ async fn persisted_order_set_journal_lost_commit_proves_original_atomic_state(
         "two extra accounting executions, one projection and no queued rollback: {trace:?}"
     );
     ensure!(trace[4].contains("UPDATE public.spot_order_set_generation g") && trace[5] == "COMMIT");
-    ensure!(j_present(&pool, j.intent.intent_id).await?);
-    ensure!(fields(&pool, &g).await? == (before.0 + 1, before.1 + 1, 1, 0, 1, 0));
+    let committed = fields(&pool, &g).await?;
+    ensure!(committed == (before.0 + 1, before.1 + 1, 1, 0, 1, 0));
     eprintln!("Persisted journal native lost COMMIT ACK: 6 wire commands, original retired");
+
+    let venue = VenueId::new(VenueId::BINANCE_SPOT);
+    let binding = ExpectedGeneration {
+        tenant_id: g.tenant_id,
+        venue: &venue,
+        account_scope: &g.account_scope,
+        generation_id: g.generation_id,
+        process_epoch: g.process_epoch,
+        source_audit_id: g.source_audit_id,
+    };
+    let mut reader = pool.connect_options().connect().await?;
+    let intent_generation = "SELECT j.uncertain_generation FROM public.order_intents j
+        JOIN public.spot_order_set_sell_intents m USING (tenant_id,venue_id,account_scope,intent_id)
+        WHERE j.intent_id=$1 AND m.generation_id=$2 AND m.potential AND NOT m.conflict
+          AND m.source_position IS NOT DISTINCT FROM j.position_id";
+    let original: Option<i64> = sqlx::query_scalar(intent_generation)
+        .bind(j.intent.intent_id)
+        .bind(g.generation_id)
+        .fetch_one(&mut reader)
+        .await?;
+    ensure!(original.is_none());
+    let observed = observe_generation(&mut reader, binding)
+        .await?
+        .context("committed generation was not readable before replacement startup")?;
+    ensure!(observed.accounting_version == committed.0);
+
+    // Only this test owns the writer handle. Close it before starting the successor.
+    stored.pool.close().await;
+    let successor =
+        crate::process_epoch::start_epoch(&pool, g.tenant_id, "journal-recovery").await?;
+    ensure!(successor.predecessor_epoch_id == Some(g.process_epoch));
+    ensure!(successor.epoch.epoch_id != g.process_epoch && successor.stamped_intents == 1);
+    let stamp = successor.unclean_generation.context("expected an unclean predecessor")?;
+    let recovered: Option<i64> = sqlx::query_scalar(intent_generation)
+        .bind(j.intent.intent_id)
+        .bind(g.generation_id)
+        .fetch_one(&mut reader)
+        .await?;
+    ensure!(recovered == Some(stamp));
+    ensure!(fields(&pool, &g).await? == committed);
+    ensure!(observe_generation(&mut reader, binding).await?.is_none());
+    eprintln!("Native successor stamped the committed intent; the prior generation refused at the same accounting version");
     Ok(())
 }
 
