@@ -566,3 +566,6 @@ async fn terminal_masks_active_cancel_but_preserves_conflict_in_every_scope(pool
 
 #[path = "sell_scale_tests.rs"]
 mod sell_scale_tests;
+
+#[path = "sell_nested_work_tests.rs"]
+mod sell_nested_work_tests;
