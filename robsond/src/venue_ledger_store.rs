@@ -22,6 +22,10 @@ mod trades;
 #[path = "../tests/venue_ledger_trades/projected.rs"]
 mod projected_trades;
 
+#[cfg(test)]
+#[path = "../tests/venue_ledger_orders/projected.rs"]
+mod projected_orders;
+
 /// Test-only access to the private venue-order row decoder, for a fixture
 /// statement that selects `ORDER_COLUMNS` under otherwise unused names.
 #[cfg(test)]
@@ -49,6 +53,8 @@ pub struct PgVenueLedger {
     statements: AtomicU64,
     /// Private opt-in generation maintenance; only `record_trades` reads it.
     trade_projection: Option<JournalGeneration>,
+    /// Private opt-in membership maintenance; only `record_order` reads it.
+    order_projection: Option<JournalGeneration>,
 }
 
 impl PgVenueLedger {
@@ -58,6 +64,7 @@ impl PgVenueLedger {
             tenant_id,
             statements: AtomicU64::new(0),
             trade_projection: None,
+            order_projection: None,
         }
     }
 
@@ -65,6 +72,16 @@ impl PgVenueLedger {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_trade_order_set_projection(mut self, generation: JournalGeneration) -> Self {
         self.trade_projection = Some(generation);
+        self
+    }
+
+    /// Isolated integrations only; nothing in the runtime selects this.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_native_order_set_projection(
+        mut self,
+        generation: JournalGeneration,
+    ) -> Self {
+        self.order_projection = Some(generation);
         self
     }
 
