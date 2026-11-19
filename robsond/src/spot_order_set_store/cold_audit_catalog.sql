@@ -70,4 +70,3 @@ FROM (VALUES
     ARRAY['admission_intent_id','position_id','tenant_id','venue_id','account_scope','symbol','decided_month'],
     ARRAY['entry_intent_id','position_id','tenant_id','venue_id','account_scope','symbol','decided_month'])
 ) f(name,source,target,source_columns,target_columns)
-
