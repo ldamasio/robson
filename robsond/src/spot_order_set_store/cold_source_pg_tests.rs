@@ -121,6 +121,10 @@ async fn explain_page(
     Ok(query.fetch_one(conn).await?)
 }
 
+fn covers_exact_source<T: Eq>(actual: &[T], expected: &[T], reached_end: bool) -> bool {
+    reached_end && actual == expected
+}
+
 async fn assert_page_family(
     conn: &mut PgConnection,
     account: &str,
@@ -136,6 +140,10 @@ async fn assert_page_family(
     let a = read_attempt_page(&mut *conn, account, tenant, intent_cursor).await?;
     let o = read_order_page(&mut *conn, account, tenant, order_cursor).await?;
     ensure!(j.full && a.full && o.full);
+    let first_intents: Vec<Uuid> = j.rows.iter().map(|row| row.intent_id).collect();
+    let first_attempts: Vec<Uuid> = a.rows.iter().map(|row| row.attempt_id).collect();
+    let first_orders: Vec<String> =
+        o.rows.iter().map(|row| row.exchange_order_id.clone()).collect();
     for (offset, ((intent, attempt), order)) in j.rows.iter().zip(&a.rows).zip(&o.rows).enumerate()
     {
         let n = preceding + offset as u32 + 1;
@@ -192,6 +200,67 @@ async fn assert_page_family(
             && a.rows[1].parent_intent_id == Some(j.rows[1].intent_id)
             && o.rows[1].exchange_order_id == exchange(preceding + 10)
     );
+    let intent_oracle: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT intent_id FROM order_intents WHERE venue_id='binance:spot' AND account_scope=$1
+         AND ($2::text IS NULL OR client_order_id>$2) ORDER BY client_order_id",
+    )
+    .bind(account)
+    .bind(intent_cursor)
+    .fetch_all(&mut *conn)
+    .await?;
+    let attempt_oracle: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT attempt_id FROM submit_attempts WHERE venue_id='binance:spot' AND account_scope=$1
+         AND ($2::text IS NULL OR client_order_id>$2) ORDER BY client_order_id",
+    )
+    .bind(account)
+    .bind(intent_cursor)
+    .fetch_all(&mut *conn)
+    .await?;
+    let order_oracle: Vec<String> = sqlx::query_scalar(
+        "SELECT exchange_order_id FROM venue_orders WHERE venue_id='binance:spot' AND account_scope=$1
+         AND ($2::text IS NULL OR exchange_order_id>$2) ORDER BY symbol,exchange_order_id",
+    )
+    .bind(account)
+    .bind(order_cursor.map(|(_, key)| key))
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut read_intents = first_intents.clone();
+    read_intents.extend(j.rows.iter().map(|row| row.intent_id));
+    let mut read_attempts = first_attempts.clone();
+    read_attempts.extend(a.rows.iter().map(|row| row.attempt_id));
+    let mut read_orders = first_orders.clone();
+    read_orders.extend(o.rows.iter().map(|row| row.exchange_order_id.clone()));
+    ensure!(covers_exact_source(&read_intents, &intent_oracle, !j.full));
+    ensure!(covers_exact_source(&read_attempts, &attempt_oracle, !a.full));
+    ensure!(covers_exact_source(&read_orders, &order_oracle, !o.full));
+
+    // A shorter successor at the wrong cursor cannot certify coverage.
+    let skipped_j =
+        read_intent_page(&mut *conn, account, tenant, Some(&j.rows[0].client_order_id)).await?;
+    let skipped_a =
+        read_attempt_page(&mut *conn, account, tenant, Some(&a.rows[0].client_order_id)).await?;
+    let skipped_o = read_order_page(
+        &mut *conn,
+        account,
+        tenant,
+        Some((&o.rows[0].symbol, &o.rows[0].exchange_order_id)),
+    )
+    .await?;
+    ensure!(!skipped_j.full && !skipped_a.full && !skipped_o.full);
+    ensure!((skipped_j.rows.len(), skipped_a.rows.len(), skipped_o.rows.len()) == (1, 1, 1));
+    ensure!(!covers_exact_source(
+        &[first_intents.as_slice(), &[skipped_j.rows[0].intent_id]].concat(),
+        &intent_oracle,
+        true
+    ));
+    ensure!(!covers_exact_source(
+        &[first_attempts.as_slice(), &[skipped_a.rows[0].attempt_id]].concat(),
+        &attempt_oracle,
+        true
+    ));
+    let mut skipped_orders = first_orders;
+    skipped_orders.push(skipped_o.rows[0].exchange_order_id.clone());
+    ensure!(!covers_exact_source(&skipped_orders, &order_oracle, true));
 
     ensure!(read_intent_page(&mut *conn, account, tenant, Some(&j.rows[1].client_order_id))
         .await?
@@ -210,6 +279,76 @@ async fn assert_page_family(
     .await?
     .rows
     .is_empty());
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn persisted_cold_source_native_tuple_order_and_end_are_exact(pool: PgPool) -> Result<()> {
+    let tenant = Uuid::now_v7();
+    let scope = "cold-tuple";
+    sqlx::query(
+        "INSERT INTO accounting_state(tenant_id,venue_id,budget_model)
+                 VALUES($1,'binance:spot','net_from_start_non_expanding_v1')",
+    )
+    .bind(tenant)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO venue_orders (venue_id,account_scope,symbol,exchange_order_id,tenant_id,
+         client_order_id,last_client_order_id,owner,side,order_type,orig_qty,status,phase,
+         last_checked_at,live_seen_at)
+         SELECT 'binance:spot',$1,symbol,id,$2,symbol||id,symbol||id,
+                'discovered','SELL','LIMIT',1,'NEW','live',now(),now()
+         FROM (VALUES ('C','1'),('A','9'),('A','2'),('A','101'),('B','2'),
+                      ('A','3'),('A','1'),('A','10002'),('B','10'),('A','10')) seed(symbol,id)",
+    )
+    .bind(scope)
+    .bind(tenant)
+    .execute(&pool)
+    .await?;
+    let mut conn = pool.begin().await?;
+    sqlx::raw_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *conn)
+        .await?;
+    let oracle: Vec<(String, String)> = sqlx::query_as(
+        "SELECT symbol,exchange_order_id FROM venue_orders
+         WHERE venue_id='binance:spot' AND account_scope=$1 ORDER BY symbol,exchange_order_id",
+    )
+    .bind(scope)
+    .fetch_all(&mut *conn)
+    .await?;
+    let first = read_order_page(&mut conn, scope, tenant, None).await?;
+    let last = first.rows.last().context("full native tuple page")?;
+    ensure!(first.full && (last.symbol.as_str(), last.exchange_order_id.as_str()) == ("B", "10"));
+    let second =
+        read_order_page(&mut conn, scope, tenant, Some((&last.symbol, &last.exchange_order_id)))
+            .await?;
+    let keys: Vec<(String, String)> = first
+        .rows
+        .into_iter()
+        .chain(second.rows)
+        .map(|row| (row.symbol, row.exchange_order_id))
+        .collect();
+    ensure!(
+        keys[8] == ("B".to_owned(), "2".to_owned()) && keys[9] == ("C".to_owned(), "1".to_owned())
+    );
+    ensure!(covers_exact_source(&keys, &oracle, !second.full));
+
+    let full_tail =
+        read_order_page(&mut conn, scope, tenant, Some((&oracle[1].0, &oracle[1].1))).await?;
+    let last = full_tail.rows.last().context("full exact tail")?;
+    let terminal =
+        read_order_page(&mut conn, scope, tenant, Some((&last.symbol, &last.exchange_order_id)))
+            .await?;
+    let tail: Vec<_> = full_tail
+        .rows
+        .into_iter()
+        .map(|row| (row.symbol, row.exchange_order_id))
+        .collect();
+    ensure!(full_tail.full && !covers_exact_source(&tail, &oracle[2..], !full_tail.full));
+    ensure!(terminal.rows.is_empty() && covers_exact_source(&tail, &oracle[2..], !terminal.full));
+    conn.rollback().await?;
     Ok(())
 }
 

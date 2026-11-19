@@ -190,12 +190,7 @@ impl Fixture {
             ensure!(elapsed == -1, "lost COMMIT ACK must precede elapsed update");
         }
         let leaves: &[&str] = match self.migration.version {
-            VERSION42 => &[
-                "sell_legs",
-                "sell_symbols",
-                "cancel_members",
-                "cancel_groups",
-            ],
+            VERSION42 => &["sell_legs", "sell_symbols", "sell_unbound"],
             VERSION43 => &["cancel_members", "cancel_groups", "cancel_legs"],
             VERSION44 => &["cancel_unbound", "cancel_ungroupable"],
             _ => &[],
