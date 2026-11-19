@@ -709,3 +709,6 @@ async fn persisted_order_set_journal_old_writer_refuses_after_same_version_nativ
     eprintln!("Native later startup stamped the source at the same version; exact old reader and writer refused");
     Ok(())
 }
+
+#[path = "order_journal_entry_pg_tests.rs"]
+mod entry;

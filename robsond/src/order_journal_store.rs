@@ -46,7 +46,8 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::spot_order_set_store::{
-    maintain_cancel_outcome, maintain_unbound_journal, JournalGeneration, JournalPrior,
+    maintain_cancel_outcome, maintain_entry_admission, maintain_unbound_journal, JournalGeneration,
+    JournalPrior,
 };
 
 /// The journal's own pool, so order writes never queue behind the daemon's.
@@ -120,9 +121,10 @@ impl PgJournalBackend {
     }
 
     /// The opted-in binding, refused before any SQL unless the batch is one
-    /// supported shape in the bound tenant and account scope, accounting-first
-    /// and without admission: a Spot Protection/Exit intent, or the outcome of
-    /// one previously persisted grouped Cancel with no attempts.
+    /// supported shape in the bound tenant and account scope, accounting-first:
+    /// a Spot Protection/Exit intent or the outcome of one previously persisted
+    /// grouped Cancel with no attempts, both without admission, or an Entry
+    /// with its own admission and no outcome.
     fn projection_for(
         &self,
         batch: &JournalBatch,
@@ -148,10 +150,26 @@ impl PgJournalBackend {
         let Some(balance) = &batch.balance else {
             return refuse("not an accounting-first batch");
         };
-        if balance.admission.is_some() {
+        if balance.admission.is_some() && intent.kind != IntentKind::Entry {
             return refuse("admission is not supported");
         }
         match intent.kind {
+            // A linked Entry outcome can change a CANCEL mask through
+            // J.not_sent: separate maintenance coverage, refused here.
+            IntentKind::Entry => {
+                let Some(admission) = &balance.admission else {
+                    return refuse("entry without an admission");
+                };
+                if batch.outcome.is_some() {
+                    return refuse("entry outcome is not supported");
+                }
+                if admission.position_id.is_nil()
+                    || intent.position_id != Some(admission.position_id)
+                    || admission.symbol.trim().is_empty()
+                {
+                    return refuse("entry admission is not the intent's leg");
+                }
+            },
             IntentKind::Protection | IntentKind::Exit => {},
             // Never a first cancel: that has its own covered transaction.
             IntentKind::Cancel => {
@@ -206,6 +224,23 @@ impl PgJournalBackend {
                     &batch.intent,
                     pending,
                     conflict,
+                )
+                .await
+            },
+            (IntentKind::Entry, JournalPrior::Entry { birth }) => {
+                let Some(admission) = batch.balance.as_ref().and_then(|b| b.admission.as_ref())
+                else {
+                    return Err(CommitFailure::Known(
+                        "order-set journal refused: entry without an admission".to_owned(),
+                    ));
+                };
+                maintain_entry_admission(
+                    &mut **tx,
+                    generation,
+                    version,
+                    &batch.intent,
+                    &admission.symbol,
+                    birth,
                 )
                 .await
             },
@@ -276,6 +311,7 @@ impl PgJournalBackend {
         let intent = &batch.intent;
         let projected = self.order_set_projection.is_some();
         let projected_cancel = projected && intent.kind == IntentKind::Cancel;
+        let projected_entry = projected && intent.kind == IntentKind::Entry;
         // The no-op update returns the row that owns the id, ours or not.
         let ordinary_intent = r#"
             INSERT INTO order_intents (
@@ -296,6 +332,18 @@ impl PgJournalBackend {
                         coalesce(prior_cancel.pending, false) AS prior_pending,
                         coalesce(prior_cancel.conflict, false) AS prior_conflict
                  FROM written LEFT JOIN prior_cancel ON true"
+            );
+            projected_intent.as_str()
+        } else if projected_entry {
+            // The leg, admission and native edge before this write and the
+            // admission below.
+            let before = include_str!("spot_order_set_store/journal_entry_before_write.sql");
+            projected_intent = format!(
+                "{before}, written AS ({ordinary_intent})
+                 SELECT written.intent_id, prior_entry.prior_found, prior_entry.prior_leg,
+                        prior_entry.prior_admission, prior_entry.prior_admitted,
+                        prior_entry.prior_native
+                 FROM written CROSS JOIN prior_entry"
             );
             projected_intent.as_str()
         } else if projected {
@@ -339,6 +387,23 @@ impl PgJournalBackend {
                 pending: written.try_get("prior_pending").map_err(known)?,
                 conflict: written.try_get("prior_conflict").map_err(known)?,
             }
+        } else if projected_entry {
+            let found: bool = written.try_get("prior_found").map_err(known)?;
+            let leg: bool = written.try_get("prior_leg").map_err(known)?;
+            let admission: Option<Uuid> = written.try_get("prior_admission").map_err(known)?;
+            let admitted: bool = written.try_get("prior_admitted").map_err(known)?;
+            let native: bool = written.try_get("prior_native").map_err(known)?;
+            // A fresh birth, or the same current admission replayed. Any
+            // supersession, foreign leg or native edge is held for repair.
+            let birth = !found && !leg && !admitted;
+            let replay = found && admitted && admission == Some(intent.intent_id);
+            if native || !(birth || replay) {
+                return Err(CommitFailure::Known(
+                    "order-set journal refused: entry is neither a fresh birth nor its replay"
+                        .to_owned(),
+                ));
+            }
+            JournalPrior::Entry { birth }
         } else {
             JournalPrior::Sell {
                 member_expected: projected

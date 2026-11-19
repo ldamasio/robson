@@ -32,6 +32,7 @@ impl JournalGeneration {
 
 const JOURNAL_UNBOUND: &str = include_str!("journal_unbound.sql");
 const JOURNAL_CANCEL_OUTCOME: &str = include_str!("journal_cancel_outcome.sql");
+const JOURNAL_ENTRY: &str = include_str!("journal_entry.sql");
 
 /// The existing contribution captured in the original intent upsert's
 /// snapshot, typed by the opted route it belongs to.
@@ -42,6 +43,39 @@ pub(crate) enum JournalPrior {
     /// One preexisting grouped cancel, as journal_cancel_before_write.sql
     /// reads it. Absent J is a fresh intent and refuses.
     Cancel { pending: bool, conflict: bool },
+    /// One admitted Entry, as journal_entry_before_write.sql read it and its
+    /// caller qualified it: a fresh birth or the same admission's replay.
+    Entry { birth: bool },
+}
+
+/// One statement on the caller's transaction after an Entry's original
+/// intent, attempt, clock and admission effects. Same contract as
+/// [`maintain_unbound_journal`]: no row is a refusal.
+pub(crate) async fn maintain_entry_admission(
+    connection: &mut PgConnection,
+    generation: &JournalGeneration,
+    version: i64,
+    intent: &IntentRow,
+    symbol: &str,
+    birth: bool,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(JOURNAL_ENTRY)
+        .bind(generation.tenant_id)
+        .bind(&generation.account_scope)
+        .bind(generation.generation_id)
+        .bind(generation.process_epoch)
+        .bind(generation.source_audit_id)
+        .bind(version)
+        .bind(intent.intent_id)
+        .bind(&intent.client_order_id)
+        .bind(intent.position_id)
+        .bind(symbol)
+        .bind(birth)
+        .fetch_optional(connection)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
+        .await
 }
 
 /// One statement on the caller's transaction for the outcome of one
