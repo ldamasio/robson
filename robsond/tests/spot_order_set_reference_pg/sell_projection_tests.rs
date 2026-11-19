@@ -35,9 +35,13 @@ struct Hot {
     leg_sell: i64,
     leg_sell_conflicts: i64,
     symbol_sell: i64,
+    symbol_sell_conflicts: i64,
     grouped_cancel: i64,
+    grouped_cancel_conflicts: i64,
     ungroupable_cancel: i64,
+    ungroupable_cancel_conflicts: i64,
     unbound_cancel: i64,
+    unbound_cancel_conflicts: i64,
     stop_id: Option<String>,
     stop_phase: Option<String>,
     stop_status: Option<String>,
@@ -62,56 +66,148 @@ fn terminal(phase: Option<&str>, status: Option<&str>) -> bool {
         )
 }
 
-fn cold_sells(report: &Report) -> (i64, i64) {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Liability {
+    active: i64,
+    conflicts: i64,
+}
+
+impl Liability {
+    fn observe(&mut self, active: bool, conflict: bool) {
+        self.active += i64::from(active);
+        self.conflicts += i64::from(conflict);
+    }
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct Sells {
+    leg: Liability,
+    symbol: Liability,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct Cancels {
+    grouped: Liability,
+    ungroupable: Liability,
+    unbound: Liability,
+}
+
+impl Hot {
+    fn sells(&self) -> Sells {
+        Sells {
+            leg: Liability {
+                active: self.leg_sell,
+                conflicts: self.leg_sell_conflicts,
+            },
+            symbol: Liability {
+                active: self.symbol_sell,
+                conflicts: self.symbol_sell_conflicts,
+            },
+        }
+    }
+
+    fn cancels(&self) -> Cancels {
+        Cancels {
+            grouped: Liability {
+                active: self.grouped_cancel,
+                conflicts: self.grouped_cancel_conflicts,
+            },
+            ungroupable: Liability {
+                active: self.ungroupable_cancel,
+                conflicts: self.ungroupable_cancel_conflicts,
+            },
+            unbound: Liability {
+                active: self.unbound_cancel,
+                conflicts: self.unbound_cancel_conflicts,
+            },
+        }
+    }
+}
+
+fn cold_sells(report: &Report) -> Sells {
+    let mut counts = Sells::default();
     let mut handled = Vec::new();
-    let mut leg = 0;
     for row in report
         .rows
         .iter()
         .filter(|row| matches!(row.kind.as_str(), "exit" | "protection"))
     {
-        if row.named_identity_matches {
+        let exact_sell = row.named_identity_matches && row.named_side.as_deref() == Some("SELL");
+        if exact_sell {
             handled.push(row.named_id.as_deref().unwrap());
         }
-        let proved_terminal = row.named_identity_matches
-            && row.named_side.as_deref() == Some("SELL")
-            && !row.named_conflict
-            && row.venue_outcome.as_deref() != Some("rejected")
+        let contradictory_outcome =
+            row.not_sent || row.venue_outcome.as_deref() == Some("rejected");
+        let proved_terminal = exact_sell
+            && !contradictory_outcome
             && terminal(row.named_phase.as_deref(), row.named_status.as_deref());
-        if !row.no_send && !row.has_durable_rejection() && !proved_terminal {
-            leg += 1;
-        }
-    }
-    let mut symbol = 0;
-    for row in &report.venue_complement {
-        if row.side != "SELL" || handled.contains(&row.exchange_order_id.as_str()) {
+        if row.no_send || row.has_durable_rejection() || proved_terminal {
             continue;
         }
-        // Only exact, positively linked terminal evidence relieves a SELL.
+        // An exact pair is one member. Mismatches stay on both native and journal paths.
+        let conflict = contradictory_outcome
+            || (row.named_id.is_some() && !exact_sell)
+            || row.named_phase.as_deref() == Some("terminal");
+        counts.leg.observe(true, conflict);
+    }
+    for row in &report.venue_complement {
+        if handled.contains(&row.exchange_order_id.as_str()) {
+            continue;
+        }
+        if row.side != "SELL"
+            && !report.rows.iter().any(|journal| {
+                Some(journal.intent_id) == row.intent_id
+                    && matches!(journal.kind.as_str(), "exit" | "protection")
+            })
+        {
+            continue;
+        }
+        // No entry in the complement supplies exact terminal evidence for a SELL.
+        // Owning-leg complements carry missing or contradictory linkage. An
+        // unowned observation is an active hold even without a contradiction.
         if row.position_id.is_some() {
-            leg += 1;
+            counts.leg.observe(true, true);
         } else {
-            symbol += 1;
+            counts.symbol.observe(true, row.phase == "terminal");
         }
     }
-    (leg, symbol)
+    counts
 }
 
-fn cold_cancels(report: &Report) -> (i64, i64, i64) {
-    let mut grouped = 0;
-    let mut ungroupable = 0;
-    for row in report.rows.iter().filter(|row| row.kind == "cancel" && !row.no_send) {
+fn cancel_conflict(named: bool, not_sent: bool, has_outcome: bool, has_evidence: bool) -> bool {
+    named || (not_sent && (has_outcome || has_evidence))
+}
+
+fn cold_cancels(report: &Report) -> Cancels {
+    let mut counts = Cancels::default();
+    for row in report.rows.iter().filter(|row| row.kind == "cancel") {
+        let contradiction = cancel_conflict(
+            row.named_id.is_some(),
+            row.not_sent,
+            row.venue_outcome.is_some(),
+            row.venue_evidence.is_some(),
+        );
         if row.original_target.is_none() {
-            ungroupable += 1;
-        } else if row.target_conflict
-            || row.target_id != row.original_target
-            || !terminal(row.target_phase.as_deref(), row.target_status.as_deref())
-        {
-            grouped += 1;
+            counts.ungroupable.observe(!row.no_send, contradiction);
+            continue;
         }
+        let exact_terminal = !row.target_conflict
+            && row.target_id == row.original_target
+            && terminal(row.target_phase.as_deref(), row.target_status.as_deref());
+        counts.grouped.observe(!row.no_send && !exact_terminal, contradiction);
     }
-    let unbound = report.unbound_cancels.iter().filter(|row| !row.no_send).count() as i64;
-    (grouped, ungroupable, unbound)
+    for row in &report.unbound_cancels {
+        counts.unbound.observe(
+            !row.no_send,
+            cancel_conflict(
+                row.named_id.is_some(),
+                row.not_sent,
+                row.venue_outcome.is_some(),
+                row.venue_evidence.is_some(),
+            ),
+        );
+    }
+    counts
 }
 
 async fn checkpoint(
@@ -125,15 +221,13 @@ async fn checkpoint(
     let cold = audit(pool, s).await.unwrap();
     assert_eq!(hot.position_id, s.position, "{label}");
     assert_eq!(hot.accounting_version, cold.version, "{label}: accounting version");
-    assert_eq!(cold_sells(&cold), expected_sells, "{label}: cold SELL inventory");
-    assert_eq!((hot.leg_sell, hot.symbol_sell), expected_sells, "{label}: hot SELL inventory");
-    assert_eq!(
-        (hot.grouped_cancel, hot.ungroupable_cancel, hot.unbound_cancel),
-        cold_cancels(&cold),
-        "{label}: cancellation inventory"
-    );
+    let sells = cold_sells(&cold);
+    let cancels = cold_cancels(&cold);
+    assert_eq!((sells.leg.active, sells.symbol.active), expected_sells, "{label}: cold SELL");
+    assert_eq!(hot.sells(), sells, "{label}: SELL liabilities");
+    assert_eq!(hot.cancels(), cancels, "{label}: cancellation liabilities");
     println!(
-        "order-set event={label} version={} sells={expected_sells:?}",
+        "order-set event={label} version={} sells={sells:?} cancels={cancels:?}",
         hot.accounting_version
     );
     hot
@@ -389,6 +483,85 @@ async fn sell_projection_matches_cold_after_flagged_and_native_writes(pool: PgPo
     assert_eq!(proxy.query_trace().len(), 2);
     assert_eq!(proxy.query_trace_dropped(), 0);
     println!("order-set exact/absent controls execute one statement each");
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires isolated PostgreSQL"]
+async fn terminal_masks_active_cancel_but_preserves_conflict_in_every_scope(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let sibling = Fixture::for_tenant(&pool, f.tenant).await;
+    let s = scope(&f);
+    let other = scope(&sibling);
+    let journal = PgJournalBackend::new(&pool, s.tenant);
+    install(&pool).await;
+    checkpoint(&pool, s, "before-conflicts", (0, 0), None).await;
+
+    let contradictory = OutcomeRow {
+        not_sent: true,
+        venue_evidence: Some(serde_json::json!({"opaque_fixture_evidence": "retained"})),
+        ..OutcomeRow::default()
+    };
+    for (label, target, bound) in [
+        ("grouped-contradicted-no-send", Some("701"), true),
+        ("ungroupable-contradicted-no-send", Some("invalid-id"), true),
+        ("unbound-contradicted-no-send", Some("701"), false),
+    ] {
+        let mut cancel = batch(s, IntentKind::Cancel, target);
+        cancel.intent.position_id = bound.then_some(s.position);
+        cancel.outcome = Some(contradictory.clone());
+        journal.commit(&cancel).await.unwrap();
+        checkpoint(&pool, s, label, (0, 0), None).await;
+    }
+    let all_conflicting = Liability { active: 1, conflicts: 1 };
+    let live = checkpoint(&pool, s, "all-cancel-channels-positive", (0, 0), None).await;
+    assert_eq!(
+        live.cancels(),
+        Cancels {
+            grouped: all_conflicting,
+            ungroupable: all_conflicting,
+            unbound: all_conflicting
+        }
+    );
+
+    let original = batch(s, IntentKind::Exit, None);
+    journal.commit(&original).await.unwrap();
+    checkpoint(&pool, s, "conflicting-cancel-target-journal", (1, 0), None).await;
+    let link = linked_sell(&f, &original.intent);
+    let mut own_terminal = zero_execution_order("701", "CANCELED", OrderPhase::Terminal);
+    own_terminal.client_order_id = link.client_order_id.clone();
+    assert!(f.ledger.record_order(&own_terminal, &link, seen(1)).await.unwrap().changed);
+    let masked = checkpoint(&pool, s, "terminal-masks-active-retains-conflict", (0, 0), None).await;
+    assert_eq!(
+        masked.cancels(),
+        Cancels {
+            grouped: Liability { active: 0, conflicts: 1 },
+            ungroupable: all_conflicting,
+            unbound: all_conflicting,
+        }
+    );
+
+    // Even recognized terminal evidence on an unowned SELL cannot be
+    // attributed to either leg. Its unresolved conflict is shared by symbol.
+    let unowned_terminal = zero_execution_order("702", "CANCELED", OrderPhase::Terminal);
+    assert!(
+        f.ledger
+            .record_order(&unowned_terminal, &unowned(), seen(2))
+            .await
+            .unwrap()
+            .changed
+    );
+    let native = checkpoint(&pool, s, "symbol-terminal-conflict", (0, 1), None).await;
+    assert_eq!(native.sells().symbol, all_conflicting);
+    let sibling_hot =
+        checkpoint(&pool, other, "sibling-shares-account-and-symbol", (0, 1), None).await;
+    assert_eq!(sibling_hot.sells().symbol, all_conflicting);
+    assert_eq!(
+        sibling_hot.cancels(),
+        Cancels {
+            unbound: all_conflicting,
+            ..Cancels::default()
+        }
+    );
 }
 
 #[path = "sell_scale_tests.rs"]

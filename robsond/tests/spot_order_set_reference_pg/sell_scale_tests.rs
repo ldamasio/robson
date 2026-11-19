@@ -1,8 +1,8 @@
 use super::{
     batch, cold_cancels, cold_sells, empty_budget, hot_query, install, linked_sell, scope, seen,
-    through_proxy_limit, zero_execution_order, Fixture, IntentKind, JournalBackend, LegOrderKind,
-    OrderKey, OrderOwner, OrderPhase, PgJournalBackend, PgPool, ProtectionKind, Scope, TradeFill,
-    TradePage, HOT,
+    through_proxy_limit, zero_execution_order, Cancels, Fixture, IntentKind, JournalBackend,
+    LegOrderKind, Liability, OrderKey, OrderOwner, OrderPhase, PgJournalBackend, PgPool,
+    ProtectionKind, Scope, Sells, TradeFill, TradePage, HOT,
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -61,13 +61,15 @@ fn explain_rows(node: &Value, field: &str) -> u64 {
 
 async fn measure(pool: &PgPool, s: Scope, expected_closed: i64) {
     // The history inventory and its joins are fixture assertions outside the timed query.
-    let closed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM venue_orders o JOIN order_intents j ON j.intent_id=o.intent_id
-         WHERE (o.tenant_id,o.venue_id,o.account_scope,o.position_id,o.symbol)=($1,$2,$3,$4,$5)
-           AND o.phase='terminal' AND o.status='CANCELED' AND o.owner='leg' AND o.kind='sell'
-           AND (j.tenant_id,j.venue_id,j.account_scope,j.position_id,j.client_order_id)
-               = (o.tenant_id,o.venue_id,o.account_scope,o.position_id,o.client_order_id)
-           AND j.kind='exit'",
+    let (closed, venue_rows, intent_rows): (i64, i64, i64) = sqlx::query_as(
+        "SELECT (
+             SELECT count(*) FROM venue_orders o JOIN order_intents j ON j.intent_id=o.intent_id
+             WHERE (o.tenant_id,o.venue_id,o.account_scope,o.position_id,o.symbol)=($1,$2,$3,$4,$5)
+               AND o.phase='terminal' AND o.status='CANCELED' AND o.owner='leg' AND o.kind='sell'
+               AND (j.tenant_id,j.venue_id,j.account_scope,j.position_id,j.client_order_id)
+                   = (o.tenant_id,o.venue_id,o.account_scope,o.position_id,o.client_order_id)
+               AND j.kind='exit'
+         ), (SELECT count(*) FROM venue_orders), (SELECT count(*) FROM order_intents)",
     )
     .bind(s.tenant)
     .bind(s.venue)
@@ -78,6 +80,7 @@ async fn measure(pool: &PgPool, s: Scope, expected_closed: i64) {
     .await
     .unwrap();
     assert_eq!(closed, expected_closed);
+    assert_eq!((venue_rows, intent_rows), (closed + 1, closed + 2));
     let started = Instant::now();
     let cold = tokio::time::timeout(Duration::from_secs(30), async {
         Snapshot::open(pool, s).await?.finish().await
@@ -85,18 +88,23 @@ async fn measure(pool: &PgPool, s: Scope, expected_closed: i64) {
     .await
     .expect("the exhaustive scale oracle exceeded its fixture deadline")
     .unwrap();
-    assert_eq!(cold_sells(&cold), (1, 0));
-    assert_eq!(cold_cancels(&cold), (0, 0, 0));
+    let sells = cold_sells(&cold);
+    let cancels = cold_cancels(&cold);
+    assert_eq!(
+        sells,
+        Sells {
+            leg: Liability { active: 1, conflicts: 0 },
+            ..Sells::default()
+        }
+    );
+    assert_eq!(cancels, Cancels::default());
     println!(
         "order-set closed_history={closed} exhausted_cold_ms={}",
         started.elapsed().as_millis()
     );
     let witness = hot_query(s, Some(STOP_ID)).fetch_one(pool).await.unwrap();
-    assert_eq!((witness.leg_sell, witness.symbol_sell), (1, 0));
-    assert_eq!(
-        (witness.grouped_cancel, witness.ungroupable_cancel, witness.unbound_cancel),
-        (0, 0, 0)
-    );
+    assert_eq!(witness.sells(), sells);
+    assert_eq!(witness.cancels(), cancels);
     assert_eq!(witness.accounting_version, cold.version);
     assert!(witness.exact_stop_identity);
 
@@ -127,24 +135,33 @@ async fn measure(pool: &PgPool, s: Scope, expected_closed: i64) {
         println!("order-set closed_history={closed} candidate={candidate} explain={explain}");
         let plan = &explain[0]["Plan"];
         assert_eq!(plan["Actual Rows"].as_u64(), Some(1));
-        if closed >= 512 {
-            let mut nodes = Vec::new();
-            historical_nodes(plan, &mut nodes);
-            for table in ["venue_orders", "order_intents"] {
-                assert!(
-                    nodes.iter().any(|node| node["Relation Name"] == table),
-                    "EXPLAIN must retain the exact {table} probe"
-                );
-            }
-            for node in nodes {
-                let loops = node["Actual Loops"].as_u64().expect("native loop count");
-                assert!(loops <= 1, "{node}");
-                assert!(node["Actual Rows"].as_u64().expect("native row count") <= 1, "{node}");
-                if loops != 0 {
-                    assert_ne!(node["Node Type"], "Seq Scan", "{node}");
-                    assert_eq!(explain_rows(node, "Rows Removed by Filter"), 0, "{node}");
-                    assert_eq!(explain_rows(node, "Rows Removed by Index Recheck"), 0, "{node}");
-                }
+        let mut nodes = Vec::new();
+        historical_nodes(plan, &mut nodes);
+        for table in ["venue_orders", "order_intents"] {
+            assert_eq!(
+                nodes.iter().filter(|node| node["Relation Name"] == table).count(),
+                1,
+                "EXPLAIN must retain one exact {table} probe"
+            );
+        }
+        for node in nodes {
+            let loops = node["Actual Loops"].as_u64().expect("native loop count");
+            let rows = node["Actual Rows"].as_u64().expect("native row count");
+            assert!(loops <= 1 && rows <= 1, "{node}");
+            let removed = explain_rows(node, "Rows Removed by Filter")
+                + explain_rows(node, "Rows Removed by Index Recheck");
+            if closed >= 512 && loops != 0 {
+                assert_ne!(node["Node Type"], "Seq Scan", "{node}");
+                assert_eq!(removed, 0, "{node}");
+            } else if closed == 2 {
+                // At this size the default planner may scan the entire test
+                // relation: two closed orders, one stop, and its one extra J entry.
+                let fixture_rows = if node["Relation Name"] == "order_intents" {
+                    intent_rows
+                } else {
+                    venue_rows
+                };
+                assert!(rows + removed <= u64::try_from(fixture_rows).unwrap(), "{node}");
             }
         }
     }
