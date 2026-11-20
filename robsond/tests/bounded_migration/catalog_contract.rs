@@ -21,6 +21,26 @@ pub(super) fn source_hash() -> Result<String> {
     ensure!(actual == CHECKSUM, "original source checksum drift");
     Ok(actual)
 }
+/// Run ORIGINAL as the reference inside the caller's open transaction. The
+/// fixture's sentinel statement_timeout must not bound this oracle, so it is
+/// lifted transaction-locally and restored before the caller's capture.
+pub(super) async fn run_original(c: &mut sqlx::PgConnection) -> Result<()> {
+    let statement: String = sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+        .persistent(false)
+        .fetch_one(&mut *c)
+        .await?;
+    sqlx::query("SELECT set_config('statement_timeout','0',true)")
+        .persistent(false)
+        .execute(&mut *c)
+        .await?;
+    sqlx::raw_sql(ORIGINAL).execute(&mut *c).await?;
+    sqlx::query("SELECT set_config('statement_timeout',$1,true)")
+        .bind(&statement)
+        .persistent(false)
+        .execute(&mut *c)
+        .await?;
+    Ok(())
+}
 #[path = "catalog_contract_data.rs"]
 mod data;
 use data::{KEYS, SPECS};

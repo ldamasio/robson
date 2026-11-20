@@ -138,9 +138,9 @@ async fn finish(
     let deadline = tokio::time::Instant::now() + ACQUIRE_BOUND;
     let status = adapter.status();
     drop(adapter); // Also discards a queued reference ROLLBACK on failure.
-    let retirement = tokio::time::timeout(Duration::from_millis(300), async {
+    let retirement = tokio::time::timeout(NATIVE_RETIREMENT, async {
         let pid = pid.context("backend PID unavailable; no retirement proof")?;
-        for _ in 0..60 {
+        for _ in 0..NATIVE_RETIREMENT_POLLS {
             if !helpers::alive(&mut observer, pid).await? {
                 return Ok::<_, anyhow::Error>(true);
             }
@@ -214,7 +214,7 @@ async fn actual52_catalog_matches_rolled_back_original_do(pool: PgPool) -> Resul
         ).fetch_one(c).await?)
     }).await.context("actor GUC/PID deadline").and_then(|r| r.map_err(anyhow::Error::from));
     let pid = configured.as_ref().ok().map(|v| v.0);
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         if let Some(error) = legacy_error { return Err(error.context("initial legacy snapshot failed")); }
         let (pid, lock, statement, idle) = configured?;
         ensure!((lock.as_str(), statement.as_str(), idle.as_str()) == ("310ms", "410ms", "510ms"), "reference setup GUC mismatch");
@@ -224,7 +224,7 @@ async fn actual52_catalog_matches_rolled_back_original_do(pool: PgPool) -> Resul
         // No candidate chunks/ranges/helper are used for the reference.
         let reference = {
             let mut transaction = adapter.connection()?.begin().await?;
-            sqlx::raw_sql(contract::ORIGINAL).execute(&mut *transaction).await?;
+            contract::run_original(&mut transaction).await?;
             let reference = capture(&mut transaction, "R").await?;
             transaction.rollback().await?;
             reference
@@ -246,7 +246,7 @@ async fn actual52_catalog_matches_rolled_back_original_do(pool: PgPool) -> Resul
         let duration = started.elapsed();
         eprintln!("CATALOG_PRIMARY apply_ok={} duration={duration:?}", applied.is_ok());
         applied?;
-        ensure!(duration < APPLY_BOUND, "candidate global200 exceeded");
+        ensure!(duration < APPLY_BOUND, "candidate global APPLY_BOUND exceeded");
         ensure!(adapter.status().phase == Phase::Restored && adapter.status().failure.is_none(), "candidate not restored");
         let candidate = capture(adapter.connection()?, "C").await?;
         contract::declared(&candidate)?;

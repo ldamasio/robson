@@ -75,7 +75,7 @@ pub(super) async fn apply(
     point!(Stage::Commit, Edge::AfterReturn);
     point!(Stage::Elapsed, Edge::BeforeCall);
     // Preserve pinned SQLx's elapsed metadata representation; the absolute
-    // 200ms owner bound is independent of this debugging/lineage field.
+    // 15s owner bound is independent of this debugging/lineage field.
     #[allow(clippy::cast_possible_truncation)]
     let nanos = elapsed.as_nanos() as i64;
     sqlx::query(ELAPSED)

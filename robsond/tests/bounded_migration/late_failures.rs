@@ -126,7 +126,7 @@ async fn exercise(f: &mut Fixture, fault: Fault, oracle: &mut Oracle) -> Result<
         (result, started.elapsed())
     };
     let ((result, duration), observed) =
-        tokio::join!(producer, tokio::time::timeout(Duration::from_millis(300), controller));
+        tokio::join!(producer, tokio::time::timeout(CONTROLLER_CEILING, controller));
     let joined = started.elapsed();
     let status = f.adapter.status();
     let stats = f.proxy.stats();
@@ -155,7 +155,7 @@ async fn exercise(f: &mut Fixture, fault: Fault, oracle: &mut Oracle) -> Result<
     });
     ensure!(
         duration < APPLY_BOUND,
-        "required real-fault apply return exceeded controlled200ms"
+        "required real-fault apply return exceeded controlled APPLY_BOUND"
     );
     match fault {
         Fault::RestoreSever => ensure!(
@@ -228,7 +228,7 @@ async fn exercise(f: &mut Fixture, fault: Fault, oracle: &mut Oracle) -> Result<
 async fn run(pool: PgPool, fault: Fault) -> Result<()> {
     let mut f = Fixture::new(&pool).await?;
     let mut oracle = None;
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         oracle = Some(prepare(&mut f, fault).await?);
         let exercised = exercise(&mut f, fault, oracle.as_mut().context("oracle missing")?).await;
         let post = post_fault(&mut f,oracle.as_mut().context("oracle missing")?,fault).await;

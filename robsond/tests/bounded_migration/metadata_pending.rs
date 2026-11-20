@@ -67,6 +67,7 @@ async fn cancel_in_io(f: &mut Fixture, relation: i64, blocker: i32) -> Result<()
                 ensure!(clear, "an app gate remained armed before metadata I/O");
                 let released = Instant::now();
                 current.1.send(()).map_err(|_| anyhow::anyhow!("metadata release lost"))?;
+                // 20 ms observation window, kept strictly inside lock_timeout (200ms).
                 let deadline = tokio::time::Instant::from_std(released) + Duration::from_millis(20);
                 return tokio::time::timeout_at(deadline, async {
                     for polls in 1..=4 {
@@ -88,7 +89,7 @@ async fn cancel_in_io(f: &mut Fixture, relation: i64, blocker: i32) -> Result<()
                     anyhow::bail!("actual metadata lock wait not observed")
                 })
                 .await
-                .context("metadata lock20 observation window expired")?;
+                .context("metadata 20ms lock observation window expired")?;
             }
         }
         anyhow::bail!("metadata gate not reached")
@@ -109,7 +110,7 @@ async fn cancel_in_io(f: &mut Fixture, relation: i64, blocker: i32) -> Result<()
                 std::task::Poll::Ready(match std::future::Future::poll(original.as_mut(), cx) {
                     std::task::Poll::Pending => Ok(true),
                     std::task::Poll::Ready(Err(error)) => {
-                        Err(anyhow::Error::from(error).context("lock20 won before Pending probe"))
+                        Err(anyhow::Error::from(error).context("lock timer won before Pending"))
                     },
                     std::task::Poll::Ready(Ok(_)) => {
                         Err(anyhow::anyhow!("metadata returned instead of Pending"))
@@ -135,9 +136,9 @@ async fn cancel_in_io(f: &mut Fixture, relation: i64, blocker: i32) -> Result<()
     ensure!(probe?, "original was not Pending after all app gates cleared");
     ensure!(
         dropped_at.duration_since(witness.released) < Duration::from_millis(20),
-        "lock20 window won; no before-timeout cancellation claim"
+        "20ms window inside lock_timeout missed; no before-timeout cancellation claim"
     );
-    ensure!(started.elapsed() < APPLY_BOUND, "global200 won before lockwait cancellation");
+    ensure!(started.elapsed() < APPLY_BOUND, "APPLY_BOUND won before lockwait cancellation");
     let clear = {
         let guard = slot.lock().map_err(|_| anyhow::anyhow!("gate poisoned"))?;
         guard.is_none()
@@ -209,8 +210,8 @@ async fn finish_both(
     // The original Box is already gone. No graceful close or queued ROLLBACK.
     drop(adapter);
     drop(blocker); // Releases fixture SHARE only AFTER the original owner drop.
-    let retired = tokio::time::timeout(Duration::from_millis(300), async {
-        for _ in 0..60 {
+    let retired = tokio::time::timeout(NATIVE_RETIREMENT, async {
+        for _ in 0..NATIVE_RETIREMENT_POLLS {
             let gone: bool = sqlx::query_scalar(GONE)
                 .bind(pid)
                 .bind(blocker_pid)
@@ -272,7 +273,7 @@ async fn actual52_metadata_lock_wait_cancel_preserves_full_baseline(pool: PgPool
     let mut blocker = None;
     let mut blocker_pid = None;
     let mut baseline = None;
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         let old = f.proxy.stats();
         f.adapter.lock().await?;
         ensure!(f.proxy.stats().statements - old.statements == 2, "original advisory setup inventory");

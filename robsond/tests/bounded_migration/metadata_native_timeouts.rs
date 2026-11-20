@@ -1,9 +1,11 @@
-//! Native server40/20 on the ORIGINAL metadata await, no client fault timer.
+//! Native server statement 1s / lock 200ms timers on the ORIGINAL metadata
+//! await, no client fault timer. The test trigger sleeps 2s, twice the 1s
+//! statement_timeout (the same 2x margin as the former 80ms/40ms).
 use super::*;
 
 const IDENTITY: &str = "SELECT jsonb_build_object('backend',(SELECT backend_start::text FROM pg_stat_activity WHERE pid=$1),'metadata','public._sqlx_migrations'::regclass::oid::bigint,'venue','public.venue_orders'::regclass::oid::bigint,'clock','public.spot_intent_clock'::regclass::oid::bigint)";
 const OBSERVE: &str = "SELECT EXISTS(SELECT 1 FROM pg_stat_activity a WHERE a.pid=$1 AND a.backend_start::text=$2 AND a.state='active' AND EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND relation::bigint=$5 AND mode='AccessExclusiveLock' AND granted) AND EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND relation::bigint=$6 AND mode='AccessExclusiveLock' AND granted) AND (($4::integer IS NULL AND a.wait_event_type='Timeout' AND a.wait_event='PgSleep' AND EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND relation::bigint=$3 AND mode='RowExclusiveLock' AND granted)) OR ($4::integer IS NOT NULL AND a.wait_event_type='Lock' AND $4=ANY(pg_blocking_pids(a.pid)) AND EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND relation::bigint=$3 AND mode='RowExclusiveLock' AND NOT granted))))";
-const SLEEP_FUNCTION: &str = "CREATE FUNCTION public.test_metadata_statement40() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.version=20240101000038 THEN PERFORM pg_sleep(0.080); END IF; RETURN NEW; END $$";
+const SLEEP_FUNCTION: &str = "CREATE FUNCTION public.test_metadata_statement40() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.version=20240101000038 THEN PERFORM pg_sleep(2.0); END IF; RETURN NEW; END $$";
 const SLEEP_TRIGGER: &str = "CREATE TRIGGER test_metadata_statement40 BEFORE INSERT ON public._sqlx_migrations FOR EACH ROW EXECUTE FUNCTION public.test_metadata_statement40()";
 
 #[derive(Clone, Copy, Debug)]
@@ -141,7 +143,7 @@ async fn measure(f: &mut Fixture, id: &Value, blocker: Option<i32>, timer: Timer
         cause(&apply), cause(&observed), stats.statements - baseline.statements, stats.commits - baseline.commits);
     let witness = observed?;
     ensure!(actual.as_deref() == Some(timer.state()), "native timer wrong actual SQLSTATE");
-    ensure!(elapsed < APPLY_BOUND, "global200 masked native timer");
+    ensure!(elapsed < APPLY_BOUND, "global APPLY_BOUND masked native timer");
     ensure!(
         status.phase == Phase::Retired
             && status.failure
@@ -194,7 +196,7 @@ async fn measure(f: &mut Fixture, id: &Value, blocker: Option<i32>, timer: Timer
 async fn run(pool: PgPool, timer: Timer) -> Result<()> {
     let mut f = Fixture::new(&pool).await?;
     let (mut blocker, mut blocker_pid, mut baseline) = (None, None, None);
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         // Test-owned schema is in B0; it is not part of original38's DDL.
         if matches!(timer, Timer::Statement40) {
             sqlx::query(SLEEP_FUNCTION).persistent(false).execute(&mut f.observer).await?;
@@ -236,7 +238,7 @@ async fn run(pool: PgPool, timer: Timer) -> Result<()> {
         eprintln!("NATIVE_TIMER_SETUP timer={timer:?} advisorySQL=2 prepareQE=0 parameters=3 cache=1 observerSetup=4 triggerSQL={} blockerSQL={}",
             usize::from(matches!(timer, Timer::Statement40)) * 2, usize::from(blocker_pid.is_some()) * 3);
         measure(&mut f, &id, blocker_pid, timer).await
-    }).await.context("native timer primary5s deadline").and_then(|r| r);
+    }).await.context("native timer primary deadline").and_then(|r| r);
     let before = f.proxy.stats();
     let cleanup = match timer {
         Timer::Statement40 => super::super::finish(f, baseline.as_ref(), before).await,

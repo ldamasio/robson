@@ -35,8 +35,8 @@ async fn finish(f: Fixture, baseline: Option<&Value>, before_cleanup: ProxyStats
     } = f;
     let deadline = tokio::time::Instant::now() + ACQUIRE_BOUND;
     drop(adapter);
-    let retirement = tokio::time::timeout(Duration::from_millis(300), async {
-        for _ in 0..60 {
+    let retirement = tokio::time::timeout(NATIVE_RETIREMENT, async {
+        for _ in 0..NATIVE_RETIREMENT_POLLS {
             if !alive(&mut observer, pid).await? {
                 return Ok::<_, sqlx::Error>(true);
             }
@@ -100,7 +100,7 @@ async fn finish(f: Fixture, baseline: Option<&Value>, before_cleanup: ProxyStats
 async fn run_cut(pool: PgPool, cut: Cut) -> Result<()> {
     let mut f = Fixture::new(&pool).await?;
     let mut baseline = None;
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         // Existing SQLx public lock includes current_database and lock: setup,
         // outside the measured apply prefix; never copy its key-generation algorithm.
         let setup = f.proxy.stats();
@@ -133,7 +133,7 @@ async fn run_cut(pool: PgPool, cut: Cut) -> Result<()> {
 async fn actual52_drop_unpolled_apply_preserves_owner(pool: PgPool) -> Result<()> {
     let mut f = Fixture::new(&pool).await?;
     let mut baseline = None;
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         let setup = f.proxy.stats();
         f.adapter.lock().await?;
         ensure!(f.proxy.stats().statements - setup.statements == 2,

@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use sqlx::{migrate::MigrationType, PgPool};
 
@@ -46,10 +46,10 @@ async fn actual52_restores_same_session_and_preserves_legacy(pool: PgPool) {
         run.as_ref().map(|(applied, _, producer_duration)| (applied, producer_duration))
     );
     let (applied, windows, _producer_duration) = run.expect("initial private stage fixture setup");
-    applied.expect("actual original52 must complete under the production200ms bound");
+    applied.expect("actual original52 must complete under the production APPLY_BOUND");
     let finished = finished.expect("cleanup/observation after original producer result");
     assert!(finished.retired, "actual52_backend_not_retired");
-    assert!(duration < Duration::from_millis(200), "actual52_global200");
+    assert!(duration < APPLY_BOUND, "actual52_global_apply_bound");
     assert_eq!(statements, 58, "actual52_apply_inventory");
     assert_eq!(status.phase, Phase::Restored);
     assert_eq!(status.failure, None);

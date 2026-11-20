@@ -13,7 +13,7 @@ async fn actual52_postcommit_original_advisory_holder_forces_public_waiter5s(
     let mut waiter_pid = None;
     let mut applied_baseline = None;
     let primary = async {
-        let (holder_start, waiter_start) = tokio::time::timeout(ACQUIRE_BOUND, async {
+        let (holder_start, waiter_start) = tokio::time::timeout(APPLY_FIXTURE, async {
             f.adapter.lock().await?;
             f.proxy.enable_query_trace(32);
             f.baseline = f.proxy.stats();
@@ -32,7 +32,7 @@ async fn actual52_postcommit_original_advisory_holder_forces_public_waiter5s(
             f.proxy.enable_query_trace(32);
             f.baseline = f.proxy.stats();
             Ok::<_, anyhow::Error>((holder_start, waiter_start))
-        }).await.context("advisory setup5s (separate from real acquisition5s)")??;
+        }).await.context("advisory setup ceiling (separate from real acquisition5s)")??;
         let w = waiter.as_mut().context("waiter missing after setup")?;
         let wp = waiter_pid.context("waiter PID absent")?;
         let proxy = &f.proxy;

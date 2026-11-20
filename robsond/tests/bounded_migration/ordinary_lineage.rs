@@ -93,8 +93,8 @@ async fn finish(
     } = f;
     let end = tokio::time::Instant::now() + ACQUIRE_BOUND;
     drop(adapter); // Upstream early lineage refusal does NOT poison the adapter.
-    let retired = tokio::time::timeout(Duration::from_millis(300), async {
-        for _ in 0..60 {
+    let retired = tokio::time::timeout(NATIVE_RETIREMENT, async {
+        for _ in 0..NATIVE_RETIREMENT_POLLS {
             let gone: bool = sqlx::query_scalar(GONE).bind(pid).fetch_one(&mut observer).await?;
             if gone {
                 return Ok::<_, sqlx::Error>(true);
@@ -104,7 +104,7 @@ async fn finish(
         Ok(false)
     })
     .await
-    .context("P9 original raw retirement300ms")
+    .context("P9 original raw retirement window")
     .and_then(|r| r.map_err(Into::into));
     let after = proxy.stats();
     let dropped = proxy.query_trace_dropped();
@@ -183,7 +183,7 @@ async fn finish(
 async fn run(pool: PgPool, kind: Kind) -> Result<()> {
     let mut f = Fixture::new(&pool).await?;
     let mut baseline = None;
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         initial::original38(&mut f).await?;
         sqlx::query(CREATE_WITNESS).execute(&mut f.observer).await?;
         // Deliberate TEST-ONLY isolated database faults; never a repair path.
@@ -280,7 +280,7 @@ async fn run(pool: PgPool, kind: Kind) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     })
     .await
-    .context("P9 fixture5s")
+    .context("P9 fixture ceiling")
     .and_then(|r| r);
     let before = f.proxy.stats();
     let cleanup = finish(f, baseline.as_ref(), kind, before).await;

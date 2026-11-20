@@ -1,4 +1,4 @@
-//! Real original global200 firing; scheduled gaps are never server idleTX.
+//! Real original APPLY_BOUND firing; scheduled gaps are never server idleTX.
 use super::*;
 
 #[sqlx::test(migrations = false)]
@@ -8,10 +8,10 @@ async fn actual52_global200_blackhole_before_install_retires_without_server_work
 ) -> Result<()> {
     let mut f = Fixture::new(&pool).await?;
     let mut baseline = None;
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         f.adapter.lock().await?;
         let p = profile(f.adapter.connection()?).await?;
-        ensure!(p.0 == f.pid && p.4.as_deref().is_none_or(|v| v == "0"), "outsideTX server idle limit could mask200");
+        ensure!(p.0 == f.pid && p.4.as_deref().is_none_or(|v| v == "0"), "outsideTX server idle limit could mask APPLY_BOUND");
         let start = backend(&mut f).await?;
         ensure!(outside(&mut f.observer, f.pid, &start).await?, "initial owner not idle outsideTX/advisory");
         baseline = Some(capture(&mut f.observer, "B0").await?);
@@ -26,10 +26,10 @@ async fn actual52_global200_blackhole_before_install_retires_without_server_work
         let (result, upper, ended) = {
             let mut original = f.adapter.apply(migration());
             let mut controller = Box::pin(async {
-                hit.await.map_err(|_| anyhow::anyhow!("global200 BeforeInstall absent"))?;
+                hit.await.map_err(|_| anyhow::anyhow!("global APPLY_BOUND BeforeInstall absent"))?;
                 let upper = Instant::now();
-                release.send(()).map_err(|_| anyhow::anyhow!("global200 Install release lost"))?;
-                ensure!(outside(observer, pid, &start).await?, "global200 server enteredTX/businesslocks");
+                release.send(()).map_err(|_| anyhow::anyhow!("global APPLY_BOUND Install release lost"))?;
+                ensure!(outside(observer, pid, &start).await?, "global APPLY_BOUND server enteredTX/businesslocks");
                 Ok::<_, anyhow::Error>(upper)
             });
             let (early, seen) = tokio::select! {
@@ -37,11 +37,11 @@ async fn actual52_global200_blackhole_before_install_retires_without_server_work
                 s = &mut controller => (None, Some(s)),
             };
             drop(controller);
-            let upper = seen.context("global200 returned before released native witness")??;
-            ensure!(early.is_none() && slot.lock().map_err(|_| anyhow::anyhow!("gate poisoned"))?.is_none(), "global200 appgate/early return");
+            let upper = seen.context("global APPLY_BOUND returned before released native witness")??;
+            ensure!(early.is_none() && slot.lock().map_err(|_| anyhow::anyhow!("gate poisoned"))?.is_none(), "global APPLY_BOUND appgate/early return");
             let probe = std::future::poll_fn(|cx| std::task::Poll::Ready(match std::future::Future::poll(original.as_mut(), cx) {
                 std::task::Poll::Pending => Ok(()),
-                std::task::Poll::Ready(_) => Err(anyhow::anyhow!("global200 genuine I/O Pending absent")),
+                std::task::Poll::Ready(_) => Err(anyhow::anyhow!("global APPLY_BOUND genuine I/O Pending absent")),
             })).await;
             probe?;
             let r = (&mut original).await.map_err(anyhow::Error::from);
@@ -57,11 +57,11 @@ async fn actual52_global200_blackhole_before_install_retires_without_server_work
             cause(&result), ended.duration_since(began), upper.duration_since(began),
             ended.saturating_duration_since(upper + APPLY_BOUND), ended.saturating_duration_since(began + APPLY_BOUND));
         ensure!(deadline(&result, "migration38 whole-apply deadline exceeded") && ended.duration_since(began) >= APPLY_BOUND,
-            "global200 original timeout did not fire");
+            "global APPLY_BOUND original timeout did not fire");
         ensure!(status == (Status { phase: Phase::Retired, failure: Some(Failure { at: Phase::SetupStarted, outcome: Outcome::ApplyNotStarted }) })
-            && refused && proxy.stats() == stats && stats == f.baseline, "global200 work/reuse/39/outcome");
+            && refused && proxy.stats() == stats && stats == f.baseline, "global APPLY_BOUND work/reuse/39/outcome");
         Ok::<_, anyhow::Error>(())
-    }).await.context("global200 fixture5s").and_then(|r| r);
+    }).await.context("global fixture ceiling").and_then(|r| r);
     let before = f.proxy.stats();
     let cleanup = super::super::super::finish(f, baseline.as_ref(), before).await;
     eprintln!("GLOBAL200_IO_CLEANUP primary={} cleanup={}", cause(&primary), cause(&cleanup));
@@ -70,9 +70,13 @@ async fn actual52_global200_blackhole_before_install_retires_without_server_work
     Ok(())
 }
 
-// One shared 200 ms budget must expire within this measured excess after its
-// preflight bracket; per-stage renewed budgets end about 100 ms later.
+// One shared APPLY_BOUND budget must expire within this measured excess after
+// its preflight bracket; a budget renewed per stage would never expire, since
+// every scheduled gap stays below APPLY_BOUND.
 const CUMULATIVE_EXCESS_BOUND: Duration = Duration::from_millis(50);
+// Each outside-TX gap is 45% of APPLY_BOUND (formerly 90 ms of 200 ms): two
+// gaps stay below one bound, three exceed it (6.75 s of 15 s).
+const OUTSIDE_TX_GAP: Duration = Duration::from_millis(APPLY_BOUND.as_millis() as u64 * 9 / 20);
 
 #[sqlx::test(migrations = false)]
 #[ignore = "requires DATABASE_URL"]
@@ -85,12 +89,12 @@ async fn actual52_global200_is_cumulative_across_three_outside_tx_gaps(pool: PgP
     let mut windows = Vec::with_capacity(6);
     let mut committed_at_gate = false;
     let mut landed_outcome = None;
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         f.adapter.lock().await?;
         let start = backend(&mut f).await?;
         ensure!(outside(&mut f.observer, f.pid, &start).await?, "cumulative initial owner not outsideTX/advisory");
         let p = profile(f.adapter.connection()?).await?;
-        ensure!(p.4.as_deref().is_none_or(|s| s == "0"), "cumulative idle_session timeout could mask200");
+        ensure!(p.4.as_deref().is_none_or(|s| s == "0"), "cumulative idle_session timeout could mask APPLY_BOUND");
         // DDL speed decides whether the shared deadline lands before or after
         // COMMIT; both are exact outcomes, so keep the full B0 for the former.
         unapplied_baseline = Some(capture(&mut f.observer, "B0").await?);
@@ -128,7 +132,7 @@ async fn actual52_global200_is_cumulative_across_three_outside_tx_gaps(pool: PgP
                         Some(stages::arm(&slot, points[n+1], if matches!(points[n+1],Stage::Ddl(_)) { Edge::AfterReturn } else { Edge::BeforeCall })?)
                     } else { None };
                     if matches!(stage, Stage::Install | Stage::Elapsed | Stage::Restore) {
-                        tokio::time::sleep(Duration::from_millis(90)).await;
+                        tokio::time::sleep(OUTSIDE_TX_GAP).await;
                         completed_delays += 1;
                     }
                     current.1.send(()).map_err(|_| anyhow::anyhow!("cumulative release lost"))?;
@@ -151,8 +155,8 @@ async fn actual52_global200_is_cumulative_across_three_outside_tx_gaps(pool: PgP
         // resolution. A flushed COMMIT may still be unread by the proxy here.
         eprintln!("GLOBAL200_CUMULATIVE_RETURN actual_apply_return={:?} original_global200_error={} elapsed_seen={committed} gate_verified={committed_at_gate}",ended.duration_since(began),deadline(&result,"migration38 whole-apply deadline exceeded"));
         ensure!(status.phase == Phase::Retired, "cumulative owner not retired");
-        let gone = tokio::time::timeout(Duration::from_millis(300), async {
-            for _ in 0..60 {
+        let gone = tokio::time::timeout(NATIVE_RETIREMENT, async {
+            for _ in 0..NATIVE_RETIREMENT_POLLS {
                 let native_gone = sqlx::query_scalar::<_, bool>("SELECT NOT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1) AND NOT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1)")
                     .bind(pid).fetch_one(&mut *observer).await?;
                 if native_gone && proxy.closed_relays() == baseline.connections {
@@ -161,7 +165,7 @@ async fn actual52_global200_is_cumulative_across_three_outside_tx_gaps(pool: PgP
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Ok(false)
-        }).await.context("cumulative native/proxy retirement300ms")??;
+        }).await.context("cumulative native/proxy retirement window")??;
         ensure!(gone && baseline.connections > 0, "cumulative native/proxy retirement absent");
         // Only native catalog evidence behind the public advisory barrier
         // decides durability and cleanup. Sent COMMIT is not committed SQL.
@@ -216,9 +220,9 @@ async fn actual52_global200_is_cumulative_across_three_outside_tx_gaps(pool: PgP
             && (n < 55 || sql[54] == public_apply::metadata_insert_sql_for_tests().trim())
             && if committed { sql[55] == "COMMIT" && (n == 56 || sql[56] == elapsed_sql) } else if commit_sent { n == 56 && sql[55] == "COMMIT" } else { n <= 55 }, "cumulative fixed52/metadata/source order");
         eprintln!("GLOBAL200_CUMULATIVE cause={} elapsed={:?} preflight_hit_bracket={bracket:?} excess_lower={:?} excess_upper={:?} planned90=3 completed90={completed_delays} hits={hits:?} status={status:?}", cause(&result), ended.duration_since(began), ended.saturating_duration_since(began + bracket + APPLY_BOUND), ended.saturating_duration_since(began + APPLY_BOUND));
-        ensure!(ended.saturating_duration_since(began + bracket + APPLY_BOUND) <= CUMULATIVE_EXCESS_BOUND, "global200 cumulative deadline later than one shared budget");
+        ensure!(ended.saturating_duration_since(began + bracket + APPLY_BOUND) <= CUMULATIVE_EXCESS_BOUND, "global APPLY_BOUND cumulative deadline later than one shared budget");
         ensure!(deadline(&result, "migration38 whole-apply deadline exceeded") && (1..3).contains(&completed_delays)
-            && hits.iter().any(|h| h.0 == Stage::Install), "global200 reset/cumulative witness absent");
+            && hits.iter().any(|h| h.0 == Stage::Install), "global APPLY_BOUND reset/cumulative witness absent");
         let statements = stats.statements - f.baseline.statements;
         ensure!(refused && f.proxy.stats() == stats && stats.commits - f.baseline.commits == u64::from(committed || commit_sent)
             && if committed { (56..=57).contains(&statements) } else if commit_sent { statements == 56 } else { (2..=55).contains(&statements) }, "cumulative laterSQL/39/COMMIT/prefix");
@@ -226,7 +230,7 @@ async fn actual52_global200_is_cumulative_across_three_outside_tx_gaps(pool: PgP
         ensure!(status == (Status { phase: Phase::Retired, failure: Some(expected_failure) }), "cumulative conservative exact outcome");
         eprintln!("GLOBAL200_CUMULATIVE_UNCERTAIN_COMMIT landed={landed} elapsed_seen={committed}");
         Ok::<_, anyhow::Error>(())
-    }).await.context("cumulative fixture5s").and_then(|r| r);
+    }).await.context("cumulative fixture ceiling").and_then(|r| r);
     let before = f.proxy.stats();
     let cleanup: Result<()> = match landed_outcome {
         Some(true) => finish_applied(f, None, None, applied_baseline.as_ref(), before).await,

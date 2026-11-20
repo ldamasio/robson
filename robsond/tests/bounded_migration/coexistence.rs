@@ -120,7 +120,7 @@ async fn contend(
                 };
                 let seen = tokio::select! {
                     result = &mut job => { early = Some(result); anyhow::bail!("journal returned before native wait"); },
-                    result = tokio::time::timeout(Duration::from_millis(20), wait) => result.context("coexistence idle20 window")??,
+                    result = tokio::time::timeout(Duration::from_millis(20), wait) => result.context("coexistence 20ms window inside idle 1s")??,
                 };
                 return Ok::<_, anyhow::Error>((windows, current.1, seen));
             }
@@ -255,7 +255,7 @@ async fn run(pool: PgPool, work: Work) -> Result<()> {
     let mut baseline = None;
     let mut old_rows = None;
     let mut owned_pids = vec![f.pid];
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         // Second INSTANCE of the unchanged proxy isolates actual journal wire counts.
         let supplied = pool.connect_options();
         let upstream = tokio::net::lookup_host((supplied.get_host(), supplied.get_port())).await?
@@ -317,7 +317,7 @@ async fn run(pool: PgPool, work: Work) -> Result<()> {
         contend(&mut f, jp, work, job, &warm, &actor_backend, relation).await?;
         ensure!(j.gate().generation() == generation && j.latch_set() == latch, "coexistence introduced a journal failure/latch");
         Ok::<_, anyhow::Error>(())
-    }).await.context("coexistence primary5s ceiling").and_then(|v| v);
+    }).await.context("coexistence primary ceiling").and_then(|v| v);
     let expected_intent = intent.as_ref().map(|i| i.intent_id());
     drop(intent);
     drop(operation);

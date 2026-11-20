@@ -43,7 +43,7 @@ async fn run_generated(pool: PgPool, index: usize) -> Result<()> {
     let mut reconnecting = false;
     let lost_reply = s.rounds.iter().any(|r| matches!(r, Round::LostReply));
     let label = 0x9e00_0000_u64 + index as u64;
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         let f = active.as_mut().context("property fixture absent")?;
         let mut oracle = native::prepare_with(f, s.deferred_fixture, lost_reply).await?;
         let mut model = Model::Unapplied;
@@ -85,7 +85,7 @@ async fn run_generated(pool: PgPool, index: usize) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     })
     .await
-    .context("generated property primary5s")
+    .context("generated property primary ceiling")
     .and_then(|r| r);
     let end = tokio::time::Instant::now() + ACQUIRE_BOUND;
     let interrupted = match retiring.take() {
@@ -95,11 +95,11 @@ async fn run_generated(pool: PgPool, index: usize) -> Result<()> {
         )),
         Some(pid) => tokio::time::timeout_at(end, async {
             let mut c = pool.acquire().await?.detach();
-            for n in 1..=60 {
+            for n in 1..=NATIVE_RETIREMENT_POLLS {
                 if sqlx::query_scalar::<_, bool>(native::GONE).bind(pid).fetch_one(&mut c).await? {
                     return Ok::<_, anyhow::Error>(());
                 }
-                if n < 60 {
+                if n < NATIVE_RETIREMENT_POLLS {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             }
