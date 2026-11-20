@@ -64,6 +64,13 @@ async fn journal(
 }
 
 async fn generation(pool: &PgPool, f: &Fixture) -> Result<JournalGeneration> {
+    Ok(generation_and_start(pool, f).await?.0)
+}
+
+async fn generation_and_start(
+    pool: &PgPool,
+    f: &Fixture,
+) -> Result<(JournalGeneration, process_epoch::EpochStart)> {
     let process = process_epoch::start_epoch(pool, f.tenant, "native-order-projection").await?;
     let binding = JournalGeneration {
         tenant_id: f.tenant,
@@ -86,7 +93,7 @@ async fn generation(pool: &PgPool, f: &Fixture) -> Result<JournalGeneration> {
         .fetch_one(pool)
         .await?;
     ensure!(receipt == binding.generation_id);
-    Ok(binding)
+    Ok((binding, process))
 }
 
 fn linked(f: &Fixture, order: u64, intent: Uuid) -> OrderLink {
@@ -556,6 +563,126 @@ async fn projected_native_order_commit_coordinate_only_follows_confirmed_commit(
     ensure!(landed == (1, Some(exits[1])));
     exact_reference(&pool, &b).await?;
     eprintln!("C8_COMMIT_COORDINATE confirmed=1 observed_execution=0.25 changed_sql=9 replay_sql=1 lost_ack_sql=8 lost_ack_coordinate=0");
+    Ok(())
+}
+
+#[cfg(feature = "crash-points")]
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_native_order_pending_ack_preserves_newer_execution(pool: PgPool) -> Result<()> {
+    use std::{sync::Arc, time::Duration};
+
+    use robson_exec::{
+        gate::{EpochView, PendingExecutionEvidence},
+        order_journal::OrderJournal,
+        venue_clock::NativeClock,
+    };
+    use robson_testkit::db_proxy::ProxyMode;
+    use tokio::sync::oneshot;
+
+    use crate::order_journal_store::PgJournalBackend;
+    use super::pending_execution::OrderExecutionReceiver;
+
+    let f = setup(&pool).await?;
+    let intent = Uuid::now_v7();
+    journal(&pool, &f, intent, "order-1", "exit", Some(f.position), None, false).await?;
+    let (binding, start) = generation_and_start(&pool, &f).await?;
+    let (proxy, proxied) = support::through_proxy(&pool, 1).await;
+    let ledger = f.ledger(&proxied).with_native_order_set_projection(binding.clone());
+    let link = linked(&f, 1, intent);
+    let initial = f.record(1, Decimal::ZERO, OrderPhase::Live);
+    write(&pool, &ledger, &binding, &initial, &link, seen()).await?;
+    let initial_version = version(&pool, &binding).await?;
+    let journal = OrderJournal::new(
+        Arc::new(PgJournalBackend::new(&pool, f.tenant)), &link.venue,
+    );
+    let gate = journal.gate();
+    gate.begin_epoch(
+        EpochView {
+            epoch_seq: start.epoch.epoch_seq,
+            unclean_reason: start.predecessor.unclean_reason(),
+        },
+        start.unclean_generation,
+        start.open_incidents,
+    );
+    let receiver = OrderExecutionReceiver::bind(gate, &ledger, f.key(1), link)?;
+    let clock = NativeClock::initialize()?;
+    let sample = Uuid::now_v7();
+    let observe = |executed| -> Result<PendingExecutionEvidence> {
+        let send = clock.wall_bracket(binding.process_epoch)?;
+        let receive = clock.wall_bracket(binding.process_epoch)?;
+        Ok(PendingExecutionEvidence { sample, send, receive, executed })
+    };
+    let readback = || async {
+        sqlx::query_as::<_, (Decimal, Uuid)>(
+            "SELECT executed_cum, intent_id FROM venue_orders
+             WHERE tenant_id=$1 AND venue_id='binance:spot' AND account_scope=$2
+               AND symbol=$3 AND exchange_order_id='1' AND owner='leg'",
+        ).bind(f.tenant).bind(&f.scope).bind(SYMBOL).fetch_one(&pool).await
+    };
+
+    let first = observe(Decimal::new(25, 2))?;
+    let work = receiver.register(f.record(1, first.executed, OrderPhase::Live), first)?;
+    ensure!(receiver.pending() == Some(first), "registered before any persistence await");
+
+    // Hold delivery in the application after a real COMMIT, with no
+    // transaction, database connection or operation gate lock kept by ACK.
+    let (ack_ready, committed) = oneshot::channel();
+    let (allow_ack, resume_ack) = oneshot::channel();
+    let complete_old = async {
+        let before = ledger.statements_total();
+        let ack = work.persist().await?.context("first changed commit receipt")?;
+        ensure!(ledger.statements_total() - before == 9);
+        ensure!(ack.accounting_version == initial_version + 1);
+        ack_ready.send(()).map_err(|_| anyhow::anyhow!("ACK controller missing"))?;
+        resume_ack.await?;
+        ensure!(!ack.apply(), "old proof cannot retire a newer observation");
+        Ok::<_, anyhow::Error>(())
+    };
+    let register_new = async {
+        committed.await?;
+        ensure!(readback().await? == (first.executed, intent));
+        let second = observe(Decimal::new(50, 2))?;
+        let work = receiver.register(f.record(1, second.executed, OrderPhase::Live), second)?;
+        ensure!(receiver.pending() == Some(second));
+        allow_ack.send(()).map_err(|_| anyhow::anyhow!("ACK waiter missing"))?;
+        Ok::<_, anyhow::Error>((second, work))
+    };
+    let (old, new) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(complete_old, register_new)
+    }).await?;
+    old?;
+    let (second, work) = new?;
+    ensure!(receiver.pending() == Some(second), "ACK1 preserves 0.50 and original marks");
+    ensure!(readback().await? == (first.executed, intent), "no early persistence of 0.50");
+
+    let before = ledger.statements_total();
+    let ack = work.persist().await?.context("newer changed commit receipt")?;
+    ensure!(ledger.statements_total() - before == 9);
+    ensure!(ack.accounting_version == initial_version + 2);
+    ensure!(readback().await? == (second.executed, intent));
+    ensure!(receiver.pending() == Some(second), "only applying the exact ACK retires it");
+    ensure!(ack.apply() && receiver.pending().is_none());
+
+    let same = observe(second.executed)?;
+    let before = ledger.statements_total();
+    let replay = receiver.register(f.record(1, same.executed, OrderPhase::Live), same)?;
+    ensure!(replay.persist().await?.is_none() && ledger.statements_total() - before == 1);
+    ensure!(receiver.pending() == Some(same), "no-op returned no proof and preserves pending");
+
+    let last = observe(Decimal::new(75, 2))?;
+    let unknown = receiver.register(f.record(1, last.executed, OrderPhase::Live), last)?;
+    let before = ledger.statements_total();
+    proxy.enable_exact_query_trace(16);
+    proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE venue_orders"));
+    ensure!(matches!(unknown.persist().await, Err(LedgerError::Uncertain(_))));
+    ensure!(ledger.statements_total() - before == 9 && proxy.stats().commit_acks_dropped == 1);
+    ensure!(receiver.pending() == Some(last), "lost native reply cannot clear pending");
+    ensure!(readback().await? == (last.executed, intent));
+    ensure!(version(&pool, &binding).await? == initial_version + 3);
+    exact_reference(&pool, &binding).await?;
+    ensure!(gate.fenced(), "this recovery proof does not open admissions");
+    eprintln!("C8_EXACT_PENDING_ACK previous=0.25 retained=0.50 cleared_by_exact_ack=1 no_op_retained=1 lost_ack_retained=0.75 changed_sql=9 replay_sql=1");
     Ok(())
 }
 
