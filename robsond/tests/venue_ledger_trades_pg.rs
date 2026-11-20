@@ -281,8 +281,9 @@ async fn a_duplicate_page_without_cursor_advance_writes_nothing(pool: PgPool) {
             .unwrap()
             .changed
     );
-    assert_eq!(proxy.stats().statements - wire, 1);
-    assert_eq!(ledger.statements_total() - count, 1);
+    // BEGIN, the server bounds, one read and ROLLBACK.
+    assert_eq!(proxy.stats().statements - wire, 4);
+    assert_eq!(ledger.statements_total() - count, 4);
     assert_eq!(snapshot(&pool).await, before);
     let recorded: chrono::DateTime<chrono::Utc> =
         sqlx::query_scalar("SELECT recorded_at FROM order_fills")
@@ -518,6 +519,39 @@ async fn a_touch_lock_wait_ends_at_the_server_bound_and_retires_raw(pool: PgPool
     assert!(trace[2].starts_with("UPDATE venue_orders SET last_checked_at"), "{trace:?}");
     assert_eq!(snapshot(&pool).await, before);
     ledger.touch_checked(&key, at() + chrono::Duration::seconds(1)).await.unwrap();
+}
+
+/// A duplicate page's pre-read runs under the server bounds: a table lock
+/// ends it at the lock timeout on the server, well before the client bound.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_trade_pre_read_lock_wait_ends_at_the_server_bound(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let key = f.seed_order(&pool, 1, Decimal::ZERO, OrderPhase::Live).await;
+    let ledger = f.ledger(&pool);
+    ledger.record_trades(&key, &page(1, dec!(1)), at()).await.unwrap();
+    let before = snapshot(&pool).await;
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE venue_orders IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        ledger.record_trades(&key, &page(1, dec!(1)), at()),
+    )
+    .await
+    .expect("record_trades exceeded its outer deadline");
+    let elapsed = started.elapsed();
+    held.rollback().await.unwrap();
+    assert!(
+        matches!(&result, Err(LedgerError::Backend(reason)) if reason.contains("lock timeout")),
+        "{result:?}"
+    );
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    assert_eq!(snapshot(&pool).await, before);
+    assert!(!ledger.record_trades(&key, &page(1, dec!(1)), at()).await.unwrap().changed);
 }
 
 #[sqlx::test(migrations = "../migrations")]

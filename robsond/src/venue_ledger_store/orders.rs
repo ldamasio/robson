@@ -37,8 +37,9 @@ pub(super) struct OrderContext {
 impl PgVenueLedger {
     /// Persist an actual venue order record, never an absence/unknown response
     /// or a placement's un-timed FULL fills. At most eight statements,
-    /// including the pre-read. A replay without new evidence is one read
-    /// and no bump.
+    /// including the pre-read, which already runs under the server bounds. A
+    /// replay without new evidence is BEGIN, the bounds, one read and
+    /// ROLLBACK, with no bump.
     pub async fn record_order(
         &self,
         record: &VenueOrderRecord,
@@ -51,15 +52,17 @@ impl PgVenueLedger {
             let position = match link.owner { OrderOwner::Leg {position_id,..} => Some(position_id), _ => None };
             let connection = self.pool.acquire().await.map_err(backend)?;
             let mut held = LedgerConnection::new(connection);
-            let before = self.read_order_context(held.connection(),&key,position,false).await?;
-            let proposed = merge_order(before.order.as_ref(),record,link,&seen,before.leg.as_ref())?;
-            if !proposed.changed {
-                held.finished=true;
-                return Ok(OrderWriteResult {changed:false,anomalies:proposed.anomalies});
-            }
             self.statement();
             let mut tx = held.connection().begin().await.map_err(backend)?;
             self.timeouts(&mut tx).await?;
+            let before = self.read_order_context(&mut tx,&key,position,false).await?;
+            let proposed = merge_order(before.order.as_ref(),record,link,&seen,before.leg.as_ref())?;
+            if !proposed.changed {
+                self.statement();
+                tx.rollback().await.map_err(backend)?;
+                held.finished=true;
+                return Ok(OrderWriteResult {changed:false,anomalies:proposed.anomalies});
+            }
             self.statement();
             let bumped=sqlx::query("UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id=$2")
                 .bind(self.tenant_id).bind(key.venue.as_str()).execute(&mut *tx).await.map_err(backend)?;

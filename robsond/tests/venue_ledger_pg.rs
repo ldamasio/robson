@@ -35,7 +35,8 @@ async fn order_and_contribution_are_atomic_and_replay_is_one_read(pool: PgPool) 
     let before = snapshot(&pool).await;
     let n = f.ledger.statements_total();
     assert!(!f.ledger.record_order(&r, &link, seen(99)).await.unwrap().changed);
-    assert_eq!(f.ledger.statements_total() - n, 1);
+    // BEGIN, the server bounds, one read and ROLLBACK.
+    assert_eq!(f.ledger.statements_total() - n, 4);
     assert_eq!(snapshot(&pool).await, before);
     r.executed_qty = Decimal::from(3);
     r.cumulative_quote_qty = Some(Decimal::from(300));
@@ -529,6 +530,38 @@ async fn first_clock_evidence_is_retained_even_when_later_audit_changes(pool: Pg
     assert!(after.contains(&terminal.clock.unwrap().sample_id.to_string()));
 }
 
+/// The replay's pre-read runs under the server bounds: a table lock ends it
+/// at the lock timeout on the server, well before the 2 s client bound.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn an_order_pre_read_lock_wait_ends_at_the_server_bound(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let link = f.link(LegOrderKind::Sell);
+    f.ledger.record_order(&record(), &link, seen(1)).await.unwrap();
+    let before = snapshot(&pool).await;
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE venue_orders IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let start = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        f.ledger.record_order(&record(), &link, seen(2)),
+    )
+    .await
+    .expect("record_order exceeded its outer deadline");
+    let elapsed = start.elapsed();
+    held.rollback().await.unwrap();
+    assert!(
+        matches!(&result, Err(LedgerError::Backend(reason)) if reason.contains("lock timeout")),
+        "{result:?}"
+    );
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    assert_eq!(snapshot(&pool).await, before);
+    assert!(!f.ledger.record_order(&record(), &link, seen(2)).await.unwrap().changed);
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn lost_commit_ack_is_uncertain_and_replay_does_not_bump(pool: PgPool) {
@@ -550,7 +583,7 @@ async fn lost_commit_ack_is_uncertain_and_replay_does_not_bump(pool: PgPool) {
     let before = snapshot(&pool).await;
     let n = ledger.statements_total();
     assert!(!ledger.record_order(&record(), &link, seen(2)).await.unwrap().changed);
-    assert_eq!(ledger.statements_total() - n, 1);
+    assert_eq!(ledger.statements_total() - n, 4);
     assert_eq!(snapshot(&pool).await, before);
     assert_eq!(proxy.stats().commit_acks_dropped, 1);
 }
@@ -792,7 +825,7 @@ async fn wire_statement_counts_match_the_counter_and_replay_contract(pool: PgPoo
     let (proxy, proxied) = through_proxy(&pool).await;
     let ledger = PgVenueLedger::new(&proxied, f.tenant);
     let mut r = record();
-    for (seen_at, expected) in [(1, 8), (2, 1), (3, 7)] {
+    for (seen_at, expected) in [(1, 8), (2, 4), (3, 7)] {
         if seen_at == 3 {
             r.update_time_ms = Some(123);
         }

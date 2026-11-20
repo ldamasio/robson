@@ -25,8 +25,9 @@ const FILL_COLUMNS: &str = "f.trade_id AS fill_trade_id,f.exchange_order_id AS f
     f.commission_asset AS fill_asset,f.trade_time AS fill_time,f.recorded_at AS fill_recorded_at";
 
 impl PgVenueLedger {
-    /// One page, at most 1,000 trades and ten statements. A duplicate page
-    /// without cursor progress is one read, no bump, and no rotation update.
+    /// One page, at most 1,000 trades and ten statements, the pre-read already
+    /// under the server bounds. A duplicate page without cursor progress is
+    /// BEGIN, the bounds, one read and ROLLBACK: no bump, no rotation update.
     pub async fn record_trades(
         &self,
         key: &OrderKey,
@@ -41,15 +42,17 @@ impl PgVenueLedger {
             let ids: Vec<String>=page.trades.iter().map(|fill| fill.trade_id.parse::<VenueIntId>().map(|id| id.to_string())).collect::<Result<_,_>>()?;
             let connection=self.pool.acquire().await.map_err(backend)?;
             let mut held=LedgerConnection::new(connection);
-            let (before,existing)=self.read_trade_context(held.connection(),key,&ids).await?;
-            let proposed=plan_trades(&before,self.tenant_id,page,&existing,recorded_at)?;
-            if !proposed.changed {
-                held.finished=true;
-                return Ok(TradeWriteResult {changed:false});
-            }
             self.statement();
             let mut tx=held.connection().begin().await.map_err(backend)?;
             self.timeouts(&mut tx).await?;
+            let (before,existing)=self.read_trade_context(&mut tx,key,&ids).await?;
+            let proposed=plan_trades(&before,self.tenant_id,page,&existing,recorded_at)?;
+            if !proposed.changed {
+                self.statement();
+                tx.rollback().await.map_err(backend)?;
+                held.finished=true;
+                return Ok(TradeWriteResult {changed:false});
+            }
             self.statement();
             let bump=sqlx::query("UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id=$2")
                 .bind(self.tenant_id).bind(key.venue.as_str()).execute(&mut *tx).await.map_err(backend)?;
