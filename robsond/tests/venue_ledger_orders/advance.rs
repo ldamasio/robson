@@ -42,6 +42,8 @@ const ADVANCED_MS: i64 = UPDATE_MS + 2_000;
 /// surviving old-owner session. It is not a supervisor or role admission.
 struct ClosedFixture<'a> {
     pool: &'a PgPool,
+    wire: &'a DbProxy,
+    sql: u64,
     gate: &'a Arc<OperationGate>,
     expected: RestoreIdentity,
     owner: Uuid,
@@ -56,6 +58,7 @@ impl ClosedWriterFence for ClosedFixture<'_> {
         deadline: Instant,
     ) -> std::result::Result<FenceReceipt, FixtureFenceError> {
         self.seen.push(phase);
+        let before = self.wire.stats().statements;
         let old = timeout_at(
             deadline,
             sqlx::query_scalar::<_, i64>(
@@ -68,6 +71,7 @@ impl ClosedWriterFence for ClosedFixture<'_> {
         .await
         .map_err(|_| FixtureFenceError)?
         .map_err(|_| FixtureFenceError)?;
+        self.sql += self.wire.stats().statements - before;
         if restore != self.expected
             || !matches!(
                 phase,
@@ -100,6 +104,10 @@ struct Advanced {
     late_old_held: bool,
     current_projection: i64,
     cold_capture_sql: u64,
+    capture_wire: u64,
+    install_sql: u64,
+    fence_sql: u64,
+    rollback_poll_sql: u64,
 }
 
 async fn fill_rows(pool: &PgPool) -> Result<i64> {
@@ -167,11 +175,17 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
     )
     .execute(&pool)
     .await?;
-    let old_projection = f.ledger(&pool).with_native_order_set_projection(binding.clone());
-    let frozen = support::snapshot(&pool).await;
-    let accounting = f.version(&pool).await;
-    let consumed = f.consumed(&pool).await;
-    ensure!(accounting == seeded + 1 && fill_rows(&pool).await? == 0);
+    // Every later phase sends its SQL through its own tracing proxy, measured
+    // separately and in total through pool retirement. The C2 clock lookup
+    // keeps the accepted restart harness's direct pool and its own receipts.
+    let (fixture_wire, fixture) = support::through_proxy(&pool, 1).await;
+    let (install_wire, installer) = support::through_proxy(&pool, 2).await;
+    let (writer_wire, writers) = support::through_proxy(&pool, 1).await;
+    let old_projection = f.ledger(&writers).with_native_order_set_projection(binding.clone());
+    let frozen = support::snapshot(&fixture).await;
+    let accounting = f.version(&fixture).await;
+    let consumed = f.consumed(&fixture).await;
+    ensure!(accounting == seeded + 1 && fill_rows(&fixture).await? == 0);
 
     let deadline = Instant::now() + Duration::from_secs(148);
     let proxy = DbProxy::start(upstream).await?;
@@ -224,24 +238,40 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
             restore,
         };
         let install_deadline = deadline.min(Instant::now() + Duration::from_secs(5));
-        let cut = capture(&pool, &request, install_deadline)
+        let before = install_wire.stats().statements;
+        let cut = capture(&installer, &request, install_deadline)
             .await
             .map_err(|e| anyhow!("successor cold cut: {e:?}"))?;
+        let capture_wire = install_wire.stats().statements - before;
+        // Six fixed statements plus one terminal page for each family below
+        // its eight-row page: two journal intents, no attempt, one order and
+        // one route.
         let cold_capture_sql = cut.receipt.statements;
-        ensure!(cold_capture_sql == 11);
+        let families: Vec<(u64, u32)> =
+            cut.receipt.families.iter().map(|family| (family.rows, family.pages)).collect();
+        ensure!(
+            cold_capture_sql == 10 && families == [(2, 1), (0, 1), (1, 1), (1, 1)],
+            "cold source terminals {families:?}"
+        );
         let mut fence = ClosedFixture {
-            pool: &pool,
+            pool: &fixture,
+            wire: &fixture_wire,
+            sql: 0,
             gate,
             expected: restore,
             owner: Uuid::now_v7(),
             seen: Vec::new(),
         };
-        let installed = install(&pool, &cut, &mut fence, install_deadline)
+        let before = install_wire.stats().statements;
+        let installed = install(&installer, &cut, &mut fence, install_deadline)
             .await
             .map_err(|e| anyhow!("successor install: {e:?}"))?;
+        let install_sql = install_wire.stats().statements - before;
+        ensure!(install_wire.stats().commits == 2, "one audit and one publication COMMIT");
         ensure!(
             fence.seen
                 == [FencePhase::BeforeRead, FencePhase::BeforePublish, FencePhase::AfterReadback]
+                && fence.sql == 3
         );
         let current = installed.generation;
         ensure!(
@@ -255,12 +285,15 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
         );
         // Independently, the installed tuple is the only current one.
         ensure!(
-            generations(&pool, &current).await?
+            generations(&fixture, &current).await?
                 == [(current.generation_id, current.source_audit_id, current.process_epoch)]
         );
-        ensure!(version(&pool, &current).await? == accounting);
-        exact_reference(&pool, &current).await?;
-        ensure!(support::snapshot(&pool).await == frozen && f.version(&pool).await == accounting);
+        ensure!(version(&fixture, &current).await? == accounting);
+        exact_reference(&fixture, &current).await?;
+        ensure!(
+            support::snapshot(&fixture).await == frozen
+                && f.version(&fixture).await == accounting
+        );
         // The predecessor's binding no longer reconstructs; the held blocker
         // follows only the exact installed generation.
         ensure!(matches!(
@@ -298,8 +331,13 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
             Err(LedgerError::Invariant(reason)) if reason.contains("projection membership refused")
         ));
         let stale_sql = old_projection.statements_total() - before;
-        wait_rolled_back(&pool).await?;
-        ensure!(support::snapshot(&pool).await == frozen && f.version(&pool).await == accounting);
+        let before = fixture_wire.stats().statements;
+        wait_rolled_back(&fixture).await?;
+        let rollback_poll_sql = fixture_wire.stats().statements - before;
+        ensure!(
+            support::snapshot(&fixture).await == frozen
+                && f.version(&fixture).await == accounting
+        );
 
         // A late exact 0.25 cannot lower the retained high water or clear.
         let checked = blocker.precheck().await?;
@@ -310,9 +348,9 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
 
         // One projected write under the installed generation. The pending
         // observation stays held through the commit and its readback.
-        let current_ledger = f.ledger(&pool).with_native_order_set_projection(current.clone());
-        let receiver =
-            OrderExecutionReceiver::bind(gate, &current_ledger, key(&f.scope)?, order_link.clone())?;
+        let current_ledger = f.ledger(&writers).with_native_order_set_projection(current.clone());
+        let link = order_link.clone();
+        let receiver = OrderExecutionReceiver::bind(gate, &current_ledger, key(&f.scope)?, link)?;
         let work = receiver.register(record.clone(), evidence)?.context("advance ticket")?;
         let held_before = receiver.pending() == Some(evidence);
         ensure!(held_before, "registered before any persistence await");
@@ -325,12 +363,12 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
         ensure!(held_after_commit, "a commit alone retires nothing");
         blocker.adopt_commit(ack.accounting_version).await?;
         ensure!(blocker.state() == RestartState::Blocked && gate.fenced());
-        let consumed_delta = f.consumed(&pool).await - consumed;
+        let consumed_delta = f.consumed(&fixture).await - consumed;
         ensure!(consumed_delta == Decimal::new(5, 2));
-        ensure!(version(&pool, &current).await? == accounting + 1);
-        exact_reference(&pool, &current).await?;
-        let committed = support::snapshot(&pool).await;
-        let projected = super::super::projection_snapshot(&pool, &current).await?;
+        ensure!(version(&fixture, &current).await? == accounting + 1);
+        exact_reference(&fixture, &current).await?;
+        let committed = support::snapshot(&fixture).await;
+        let projected = super::super::projection_snapshot(&fixture, &current).await?;
 
         // The same original record through the same projected writer, at its
         // original receive mark: one read, no commit, still pending.
@@ -341,9 +379,9 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
         ensure!(!changed && duplicate_commits == 0 && duplicate_sql == 1);
         ensure!(receiver.pending() == Some(evidence));
         ensure!(
-            support::snapshot(&pool).await == committed
-                && super::super::projection_snapshot(&pool, &current).await? == projected
-                && f.version(&pool).await == accounting + 1
+            support::snapshot(&fixture).await == committed
+                && super::super::projection_snapshot(&fixture, &current).await? == projected
+                && f.version(&fixture).await == accounting + 1
         );
 
         // Only a fresh exact governed receipt of the committed facts resolves.
@@ -365,7 +403,7 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
         .bind(&f.scope)
         .bind(support::SYMBOL)
         .bind(ORDER.to_string())
-        .fetch_one(&pool)
+        .fetch_one(&fixture)
         .await?;
         ensure!(
             final_row
@@ -376,10 +414,10 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
                     intent
                 )
         );
-        let fill_rows = fill_rows(&pool).await?;
+        let fill_rows = fill_rows(&fixture).await?;
         ensure!(fill_rows == 0, "no trade facts recorded");
-        let current_projection = i64::try_from(generations(&pool, &current).await?.len())?;
-        ensure!(current_projection == 1 && support::snapshot(&pool).await == committed);
+        let current_projection = i64::try_from(generations(&fixture, &current).await?.len())?;
+        ensure!(current_projection == 1 && support::snapshot(&fixture).await == committed);
         lookup.verify_weight()?;
         Ok::<_, anyhow::Error>(Advanced {
             observed: record.executed_qty,
@@ -397,6 +435,10 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
             late_old_held,
             current_projection,
             cold_capture_sql,
+            capture_wire,
+            install_sql,
+            fence_sql: fence.sql,
+            rollback_poll_sql,
         })
     })
     .await
@@ -405,8 +447,15 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
     let reads = lookup.reads();
     let retired = lookup.finish(&successor, outcomes.is_err()).await;
     let readonly_stopped = timeout(Duration::from_secs(2), readonly.close()).await;
+    let measured_stopped = timeout(Duration::from_secs(2), async {
+        fixture.close().await;
+        installer.close().await;
+        writers.close().await;
+    })
+    .await;
     retired?;
     readonly_stopped.context("reader pool retirement")?;
+    measured_stopped.context("measured pool retirement")?;
     let a = outcomes?;
     let trace = proxy.query_trace();
     let recovery_selects = trace
@@ -422,14 +471,24 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
         "bounded read-only trace: {trace:?}"
     );
     ensure!(reads == 4 && gate.fenced());
+    let recovery_wire = proxy.stats().statements;
+    ensure!(recovery_wire == u64::try_from(trace.len())?);
+    let fixture_sql = fixture_wire.stats().statements;
+    let readback_sql = fixture_sql - a.fence_sql - a.rollback_poll_sql;
+    let writer_sql = writer_wire.stats().statements;
+    ensure!(install_wire.stats().statements == a.capture_wire + a.install_sql);
+    let total_sql = recovery_wire + a.capture_wire + a.install_sql + fixture_sql + writer_sql;
     let flag = |held: bool| u8::from(held);
     eprintln!(
         "C8_ADVANCE_RESTART old_durable={} observed={} final_durable={} consumed_delta={} \
          version_delta={} write_sql={} duplicate_sql={} duplicate_commits={} fill_rows={} \
          held_before={} held_after_commit={} reconciled_exact={} native_fence=held old_retired=1 \
          current_projection={} late_old_held={} quarantine_seconds=120 get_handoffs={reads} \
-         total_weight={} get_sql=0 stale_writer_refused=1 stale_sql={} cold_capture_sql={} \
-         recovery_selects={recovery_selects} old_pid={child_pid} successor_pid={}",
+         total_weight={} get_sql=0 stale_writer_refused=1 stale_sql={} \
+         recovery_selects={recovery_selects} recovery_wire={recovery_wire} \
+         capture_sql={} capture_wire={} install_sql={} install_commits=2 fence_sql={} \
+         readback_sql={readback_sql} rollback_poll_sql={} writer_sql={writer_sql} \
+         total_sql={total_sql} old_pid={child_pid} successor_pid={}",
         durable.0,
         a.observed,
         a.final_durable,
@@ -447,6 +506,10 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
         1 + 4 * reads,
         a.stale_sql,
         a.cold_capture_sql,
+        a.capture_wire,
+        a.install_sql,
+        a.fence_sql,
+        a.rollback_poll_sql,
         std::process::id(),
     );
     Ok(())
