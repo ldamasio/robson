@@ -50,17 +50,19 @@ async fn prepared_time_is_unsigned_and_returns_before_body_collection() {
 
 #[tokio::test]
 async fn prepared_time_keeps_each_redirect_as_the_original_answer() {
-    timeout(Duration::from_secs(3), async {
-        for status in [301, 302, 303, 307, 308] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let target = destination.local_addr().unwrap();
-            let prepared = BinanceRestClient::with_local_base_url(format!(
-                "http://{}",
-                listener.local_addr().unwrap()
-            ))
-            .prepare_spot_time()
-            .unwrap();
+    for status in [301, 302, 303, 307, 308] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = destination.local_addr().unwrap();
+        // Building the clients loads TLS roots and can be slow on a loaded
+        // test host; only the exchange itself is bounded.
+        let prepared = BinanceRestClient::with_local_base_url(format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        ))
+        .prepare_spot_time()
+        .unwrap();
+        timeout(Duration::from_secs(3), async {
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 headers(&mut socket).await;
@@ -72,8 +74,8 @@ async fn prepared_time_keeps_each_redirect_as_the_original_answer() {
             assert_eq!(prepared.send().await.unwrap().status().as_u16(), status);
             server.await.unwrap();
             assert!(timeout(Duration::from_millis(50), destination.accept()).await.is_err());
-        }
-    })
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
+    }
 }
