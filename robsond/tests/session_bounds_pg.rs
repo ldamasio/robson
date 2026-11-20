@@ -27,6 +27,9 @@ use uuid::Uuid;
 const SHOW: &str = "SELECT current_setting('lock_timeout'), current_setting('statement_timeout'), \
                     current_setting('idle_in_transaction_session_timeout')";
 const LOCK_BOUND: Duration = Duration::from_secs(2);
+/// A client-side guard well past every server bound, so a missing bound fails
+/// a test instead of hanging it.
+const GUARD: Duration = Duration::from_secs(10);
 /// Short bounds for the lifecycle and generated cases, so they stay fast.
 const SHORT: SessionBounds = SessionBounds {
     lock_timeout_ms: 100,
@@ -99,6 +102,16 @@ fn sqlstate(error: &dyn Debug) -> String {
         }
     }
     text
+}
+
+/// `work` and how long it took, failing the test if no server bound ends it
+/// within [`GUARD`].
+async fn timed<T>(what: &str, work: impl std::future::Future<Output = T>) -> (T, Duration) {
+    let started = Instant::now();
+    match tokio::time::timeout(GUARD, work).await {
+        Ok(value) => (value, started.elapsed()),
+        Err(_) => panic!("{what}: no server bound ended it within {GUARD:?}"),
+    }
 }
 
 /// A lock wait ended by the server's lock bound: `55P03`, after about 2 s.
@@ -197,9 +210,11 @@ async fn t2a_append_event_waits_end_at_the_lock_bound(pool: PgPool) {
         .execute(&mut *holder)
         .await
         .unwrap();
-    let started = Instant::now();
-    let result = robson_eventlog::append_event(&root, &stream, None, event(tenant, &stream)).await;
-    let elapsed = started.elapsed();
+    let (result, elapsed) = timed(
+        "append_event",
+        robson_eventlog::append_event(&root, &stream, None, event(tenant, &stream)),
+    )
+    .await;
     holder.rollback().await.unwrap();
     assert_lock_bound("append_event", &result.unwrap_err(), elapsed);
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM event_log WHERE stream_key = $1")
@@ -222,9 +237,9 @@ async fn t2b_start_epoch_waits_end_at_the_lock_bound(pool: PgPool) {
         .execute(&mut *holder)
         .await
         .unwrap();
-    let started = Instant::now();
-    let result = robsond::process_epoch::start_epoch(&root, Uuid::now_v7(), "t2b").await;
-    let elapsed = started.elapsed();
+    let (result, elapsed) =
+        timed("start_epoch", robsond::process_epoch::start_epoch(&root, Uuid::now_v7(), "t2b"))
+            .await;
     holder.rollback().await.unwrap();
     assert_lock_bound("start_epoch", &result.unwrap_err(), elapsed);
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM process_epochs")
@@ -263,9 +278,8 @@ async fn partition_wait_ends_at_the_lock_bound(pool: PgPool, parent: &str, funct
         .execute(&mut *holder)
         .await
         .unwrap();
-    let started = Instant::now();
-    let result = sqlx::query(&format!("SELECT {function}(3)")).execute(&root).await;
-    let elapsed = started.elapsed();
+    let call = format!("SELECT {function}(3)");
+    let (result, elapsed) = timed(function, sqlx::query(&call).execute(&root)).await;
     holder.rollback().await.unwrap();
     assert_lock_bound(function, &result.unwrap_err(), elapsed);
     assert!(
@@ -328,15 +342,16 @@ async fn t2d_monthly_peak_write_waits_end_at_the_lock_bound(pool: PgPool) {
         .execute(&mut *holder)
         .await
         .unwrap();
-    let started = Instant::now();
-    let result = sqlx::query(MONTH_PEAK)
-        .bind(2030_i32)
-        .bind(5_i16)
-        .bind(decimal(1000))
-        .bind(decimal(20))
-        .execute(&root)
-        .await;
-    let elapsed = started.elapsed();
+    let (result, elapsed) = timed(
+        "monthly peak write",
+        sqlx::query(MONTH_PEAK)
+            .bind(2030_i32)
+            .bind(5_i16)
+            .bind(decimal(1000))
+            .bind(decimal(20))
+            .execute(&root),
+    )
+    .await;
     holder.rollback().await.unwrap();
     assert_lock_bound("monthly peak write", &result.unwrap_err(), elapsed);
     let peak: rust_decimal::Decimal = sqlx::query_scalar(
@@ -369,16 +384,17 @@ async fn t2e_suspension_repair_write_waits_end_at_the_lock_bound(pool: PgPool) {
         .execute(&mut *holder)
         .await
         .unwrap();
-    let started = Instant::now();
     // The repair's clearing write of `event_streams.rs`, verbatim.
-    let result = sqlx::query(
-        "UPDATE stream_suspensions SET cleared_at = NOW(), repair_error = NULL \
-         WHERE suspension_id = $1",
+    let (result, elapsed) = timed(
+        "suspension clear",
+        sqlx::query(
+            "UPDATE stream_suspensions SET cleared_at = NOW(), repair_error = NULL \
+             WHERE suspension_id = $1",
+        )
+        .bind(suspension)
+        .execute(&root),
     )
-    .bind(suspension)
-    .execute(&root)
     .await;
-    let elapsed = started.elapsed();
     holder.rollback().await.unwrap();
     assert_lock_bound("suspension clear", &result.unwrap_err(), elapsed);
 }
@@ -409,9 +425,7 @@ async fn t2f_projection_checkpoint_waits_end_at_the_lock_bound(pool: PgPool) {
         .execute(&mut *holder)
         .await
         .unwrap();
-    let started = Instant::now();
-    let result = write(root.clone(), 2).await;
-    let elapsed = started.elapsed();
+    let (result, elapsed) = timed("projection checkpoint", write(root.clone(), 2)).await;
     holder.rollback().await.unwrap();
     assert_lock_bound("projection checkpoint", &result.unwrap_err(), elapsed);
 }
@@ -428,13 +442,14 @@ async fn t2g_projector_position_handler_waits_end_at_the_lock_bound(pool: PgPool
         .execute(&mut *holder)
         .await
         .unwrap();
-    let started = Instant::now();
-    let result = robson_projector::apply_event_to_projections(
-        &root,
-        &entry_filled(tenant, position_id, Utc::now()),
+    let (result, elapsed) = timed(
+        "projector entry_filled",
+        robson_projector::apply_event_to_projections(
+            &root,
+            &entry_filled(tenant, position_id, Utc::now()),
+        ),
     )
     .await;
-    let elapsed = started.elapsed();
     holder.rollback().await.unwrap();
     assert_lock_bound("projector entry_filled", &result.unwrap_err(), elapsed);
     let state: String =
@@ -461,13 +476,14 @@ async fn t2h_monthly_projector_explicit_lock_waits_end_at_the_lock_bound(pool: P
     let projector = {
         let root = root.clone();
         tokio::spawn(async move {
-            let started = Instant::now();
-            let result = robson_projector::apply_event_to_projections(
-                &root,
-                &entry_filled(Uuid::now_v7(), Uuid::now_v7(), at),
+            timed(
+                "monthly explicit lock",
+                robson_projector::apply_event_to_projections(
+                    &root,
+                    &entry_filled(Uuid::now_v7(), Uuid::now_v7(), at),
+                ),
             )
-            .await;
-            (result, started.elapsed())
+            .await
         })
     };
     // Observe the wait on the explicit SHARE ROW EXCLUSIVE request itself.
@@ -503,9 +519,7 @@ async fn read_under_holder<T: Debug>(
         .execute(&mut *holder)
         .await
         .unwrap();
-    let started = Instant::now();
-    let value = read.await;
-    let elapsed = started.elapsed();
+    let (value, elapsed) = timed(table, read).await;
     holder.rollback().await.unwrap();
     (value, elapsed)
 }
@@ -696,9 +710,9 @@ async fn t5_an_abandoned_lock_holder_is_ended_by_the_server(pool: PgPool) {
 #[ignore = "requires DATABASE_URL"]
 async fn t6_a_statement_ends_at_the_statement_bound(pool: PgPool) {
     let root = root(&pool).await;
-    let started = Instant::now();
-    let error = sqlx::query("SELECT pg_sleep(6)").execute(&root).await.unwrap_err();
-    let elapsed = started.elapsed();
+    let (result, elapsed) =
+        timed("pg_sleep(6)", sqlx::query("SELECT pg_sleep(6)").execute(&root)).await;
+    let error = result.unwrap_err();
     assert_eq!(sqlstate(&error), "57014");
     assert!(
         elapsed >= Duration::from_millis(4_900) && elapsed < Duration::from_secs(6),
@@ -745,10 +759,10 @@ async fn run_step(
             sqlx::query("SELECT 1").execute(bounded).await.unwrap();
         },
         Step::Cancel => {
-            let started = Instant::now();
-            let error = sqlx::query("SELECT pg_sleep(2)").execute(bounded).await.unwrap_err();
-            assert_eq!(sqlstate(&error), "57014");
-            assert!(started.elapsed() < Duration::from_millis(SHORT.statement_timeout_ms) + slack);
+            let (result, elapsed) =
+                timed("pg_sleep(2)", sqlx::query("SELECT pg_sleep(2)").execute(bounded)).await;
+            assert_eq!(sqlstate(&result.unwrap_err()), "57014");
+            assert!(elapsed < Duration::from_millis(SHORT.statement_timeout_ms) + slack);
         },
         Step::Abandon => {
             let mut abandoned =
@@ -761,11 +775,15 @@ async fn run_step(
                 .unwrap();
             let abandoned_at = Instant::now();
             std::mem::forget(abandoned);
-            sqlx::query("UPDATE stream_state SET last_seq = last_seq WHERE stream_key = $1")
-                .bind(stream)
-                .execute(plain)
-                .await
-                .unwrap();
+            timed(
+                "waiter behind an abandoned holder",
+                sqlx::query("UPDATE stream_state SET last_seq = last_seq WHERE stream_key = $1")
+                    .bind(stream)
+                    .execute(plain),
+            )
+            .await
+            .0
+            .unwrap();
             assert!(
                 abandoned_at.elapsed()
                     < Duration::from_millis(SHORT.idle_in_transaction_ms) + slack,
@@ -780,14 +798,14 @@ async fn run_step(
                 .execute(&mut *holder)
                 .await
                 .unwrap();
-            let started = Instant::now();
-            let error =
+            let (result, waited) = timed(
+                "waiter",
                 sqlx::query("UPDATE stream_state SET last_seq = last_seq WHERE stream_key = $1")
                     .bind(stream)
-                    .execute(bounded)
-                    .await
-                    .unwrap_err();
-            let waited = started.elapsed();
+                    .execute(bounded),
+            )
+            .await;
+            let error = result.unwrap_err();
             holder.rollback().await.unwrap();
             assert_eq!(sqlstate(&error), "55P03");
             assert!(waited < Duration::from_millis(SHORT.lock_timeout_ms) + slack, "{waited:?}");
