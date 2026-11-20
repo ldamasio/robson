@@ -173,7 +173,9 @@ impl Fixture {
         } = self;
         let before = proxy.stats().statements;
         drop(adapter);
-        timeout(Duration::from_millis(350), async {
+        // The raw-dropped backend may still finish a statement under the 1 s
+        // statement_timeout before it notices the closed socket.
+        timeout(NATIVE_RETIREMENT, async {
             loop {
                 let alive: bool = sqlx::query_scalar(EXACT_BACKEND)
                     .bind(pid)

@@ -335,3 +335,48 @@ transaction has finished.
 SELECT version, success, execution_time
 FROM _sqlx_migrations WHERE version = 20240101000039;
 ```
+
+## Migration 40: balance transitions through the bounded adapter
+
+Migration 40 (`20240101000040_balance_transitions.sql`) is one `DO` block
+that creates the dormant `balance_transitions` table: foreign keys to
+`balance_legs`, `order_intents` and `venue_orders`, a partial unique index on
+open transitions and a trigger that refuses deletes. It changes no existing
+table or row. Creating the foreign keys takes `SHARE ROW EXCLUSIVE` locks on
+the three referenced tables, so the apply waits behind any open transaction
+that wrote one of them and, while it holds them, briefly blocks their
+writers.
+
+The adapter applies it like 39, in 7 operations on the same dedicated raw
+connection: settings install, SQLx's own unmodified apply (BEGIN, the `DO`
+statement, the `_sqlx_migrations` INSERT, COMMIT, the `execution_time`
+UPDATE), and the settings restore, under the same 1 s statement, 200 ms lock
+and 1 s idle-in-transaction timeouts, the 15 s whole-apply bound and the 5 s
+connection and advisory-lock bounds. A lock wait longer than 200 ms fails with
+`55P03` and fails the `robsond-db-migrate` hook. Only the exact embedded file
+is applied; any other version-40 source is refused before any SQL
+(`migration40 contract mismatch`).
+
+### Rollback boundary
+
+Record the deployed image digest before the merge that carries 40. **Once 40
+is applied, an image without 40 is not a deploy rollback target**: its
+`robsond db migrate` rejects the applied 40 missing from its embedded set
+(`VersionMissing(20240101000040)`), the hook fails and the sync stops. The
+earliest compatible rollback artifact is the first image that embeds 40.
+There is no down migration. A daemon of an image without 40 that is already
+running is unaffected: it never names `balance_transitions`, and the trigger
+only guards that new table.
+
+### Failure outcomes
+
+Those of migration 39 above, applied to version `20240101000040`. A `55P03`
+lock timeout or a lost answer is reported as `MayHaveCommitted`: wait for the
+failed backend to be gone, rerun `robsond db migrate` after the conflicting
+transaction on `balance_legs`, `order_intents` or `venue_orders` has
+finished, and confirm with the query below.
+
+```sql
+SELECT version, success, execution_time
+FROM _sqlx_migrations WHERE version = 20240101000040;
+```
