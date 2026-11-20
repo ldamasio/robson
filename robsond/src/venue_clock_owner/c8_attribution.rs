@@ -48,8 +48,9 @@ pub(super) enum Divergence {
     Client,
     Side,
     Phase,
-    /// A `leg` row whose J is missing or disagrees on
-    /// tenant/venue/scope/client.
+    /// A `leg` row whose J is missing, has contradictory delivery evidence, or
+    /// disagrees on tenant/venue/scope/client/position/kind, or whose
+    /// ledger type disagrees with the wire.
     Journal,
 }
 
@@ -252,6 +253,20 @@ fn journal(row: &PgRow, scope: Scope<'_>, order: &SpotOrderRecord) -> Result<Fac
     let venue: Option<String> = row.try_get("j_venue").map_err(bad)?;
     let account: Option<String> = row.try_get("j_scope").map_err(bad)?;
     let client: Option<String> = row.try_get("j_client").map_err(bad)?;
+    let o_position: Option<Uuid> = row.try_get("o_position").map_err(bad)?;
+    let j_position: Option<Uuid> = row.try_get("j_position").map_err(bad)?;
+    let o_kind: Option<String> = row.try_get("o_kind").map_err(bad)?;
+    let j_kind: Option<String> = row.try_get("j_kind").map_err(bad)?;
+    let o_type: Option<String> = row.try_get("o_type").map_err(bad)?;
+    let not_sent: Option<bool> = row.try_get("j_not_sent").map_err(bad)?;
+    let outcome: Option<String> = row.try_get("j_outcome").map_err(bad)?;
+    // J kind against the ledger leg kind; the ledger type against the wire.
+    let kinds = matches!(
+        (j_kind.as_deref(), o_kind.as_deref()),
+        (Some("entry"), Some("entry"))
+            | (Some("protection"), Some("stop"))
+            | (Some("exit"), Some("sell"))
+    );
     let e = scope.expected;
     Ok(match (linked, intent) {
         (Some(linked), Some(intent))
@@ -259,7 +274,13 @@ fn journal(row: &PgRow, scope: Scope<'_>, order: &SpotOrderRecord) -> Result<Fac
                 && tenant == Some(e.tenant_id)
                 && venue.as_deref() == Some(e.venue.as_str())
                 && account.as_deref() == Some(e.account_scope)
-                && client.as_deref() == Some(order.client_order_id.as_str()) =>
+                && client.as_deref() == Some(order.client_order_id.as_str())
+                && o_position.is_some()
+                && o_position == j_position
+                && kinds
+                && o_type.as_deref() == Some(order.order_type.as_str())
+                && not_sent == Some(false)
+                && matches!(outcome.as_deref(), None | Some("success")) =>
         {
             Fact::Ledger { intent_id: intent }
         },

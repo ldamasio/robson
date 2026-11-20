@@ -209,8 +209,9 @@ pub(super) fn triple_script() -> Vec<(&'static str, String)> {
 }
 
 /// Attribution variant: the physical fixture's verbatim discovered
-/// BTCUSDT/417011 BUY, an operated list member with no durable row, and an
-/// unrelated pair and list. Test identities only; no financial meaning.
+/// BTCUSDT/417011 BUY, an operated list member with no durable row, the
+/// fixture's authored BTCUSDT/417013 entry, and an unrelated pair and list.
+/// Test identities only; no financial meaning.
 pub(super) fn attribution_script() -> Vec<(&'static str, String)> {
     use robson_connectors::inventory_loopback::LOOPBACK_UID;
     let account = format!(
@@ -222,9 +223,10 @@ pub(super) fn attribution_script() -> Vec<(&'static str, String)> {
         )
     };
     let orders = format!(
-        "[{},{},{}]",
+        "[{},{},{},{}]",
         order("BTCUSDT", 417011, -1, "physical-recovery-observed-buy", "LIMIT", "BUY"),
         order("BTCUSDT", 417012, 9, "c8-absent-sell", "STOP_LOSS_LIMIT", "SELL"),
+        order("BTCUSDT", 417013, -1, "physical-recovery-owned-buy", "MARKET", "BUY"),
         order("AAABBB", 11, 7, "c8-a", "STOP_LOSS_LIMIT", "SELL"),
     );
     let lists = "[{\"orderListId\":9,\"contingencyType\":\"OCO\",\"listStatusType\":\"EXEC_STARTED\",\"listOrderStatus\":\"EXECUTING\",\"listClientOrderId\":\"c8-operated-list\",\"transactionTime\":3,\"symbol\":\"BTCUSDT\",\"orders\":[{\"symbol\":\"BTCUSDT\",\"orderId\":417012,\"clientOrderId\":\"c8-absent-sell\"}]},{\"orderListId\":7,\"contingencyType\":\"OCO\",\"listStatusType\":\"EXEC_STARTED\",\"listOrderStatus\":\"EXECUTING\",\"listClientOrderId\":\"c8-l\",\"transactionTime\":3,\"symbol\":\"AAABBB\",\"orders\":[{\"symbol\":\"AAABBB\",\"orderId\":11,\"clientOrderId\":\"c8-a\"}]}]"

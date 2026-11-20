@@ -260,6 +260,7 @@ pub(crate) async fn run_held_inventory_rehearsal(
     uid: &str,
     version: i64,
     operated: &str,
+    owned: Uuid,
 ) -> anyhow::Result<Uuid> {
     use c8_attribution::{Divergence, Fact, ListFact, Refusal, Scope};
     let venue_id = VenueId::new(VenueId::BINANCE_SPOT);
@@ -366,7 +367,9 @@ pub(crate) async fn run_held_inventory_rehearsal(
         ensure!(summary == [
             ("BTCUSDT", 417011, "physical-recovery-observed-buy", "BUY", -1, Fact::Discovered),
             ("BTCUSDT", 417012, "c8-absent-sell", "SELL", 9, Fact::Absent),
-        ], "exact discovered and absent operated facts: {summary:?}");
+            ("BTCUSDT", 417013, "physical-recovery-owned-buy", "BUY", -1,
+                Fact::Ledger { intent_id: owned }),
+        ], "exact discovered, absent and owned operated facts: {summary:?}");
 
         // Negative controls, counted outside the live scan.
         let negatives = counters().0;
@@ -399,12 +402,32 @@ pub(crate) async fn run_held_inventory_rehearsal(
             } else {
                 contrary.side = "SELL".into();
             }
-            let keyed = [&contrary, selected.orders[1]];
+            let keyed = [&contrary, selected.orders[1], selected.orders[2]];
             let judged = c8_attribution::attribute(scope, &keyed, &post)
                 .map_err(|e| anyhow!("contrary attribution: {e:?}"))?;
-            ensure!(judged[0].fact == Fact::Contradiction(expected) && judged[1].fact == Fact::Absent,
+            ensure!(judged[0].fact == Fact::Contradiction(expected) && judged[1].fact == Fact::Absent
+                && judged[2].fact == Fact::Ledger { intent_id: owned },
                 "contradiction under the exact original key never reads as absence");
         }
+        // The same owned post row against a contrary wire type or client.
+        for (mutate, expected) in [
+            (0, Divergence::Journal),
+            (1, Divergence::Client),
+        ] {
+            let mut contrary = selected.orders[2].clone();
+            if mutate == 0 {
+                contrary.order_type = "LIMIT".into();
+            } else {
+                contrary.client_order_id = "c8-contrary-owned".into();
+            }
+            let keyed = [selected.orders[0], selected.orders[1], &contrary];
+            let judged = c8_attribution::attribute(scope, &keyed, &post)
+                .map_err(|e| anyhow!("contrary owned attribution: {e:?}"))?;
+            ensure!(judged[0].fact == Fact::Discovered && judged[1].fact == Fact::Absent
+                && judged[2].fact == Fact::Contradiction(expected),
+                "owned identity mismatch is never a ledger binding");
+        }
+        ensure!(counters().0 == negatives + 4, "contrary judgments issue no SQL");
         Ok::<_, anyhow::Error>(sample)
     }).await.context("held inventory window");
 

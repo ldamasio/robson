@@ -30,8 +30,11 @@ SELECT g.accounting_version,
        k.ord, k.symbol, k.order_id,
        o.tenant_id AS o_tenant, o.client_order_id AS o_client, o.side AS o_side,
        o.phase AS o_phase, o.owner AS o_owner, o.intent_id AS o_intent,
+       o.position_id AS o_position, o.kind AS o_kind, o.order_type AS o_type,
        j.intent_id AS j_intent, j.tenant_id AS j_tenant, j.venue_id AS j_venue,
-       j.account_scope AS j_scope, j.client_order_id AS j_client
+       j.account_scope AS j_scope, j.client_order_id AS j_client,
+       j.position_id AS j_position, j.kind AS j_kind,
+       j.not_sent AS j_not_sent, j.venue_outcome AS j_outcome
 FROM g
 LEFT JOIN k ON true
 LEFT JOIN public.venue_orders o
