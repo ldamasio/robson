@@ -15,6 +15,10 @@ mod http;
 #[path = "c8_account_http.rs"]
 mod c8_account_http;
 
+#[cfg(all(test, feature = "crash-points"))]
+#[path = "c8_attribution.rs"]
+mod c8_attribution;
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Result<()> {
@@ -252,7 +256,31 @@ pub(crate) async fn run_held_inventory_rehearsal(
     tenant: Uuid,
     clock: Arc<NativeClock>,
     mut rows: venue_budget::BootstrapRows,
+    installed: &crate::spot_order_set_store::JournalGeneration,
+    uid: &str,
+    version: i64,
+    operated: &str,
 ) -> anyhow::Result<Uuid> {
+    use c8_attribution::{Divergence, Fact, ListFact, Refusal, Scope};
+    let venue_id = VenueId::new(VenueId::BINANCE_SPOT);
+    let scope = Scope {
+        expected: crate::spot_order_set_store::ExpectedGeneration {
+            tenant_id: installed.tenant_id,
+            venue: &venue_id,
+            account_scope: &installed.account_scope,
+            generation_id: installed.generation_id,
+            process_epoch: installed.process_epoch,
+            source_audit_id: installed.source_audit_id,
+        },
+        uid,
+        version,
+        operated,
+    };
+    let attribution_options = pool.connect_options().as_ref().clone().options([
+        ("default_transaction_read_only", "on"),
+        ("lock_timeout", "300ms"),
+        ("statement_timeout", "1s"),
+    ]);
     let deadline = Instant::now() + Duration::from_secs(135);
     let mut time_http = None;
     let mut inventory_http = None;
@@ -289,13 +317,20 @@ pub(crate) async fn run_held_inventory_rehearsal(
         ensure!(durable == [(sample, time.server_ms()?)]);
         ensure!(time.connections() == 1 && budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 1);
 
-        inventory_http = Some(c8_account_http::AccountFixture::triple(deadline).await?);
+        inventory_http = Some(c8_account_http::AccountFixture::attribution(deadline).await?);
         let listener = inventory_http.as_ref().context("owned inventory listener")?;
         let scan_deadline = deadline.min(Instant::now() + Duration::from_secs(10));
-        let signed = owner.commission_signing_time().map_err(|e| anyhow!("{e:?}"))?;
-        let claim = clock.capture()?;
         let counters = || (wire.stats().statements, wire.prepared_statement_parses(),
             wire.query_trace().len(), wire.query_trace_dropped());
+        // One scoped pre-snapshot, autocommit: nothing is held across HTTP.
+        let before_pre = counters();
+        let pre = c8_attribution::snapshot(&attribution_options, scope, &[], scan_deadline)
+            .await.map_err(|e| anyhow!("attribution pre-snapshot: {e:?}"))?;
+        ensure!(c8_attribution::attribute(scope, &[], &pre)
+            .map_err(|e| anyhow!("pre header: {e:?}"))?.is_empty());
+        ensure!(counters().0 == before_pre.0 + 1, "one pre-snapshot statement");
+        let signed = owner.commission_signing_time().map_err(|e| anyhow!("{e:?}"))?;
+        let claim = clock.capture()?;
         let previous = counters();
         ensure!(previous.3 == 0, "bounded restored wire trace");
         let triple = owner.read_inventory_triple(&signed, claim, &mut slot, listener.port, scan_deadline)
@@ -305,6 +340,71 @@ pub(crate) async fn run_held_inventory_rehearsal(
         ensure!(listener.connections() == 3 && listener.signing_stamps()? == [signed.timestamp_ms(); 3]);
         ensure!(budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 4);
         verify_triple_budget(&budget, &clock)?;
+
+        let (InventoryBody::OpenOrders(orders), InventoryBody::OpenOrderLists(lists)) =
+            (&triple.receipts[1].body, &triple.receipts[2].body)
+        else {
+            return Err(anyhow!("typed inventory order bodies"));
+        };
+        let selected = c8_attribution::select(scope, orders, lists)
+            .map_err(|e| anyhow!("operated subset: {e:?}"))?;
+        ensure!(selected.unrelated_orders == 1 && selected.unrelated_lists == 1,
+            "unrelated pair and list kept, never parsed as another asset");
+        ensure!(selected.lists == [ListFact {
+            order_list_id: 9,
+            list_client_order_id: "c8-operated-list".into(),
+            members: vec![(417012, "c8-absent-sell".into())],
+        }], "operated list keeps its own native and client identity");
+        let post = c8_attribution::snapshot(&attribution_options, scope, &selected.orders, scan_deadline)
+            .await.map_err(|e| anyhow!("attribution post-snapshot: {e:?}"))?;
+        ensure!(counters().0 == previous.0 + 1 && counters().3 == 0,
+            "one bounded post-snapshot statement");
+        let facts = c8_attribution::attribute(scope, &selected.orders, &post)
+            .map_err(|e| anyhow!("attribution: {e:?}"))?;
+        let summary: Vec<_> = facts.iter().map(|f| (f.symbol.as_str(), f.order_id,
+            f.client_order_id.as_str(), f.side.as_str(), f.order_list_id, f.fact.clone())).collect();
+        ensure!(summary == [
+            ("BTCUSDT", 417011, "physical-recovery-observed-buy", "BUY", -1, Fact::Discovered),
+            ("BTCUSDT", 417012, "c8-absent-sell", "SELL", 9, Fact::Absent),
+        ], "exact discovered and absent operated facts: {summary:?}");
+
+        // Negative controls, counted outside the live scan.
+        let negatives = counters().0;
+        let other_scope = format!("{}-other", installed.account_scope);
+        let moved = [
+            Scope { uid: "0", ..scope },
+            Scope { version: version + 1, ..scope },
+            Scope { expected: crate::spot_order_set_store::ExpectedGeneration {
+                account_scope: &other_scope, ..scope.expected }, ..scope },
+            Scope { expected: crate::spot_order_set_store::ExpectedGeneration {
+                generation_id: Uuid::now_v7(), ..scope.expected }, ..scope },
+        ];
+        for wrong in moved {
+            let refused = c8_attribution::snapshot(&attribution_options, wrong, &selected.orders, scan_deadline).await;
+            ensure!(matches!(refused, Err(Refusal::Scope)), "moved identity refused: {:?}",
+                refused.as_ref().err());
+        }
+        ensure!(counters().0 == negatives + 4, "one statement per moved-identity control");
+        let many: Vec<_> = std::iter::repeat(selected.orders[0])
+            .take(c8_attribution::FIXTURE_KEY_CAP + 1).collect();
+        ensure!(matches!(c8_attribution::snapshot(&attribution_options, scope, &many, scan_deadline).await,
+            Err(Refusal::Cap)) && counters().0 == negatives + 4, "cap refuses before SQL");
+        for (mutate, expected) in [
+            (0, Divergence::Client),
+            (1, Divergence::Side),
+        ] {
+            let mut contrary = selected.orders[0].clone();
+            if mutate == 0 {
+                contrary.client_order_id = "c8-contrary-client".into();
+            } else {
+                contrary.side = "SELL".into();
+            }
+            let keyed = [&contrary, selected.orders[1]];
+            let judged = c8_attribution::attribute(scope, &keyed, &post)
+                .map_err(|e| anyhow!("contrary attribution: {e:?}"))?;
+            ensure!(judged[0].fact == Fact::Contradiction(expected) && judged[1].fact == Fact::Absent,
+                "contradiction under the exact original key never reads as absence");
+        }
         Ok::<_, anyhow::Error>(sample)
     }).await.context("held inventory window");
 

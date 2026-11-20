@@ -402,6 +402,7 @@ fn an_open_order_list_keeps_its_raw_identity_as_documented() {
     assert_eq!(decode(OPEN_ORDER_LIST).unwrap(), [SpotOpenOrderList {
         order_list_id: 31,
         symbol: "LTCBTC".into(),
+        list_client_order_id: Some("wuB13fmulKj3YjdqWEcsnp".into()),
         orders: vec![
             member("LTCBTC", 4, "r3EH2N76dHfLoSZWIUw1bT"),
             member("LTCBTC", 5, "Cv1SnyPD3qhqpbjpYEHbd2"),

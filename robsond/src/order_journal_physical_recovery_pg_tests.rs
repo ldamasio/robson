@@ -758,6 +758,7 @@ async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
         })).await?;
         let sample = crate::venue_clock_owner::run_held_inventory_rehearsal(
             &restore, &restored_wire, &new, g.tenant_id, std::sync::Arc::new(clock), rows,
+            &successor, &uid, committed.0, SYMBOL,
         ).await?;
         drop(reader);
         restore.close().await;

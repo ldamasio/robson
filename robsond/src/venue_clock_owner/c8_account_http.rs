@@ -44,6 +44,11 @@ impl AccountFixture {
         Self::scripted(deadline, None, triple_script()).await
     }
 
+    /// The same three reads, carrying the physical fixture's operated orders.
+    pub(super) async fn attribution(deadline: Instant) -> anyhow::Result<Self> {
+        Self::scripted(deadline, None, attribution_script()).await
+    }
+
     async fn with_gate(
         deadline: Instant,
         body_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
@@ -195,6 +200,34 @@ pub(super) fn triple_script() -> Vec<(&'static str, String)> {
     let orders =
         format!("[{},{}]", order("AAABBB", 11, 7, "c8-a"), order("zzzQQQ", 12, -1, "c8-b"));
     let lists = "[{\"orderListId\":7,\"contingencyType\":\"OCO\",\"listStatusType\":\"EXEC_STARTED\",\"listOrderStatus\":\"EXECUTING\",\"listClientOrderId\":\"c8-l\",\"transactionTime\":3,\"symbol\":\"AAABBB\",\"orders\":[{\"symbol\":\"AAABBB\",\"orderId\":11,\"clientOrderId\":\"c8-a\"}]}]"
+        .to_string();
+    vec![
+        ("/api/v3/account", account),
+        ("/api/v3/openOrders", orders),
+        ("/api/v3/openOrderList", lists),
+    ]
+}
+
+/// Attribution variant: the physical fixture's verbatim discovered
+/// BTCUSDT/417011 BUY, an operated list member with no durable row, and an
+/// unrelated pair and list. Test identities only; no financial meaning.
+pub(super) fn attribution_script() -> Vec<(&'static str, String)> {
+    use robson_connectors::inventory_loopback::LOOPBACK_UID;
+    let account = format!(
+        "{{\"canTrade\":false,\"accountType\":\"SPOT\",\"permissions\":[\"SPOT\"],\"balances\":[],\"uid\":{LOOPBACK_UID}}}"
+    );
+    let order = |symbol: &str, id: u64, list: i64, client: &str, kind: &str, side: &str| {
+        format!(
+            "{{\"symbol\":\"{symbol}\",\"orderId\":{id},\"orderListId\":{list},\"clientOrderId\":\"{client}\",\"price\":\"1.0\",\"origQty\":\"1.0\",\"executedQty\":\"0.0\",\"cummulativeQuoteQty\":\"0.0\",\"status\":\"NEW\",\"timeInForce\":\"GTC\",\"type\":\"{kind}\",\"side\":\"{side}\",\"stopPrice\":\"0.9\",\"time\":1,\"updateTime\":2,\"workingTime\":-1,\"selfTradePreventionMode\":\"EXPIRE_MAKER\"}}"
+        )
+    };
+    let orders = format!(
+        "[{},{},{}]",
+        order("BTCUSDT", 417011, -1, "physical-recovery-observed-buy", "LIMIT", "BUY"),
+        order("BTCUSDT", 417012, 9, "c8-absent-sell", "STOP_LOSS_LIMIT", "SELL"),
+        order("AAABBB", 11, 7, "c8-a", "STOP_LOSS_LIMIT", "SELL"),
+    );
+    let lists = "[{\"orderListId\":9,\"contingencyType\":\"OCO\",\"listStatusType\":\"EXEC_STARTED\",\"listOrderStatus\":\"EXECUTING\",\"listClientOrderId\":\"c8-operated-list\",\"transactionTime\":3,\"symbol\":\"BTCUSDT\",\"orders\":[{\"symbol\":\"BTCUSDT\",\"orderId\":417012,\"clientOrderId\":\"c8-absent-sell\"}]},{\"orderListId\":7,\"contingencyType\":\"OCO\",\"listStatusType\":\"EXEC_STARTED\",\"listOrderStatus\":\"EXECUTING\",\"listClientOrderId\":\"c8-l\",\"transactionTime\":3,\"symbol\":\"AAABBB\",\"orders\":[{\"symbol\":\"AAABBB\",\"orderId\":11,\"clientOrderId\":\"c8-a\"}]}]"
         .to_string();
     vec![
         ("/api/v3/account", account),

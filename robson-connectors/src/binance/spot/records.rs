@@ -181,6 +181,10 @@ pub struct SpotOpenOrderList {
     pub order_list_id: i64,
     /// Raw, case kept.
     pub symbol: String,
+    /// The list's own client ID, raw and case kept. Optional so earlier
+    /// bodies without it still decode; absence is never an identity.
+    #[serde(default)]
+    pub list_client_order_id: Option<String>,
     /// Members in the venue's order. The validated decoder requires a member.
     #[serde(deserialize_with = "object_entries")]
     pub orders: Vec<SpotOrderListMember>,
@@ -332,6 +336,9 @@ pub fn decode_open_order_lists(
         }
         if !valid_identity(&list.symbol) {
             return Err(SpotOrderListError::InvalidIdentity { list_id, field: "symbol" });
+        }
+        if list.list_client_order_id.as_deref().is_some_and(|id| !valid_identity(id)) {
+            return Err(SpotOrderListError::InvalidIdentity { list_id, field: "listClientOrderId" });
         }
         if list.orders.is_empty() {
             return Err(SpotOrderListError::NoMembers(list_id));
