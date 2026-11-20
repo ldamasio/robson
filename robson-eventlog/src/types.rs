@@ -1,6 +1,6 @@
 //! Event Log Types
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
@@ -170,3 +170,84 @@ pub enum EventLogError {
 }
 
 pub type Result<T> = std::result::Result<T, EventLogError>;
+
+/// Untrusted event reference with explicit shape validation. Public fields may
+/// contain unvalidated data; even successful validation proves no commit or
+/// ownership. Original coordinates must not be replaced by a projection's
+/// latest event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventCoordinates {
+    pub event_id: Uuid,
+    pub tenant_id: Uuid,
+    pub stream_key: String,
+    pub seq: i64,
+    pub occurred_at: DateTime<Utc>,
+    pub ingested_at: DateTime<Utc>,
+}
+
+impl EventCoordinates {
+    pub fn validate(&self) -> Result<()> {
+        if self.event_id.is_nil()
+            || self.tenant_id.is_nil()
+            || self.stream_key.trim().is_empty()
+            || self.seq <= 0
+        {
+            return Err(EventLogError::InvalidEvent("invalid event coordinates".into()));
+        }
+        Ok(())
+    }
+
+    /// UTC ingestion month only; occurred_at may be in another partition.
+    pub fn ingestion_month(&self) -> (i32, u32) {
+        (self.ingested_at.year(), self.ingested_at.month())
+    }
+}
+
+#[cfg(test)]
+mod coordinate_tests {
+    use super::*;
+
+    fn coordinates() -> EventCoordinates {
+        EventCoordinates {
+            event_id: Uuid::from_u128(1),
+            tenant_id: Uuid::from_u128(2),
+            stream_key: "position:test".into(),
+            seq: 1,
+            occurred_at: "2026-01-31T23:59:59Z".parse().unwrap(),
+            ingested_at: "2026-02-01T00:00:00Z".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn partition_uses_original_ingestion_not_event_occurrence() {
+        let mut c = coordinates();
+        c.validate().unwrap();
+        assert_eq!(c.ingestion_month(), (2026, 2));
+        c.occurred_at = "2025-12-01T00:00:00Z".parse().unwrap();
+        assert_eq!(c.ingestion_month(), (2026, 2));
+    }
+
+    #[test]
+    fn empty_identity_and_nonpositive_sequence_are_rejected() {
+        let original = coordinates();
+        let mut bad = original.clone();
+        bad.event_id = Uuid::nil();
+        assert!(bad.validate().is_err());
+        bad = original.clone();
+        bad.tenant_id = Uuid::nil();
+        assert!(bad.validate().is_err());
+        for stream in ["", " ", "\n"] {
+            bad = original.clone();
+            bad.stream_key = stream.into();
+            assert!(bad.validate().is_err());
+        }
+        for seq in [0, -1, i64::MIN] {
+            bad = original.clone();
+            bad.seq = seq;
+            assert!(bad.validate().is_err());
+        }
+        bad = original;
+        bad.seq = i64::MAX;
+        bad.validate().unwrap();
+    }
+}

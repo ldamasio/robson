@@ -14,6 +14,7 @@ pub fn seen(second: i64) -> SeenAt {
     SeenAt {
         at: DateTime::from_timestamp(1_794_614_400 + second, 0).unwrap(),
         clock: None,
+        capture: None,
     }
 }
 pub fn record() -> VenueOrderRecord {

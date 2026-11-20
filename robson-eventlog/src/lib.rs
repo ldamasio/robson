@@ -40,4 +40,4 @@ pub const QUERY_STATE_CHANGED_EVENT_TYPE: &str = "QUERY_STATE_CHANGED";
 pub use append::append_event;
 pub use idempotency::compute_idempotency_key;
 pub use query::{query_events, query_stream_in_seq_order, QueryOptions};
-pub use types::{ActorType, Event, EventEnvelope, EventLogError};
+pub use types::{ActorType, Event, EventCoordinates, EventEnvelope, EventLogError};

@@ -25,7 +25,7 @@ pub fn venue() -> VenueId {
     VenueId::new(VenueId::BINANCE_SPOT)
 }
 pub fn seen() -> SeenAt {
-    SeenAt { at: at(), clock: None }
+    SeenAt { at: at(), clock: None, capture: None }
 }
 pub fn fill(id: u64, qty: Decimal) -> TradeFill {
     TradeFill {

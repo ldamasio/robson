@@ -8,6 +8,7 @@ fn at(second: i64) -> SeenAt {
     SeenAt {
         at: DateTime::from_timestamp(1_794_614_400 + second, 0).unwrap(),
         clock: None,
+        capture: None,
     }
 }
 
@@ -683,4 +684,43 @@ fn a_quote_subtotal_never_becomes_an_unknown_larger_execution_total() {
                 .changed
         );
     }
+}
+
+#[test]
+fn original_exact_capture_and_legacy_absence_never_get_enriched() {
+    use crate::{clock_records::RawClockCapture, venue_clock::ClockDomain};
+    let mut observed = at(1);
+    let raw = RawClockCapture {
+        epoch: Uuid::from_u128(2),
+        wall_seconds: 1,
+        wall_nanoseconds: 7,
+        domain: ClockDomain::new(Uuid::from_u128(3), -2, 4).unwrap(),
+        before_ns: 5,
+        after_ns: 9,
+    };
+    observed.capture = Some(raw);
+    let r = record();
+    let l = link(OrderOwner::Discovered);
+    let first = merge_order(None, &r, &l, &observed, None).unwrap().order;
+    let mut later = at(2);
+    later.capture = Some(RawClockCapture {
+        wall_nanoseconds: 8,
+        ..raw
+    });
+    let replay = merge_order(Some(&first), &r, &l, &later, None).unwrap();
+    assert!(!replay.changed);
+    assert_eq!(replay.order.live_seen.capture, Some(raw));
+    let legacy = merge_order(None, &r, &l, &at(0), None).unwrap().order;
+    let replay = merge_order(Some(&legacy), &r, &l, &later, None).unwrap();
+    assert!(!replay.changed);
+    assert_eq!(replay.order.live_seen.capture, None);
+    let mut terminal = r.clone();
+    terminal.phase = OrderPhase::Terminal;
+    terminal.status = "CANCELED".into();
+    let first_terminal = merge_order(Some(&first), &terminal, &l, &observed, None)
+        .unwrap()
+        .order;
+    let replay = merge_order(Some(&first_terminal), &terminal, &l, &later, None).unwrap();
+    assert!(!replay.changed);
+    assert_eq!(replay.order.terminal_seen.unwrap().capture, Some(raw));
 }

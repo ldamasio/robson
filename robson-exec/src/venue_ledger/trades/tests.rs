@@ -38,7 +38,7 @@ fn order() -> StoredOrder {
         fills_qty: Decimal::ZERO,
         trades_cursor: 0,
         last_checked_at: at(),
-        live_seen: SeenAt { at: at(), clock: None },
+        live_seen: SeenAt { at: at(), clock: None, capture: None },
         terminal_seen: None,
         expiry_reason: None,
         venue_time_ms: None,

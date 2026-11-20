@@ -29,6 +29,9 @@ tokio = { workspace = true }
 tokio-util = { version = "0.7" }
 axum = { workspace = true }
 reqwest = { workspace = true }
+# Existing locked charset implementation; no new dependency source/version.
+encoding_rs = "=0.8.35"
+mime = "=0.3.17"
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 tower = { workspace = true, features = ["util"] }
 tower-http = { workspace = true }

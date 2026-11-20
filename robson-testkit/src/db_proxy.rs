@@ -80,6 +80,13 @@ pub enum ProxyMode {
     /// do not fire it; explicit transactions and multi-statement simple
     /// queries are excluded. Cached extended executions remain attributable.
     DropAutocommitAckOf(&'static str),
+    /// Dev-only: drop the answer to one matching simple-query `DO` sent after
+    /// an explicit `BEGIN` on the same connection, then close that relay. A
+    /// query binds as a candidate when sent; the mode is claimed only when its
+    /// own answer is exactly `CommandComplete` `DO` then `ReadyForQuery` `T`.
+    /// Errors, other statuses or messages, nonmatching, autocommit, extended
+    /// and earlier queued answers are forwarded untouched, mode still armed.
+    DropSimpleInTransactionAckOf(&'static str),
 }
 
 /// Connection and commit counts.
@@ -103,6 +110,7 @@ struct Counters {
     rollback_acks_dropped: AtomicU64,
     prepared_statement_parses: AtomicU64,
     autocommit_acks_dropped: AtomicU64,
+    simple_in_transaction_acks_dropped: AtomicU64,
 }
 
 /// Optional test SQL only: never startup/authentication or bound parameter
@@ -170,6 +178,37 @@ impl Shared {
         }
         self.mode.send_if_modified(|mode| {
             let fires = matches!(*mode, ProxyMode::DropAutocommitAckOf(text) if sql.contains(text));
+            if fires {
+                *mode = ProxyMode::Pass;
+            }
+            fires
+        })
+    }
+
+    /// A candidate only; nothing is claimed until the server answers it.
+    fn simple_in_transaction_candidate(
+        &self,
+        transaction: &TransactionWatch,
+        tag: u8,
+        body: &[u8],
+    ) -> Option<&'static str> {
+        if tag != b'Q' || !transaction.in_transaction {
+            return None;
+        }
+        let ProxyMode::DropSimpleInTransactionAckOf(needle) = *self.mode.borrow() else {
+            return None;
+        };
+        let sql = simple_query_text(body);
+        let is_do = sql.len() > 2
+            && sql.as_bytes()[..2].eq_ignore_ascii_case(b"DO")
+            && sql.as_bytes()[2].is_ascii_whitespace();
+        (is_do && sql.contains(needle)).then_some(needle)
+    }
+
+    /// Claim on positive server evidence, so only one connection fires it.
+    fn claim_simple_in_transaction_ack_drop(&self, needle: &'static str) -> bool {
+        self.mode.send_if_modified(|mode| {
+            let fires = *mode == ProxyMode::DropSimpleInTransactionAckOf(needle);
             if fires {
                 *mode = ProxyMode::Pass;
             }
@@ -292,6 +331,49 @@ impl TransactionWatch {
     }
 }
 
+/// Binds [`ProxyMode::DropSimpleInTransactionAckOf`] candidates to their own
+/// answer on one connection. Every forwarded simple `Query`, `Sync` and
+/// `FunctionCall` ends in exactly one `ReadyForQuery`, so answers are counted
+/// in order and a reply queued for an earlier request is never attributed to
+/// a later candidate. The startup `ReadyForQuery` answers no request.
+#[derive(Default)]
+struct SimpleAckWatch {
+    requested: AtomicU64,
+    candidate: Mutex<Option<(u64, &'static str)>>,
+}
+
+impl SimpleAckWatch {
+    /// Before forwarding one frontend message.
+    fn request(&self, tag: u8, candidate: Option<&'static str>) {
+        if !matches!(tag, b'Q' | b'S' | b'F') {
+            return;
+        }
+        let ordinal = self.requested.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(needle) = candidate {
+            // Retain only the first eligible outstanding slot per relay.
+            self.candidate.lock().unwrap().get_or_insert((ordinal, needle));
+        }
+    }
+
+    /// The candidate one backend message answers, if any. `answered` counts
+    /// the requests whose `ReadyForQuery` has arrived.
+    fn answering(&self, answered: &mut u64, tag: u8) -> Option<&'static str> {
+        let current = *answered + 1;
+        let mut candidate = self.candidate.lock().unwrap();
+        let needle = candidate
+            .as_ref()
+            .filter(|(ordinal, _)| *ordinal == current)
+            .map(|(_, needle)| *needle);
+        if tag == b'Z' && *answered < self.requested.load(Ordering::SeqCst) {
+            *answered = current;
+            if needle.is_some() {
+                *candidate = None;
+            }
+        }
+        needle
+    }
+}
+
 /// A running proxy. Dropping it stops listening and closes its connections.
 pub struct DbProxy {
     addr: SocketAddr,
@@ -372,6 +454,11 @@ impl DbProxy {
     /// Successful matching autocommits whose completion was swallowed.
     pub fn autocommit_acks_dropped(&self) -> u64 {
         self.shared.counters.autocommit_acks_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Successful matching in-transaction `DO` answers that were swallowed.
+    pub fn simple_in_transaction_acks_dropped(&self) -> u64 {
+        self.shared.counters.simple_in_transaction_acks_dropped.load(Ordering::Relaxed)
     }
 
     /// Change the failure mode.
@@ -540,11 +627,13 @@ async fn relay(mut client: TcpStream, shared: &Shared, id: u64) -> std::io::Resu
     #[cfg(test)]
     let _socket_drop_probe = control_test_support::SocketDropProbe(shared, id);
     let commit_ack_pending = AtomicU8::new(0);
+    let simple_ack = SimpleAckWatch::default();
     let frontend = frontend_to_backend(
         &mut client_read,
         &mut server_write,
         shared,
         &commit_ack_pending,
+        &simple_ack,
         diagnostic.as_ref(),
         id,
     );
@@ -553,6 +642,7 @@ async fn relay(mut client: TcpStream, shared: &Shared, id: u64) -> std::io::Resu
         &mut client_write,
         shared,
         &commit_ack_pending,
+        &simple_ack,
         diagnostic.as_ref(),
         id,
     );
@@ -588,6 +678,7 @@ async fn frontend_to_backend(
     server: &mut OwnedWriteHalf,
     shared: &Shared,
     commit_ack_pending: &AtomicU8,
+    simple_ack: &SimpleAckWatch,
     diagnostic: Option<&diagnostic::Connection<'_>>,
     id: u64,
 ) -> std::io::Result<()> {
@@ -644,6 +735,9 @@ async fn frontend_to_backend(
                     }));
             diagnostic.frontend(tag, category, supported)
         });
+        // Bound before forwarding, so the backend half always knows it first.
+        let candidate = shared.simple_in_transaction_candidate(&transaction, tag, &body);
+        simple_ack.request(tag, candidate);
         transaction.observe(tag, &body);
         frames.forward(server, tag, &body, record, true).await?;
     }
@@ -654,11 +748,16 @@ async fn backend_to_frontend(
     client: &mut OwnedWriteHalf,
     shared: &Shared,
     commit_ack_pending: &AtomicU8,
+    simple_ack: &SimpleAckWatch,
     diagnostic: Option<&diagnostic::Connection<'_>>,
     id: u64,
 ) -> std::io::Result<()> {
     let mut autocommit_complete: Option<Vec<u8>> = None;
     let mut held_record = None;
+    let mut startup = true;
+    let mut answered = 0;
+    let mut held_do: Option<(Vec<u8>, Option<DiagnosticRecord>)> = None;
+    let mut do_spent = false;
     let frames = control::io::Frames {
         shared,
         pending: commit_ack_pending,
@@ -674,6 +773,12 @@ async fn backend_to_frontend(
             }
         };
         let pending = commit_ack_pending.load(Ordering::SeqCst);
+        let candidate = if startup {
+            startup = tag != b'Z';
+            None
+        } else {
+            simple_ack.answering(&mut answered, tag)
+        };
         if let Some(state) = control::active(shared, id) {
             state.check(shared, pending)?;
         }
@@ -727,6 +832,43 @@ async fn backend_to_frontend(
                 return Ok(());
             }
             continue;
+        }
+        if let Some(needle) = candidate {
+            match tag {
+                b'C' if held_do.is_none() && !do_spent && body == b"DO\0" => {
+                    mark(record, DiagnosticDelivery::Held);
+                    held_do = Some((body, record));
+                    continue;
+                },
+                // Positive evidence: the DO completed inside the transaction.
+                b'Z' if body == b"T"
+                    && held_do.is_some()
+                    && shared.claim_simple_in_transaction_ack_drop(needle) =>
+                {
+                    shared
+                        .counters
+                        .simple_in_transaction_acks_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                    mark(held_do.take().and_then(|(_, held)| held), DiagnosticDelivery::Dropped);
+                    mark(record, DiagnosticDelivery::Dropped);
+                    return Ok(());
+                },
+                _ => {
+                    // Notices may precede the completion; anything else, or
+                    // anything after it, means this is not one successful DO.
+                    do_spent |= tag != b'N' || held_do.is_some();
+                    if let Some((complete, held)) = held_do.take() {
+                        if shared.blackholed() {
+                            mark(held, DiagnosticDelivery::Dropped);
+                        } else {
+                            frames.forward(client, b'C', &complete, held, false).await?;
+                        }
+                    }
+                },
+            }
+            if tag == b'Z' {
+                do_spent = false;
+            }
         }
         if shared.blackholed() {
             mark(record, DiagnosticDelivery::Dropped);
@@ -1234,6 +1376,244 @@ mod tests {
             assert_eq!(received, expected);
             assert_eq!(proxy.autocommit_acks_dropped(), 0);
             server.await.unwrap();
+        })
+        .await;
+    }
+}
+
+/// Scripted loopback peers only: these tests never connect to PostgreSQL.
+#[cfg(test)]
+mod simple_in_transaction_ack_tests {
+    use super::{
+        control_tests::{accept, bounded, listening, pair, recv, send},
+        *,
+    };
+
+    const NEEDLE: &str = "spot_transition_fixture";
+    const ARMED: ProxyMode = ProxyMode::DropSimpleInTransactionAckOf(NEEDLE);
+    const DO: &[u8] = b"DO $fixture$ BEGIN PERFORM 'spot_transition_fixture'; END $fixture$;\0";
+    const OTHER_DO: &[u8] = b"DO $fixture$ BEGIN PERFORM 'other_fixture'; END $fixture$;\0";
+    const DONE: &[(u8, &[u8])] = &[(b'C', b"DO\0"), (b'Z', b"T")];
+
+    async fn connect(proxy: &DbProxy, listener: &TcpListener) -> (TcpStream, TcpStream) {
+        let mut client = TcpStream::connect(proxy.addr()).await.unwrap();
+        client.set_nodelay(true).unwrap();
+        client.write_all(&[0, 0, 0, 8, 0, 3, 0, 0]).await.unwrap();
+        let server = accept(listener).await;
+        for tag in [b'R', b'K', b'Z'] {
+            assert_eq!(recv(&mut client).await.0, tag);
+        }
+        (client, server)
+    }
+
+    async fn exchange(
+        client: &mut TcpStream,
+        server: &mut TcpStream,
+        request: &[(u8, &[u8])],
+        reply: &[(u8, &[u8])],
+    ) {
+        send(client, request).await;
+        for (tag, body) in request {
+            assert_eq!(recv(server).await, (*tag, body.to_vec()));
+        }
+        send(server, reply).await;
+        for (tag, body) in reply {
+            assert_eq!(recv(client).await, (*tag, body.to_vec()));
+        }
+    }
+
+    async fn begin(client: &mut TcpStream, server: &mut TcpStream) {
+        let reply: &[(u8, &[u8])] = &[(b'C', b"BEGIN\0"), (b'Z', b"T")];
+        exchange(client, server, &[(b'Q', b"BEGIN\0")], reply).await;
+    }
+
+    fn extended_do() -> Vec<(u8, Vec<u8>)> {
+        vec![
+            (b'P', [b"\0".as_slice(), DO, &[0, 0]].concat()),
+            (b'B', vec![0; 8]),
+            (b'E', vec![0; 5]),
+            (b'S', vec![]),
+        ]
+    }
+
+    #[test]
+    fn answers_bind_in_request_order_and_ignore_the_startup_ready() {
+        let watch = SimpleAckWatch::default();
+        let mut answered = 0;
+        assert_eq!(watch.answering(&mut answered, b'Z'), None, "startup ReadyForQuery");
+        assert_eq!(answered, 0);
+        watch.request(b'Q', None);
+        watch.request(b'P', None);
+        watch.request(b'S', None);
+        watch.request(b'Q', Some("x"));
+        for tag in [b'C', b'Z', b'1', b'Z'] {
+            assert_eq!(watch.answering(&mut answered, tag), None);
+        }
+        assert_eq!(watch.answering(&mut answered, b'C'), Some("x"));
+        assert_eq!(watch.answering(&mut answered, b'Z'), Some("x"));
+        assert_eq!(watch.answering(&mut answered, b'Z'), None, "unrequested ReadyForQuery");
+        assert_eq!(answered, 3);
+    }
+
+    #[tokio::test]
+    async fn a_completed_in_transaction_do_loses_only_its_answer_and_closes() {
+        bounded(async {
+            for notice in [false, true] {
+                let (proxy, mut client, mut server) = pair().await;
+                proxy.set_mode(ARMED);
+                begin(&mut client, &mut server).await;
+                send(&mut client, &[(b'Q', DO)]).await;
+                assert_eq!(recv(&mut server).await, (b'Q', DO.to_vec()));
+                assert_eq!(proxy.mode(), ARMED, "claimed before server evidence");
+                if notice {
+                    send(&mut server, &[(b'N', b"SNOTICE\0Mfixture\0\0")]).await;
+                    assert_eq!(recv(&mut client).await, (b'N', b"SNOTICE\0Mfixture\0\0".to_vec()));
+                }
+                send(&mut server, DONE).await;
+                assert!(client.read_u8().await.is_err(), "the DO answer reached the client");
+                assert!(server.read_u8().await.is_err(), "the relay stayed open");
+                assert_eq!(proxy.simple_in_transaction_acks_dropped(), 1);
+                assert_eq!(proxy.mode(), ProxyMode::Pass);
+                assert_eq!(proxy.stats().commit_acks_dropped, 0);
+                assert_eq!(proxy.rollback_acks_dropped(), 0);
+                assert_eq!(proxy.autocommit_acks_dropped(), 0);
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn anything_but_one_completed_matching_in_transaction_do_is_untouched() {
+        bounded(async {
+            let multi = [&DO[..DO.len() - 1], b" ", DO].concat();
+            let extended = extended_do();
+            let extended: Vec<_> = extended.iter().map(|(t, b)| (*t, b.as_slice())).collect();
+            let error: &[(u8, &[u8])] = &[
+                (b'E', b"SERROR\0C23514\0Mfixture failure\0\0"),
+                (b'Z', b"E"),
+            ];
+            let cases: [(bool, &[(u8, &[u8])], &[(u8, &[u8])]); 8] = [
+                // ErrorResponse, with and without a completion before it.
+                (true, &[(b'Q', DO)], error),
+                (true, &[(b'Q', DO)], &[(b'C', b"DO\0"), error[0], error[1]]),
+                // Completed, but not left inside the transaction.
+                (true, &[(b'Q', DO)], &[(b'C', b"DO\0"), (b'Z', b"I")]),
+                // Something after the completion.
+                (true, &[(b'Q', DO)], &[(b'C', b"DO\0"), (b'N', b"SNOTICE\0\0"), (b'Z', b"T")]),
+                (true, &[(b'Q', OTHER_DO)], DONE),
+                // Implicit/autocommit: never a candidate, whatever the status.
+                (false, &[(b'Q', DO)], DONE),
+                (true, &extended, &[(b'1', b""), (b'2', b""), DONE[0], DONE[1]]),
+                (true, &[(b'Q', &multi)], &[DONE[0], DONE[0], DONE[1]]),
+            ];
+            for (in_transaction, request, reply) in cases {
+                let (proxy, mut client, mut server) = pair().await;
+                proxy.set_mode(ARMED);
+                if in_transaction {
+                    begin(&mut client, &mut server).await;
+                }
+                exchange(&mut client, &mut server, request, reply).await;
+                assert_eq!(proxy.simple_in_transaction_acks_dropped(), 0, "{reply:?}");
+                assert_eq!(proxy.mode(), ARMED, "{reply:?}");
+                // The relay stays open and keeps passing.
+                exchange(&mut client, &mut server, &[(b'Q', b"SELECT 1\0")], &[
+                    (b'C', b"SELECT 1\0"),
+                    (b'Z', b"T"),
+                ])
+                .await;
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn earlier_queued_answers_are_untouched_and_binding_is_per_query() {
+        bounded(async {
+            // Pipelined: an extended Sync and a nonmatching DO answer first.
+            let (proxy, mut client, mut server) = pair().await;
+            proxy.set_mode(ARMED);
+            begin(&mut client, &mut server).await;
+            let extended = extended_do();
+            let mut request: Vec<_> = extended.iter().map(|(t, b)| (*t, b.as_slice())).collect();
+            request.extend([(b'Q', OTHER_DO), (b'Q', DO)]);
+            send(&mut client, &request).await;
+            for (tag, body) in &request {
+                assert_eq!(recv(&mut server).await, (*tag, body.to_vec()));
+            }
+            let earlier: &[(u8, &[u8])] =
+                &[(b'1', b""), (b'2', b""), DONE[0], DONE[1], DONE[0], DONE[1]];
+            send(&mut server, &[earlier, DONE].concat()).await;
+            for (tag, body) in earlier {
+                assert_eq!(recv(&mut client).await, (*tag, body.to_vec()));
+            }
+            assert!(client.read_u8().await.is_err());
+            assert_eq!(proxy.simple_in_transaction_acks_dropped(), 1);
+            assert_eq!(proxy.mode(), ProxyMode::Pass);
+
+            // A matching DO sent before arming answers untouched; the next fires.
+            let (proxy, mut client, mut server) = pair().await;
+            begin(&mut client, &mut server).await;
+            send(&mut client, &[(b'Q', DO)]).await;
+            assert_eq!(recv(&mut server).await, (b'Q', DO.to_vec()));
+            proxy.set_mode(ARMED);
+            send(&mut server, DONE).await;
+            for (tag, body) in DONE {
+                assert_eq!(recv(&mut client).await, (*tag, body.to_vec()));
+            }
+            assert_eq!(proxy.mode(), ARMED);
+            send(&mut client, &[(b'Q', DO)]).await;
+            assert_eq!(recv(&mut server).await, (b'Q', DO.to_vec()));
+            send(&mut server, DONE).await;
+            assert!(client.read_u8().await.is_err());
+            assert_eq!(proxy.simple_in_transaction_acks_dropped(), 1);
+            assert_eq!(proxy.mode(), ProxyMode::Pass);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn only_the_first_connection_with_positive_evidence_claims_the_mode() {
+        bounded(async {
+            let (proxy, listener) = listening().await;
+            let mut autocommit = connect(&proxy, &listener).await;
+            let mut failing = connect(&proxy, &listener).await;
+            let mut winner = connect(&proxy, &listener).await;
+            let mut late = connect(&proxy, &listener).await;
+            for (client, server) in [&mut failing, &mut winner, &mut late] {
+                begin(client, server).await;
+            }
+            proxy.set_mode(ARMED);
+            for (client, server) in [&mut autocommit, &mut failing, &mut winner, &mut late] {
+                send(client, &[(b'Q', DO)]).await;
+                assert_eq!(recv(server).await, (b'Q', DO.to_vec()));
+            }
+            let error: &[(u8, &[u8])] = &[
+                (b'E', b"SERROR\0C23514\0Mfixture failure\0\0"),
+                (b'Z', b"E"),
+            ];
+            for ((client, server), reply) in [(&mut autocommit, DONE), (&mut failing, error)] {
+                send(server, reply).await;
+                for (tag, body) in reply {
+                    assert_eq!(recv(client).await, (*tag, body.to_vec()));
+                }
+                assert_eq!(proxy.mode(), ARMED);
+            }
+            send(&mut winner.1, DONE).await;
+            assert!(winner.0.read_u8().await.is_err());
+            assert_eq!(proxy.mode(), ProxyMode::Pass);
+            // Still a candidate, but the mode was already claimed elsewhere.
+            send(&mut late.1, DONE).await;
+            for (tag, body) in DONE {
+                assert_eq!(recv(&mut late.0).await, (*tag, body.to_vec()));
+            }
+            assert_eq!(proxy.simple_in_transaction_acks_dropped(), 1);
+            for (client, server) in [&mut autocommit, &mut failing, &mut late] {
+                exchange(client, server, &[(b'Q', b"SELECT 1\0")], &[
+                    (b'C', b"SELECT 1\0"),
+                    (b'Z', b"I"),
+                ])
+                .await;
+            }
         })
         .await;
     }
