@@ -1492,7 +1492,8 @@ mod simple_in_transaction_ack_tests {
                 (b'E', b"SERROR\0C23514\0Mfixture failure\0\0"),
                 (b'Z', b"E"),
             ];
-            let cases: [(bool, &[(u8, &[u8])], &[(u8, &[u8])]); 8] = [
+            type Frames<'a> = &'a [(u8, &'a [u8])];
+            let cases: [(bool, Frames, Frames); 8] = [
                 // ErrorResponse, with and without a completion before it.
                 (true, &[(b'Q', DO)], error),
                 (true, &[(b'Q', DO)], &[(b'C', b"DO\0"), error[0], error[1]]),

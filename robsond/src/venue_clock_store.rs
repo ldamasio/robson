@@ -57,6 +57,8 @@ impl Session {
 }
 
 impl ClockSampleStore {
+    /// Only the dormant clock owner and its tests construct a store.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_committed_epoch(
         pool: &PgPool,
         tenant: Uuid,

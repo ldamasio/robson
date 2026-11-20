@@ -38,13 +38,15 @@ pub(super) fn capture(domain: ClockDomain, tick: i128) -> Result<TickCapture, Bu
     .map_err(|_| BudgetError::Invalid)
 }
 
+type ObservedState = (Uuid, Uuid, i64, i64, String, Option<Uuid>, Option<Uuid>, i16, i16, String);
+
 pub(crate) struct BootstrapRows {
     pub(super) start: TickCapture,
     pub(super) active: Vec<(Uuid, Option<TickCapture>)>,
     pub(super) pause: Option<PauseValue>,
     // Retain the observed state; none of these descriptive fields grants
     // current-domain comparability or production readiness.
-    _state: (Uuid, Uuid, i64, i64, String, Option<Uuid>, Option<Uuid>, i16, i16, String),
+    _state: ObservedState,
 }
 
 pub(super) fn check_state(row: &PgRow, input: &BootstrapInput) -> Result<(), BudgetError> {

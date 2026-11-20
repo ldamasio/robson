@@ -37,6 +37,8 @@ pub(super) fn faults(mask: u8, new: u8) {
         }
     }
 }
+// A Prometheus gauge value in seconds, not a financial amount.
+#[allow(clippy::disallowed_types)]
 pub(super) fn uncertainty(u2: i128) {
     UNCERTAINTY.set(u2 as f64 / 2_000_000_000.0);
 }

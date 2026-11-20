@@ -81,11 +81,17 @@ mod ledger_connection;
 pub mod order_journal_store;
 #[cfg(feature = "postgres")]
 pub mod process_epoch;
+// The Spot TIME and request-budget owner is dormant: no production caller
+// until the Spot runtime is wired, while production still refuses
+// `binance_spot`. Its tests exercise it.
 #[cfg(feature = "postgres")]
+#[cfg_attr(not(test), allow(dead_code))]
 mod venue_budget;
 #[cfg(feature = "postgres")]
+#[cfg_attr(not(test), allow(dead_code))]
 mod venue_clock_http;
 #[cfg(feature = "postgres")]
+#[cfg_attr(not(test), allow(dead_code))]
 mod venue_clock_owner;
 #[cfg(feature = "postgres")]
 mod venue_clock_store;
