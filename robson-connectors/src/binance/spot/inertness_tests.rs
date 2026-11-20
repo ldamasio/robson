@@ -775,6 +775,13 @@ fn nothing_outside_the_spot_module_names_it() {
             "#![cfg(all(test, feature = \"crash-points\"))]\n",
         ),
         (
+            clock_dir.as_path(),
+            "c8_attribution.rs",
+            "pg_tests.rs",
+            "mod c8_attribution",
+            "#![cfg(all(test, feature = \"crash-points\"))]\n",
+        ),
+        (
             connector_dir.as_path(),
             "spot_inventory_wire_tests.rs",
             "binance_rest.rs",
