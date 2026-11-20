@@ -28,8 +28,6 @@
 //! // (See process_active_position for full example)
 //! ```
 
-#![warn(clippy::all)]
-
 // Trading strategy modules
 pub mod risk;
 pub mod signal_strategy;

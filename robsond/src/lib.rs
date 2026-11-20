@@ -39,8 +39,6 @@
 //! }
 //! ```
 
-#![warn(clippy::all)]
-
 pub mod api;
 pub mod auth;
 pub mod circuit_breaker;
