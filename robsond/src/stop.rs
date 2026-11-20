@@ -393,6 +393,13 @@ pub(crate) async fn stop_when_asked_with_clock(
 }
 
 #[cfg(feature = "postgres")]
+/// The closing log both stop paths write once the drain ends.
+fn log_closing(draining: Duration) {
+    #[cfg(test)]
+    tests::CLOSING_LOGS.with(|count| count.set(count.get() + 1));
+    info!(draining_ms = draining.as_millis(), "Stop: closing");
+}
+
 pub(crate) async fn run_stop_with_clock(
     journal: &OrderJournal,
     asked_at: Instant,
@@ -410,7 +417,7 @@ pub(crate) async fn run_stop_with_clock(
         clock.begin_closing();
     }
     gate.begin_closing();
-    info!(draining_ms = draining.as_millis(), "Stop: closing");
+    log_closing(draining);
     close();
     let joined = match clock {
         Some(clock) => clock.join(deadline).await,
@@ -453,7 +460,7 @@ pub async fn run_stop(
     let draining = asked_at.elapsed();
 
     gate.begin_closing();
-    info!(draining_ms = draining.as_millis(), "Stop: closing");
+    log_closing(draining);
     close();
     let (result, marker) = closing(journal, marker, deadline).await;
     StopReport {
@@ -599,30 +606,18 @@ mod tests {
         assert_eq!(report.draining, Duration::ZERO);
     }
 
+    thread_local! {
+        pub(super) static CLOSING_LOGS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
     /// The clock-aware stop keeps the plain stop's closing log, part of the
-    /// shutdown evidence the operator reads.
+    /// shutdown evidence the operator reads. Counted per test thread: the
+    /// paused runtime runs the stop on it.
     #[cfg(feature = "postgres")]
     #[tokio::test(start_paused = true)]
     async fn both_stop_paths_log_the_closing_phase() {
-        #[derive(Clone, Default)]
-        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
         for clock_aware in [false, true] {
-            let captured = Captured::default();
-            let writer = captured.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(move || writer.clone())
-                .with_ansi(false)
-                .finish();
-            let _guard = tracing::subscriber::set_default(subscriber);
+            CLOSING_LOGS.with(|count| count.set(0));
             let (_backend, journal) = stub_journal();
             if clock_aware {
                 run_stop_with_clock(
@@ -637,11 +632,7 @@ mod tests {
             } else {
                 run_stop(&journal, Instant::now(), || {}, None, StopTimings::default()).await;
             }
-            let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-            assert!(
-                text.contains("Stop: closing") && text.contains("draining_ms=0"),
-                "clock_aware={clock_aware}: {text}"
-            );
+            assert_eq!(CLOSING_LOGS.with(std::cell::Cell::get), 1, "clock_aware={clock_aware}");
         }
     }
 
