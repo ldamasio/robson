@@ -340,53 +340,71 @@ mod session_bounds_tests {
         every_pool_through_the_wiring(url(&pool), None).await;
     }
 
-    /// The parent's database, given only to the child process of
-    /// [`pgoptions_are_kept_through_the_wiring_in_a_process_of_their_own`].
+    /// Given only to the child processes of
+    /// [`startup_options_are_kept_through_the_wiring_in_processes_of_their_own`]:
+    /// the parent's database, and the `work_mem` its `PGOPTIONS` sets (absent
+    /// when the child starts without `PGOPTIONS`).
     const CHILD_DATABASE_URL: &str = "ROBSON_SESSION_BOUNDS_CHILD_DATABASE_URL";
-    const CHILD_PROVED: &str = "session-bounds child: PGOPTIONS proof ran";
+    const CHILD_WORK_MEM: &str = "ROBSON_SESSION_BOUNDS_CHILD_WORK_MEM";
+    const CHILD_PROVED: &str = "session-bounds child proof ran:";
 
-    /// The child half of the `PGOPTIONS` proof. It proves something only in the
-    /// process that test starts, with `PGOPTIONS` and the parent's database in
-    /// its environment from birth; anywhere else it returns at once, and the
-    /// parent accepts only the marker it prints after the proof.
+    /// The child half of the startup-options proof. It proves something only
+    /// in a process that test starts, with its environment set from birth;
+    /// anywhere else it returns at once, and the parent accepts only the
+    /// marker printed after the proof.
     #[tokio::test]
-    #[ignore = "child of pgoptions_are_kept_through_the_wiring_in_a_process_of_their_own"]
-    async fn pgoptions_child() {
+    #[ignore = "child of startup_options_are_kept_through_the_wiring_in_processes_of_their_own"]
+    async fn startup_options_child() {
         let Ok(url) = std::env::var(CHILD_DATABASE_URL) else {
             return;
         };
-        every_pool_through_the_wiring(url, Some("16MB")).await;
-        println!("{CHILD_PROVED}");
+        let work_mem = std::env::var(CHILD_WORK_MEM).ok();
+        let pgoptions = std::env::var_os("PGOPTIONS");
+        assert_eq!(pgoptions.is_some(), work_mem.is_some(), "PGOPTIONS as the parent set it");
+        every_pool_through_the_wiring(url, work_mem.as_deref()).await;
+        let case = if pgoptions.is_some() {
+            "PGOPTIONS set"
+        } else {
+            "PGOPTIONS unset"
+        };
+        println!("{CHILD_PROVED} {case}");
     }
 
-    /// The same proof with `PGOPTIONS`, in a child process of this test binary
-    /// started with it: this process's environment is never changed, so no
-    /// test running beside it sees the setting.
+    /// The proof in two child processes of this test binary, one started with
+    /// `PGOPTIONS` and one without it: this process's environment is never
+    /// changed, so no test running beside it sees either.
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
-    async fn pgoptions_are_kept_through_the_wiring_in_a_process_of_their_own(pool: sqlx::PgPool) {
-        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "session_bounds_tests::pgoptions_child",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env("PGOPTIONS", "-c work_mem=16MB")
-            .env(CHILD_DATABASE_URL, url(&pool))
-            .output()
-            .await
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success()
-                && stdout.contains(CHILD_PROVED)
-                && stdout.contains("test result: ok. 1 passed"),
-            "child: {}\n{stdout}\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
+    async fn startup_options_are_kept_through_the_wiring_in_processes_of_their_own(
+        pool: sqlx::PgPool,
+    ) {
+        for (case, pgoptions) in [("PGOPTIONS set", true), ("PGOPTIONS unset", false)] {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "session_bounds_tests::startup_options_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_DATABASE_URL, url(&pool))
+                .env_remove("PGOPTIONS")
+                .env_remove(CHILD_WORK_MEM);
+            if pgoptions {
+                child.env("PGOPTIONS", "-c work_mem=16MB").env(CHILD_WORK_MEM, "16MB");
+            }
+            let output = child.output().await.unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success()
+                    && stdout.contains(&format!("{CHILD_PROVED} {case}"))
+                    && stdout.contains("test result: ok. 1 passed"),
+                "{case} child: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     /// T7: with bounds that differ from the expected ones, the start fails on
