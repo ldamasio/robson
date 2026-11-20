@@ -4,9 +4,12 @@
 //! candidate blocked and resolves it only when a fresh exact venue record
 //! equals durable state that stayed byte-identical across the lookup. It is
 //! read-only: no ledger, projection or gate write. No live loop selects it.
+//! It may follow one exact installed successor generation and one exact
+//! committed advance of its retained evidence; neither resolves it.
 
 use robson_domain::OrderSide;
 use robson_exec::{
+    gate::PendingExecutionEvidence,
     venue::{OrderObservation, OrderPhase, VenueId, VenueOrderRecord},
     venue_ledger::{LedgerError, LegOrderKind, OrderKey, OrderLink, OrderOwner},
 };
@@ -92,6 +95,9 @@ pub(super) enum RestartState {
 
 pub(super) struct RestartExecutionBlocker<'pool> {
     pool: &'pool PgPool,
+    /// The true unclean predecessor's projection, kept after installation.
+    predecessor: JournalGeneration,
+    /// The projection the durable fingerprint is currently bound to.
     generation: JournalGeneration,
     key: OrderKey,
     link: OrderLink,
@@ -141,6 +147,7 @@ impl<'pool> RestartExecutionBlocker<'pool> {
             read_candidate(pool, generation.tenant_id, &key, intent_id, position_id).await?;
         let blocker = Self {
             pool,
+            predecessor: generation.clone(),
             generation: generation.clone(),
             key,
             link,
@@ -167,6 +174,107 @@ impl<'pool> RestartExecutionBlocker<'pool> {
         self.retained.as_ref().map(|(executed, _)| *executed)
     }
 
+    /// Follow one exact fixture-installed successor projection. Against the
+    /// full prior fingerprint, only the generation, its source audit and its
+    /// projection epoch may move; accounting stays exactly where it was. The
+    /// true predecessor is kept, and the blocker stays held.
+    pub(super) async fn adopt_installed(
+        &mut self,
+        installed: &JournalGeneration,
+    ) -> Result<(), LedgerError> {
+        if self.state != RestartState::Blocked
+            || self.retained.is_some()
+            || self.generation != self.predecessor
+            || !installed.is_valid()
+            || installed.tenant_id != self.predecessor.tenant_id
+            || installed.account_scope != self.predecessor.account_scope
+            || installed.generation_id == self.predecessor.generation_id
+            || installed.source_audit_id == self.predecessor.source_audit_id
+            || installed.process_epoch != self.successor.epoch_id
+        {
+            return Err(LedgerError::IdentityConflict);
+        }
+        let expected = DurableCandidate {
+            generation_id: installed.generation_id,
+            source_audit_id: Some(installed.source_audit_id),
+            projection_epoch: Some(installed.process_epoch),
+            ..self.durable.clone()
+        };
+        if self.read().await? != expected {
+            return Err(LedgerError::Invariant(
+                "installed projection moved more than its generation".into(),
+            ));
+        }
+        self.generation = installed.clone();
+        self.durable = expected;
+        self.admissible()
+    }
+
+    /// The retained newer record with its original marks, for one projected
+    /// write under the installed generation, never the obsolete predecessor.
+    /// It stays retained until its commit is independently read back.
+    pub(super) fn retained_advance(
+        &self,
+    ) -> Result<(VenueOrderRecord, PendingExecutionEvidence), LedgerError> {
+        let d = &self.durable;
+        let Some((record, evidence)) =
+            self.retained.as_ref().and_then(|(_, receipt)| receipt.execution())
+        else {
+            return Err(LedgerError::Invariant("no retained execution".into()));
+        };
+        let newer = record.executed_qty > d.executed
+            && record.executed_qty < d.orig_qty
+            && matches!(
+                (d.quote, record.cumulative_quote_qty),
+                (Some(old), Some(new)) if new > old
+            )
+            && matches!(
+                (d.update_time_ms, record.update_time_ms),
+                (Some(old), Some(new)) if new > old
+            );
+        if self.state != RestartState::Blocked
+            || self.generation == self.predecessor
+            || !self.same_order(record)
+            || !newer
+            || evidence.send.epoch != self.successor.epoch_id
+            || evidence.receive.epoch != self.successor.epoch_id
+        {
+            return Err(LedgerError::InvalidEvidence("not an exact newer execution".into()));
+        }
+        Ok((record.clone(), evidence))
+    }
+
+    /// Follow the one confirmed projected commit of the retained record. The
+    /// independent read must show exactly its financial facts at one more
+    /// accounting version, with nothing else moved. The blocker stays held:
+    /// only a later fresh exact governed receipt can resolve it.
+    pub(super) async fn adopt_commit(
+        &mut self,
+        accounting_version: i64,
+    ) -> Result<(), LedgerError> {
+        let (record, _) = self.retained_advance()?;
+        let d = &self.durable;
+        if d.projected_version != Some(d.accounting_version)
+            || d.accounting_version.checked_add(1) != Some(accounting_version)
+        {
+            return Err(LedgerError::Invariant("commit is not the next accounting version".into()));
+        }
+        let expected = DurableCandidate {
+            executed: record.executed_qty,
+            quote: record.cumulative_quote_qty,
+            update_time_ms: record.update_time_ms,
+            projected_version: Some(accounting_version),
+            accounting_version,
+            ..d.clone()
+        };
+        if self.read().await? != expected {
+            return Err(LedgerError::Invariant("committed advance differs from retained".into()));
+        }
+        self.durable = expected;
+        self.retained = None;
+        self.admissible()
+    }
+
     /// The exact pre-lookup snapshot must still be current. The returned
     /// borrow is the sole path to applying one subsequent governed receipt.
     pub(super) async fn precheck(&mut self) -> Result<RestartPrecheck<'_, 'pool>, LedgerError> {
@@ -182,7 +290,7 @@ impl<'pool> RestartExecutionBlocker<'pool> {
             && d.latest_seq == self.successor.epoch_seq
             && d.latest_open
             && d.latest_seq > 0
-            && d.prior_epoch == g.process_epoch
+            && d.prior_epoch == self.predecessor.process_epoch
             && d.prior_unclean
             && d.generation_id == g.generation_id
             && d.source_audit_id == Some(g.source_audit_id)
@@ -212,6 +320,15 @@ impl<'pool> RestartExecutionBlocker<'pool> {
 
     fn matches(&self, r: &VenueOrderRecord) -> bool {
         let d = &self.durable;
+        self.same_order(r)
+            && r.executed_qty == d.executed
+            && r.cumulative_quote_qty == d.quote
+            && r.update_time_ms == d.update_time_ms
+    }
+
+    /// The exact linked order and shape, with its execution facts present.
+    fn same_order(&self, r: &VenueOrderRecord) -> bool {
+        let d = &self.durable;
         r.exchange_order_id == self.key.exchange_order_id.to_string()
             && r.client_order_id == self.link.client_order_id
             && r.orig_client_order_id
@@ -227,11 +344,8 @@ impl<'pool> RestartExecutionBlocker<'pool> {
             && r.expiry_reason.is_none()
             && r.quantities_consistent()
             && r.orig_qty == d.orig_qty
-            && r.executed_qty == d.executed
             && r.cumulative_quote_qty.is_some()
-            && r.cumulative_quote_qty == d.quote
             && r.update_time_ms.is_some()
-            && r.update_time_ms == d.update_time_ms
     }
 
     async fn read(&self) -> Result<DurableCandidate, LedgerError> {

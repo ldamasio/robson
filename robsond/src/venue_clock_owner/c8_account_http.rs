@@ -53,9 +53,9 @@ impl AccountFixture {
         Self::owned_order_answer(deadline, None, 200, owned_order_body()).await
     }
 
-    pub(super) async fn restart_order_answers(
+    pub(super) async fn restart_order_answers<const N: usize>(
         deadline: Instant,
-        answers: [(u16, String); 6],
+        answers: [(u16, String); N],
     ) -> anyhow::Result<Self> {
         const KEY: &str = "/api/v3/order?symbol=BTCUSDT&orderId=417013";
         Self::respond(

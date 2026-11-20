@@ -86,7 +86,10 @@ fn sell(executed: Decimal, update_ms: i64) -> VenueOrderRecord {
 }
 
 fn order_body(executed: &str, quote: &str) -> String {
-    let updated = UPDATE_MS + 1_000;
+    order_body_at(executed, quote, UPDATE_MS + 1_000)
+}
+
+fn order_body_at(executed: &str, quote: &str, updated: i64) -> String {
     format!(
         r#"{{"symbol":"BTCUSDT","orderId":417013,"orderListId":-1,"clientOrderId":"{CLIENT}","price":"0","origQty":"10000","executedQty":"{executed}","cummulativeQuoteQty":"{quote}","status":"PARTIALLY_FILLED","timeInForce":"GTC","type":"MARKET","side":"SELL","stopPrice":"0","time":{UPDATE_MS},"updateTime":{updated},"workingTime":-1,"selfTradePreventionMode":"EXPIRE_MAKER"}}"#
     )
@@ -153,11 +156,27 @@ fn parse_marker(line: &str) -> Result<OldReport> {
     })
 }
 
-#[sqlx::test(migrations = false)]
-#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
-async fn projected_native_order_pending_execution_recovers_after_restart(
-    pool: PgPool,
-) -> Result<()> {
+/// The accepted restart prefix, shared by every successor proof: one live
+/// linked SELL, an old owner whose 0.25 COMMIT landed while its reply was
+/// dropped, SIGKILL and reap, retired backend and sessions, and an actual
+/// unclean successor epoch whose own gate starts fenced.
+struct Restart {
+    f: support::Fixture,
+    clock: Arc<NativeClock>,
+    input: venue_budget::bootstrap::BootstrapInput,
+    intent: Uuid,
+    binding: JournalGeneration,
+    order_link: OrderLink,
+    seeded: i64,
+    successor: process_epoch::EpochStart,
+    journal: OrderJournal,
+    upstream: std::net::SocketAddr,
+    child_pid: u32,
+    durable: (Decimal, Option<Decimal>, Option<i64>, Uuid),
+}
+
+async fn restart_after_lost_ack(pool: &PgPool) -> Result<Restart> {
+    let pool = pool.clone();
     setup_tables(&pool).await?;
     let clock = Arc::new(NativeClock::initialize()?);
     let traces = venue_budget::Trace::default();
@@ -294,13 +313,26 @@ async fn projected_native_order_pending_execution_recovers_after_restart(
         successor.open_incidents.clone(),
     );
     ensure!(gate.fenced(), "unclean successor starts with the native fence");
-    let frozen = support::snapshot(&pool).await;
-    let accounting = f.version(&pool).await;
+    Ok(Restart {
+        f,
+        clock,
+        input,
+        intent,
+        binding,
+        order_link,
+        seeded,
+        successor,
+        journal: successor_journal,
+        upstream,
+        child_pid,
+        durable,
+    })
+}
 
-    let deadline = Instant::now() + Duration::from_secs(148);
-    let proxy = DbProxy::start(upstream).await?;
-    proxy.enable_exact_query_trace(24);
-    let readonly_options = options
+/// One bounded read-only reader session through the tracing proxy.
+async fn read_only(pool: &PgPool, proxy: &DbProxy) -> Result<PgPool> {
+    let readonly_options = pool
+        .connect_options()
         .as_ref()
         .clone()
         .host(&proxy.addr().ip().to_string())
@@ -320,6 +352,35 @@ async fn projected_native_order_pending_execution_recovers_after_restart(
     let session_readonly: String =
         sqlx::query_scalar("SHOW transaction_read_only").fetch_one(&readonly).await?;
     ensure!(session_readonly == "on");
+    Ok(readonly)
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_native_order_pending_execution_recovers_after_restart(
+    pool: PgPool,
+) -> Result<()> {
+    let Restart {
+        f,
+        clock,
+        input,
+        binding,
+        order_link,
+        successor,
+        journal: successor_journal,
+        upstream,
+        child_pid,
+        durable,
+        ..
+    } = restart_after_lost_ack(&pool).await?;
+    let gate = successor_journal.gate();
+    let frozen = support::snapshot(&pool).await;
+    let accounting = f.version(&pool).await;
+
+    let deadline = Instant::now() + Duration::from_secs(148);
+    let proxy = DbProxy::start(upstream).await?;
+    proxy.enable_exact_query_trace(24);
+    let readonly = read_only(&pool, &proxy).await?;
     let mut lookup = RestartLookup::new(clock, deadline);
     let outcomes = timeout_at(deadline, async {
         let foreign = RestartExecutionBlocker::reconstruct(
@@ -540,3 +601,6 @@ async fn old_owner(
     tokio::time::sleep(Duration::from_secs(60)).await;
     Err(anyhow!("old owner was not killed"))
 }
+
+#[path = "advance.rs"]
+mod advance;

@@ -1,5 +1,8 @@
 //! Controlled GET witness for one native restart. No live callers.
-use robson_exec::venue::OrderObservation;
+use robson_exec::{
+    gate::PendingExecutionEvidence,
+    venue::{OrderObservation, VenueOrderRecord},
+};
 use robson_testkit::db_proxy::DbProxy;
 
 use super::*;
@@ -16,6 +19,20 @@ impl GovernedRestartRead {
             && self.receipt.receive.epoch == epoch)
             .then_some(&self.receipt.observation)
     }
+
+    /// A found record with its original first-poll mark and EOF capture,
+    /// never restamped. A raw capture alone authorizes nothing.
+    pub(crate) fn execution(&self) -> Option<(&VenueOrderRecord, PendingExecutionEvidence)> {
+        let OrderObservation::Found(record) = &self.receipt.observation else {
+            return None;
+        };
+        Some((record, PendingExecutionEvidence {
+            sample: self.receipt.mark.sample,
+            send: self.receipt.mark.raw,
+            receive: self.receipt.receive,
+            executed: record.executed_qty,
+        }))
+    }
 }
 
 pub(crate) struct RestartLookup {
@@ -27,6 +44,7 @@ pub(crate) struct RestartLookup {
     slot: Option<inventory::OwnedOrderPreparation>,
     sample: Option<Uuid>,
     reads: usize,
+    armed: usize,
 }
 
 impl RestartLookup {
@@ -40,18 +58,21 @@ impl RestartLookup {
             slot: None,
             sample: None,
             reads: 0,
+            armed: 0,
         }
     }
 
-    pub(crate) async fn arm(
+    pub(crate) async fn arm<const N: usize>(
         &mut self,
         pool: &PgPool,
         tenant: Uuid,
         start: &process_epoch::EpochStart,
         input: &bootstrap::BootstrapInput,
-        answers: [(u16, String); 6],
+        answers: [(u16, String); N],
     ) -> anyhow::Result<()> {
         ensure!(start.predecessor.unclean_reason() == Some("no_marker"));
+        ensure!(N > 0 && self.armed == 0, "one scripted lookup per witness");
+        self.armed = N;
         let due = self.deadline.min(Instant::now() + Duration::from_secs(2));
         let trace = Trace::default();
         let mut rows = bootstrap::observe_bootstrap(pool, tenant, start, input, due, &trace)
@@ -151,11 +172,17 @@ impl RestartLookup {
         Ok(GovernedRestartRead { receipt, started })
     }
 
+    /// Every scripted answer was read. Check actual remaining capacity:
+    /// 400 - (1 TIME + 4 per GET), as 20-weight ACCOUNT then unit TIME.
     pub(crate) fn verify_weight(&self) -> anyhow::Result<()> {
-        ensure!(self.reads == 6);
+        ensure!(self.armed > 0 && self.reads == self.armed);
         let owner = self.owner.as_ref().context("successor owner")?;
-        // 400 - (1 TIME + 6*4 GET) = 375. Check actual remaining capacity.
-        verify_budget_remaining(&owner.budget, &self.clock, 18, 15)
+        let remaining = 400 - (1 + 4 * self.reads);
+        verify_budget_remaining(&owner.budget, &self.clock, remaining / 20, remaining % 20)
+    }
+
+    pub(crate) fn reads(&self) -> usize {
+        self.reads
     }
 
     pub(crate) async fn finish(

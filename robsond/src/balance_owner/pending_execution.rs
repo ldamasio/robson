@@ -140,9 +140,27 @@ impl<'ledger> OrderExecutionReceiver<'ledger> {
     pub(super) fn pending(&self) -> Option<PendingExecutionEvidence> {
         self.gate.pending()
     }
+
+    /// Repeat one already-registered original record through the same
+    /// projected writer at its original receive mark. It issues no ticket and
+    /// never retires the pending slot.
+    pub(super) async fn replay_original(
+        &self,
+        record: &VenueOrderRecord,
+        evidence: PendingExecutionEvidence,
+    ) -> Result<(bool, bool), LedgerError> {
+        if self.gate.pending() != Some(evidence) || record.executed_qty != evidence.executed {
+            return Err(LedgerError::InvalidEvidence("not the pending original".into()));
+        }
+        let (result, commit) = self
+            .ledger
+            .record_order_observed(record, &self.link, receive_mark(evidence)?)
+            .await?;
+        Ok((result.changed, commit.is_some()))
+    }
 }
 
-fn receive_mark(evidence: PendingExecutionEvidence) -> Result<SeenAt, LedgerError> {
+pub(super) fn receive_mark(evidence: PendingExecutionEvidence) -> Result<SeenAt, LedgerError> {
     let at = DateTime::<Utc>::from_timestamp(
         evidence.receive.wall_seconds,
         evidence.receive.wall_nanoseconds,
