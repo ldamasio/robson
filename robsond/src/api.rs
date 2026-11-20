@@ -1002,6 +1002,13 @@ where
     let Some(axum::Extension(identity)) = identity else {
         return Err(fail(StatusCode::UNAUTHORIZED, "a verified identity is required"));
     };
+    // ADR-0056 step 8: this legacy decision opens an unbounded journal
+    // transaction, so a balance account is refused before any SQL.
+    crate::capability::require_position_account(
+        &state.exchange.capabilities(),
+        "recovery disposition",
+    )
+    .map_err(|error| fail(StatusCode::BAD_REQUEST, &error.to_string()))?;
     let note = body.note.trim();
     if note.is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, "a note is required"));
@@ -5581,6 +5588,66 @@ mod tests {
         let app = disposition_app(pool.clone(), Arc::new(OrderJournal::unpersisted()), None).await;
         let (status, _) = post_disposition(&app, None, accepted_risk(intent_id)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A balance account never reaches the legacy disposition's unbounded
+    /// transaction: refused before any SQL, here against a database that
+    /// cannot be reached, which would otherwise answer 503.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn a_balance_account_disposition_is_refused_before_any_sql() {
+        let exchange = Arc::new(crate::capability::test_exchange::RestrictedExchange::new());
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(8));
+        let executor = Arc::new(Executor::new(
+            exchange.clone(),
+            Arc::new(IntentJournal::new()),
+            store.clone(),
+        ));
+        let manager = PositionManager::new(
+            Engine::new(RiskConfig::new(dec!(10000)).unwrap()),
+            executor,
+            store,
+            event_bus.clone(),
+            Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
+        );
+        let circuit_breaker = manager.circuit_breaker();
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://robson@127.0.0.1:1/unreachable")
+            .unwrap();
+        let state = Arc::new(ApiState {
+            exchange: exchange.clone(),
+            position_manager: Arc::new(RwLock::new(manager)),
+            event_bus,
+            circuit_breaker,
+            wallet_balance_cache: Mutex::new(None),
+            pg_pool: Some(Arc::new(unreachable)),
+            tenant_id: None,
+            google_auth: None,
+            legacy_api_token: None,
+            funding: FundingConfig::default(),
+            funding_route_mode: FundingRouteMode::Selected,
+            venue_feed: VenueFeedView::default(),
+            order_journal: Arc::new(OrderJournal::unpersisted().with_balance_account(true)),
+        });
+        let body: DispositionBody = serde_json::from_value(accepted_risk(Uuid::now_v7())).unwrap();
+
+        let (status, Json(error)) = recovery_disposition_handler(
+            State(state),
+            Some(axum::Extension(OperatorIdentity::legacy_token())),
+            Json(body),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", error.error);
+        assert_eq!(
+            error.error,
+            "Configuration error: recovery disposition requires a position account"
+        );
+        assert_eq!(exchange.requests(), 0);
     }
 
     /// An intent this process is still working on cannot be decided on.
