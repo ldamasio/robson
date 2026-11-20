@@ -412,7 +412,8 @@ async fn scan(
 ) -> Result<Scanned> {
     rig.settle(attempts).await?;
     let listener = Listener::triples(Instant::now() + Duration::from_secs(60), answers).await?;
-    let scanned = rig.scan(inputs, &listener, between).await;
+    // Boxed: each case's call site stays small on the pinned 1 MiB test stack.
+    let scanned = Box::pin(rig.scan(inputs, &listener, between)).await;
     let finished = listener.finish(Instant::now() + Duration::from_secs(5)).await;
     let scanned = scanned?;
     finished?;
@@ -562,7 +563,7 @@ async fn base_cases(pool: &PgPool, tenant: Uuid, rig: &mut ReconciliationRig) ->
         )
         .await?;
         clean("n1", &n1)?;
-        costs("n1", &n1, 1, 2, 3, 106)?;
+        costs("n1", &n1, 1, 2, 3, 32)?;
         let account = n1.account.context("n1 ACCOUNT receipt")?;
         let i = interval(&n1)?;
         let u = (account.u2 + 1) / 2;
@@ -595,7 +596,7 @@ async fn base_cases(pool: &PgPool, tenant: Uuid, rig: &mut ReconciliationRig) ->
         let excess = Finding::BaseExcess { holdings: dec!(1.499), upper: dec!(1) };
         findings("n2", &n2, std::slice::from_ref(&excess))?;
         ensure!(consequence(&excess) == Consequence::FenceAndPage, "n2: consequence");
-        costs("n2", &n2, 1, 2, 3, 106)?;
+        costs("n2", &n2, 1, 2, 3, 32)?;
     }
     if wanted("n3") {
         let n3 = scan(
@@ -616,21 +617,46 @@ async fn base_cases(pool: &PgPool, tenant: Uuid, rig: &mut ReconciliationRig) ->
         ])?;
     }
     if wanted("n4") {
-        // A foreign BTC lock from another pair; its list is ignored.
-        let foreign = order("ETHBTC", 77, 5, "foreign-buy", "LIMIT", "BUY", Decimal::ZERO);
+        // A foreign BTC lock from another pair's order: the scoped orders do
+        // not show it, ACCOUNT does. Its account-wide list is ignored.
         let n4 = scan(
             rig,
             &ctx.inputs(b),
             1,
             &[triple(
                 btc(dec!(0), dec!(1)),
-                &[robson.clone(), foreign],
+                std::slice::from_ref(&robson),
                 &[list("ETHBTC", 5, "foreign-oco", 77)],
             )],
             None,
         )
         .await?;
-        findings("n4", &n4, &[Finding::LockedForeign { locked: dec!(1), robson: dec!(0.999) }])?;
+        let foreign = Finding::LockedForeign { locked: dec!(1), robson: dec!(0.999) };
+        findings("n4", &n4, std::slice::from_ref(&foreign))?;
+        ensure!(consequence(&foreign) == Consequence::FenceAndPage, "n4: consequence");
+        costs("n4", &n4, 1, 2, 3, 32)?;
+    }
+    if wanted("nB") {
+        // A scoped answer naming another pair is refused whole, never retried:
+        // no list request, no post and no conclusion.
+        let other = order("ETHBTC", 77, 5, "foreign-buy", "LIMIT", "BUY", Decimal::ZERO);
+        let nb = scan(
+            rig,
+            &ctx.inputs(b),
+            1,
+            &[triple(btc(dec!(0), dec!(1)), &[robson.clone(), other], &[])],
+            None,
+        )
+        .await?;
+        ensure!(
+            matches!(nb.verdict, BaseVerdict::Unqualified(UnqualifiedReason::Malformed))
+                && nb.attempts == [AttemptOutcome::Unqualified(UnqualifiedReason::Malformed)]
+                && nb.account.is_none(),
+            "nB: {:?} {:?}",
+            nb.verdict,
+            nb.attempts
+        );
+        costs("nB", &nb, 1, 1, 2, 26)?;
     }
     if wanted("n5") {
         let n5 = scan(
@@ -851,7 +877,7 @@ async fn qualification_cases(
             n7.attempts
         );
         clean("n7", &n7)?;
-        costs("n7", &n7, 2, 4, 6, 212)?;
+        costs("n7", &n7, 2, 4, 6, 64)?;
     }
     if wanted("nI1") {
         // A record_order commit while held at OPEN_ORDERS.
@@ -881,7 +907,7 @@ async fn qualification_cases(
             ni1.attempts
         );
         clean("nI1", &ni1)?;
-        costs("nI1", &ni1, 2, 4, 6, 212)?;
+        costs("nI1", &ni1, 2, 4, 6, 64)?;
     }
     if wanted("nI3") {
         // A gate generation bump after the triple, before post.
@@ -897,7 +923,7 @@ async fn qualification_cases(
             ni3.attempts
         );
         clean("nI3", &ni3)?;
-        costs("nI3", &ni3, 2, 4, 6, 212)?;
+        costs("nI3", &ni3, 2, 4, 6, 64)?;
     }
     if wanted("n9") {
         // A clock fault between the triple and post fails the revalidated
@@ -911,7 +937,7 @@ async fn qualification_cases(
             n9.attempts
         );
         clean("n9-fault", &n9)?;
-        costs("n9-fault", &n9, 2, 4, 6, 212)?;
+        costs("n9-fault", &n9, 2, 4, 6, 64)?;
         rig.stale().await?;
         let listener = Listener::triples(Instant::now() + Duration::from_secs(60), &[]).await?;
         let stale = rig.scan(&inputs, &listener, None).await;
@@ -940,7 +966,7 @@ async fn qualification_cases(
             "n8: {:?}",
             n8.verdict
         );
-        costs("n8", &n8, 3, 6, 9, 318)?;
+        costs("n8", &n8, 3, 6, 9, 96)?;
         ensure!(pending.acknowledge(ticket) && pending.pending().is_none(), "n8: acknowledged");
     }
     if wanted("nI2") {
@@ -971,7 +997,7 @@ async fn qualification_cases(
             "nI2: {:?}",
             ni2.attempts
         );
-        costs("nI2", &ni2, 3, 6, 9, 318)?;
+        costs("nI2", &ni2, 3, 6, 9, 96)?;
         ensure!(pending.acknowledge(ticket) && pending.pending().is_none(), "nI2: acknowledged");
     }
     if wanted("nI4") {
@@ -1047,7 +1073,7 @@ async fn restart_case(
     )
     .await?;
     clean("n12", &after)?;
-    costs("n12", &after, 1, 2, 3, 106)?;
+    costs("n12", &after, 1, 2, 3, 32)?;
     let account = after.account.context("n12 ACCOUNT receipt")?;
     let recomputed = interval(&after)?;
     // Captures carry the new epoch and follow the old receipt; the widened

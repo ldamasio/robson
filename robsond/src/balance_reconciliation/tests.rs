@@ -524,10 +524,10 @@ fn three_attempts_count_every_prefix() {
     let outcome = scan([venue_at_open_orders, moved, clock_at_account, never]).unwrap();
     assert_eq!(outcome.attempts, 3);
     assert_eq!(outcome.outcome, AttemptOutcome::Unqualified(UnqualifiedReason::Clock));
-    // 1+2+1 SQL, 2+3+1 HTTP, 100+106+20 weight.
-    assert_eq!(outcome.cost, ScanCost { sql: 4, http: 6, weight: 226 });
+    // 1+2+1 SQL, 2+3+1 HTTP, 26+32+20 weight.
+    assert_eq!(outcome.cost, ScanCost { sql: 4, http: 6, weight: 78 });
     let retried = scan([moved, Attempt { progress: full(), outcome: qualified() }]).unwrap();
-    assert_eq!((retried.attempts, retried.cost), (2, ScanCost { sql: 4, http: 6, weight: 212 }));
+    assert_eq!((retried.attempts, retried.cost), (2, ScanCost { sql: 4, http: 6, weight: 64 }));
     // A permanent refusal at pre stops the scan.
     let scope = Attempt {
         progress: Progress { pre: true, responses: 0, post: false },
@@ -701,7 +701,7 @@ fn simulate(event: Option<(Perturbation, u8)>) -> Attempt {
 fn oracle(perturbation: Perturbation, at: u8) -> Option<(UnqualifiedReason, u32, u32, u32)> {
     use Perturbation as P;
     use UnqualifiedReason as U;
-    const FULL: (u32, u32, u32) = (2, 3, 106);
+    const FULL: (u32, u32, u32) = (2, 3, 32);
     let (reason, (sql, http, weight)) = match (perturbation, at) {
         // A write before pre is seen by pre; one after post is late evidence.
         (P::LedgerWrite, 1..=4) => (U::VersionChanged, FULL),
@@ -710,15 +710,15 @@ fn oracle(perturbation: Perturbation, at: u8) -> Option<(UnqualifiedReason, u32,
         (P::GenerationChange, 1..=4) => (U::GenerationChanged, FULL),
         // The ACCOUNT receipt itself, or its revalidation ending the triple.
         (P::ClockInvalidAccount, 0 | 1) => (U::Clock, (1, 1, 20)),
-        (P::ClockInvalidAccount, 2 | 3) => (U::Clock, (1, 3, 106)),
+        (P::ClockInvalidAccount, 2 | 3) => (U::Clock, (1, 3, 32)),
         // Past the triple, the anchor's revalidation after post refuses it.
         (P::ClockInvalidAccount, 4) => (U::Clock, FULL),
-        (P::ClockInvalidLater, 0..=2) => (U::Clock, (1, 2, 100)),
-        (P::ClockInvalidLater, 3) => (U::Clock, (1, 3, 106)),
+        (P::ClockInvalidLater, 0..=2) => (U::Clock, (1, 2, 26)),
+        (P::ClockInvalidLater, 3) => (U::Clock, (1, 3, 32)),
         (P::PostSqlError, 0..=4) => (U::Sql, FULL),
         (P::VenueError, 0 | 1) => (U::Venue, (1, 1, 20)),
-        (P::VenueError, 2) => (U::Venue, (1, 2, 100)),
-        (P::VenueError, 3) => (U::Venue, (1, 3, 106)),
+        (P::VenueError, 2) => (U::Venue, (1, 2, 26)),
+        (P::VenueError, 3) => (U::Venue, (1, 3, 32)),
         _ => return None,
     };
     Some((reason, sql, http, weight))
@@ -738,9 +738,9 @@ fn qualification_oracle_covers_144_schedules() {
                 let outcome = scan(run).unwrap();
                 let n = u32::from(hit);
                 let (attempts, sql, http, weight, last) = match oracle(perturbation, point) {
-                    None => (1, 2, 3, 106, None),
+                    None => (1, 2, 3, 32, None),
                     Some((reason, s, h, w)) if hit == 3 => (3, 3 * s, 3 * h, 3 * w, Some(reason)),
-                    Some((_, s, h, w)) => (hit + 1, n * s + 2, n * h + 3, n * w + 106, None),
+                    Some((_, s, h, w)) => (hit + 1, n * s + 2, n * h + 3, n * w + 32, None),
                 };
                 let context = format!("{perturbation:?} at {point}, hit {hit}");
                 assert_eq!(outcome.attempts, attempts, "{context}");

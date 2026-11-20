@@ -99,7 +99,7 @@ fn script(triples: &[[String; 3]]) -> Vec<(&'static str, u16, String)> {
         .flat_map(|[account, orders, lists]| {
             [
                 ("/api/v3/account", 200, account.clone()),
-                ("/api/v3/openOrders", 200, orders.clone()),
+                ("/api/v3/openOrders?symbol=BTCUSDT", 200, orders.clone()),
                 ("/api/v3/openOrderList", 200, lists.clone()),
             ]
         })
@@ -140,6 +140,9 @@ fn time_refusal(error: &TimeError) -> UnqualifiedReason {
     match error {
         TimeError::Native => UnqualifiedReason::Clock,
         TimeError::Expired => UnqualifiedReason::Timeout,
+        // A refused body, such as a scoped answer naming another pair, is
+        // not retried within the scan.
+        TimeError::Payload => UnqualifiedReason::Malformed,
         _ => UnqualifiedReason::Venue,
     }
 }

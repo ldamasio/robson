@@ -19,30 +19,48 @@ pub const LOOPBACK_UID: u64 = 4_200_000_008;
 /// Explicit test bound for one loopback ACCOUNT body; not a production cap.
 pub const LOOPBACK_BODY_LIMIT: usize = 64 * 1024;
 
-/// The closed set of inventory reads: fixed paths and weights, no parameter
-/// but the caller's timestamp.
+/// The one pair whose open orders the inventory reads (8k-1 option B): a
+/// fixed constant, never a caller's symbol.
+pub const OPERATED_SYMBOL: &str = "BTCUSDT";
+
+/// The closed set of inventory reads: fixed paths, fixed parameters and
+/// weights. The balances and the account-wide order lists are read whole;
+/// open orders only for [`OPERATED_SYMBOL`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InventoryRead {
     Account,
-    AllOpenOrders,
+    OperatedOpenOrders,
     OpenOrderLists,
 }
 
 impl InventoryRead {
-    pub const ALL: [Self; 3] = [Self::Account, Self::AllOpenOrders, Self::OpenOrderLists];
+    pub const ALL: [Self; 3] = [
+        Self::Account,
+        Self::OperatedOpenOrders,
+        Self::OpenOrderLists,
+    ];
 
     pub fn path(self) -> &'static str {
         match self {
             Self::Account => "/api/v3/account",
-            Self::AllOpenOrders => "/api/v3/openOrders",
+            Self::OperatedOpenOrders => "/api/v3/openOrders",
             Self::OpenOrderLists => "/api/v3/openOrderList",
         }
     }
 
+    /// The fixed parameters before the caller's timestamp, if any.
+    pub fn query(self) -> Option<&'static str> {
+        match self {
+            Self::OperatedOpenOrders => Some("symbol=BTCUSDT"),
+            Self::Account | Self::OpenOrderLists => None,
+        }
+    }
+
+    /// The documented weight: 6 for a single symbol's open orders.
     pub fn weight(self) -> u32 {
         match self {
             Self::Account => 20,
-            Self::AllOpenOrders => 80,
+            Self::OperatedOpenOrders => 6,
             Self::OpenOrderLists => 6,
         }
     }
@@ -82,16 +100,15 @@ impl PreparedRead {
         self.read
     }
 
-    /// The canonical HMAC GET of the commission binder, with the immutable
-    /// caller timestamp as its only parameter, to `127.0.0.1:port` only.
+    /// The canonical HMAC GET of the commission binder: the read's fixed
+    /// parameters, then the immutable caller timestamp, to `127.0.0.1:port`
+    /// only.
     pub fn sign(self, port: u16, timestamp_ms: i64) -> Result<SignedRead, BinanceRestError> {
-        sign_loopback(
-            self.transport,
-            port,
-            self.read.path(),
-            &format!("timestamp={timestamp_ms}"),
-            timestamp_ms,
-        )
+        let query = match self.read.query() {
+            Some(fixed) => format!("{fixed}&timestamp={timestamp_ms}"),
+            None => format!("timestamp={timestamp_ms}"),
+        };
+        sign_loopback(self.transport, port, self.read.path(), &query, timestamp_ms)
     }
 }
 
@@ -201,14 +218,16 @@ impl InventoryBody {
     pub fn read(&self) -> InventoryRead {
         match self {
             Self::Account(_) => InventoryRead::Account,
-            Self::OpenOrders(_) => InventoryRead::AllOpenOrders,
+            Self::OpenOrders(_) => InventoryRead::OperatedOpenOrders,
             Self::OpenOrderLists(_) => InventoryRead::OpenOrderLists,
         }
     }
 }
 
 /// Strict decode of one complete, bounded body by the read that fetched it,
-/// all or nothing. Refusals carry no input text.
+/// all or nothing. Refusals carry no input text. A symbol-scoped answer with
+/// an order on any other symbol is outside its own request and is refused
+/// whole, as the production reader does.
 pub fn decode(read: InventoryRead, body: &[u8]) -> Result<InventoryBody, BinanceRestError> {
     use crate::binance::spot;
     let refuse = |detail: &str| BinanceRestError::Refused(format!("loopback inventory: {detail}"));
@@ -220,9 +239,14 @@ pub fn decode(read: InventoryRead, body: &[u8]) -> Result<InventoryBody, Binance
         InventoryRead::Account => spot::decode_account(text, LOOPBACK_BODY_LIMIT)
             .map(InventoryBody::Account)
             .map_err(|_| refuse("invalid typed account")),
-        InventoryRead::AllOpenOrders => spot::decode_open_orders(text, LOOPBACK_BODY_LIMIT)
-            .map(InventoryBody::OpenOrders)
-            .map_err(|_| refuse("invalid typed open orders")),
+        InventoryRead::OperatedOpenOrders => {
+            let orders = spot::decode_open_orders(text, LOOPBACK_BODY_LIMIT)
+                .map_err(|_| refuse("invalid typed open orders"))?;
+            if orders.iter().any(|order| order.symbol != OPERATED_SYMBOL) {
+                return Err(refuse("open orders outside the operated symbol"));
+            }
+            Ok(InventoryBody::OpenOrders(orders))
+        },
         InventoryRead::OpenOrderLists => spot::decode_open_order_lists(text, LOOPBACK_BODY_LIMIT)
             .map(InventoryBody::OpenOrderLists)
             .map_err(|_| refuse("invalid typed open order lists")),

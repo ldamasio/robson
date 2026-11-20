@@ -189,8 +189,9 @@ pub(crate) fn qualify(marks: &QualificationMarks) -> AttemptOutcome {
     }
 }
 
-/// Weights of ACCOUNT, OPEN_ORDERS and OPEN_ORDER_LIST, in triple order.
-pub(crate) const INVENTORY_WEIGHTS: [u32; 3] = [20, 80, 6];
+/// Weights of ACCOUNT, the operated pair's OPEN_ORDERS and OPEN_ORDER_LIST,
+/// in triple order.
+pub(crate) const INVENTORY_WEIGHTS: [u32; 3] = [20, 6, 6];
 pub(crate) const MAX_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

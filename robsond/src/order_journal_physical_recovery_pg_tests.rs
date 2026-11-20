@@ -891,12 +891,16 @@ async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
             "pending observation retained across close under its exact binding");
         drop(reader);
         restore.close().await;
+        // TIME 1 + the scoped triple 20 + 6 + 6, then the weight-4 exact lookup.
+        let (weight, lookup_weight, cumulative_weight) = (33, 4, 37);
+        ensure!(cumulative_weight == weight + lookup_weight && cumulative_weight == 37,
+            "cumulative evidence weight is the triple's plus the lookup's");
         installed.supervisor().phase("rehearsal_complete", json!({
             "epoch": successor.process_epoch, "generation": successor.generation_id,
-            "sample": witness.sample, "handoffs": 4, "weight": 107, "inventory_sql": 0,
+            "sample": witness.sample, "handoffs": 4, "weight": weight, "inventory_sql": 0,
             "uid": uid.parse::<u64>()?, "owned_intent": owned,
-            "lookup_handoffs": witness.lookup_handoffs, "lookup_weight": 4, "lookup_sql": witness.lookup_sql,
-            "cumulative_handoffs": witness.cumulative_handoffs, "cumulative_weight": 111,
+            "lookup_handoffs": witness.lookup_handoffs, "lookup_weight": lookup_weight, "lookup_sql": witness.lookup_sql,
+            "cumulative_handoffs": witness.cumulative_handoffs, "cumulative_weight": cumulative_weight,
             "lookup_sample": witness.lookup_sample, "durable_executed": witness.durable_executed.normalize().to_string(),
             "lookup_executed": witness.lookup_executed.normalize().to_string(), "pending_execution_observed": true,
         })).await?;
