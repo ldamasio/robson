@@ -56,6 +56,21 @@ impl Session {
     }
 }
 
+/// The store's server bounds, sent as connection startup options so they hold
+/// from the session's first statement, the settings statement that confirms
+/// them included.
+#[cfg_attr(not(test), allow(dead_code))]
+const SESSION_BOUNDS: [(&str, &str); 3] = [
+    ("lock_timeout", "300ms"),
+    ("statement_timeout", "1s"),
+    ("idle_in_transaction_session_timeout", "1s"),
+];
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn bounded_options(pool: &PgPool) -> PgConnectOptions {
+    (*pool.connect_options()).clone().options(SESSION_BOUNDS)
+}
+
 impl ClockSampleStore {
     /// Only the dormant clock owner and its tests construct a store.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -65,7 +80,7 @@ impl ClockSampleStore {
         start: &crate::process_epoch::EpochStart,
     ) -> Self {
         Self {
-            options: pool.connect_options(),
+            options: Arc::new(bounded_options(pool)),
             tenant,
             epoch: start.epoch.epoch_id,
             connection: None,

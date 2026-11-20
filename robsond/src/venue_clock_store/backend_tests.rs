@@ -73,3 +73,19 @@ async fn invalid_identity_cannot_refund_cycle_or_prove_absence() {
     assert_eq!(store.statements, 0);
     assert!(store.connection.is_none());
 }
+
+#[tokio::test]
+async fn store_sessions_start_with_the_server_bounds() {
+    let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy_with(
+        PgConnectOptions::new_without_pgpass().host("/clock-tests-do-not-connect"),
+    );
+    let options = bounded_options(&pool);
+    let startup = options.get_options().unwrap_or_default();
+    for bound in [
+        "-c lock_timeout=300ms",
+        "-c statement_timeout=1s",
+        "-c idle_in_transaction_session_timeout=1s",
+    ] {
+        assert!(startup.contains(bound), "{bound} missing from {startup:?}");
+    }
+}
