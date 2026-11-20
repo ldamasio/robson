@@ -3140,6 +3140,19 @@ where
             ))
         };
 
+        // ADR-0056 step 8: the income ledger is position-account work, so a
+        // balance account is refused before any SQL, as on the funding routes.
+        if let Err(error) = crate::capability::require_position_account(
+            &state.exchange.capabilities(),
+            "income acknowledgement",
+        ) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "position_account_required",
+                Some(error.to_string()),
+            );
+        }
+
         let reason = req.reason.trim();
         if reason.is_empty() {
             return error_response(
@@ -5976,6 +5989,70 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json, serde_json::json!({ "error": "funding_disabled" }));
+    }
+
+    /// The income ledger is position-account work: a balance account is
+    /// refused before any SQL, here against a database that cannot be
+    /// reached, which would otherwise answer 500.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn a_balance_account_income_ack_is_refused_before_any_sql() {
+        let exchange = Arc::new(crate::capability::test_exchange::RestrictedExchange::new());
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(8));
+        let executor = Arc::new(Executor::new(
+            exchange.clone(),
+            Arc::new(IntentJournal::new()),
+            store.clone(),
+        ));
+        let manager = PositionManager::new(
+            Engine::new(RiskConfig::new(dec!(10000)).unwrap()),
+            executor,
+            store,
+            event_bus.clone(),
+            Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
+        );
+        let circuit_breaker = manager.circuit_breaker();
+        let order_journal = manager.order_journal();
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://robson@127.0.0.1:1/unreachable")
+            .unwrap();
+        let state = Arc::new(ApiState {
+            exchange: exchange.clone(),
+            position_manager: Arc::new(RwLock::new(manager)),
+            event_bus,
+            circuit_breaker,
+            wallet_balance_cache: Mutex::new(None),
+            pg_pool: Some(Arc::new(unreachable)),
+            tenant_id: None,
+            google_auth: None,
+            legacy_api_token: None,
+            funding: FundingConfig::default(),
+            funding_route_mode: FundingRouteMode::Selected,
+            venue_feed: VenueFeedView::default(),
+            order_journal,
+        });
+
+        let (status, Json(error)) = income_ack_handler(
+            State(state),
+            Path("tran-ack".to_string()),
+            Json(IncomeAckRequest {
+                reason: "reviewed".to_string(),
+                actor: "operator".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error:?}");
+        assert_eq!(error.error, "position_account_required");
+        assert_eq!(
+            error.details.as_deref(),
+            Some("Configuration error: income acknowledgement requires a position account")
+        );
+        assert_eq!(exchange.requests(), 0);
     }
 
     #[tokio::test]
