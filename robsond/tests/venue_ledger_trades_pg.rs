@@ -308,8 +308,9 @@ async fn touch_checked_changes_rotation_only(pool: PgPool) {
     let count = proxy.stats().statements;
     let later = at() + chrono::Duration::seconds(5);
     ledger.touch_checked(&key, later).await.unwrap();
-    assert_eq!(proxy.stats().statements - count, 1);
-    assert_eq!(ledger.statements_total(), 1);
+    // BEGIN, the server bounds, the update and COMMIT.
+    assert_eq!(proxy.stats().statements - count, 4);
+    assert_eq!(ledger.statements_total(), 4);
     ledger.touch_checked(&key, at()).await.unwrap();
     let (after, checked): (String, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
         "SELECT (to_jsonb(o)-'last_checked_at')::text,last_checked_at FROM venue_orders o",
@@ -416,19 +417,19 @@ async fn adoption_after_trade_pages_counts_the_whole_execution(pool: PgPool) {
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
-async fn a_lost_autocommit_answer_on_touch_converges(pool: PgPool) {
+async fn a_lost_commit_answer_on_touch_converges(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let key = f.seed_order(&pool, 1, dec!(1), OrderPhase::Terminal).await;
     let (proxy, proxied) = through_proxy(&pool, 1).await;
     let ledger = f.ledger(&proxied);
     let v = f.version(&pool).await;
     let later = at() + chrono::Duration::seconds(10);
-    proxy.set_mode(ProxyMode::DropAutocommitAckOf("UPDATE venue_orders SET last_checked_at"));
+    proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE venue_orders SET last_checked_at"));
     assert!(matches!(
         ledger.touch_checked(&key, later).await,
         Err(LedgerError::Uncertain(_))
     ));
-    assert_eq!(proxy.autocommit_acks_dropped(), 1);
+    assert_eq!(proxy.stats().commit_acks_dropped, 1);
     let landed = snapshot(&pool).await;
     assert_eq!(
         sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
@@ -446,7 +447,7 @@ async fn a_lost_autocommit_answer_on_touch_converges(pool: PgPool) {
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
-async fn a_touch_timeout_is_uncertain_and_retires_its_connection(pool: PgPool) {
+async fn a_touch_timeout_before_commit_is_known_and_retires_its_connection(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let key = f.seed_order(&pool, 1, dec!(1), OrderPhase::Terminal).await;
     let (proxy, proxied) = through_proxy(&pool, 1).await;
@@ -454,6 +455,8 @@ async fn a_touch_timeout_is_uncertain_and_retires_its_connection(pool: PgPool) {
     let before = snapshot(&pool).await;
     proxy.set_mode(ProxyMode::Blackhole);
     let started = Instant::now();
+    // No COMMIT was sent, so nothing can have landed: known, not uncertain. A
+    // lost COMMIT answer stays uncertain (a_lost_commit_answer_on_touch_converges).
     assert!(matches!(
         tokio::time::timeout(
             Duration::from_secs(3),
@@ -461,13 +464,60 @@ async fn a_touch_timeout_is_uncertain_and_retires_its_connection(pool: PgPool) {
         )
         .await
         .expect("touch exceeded its outer deadline"),
-        Err(LedgerError::Uncertain(_))
+        Err(LedgerError::Backend(_))
     ));
     assert!(started.elapsed() < Duration::from_secs(3));
     proxy.set_mode(ProxyMode::Pass);
     assert_eq!(snapshot(&pool).await, before);
     ledger.touch_checked(&key, at() + chrono::Duration::seconds(1)).await.unwrap();
     assert!(proxy.stats().connections >= 2);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_touch_lock_wait_ends_at_the_server_bound_and_retires_raw(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let key = f.seed_order(&pool, 1, dec!(1), OrderPhase::Terminal).await;
+    let (proxy, proxied) = through_proxy(&pool, 1).await;
+    let ledger = f.ledger(&proxied);
+    let before = snapshot(&pool).await;
+    // A real row lock on the order: the update waits in its execution.
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM venue_orders FOR UPDATE")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    proxy.enable_query_trace(8);
+    let closed = proxy.closed_relays();
+    let started = Instant::now();
+    // The 2 s client bound would end it later, as a Backend timeout.
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        ledger.touch_checked(&key, at() + chrono::Duration::seconds(1)),
+    )
+    .await
+    .expect("touch exceeded its outer deadline");
+    let elapsed = started.elapsed();
+    held.rollback().await.unwrap();
+    assert!(
+        matches!(&result, Err(LedgerError::Backend(reason)) if reason.contains("lock timeout")),
+        "{result:?}"
+    );
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while proxy.closed_relays() == closed {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the failed connection must be closed");
+    let trace: Vec<String> = proxy.query_trace().iter().map(|sql| sql.trim().to_owned()).collect();
+    assert_eq!(trace.len(), 3, "{trace:?}");
+    assert_eq!(trace[0], "BEGIN");
+    assert!(trace[1].starts_with("SELECT set_config('lock_timeout'"), "{trace:?}");
+    assert!(trace[2].starts_with("UPDATE venue_orders SET last_checked_at"), "{trace:?}");
+    assert_eq!(snapshot(&pool).await, before);
+    ledger.touch_checked(&key, at() + chrono::Duration::seconds(1)).await.unwrap();
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -577,10 +627,10 @@ async fn trade_raised_execution_never_freezes_an_old_quote_subtotal(pool: PgPool
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
-async fn a_deferred_autocommit_failure_is_not_a_landed_touch_ack(pool: PgPool) {
+async fn a_deferred_commit_failure_is_not_a_landed_touch_ack(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let key = f.seed_order(&pool, 1, dec!(1), OrderPhase::Terminal).await;
-    sqlx::raw_sql("CREATE FUNCTION refuse_touch_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rejects implicit commit' USING ERRCODE='23514'; END $$; CREATE CONSTRAINT TRIGGER refuse_touch_commit AFTER UPDATE ON venue_orders DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse_touch_commit()")
+    sqlx::raw_sql("CREATE FUNCTION refuse_touch_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rejects the commit' USING ERRCODE='23514'; END $$; CREATE CONSTRAINT TRIGGER refuse_touch_commit AFTER UPDATE ON venue_orders DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse_touch_commit()")
         .execute(&pool).await.unwrap();
     let (proxy, proxied) = through_proxy(&pool, 1).await;
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&proxied).await.unwrap();
@@ -588,28 +638,26 @@ async fn a_deferred_autocommit_failure_is_not_a_landed_touch_ack(pool: PgPool) {
     let before = snapshot(&pool).await;
     let wire = proxy.stats().statements;
     let later = at() + chrono::Duration::seconds(5);
-    proxy.set_mode(ProxyMode::DropAutocommitAckOf("UPDATE venue_orders SET last_checked_at"));
+    // The COMMIT's answer passes: the server's own 23514 rejection, not a
+    // lost acknowledgement, proves nothing landed.
     assert!(matches!(ledger.touch_checked(&key, later).await, Err(LedgerError::Backend(_))));
     wait_for_backend_exit(&pool, pid).await;
-    assert_eq!(
-        proxy.autocommit_acks_dropped(),
-        0,
-        "rolled-back autocommit has no landed acknowledgement"
-    );
-    assert_eq!(proxy.stats().statements - wire, 1);
-    assert_eq!(ledger.statements_total(), 1);
+    assert_eq!(proxy.stats().commit_acks_dropped, 0);
+    // BEGIN, the server bounds, the update and the rejected COMMIT.
+    assert_eq!(proxy.stats().statements - wire, 4);
+    assert_eq!(ledger.statements_total(), 4);
     assert_eq!(snapshot(&pool).await, before);
     sqlx::query("DROP TRIGGER refuse_touch_commit ON venue_orders")
         .execute(&pool)
         .await
         .unwrap();
-    proxy.set_mode(ProxyMode::DropAutocommitAckOf("UPDATE venue_orders SET last_checked_at"));
+    proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE venue_orders SET last_checked_at"));
     assert!(matches!(
         ledger.touch_checked(&key, later).await,
         Err(LedgerError::Uncertain(_))
     ));
     assert_eq!(
-        proxy.autocommit_acks_dropped(),
+        proxy.stats().commit_acks_dropped,
         1,
         "only the successful retry may drop completion"
     );

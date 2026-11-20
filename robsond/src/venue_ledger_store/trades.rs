@@ -94,8 +94,10 @@ impl PgVenueLedger {
         },&committing).await
     }
 
-    /// Rotation metadata only: one autocommit statement, no accounting bump.
-    /// A missing answer is uncertain because that autocommit may have landed.
+    /// Rotation metadata only: one bounded transaction, no accounting bump.
+    /// The server bounds come first, as for every ledger write, so a lock
+    /// wait ends on the server instead of outliving the client's deadline. A
+    /// missing COMMIT answer is uncertain because the update may have landed.
     pub async fn touch_checked(
         &self,
         key: &OrderKey,
@@ -106,14 +108,19 @@ impl PgVenueLedger {
             let connection=self.pool.acquire().await.map_err(backend)?;
             let mut held=LedgerConnection::new(connection);
             self.statement();
-            committing.store(true,Ordering::Relaxed);
+            let mut tx=held.connection().begin().await.map_err(backend)?;
+            self.timeouts(&mut tx).await?;
+            self.statement();
             let updated=sqlx::query("UPDATE venue_orders SET last_checked_at=GREATEST(last_checked_at,$1)
                 WHERE venue_id=$2 AND account_scope=$3 AND symbol=$4 AND exchange_order_id=$5 AND tenant_id=$6")
                 .bind(at).bind(key.venue.as_str()).bind(&key.account_scope).bind(&key.symbol)
                 .bind(key.exchange_order_id.to_string()).bind(self.tenant_id)
-                .execute(held.connection()).await.map_err(commit_error)?;
-            held.finished=true;
+                .execute(&mut *tx).await.map_err(backend)?;
             if updated.rows_affected()!=1 {return Err(LedgerError::UnknownOrder);}
+            self.statement();
+            committing.store(true,Ordering::Relaxed);
+            tx.commit().await.map_err(commit_error)?;
+            held.finished=true;
             Ok(())
         },&committing).await
     }
