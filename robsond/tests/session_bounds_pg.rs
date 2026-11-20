@@ -581,6 +581,14 @@ async fn t2h_monthly_projector_explicit_lock_waits_end_at_the_lock_bound(pool: P
 
 // T3: reads under an ACCESS EXCLUSIVE holder end at the server's lock bound.
 
+/// The funding list of `funding/saga.rs`, verbatim.
+const FUNDING_LIST: &str = "SELECT saga_id, state, estimated_usdt, created_at FROM funding_sagas \
+                            WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 100";
+/// The pending-recovery count of `api.rs`, verbatim.
+const PENDING_COUNT: &str = "SELECT COUNT(*) FROM order_intents WHERE tenant_id = $1 \
+                             AND uncertain_generation IS NOT NULL AND venue_outcome IS NULL \
+                             AND NOT not_sent AND disposition_kind IS NULL";
+
 async fn read_under_holder<T: Debug>(
     pool: &PgPool,
     table: &str,
@@ -615,30 +623,17 @@ async fn t3_reads_under_an_exclusive_holder_end_at_the_lock_bound(pool: PgPool) 
     )
     .await;
     assert_lock_bound("store recovery read", &result.unwrap_err(), elapsed);
-    // The funding list of `funding/saga.rs`, verbatim.
     let (result, elapsed) = read_under_holder(
         &pool,
         "funding_sagas",
-        sqlx::query(
-            "SELECT saga_id, state, estimated_usdt, created_at FROM funding_sagas \
-             WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 100",
-        )
-        .bind(tenant)
-        .fetch_all(&root),
+        sqlx::query(FUNDING_LIST).bind(tenant).fetch_all(&root),
     )
     .await;
     assert_lock_bound("funding list", &result.unwrap_err(), elapsed);
-    // The pending-recovery count of `api.rs`, verbatim.
     let (result, elapsed) = read_under_holder(
         &pool,
         "order_intents",
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM order_intents WHERE tenant_id = $1 \
-             AND uncertain_generation IS NOT NULL AND venue_outcome IS NULL AND NOT not_sent \
-             AND disposition_kind IS NULL",
-        )
-        .bind(tenant)
-        .fetch_one(&root),
+        sqlx::query_scalar::<_, i64>(PENDING_COUNT).bind(tenant).fetch_one(&root),
     )
     .await;
     assert_lock_bound("pending recovery count", &result.unwrap_err(), elapsed);
@@ -652,9 +647,10 @@ async fn t3_reads_under_an_exclusive_holder_end_at_the_lock_bound(pool: PgPool) 
     // Without a holder the same reads answer on the same pools.
     robson_eventlog::query_events(&root, QueryOptions::new(tenant)).await.unwrap();
     robson_store::find_active_from_projection(&root, tenant).await.unwrap();
-    sqlx::query("SELECT 1 FROM funding_sagas WHERE tenant_id = $1")
+    sqlx::query(FUNDING_LIST).bind(tenant).fetch_all(&root).await.unwrap();
+    sqlx::query_scalar::<_, i64>(PENDING_COUNT)
         .bind(tenant)
-        .fetch_all(&root)
+        .fetch_one(&root)
         .await
         .unwrap();
     backend.check_ready().await.unwrap();
