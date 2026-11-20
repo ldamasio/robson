@@ -20,6 +20,12 @@ pub use orders::{
 mod trades;
 pub use trades::{plan_trades, StoredTrade, TradePlan, TradeWriteResult};
 
+mod entry_fee;
+pub use entry_fee::{
+    plan_entry_fee, EntryFeeHold, EntryFeeInput, EntryFeePending, EntryFeePlan, EntryFillTotals,
+    EntryOrderFacts,
+};
+
 /// The orders whose execution can belong to a governed leg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegOrderKind {

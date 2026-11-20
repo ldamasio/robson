@@ -535,3 +535,6 @@ async fn entry_partition_guard_refuses_a_stale_identical_set(pool: PgPool) -> Re
     println!("EP1_GUARD identical_m36=accepted guarded_update=zero_rows rows=unchanged");
     Ok(())
 }
+
+#[path = "entry_fee.rs"]
+mod entry_fee;
