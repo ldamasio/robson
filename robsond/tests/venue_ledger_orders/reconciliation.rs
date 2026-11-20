@@ -13,7 +13,9 @@ use robson_exec::{
         BalanceBatch, IntentKind, IntentRow, JournalBackend, JournalBatch, OrderJournal,
         OutcomeRow, VenueOutcome,
     },
-    venue::{ProtectionKind, VenueId},
+    ports::TradeFill,
+    venue::{ProtectionKind, TradePage, VenueId},
+    venue_ledger::EntryFeePlan,
 };
 use robson_testkit::db_proxy::DbProxy;
 use rust_decimal_macros::dec;
@@ -172,11 +174,79 @@ async fn protect(pool: &PgPool, f: &Fixture, id: u64, seen: SeenAt) -> Result<Or
 }
 
 /// A filled leg protected by one live stop.
+/// A filled leg whose entry commission EP-2 finalized from its base-charged
+/// fills (B = 0.001, so X stays 0.999), protected by one live stop.
 async fn protected(pool: &PgPool, tenant: Uuid, seen: &mut Seen) -> Result<(Fixture, OrderLink)> {
     let f = Fixture::for_tenant(pool, tenant).await;
     entry(pool, &f, dec!(1.00000000), true, seen.next()).await?;
+    let fill = |id: u64, qty: Decimal| TradeFill {
+        trade_id: id.to_string(),
+        price: dec!(100000),
+        qty,
+        quote_qty: qty * dec!(100000),
+        commission: qty / dec!(1000),
+        commission_asset: "BTC".into(),
+        time: Some(at()),
+    };
+    let fills = TradePage {
+        trades: vec![fill(1, dec!(0.6)), fill(2, dec!(0.4))],
+        next_from_id: None,
+    };
+    let ledger = f.ledger(pool);
+    ledger.record_trades(&f.key(ENTRY), &fills, at()).await?;
+    let plan = ledger.finalize_entry_fee(f.position, "BTC").await?;
+    ensure!(
+        matches!(plan, EntryFeePlan::Finalize { base_fee, executable, reduced: false, deficit: false }
+            if base_fee == dec!(0.001) && executable == dec!(0.999)),
+        "EP-2: {plan:?}"
+    );
     let link = protect(pool, &f, STOP, seen.next()).await?;
     Ok((f, link))
+}
+
+/// The pre statement under EXPLAIN (ANALYZE, BUFFERS) on the fixture: the
+/// intent probe's plan nodes and the rows they examined.
+async fn explain_pre(pool: &PgPool, b: &JournalGeneration) -> Result<(Vec<String>, u64)> {
+    let sql = format!(
+        "EXPLAIN (ANALYZE, BUFFERS)\n{}",
+        include_str!("../../src/balance_reconciliation/btc_partition.sql")
+    );
+    let plan: Vec<String> = sqlx::query_scalar(&sql)
+        .bind(b.tenant_id)
+        .bind(VenueId::BINANCE_SPOT)
+        .bind(&b.account_scope)
+        .bind(b.generation_id)
+        .bind(b.process_epoch)
+        .bind(b.source_audit_id)
+        .bind(LOOPBACK_UID.to_string())
+        .bind(SYMBOL)
+        .fetch_all(pool)
+        .await?;
+    let number = |line: &str, key: &str| -> Option<u64> {
+        let rest = &line[line.find(key)? + key.len()..];
+        rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    };
+    let (mut nodes, mut examined) = (Vec::new(), 0);
+    for (i, line) in plan.iter().enumerate() {
+        if !line.contains(" on order_intents") {
+            continue;
+        }
+        nodes.push(line.trim().to_string());
+        // A node the executor never reached examined nothing.
+        let Some(at) = line.find("(actual time") else {
+            continue;
+        };
+        let actual = &line[at..];
+        let rows = number(actual, "rows=").context("actual rows")?;
+        let loops = number(actual, "loops=").context("loops")?;
+        let removed = plan[i + 1..]
+            .iter()
+            .take_while(|l| !l.trim_start().starts_with("->"))
+            .find_map(|l| number(l, "Rows Removed by Filter: "))
+            .unwrap_or(0);
+        examined += (rows + removed) * loops;
+    }
+    Ok((nodes, examined))
 }
 
 /// The scope's generation at the current version on the rig's epoch, its
@@ -504,6 +574,13 @@ async fn base_cases(pool: &PgPool, tenant: Uuid, rig: &mut ReconciliationRig) ->
             "n1: the interval and cut are the ACCOUNT receipt's: {i:?}"
         );
         cut = Some(i);
+        // Plan item 2: the intent probe's examined rows, measured.
+        let (nodes, examined) = explain_pre(pool, b).await?;
+        ensure!(!nodes.is_empty(), "n1: the intent probe in the plan: {nodes:?}");
+        println!(
+            "RECON_8K2_EXPLAIN intent_nodes={} examined_rows={examined} plan={nodes:?}",
+            nodes.len()
+        );
     }
     if wanted("n2") {
         // Operator excess: fenced and paged, never sold or sent anywhere.

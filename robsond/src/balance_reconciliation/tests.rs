@@ -685,7 +685,12 @@ fn simulate(event: Option<(Perturbation, u8)>) -> Attempt {
         pending_before,
         pending_after: world.pending(),
         post,
-        clock: ClockOutcome::Valid(interval),
+        // After post the ACCOUNT anchor is revalidated, never retroactively.
+        clock: if world.account_clock_invalid {
+            ClockOutcome::Invalid
+        } else {
+            ClockOutcome::Valid(interval)
+        },
     };
     at(5, &mut world);
     Attempt { progress, outcome: qualify(&marks) }
@@ -706,6 +711,8 @@ fn oracle(perturbation: Perturbation, at: u8) -> Option<(UnqualifiedReason, u32,
         // The ACCOUNT receipt itself, or its revalidation ending the triple.
         (P::ClockInvalidAccount, 0 | 1) => (U::Clock, (1, 1, 20)),
         (P::ClockInvalidAccount, 2 | 3) => (U::Clock, (1, 3, 106)),
+        // Past the triple, the anchor's revalidation after post refuses it.
+        (P::ClockInvalidAccount, 4) => (U::Clock, FULL),
         (P::ClockInvalidLater, 0..=2) => (U::Clock, (1, 2, 100)),
         (P::ClockInvalidLater, 3) => (U::Clock, (1, 3, 106)),
         (P::PostSqlError, 0..=4) => (U::Sql, FULL),
@@ -762,6 +769,7 @@ struct GenLeg {
     b: i64,
     x: i64,
     consumed: i64,
+    final_fee: bool,
     stops: Vec<(i64, i64)>,
 }
 
@@ -779,10 +787,18 @@ fn gen_leg() -> impl Strategy<Value = GenLeg> {
                 Just(b),
                 Just(x),
                 0..=x,
+                any::<bool>(),
                 prop::collection::vec((1i64..=100_000).prop_flat_map(|o| (Just(o), 0..=o)), 0..=2),
             )
         })
-        .prop_map(|(q, b, x, consumed, stops)| GenLeg { q, b, x, consumed, stops })
+        .prop_map(|(q, b, x, consumed, final_fee, stops)| GenLeg {
+            q,
+            b,
+            x,
+            consumed,
+            final_fee,
+            stops,
+        })
 }
 
 proptest! {
@@ -798,6 +814,8 @@ proptest! {
         let mut id = 100;
         for leg in &legs {
             let position = built.partitioned(units(leg.q), units(leg.b), units(leg.x), units(leg.consumed));
+            // B̂ or a final B: the interval does not depend on which.
+            built.pre.legs.last_mut().unwrap().base_fee_final = leg.final_fee;
             for (orig, executed) in &leg.stops {
                 id += 1;
                 built.stop(position, id, units(*orig), units(*executed), true);
