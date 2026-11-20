@@ -273,3 +273,75 @@ fn arm_crash_harness() {
     let _ = dotenvy::dotenv();
     robson_exec::crash_points::arm_from_env();
 }
+
+#[cfg(all(test, feature = "postgres"))]
+mod session_bounds_tests {
+    use super::*;
+
+    /// The `sqlx::test` database, addressed through `DATABASE_URL`.
+    fn url(pool: &sqlx::PgPool) -> String {
+        let database = pool.connect_options().get_database().unwrap().to_string();
+        let base = std::env::var("DATABASE_URL").unwrap();
+        format!("{}/{database}", base.rsplit_once('/').unwrap().0)
+    }
+
+    async fn settings(pool: &sqlx::PgPool) -> (String, String, String) {
+        sqlx::query_as(
+            "SELECT current_setting('lock_timeout'), current_setting('statement_timeout'), \
+         current_setting('idle_in_transaction_session_timeout')",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// T1 through the daemon's own wiring: a balance account's pool starts
+    /// bounded; a position account's matches a direct `PgPool::connect`.
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn the_daemon_pool_is_bounded_only_for_a_balance_account(pool: sqlx::PgPool) {
+        let url = url(&pool);
+        let balance = connect_database(&url, AccountKind::BalanceAccount).await.unwrap();
+        assert_eq!(settings(&balance).await, ("2s".into(), "5s".into(), "5s".into()));
+        let position = connect_database(&url, AccountKind::PositionAccount).await.unwrap();
+        let direct = sqlx::PgPool::connect(&url).await.unwrap();
+        assert_eq!(settings(&position).await, settings(&direct).await);
+    }
+
+    /// T7: with bounds that differ from the expected ones, the start fails on
+    /// the self-check. The database has no ADR-0052 schema, so had schema
+    /// readiness run first, the error would be that one instead.
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires DATABASE_URL"]
+    async fn the_self_check_refuses_the_start_before_schema_readiness(pool: sqlx::PgPool) {
+        let applied = SessionBounds {
+            lock_timeout_ms: 1_000,
+            ..SessionBounds::BALANCE
+        };
+        let error = connect_database_with(
+            &url(&pool),
+            AccountKind::BalanceAccount,
+            applied,
+            SessionBounds::BALANCE,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("session bounds not in effect"), "{error}");
+        assert!(!error.contains("ADR-0052"), "{error}");
+    }
+
+    /// T7, the other side: matching bounds pass the self-check and the start.
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn matching_bounds_pass_the_self_check(pool: sqlx::PgPool) {
+        connect_database_with(
+            &url(&pool),
+            AccountKind::BalanceAccount,
+            SessionBounds::BALANCE,
+            SessionBounds::BALANCE,
+        )
+        .await
+        .unwrap();
+    }
+}

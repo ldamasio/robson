@@ -138,6 +138,31 @@ mod tests {
 
     use super::*;
 
+    /// T1: the alarm pool clones the root pool's connect options: it keeps its
+    /// own statement timeout and inherits the lock and idle bounds.
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn the_alarm_pool_inherits_the_balance_session_bounds(pool: PgPool) {
+        let database = pool.connect_options().get_database().unwrap().to_string();
+        let base = std::env::var("DATABASE_URL").unwrap();
+        let url = format!("{}/{database}", base.rsplit_once('/').unwrap().0);
+        let root = crate::db_session::connect_daemon_pool(
+            &url,
+            robson_exec::venue::AccountKind::BalanceAccount,
+        )
+        .await
+        .unwrap();
+        let alarm = BudgetBasisAlarm::new(&root);
+        let settings: (String, String, String) = sqlx::query_as(
+            "SELECT current_setting('lock_timeout'), current_setting('statement_timeout'), \
+         current_setting('idle_in_transaction_session_timeout')",
+        )
+        .fetch_one(&alarm.pool)
+        .await
+        .unwrap();
+        assert_eq!(settings, ("2s".into(), "10s".into(), "5s".into()));
+    }
+
     fn alarm_with_timeout(pool: &PgPool, read_timeout: Duration) -> BudgetBasisAlarm {
         let mut alarm = BudgetBasisAlarm::with_metrics(
             pool,

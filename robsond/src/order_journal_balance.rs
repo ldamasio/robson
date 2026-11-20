@@ -200,6 +200,31 @@ impl PgJournalBackend {
 mod tests {
     use super::*;
 
+    /// T1: the journal pool clones the root pool's connect options, so a
+    /// balance-account daemon's journal sessions start bounded too.
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn the_journal_pool_inherits_the_balance_session_bounds(pool: sqlx::PgPool) {
+        let database = pool.connect_options().get_database().unwrap().to_string();
+        let base = std::env::var("DATABASE_URL").unwrap();
+        let url = format!("{}/{database}", base.rsplit_once('/').unwrap().0);
+        let root = crate::db_session::connect_daemon_pool(
+            &url,
+            robson_exec::venue::AccountKind::BalanceAccount,
+        )
+        .await
+        .unwrap();
+        let backend = PgJournalBackend::new(&root, uuid::Uuid::now_v7());
+        let settings: (String, String, String) = sqlx::query_as(
+            "SELECT current_setting('lock_timeout'), current_setting('statement_timeout'), \
+         current_setting('idle_in_transaction_session_timeout')",
+        )
+        .fetch_one(&backend.pool)
+        .await
+        .unwrap();
+        assert_eq!(settings, ("2s".into(), "5s".into(), "5s".into()));
+    }
+
     #[test]
     fn balance_statement_budget_counts_acquisition_and_reserves_commit_time() {
         let ms = Duration::from_millis;
