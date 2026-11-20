@@ -300,6 +300,124 @@ async fn migration40_healthy_restores_settings_and_keeps_exact_history(pool: PgP
     f.finish(Some(true)).await
 }
 
+/// The whole-apply bound fires on migration 40 itself: once its settings are
+/// installed nothing else reaches the server, and only the shared bound ends
+/// the apply. The owner retires, and neither schema nor history moves.
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn migration40_blackhole_after_install_fires_the_global_bound(pool: PgPool) -> Result<()> {
+    let mut f = Fixture::new(&pool).await?;
+    let (hit, release) = stages::arm(&f.adapter.gate, Stage::Install, Edge::AfterReturn)?;
+    let started = Instant::now();
+    let (result, blackhole) = {
+        let proxy = &f.proxy;
+        let baseline = f.baseline_statements;
+        let apply = timeout(APPLY_FIXTURE, f.adapter.apply(migration()));
+        let blackhole = timeout(CONTROLLER_CEILING, async {
+            hit.await?;
+            let seen = proxy.stats().statements - baseline;
+            proxy.set_mode(ProxyMode::Blackhole);
+            release.send(()).map_err(|_| anyhow::anyhow!("install gate expired"))?;
+            Ok::<_, anyhow::Error>(seen)
+        });
+        tokio::join!(apply, blackhole)
+    };
+    let duration = started.elapsed();
+    eprintln!("M40 blackhole duration={duration:?} result={result:?}");
+    let seen = blackhole??;
+    assert_eq!(seen, 1, "only the install reached the server before the blackhole");
+    let error = result
+        .map_err(|_| anyhow::anyhow!("migration40 whole-apply bound did not fire"))?
+        .expect_err("blackholed M40 reported success");
+    assert!(
+        matches!(&error, MigrateError::Source(e) if e.to_string() == "migration40 whole-apply deadline exceeded"),
+        "{error:?}"
+    );
+    assert!(duration >= APPLY_BOUND && duration < APPLY_FIXTURE, "{duration:?}");
+    assert_eq!(f.adapter.status(), Status {
+        phase: Phase::Retired,
+        failure: Some(Failure {
+            at: Phase::DelegatedApply,
+            outcome: Outcome::MayHaveCommitted,
+        }),
+    });
+    assert!(refuses_after_retirement(&mut f.adapter).await);
+    f.assert_wire_prefix(1);
+    f.finish(None).await
+}
+
+/// The deployment rollback boundary on migration 40 itself: once 40 has
+/// committed, a binary embedding only up to 39 refuses with
+/// `VersionMissing(40)` while holding SQLx's advisory key, which only its raw
+/// retirement releases; the canonical binary then skips the durable 40 by
+/// checksum and unlocks. History is never rewritten.
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn migration40_rollback_binary_refuses_committed_40(pool: PgPool) -> Result<()> {
+    const LOCKED: &str = "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND granted AND objsubid=1 AND classid::bigint=$2 AND objid::bigint=$3)";
+    let mut f = Fixture::new(&pool).await?;
+    let key = f.key;
+    f.adapter.apply(migration()).await?;
+    f.finish(Some(true)).await?;
+    let options = pool.connect_options();
+    let mut watcher = options.connect().await?;
+    let before: Vec<MigrationRow> = sqlx::query_as(HISTORY).fetch_all(&mut watcher).await?;
+    assert_eq!(before.last().map(|row| (row.0, row.3)), Some((VERSION40, true)));
+    let mut old = options.connect().await?;
+    let (old_pid, old_birth): (i32, String) = sqlx::query_as("SELECT pg_backend_pid(),backend_start::text FROM pg_stat_activity WHERE pid=pg_backend_pid()")
+        .fetch_one(&mut old).await?;
+    let rollback = timeout(ACQUIRE_BOUND, through(VERSION39).run_direct(&mut old)).await;
+    let leaked: bool = sqlx::query_scalar(LOCKED)
+        .bind(old_pid)
+        .bind(key.0)
+        .bind(key.1)
+        .fetch_one(&mut watcher)
+        .await?;
+    drop(old); // Raw drop: the key retires with its backend, never unlock SQL.
+    let retired = timeout(NATIVE_RETIREMENT, async {
+        loop {
+            let alive: bool = sqlx::query_scalar(EXACT_BACKEND)
+                .bind(old_pid)
+                .bind(&old_birth)
+                .fetch_one(&mut watcher)
+                .await?;
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok::<_, sqlx::Error>(())
+    })
+    .await;
+    let mut current = options.connect().await?;
+    let current_pid: i32 =
+        sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut current).await?;
+    let canonical = timeout(ACQUIRE_BOUND, through(VERSION40).run_direct(&mut current)).await;
+    let kept: bool = sqlx::query_scalar(LOCKED)
+        .bind(current_pid)
+        .bind(key.0)
+        .bind(key.1)
+        .fetch_one(&mut watcher)
+        .await?;
+    let after: Vec<MigrationRow> = sqlx::query_as(HISTORY).fetch_all(&mut watcher).await?;
+    eprintln!("rollback40={rollback:?} leaked={leaked} retired={retired:?} canonical40={canonical:?} kept={kept}");
+    assert!(
+        matches!(rollback, Ok(Err(MigrateError::VersionMissing(v))) if v == VERSION40),
+        "an M39-only binary must refuse the committed 40"
+    );
+    assert!(
+        leaked,
+        "SQLx's refusal boundary changed: the refusing binary does not hold the key"
+    );
+    retired
+        .map_err(|_| anyhow::anyhow!("the refusing backend survived with the key"))?
+        .map_err(anyhow::Error::from)?;
+    assert!(matches!(canonical, Ok(Ok(()))), "the canonical binary must skip the durable 40");
+    assert!(!kept, "the canonical binary kept the advisory key");
+    assert_eq!(after, before, "a binary rewrote migration history");
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fault {
     ParentLock,
