@@ -32,6 +32,21 @@ pub(crate) enum TimeError {
     Venue,
 }
 
+/// A TIME answer is tens of bytes. A body over this size is refused before it
+/// is accumulated, so a broken or hostile intermediary cannot grow memory, and
+/// decoding then works on at most this many bytes.
+pub(crate) const MAX_TIME_BODY_BYTES: usize = 64 * 1024;
+
+fn append_bounded(bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<(), TimeError> {
+    let length = bytes.len().checked_add(chunk.len()).ok_or(TimeError::Resource)?;
+    if length > MAX_TIME_BODY_BYTES {
+        return Err(TimeError::Resource);
+    }
+    bytes.try_reserve(chunk.len()).map_err(|_| TimeError::Resource)?;
+    bytes.extend_from_slice(chunk);
+    Ok(())
+}
+
 pub(crate) struct CompleteBody {
     bytes: Vec<u8>,
     content_type: Option<String>,
@@ -83,9 +98,7 @@ pub(crate) async fn receive(
             let Some(chunk) = response.chunk().await.map_err(|_| TimeError::Transport)? else {
                 break;
             };
-            bytes.len().checked_add(chunk.len()).ok_or(TimeError::Resource)?;
-            bytes.try_reserve(chunk.len()).map_err(|_| TimeError::Resource)?;
-            bytes.extend_from_slice(&chunk);
+            append_bounded(&mut bytes, &chunk)?;
         }
         let receive = clock.wall_bracket(epoch).map_err(|_| TimeError::Native)?;
         if Instant::now() >= deadline {

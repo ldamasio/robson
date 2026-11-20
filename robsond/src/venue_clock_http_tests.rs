@@ -19,6 +19,22 @@ fn body(bytes: Vec<u8>, kind: &str) -> CompleteBody {
     }
 }
 #[test]
+fn the_body_is_refused_past_its_ceiling_before_it_grows() {
+    let mut bytes = Vec::new();
+    append_bounded(&mut bytes, &vec![b' '; MAX_TIME_BODY_BYTES - 1]).unwrap();
+    append_bounded(&mut bytes, b"x").unwrap();
+    assert_eq!(bytes.len(), MAX_TIME_BODY_BYTES);
+    assert_eq!(append_bounded(&mut bytes, b"y"), Err(TimeError::Resource));
+    assert_eq!(bytes.len(), MAX_TIME_BODY_BYTES, "a refused chunk is not kept");
+    let mut fresh = Vec::new();
+    assert_eq!(
+        append_bounded(&mut fresh, &vec![0; MAX_TIME_BODY_BYTES + 1]),
+        Err(TimeError::Resource)
+    );
+    assert_eq!(fresh.capacity(), 0, "nothing is reserved for an oversized chunk");
+}
+/// The decoder alone: `receive` never hands it more than MAX_TIME_BODY_BYTES.
+#[test]
 fn complete_large_unknown_fields_preserve_raw_capture() {
     for size in [2 * 1024 * 1024, 8 * 1024 * 1024] {
         let bytes =
