@@ -3,6 +3,9 @@
 //! disposable PostgreSQL 16, in two runs (seed, then measure) so the server can
 //! be restarted in between and the first measured pass starts with empty
 //! shared buffers.
+//!
+//! The infrastructure provisions the database and passes it as
+//! `C1_DATABASE_URL`; the seed refuses any database that is not empty.
 
 #![cfg(feature = "calibration")]
 
@@ -23,30 +26,29 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const DATABASE: &str = "robson_c1_calibration";
 const TENANT: Uuid = Uuid::from_u128(0x0000_0000_0000_7000_8000_0000_0000_c101);
 const ACCOUNT_STREAM: &str = "account:c1";
 const ACCOUNT_EVENTS: i64 = 200_000;
 
-fn url_for(database: &str) -> String {
-    let url = std::env::var("DATABASE_URL").unwrap();
-    format!("{}/{database}", url.rsplit_once('/').unwrap().0)
+/// The database the infrastructure assigned to the calibration.
+fn calibration_url() -> String {
+    std::env::var("C1_DATABASE_URL").expect("C1_DATABASE_URL names the assigned database")
 }
 
-/// Seed the representative volume of PLAN r4 §6 C1 into a fresh database.
+/// Seed the representative volume of PLAN r4 §6 C1 into the assigned
+/// database, which must be empty: the seed never touches anything else.
 #[tokio::test]
-#[ignore = "calibration seed; requires DATABASE_URL"]
+#[ignore = "calibration seed; requires C1_DATABASE_URL"]
 async fn c1_seed() {
-    let admin = PgPool::connect(&std::env::var("DATABASE_URL").unwrap()).await.unwrap();
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {DATABASE} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .unwrap();
-    sqlx::query(&format!("CREATE DATABASE {DATABASE}"))
-        .execute(&admin)
-        .await
-        .unwrap();
-    let pool = PgPool::connect(&url_for(DATABASE)).await.unwrap();
+    let pool = PgPool::connect(&calibration_url()).await.unwrap();
+    let relations: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(relations, 0, "the assigned calibration database must be empty");
     sqlx::migrate!("../migrations").run(&pool).await.unwrap();
     let started = Instant::now();
     let statements = [
@@ -450,9 +452,9 @@ async fn measure_pass(root: &PgPool, plain: &PgPool, pass: &'static str, round: 
 /// Measure every C1 operation through the bounded root pool: cold (the first
 /// pass after the server restart), warm, then under four concurrent writers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "calibration measurement; requires DATABASE_URL and a prior c1_seed"]
+#[ignore = "calibration measurement; requires C1_DATABASE_URL and a prior c1_seed"]
 async fn c1_measure() {
-    let url = url_for(DATABASE);
+    let url = calibration_url();
     let root = connect_daemon_pool(&url, AccountKind::BalanceAccount).await.unwrap();
     let plain = PgPool::connect(&url).await.unwrap();
     measure_pass(&root, &plain, "cold", 0).await;
