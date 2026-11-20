@@ -22,6 +22,9 @@ mod c8_attribution;
 #[path = "pg_tests/restart_lookup.rs"]
 pub(super) mod restart_lookup;
 
+#[path = "pg_tests/reconciliation.rs"]
+pub(crate) mod reconciliation;
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Result<()> {

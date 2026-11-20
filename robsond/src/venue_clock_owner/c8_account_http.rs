@@ -49,6 +49,26 @@ impl AccountFixture {
         Self::scripted(deadline, None, attribution_script()).await
     }
 
+    /// Scripted signed inventory answers in connection order, any number of
+    /// attempts. A held one writes its head, reports it, and waits.
+    pub(super) async fn inventory(
+        deadline: Instant,
+        script: Vec<(&'static str, u16, String)>,
+    ) -> anyhow::Result<Self> {
+        Self::respond(deadline, None, script).await
+    }
+
+    pub(super) async fn held_inventory(
+        deadline: Instant,
+        script: Vec<(&'static str, u16, String)>,
+        at: usize,
+    ) -> anyhow::Result<(Self, oneshot::Receiver<()>, oneshot::Sender<()>)> {
+        let (head, seen) = oneshot::channel();
+        let (release, ready) = oneshot::channel();
+        let fixture = Self::respond_at(deadline, Some((head, ready)), at, script).await?;
+        Ok((fixture, seen, release))
+    }
+
     pub(super) async fn owned_order(deadline: Instant) -> anyhow::Result<Self> {
         Self::owned_order_answer(deadline, None, 200, owned_order_body()).await
     }
@@ -117,7 +137,17 @@ impl AccountFixture {
 
     async fn respond(
         deadline: Instant,
+        body_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+        script: Vec<(&'static str, u16, String)>,
+    ) -> anyhow::Result<Self> {
+        Self::respond_at(deadline, body_gate, 0, script).await
+    }
+
+    /// The body gate holds the exchange at connection index `hold` only.
+    async fn respond_at(
+        deadline: Instant,
         mut body_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+        hold: usize,
         script: Vec<(&'static str, u16, String)>,
     ) -> anyhow::Result<Self> {
         use robson_connectors::inventory_loopback::{LOOPBACK_BODY_LIMIT, LOOPBACK_KEY};
@@ -182,7 +212,7 @@ impl AccountFixture {
                         ensure!(lower.contains(&format!("\r\nx-mbx-apikey: {LOOPBACK_KEY}\r\n")));
                         let head = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                         socket.write_all(head.as_bytes()).await?;
-                        if let Some((sent, ready)) = body_gate.take() {
+                        if let Some((sent, ready)) = body_gate.take_if(|_| index == hold) {
                             sent.send(()).map_err(|_| anyhow!("missing body controller"))?;
                             ready.await.context("missing body release")?;
                         }

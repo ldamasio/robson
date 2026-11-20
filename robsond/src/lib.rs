@@ -46,6 +46,16 @@ extern crate self as robsond;
 
 pub mod api;
 pub mod auth;
+#[cfg(feature = "postgres")]
+#[cfg_attr(
+    not(all(test, feature = "crash-points")),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "8k-2 detector: no production caller until 8k-1 transport and 8k-3 consequences"
+    )
+)]
+mod balance_reconciliation;
 mod capability;
 pub mod circuit_breaker;
 pub mod config;
