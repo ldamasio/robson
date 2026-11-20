@@ -45,7 +45,9 @@ async fn spot_phase_evidence_preserves_the_native_active_order_predicate(pool: P
         ),
         "{result:?}"
     );
-    assert_eq!(f.ledger.statements_total() - statements, 1);
+    // BEGIN, the server bounds and the pre-read; the refusal retires the
+    // connection raw, without a ROLLBACK.
+    assert_eq!(f.ledger.statements_total() - statements, 3);
 
     const EVIDENCE: &str = "SELECT status,phase,NOT terminal FROM venue_orders
         WHERE tenant_id=$1 AND venue_id=$2 AND account_scope=$3 AND symbol=$4 AND exchange_order_id=$5";
@@ -110,7 +112,9 @@ async fn spot_writer_refuses_to_reuse_an_existing_contradictory_phase(pool: PgPo
         ),
         "{result:?}"
     );
-    assert_eq!(f.ledger.statements_total() - statements, 1);
+    // BEGIN, the server bounds and the pre-read; the refusal retires the
+    // connection raw, without a ROLLBACK.
+    assert_eq!(f.ledger.statements_total() - statements, 3);
 }
 
 #[sqlx::test(migrations = "../migrations")]
