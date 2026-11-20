@@ -13,8 +13,8 @@ use crate::{order_journal::IntentKind, venue::VenueId};
 
 mod orders;
 pub use orders::{
-    contribution, merge_order, OrderAnomaly, OrderKey, OrderLeg, OrderMerge, OrderWriteResult,
-    StoredOrder,
+    contribution, merge_order, AdmissionTerms, LegPartition, OrderAnomaly, OrderKey, OrderLeg,
+    OrderMerge, OrderWriteResult, StoredOrder,
 };
 
 mod trades;
@@ -115,15 +115,25 @@ impl fmt::Display for VenueIntId {
 
 /// Checked decimal arithmetic must also reject silent precision reduction.
 pub fn exact_add(left: Decimal, right: Decimal) -> Result<Decimal, LedgerError> {
-    exact_result(left.checked_add(right), left.scale().max(right.scale()))
+    exact_result(left.checked_add(right), left, right)
 }
 
 pub fn exact_sub(left: Decimal, right: Decimal) -> Result<Decimal, LedgerError> {
-    exact_result(left.checked_sub(right), left.scale().max(right.scale()))
+    exact_result(left.checked_sub(right), left, right)
 }
 
-fn exact_result(value: Option<Decimal>, scale: u32) -> Result<Decimal, LedgerError> {
-    value.filter(|value| value.scale() >= scale).ok_or(LedgerError::Unrepresentable)
+// rust_decimal returns the other operand unaligned, at its own scale, when one
+// operand is zero. That result is exact; only a nonzero pair can be rounded.
+fn exact_result(
+    value: Option<Decimal>,
+    left: Decimal,
+    right: Decimal,
+) -> Result<Decimal, LedgerError> {
+    let scale = left.scale().max(right.scale());
+    let zero = left.is_zero() || right.is_zero();
+    value
+        .filter(|value| zero || value.scale() >= scale)
+        .ok_or(LedgerError::Unrepresentable)
 }
 
 /// `Backend` proves nothing landed; `Uncertain` cannot make that promise.
@@ -172,6 +182,13 @@ mod tests {
         }
         assert_eq!(exact_add(dec!(2.00), dec!(-0.125)), Ok(dec!(1.875)));
         assert_eq!(exact_sub(dec!(2.00), dec!(-0.125)), Ok(dec!(2.125)));
+        // A zero operand comes back unaligned at the other's lower scale.
+        let zero = dec!(0.00000000);
+        assert_eq!(exact_add(dec!(0.0003), zero), Ok(dec!(0.0003)));
+        assert_eq!(exact_add(zero, dec!(0.0003)), Ok(dec!(0.0003)));
+        assert_eq!(exact_sub(dec!(0.25), zero), Ok(dec!(0.25)));
+        assert_eq!(exact_sub(zero, dec!(0.25)), Ok(dec!(-0.25)));
+        assert_eq!(exact_add(Decimal::MAX, zero), Ok(Decimal::MAX));
     }
 
     #[test]
@@ -225,6 +242,16 @@ mod tests {
             let right = Decimal::from_i128_with_scale(i128::from(b), scale);
             prop_assert_eq!(exact_add(left, right), Ok(Decimal::from_i128_with_scale(i128::from(a) + i128::from(b), scale)));
             prop_assert_eq!(exact_sub(left, right), Ok(Decimal::from_i128_with_scale(i128::from(a) - i128::from(b), scale)));
+        }
+
+        #[test]
+        fn a_zero_operand_of_any_scale_is_exact(a: i64, scale in 0..=28u32, zero_scale in 0..=28u32) {
+            let value = Decimal::from_i128_with_scale(i128::from(a), scale);
+            let zero = Decimal::from_i128_with_scale(0, zero_scale);
+            prop_assert_eq!(exact_add(value, zero), Ok(value));
+            prop_assert_eq!(exact_add(zero, value), Ok(value));
+            prop_assert_eq!(exact_sub(value, zero), Ok(value));
+            prop_assert_eq!(exact_sub(zero, value), Ok(-value));
         }
     }
 }

@@ -3,7 +3,8 @@
 //! These calculations neither establish complete/current evidence nor authorize
 //! protection, settlement, a transition, or a send. No runtime caller uses
 //! them. Exact initial X and its final-fee reduction (8i-2) are candidates
-//! only; complete O(L), R1/R3 and durable writes are later work.
+//! only. The venue ledger's order merge records the initial candidate once at
+//! a terminal entry (EP-1); final B, complete O(L) and R1/R3 are later work.
 //!
 //! Successful fact values cannot be constructed without validation:
 //! ```compile_fail

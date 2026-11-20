@@ -8,7 +8,10 @@ use uuid::Uuid;
 use super::{
     exact_add, exact_sub, LedgerError, LegOrderKind, OrderLink, OrderOwner, SeenAt, VenueIntId,
 };
-use crate::venue::{OrderPhase, ProtectionKind, VenueId, VenueOrderRecord};
+use crate::{
+    balance_liability::{initial_quantity, FactError, InitialQuantityInput, LegFeeInput},
+    venue::{OrderPhase, ProtectionKind, VenueId, VenueOrderRecord},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OrderKey {
@@ -82,6 +85,28 @@ pub struct OrderLeg {
     pub cohort_month: Option<NaiveDate>,
     pub consumed_cum: Decimal,
     pub closed_at: Option<DateTime<Utc>>,
+    pub partition: Option<LegPartition>,
+    /// Terms of the leg's admission only while it is current; a superseded
+    /// admission supplies none.
+    pub terms: Option<AdmissionTerms>,
+}
+
+/// The leg's recorded entry partition (v16 §3.3.2): Q, C, B or B̂ and X. The
+/// schema keeps the four amounts together: all set or all NULL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegPartition {
+    pub gross: Decimal,
+    pub cost: Decimal,
+    pub base_fee: Decimal,
+    pub base_fee_final: bool,
+    pub executable: Decimal,
+}
+
+/// Persisted cost terms of the current admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionTerms {
+    pub taker_bps: Decimal,
+    pub lot_step: Decimal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +127,8 @@ pub struct OrderMerge {
     pub changed: bool,
     pub consumed_delta: Decimal,
     pub set_cohort: bool,
+    /// The one-time first set of the leg's entry partition, never an overwrite.
+    pub set_partition: Option<LegPartition>,
     pub anomalies: Vec<OrderAnomaly>,
 }
 
@@ -168,6 +195,62 @@ fn validate_leg(
         return Err(LedgerError::IdentityConflict);
     }
     Ok(())
+}
+
+/// f_L = taker_bps × 10⁻⁴ by a scale shift: exact, never a rounding division.
+fn taker_fraction(bps: Decimal) -> Option<Decimal> {
+    if bps < Decimal::ZERO || bps > Decimal::from(10_000) {
+        return None;
+    }
+    let mut fraction = bps;
+    fraction.set_scale(bps.scale() + 4).ok()?;
+    Some(fraction)
+}
+
+/// A recorded partition must equal the terminal entry's (Q, C). A first set
+/// needs a terminal execution with a known quote and current admission terms;
+/// B̂ = Q × f_L stays provisional and X is only ever this candidate.
+fn entry_partition(
+    order: &StoredOrder,
+    leg: &OrderLeg,
+) -> Result<Option<LegPartition>, LedgerError> {
+    if let Some(recorded) = leg.partition {
+        if !order.terminal()
+            || order.executed_cum != recorded.gross
+            || order.cumulative_quote != Some(recorded.cost)
+        {
+            return Err(LedgerError::IdentityConflict);
+        }
+        return Ok(None);
+    }
+    let Some(cost) = order.cumulative_quote else {
+        return Ok(None);
+    };
+    if !order.terminal() || order.executed_cum <= Decimal::ZERO {
+        return Ok(None);
+    }
+    let terms = leg.terms.ok_or_else(|| {
+        LedgerError::Invariant("entry partition without current admission terms".into())
+    })?;
+    let fraction = taker_fraction(terms.taker_bps)
+        .ok_or_else(|| LedgerError::Invariant("admission taker rate out of range".into()))?;
+    let quantity = initial_quantity(InitialQuantityInput {
+        gross: order.executed_cum,
+        lot_step: terms.lot_step,
+        consumed: leg.consumed_cum,
+        fee: LegFeeInput::ProvisionalBound { fraction },
+    })
+    .map_err(|error| match error {
+        FactError::Unrepresentable => LedgerError::Unrepresentable,
+        _ => LedgerError::Invariant("entry partition terms refused".into()),
+    })?;
+    Ok(Some(LegPartition {
+        gross: order.executed_cum,
+        cost,
+        base_fee: quantity.base_fee(),
+        base_fee_final: false,
+        executable: quantity.executable(),
+    }))
 }
 
 /// Merge typed venue evidence without weakening any first-seen or terminal
@@ -361,9 +444,16 @@ pub fn merge_order(
     if consumed_delta > Decimal::ZERO {
         exact_add(leg.ok_or(LedgerError::IdentityConflict)?.consumed_cum, consumed_delta)?;
     }
-    let set_cohort = matches!(order.owner, OrderOwner::Leg { kind: LegOrderKind::Entry, .. })
-        && leg.is_some_and(|leg| leg.cohort_month.is_none());
-    let changed = stored != Some(&order) || set_cohort;
+    let entry_leg = match (&order.owner, leg) {
+        (OrderOwner::Leg { kind: LegOrderKind::Entry, .. }, Some(leg)) => Some(leg),
+        _ => None,
+    };
+    let set_cohort = entry_leg.is_some_and(|leg| leg.cohort_month.is_none());
+    let set_partition = match entry_leg {
+        Some(leg) => entry_partition(&order, leg)?,
+        None => None,
+    };
+    let changed = stored != Some(&order) || set_cohort || set_partition.is_some();
     if changed {
         order.last_checked_at = stored.map_or(seen.at, |old| old.last_checked_at.max(seen.at));
     }
@@ -372,6 +462,7 @@ pub fn merge_order(
         changed,
         consumed_delta,
         set_cohort,
+        set_partition,
         anomalies,
     })
 }
