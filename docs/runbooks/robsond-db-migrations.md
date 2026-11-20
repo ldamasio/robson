@@ -291,10 +291,10 @@ the table and, while waiting, block every later reader and writer of it.
 The adapter applies it on the same dedicated raw connection as 38, in 7
 operations: settings install, SQLx's own unmodified apply (BEGIN, the original
 statement, the `_sqlx_migrations` INSERT, COMMIT, the `execution_time`
-UPDATE), and the settings restore. The 40 ms statement, 20 ms lock and 20 ms
-idle-in-transaction timeouts, the 200 ms whole-apply bound and the 5 s
+UPDATE), and the settings restore. The 1 s statement, 200 ms lock and 1 s
+idle-in-transaction timeouts, the 15 s whole-apply bound and the 5 s
 connection and advisory-lock bounds are the same as 38. A lock wait longer than
-20 ms fails with `55P03` (`lock_not_available`) and fails the
+200 ms fails with `55P03` (`lock_not_available`) and fails the
 `robsond-db-migrate` hook; it never queues indefinitely. The path is selected
 only for the exact embedded file; the original bytes, checksum and history row
 are SQLx's own. Any other version-39 source is refused before any SQL

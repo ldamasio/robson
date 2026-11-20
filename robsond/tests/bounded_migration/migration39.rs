@@ -32,9 +32,10 @@ const LOCKED: &str = "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND lock
 // The whole durable 39 row plus the history size: any rewrite or insert moves
 // it.
 const HISTORY: &str = "SELECT description,installed_on::text,success,checksum,execution_time,(SELECT count(*) FROM _sqlx_migrations) FROM _sqlx_migrations WHERE version=20240101000039";
-// Outer test watchdog, well past the production 200 ms bound: a build without
-// that bound reaches a named assertion instead of hanging on the blackhole.
-const WATCHDOG: Duration = Duration::from_millis(1000);
+// Outer test watchdog, past the production APPLY_BOUND by the apply-owning
+// fixture margin (formerly 1 s over 200 ms): a build without that bound
+// reaches a named assertion instead of hanging on the blackhole.
+const WATCHDOG: Duration = APPLY_FIXTURE;
 type Schema = (bool, bool, i64, i64);
 type History = (String, String, bool, Vec<u8>, i64, i64);
 const ABSENT: Schema = (false, false, 0, 0);
@@ -55,10 +56,11 @@ fn through38() -> Migrator {
     through38
 }
 
-/// Bounded 60x5ms poll, as in `finish`, for one raw-dropped backend.
+/// Bounded 5 ms poll over the native retirement window, as in `finish`, for
+/// one raw-dropped backend.
 async fn retires(observer: &mut PgConnection, pid: i32) -> Result<bool, sqlx::Error> {
-    tokio::time::timeout(Duration::from_millis(300), async {
-        for _ in 0..60 {
+    tokio::time::timeout(NATIVE_RETIREMENT, async {
+        for _ in 0..NATIVE_RETIREMENT_POLLS {
             if !alive(observer, pid).await? {
                 return Ok(true);
             }
@@ -164,8 +166,8 @@ impl Fixture39 {
         let cleanup_deadline = tokio::time::Instant::now() + ACQUIRE_BOUND;
         let status = adapter.status();
         drop(adapter); // Whole raw owner, never graceful-close or pool-return.
-        let retirement = tokio::time::timeout(Duration::from_millis(300), async {
-            for _ in 0..60 {
+        let retirement = tokio::time::timeout(NATIVE_RETIREMENT, async {
+            for _ in 0..NATIVE_RETIREMENT_POLLS {
                 if !alive(&mut observer, pid).await? {
                     return Ok::<_, sqlx::Error>(true);
                 }
@@ -238,9 +240,9 @@ async fn migration39_bounded_apply_restores_same_session(pool: PgPool) {
     let baseline = f.baseline;
     let finished = f.finish().await;
     eprintln!("primary apply={result:?} duration={duration:?} status={status:?}");
-    result.expect("embedded39 must complete under the production200ms bound");
+    result.expect("embedded39 must complete under the production APPLY_BOUND");
     let finished = finished.expect("migration39 cleanup observation");
-    assert!(duration < Duration::from_millis(200), "migration39_global200");
+    assert!(duration < APPLY_BOUND, "migration39_global_apply_bound");
     assert_eq!(status, Status { phase: Phase::Restored, failure: None });
     assert_eq!(stats.statements - baseline.statements, 7, "migration39_apply_inventory");
     assert_eq!(stats.commits - baseline.commits, 1);
@@ -310,7 +312,7 @@ async fn migration39_contention_fails_at_lock_timeout_and_retires(pool: PgPool) 
         Some((VERSION39, "55P03".to_owned())),
         "lock_timeout_of_the_migration39_statement_not_the_cause"
     );
-    assert!(duration < Duration::from_millis(200), "contended39_global200");
+    assert!(duration < APPLY_BOUND, "contended39_global_apply_bound");
     let q: Vec<_> = trace.iter().map(|s| s.trim().trim_end_matches(';').trim()).collect();
     assert_eq!(q.len(), 3, "contended39_received_trace");
     assert!(q[0].starts_with("WITH old AS MATERIALIZED"), "install before ALTER TABLE");
@@ -472,7 +474,7 @@ async fn migration39_blackhole_after_install_fires_global200_and_retires(pool: P
         };
         tokio::join!(
             tokio::time::timeout(WATCHDOG, producer),
-            tokio::time::timeout(Duration::from_millis(300), controller)
+            tokio::time::timeout(CONTROLLER_CEILING, controller)
         )
     };
     let status = f.adapter.status();
@@ -483,7 +485,7 @@ async fn migration39_blackhole_after_install_fires_global200_and_retires(pool: P
     let refused = refuses_after_retirement(&mut f.adapter).await;
     let after_refusals = f.proxy.stats();
     // Physical close: the raw-dropped client socket ends its relay scope.
-    let closed = tokio::time::timeout(Duration::from_millis(300), async {
+    let closed = tokio::time::timeout(NATIVE_RETIREMENT, async {
         while f.proxy.closed_relays() < stats.connections {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -497,14 +499,17 @@ async fn migration39_blackhole_after_install_fires_global200_and_retires(pool: P
     );
     let (result, duration) = match watched {
         Ok(returned) => returned,
-        Err(_) => panic!("migration39_blackhole_global200_missing"),
+        Err(_) => panic!("migration39_blackhole_global_apply_bound_missing"),
     };
     let error = result.expect_err("blackhole39_reported_success");
     assert!(
         matches!(&error, MigrateError::Source(e) if e.to_string() == "migration39 whole-apply deadline exceeded"),
-        "blackhole39_not_the_global200_branch"
+        "blackhole39_not_the_global_apply_bound_branch"
     );
-    assert!(duration >= APPLY_BOUND && duration < WATCHDOG, "blackhole39_global200_timing");
+    assert!(
+        duration >= APPLY_BOUND && duration < WATCHDOG,
+        "blackhole39_global_apply_bound_timing"
+    );
     let seen = gate.expect("blackhole39 observer deadline").expect("actual install return");
     assert_eq!(seen, (ProxyMode::Pass, 1), "blackhole39_injected_at_wrong_call");
     assert_eq!(mode, ProxyMode::Blackhole, "blackhole39_mode_not_in_effect");
@@ -565,7 +570,7 @@ async fn migration39_restore_ack_loss_is_applied_but_unrestored(pool: PgPool) {
             release.send(()).map_err(|_| refusal("restore39 stage release lost"))?;
             Ok::<_, MigrateError>(before)
         };
-        tokio::join!(producer, tokio::time::timeout(Duration::from_millis(300), controller))
+        tokio::join!(producer, tokio::time::timeout(CONTROLLER_CEILING, controller))
     };
     let status = f.adapter.status();
     let stats = f.proxy.stats();
