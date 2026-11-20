@@ -285,27 +285,83 @@ mod session_bounds_tests {
         format!("{}/{database}", base.rsplit_once('/').unwrap().0)
     }
 
-    async fn settings(pool: &sqlx::PgPool) -> (String, String, String) {
+    /// `work_mem` and the three bounds, as the pool's sessions see them.
+    async fn settings(pool: &sqlx::PgPool) -> (String, String, String, String) {
         sqlx::query_as(
-            "SELECT current_setting('lock_timeout'), current_setting('statement_timeout'), \
-         current_setting('idle_in_transaction_session_timeout')",
+            "SELECT current_setting('work_mem'), current_setting('lock_timeout'), \
+             current_setting('statement_timeout'), \
+             current_setting('idle_in_transaction_session_timeout')",
         )
         .fetch_one(pool)
         .await
         .unwrap()
     }
 
-    /// T1 through the daemon's own wiring: a balance account's pool starts
-    /// bounded; a position account's matches a direct `PgPool::connect`.
+    /// Set only in the child process of
+    /// [`pgoptions_are_kept_through_the_wiring_in_a_process_of_their_own`].
+    const EXPECT_WORK_MEM: &str = "ROBSON_SESSION_BOUNDS_EXPECT_WORK_MEM";
+
+    /// T1 and T1-USD-M through the daemon's own wiring, for a plain URL and a
+    /// URL that already carries Startup options (one of them a bound), with
+    /// whatever `PGOPTIONS` this process was started with. A balance account's
+    /// root, journal and alarm pools keep the existing options and carry the
+    /// bounds, the alarm with its own statement bound; a position account's
+    /// root pool reports what a direct `PgPool::connect` reports.
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
-    async fn the_daemon_pool_is_bounded_only_for_a_balance_account(pool: sqlx::PgPool) {
-        let url = url(&pool);
-        let balance = connect_database(&url, AccountKind::BalanceAccount).await.unwrap();
-        assert_eq!(settings(&balance).await, ("2s".into(), "5s".into(), "5s".into()));
-        let position = connect_database(&url, AccountKind::PositionAccount).await.unwrap();
-        let direct = sqlx::PgPool::connect(&url).await.unwrap();
-        assert_eq!(settings(&position).await, settings(&direct).await);
+    async fn every_daemon_pool_carries_the_bounds_through_the_wiring(pool: sqlx::PgPool) {
+        let plain = url(&pool);
+        let with_options = format!("{plain}?options=-c%20work_mem%3D8MB%20-c%20lock_timeout%3D3s");
+        for url in [plain, with_options] {
+            let direct_pool = sqlx::PgPool::connect(&url).await.unwrap();
+            let direct = settings(&direct_pool).await;
+            let position = connect_database(&url, AccountKind::PositionAccount).await.unwrap();
+            assert_eq!(settings(&position).await, direct, "position account: {url:?}");
+            if url.contains("?options=") {
+                assert_eq!((direct.0.as_str(), direct.1.as_str()), ("8MB", "3s"));
+            } else if let Ok(work_mem) = std::env::var(EXPECT_WORK_MEM) {
+                assert_eq!(direct.0, work_mem, "PGOPTIONS reached the connection");
+            }
+            let bounded = |statement: &str| {
+                (direct.0.clone(), "2s".to_string(), statement.to_string(), "5s".to_string())
+            };
+            let root = connect_database(&url, AccountKind::BalanceAccount).await.unwrap();
+            assert_eq!(settings(&root).await, bounded("5s"), "root pool");
+            let journal =
+                robsond::order_journal_store::PgJournalBackend::new(&root, uuid::Uuid::now_v7());
+            assert_eq!(settings(journal.session_pool()).await, bounded("5s"), "journal pool");
+            let alarm = robsond::budget_basis_alarm::BudgetBasisAlarm::new(&root);
+            assert_eq!(settings(alarm.session_pool()).await, bounded("10s"), "alarm pool");
+            for opened in [direct_pool, position, root] {
+                opened.close().await;
+            }
+        }
+    }
+
+    /// The same proof with `PGOPTIONS`, in a child process of this test binary
+    /// that starts with it: this process's environment is never changed, so no
+    /// test running beside it sees the setting.
+    #[test]
+    #[ignore = "requires DATABASE_URL"]
+    fn pgoptions_are_kept_through_the_wiring_in_a_process_of_their_own() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "session_bounds_tests::every_daemon_pool_carries_the_bounds_through_the_wiring",
+                "--test-threads=1",
+            ])
+            .env("PGOPTIONS", "-c work_mem=16MB")
+            .env(EXPECT_WORK_MEM, "16MB")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "child: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// T7: with bounds that differ from the expected ones, the start fails on
