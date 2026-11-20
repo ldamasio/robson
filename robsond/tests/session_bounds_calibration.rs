@@ -1,9 +1,10 @@
 //! C1 calibration for the balance-account session bounds (PLAN r4 §6). Not a
-//! gate: ignored and run on demand against a disposable PostgreSQL 16, in two
-//! runs (seed, then measure) so the server can be restarted in between and the
-//! first measured pass starts with empty shared buffers.
+//! gate: built only with the `calibration` feature and run on demand against a
+//! disposable PostgreSQL 16, in two runs (seed, then measure) so the server can
+//! be restarted in between and the first measured pass starts with empty
+//! shared buffers.
 
-#![cfg(feature = "postgres")]
+#![cfg(feature = "calibration")]
 
 use std::{
     sync::{
