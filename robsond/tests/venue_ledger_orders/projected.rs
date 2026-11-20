@@ -460,6 +460,105 @@ async fn projected_native_order_commit_loss_has_one_atomic_publication(pool: PgP
     exact_reference(&pool, &b).await
 }
 
+/// A coordinate exists only after a positively confirmed COMMIT of a changed,
+/// leg-owned projected write. It is not an observation ACK and clears nothing.
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn projected_native_order_commit_coordinate_only_follows_confirmed_commit(
+    pool: PgPool,
+) -> Result<()> {
+    use robson_testkit::db_proxy::ProxyMode;
+    let f = setup(&pool).await?;
+    let exits = [Uuid::now_v7(), Uuid::now_v7()];
+    journal(&pool, &f, exits[0], "order-1", "exit", Some(f.position), None, false).await?;
+    journal(&pool, &f, exits[1], "order-2", "exit", Some(f.position), None, false).await?;
+    let b = generation(&pool, &f).await?;
+    exact_reference(&pool, &b).await?;
+    let (proxy, proxied) = support::through_proxy(&pool, 1).await;
+    let ledger = f.ledger(&proxied).with_native_order_set_projection(b.clone());
+
+    let first_link = linked(&f, 1, exits[0]);
+    let original = f.record(1, Decimal::ZERO, OrderPhase::Live);
+    write(&pool, &ledger, &b, &original, &first_link, seen()).await?;
+    // Linked SELL execution updates the order and consumed leg: nine commands.
+    let executed = Decimal::new(25, 2);
+    let first = f.record(1, executed, OrderPhase::Live);
+    let v = version(&pool, &b).await?;
+    let commands = ledger.statements_total();
+    proxy.enable_exact_query_trace(16);
+    let (result, commit) = ledger.record_order_observed(&first, &first_link, later(1)).await?;
+    let trace = proxy.query_trace();
+    ensure!(result.changed && result.anomalies.is_empty());
+    ensure!(ledger.statements_total() - commands == 9);
+    ensure!(trace.len() == 9 && trace.last().is_some_and(|cmd| cmd == "COMMIT"), "{trace:?}");
+    ensure!(trace.iter().filter(|cmd| cmd.contains("spot_order_set_generation")).count() == 1);
+    ensure!(version(&pool, &b).await? == v + 1);
+    let commit = commit.context("confirmed projected leg write has a coordinate")?;
+    ensure!(commit.key() == &f.key(1));
+    ensure!(commit.owner() == &first_link.owner);
+    ensure!(commit.generation() == &b);
+    ensure!(commit.executed_cum() == executed);
+    ensure!(commit.accounting_version() == v + 1);
+    exact_reference(&pool, &b).await?;
+
+    // The same record at the exact same SeenAt is one read and no coordinate.
+    let commands = ledger.statements_total();
+    proxy.enable_exact_query_trace(16);
+    let (result, commit) = ledger.record_order_observed(&first, &first_link, later(1)).await?;
+    let trace = proxy.query_trace();
+    ensure!(!result.changed && commit.is_none());
+    ensure!(ledger.statements_total() - commands == 1 && trace.len() == 1, "{trace:?}");
+    ensure!(version(&pool, &b).await? == v + 1);
+
+    let (pid, birth): (i32, String) = sqlx::query_as(
+        "SELECT pid,backend_start::text FROM pg_stat_activity WHERE pid=pg_backend_pid()",
+    )
+    .fetch_one(&proxied)
+    .await?;
+    let second = f.record(2, Decimal::ZERO, OrderPhase::Live);
+    let second_link = linked(&f, 2, exits[1]);
+    let commands = ledger.statements_total();
+    proxy.enable_exact_query_trace(16);
+    proxy.set_mode(ProxyMode::DropCommitAckOf("INSERT INTO venue_orders"));
+    ensure!(matches!(
+        ledger.record_order_observed(&second, &second_link, later(2)).await,
+        Err(LedgerError::Uncertain(_))
+    ));
+    let trace = proxy.query_trace();
+    ensure!(proxy.stats().commit_acks_dropped == 1);
+    ensure!(ledger.statements_total() - commands == 8);
+    ensure!(trace.len() == 8 && trace.last().is_some_and(|cmd| cmd == "COMMIT"), "{trace:?}");
+    ensure!(trace.iter().filter(|cmd| cmd.contains("spot_order_set_generation")).count() == 1);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let original: bool=sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                                WHERE pid=$1 AND backend_start::text=$2 AND datname=current_database())",
+            )
+            .bind(pid).bind(&birth).fetch_one(&pool).await?;
+            if !original {break;}
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        Ok::<_,sqlx::Error>(())
+    }).await??;
+    // The lost acknowledgement still landed exactly once.
+    ensure!(version(&pool, &b).await? == v + 2);
+    let landed: (i64, Option<Uuid>) = sqlx::query_as(
+        "SELECT count(*),min(intent_id::text)::uuid FROM venue_orders
+         WHERE tenant_id=$1 AND account_scope=$2 AND symbol=$3 AND exchange_order_id='2'",
+    )
+    .bind(f.tenant)
+    .bind(&f.scope)
+    .bind(SYMBOL)
+    .fetch_one(&pool)
+    .await?;
+    ensure!(landed == (1, Some(exits[1])));
+    exact_reference(&pool, &b).await?;
+    eprintln!("C8_COMMIT_COORDINATE confirmed=1 observed_execution=0.25 changed_sql=9 replay_sql=1 lost_ack_sql=8 lost_ack_coordinate=0");
+    Ok(())
+}
+
 #[sqlx::test(migrations = false)]
 #[ignore = "requires isolated PostgreSQL DATABASE_URL"]
 async fn projected_native_order_concurrent_changes_keep_versions_and_memberships_together(
