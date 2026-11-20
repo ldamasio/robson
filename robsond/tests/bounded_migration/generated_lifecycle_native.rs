@@ -89,7 +89,7 @@ pub(super) async fn prepare_with(
     ensure!(f.proxy.stats().statements - n == 2, "generated real original advisory setup2");
     let reference = {
         let mut tx = f.adapter.connection()?.begin().await?;
-        sqlx::raw_sql(contract::ORIGINAL).execute(&mut *tx).await?;
+        contract::run_original(&mut tx).await?;
         let r = capture(&mut tx, "R").await?;
         tx.rollback().await?;
         r
@@ -98,7 +98,7 @@ pub(super) async fn prepare_with(
     same(&before, &capture(&mut f.observer, "B1").await?, true)?;
     f.baseline = f.proxy.stats();
     f.proxy.enable_exact_query_trace(32);
-    eprintln!("GENERATED_SETUP fixed_fixture_once=true trigger_DDL={} full_captures=3 metadata_reads=1 history_reads=1 advisory_SQL=2 reference_owner_SQL=4",if deferred{3}else{1});
+    eprintln!("GENERATED_SETUP fixed_fixture_once=true trigger_DDL={} full_captures=3 metadata_reads=1 history_reads=1 advisory_SQL=2 reference_owner_SQL=7",if deferred{3}else{1});
     Ok(Oracle {
         before,
         reference,

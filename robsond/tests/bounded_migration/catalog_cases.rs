@@ -224,7 +224,7 @@ async fn actual52_catalog_matches_rolled_back_original_do(pool: PgPool) -> Resul
         // No candidate chunks/ranges/helper are used for the reference.
         let reference = {
             let mut transaction = adapter.connection()?.begin().await?;
-            sqlx::raw_sql(contract::ORIGINAL).execute(&mut *transaction).await?;
+            contract::run_original(&mut transaction).await?;
             let reference = capture(&mut transaction, "R").await?;
             transaction.rollback().await?;
             reference

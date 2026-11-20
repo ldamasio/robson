@@ -261,7 +261,7 @@ async fn actual52_absence_precedes_same_original_late_commit(pool: PgPool) -> Re
         // Original DO reference and rollback are outside the real APPLY_BOUND apply.
         let r = {
             let mut tx = f.adapter.connection()?.begin().await?;
-            sqlx::raw_sql(contract::ORIGINAL).execute(&mut *tx).await?;
+            contract::run_original(&mut tx).await?;
             let r = capture(&mut tx, "R").await?;
             tx.rollback().await?;
             r

@@ -98,7 +98,7 @@ pub(super) async fn prepare(f: &mut Fixture, fault: Fault) -> Result<Oracle> {
     // Independent original DO, not candidate chunks. All outside APPLY_BOUND apply.
     let reference = {
         let mut tx = f.adapter.connection()?.begin().await?;
-        sqlx::raw_sql(contract::ORIGINAL).execute(&mut *tx).await?;
+        contract::run_original(&mut tx).await?;
         let reference = capture(&mut tx, "R").await?;
         tx.rollback().await?;
         reference
