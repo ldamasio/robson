@@ -443,6 +443,10 @@ fn bound_mentions(code: &str) -> Vec<String> {
         // The literal's text, between its quotes (`"…"`, `b"…"`, `r#"…"#`).
         let open = literal.find('"').map_or(1, |i| i + 1);
         let literal = &literal[open..literal.rfind('"').unwrap_or(literal.len()).max(open)];
+        // PostgreSQL folds unquoted names to lower case: `SET STATEMENT_TIMEOUT`
+        // is the same setting. ASCII folding keeps every byte offset.
+        let literal = literal.to_ascii_lowercase();
+        let literal = literal.as_str();
         let bytes = literal.as_bytes();
         for guc in GUCS {
             for (at, _) in literal.match_indices(guc) {
@@ -514,14 +518,17 @@ fn the_guard_sees_what_it_guards() {
          q(\"set Session statement_timeout = 0\"); q(\"set idle_in_transaction_session_timeout = 0\");\n\
          o([(\"lock_timeout\", \"0\")]); o(\"-c statement_timeout=0\");\n\
          q(\"SELECT current_setting('lock_timeout')\"); q(\"SHOW lock_timeout\");\n\
-         m(\"expected lock_timeout={}\"); let lock_timeout_ms = 1; // statement_timeout\n",
+         m(\"expected lock_timeout={}\"); let lock_timeout_ms = 1; // statement_timeout\n\
+         q(\"SET STATEMENT_TIMEOUT = 0\"); q(\"Reset Lock_Timeout\");\n",
     ));
     assert_eq!(mentions, [
         "-c option statement_timeout",
         "RESET lock_timeout",
+        "RESET lock_timeout",
         "SET LOCAL lock_timeout",
         "SET SESSION statement_timeout",
         "SET idle_in_transaction_session_timeout",
+        "SET statement_timeout",
         "name lock_timeout",
         "other lock_timeout",
         "read lock_timeout",
