@@ -246,11 +246,15 @@ async fn t2b_start_epoch_waits_end_at_the_lock_bound(pool: PgPool) {
             .await;
     holder.rollback().await.unwrap();
     assert_lock_bound("start_epoch", &result.unwrap_err(), elapsed);
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM process_epochs")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(count, 0);
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM process_epochs")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(count().await, 0, "nothing written by the refused start");
+    robsond::process_epoch::start_epoch(&root, Uuid::now_v7(), "t2b").await.unwrap();
+    assert_eq!(count().await, 1, "the bounded pool still starts an epoch");
 }
 
 /// The partition `ahead` months from now, named as the partition functions name
@@ -358,13 +362,24 @@ async fn t2d_monthly_peak_write_waits_end_at_the_lock_bound(pool: PgPool) {
     .await;
     holder.rollback().await.unwrap();
     assert_lock_bound("monthly peak write", &result.unwrap_err(), elapsed);
-    let peak: rust_decimal::Decimal = sqlx::query_scalar(
-        "SELECT month_peak_net FROM monthly_state WHERE year = 2030 AND month = 5",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(peak, decimal(10));
+    let peak = || async {
+        sqlx::query_scalar::<_, rust_decimal::Decimal>(
+            "SELECT month_peak_net FROM monthly_state WHERE year = 2030 AND month = 5",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(peak().await, decimal(10), "nothing written by the refused write");
+    sqlx::query(MONTH_PEAK)
+        .bind(2030_i32)
+        .bind(5_i16)
+        .bind(decimal(1000))
+        .bind(decimal(20))
+        .execute(&root)
+        .await
+        .unwrap();
+    assert_eq!(peak().await, decimal(20), "the bounded pool still writes the peak");
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -389,18 +404,29 @@ async fn t2e_suspension_repair_write_waits_end_at_the_lock_bound(pool: PgPool) {
         .await
         .unwrap();
     // The repair's clearing write of `event_streams.rs`, verbatim.
-    let (result, elapsed) = timed(
-        "suspension clear",
+    let clear = || {
         sqlx::query(
             "UPDATE stream_suspensions SET cleared_at = NOW(), repair_error = NULL \
              WHERE suspension_id = $1",
         )
         .bind(suspension)
-        .execute(&root),
-    )
-    .await;
+        .execute(&root)
+    };
+    let (result, elapsed) = timed("suspension clear", clear()).await;
     holder.rollback().await.unwrap();
     assert_lock_bound("suspension clear", &result.unwrap_err(), elapsed);
+    let cleared = || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT cleared_at IS NOT NULL FROM stream_suspensions WHERE suspension_id = $1",
+        )
+        .bind(suspension)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert!(!cleared().await, "nothing written by the refused clear");
+    assert_eq!(clear().await.unwrap().rows_affected(), 1);
+    assert!(cleared().await, "the bounded pool still clears the suspension");
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -432,6 +458,18 @@ async fn t2f_projection_checkpoint_waits_end_at_the_lock_bound(pool: PgPool) {
     let (result, elapsed) = timed("projection checkpoint", write(root.clone(), 2)).await;
     holder.rollback().await.unwrap();
     assert_lock_bound("projection checkpoint", &result.unwrap_err(), elapsed);
+    let last_seq = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT last_seq FROM projection_checkpoints WHERE tenant_id = $1",
+        )
+        .bind(tenant)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(last_seq().await, 1, "nothing written by the refused checkpoint");
+    write(root.clone(), 2).await.unwrap();
+    assert_eq!(last_seq().await, 2, "the bounded pool still checkpoints");
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -524,6 +562,21 @@ async fn t2h_monthly_projector_explicit_lock_waits_end_at_the_lock_bound(pool: P
     holder.rollback().await.unwrap();
     assert!(seen_waiting, "the projector never reached its explicit LOCK TABLE");
     assert_lock_bound("monthly explicit lock", &result.unwrap_err(), elapsed);
+    let rows = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM monthly_state")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(rows().await, 0, "nothing written by the refused handler");
+    // Without the holder the same path takes its lock and completes.
+    robson_projector::apply_event_to_projections(
+        &root,
+        &entry_filled(Uuid::now_v7(), Uuid::now_v7(), at),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows().await, 0, "a month with no row is not counted");
 }
 
 // T3: reads under an ACCESS EXCLUSIVE holder end at the server's lock bound.
@@ -596,6 +649,15 @@ async fn t3_reads_under_an_exclusive_holder_end_at_the_lock_bound(pool: PgPool) 
     let error = result.unwrap_err();
     assert!(error.contains("lock timeout"), "journal readiness: {error}");
     assert!(elapsed < LOCK_BOUND + Duration::from_secs(1), "journal readiness: {elapsed:?}");
+    // Without a holder the same reads answer on the same pools.
+    robson_eventlog::query_events(&root, QueryOptions::new(tenant)).await.unwrap();
+    robson_store::find_active_from_projection(&root, tenant).await.unwrap();
+    sqlx::query("SELECT 1 FROM funding_sagas WHERE tenant_id = $1")
+        .bind(tenant)
+        .fetch_all(&root)
+        .await
+        .unwrap();
+    backend.check_ready().await.unwrap();
 }
 
 // T4: lifecycle of the session bounds on reused and replacement connections.
@@ -672,22 +734,19 @@ async fn t5_an_abandoned_lock_holder_is_ended_by_the_server(pool: PgPool) {
     robson_eventlog::append_event(&pool, &stream, None, event(Uuid::now_v7(), &stream))
         .await
         .unwrap();
-    let mut abandoned = balance_session_options(options(&pool), SessionBounds::BALANCE)
-        .connect()
-        .await
-        .unwrap();
+    let root = root(&pool).await;
+    let mut abandoned = root.begin().await.unwrap();
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut abandoned)
+        .fetch_one(&mut *abandoned)
         .await
         .unwrap();
-    sqlx::query("BEGIN").execute(&mut abandoned).await.unwrap();
     sqlx::query("UPDATE stream_state SET last_seq = last_seq WHERE stream_key = $1")
         .bind(&stream)
-        .execute(&mut abandoned)
+        .execute(&mut *abandoned)
         .await
         .unwrap();
     let abandoned_at = Instant::now();
-    // No ROLLBACK, no close: the client simply stops.
+    // No ROLLBACK, no close, no return to the pool: the client simply stops.
     std::mem::forget(abandoned);
     let waiter = {
         let pool = pool.clone();
@@ -721,6 +780,10 @@ async fn t5_an_abandoned_lock_holder_is_ended_by_the_server(pool: PgPool) {
     let proceeded = waiter.await.unwrap().duration_since(abandoned_at);
     assert!(gone < deadline, "{gone:?}");
     assert!(proceeded < deadline, "the waiter proceeded only after {proceeded:?}");
+    sqlx::query("SELECT 1")
+        .execute(&root)
+        .await
+        .expect("the root pool is still usable");
 }
 
 // T6: a statement ends at the server's statement bound.
