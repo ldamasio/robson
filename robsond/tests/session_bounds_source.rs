@@ -272,36 +272,263 @@ fn production_sources() -> Vec<Source> {
     out
 }
 
-/// The function whose body contains byte `at` of production `text`.
-fn enclosing_fn(text: &str, at: usize) -> String {
-    let mut best = String::from("<none>");
-    for line in text[..at].lines() {
-        let trimmed = line.trim_start();
-        let Some(pos) = trimmed.find("fn ") else {
+/// A `fn` or `impl` item of production code, with its byte span.
+#[derive(Debug)]
+struct Item {
+    is_impl: bool,
+    name: String,
+    span: std::ops::Range<usize>,
+}
+
+/// Whether the keyword at `start` begins an item: only item qualifiers stand
+/// between it and the end of the previous item, a block opening or an
+/// attribute. `fn` and `impl` in type position (`fn(u8)`, `-> impl Fn`) do
+/// not.
+fn starts_item(code: &str, start: usize) -> bool {
+    let mut before = code[..start].trim_end();
+    loop {
+        if before.ends_with(')') {
+            if let Some(visibility) = before.rfind("pub(") {
+                if before[visibility..].find(')') == Some(before.len() - visibility - 1) {
+                    before = before[..visibility].trim_end();
+                    continue;
+                }
+            }
+        }
+        let word_start = before
+            .rfind(|c: char| c.is_whitespace() || matches!(c, ';' | '{' | '}' | ']'))
+            .map_or(0, |i| i + 1);
+        if ["pub", "async", "const", "unsafe", "default", "extern"].contains(&&before[word_start..])
+        {
+            before = before[..word_start].trim_end();
             continue;
-        };
-        if trimmed[..pos].split_whitespace().all(|word| {
-            [
-                "pub",
-                "pub(crate)",
-                "pub(super)",
-                "async",
-                "const",
-                "unsafe",
-            ]
-            .contains(&word)
-        }) {
-            let name: String = trimmed[pos + 3..]
-                .bytes()
-                .take_while(|b| is_ident(*b))
-                .map(char::from)
-                .collect();
-            if !name.is_empty() {
-                best = name;
+        }
+        break;
+    }
+    before.is_empty() || before.ends_with([';', '{', '}', ']'])
+}
+
+fn leading_ident(text: &str) -> Option<String> {
+    let name: String =
+        text.trim_start().bytes().take_while(|b| is_ident(*b)).map(char::from).collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The self type an `impl` header names: `impl<T> Trait for Type<T>` gives
+/// `Type`.
+fn impl_type(header: &str) -> Option<String> {
+    let mut header = header.trim_start();
+    if header.starts_with('<') {
+        let mut depth = 0;
+        let close = header.char_indices().find_map(|(i, c)| {
+            depth += match c {
+                '<' => 1,
+                '>' => -1,
+                _ => 0,
+            };
+            (depth == 0).then_some(i)
+        })?;
+        header = &header[close + 1..];
+    }
+    let header = header.split(['{', ';']).next()?;
+    let ty = header.rsplit(" for ").next()?.trim().trim_start_matches('&');
+    let path = ty.split(['<', ' ', '\n']).next()?;
+    leading_ident(path.rsplit("::").next()?)
+}
+
+/// The `fn` and `impl` items of production `code`.
+fn items(code: &str) -> Vec<Item> {
+    let bytes = code.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0;
+    for (kind, part) in segments(code) {
+        if kind == Kind::Code {
+            for keyword in ["fn", "impl"] {
+                for (offset, _) in part.match_indices(keyword) {
+                    let start = at + offset;
+                    let end = start + keyword.len();
+                    if (start > 0 && is_ident(bytes[start - 1]))
+                        || bytes.get(end).is_some_and(|b| is_ident(*b))
+                        || !starts_item(code, start)
+                    {
+                        continue;
+                    }
+                    let name = if keyword == "fn" {
+                        leading_ident(&code[end..])
+                    } else {
+                        impl_type(&code[end..])
+                    };
+                    if let Some(name) = name {
+                        out.push(Item {
+                            is_impl: keyword == "impl",
+                            name,
+                            span: start..item_end(code, start),
+                        });
+                    }
+                }
+            }
+        }
+        at += part.len();
+    }
+    out
+}
+
+/// The innermost `impl` (empty outside one) and `fn` (`<module>` outside one)
+/// whose span contains byte `at`.
+fn owner(items: &[Item], at: usize) -> (String, String) {
+    let innermost = |is_impl: bool| {
+        items
+            .iter()
+            .filter(|item| item.is_impl == is_impl && item.span.contains(&at))
+            .min_by_key(|item| item.span.len())
+            .map(|item| item.name.clone())
+    };
+    (
+        innermost(true).unwrap_or_default(),
+        innermost(false).unwrap_or_else(|| "<module>".into()),
+    )
+}
+
+const CONSTRUCTORS: [&str; 9] = [
+    "PgPool::connect",
+    "Pool::<Postgres>::connect",
+    "PgPoolOptions::new()",
+    "PgConnection::connect",
+    "PgListener::connect",
+    ".connect_with(",
+    ".connect_lazy(",
+    ".connect_lazy_with(",
+    ".connect()",
+];
+
+/// Every pool or connection constructor in production `code`, with its owner.
+fn constructors(code: &str) -> Vec<(String, String, &'static str)> {
+    if !CONSTRUCTORS.iter().any(|needle| code.contains(needle)) {
+        return Vec::new();
+    }
+    let items = items(code);
+    let mut found = Vec::new();
+    for needle in CONSTRUCTORS {
+        for (at, _) in code.match_indices(needle) {
+            let (ty, function) = owner(&items, at);
+            found.push((ty, function, needle));
+        }
+    }
+    found
+}
+
+const GUCS: [&str; 3] = [
+    "lock_timeout",
+    "statement_timeout",
+    "idle_in_transaction_session_timeout",
+];
+
+/// The text in lower case, without whitespace, quotes or backslashes.
+fn folded(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '\'' | '"' | '\\'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Every mention of a bound's name in a string literal of production `code`,
+/// with what the text before it does with it: a read, a change (and which
+/// kind), the bare name (an options key or a constant), or anything else.
+fn bound_mentions(code: &str) -> Vec<String> {
+    let mut mentions = Vec::new();
+    for (kind, literal) in segments(code) {
+        if kind != Kind::Literal {
+            continue;
+        }
+        // The literal's text, between its quotes (`"…"`, `b"…"`, `r#"…"#`).
+        let open = literal.find('"').map_or(1, |i| i + 1);
+        let literal = &literal[open..literal.rfind('"').unwrap_or(literal.len()).max(open)];
+        let bytes = literal.as_bytes();
+        for guc in GUCS {
+            for (at, _) in literal.match_indices(guc) {
+                let end = at + guc.len();
+                if (at > 0 && is_ident(bytes[at - 1]))
+                    || bytes.get(end).is_some_and(|b| is_ident(*b))
+                {
+                    continue;
+                }
+                let before = folded(&literal[..at]);
+                let after = folded(&literal[end..]);
+                let how = if before.ends_with("current_setting(") || before.ends_with("show") {
+                    "read"
+                } else if before.ends_with("set_config(") {
+                    match after.split(')').next().and_then(|args| args.rsplit(',').next()) {
+                        Some("true") => "set_config local",
+                        Some("false") => "set_config session",
+                        _ => "set_config unknown",
+                    }
+                } else if before.ends_with("reset") {
+                    "RESET"
+                } else if before.ends_with("setlocal") {
+                    "SET LOCAL"
+                } else if before.ends_with("setsession") {
+                    "SET SESSION"
+                } else if before.ends_with("set") {
+                    "SET"
+                } else if before.ends_with("-c") || before.ends_with("-c%20") {
+                    "-c option"
+                } else if before.is_empty() && after.is_empty() {
+                    "name"
+                } else {
+                    "other"
+                };
+                mentions.push(format!("{how} {guc}"));
             }
         }
     }
-    best
+    mentions.sort();
+    mentions
+}
+
+#[test]
+fn the_guard_sees_what_it_guards() {
+    let code = production(
+        "impl Other {\n    pub fn new() -> Self { Self }\n}\n\
+         impl<T: Clone> JournalBackend for PgJournalBackend<T> {\n\
+         \x20   fn helper() {}\n\
+         \x20   pub(crate) async fn new(pool: &PgPool) -> Self {\n\
+         \x20       let p = PgPoolOptions::new();\n        Self\n    }\n\
+         \x20   fn after() { let q = PgPoolOptions::new(); }\n}\n\
+         fn takes(f: fn(u8) -> u8, g: impl Fn()) -> impl Fn() { PgPoolOptions::new(); }\n\
+         static POOL: () = { PgPoolOptions::new(); };\n",
+    );
+    let owners: Vec<_> = constructors(&code)
+        .into_iter()
+        .map(|(ty, function, _)| format!("{ty}::{function}"))
+        .collect();
+    assert_eq!(owners, [
+        "PgJournalBackend::new",
+        "PgJournalBackend::after",
+        "::takes",
+        "::<module>"
+    ]);
+    let mentions = bound_mentions(&production(
+        "q(\"SELECT set_config( 'statement_timeout', '0', false)\");\n\
+         q(\"SELECT set_config('lock_timeout', $1, true)\");\n\
+         q(\"RESET lock_timeout\"); q(\"SET  LOCAL lock_timeout = '1s'\");\n\
+         q(\"set Session statement_timeout = 0\"); q(\"set idle_in_transaction_session_timeout = 0\");\n\
+         o([(\"lock_timeout\", \"0\")]); o(\"-c statement_timeout=0\");\n\
+         q(\"SELECT current_setting('lock_timeout')\"); q(\"SHOW lock_timeout\");\n\
+         m(\"expected lock_timeout={}\"); let lock_timeout_ms = 1; // statement_timeout\n",
+    ));
+    assert_eq!(mentions, [
+        "-c option statement_timeout",
+        "RESET lock_timeout",
+        "SET LOCAL lock_timeout",
+        "SET SESSION statement_timeout",
+        "SET idle_in_transaction_session_timeout",
+        "name lock_timeout",
+        "other lock_timeout",
+        "read lock_timeout",
+        "read lock_timeout",
+        "set_config local lock_timeout",
+        "set_config session statement_timeout",
+    ]);
 }
 
 /// The production body of the function whose signature starts with `signature`.
@@ -355,126 +582,62 @@ fn the_guard_reads_production_code_only() {
 fn every_daemon_pool_and_connection_is_built_where_the_bounds_reach_it() {
     // `connect_daemon_pool` delegates to `connect_daemon_pool_with`, as
     // `BudgetBasisAlarm::new` delegates to `with_metrics`.
-    let allowed: BTreeSet<(&str, &str)> = [
-        ("db_session.rs", "connect_daemon_pool_with"),
-        ("order_journal_store.rs", "new"),
-        ("budget_basis_alarm.rs", "with_metrics"),
-        ("db.rs", "run_db_command"),
+    let allowed: BTreeSet<(&str, &str, &str)> = [
+        ("db_session.rs", "", "connect_daemon_pool_with"),
+        ("order_journal_store.rs", "PgJournalBackend", "new"),
+        ("budget_basis_alarm.rs", "BudgetBasisAlarm", "with_metrics"),
+        ("db.rs", "", "run_db_command"),
     ]
     .into_iter()
     .collect();
-    let constructors = [
-        "PgPool::connect",
-        "Pool::<Postgres>::connect",
-        "PgPoolOptions::new()",
-        "PgConnection::connect",
-        "PgListener::connect",
-        ".connect_with(",
-        ".connect_lazy(",
-        ".connect_lazy_with(",
-        ".connect()",
-    ];
     let mut found = Vec::new();
     for source in production_sources() {
-        for needle in constructors {
-            for (at, _) in source.text.match_indices(needle) {
-                found.push((source.file.clone(), enclosing_fn(&source.text, at), needle));
-            }
+        for (ty, function, needle) in constructors(&source.text) {
+            found.push((source.file.clone(), ty, function, needle));
         }
     }
     let stray: Vec<_> = found
         .iter()
-        .filter(|(file, function, _)| !allowed.contains(&(file.as_str(), function.as_str())))
+        .filter(|(file, ty, function, _)| {
+            !allowed.contains(&(file.as_str(), ty.as_str(), function.as_str()))
+        })
         .collect();
     assert!(
         stray.is_empty(),
         "pool or connection built outside the bounded owners: {stray:?}"
     );
-    let owners: BTreeSet<(&str, &str)> = found
+    let owners: BTreeSet<(&str, &str, &str)> = found
         .iter()
-        .map(|(file, function, _)| (file.as_str(), function.as_str()))
+        .map(|(file, ty, function, _)| (file.as_str(), ty.as_str(), function.as_str()))
         .collect();
     assert_eq!(owners, allowed, "every allowed owner still builds its pool");
 }
 
-const GUCS: [&str; 3] = [
-    "lock_timeout",
-    "statement_timeout",
-    "idle_in_transaction_session_timeout",
-];
-
-/// Each change of a bound in `text`: a `set_config` (transaction-local or
-/// session), a `SET`, a `-c` Startup option or a Startup options key.
-fn bound_changes(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
-    let mut changes = Vec::new();
-    for guc in GUCS {
-        for (at, _) in text.match_indices(guc) {
-            let end = at + guc.len();
-            if (at > 0 && is_ident(bytes[at - 1])) || bytes.get(end).is_some_and(|b| is_ident(*b)) {
-                continue;
-            }
-            let mut window = at.saturating_sub(40);
-            while !text.is_char_boundary(window) {
-                window -= 1;
-            }
-            let before = text[window..at].trim_end();
-            let upper = before.to_ascii_uppercase();
-            let how = if before.to_ascii_lowercase().ends_with("set_config('") {
-                let args = &text[end..end + text[end..].find(')').unwrap()];
-                if args.trim_end().ends_with("true") {
-                    "set_config local"
-                } else {
-                    "set_config session"
-                }
-            } else if upper.ends_with("SET")
-                || upper.ends_with("SET LOCAL")
-                || upper.ends_with("SET SESSION")
-            {
-                "SET"
-            } else if before.ends_with("-c") || before.ends_with("-c%20") {
-                "-c option"
-            } else if before.ends_with("(\"") {
-                "options key"
-            } else {
-                continue;
-            };
-            changes.push(format!("{how} {guc}"));
-        }
-    }
-    changes.sort();
-    changes
-}
-
 #[test]
-fn only_the_known_sites_change_the_session_bounds() {
-    let local = |file: &str| {
-        (
-            file.to_string(),
-            GUCS.iter().map(|guc| format!("set_config local {guc}")).collect::<Vec<_>>(),
-        )
-    };
+fn every_mention_of_a_session_bound_is_a_known_one() {
+    let each = |how: &str| GUCS.iter().map(|guc| format!("{how} {guc}")).collect::<Vec<_>>();
     let mut expected: BTreeMap<String, Vec<String>> = [
-        local("order_journal_balance.rs"),
-        local("order_journal_readiness.rs"),
-        local("venue_ledger_store.rs"),
-        ("budget_basis_alarm.rs".to_string(), vec!["SET statement_timeout".to_string()]),
-        (
-            "db_session.rs".to_string(),
-            GUCS.iter().map(|guc| format!("options key {guc}")).collect(),
-        ),
+        // The three Startup options, the self-check's read and its message.
+        ("db_session.rs", [each("name"), each("read"), each("other")].concat()),
+        // The existing transaction-local bounds.
+        ("order_journal_balance.rs", each("set_config local")),
+        ("order_journal_readiness.rs", each("set_config local")),
+        ("venue_ledger_store.rs", each("set_config local")),
+        // The alarm's own session statement bound.
+        ("budget_basis_alarm.rs", vec!["SET statement_timeout".to_string()]),
     ]
     .into_iter()
+    .map(|(file, mentions)| (file.to_string(), mentions))
     .collect();
-    for changes in expected.values_mut() {
-        changes.sort();
+    for mentions in expected.values_mut() {
+        mentions.sort();
     }
     let observed: BTreeMap<String, Vec<String>> = production_sources()
         .into_iter()
-        .map(|s| (s.file, bound_changes(&s.text)))
-        .filter(|(_, changes)| !changes.is_empty())
+        .map(|s| (s.file, bound_mentions(&s.text)))
+        .filter(|(_, mentions)| !mentions.is_empty())
         .collect();
-    assert_eq!(observed, expected, "session bounds changed outside the known sites");
+    assert_eq!(observed, expected, "a session bound is read or changed outside the known sites");
 }
 
 #[test]
