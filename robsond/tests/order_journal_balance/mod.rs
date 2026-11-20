@@ -103,9 +103,12 @@ fn journal_on(
     venue: &str,
 ) -> Arc<OrderJournal> {
     Arc::new(
-        OrderJournal::new(Arc::new(PgJournalBackend::new(pool, tenant)), &VenueId::new(venue))
-            .with_balance_account(balance)
-            .with_one_attempt_per_client_id(one_attempt),
+        OrderJournal::new(
+            Arc::new(PgJournalBackend::new(pool, tenant).with_balance_account(balance)),
+            &VenueId::new(venue),
+        )
+        .with_balance_account(balance)
+        .with_one_attempt_per_client_id(one_attempt),
     )
 }
 
@@ -498,6 +501,8 @@ async fn a_spent_cancel_id_is_not_sent_on_a_balance_journal(pool: PgPool) {
 
 #[path = "admission.rs"]
 mod admission;
+#[path = "auxiliary_bounds.rs"]
+mod auxiliary_bounds;
 #[path = "budget.rs"]
 mod budget;
 #[path = "readiness.rs"]

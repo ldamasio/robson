@@ -190,16 +190,19 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     let (Some(pool), Some(tenant_id)) = (pool, config.projection.tenant_id) else {
         return executor;
     };
-    let backend = Arc::new(crate::order_journal_store::PgJournalBackend::new(pool, tenant_id));
-    // ADR-0056 step 8: the capability is fixed before the journal is shared.
+    // ADR-0056 step 8: the capability is fixed before the journal is shared,
+    // and its backend bounds the same account's transactions.
     let one_attempt = venue.capabilities().one_attempt_per_client_id;
+    let balance =
+        venue.capabilities().account_kind == robson_exec::venue::AccountKind::BalanceAccount;
+    let backend = Arc::new(
+        crate::order_journal_store::PgJournalBackend::new(pool, tenant_id)
+            .with_balance_account(balance),
+    );
     let journal = Arc::new(
         OrderJournal::new(backend, venue.id())
             .with_one_attempt_per_client_id(one_attempt)
-            .with_balance_account(
-                venue.capabilities().account_kind
-                    == robson_exec::venue::AccountKind::BalanceAccount,
-            ),
+            .with_balance_account(balance),
     );
     venue.attach_order_journal(Arc::clone(&journal));
     executor.with_order_journal(journal)

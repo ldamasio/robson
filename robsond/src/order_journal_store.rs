@@ -17,7 +17,7 @@ use robson_exec::{
     gate::Incident,
     order_journal::{
         CommitFailure, JournalBackend, JournalBatch, ReleaseCounts, ReleaseRecord,
-        StreamSuspensionRow,
+        StreamSuspensionRow, COMMIT_BOUND, RELEASE_BOUND,
     },
 };
 use rust_decimal::Decimal;
@@ -59,6 +59,8 @@ pub struct PgJournalBackend {
     daemon_pool: PgPool,
     tenant_id: Uuid,
     ready_wait: Duration,
+    /// Bound incidents, suspensions and releases as a balance account's.
+    balance_account: bool,
 }
 
 impl PgJournalBackend {
@@ -76,7 +78,16 @@ impl PgJournalBackend {
             daemon_pool: daemon_pool.clone(),
             tenant_id,
             ready_wait: JOURNAL_READY_WAIT,
+            balance_account: false,
         }
+    }
+
+    /// Run this backend's incident, suspension and release transactions as a
+    /// balance account's (ADR-0056 step 8): server bounds first, raw
+    /// retirement. Set it with the journal's own `with_balance_account`.
+    pub fn with_balance_account(mut self, on: bool) -> Self {
+        self.balance_account = on;
+        self
     }
 
     /// Change how long the startup check may take.
@@ -271,18 +282,22 @@ impl JournalBackend for PgJournalBackend {
         &self,
         suspension: &StreamSuspensionRow,
     ) -> Result<(), CommitFailure> {
+        let started = Instant::now();
         let known = |e: sqlx::Error| CommitFailure::Known(e.to_string());
         let connection = self.pool.acquire().await.map_err(known)?;
-        let mut write = RetiringConnection { connection, finished: false };
+        let mut write = self.hold(connection);
         let mut tx = write
-            .connection
+            .connection()
             .begin()
             .instrument(
                 tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
             )
             .await
             .map_err(known)?;
-        let mut rollback_observation = RollbackObservation::new();
+        let mut rollback_observation = self.rollback_observation();
+        self.bound_auxiliary(&mut tx, COMMIT_BOUND, started)
+            .await
+            .map_err(CommitFailure::Known)?;
         // An open suspension of the stream, or this one replayed, stands.
         sqlx::query(
             r#"
@@ -315,23 +330,27 @@ impl JournalBackend for PgJournalBackend {
             .await
             .map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
         rollback_observation.disarm();
-        write.finished = true;
+        write.finish();
         Ok(())
     }
 
     async fn upsert_incident(&self, incident: &Incident) -> Result<(), CommitFailure> {
+        let started = Instant::now();
         let known = |e: sqlx::Error| CommitFailure::Known(e.to_string());
         let connection = self.pool.acquire().await.map_err(known)?;
-        let mut write = RetiringConnection { connection, finished: false };
+        let mut write = self.hold(connection);
         let mut tx = write
-            .connection
+            .connection()
             .begin()
             .instrument(
                 tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
             )
             .await
             .map_err(known)?;
-        let mut rollback_observation = RollbackObservation::new();
+        let mut rollback_observation = self.rollback_observation();
+        self.bound_auxiliary(&mut tx, COMMIT_BOUND, started)
+            .await
+            .map_err(CommitFailure::Known)?;
         // Every value only grows, so a replay or a reordering converges. A
         // released row does not conflict: this opens a new one.
         sqlx::query(
@@ -371,31 +390,33 @@ impl JournalBackend for PgJournalBackend {
             .await
             .map_err(|e| CommitFailure::Uncertain(e.to_string()))?;
         rollback_observation.disarm();
-        write.finished = true;
+        write.finish();
         Ok(())
     }
 
     /// One transaction of five statements, `BEGIN` and `COMMIT` included
     /// (design §2.8): tombstone, release, decision. The decision comes last,
     /// with what the two before it did; the incidents' reference to it is
-    /// checked at the commit.
+    /// checked at the commit. A balance account's has six: its bounds first.
     async fn release(&self, release: &ReleaseRecord) -> Result<ReleaseCounts, String> {
+        let started = Instant::now();
         let error = |e: sqlx::Error| e.to_string();
         // A connection whose release did not finish (the caller's bound
         // dropped it, or an error cut it) is closed, not handed back: returned
         // to the pool it would wait on a ping with no deadline, holding a
         // daemon-pool slot (J's rule for the journal's own pool).
         let connection = self.daemon_pool.acquire().await.map_err(error)?;
-        let mut held = RetiringConnection { connection, finished: false };
+        let mut held = self.hold(connection);
         let mut tx = held
-            .connection
+            .connection()
             .begin()
             .instrument(
                 tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
             )
             .await
             .map_err(error)?;
-        let mut rollback_observation = RollbackObservation::new();
+        let mut rollback_observation = self.rollback_observation();
+        self.bound_auxiliary(&mut tx, RELEASE_BOUND, started).await?;
         // A row with no `uncertain_at` is never tombstoned, nor one with an
         // outcome, proven unsent, or already disposed of.
         let tombstoned = sqlx::query(
@@ -480,7 +501,7 @@ impl JournalBackend for PgJournalBackend {
             .await
             .map_err(error)?;
         rollback_observation.disarm();
-        held.finished = true;
+        held.finish();
         Ok(ReleaseCounts {
             intents_tombstoned: tombstoned,
             incidents_released: released,
