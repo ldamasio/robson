@@ -52,14 +52,14 @@ pub(super) async fn original38(f: &mut Fixture) -> Result<()> {
     let began = std::time::Instant::now();
     let (result, windows) = tokio::join!(
         source.run_direct(&mut f.adapter),
-        tokio::time::timeout(Duration::from_millis(300), controller)
+        tokio::time::timeout(CONTROLLER_CEILING, controller)
     );
     eprintln!(
         "P9_INITIAL_REAL_RUN_DIRECT total_including_housekeeping={:?} result={}",
         began.elapsed(),
         if result.is_ok() { "Ok" } else { "Err" }
     );
-    let windows = windows.context("initial stage observer300ms")?;
+    let windows = windows.context("initial stage observer ceiling")?;
     result?;
     ensure!(
         f.adapter.status() == (Status { phase: Phase::Restored, failure: None }),

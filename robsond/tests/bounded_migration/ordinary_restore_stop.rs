@@ -13,7 +13,7 @@ use super::{
 async fn ordinary39_not_run_after_original38_restore_failure(pool: PgPool) -> Result<()> {
     let mut f = Fixture::new(&pool).await?;
     let pid = f.pid;
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         sqlx::query(CREATE_WITNESS).execute(&mut f.observer).await?;
         let source = migrator(Kind::Matching);
         ensure!(
@@ -52,14 +52,14 @@ async fn ordinary39_not_run_after_original38_restore_failure(pool: PgPool) -> Re
         Ok::<_, anyhow::Error>(())
     })
     .await
-    .context("restore-stop fixture5s")
+    .context("restore-stop fixture ceiling")
     .and_then(|r| r);
     // Durable lineage after the original backend is gone: 38 committed, 39 absent.
     // One absolute 5 s cleanup deadline covers retirement and every readback.
     let end = tokio::time::Instant::now() + ACQUIRE_BOUND;
     let observed = tokio::time::timeout_at(end, async {
-        let gone = tokio::time::timeout(Duration::from_millis(300), async {
-            for _ in 0..60 {
+        let gone = tokio::time::timeout(NATIVE_RETIREMENT, async {
+            for _ in 0..NATIVE_RETIREMENT_POLLS {
                 if sqlx::query_scalar::<_, bool>(GONE).bind(pid).fetch_one(&mut f.observer).await? {
                     return Ok::<_, sqlx::Error>(true);
                 }
@@ -68,7 +68,7 @@ async fn ordinary39_not_run_after_original38_restore_failure(pool: PgPool) -> Re
             Ok(false)
         })
         .await
-        .context("restore-stop retirement300ms")??;
+        .context("restore-stop retirement window")??;
         ensure!(gone, "restore-stop original backend not retired");
         let versions: Vec<(i64, bool)> = sqlx::query_as(
             "SELECT version, success FROM _sqlx_migrations WHERE version >= $1 ORDER BY version",

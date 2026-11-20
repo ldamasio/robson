@@ -25,8 +25,8 @@ pub(super) async fn finish(
     let cleanup = async {
         let mut gone = false;
         let mut polls = 0;
-        tokio::time::timeout(Duration::from_millis(300), async {
-            for n in 1..=60 {
+        tokio::time::timeout(NATIVE_RETIREMENT, async {
+            for n in 1..=NATIVE_RETIREMENT_POLLS {
                 polls = n;
                 gone = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=ANY($1)) AND NOT EXISTS(SELECT 1 FROM pg_locks WHERE pid=ANY($1))")
                     .bind(&owned_pids).fetch_one(&mut observer).await?;

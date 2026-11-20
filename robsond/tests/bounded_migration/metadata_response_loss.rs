@@ -187,7 +187,7 @@ async fn lose_response(
                     },
                 )
                 .await
-                .context("metadata lock/response observation20 expired")?;
+                .context("metadata lock/response 20ms observation window expired")?;
             }
         }
         anyhow::bail!("metadata gate absent")
@@ -268,7 +268,7 @@ async fn lose_response(
     );
     ensure!(
         started.elapsed() < APPLY_BOUND && witness.released.elapsed() < Duration::from_millis(20),
-        "metadata Pending/drop missed unchanged200/20"
+        "metadata Pending/drop missed APPLY_BOUND/20ms window inside idle 1s"
     );
     let mut received = Vec::with_capacity(55);
     ensure!(witness.windows.len() == 4, "metadata received window count");
@@ -300,7 +300,7 @@ async fn lose_response(
 async fn actual52_metadata_server_success_lost_response_rolls_back(pool: PgPool) -> Result<()> {
     let mut f = Fixture::new_with_diagnostics(&pool, true).await?;
     let (mut blocker, mut blocker_pid, mut baseline) = (None, None, None);
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         let old = f.proxy.stats();
         f.adapter.lock().await?;
         ensure!(f.proxy.stats().statements - old.statements == 2, "metadata original advisory SQL");
@@ -334,7 +334,7 @@ async fn actual52_metadata_server_success_lost_response_rolls_back(pool: PgPool)
         f.proxy.enable_query_trace(32);
         eprintln!("METADATA_SUCCESS_SETUP advisorySQL=2 prepareQE=0 parameters=3 cache=1 blockerSQL=3 observerSetup=5");
         lose_response(&mut f, &mut blocker, pid, &id).await
-    }).await.context("metadata success primary5s deadline").and_then(|r| r);
+    }).await.context("metadata success primary deadline").and_then(|r| r);
     let before = f.proxy.stats();
     let cleanup = finish_both(f, blocker, blocker_pid, baseline.as_ref(), before).await;
     eprintln!(

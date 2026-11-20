@@ -131,19 +131,19 @@ pub(super) async fn park(f: Fixture) -> Result<Parked> {
         drop(proxy);
         anyhow::bail!("generated unknown PID; raw-drop-only cleanup; native retirement unproved");
     }
-    let retired = tokio::time::timeout(Duration::from_millis(300), async {
-        for n in 1..=60 {
+    let retired = tokio::time::timeout(NATIVE_RETIREMENT, async {
+        for n in 1..=NATIVE_RETIREMENT_POLLS {
             if sqlx::query_scalar::<_, bool>(GONE).bind(pid).fetch_one(&mut observer).await? {
                 return Ok::<_, sqlx::Error>(n);
             }
-            if n < 60 {
+            if n < NATIVE_RETIREMENT_POLLS {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
         Err(sqlx::Error::Protocol("generated original PID/locks not retired".into()))
     })
     .await
-    .context("generated native retirement300ms")
+    .context("generated native retirement window")
     .and_then(|r| r.map_err(anyhow::Error::from));
     // Attempt ownership disposal on every path; a failed retirement grants no
     // later run/reconnect or authoritative absence observation.

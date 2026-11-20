@@ -62,7 +62,7 @@ async fn exercise(f: &mut Fixture, warm: &Value) -> Result<()> {
                     .map_err(|_| anyhow::anyhow!("absence milestone release lost"))?;
                 current = next;
             } else {
-                // One warmed, cheap statement only: no full capture under idle20/apply200.
+                // One warmed, cheap statement only: no full capture under idle/apply.
                 let observed_at = Instant::now();
                 let absent = snapshot(observer, pid).await?;
                 let a = &absent["activity"];
@@ -103,7 +103,7 @@ async fn exercise(f: &mut Fixture, warm: &Value) -> Result<()> {
     let started = Instant::now();
     let (result, observed) = tokio::join!(
         f.adapter.apply(migration()),
-        tokio::time::timeout(Duration::from_millis(300), controller)
+        tokio::time::timeout(CONTROLLER_CEILING, controller)
     );
     let duration = started.elapsed();
     let status = f.adapter.status();
@@ -120,7 +120,7 @@ async fn exercise(f: &mut Fixture, warm: &Value) -> Result<()> {
         result.is_err() && duration < APPLY_BOUND,
         "counterexample lost to success/idle/global deadline; no timing adjustment"
     );
-    let mut windows = observed.context("absence controller300ms ceiling")??;
+    let mut windows = observed.context("absence controller ceiling")??;
     // The final gate window contains DDL49..52+metadata; COMMIT follows its
     // release.
     ensure!(
@@ -186,20 +186,20 @@ async fn finish(f: Fixture, reference: Option<&Value>, end_stats: ProxyStats) ->
     } = f;
     let deadline = tokio::time::Instant::now() + ACQUIRE_BOUND;
     drop(adapter); // Whole original raw owner before any retirement/barrier query.
-    let retired = tokio::time::timeout(Duration::from_millis(300), async {
-        for n in 1..=60 {
+    let retired = tokio::time::timeout(NATIVE_RETIREMENT, async {
+        for n in 1..=NATIVE_RETIREMENT_POLLS {
             let gone: bool = sqlx::query_scalar(RETIRED).bind(pid).fetch_one(&mut observer).await?;
             if gone {
                 return Ok::<_, sqlx::Error>(n);
             }
-            if n < 60 {
+            if n < NATIVE_RETIREMENT_POLLS {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
         Err(sqlx::Error::Protocol("original PID/locks did not retire".into()))
     })
     .await
-    .context("absence retirement300ms")
+    .context("absence retirement window")
     .and_then(|r| r.map_err(Into::into));
     let snapshots = if retired.is_ok() {
         tokio::time::timeout_at(deadline, async {
@@ -255,10 +255,10 @@ async fn finish(f: Fixture, reference: Option<&Value>, end_stats: ProxyStats) ->
 async fn actual52_absence_precedes_same_original_late_commit(pool: PgPool) -> Result<()> {
     let mut f = Fixture::new(&pool).await?;
     let mut reference = None;
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         contract::source_hash()?;
         f.adapter.lock().await?;
-        // Original DO reference and rollback are outside the real apply200.
+        // Original DO reference and rollback are outside the real APPLY_BOUND apply.
         let r = {
             let mut tx = f.adapter.connection()?.begin().await?;
             sqlx::raw_sql(contract::ORIGINAL).execute(&mut *tx).await?;
@@ -284,7 +284,7 @@ async fn actual52_absence_precedes_same_original_late_commit(pool: PgPool) -> Re
         exercise(&mut f, &warm).await
     })
     .await
-    .context("absence setup/experiment5s; apply still original200ms")
+    .context("absence setup/experiment ceiling; apply still original")
     .and_then(|r| r);
     let end_stats = f.proxy.stats();
     let cleanup = finish(f, reference.as_ref(), end_stats).await;

@@ -65,7 +65,7 @@ pub(super) fn error_class(error: &MigrateError) -> &'static str {
 
 pub(super) async fn post_fault(f: &mut Fixture, oracle: &mut Oracle, fault: Fault) -> Result<()> {
     if fault.applied() && oracle.committed_at_gate {
-        // AFTER actual apply return, outside original200. Not an at-gate snapshot.
+        // AFTER actual apply return, outside APPLY_BOUND. Not an at-gate snapshot.
         let full = capture(&mut f.observer, "C").await?;
         contract::declared(&full)?;
         same(&oracle.reference, &full, false)?;
@@ -95,7 +95,7 @@ pub(super) async fn prepare(f: &mut Fixture, fault: Fault) -> Result<Oracle> {
     let setup = f.proxy.stats().statements;
     f.adapter.lock().await?;
     ensure!(f.proxy.stats().statements - setup == 2, "advisory setup inventory");
-    // Independent original DO, not candidate chunks. All outside apply200.
+    // Independent original DO, not candidate chunks. All outside APPLY_BOUND apply.
     let reference = {
         let mut tx = f.adapter.connection()?.begin().await?;
         sqlx::raw_sql(contract::ORIGINAL).execute(&mut *tx).await?;
@@ -137,8 +137,8 @@ pub(super) async fn cleanup(f: Fixture, oracle: Option<&Oracle>, fault: Fault) -
     } = f;
     let deadline = tokio::time::Instant::now() + ACQUIRE_BOUND;
     drop(adapter); // Drop whole raw owner before any observer/barrier work.
-    let retired = tokio::time::timeout(Duration::from_millis(300), async {
-        for _ in 0..60 {
+    let retired = tokio::time::timeout(NATIVE_RETIREMENT, async {
+        for _ in 0..NATIVE_RETIREMENT_POLLS {
             if !alive(&mut observer, pid).await? {
                 return Ok::<_, sqlx::Error>(true);
             }
