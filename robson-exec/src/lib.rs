@@ -40,11 +40,11 @@ pub mod balance_costs;
 pub mod balance_liability;
 pub mod balance_sizing;
 pub mod cancel;
+pub mod clock_records;
 // Inert C8 arithmetic; a later reviewed producer owns persistence and
 // lifecycle.
 #[allow(dead_code)]
 mod clock_sample_facts;
-pub mod clock_records;
 mod compat;
 #[cfg(feature = "crash-points")]
 pub mod crash_points;

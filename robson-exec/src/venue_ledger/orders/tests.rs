@@ -732,10 +732,7 @@ fn original_exact_capture_and_legacy_absence_never_get_enriched() {
     let l = link(OrderOwner::Discovered);
     let first = merge_order(None, &r, &l, &observed, None).unwrap().order;
     let mut later = at(2);
-    later.capture = Some(RawClockCapture {
-        wall_nanoseconds: 8,
-        ..raw
-    });
+    later.capture = Some(RawClockCapture { wall_nanoseconds: 8, ..raw });
     let replay = merge_order(Some(&first), &r, &l, &later, None).unwrap();
     assert!(!replay.changed);
     assert_eq!(replay.order.live_seen.capture, Some(raw));
@@ -746,9 +743,7 @@ fn original_exact_capture_and_legacy_absence_never_get_enriched() {
     let mut terminal = r.clone();
     terminal.phase = OrderPhase::Terminal;
     terminal.status = "CANCELED".into();
-    let first_terminal = merge_order(Some(&first), &terminal, &l, &observed, None)
-        .unwrap()
-        .order;
+    let first_terminal = merge_order(Some(&first), &terminal, &l, &observed, None).unwrap().order;
     let replay = merge_order(Some(&first_terminal), &terminal, &l, &later, None).unwrap();
     assert!(!replay.changed);
     assert_eq!(replay.order.terminal_seen.unwrap().capture, Some(raw));

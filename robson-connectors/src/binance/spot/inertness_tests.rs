@@ -4,9 +4,9 @@
 //! Lexical regression checks over the workspace's Rust sources as they are on
 //! disk, backed by a review of each part's diff and call paths (a name split
 //! across lines, generated code or a file these filters skip can escape them):
-//! - outside `binance/spot/`, the exact controlled clock allowance is the
-//!   only production reference. No production path, factory included, can
-//!   construct the reader, feed, klines, rules cache or venue;
+//! - outside `binance/spot/`, the exact controlled clock allowance is the only
+//!   production reference. No production path, factory included, can construct
+//!   the reader, feed, klines, rules cache or venue;
 //! - readers, rules projection and cache implement no port. The exact named
 //!   input boundaries may import 8g1a's pure scalar parser; the cache may not.
 //!   8b's feed and klines additionally import exactly the existing items of the
