@@ -73,9 +73,12 @@ async fn c1_seed() {
         r#"INSERT INTO stream_state (stream_key, tenant_id, last_seq)
            SELECT stream_key, $1, max(seq) FROM event_log WHERE tenant_id = $1 GROUP BY stream_key"#,
         r#"INSERT INTO positions_current (position_id, tenant_id, account_id, symbol, side, state,
-               current_quantity, entry_mode, approval_mode, last_event_id, last_seq, created_at, updated_at)
+               current_quantity, entry_price, entry_quantity, current_price, trailing_stop_price,
+               favorable_extreme, extreme_at, entry_mode, approval_mode, last_event_id, last_seq,
+               created_at, updated_at)
            SELECT md5('c1-position-' || n)::uuid, $1, md5('c1-account')::uuid, 'BTCUSDT', 'long',
-                  (ARRAY['armed','active','closed','closed','closed'])[1 + n % 5], 1,
+                  (ARRAY['armed','active','closed','closed','closed'])[1 + n % 5], 1, 100, 1, 100, 90,
+                  100, now() - (n % 720) * interval '1 day',
                   CASE WHEN n % 5 = 0 THEN 'immediate' END, CASE WHEN n % 5 = 0 THEN 'auto' END,
                   md5('c1-last-' || n)::uuid, 80,
                   now() - (n % 720) * interval '1 day', now() - (n % 720) * interval '1 day'
