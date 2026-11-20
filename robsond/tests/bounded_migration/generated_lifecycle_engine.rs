@@ -96,7 +96,7 @@ pub(super) async fn attempt_with(
         (r, began.elapsed())
     };
     let ((result, elapsed), windows) =
-        tokio::join!(producer, tokio::time::timeout(Duration::from_millis(300), controller));
+        tokio::join!(producer, tokio::time::timeout(CONTROLLER_CEILING, controller));
     let after = f.proxy.stats();
     let status = f.adapter.status();
     let refused = if status.phase == Phase::Retired {
@@ -122,8 +122,8 @@ pub(super) async fn attempt_with(
         .unwrap_or("none");
     eprintln!("GENERATED_ERROR seed={seed:016x} class={class} sqlstate={code}");
     eprintln!("GENERATED_APPLY seed={seed:016x} profile={profile:?} elapsed={elapsed:?} status={status:?} result={} prefix={} commits={}",if result.is_ok(){"ok"}else{"error"},after.statements-before.statements,after.commits-before.commits);
-    ensure!(elapsed < APPLY_BOUND, "generated real apply missed200ms; no retry");
-    let windows = windows.context("generated controller300ms")??;
+    ensure!(elapsed < APPLY_BOUND, "generated real apply missed APPLY_BOUND; no retry");
+    let windows = windows.context("generated controller ceiling")??;
     let mut all = Vec::with_capacity(58);
     let mut previous = 0;
     for (index, (w, n)) in windows.iter().zip(counts).enumerate() {

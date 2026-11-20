@@ -22,7 +22,7 @@ mod tests;
 type MigrationFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, MigrateError>> + Send + 'a>>;
 const VERSION: i64 = 20240101000038;
 const VERSION39: i64 = 20240101000039;
-const APPLY_BOUND: Duration = Duration::from_millis(200);
+const APPLY_BOUND: Duration = Duration::from_secs(15);
 const ACQUIRE_BOUND: Duration = Duration::from_secs(5);
 
 /// Observable adapter phases, not SQLx's opaque inner wire phases.

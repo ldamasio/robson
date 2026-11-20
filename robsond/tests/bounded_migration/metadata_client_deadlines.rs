@@ -79,8 +79,8 @@ async fn finish_applied(
     let end = tokio::time::Instant::now() + ACQUIRE_BOUND;
     drop(adapter); // WHOLE actual holder, never just its unlock borrow.
     drop(waiter);
-    let retired = tokio::time::timeout(Duration::from_millis(300), async {
-        for _ in 0..60 {
+    let retired = tokio::time::timeout(NATIVE_RETIREMENT, async {
+        for _ in 0..NATIVE_RETIREMENT_POLLS {
             let done: bool = sqlx::query_scalar(RETIRED)
                 .bind(pid)
                 .bind(waiter_pid)
@@ -94,7 +94,7 @@ async fn finish_applied(
         Ok(false)
     })
     .await
-    .context("APPLIED dual retirement300ms")
+    .context("APPLIED dual retirement window")
     .and_then(|r| r.map_err(Into::into));
     let after = proxy.stats();
     let dropped = proxy.query_trace_dropped();

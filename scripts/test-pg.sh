@@ -23,7 +23,7 @@
 #   1. cargo test --workspace --exclude robson-connectors --features postgres
 #                 --no-fail-fast -- --ignored --skip bounded_migration::public_pg::
 #   2. the same selection -- --ignored bounded_migration::public_pg:: --test-threads=1
-#   Phase 2 is the migration38 suite: its server-side 40 ms statement and 200 ms
+#   Phase 2 is the migration38 suite: its server-side 1 s statement and 15 s
 #   apply bounds are measured, so its tests never run beside each other. Phase 1
 #   keeps libtest's default concurrency. Both phases run; the script fails if
 #   either failed. Together they select every ignored test exactly once.

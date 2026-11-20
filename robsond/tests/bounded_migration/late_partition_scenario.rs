@@ -2,6 +2,11 @@
 //! observation of the server-side retirement.
 use super::*;
 
+// The server idle_in_transaction_session_timeout (1s) retires the partitioned
+// backend. 400 polls of at least 5 ms cover at least 2 s, inside APPLY_BOUND
+// (formerly 60 polls for the 20 ms idle timer).
+const PARTITION_POLLS: usize = 400;
+
 struct Witness {
     windows: Vec<Window>,
     before: Value,
@@ -115,7 +120,7 @@ async fn partition(f: &mut Fixture, identity: &Value, cut: Cut) -> Result<()> {
                 post["activity"] == witness.before["activity"],
                 "partition transaction identity drift"
             );
-            for polls in 1..=60 {
+            for polls in 1..=PARTITION_POLLS {
                 let value = if polls == 1 {
                     post.clone()
                 } else {
@@ -138,7 +143,7 @@ async fn partition(f: &mut Fixture, identity: &Value, cut: Cut) -> Result<()> {
                         diagnostic_started.elapsed(),
                     )?;
                 }
-                if polls < 60 {
+                if polls < PARTITION_POLLS {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             }
@@ -148,7 +153,7 @@ async fn partition(f: &mut Fixture, identity: &Value, cut: Cut) -> Result<()> {
             let result = (&mut original).await;
             (result.map_err(anyhow::Error::from), started.elapsed())
         };
-        // The ORIGINAL global200 future continues to be polled, never reset.
+        // The ORIGINAL APPLY_BOUND future continues to be polled, never reset.
         let ((apply, duration), server) = tokio::join!(
             producer,
             tokio::time::timeout_at(
@@ -157,7 +162,7 @@ async fn partition(f: &mut Fixture, identity: &Value, cut: Cut) -> Result<()> {
             )
         );
         drop(original);
-        let server = server.context("partition server200 observation deadline").and_then(|r| r);
+        let server = server.context("partition server observation deadline").and_then(|r| r);
         (apply, duration, server, witness)
     };
     let status = f.adapter.status();
@@ -177,7 +182,7 @@ async fn partition(f: &mut Fixture, identity: &Value, cut: Cut) -> Result<()> {
     diagnostic?;
     ensure!(
         apply.is_err() && duration < APPLY_BOUND && gone_at < APPLY_BOUND,
-        "partition did not fail visibly/clean server within original200"
+        "partition did not fail visibly/clean server within original APPLY_BOUND"
     );
     ensure!(
         status.phase == Phase::Retired
@@ -241,7 +246,7 @@ async fn partition(f: &mut Fixture, identity: &Value, cut: Cut) -> Result<()> {
 pub(super) async fn run_partition(pool: PgPool, cut: Cut) -> Result<()> {
     let mut f = Fixture::new_with_diagnostics(&pool, true).await?;
     let mut baseline = None;
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         let old = f.proxy.stats();
         f.adapter.lock().await?;
         ensure!(
@@ -263,7 +268,7 @@ pub(super) async fn run_partition(pool: PgPool, cut: Cut) -> Result<()> {
         partition(&mut f, &identity, cut).await
     })
     .await
-    .context("partition primary5s deadline")
+    .context("partition primary deadline")
     .and_then(|r| r);
     let before = f.proxy.stats();
     let cleanup = finish(f, baseline.as_ref(), before).await;

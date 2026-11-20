@@ -191,11 +191,32 @@ Migration 38 (`20240101000038_request_budget.sql`) is applied as 58 operations
 on that connection: settings install, BEGIN, the 52 fixed DDL slices of the
 original file, the original `_sqlx_migrations` INSERT, COMMIT, the
 `execution_time` UPDATE after the acknowledged COMMIT, and the settings restore.
-Each statement runs with `statement_timeout=40ms`, `lock_timeout=20ms` and
-`idle_in_transaction_session_timeout=20ms`; the whole apply is bounded at
-200 ms; the connection and the migration advisory lock are each bounded at 5 s. Any bound exceeded fails
-`robsond db migrate`, so the `robsond-db-migrate` Sync hook job fails and the
-sync stops before the new deployment (see Deployment Flow).
+Each statement runs with `statement_timeout=1s`, `lock_timeout=200ms` and
+`idle_in_transaction_session_timeout=1s`; the whole apply is bounded at 15 s;
+the connection and the migration advisory lock are each bounded at 5 s. Any
+bound exceeded fails `robsond db migrate`, so the `robsond-db-migrate` Sync hook
+job fails and the sync stops before the new deployment (see Deployment Flow).
+
+These bounds come from a ROLLBACK-only measurement of the exact 52 slices in
+production on 2026-11-20 (PostgreSQL 16.15, shared cluster): DDL median 25 ms,
+p90 152 ms, max 252 ms, with 22 of 52 slices above the former 40 ms; BEGIN
+68 ms, metadata INSERT 91 ms, ROLLBACK 34 ms; whole transaction about 2.9 s.
+The statement bound is about 4x the slowest slice and the whole-apply bound
+about 5x the measured transaction. The former 40 ms / 20 ms / 20 ms / 200 ms
+bounds failed every production attempt.
+
+Lock hold during the apply: from the slice that first alters each table
+(slice 14 for `recovery_incidents`, 15 for `venue_orders`, 18 for
+`spot_intent_clock`) until COMMIT, or until the backend ends, the transaction
+holds an `ACCESS EXCLUSIVE` lock on it, so any daemon read or write of those
+tables waits behind it; queries that queue behind a pending lock request of
+the migration wait too. That wait is bounded by the
+whole-apply bound (15 s, about 3 s measured), plus at most the 1 s statement
+bound for a statement still running on the server after the client drops the
+connection, or the 1 s idle-in-transaction bound if the client vanishes
+between statements. A slice that waits for a lock held by a daemon transaction
+fails after 200 ms, which fails the apply (no retry). Run the apply when the
+daemon can tolerate a stall of up to about 16 s on those tables.
 
 ### What migration 38 changes at deploy
 
@@ -256,7 +277,8 @@ not proof of absence while the original backend can still commit. In order:
 
 Do not edit `_sqlx_migrations` or rerun 38's SQL by hand. A database lost
 mid-apply follows the same steps once it is reachable again. Repeated deadline
-failures on a busy database need the operator's direction, not wider bounds.
+failures on a busy database need the operator's direction, not wider bounds;
+the current bounds were set that way, from the measurement above.
 
 ## Migration 39: venue order quote floor through the bounded adapter
 

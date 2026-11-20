@@ -134,7 +134,7 @@ pub(super) async fn cancel_original(f: &mut Fixture, cut: Cut) -> Result<()> {
     );
     let (windows, release) = observed.context("precommit gate not observed")??;
     drop(release);
-    ensure!(duration < APPLY_BOUND, "precommit cut missed global200");
+    ensure!(duration < APPLY_BOUND, "precommit cut missed global APPLY_BOUND");
     ensure!(
         status.phase == Phase::Retired && status.failure == Some(plan.failure),
         "precommit runtime outcome"

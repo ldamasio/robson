@@ -2,7 +2,7 @@ use sqlx::{migrate::MigrateError, PgConnection};
 
 use super::refusal;
 
-const INSTALL: &str = "WITH old AS MATERIALIZED (SELECT current_setting('lock_timeout') AS old_lock, current_setting('statement_timeout') AS old_statement, current_setting('idle_in_transaction_session_timeout') AS old_idle), changed AS MATERIALIZED (SELECT old.*, set_config('lock_timeout','20ms',false) AS new_lock, set_config('statement_timeout','40ms',false) AS new_statement, set_config('idle_in_transaction_session_timeout','20ms',false) AS new_idle FROM old) SELECT * FROM changed";
+const INSTALL: &str = "WITH old AS MATERIALIZED (SELECT current_setting('lock_timeout') AS old_lock, current_setting('statement_timeout') AS old_statement, current_setting('idle_in_transaction_session_timeout') AS old_idle), changed AS MATERIALIZED (SELECT old.*, set_config('lock_timeout','200ms',false) AS new_lock, set_config('statement_timeout','1s',false) AS new_statement, set_config('idle_in_transaction_session_timeout','1s',false) AS new_idle FROM old) SELECT * FROM changed";
 const RESTORE: &str = "SELECT set_config('lock_timeout',$1,false), set_config('statement_timeout',$2,false), set_config('idle_in_transaction_session_timeout',$3,false)";
 
 pub(super) struct Settings(String, String, String);
@@ -16,7 +16,7 @@ pub(super) async fn install(connection: &mut PgConnection) -> Result<Settings, M
         String,
         String,
     ) = sqlx::query_as(INSTALL).fetch_one(connection).await?;
-    if (lock.as_str(), statement.as_str(), idle.as_str()) != ("20ms", "40ms", "20ms") {
+    if (lock.as_str(), statement.as_str(), idle.as_str()) != ("200ms", "1s", "1s") {
         return Err(refusal("migration timeout installation mismatch"));
     }
     Ok(Settings(old_lock, old_statement, old_idle))

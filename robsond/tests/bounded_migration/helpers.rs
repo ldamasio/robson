@@ -5,7 +5,7 @@ use serde_json::Value;
 use sqlx::{postgres::PgSslMode, PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::super::*;
+use super::{super::*, CONTROLLER_CEILING, NATIVE_RETIREMENT, NATIVE_RETIREMENT_POLLS};
 
 const CATALOG: &str = r#"
 SELECT jsonb_build_object(
@@ -130,8 +130,8 @@ impl Fixture {
         let cleanup_deadline = tokio::time::Instant::now() + ACQUIRE_BOUND;
         let status = adapter.status();
         drop(adapter); // Whole raw owner, never graceful-close or pool-return.
-        let retirement = tokio::time::timeout(Duration::from_millis(300), async {
-            for _ in 0..60 {
+        let retirement = tokio::time::timeout(NATIVE_RETIREMENT, async {
+            for _ in 0..NATIVE_RETIREMENT_POLLS {
                 if !alive(&mut observer, pid).await? {
                     return Ok::<_, sqlx::Error>(true);
                 }
@@ -260,15 +260,15 @@ pub(super) async fn apply_in_windows(
         }
         Ok::<_, MigrateError>(windows)
     };
-    // Observer ceiling is the approved60x5ms fixture bound. It never replaces
-    // the independent absolute200ms production apply timer (which includes gates).
+    // Observer ceiling is APPLY_BOUND plus 100 ms. It never replaces the
+    // independent absolute APPLY_BOUND production apply timer (with gates).
     let producer = async {
         let started = std::time::Instant::now();
         let result = f.adapter.apply(migration()).await;
         (result, started.elapsed())
     };
     let ((result, producer_duration), windows) =
-        tokio::join!(producer, tokio::time::timeout(Duration::from_millis(300), controller));
+        tokio::join!(producer, tokio::time::timeout(CONTROLLER_CEILING, controller));
     let windows = match windows {
         Ok(observed) => observed,
         Err(_) => Err(refusal("fixture stage observer expired")),

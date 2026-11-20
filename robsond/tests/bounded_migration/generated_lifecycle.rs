@@ -55,10 +55,10 @@ async fn run(pool: PgPool, seed: Seed) -> Result<()> {
         },
     };
     let mut parked = None;
-    // Outside the cancellable primary future: a park cancelled by the 5 s bound
+    // Outside the cancellable primary future: a park cancelled by APPLY_FIXTURE
     // must still have its native retirement proved before cleanup succeeds.
     let mut retiring = None;
-    let primary = tokio::time::timeout(ACQUIRE_BOUND, async {
+    let primary = tokio::time::timeout(APPLY_FIXTURE, async {
         let f = active.as_mut().context("initial fixture absent")?;
         let mut oracle = native::prepare(f, seed.profile).await?;
         let mut model = Model::Unapplied;
@@ -94,7 +94,7 @@ async fn run(pool: PgPool, seed: Seed) -> Result<()> {
         let expected = if matches!(seed.profile, Profile::Deferred) { Model::Unapplied } else { Model::Applied };
         ensure!(model == expected, "independent final generated invariant");
         Ok::<_, anyhow::Error>(())
-    }).await.context("generated primary5s").and_then(|r| r);
+    }).await.context("generated primary ceiling").and_then(|r| r);
     // Always drop actual ownership and finish native observations before errors
     // propagate; no assertion above can bypass this cleanup branch.
     let end = tokio::time::Instant::now() + ACQUIRE_BOUND;
@@ -107,11 +107,11 @@ async fn run(pool: PgPool, seed: Seed) -> Result<()> {
         Some(pid) => tokio::time::timeout_at(end, async {
             // Raw connection: a cancelled check never returns it to the pool.
             let mut c = pool.acquire().await?.detach();
-            for n in 1..=60 {
+            for n in 1..=NATIVE_RETIREMENT_POLLS {
                 if sqlx::query_scalar::<_, bool>(native::GONE).bind(pid).fetch_one(&mut c).await? {
                     return Ok::<_, anyhow::Error>(());
                 }
-                if n < 60 {
+                if n < NATIVE_RETIREMENT_POLLS {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             }

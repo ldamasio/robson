@@ -1,5 +1,5 @@
 //! Actual late public-call faults; app gates never claim wire completion.
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use robson_testkit::db_proxy::ProxyMode;
 use sqlx::PgPool;
@@ -44,7 +44,7 @@ async fn late_ack_loss(
             release.send(()).map_err(|_| refusal("late stage release lost"))?;
             Ok::<_, MigrateError>(before)
         };
-        tokio::join!(producer, tokio::time::timeout(Duration::from_millis(300), controller))
+        tokio::join!(producer, tokio::time::timeout(CONTROLLER_CEILING, controller))
     };
     // Preserve producer/counter facts before any assertion and before cleanup.
     let status = f.adapter.status();
@@ -146,7 +146,7 @@ async fn actual52_cancel_before_restore_retires_original(pool: PgPool) {
     );
     assert!(primary.is_none(), "cancel_producer_returned_before_the_cut");
     assert!(reached.is_some_and(|result| result.is_ok()), "cancel_actual_stage_missing");
-    assert!(duration < Duration::from_millis(200), "cancel_cut_missed_apply_deadline");
+    assert!(duration < APPLY_BOUND, "cancel_cut_missed_apply_deadline");
     let finished = finished.expect("cancel cleanup observation");
     assert_eq!(stats.statements - baseline.statements, 57, "cancel_polled_restore_or39");
     assert_eq!(stats.commits - baseline.commits, 1, "cancel_original_commit_missing");
