@@ -23,6 +23,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 rust_decimal = { workspace = true }
 chrono = { workspace = true }
+num-bigint = "=0.4.8"
+sha2 = "=0.10.9"
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]

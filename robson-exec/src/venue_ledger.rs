@@ -11,6 +11,15 @@ use uuid::Uuid;
 
 use crate::{order_journal::IntentKind, venue::VenueId};
 
+mod orders;
+pub use orders::{
+    contribution, merge_order, OrderAnomaly, OrderKey, OrderLeg, OrderMerge, OrderWriteResult,
+    StoredOrder,
+};
+
+mod trades;
+pub use trades::{plan_trades, StoredTrade, TradePlan, TradeWriteResult};
+
 /// The orders whose execution can belong to a governed leg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegOrderKind {

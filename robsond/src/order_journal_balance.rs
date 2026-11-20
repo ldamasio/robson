@@ -2,11 +2,15 @@
 use std::time::{Duration, Instant};
 
 use robson_exec::order_journal::{CommitFailure, JournalBatch};
-use sqlx::{Connection, Postgres, Transaction};
+use sqlx::{pool::PoolConnection, Connection, PgConnection, Postgres, Transaction};
 use tracing::Instrument as _;
 
-use super::PgJournalBackend;
+use super::{PgJournalBackend, RetiringConnection, RollbackObservation};
 use crate::ledger_connection::LedgerConnection;
+
+/// Transaction-local server bounds, the first statement of every balance
+/// journal transaction: lock and statement timeouts from one statement budget.
+const BOUNDS: &str = "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true), set_config('idle_in_transaction_session_timeout', '1s', true)";
 
 fn known(error: sqlx::Error) -> CommitFailure {
     CommitFailure::Known(error.to_string())
@@ -23,7 +27,75 @@ fn statement_budget(bound: Duration, elapsed: Duration) -> Result<Duration, Comm
     Ok(budget)
 }
 
+/// A journal transaction's connection. The legacy journal keeps its graceful
+/// close; a balance account's is dropped raw, as its batch commit's is.
+pub(super) enum JournalConnection {
+    Legacy(RetiringConnection),
+    Balance(LedgerConnection),
+}
+
+impl JournalConnection {
+    pub(super) fn connection(&mut self) -> &mut PgConnection {
+        match self {
+            Self::Legacy(held) => &mut held.connection,
+            Self::Balance(held) => held.connection(),
+        }
+    }
+
+    pub(super) fn finish(&mut self) {
+        match self {
+            Self::Legacy(held) => held.finished = true,
+            Self::Balance(held) => held.finished = true,
+        }
+    }
+}
+
 impl PgJournalBackend {
+    pub(super) fn hold(&self, connection: PoolConnection<Postgres>) -> JournalConnection {
+        if self.balance_account {
+            JournalConnection::Balance(LedgerConnection::new(connection))
+        } else {
+            JournalConnection::Legacy(RetiringConnection { connection, finished: false })
+        }
+    }
+
+    /// A raw-dropped balance transaction sends no ROLLBACK, so none is
+    /// observed for it.
+    pub(super) fn rollback_observation(&self) -> RollbackObservation {
+        let mut observation = RollbackObservation::new();
+        if self.balance_account {
+            observation.disarm();
+        }
+        observation
+    }
+
+    /// A balance account bounds its incident, suspension and release
+    /// transactions on the server first, as it does a batch commit, so one that
+    /// stalls or is abandoned cannot hold its locks past the statement budget
+    /// of the caller's `bound`. The legacy journal sends nothing here.
+    pub(super) async fn bound_auxiliary(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        bound: Duration,
+        started: Instant,
+    ) -> Result<(), String> {
+        if !self.balance_account {
+            return Ok(());
+        }
+        let Ok(budget) = statement_budget(bound, started.elapsed()) else {
+            return Err("balance journal statement budget exhausted".to_string());
+        };
+        sqlx::query(BOUNDS)
+            .bind(format!("{}ms", budget.as_millis()))
+            .execute(&mut **tx)
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub(super) async fn commit_balance(
         &self,
         batch: &JournalBatch,
@@ -65,10 +137,14 @@ impl PgJournalBackend {
         };
         let timeout =
             format!("{}ms", statement_budget(balance.commit_bound, started.elapsed())?.as_millis());
-        sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $1, true), set_config('idle_in_transaction_session_timeout', '1s', true)")
-            .bind(timeout).execute(&mut **tx)
-            .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
-            .await.map_err(known)?;
+        sqlx::query(BOUNDS)
+            .bind(timeout)
+            .execute(&mut **tx)
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+            )
+            .await
+            .map_err(known)?;
         let version = sqlx::query_scalar::<_, i64>(
             "UPDATE accounting_state SET version = version + 1 WHERE tenant_id = $1 AND venue_id = $2 RETURNING version",
         ).bind(self.tenant_id).bind(&batch.intent.venue_id).fetch_optional(&mut **tx)

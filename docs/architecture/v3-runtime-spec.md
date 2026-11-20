@@ -26,6 +26,21 @@ The Runtime's execution pipeline is implemented by the **QueryEngine** (`robsond
 
 **Current v2.5 implementation note**: governance is already enforced inside `robsond`, but the executor boundary is still transitional. `QueryEngine` uses an internal `GovernedAction` token after risk approval; `Executor` still accepts `Vec<EngineAction>`; query lifecycle audit events append directly to `robson-eventlog`; and executor domain events still persist through `Store`.
 
+**ADR-0056 step 8f, parts 1–3 (repository implementation; rollout pending):**
+`ExchangePort` now requires canonical `AccountPort` capabilities. Unsupported
+entry directions are refused before arm/preview side effects and at signal,
+approval, autonomous-expiry, restore and detector-rearm boundaries. Refusal
+preserves the leg and uncertain journal evidence; it does not assert no-send or
+mark the leg exhausted. Original legacy balance trading batches now refuse with
+`BalanceOwnerRequired` before batch effects at manager/governed/direct-executor
+boundaries; callers preserve their documented query audits without rearming Long.
+Legacy income/drift and funding/capital-refresh work is now gated by account kind.
+Balance funding stays visibly Blocked with read-only liabilities; its worker keeps
+the existing bounded scan and gauge rather than resuming sagas on another route.
+See [venue capability gates](venue-capability-gates.md)
+for exact query bounds, error/cancellation behavior and remaining owner boundaries.
+This does not enable spot selection or balance-account execution.
+
 **ADR-0024 policy note (implemented 2026-04-19)**: runtime risk evaluation now
 uses `TradingPolicy` and dynamic monthly-budget slots. Legacy static
 `max_open_positions`, `max_total_exposure_pct`, and `max_single_position_pct`

@@ -96,6 +96,95 @@ fn opaque_apply_and_postcommit_failures_never_mean_unapplied() {
     assert_eq!(interrupted(Phase::RestoreStarted), Outcome::AppliedButSessionUnrestored);
 }
 
+#[test]
+fn embedded39_is_selected_and_is_one_transactional_statement() {
+    let contract = contract39().expect("embedded39 contract");
+    assert_eq!(
+        contract.sql.as_ref(),
+        include_str!("../../../migrations/20240101000039_venue_order_quote_floor.sql")
+    );
+    assert!(selects39(contract, Some(contract)));
+    assert!(selects39(&contract.clone(), contract39()), "production inventory must select39");
+    assert!(preflight39(contract).is_ok());
+    assert!(!selects39(contract, None));
+}
+
+#[test]
+fn only_the_exact_embedded39_identity_selects_the_bounded39_path() {
+    let contract = contract39().expect("embedded39 contract");
+    let witness = Migration::new(
+        VERSION39,
+        "ordinary witness".into(),
+        MigrationType::Simple,
+        "SELECT 1".into(),
+        false,
+    );
+    assert!(!selects39(&witness, Some(contract)), "ordinary39 witnesses keep SQLx's path");
+    let mut changed = contract.clone();
+    changed.checksum.to_mut()[0] ^= 1;
+    assert!(!selects39(&changed, Some(contract)));
+    let mut no_tx = contract.clone();
+    no_tx.no_tx = true;
+    assert!(!selects39(&no_tx, Some(contract)));
+    let mut other = contract.clone();
+    other.version = VERSION;
+    assert!(!selects39(&other, Some(contract)));
+}
+
+#[test]
+fn production_refuses_every_non_embedded39_before_sql() {
+    let contract = contract39().expect("embedded39 contract");
+    assert!(matches!(route39(contract, contract39(), false), Ok(true)));
+    assert!(matches!(route39(contract, contract39(), true), Ok(true)));
+    let witness = Migration::new(
+        VERSION39,
+        "ordinary witness".into(),
+        MigrationType::Simple,
+        "SELECT 1".into(),
+        false,
+    );
+    assert!(route39(&witness, contract39(), false).is_err(), "production ran ordinary39");
+    assert!(route39(&witness, None, false).is_err(), "absent embedded39 ran ordinary39");
+    assert!(matches!(route39(&witness, contract39(), true), Ok(false)));
+    let mut changed = contract.clone();
+    changed.checksum.to_mut()[0] ^= 1;
+    assert!(route39(&changed, contract39(), false).is_err());
+    let mut later = witness.clone();
+    later.version += 1;
+    assert!(matches!(route39(&later, contract39(), false), Ok(false)));
+}
+
+#[test]
+fn preflight39_refuses_untimed_or_untransacted_shapes() {
+    let selected = |sql: &'static str| {
+        Migration::new(VERSION39, "shape".into(), MigrationType::Simple, sql.into(), false)
+    };
+    assert!(preflight39(&selected("ALTER TABLE t ADD COLUMN c INTEGER;\n")).is_ok());
+    let header = "-- refused; kept\n\n  --\n-- a; b;\nALTER TABLE t ADD COLUMN c INTEGER;\n";
+    assert!(preflight39(&selected(header)).is_ok(), "header semicolons are not commands");
+    for sql in [
+        "ALTER TABLE t ADD COLUMN c INTEGER",
+        "ALTER TABLE t ADD COLUMN c INTEGER; SELECT 1;",
+        "BEGIN; ALTER TABLE t ADD COLUMN c INTEGER; COMMIT;",
+        "-- header;\nALTER TABLE t ADD COLUMN c INTEGER; SELECT 1;",
+        "-- header;\nBEGIN; ALTER TABLE t ADD COLUMN c INTEGER; COMMIT;",
+        "-- only a comment;",
+        "-- header;\n",
+        // After code starts, a `--` line may be quoted; it still counts.
+        "SELECT $$\n--$$; SELECT 1;\nSELECT 2;",
+        "ALTER TABLE t\n-- inner;\nADD COLUMN c INTEGER;",
+        "ALTER TABLE t ADD COLUMN c INTEGER;\n-- trailing;",
+    ] {
+        assert!(preflight39(&selected(sql)).is_err(), "accepted {sql}");
+    }
+    let mut no_tx = selected("ALTER TABLE t ADD COLUMN c INTEGER;");
+    no_tx.no_tx = true;
+    assert!(preflight39(&no_tx).is_err());
+    let mut down = selected("ALTER TABLE t ADD COLUMN c INTEGER;");
+    down.migration_type = MigrationType::ReversibleDown;
+    assert!(preflight39(&down).is_err());
+}
+
 #[tokio::test]
 async fn retired_adapter_cannot_be_reused_by_any_migrate_entry() {
     let failure = Failure {

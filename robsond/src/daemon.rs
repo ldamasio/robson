@@ -190,16 +190,19 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     let (Some(pool), Some(tenant_id)) = (pool, config.projection.tenant_id) else {
         return executor;
     };
-    let backend = Arc::new(crate::order_journal_store::PgJournalBackend::new(pool, tenant_id));
-    // ADR-0056 step 8: the capability is fixed before the journal is shared.
+    // ADR-0056 step 8: the capability is fixed before the journal is shared,
+    // and its backend bounds the same account's transactions.
     let one_attempt = venue.capabilities().one_attempt_per_client_id;
+    let balance =
+        venue.capabilities().account_kind == robson_exec::venue::AccountKind::BalanceAccount;
+    let backend = Arc::new(
+        crate::order_journal_store::PgJournalBackend::new(pool, tenant_id)
+            .with_balance_account(balance),
+    );
     let journal = Arc::new(
         OrderJournal::new(backend, venue.id())
             .with_one_attempt_per_client_id(one_attempt)
-            .with_balance_account(
-                venue.capabilities().account_kind
-                    == robson_exec::venue::AccountKind::BalanceAccount,
-            ),
+            .with_balance_account(balance),
     );
     venue.attach_order_journal(Arc::clone(&journal));
     executor.with_order_journal(journal)
@@ -711,6 +714,11 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     /// there (ADR-0056 §3). The worker exists whatever the selected venue
     /// exposes: an older saga is never left without one.
     fn funding_worker_route(&self) -> (Arc<E>, FundingRouteMode) {
+        if self.exchange.capabilities().account_kind
+            == robson_exec::venue::AccountKind::BalanceAccount
+        {
+            return (Arc::clone(&self.exchange), FundingRouteMode::Blocked);
+        }
         if self.exchange.funding().is_some() {
             return (Arc::clone(&self.exchange), FundingRouteMode::Selected);
         }
@@ -720,6 +728,31 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             },
             _ => (Arc::clone(&self.exchange), FundingRouteMode::Blocked),
         }
+    }
+
+    /// Income observations belong to position accounts. A balance account
+    /// creates neither this worker nor its timer; its accounting owner is
+    /// separate.
+    #[cfg(feature = "postgres")]
+    fn income_ledger_worker(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Option<IncomeLedgerWorker<E, S>> {
+        if self.exchange.capabilities().account_kind
+            == robson_exec::venue::AccountKind::BalanceAccount
+        {
+            return None;
+        }
+        let pool = self.pg_pool.as_ref()?;
+        Some(IncomeLedgerWorker::new(
+            Arc::clone(&self.exchange),
+            Arc::clone(&self.position_manager),
+            Arc::clone(&self.store),
+            (**pool).clone(),
+            Arc::clone(&self.event_bus),
+            std::time::Duration::from_secs(60),
+            shutdown,
+        ))
     }
 
     /// The funding worker's service, whenever a funding store is configured.
@@ -1100,22 +1133,17 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
 
         // 8b. Spawn income ledger worker (ADR-0045 §1 — if pg_pool configured).
         #[cfg(feature = "postgres")]
-        if let Some(pool) = &self.pg_pool {
+        if let Some(worker) = self.income_ledger_worker(shutdown.clone()) {
             info!("Starting income ledger worker (ADR-0045)");
-            let worker = IncomeLedgerWorker::new(
-                Arc::clone(&self.exchange),
-                Arc::clone(&self.position_manager),
-                Arc::clone(&self.store),
-                (**pool).clone(),
-                Arc::clone(&self.event_bus),
-                std::time::Duration::from_secs(60),
-                shutdown.clone(),
-            );
             workers.push(tokio::spawn(async move {
                 if let Err(e) = worker.run().await {
                     error!(error = %e, "Income ledger worker failed");
                 }
             }));
+        } else if self.exchange.capabilities().account_kind
+            == robson_exec::venue::AccountKind::BalanceAccount
+        {
+            info!("Income ledger worker disabled for balance account");
         } else {
             info!("No income ledger worker configured (no pg_pool)");
         }
@@ -4986,3 +5014,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod account_worker_tests;

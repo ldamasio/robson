@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use chrono::{DateTime, Utc};
 use robson_domain::{OrderSide, SymbolTradingRules};
-use robson_exec::ports::*;
+use robson_exec::{
+    ports::*,
+    venue::{AccountPort, Cash, ExecutionCostEnvelope, Mark, VenueCapabilities},
+};
 use robson_store::{EventRepository, OrderRepository, PositionRepository, StoreError};
 
 #[derive(Default)]
@@ -94,6 +97,21 @@ impl CountedExchange {
             fail_inventory: AtomicBool::new(false),
             fail_wallet: AtomicBool::new(false),
         }
+    }
+}
+#[async_trait::async_trait]
+impl AccountPort for CountedExchange {
+    async fn cash(&self, asset: &str) -> Result<Cash, ExecError> {
+        AccountPort::cash(&self.inner, asset).await
+    }
+    async fn valuation(&self, symbol: &Symbol) -> Result<Mark, ExecError> {
+        AccountPort::valuation(&self.inner, symbol).await
+    }
+    async fn execution_costs(&self, symbol: &Symbol) -> Result<ExecutionCostEnvelope, ExecError> {
+        AccountPort::execution_costs(&self.inner, symbol).await
+    }
+    fn capabilities(&self) -> VenueCapabilities {
+        AccountPort::capabilities(&self.inner)
     }
 }
 #[async_trait::async_trait]

@@ -18,7 +18,8 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
 /// Run all pending migrations.
 ///
 /// Historical repairs retain their existing behavior. The dedicated owned
-/// adapter preserves SQLx migration ordering and applies the38-specific bound.
+/// adapter preserves SQLx migration ordering and applies the 38- and
+/// 39-specific bounds.
 /// An interrupted migration is not retried or inferred absent here.
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     info!("Running database migrations...");

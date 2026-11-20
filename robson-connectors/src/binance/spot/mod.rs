@@ -20,12 +20,14 @@
 //! 2026-11-11 and 2026-11-13 (design note v16 §2, F13–F17, F22, F23, F25).
 
 mod cache;
+mod costs;
 mod exchange;
 mod market_data;
 mod ohlcv;
 mod records;
 mod rest;
 mod rules;
+mod sizing_inputs;
 mod trades;
 mod trading;
 
@@ -50,6 +52,8 @@ mod adapter_tests;
 mod cancel_tests;
 #[cfg(test)]
 mod conformance_tests;
+#[cfg(test)]
+mod exact_ingress_tests;
 #[cfg(test)]
 mod feed_tests;
 #[cfg(test)]

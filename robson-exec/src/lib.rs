@@ -36,6 +36,8 @@
 
 #![warn(clippy::all)]
 
+pub mod balance_costs;
+pub mod balance_sizing;
 pub mod cancel;
 mod compat;
 #[cfg(feature = "crash-points")]

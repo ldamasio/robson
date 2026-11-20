@@ -67,6 +67,15 @@ use prometheus::{
     IntGaugeVec,
 };
 
+/// Local capability refusals. No unbounded identity labels.
+pub static VENUE_CAPABILITY_REFUSALS: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_venue_capability_refusals_total",
+        "Entry work refused by venue capabilities"
+    )
+    .expect("failed to register robsond_venue_capability_refusals_total")
+});
+
 /// Total completed engine cycles (each market tick processed).
 pub static CYCLES: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(

@@ -1002,6 +1002,13 @@ where
     let Some(axum::Extension(identity)) = identity else {
         return Err(fail(StatusCode::UNAUTHORIZED, "a verified identity is required"));
     };
+    // ADR-0056 step 8: this legacy decision opens an unbounded journal
+    // transaction, so a balance account is refused before any SQL.
+    crate::capability::require_position_account(
+        &state.exchange.capabilities(),
+        "recovery disposition",
+    )
+    .map_err(|error| fail(StatusCode::BAD_REQUEST, &error.to_string()))?;
     let note = body.note.trim();
     if note.is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, "a note is required"));
@@ -1597,6 +1604,20 @@ async fn metrics_handler() -> impl IntoResponse {
     )
 }
 
+/// Map only this pure account-kind refusal to HTTP 400. Existing supported
+/// account errors retain each handler's current mapping.
+fn account_operation_refusal<E: ExchangePort>(
+    exchange: &E,
+    operation: &'static str,
+) -> Option<Response> {
+    crate::capability::require_position_account(&exchange.capabilities(), operation)
+        .err()
+        .map(|error| {
+            (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: error.to_string() }))
+                .into_response()
+        })
+}
+
 #[cfg(feature = "postgres")]
 fn funding_service<E, S>(
     state: &ApiState<E, S>,
@@ -1629,6 +1650,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     match funding_service(&state) {
         Ok(service) => match service.quote().await {
             Ok(quote) => (StatusCode::OK, Json(quote)).into_response(),
@@ -1643,17 +1668,22 @@ where
 }
 
 #[cfg(not(feature = "postgres"))]
-async fn funding_quote_handler<E, S>(State(_state): State<Arc<ApiState<E, S>>>) -> impl IntoResponse
+async fn funding_quote_handler<E, S>(State(state): State<Arc<ApiState<E, S>>>) -> impl IntoResponse
 where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(ErrorResponse {
             error: "funding_store_unavailable".to_string(),
         }),
     )
+        .into_response()
 }
 
 /// `POST /funding/execute`, ordinary class: the saga can convert and transfer
@@ -1668,6 +1698,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     let work = Box::pin(funding_execute(State(Arc::clone(&state)), headers, Json(request)));
     permitted(&state, OperationKind::FundingExecute, work).await
 }
@@ -1682,6 +1716,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     if !state.funding.enabled {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1729,6 +1767,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     if !state.funding.enabled {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1754,6 +1796,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     let executes = request.execute && !request.dry_run;
     let work = Box::pin(recover_spot_usdt(State(Arc::clone(&state)), Json(request)));
     if !executes {
@@ -1770,6 +1816,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "funding") {
+        return response;
+    }
+
     const CONFIRM: &str = "TRANSFER_SPOT_USDT_TO_FUTURES";
     const TRANSFER_TYPE: UniversalTransferType = UniversalTransferType::MainUmfuture;
 
@@ -1994,6 +2044,10 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    if let Some(response) = account_operation_refusal(state.exchange.as_ref(), "capital refresh") {
+        return response;
+    }
+
     match refresh_capital_from_exchange(&state.exchange, &state.position_manager).await {
         Ok(capital) => (StatusCode::OK, Json(CapitalRefreshResponse { capital })).into_response(),
         Err(error) => (
@@ -2012,6 +2066,7 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    crate::capability::require_position_account(&exchange.capabilities(), "capital refresh")?;
     let balance = exchange.get_futures_balance().await?;
     let capital = balance.wallet_balance;
     if capital <= Decimal::ZERO {
@@ -2580,6 +2635,10 @@ where
         },
     };
 
+    crate::capability::require_side(&state.exchange.capabilities(), side)
+        .inspect_err(|_| crate::capability::record_refusal("api_arm"))
+        .map_err(to_error_response)?;
+
     // Capital base for position sizing.
     //
     // Source: `monthly_state` table, populated by `MonthBoundaryReset` event.
@@ -3081,6 +3140,19 @@ where
             ))
         };
 
+        // ADR-0056 step 8: the income ledger is position-account work, so a
+        // balance account is refused before any SQL, as on the funding routes.
+        if let Err(error) = crate::capability::require_position_account(
+            &state.exchange.capabilities(),
+            "income acknowledgement",
+        ) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "position_account_required",
+                Some(error.to_string()),
+            );
+        }
+
         let reason = req.reason.trim();
         if reason.is_empty() {
             return error_response(
@@ -3288,6 +3360,7 @@ where
 
 fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
     let status = match &error {
+        DaemonError::VenueUnsupported { .. } => StatusCode::BAD_REQUEST,
         DaemonError::PositionNotFound(_) => StatusCode::NOT_FOUND,
         DaemonError::QueryNotFound(_) => StatusCode::NOT_FOUND,
         DaemonError::InvalidPositionState { .. } => StatusCode::CONFLICT,
@@ -3960,8 +4033,8 @@ mod tests {
     use super::*;
     use crate::query_engine::TracingQueryRecorder;
 
-    #[derive(Debug)]
     struct WalletBalanceCacheExchange {
+        account: robson_exec::StubExchange,
         calls: Arc<AtomicUsize>,
         balance: FuturesBalance,
     }
@@ -3969,7 +4042,10 @@ mod tests {
     impl WalletBalanceCacheExchange {
         fn new(wallet_balance: Decimal) -> (Arc<Self>, Arc<AtomicUsize>) {
             let calls = Arc::new(AtomicUsize::new(0));
+            let account = robson_exec::StubExchange::new(dec!(100));
+            account.set_futures_balance(wallet_balance);
             let exchange = Arc::new(Self {
+                account,
                 calls: Arc::clone(&calls),
                 balance: FuturesBalance {
                     wallet_balance,
@@ -3979,6 +4055,39 @@ mod tests {
             });
             (exchange, calls)
         }
+    }
+
+    #[async_trait]
+    impl robson_exec::venue::AccountPort for WalletBalanceCacheExchange {
+        async fn cash(&self, asset: &str) -> Result<robson_exec::venue::Cash, ExecError> {
+            robson_exec::venue::AccountPort::cash(&self.account, asset).await
+        }
+        async fn valuation(&self, symbol: &Symbol) -> Result<robson_exec::venue::Mark, ExecError> {
+            robson_exec::venue::AccountPort::valuation(&self.account, symbol).await
+        }
+        async fn execution_costs(
+            &self,
+            symbol: &Symbol,
+        ) -> Result<robson_exec::venue::ExecutionCostEnvelope, ExecError> {
+            robson_exec::venue::AccountPort::execution_costs(&self.account, symbol).await
+        }
+        fn capabilities(&self) -> robson_exec::venue::VenueCapabilities {
+            robson_exec::venue::AccountPort::capabilities(&self.account)
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_balance_cache_exchange_forwards_canonical_account_port() {
+        let (exchange, calls) = WalletBalanceCacheExchange::new(dec!(4321));
+        crate::capability::assert_account_forwarding(exchange.as_ref(), &exchange.account).await;
+        assert_eq!(
+            robson_exec::venue::AccountPort::cash(exchange.as_ref(), "USDT")
+                .await
+                .unwrap()
+                .free,
+            dec!(4321)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[async_trait]
@@ -4164,6 +4273,72 @@ mod tests {
             venue_feed: VenueFeedView::default(),
             order_journal,
         })
+    }
+
+    /// Any repository access would precede the manager's own direction gate.
+    struct NoReadStore(MemoryStore);
+
+    impl robson_store::Store for NoReadStore {
+        fn positions(&self) -> &dyn robson_store::PositionRepository {
+            panic!("API capability gate must precede monthly/store lookup");
+        }
+        fn orders(&self) -> &dyn robson_store::OrderRepository {
+            self.0.orders()
+        }
+        fn events(&self) -> &dyn robson_store::EventRepository {
+            self.0.events()
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_api_arm_precedes_monthly_store_access() {
+        let exchange = Arc::new(crate::capability::test_exchange::RestrictedExchange::new());
+        let store = Arc::new(NoReadStore(MemoryStore::new()));
+        let event_bus = Arc::new(EventBus::new(8));
+        let executor = Arc::new(Executor::new(
+            exchange.clone(),
+            Arc::new(IntentJournal::new()),
+            store.clone(),
+        ));
+        let manager = PositionManager::new(
+            Engine::new(RiskConfig::new(dec!(10000)).unwrap()),
+            executor,
+            store,
+            event_bus.clone(),
+            Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
+        );
+        let circuit_breaker = manager.circuit_breaker();
+        let order_journal = manager.order_journal();
+        let state = Arc::new(ApiState {
+            exchange: exchange.clone(),
+            position_manager: Arc::new(RwLock::new(manager)),
+            event_bus,
+            circuit_breaker,
+            wallet_balance_cache: Mutex::new(None),
+            #[cfg(feature = "postgres")]
+            pg_pool: None,
+            #[cfg(feature = "postgres")]
+            tenant_id: None,
+            google_auth: None,
+            legacy_api_token: None,
+            funding: FundingConfig::default(),
+            funding_route_mode: FundingRouteMode::Selected,
+            venue_feed: VenueFeedView::default(),
+            order_journal,
+        });
+        for symbol in ["ETHUSDT", "SOLUSDT"] {
+            for side in ["SHORT", "SELL", "short"] {
+                let request: ArmRequest =
+                    serde_json::from_value(serde_json::json!({"symbol": symbol, "side": side}))
+                        .unwrap();
+                let (status, Json(error)) =
+                    arm(State(state.clone()), Json(request)).await.unwrap_err();
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(error.error.contains("Venue does not support entry side Short"));
+            }
+        }
+        assert_eq!(exchange.requests(), 0);
     }
 
     #[tokio::test]
@@ -5428,6 +5603,66 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
+    /// A balance account never reaches the legacy disposition's unbounded
+    /// transaction: refused before any SQL, here against a database that
+    /// cannot be reached, which would otherwise answer 503.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn a_balance_account_disposition_is_refused_before_any_sql() {
+        let exchange = Arc::new(crate::capability::test_exchange::RestrictedExchange::new());
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(8));
+        let executor = Arc::new(Executor::new(
+            exchange.clone(),
+            Arc::new(IntentJournal::new()),
+            store.clone(),
+        ));
+        let manager = PositionManager::new(
+            Engine::new(RiskConfig::new(dec!(10000)).unwrap()),
+            executor,
+            store,
+            event_bus.clone(),
+            Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
+        );
+        let circuit_breaker = manager.circuit_breaker();
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://robson@127.0.0.1:1/unreachable")
+            .unwrap();
+        let state = Arc::new(ApiState {
+            exchange: exchange.clone(),
+            position_manager: Arc::new(RwLock::new(manager)),
+            event_bus,
+            circuit_breaker,
+            wallet_balance_cache: Mutex::new(None),
+            pg_pool: Some(Arc::new(unreachable)),
+            tenant_id: None,
+            google_auth: None,
+            legacy_api_token: None,
+            funding: FundingConfig::default(),
+            funding_route_mode: FundingRouteMode::Selected,
+            venue_feed: VenueFeedView::default(),
+            order_journal: Arc::new(OrderJournal::unpersisted().with_balance_account(true)),
+        });
+        let body: DispositionBody = serde_json::from_value(accepted_risk(Uuid::now_v7())).unwrap();
+
+        let (status, Json(error)) = recovery_disposition_handler(
+            State(state),
+            Some(axum::Extension(OperatorIdentity::legacy_token())),
+            Json(body),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", error.error);
+        assert_eq!(
+            error.error,
+            "Configuration error: recovery disposition requires a position account"
+        );
+        assert_eq!(exchange.requests(), 0);
+    }
+
     /// An intent this process is still working on cannot be decided on.
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]
@@ -5754,6 +5989,70 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json, serde_json::json!({ "error": "funding_disabled" }));
+    }
+
+    /// The income ledger is position-account work: a balance account is
+    /// refused before any SQL, here against a database that cannot be
+    /// reached, which would otherwise answer 500.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn a_balance_account_income_ack_is_refused_before_any_sql() {
+        let exchange = Arc::new(crate::capability::test_exchange::RestrictedExchange::new());
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(8));
+        let executor = Arc::new(Executor::new(
+            exchange.clone(),
+            Arc::new(IntentJournal::new()),
+            store.clone(),
+        ));
+        let manager = PositionManager::new(
+            Engine::new(RiskConfig::new(dec!(10000)).unwrap()),
+            executor,
+            store,
+            event_bus.clone(),
+            Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
+        );
+        let circuit_breaker = manager.circuit_breaker();
+        let order_journal = manager.order_journal();
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://robson@127.0.0.1:1/unreachable")
+            .unwrap();
+        let state = Arc::new(ApiState {
+            exchange: exchange.clone(),
+            position_manager: Arc::new(RwLock::new(manager)),
+            event_bus,
+            circuit_breaker,
+            wallet_balance_cache: Mutex::new(None),
+            pg_pool: Some(Arc::new(unreachable)),
+            tenant_id: None,
+            google_auth: None,
+            legacy_api_token: None,
+            funding: FundingConfig::default(),
+            funding_route_mode: FundingRouteMode::Selected,
+            venue_feed: VenueFeedView::default(),
+            order_journal,
+        });
+
+        let (status, Json(error)) = income_ack_handler(
+            State(state),
+            Path("tran-ack".to_string()),
+            Json(IncomeAckRequest {
+                reason: "reviewed".to_string(),
+                actor: "operator".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error:?}");
+        assert_eq!(error.error, "position_account_required");
+        assert_eq!(
+            error.details.as_deref(),
+            Some("Configuration error: income acknowledgement requires a position account")
+        );
+        assert_eq!(exchange.requests(), 0);
     }
 
     #[tokio::test]
@@ -7795,3 +8094,6 @@ mod tests {
         assert_eq!(exchange.market_order_call_count(), 1);
     }
 }
+
+#[cfg(test)]
+mod account_worker_tests;

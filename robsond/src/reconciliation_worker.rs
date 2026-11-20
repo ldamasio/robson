@@ -1378,6 +1378,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     /// Independent typed-income validation remains responsible for its own
     /// evidence, current-state and single-use accounting requirements.
     async fn recalibrate_capital_base_after_pure_financial_drift(&self) -> DaemonResult<()> {
+        if self.exchange.capabilities().account_kind
+            == robson_exec::venue::AccountKind::BalanceAccount
+        {
+            return Ok(());
+        }
         let now = Utc::now();
         #[cfg(test)]
         self.test_scan_boundary(ScanTestPhase::BeforeRiskSnapshot).await;
@@ -4655,3 +4660,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod account_worker_tests;

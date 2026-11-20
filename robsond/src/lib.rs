@@ -43,6 +43,7 @@
 
 pub mod api;
 pub mod auth;
+mod capability;
 pub mod circuit_breaker;
 pub mod config;
 pub mod daemon;

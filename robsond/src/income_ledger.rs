@@ -160,6 +160,10 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
 
     /// Run the periodic poll→ingest→match loop until shutdown.
     pub async fn run(self) -> DaemonResult<()> {
+        crate::capability::require_position_account(
+            &self.exchange.capabilities(),
+            "income ledger",
+        )?;
         info!("Income ledger worker started");
         let mut ticker = interval(self.poll_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -196,6 +200,10 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
     /// recalibration attempt. Public so tests and a startup pass can drive
     /// it directly.
     pub async fn poll_and_match(&self) -> DaemonResult<PollOutcome> {
+        crate::capability::require_position_account(
+            &self.exchange.capabilities(),
+            "income ledger",
+        )?;
         let since = checkpoint(&self.pool).await?;
         let items = self.exchange.get_income_since(since, 1000).await?;
         let ingested = ingest_items(&self.pool, &items).await?;
@@ -721,3 +729,6 @@ pub async fn transfer_explains_delta(
         Ok(None)
     }
 }
+
+#[cfg(test)]
+mod account_worker_tests;

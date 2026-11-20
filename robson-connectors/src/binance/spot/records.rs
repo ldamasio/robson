@@ -7,17 +7,39 @@
 
 use std::collections::HashSet;
 
+use robson_exec::balance_costs::exact;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer};
 
 use super::rest::{parse_json, SpotReadError};
 
 /// One asset of the account.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpotAccountBalance {
     pub asset: String,
     pub free: Decimal,
     pub locked: Decimal,
+}
+
+impl<'de> Deserialize<'de> for SpotAccountBalance {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            asset: String,
+            free: exact::ExactDecimal,
+            locked: exact::ExactDecimal,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let free = raw.free.value();
+        let locked = raw.locked.value();
+        if free < Decimal::ZERO || locked < Decimal::ZERO {
+            return Err(serde::de::Error::custom(format!(
+                "negative spot balance for {}",
+                raw.asset
+            )));
+        }
+        Ok(Self { asset: raw.asset, free, locked })
+    }
 }
 
 /// `GET /api/v3/account` (F23; L4278-L4332): the account's holdings and what
@@ -99,10 +121,14 @@ where
 /// The commission rates of one kind (F17).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SpotCommissionRates {
-    pub maker: Decimal,
-    pub taker: Decimal,
-    pub buyer: Decimal,
-    pub seller: Decimal,
+    #[serde(deserialize_with = "exact::nonnegative_exact")]
+    pub maker: exact::ExactDecimal,
+    #[serde(deserialize_with = "exact::nonnegative_exact")]
+    pub taker: exact::ExactDecimal,
+    #[serde(deserialize_with = "exact::nonnegative_exact")]
+    pub buyer: exact::ExactDecimal,
+    #[serde(deserialize_with = "exact::nonnegative_exact")]
+    pub seller: exact::ExactDecimal,
 }
 
 /// The BNB discount block of the commission answer (F17).
@@ -113,7 +139,8 @@ pub struct SpotCommissionDiscount {
     pub enabled_for_symbol: bool,
     pub discount_asset: String,
     /// Multiplier on the standard commission when BNB pays it.
-    pub discount: Decimal,
+    #[serde(deserialize_with = "exact::nonnegative_exact")]
+    pub discount: exact::ExactDecimal,
 }
 
 /// `GET /api/v3/account/commission` for one symbol (F17; L4954-L5002).

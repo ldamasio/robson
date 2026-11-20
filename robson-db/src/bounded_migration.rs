@@ -1,9 +1,11 @@
 //! Owned migration adapter. Only the private embedded38 contract selects the
-//! bounded path; tests may override it with a private synthetic fixture.
+//! bounded path; tests may override it with a private synthetic fixture. The
+//! exact embedded39 migration takes a second, delegated bounded path; any
+//! other version-39 source is refused outside this crate's tests.
 use std::{future::Future, pin::Pin, time::Duration};
 
 use sqlx::{
-    migrate::{AppliedMigration, Migrate, MigrateError, Migration},
+    migrate::{AppliedMigration, Migrate, MigrateError, Migration, MigrationType},
     postgres::PgConnectOptions,
     ConnectOptions, PgConnection,
 };
@@ -19,6 +21,7 @@ mod tests;
 
 type MigrationFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, MigrateError>> + Send + 'a>>;
 const VERSION: i64 = 20240101000038;
+const VERSION39: i64 = 20240101000039;
 const APPLY_BOUND: Duration = Duration::from_secs(15);
 const ACQUIRE_BOUND: Duration = Duration::from_secs(5);
 
@@ -214,6 +217,107 @@ impl BoundedMigration {
         self.connection = Some(owned.finish());
         Ok(result)
     }
+
+    /// Migration39's `ALTER TABLE` needs ACCESS EXCLUSIVE on `venue_orders`.
+    /// Without the session bounds it would queue behind any holder and block
+    /// every later reader and writer of the table. SQLx's own apply (BEGIN,
+    /// the single original statement, metadata INSERT, COMMIT, elapsed UPDATE)
+    /// runs unchanged on this same owned session between install and restore.
+    async fn apply39(&mut self, migration: &Migration) -> Result<Duration, MigrateError> {
+        let preflight = preflight39(migration);
+        let mut owned = self.take()?;
+        preflight?;
+        let result = timeout(APPLY_BOUND, async {
+            owned.phase(Phase::SetupStarted);
+            #[cfg(test)]
+            stages::checkpoint(owned.gate, stages::Stage::Install, stages::Edge::BeforeCall)
+                .await?;
+            let settings = settings::install(owned.connection()).await?;
+            #[cfg(test)]
+            stages::checkpoint(owned.gate, stages::Stage::Install, stages::Edge::AfterReturn)
+                .await?;
+            owned.phase(Phase::SetupConfirmed);
+            owned.phase(Phase::DelegatedApply);
+            let elapsed = owned.connection().apply(migration).await?;
+            owned.phase(Phase::ApplyReturned);
+            owned.phase(Phase::RestoreStarted);
+            #[cfg(test)]
+            stages::checkpoint(owned.gate, stages::Stage::Restore, stages::Edge::BeforeCall)
+                .await?;
+            settings.restore(owned.connection()).await?;
+            #[cfg(test)]
+            stages::checkpoint(owned.gate, stages::Stage::Restore, stages::Edge::AfterReturn)
+                .await?;
+            owned.phase(Phase::Restored);
+            Ok::<_, MigrateError>(elapsed)
+        })
+        .await
+        .map_err(|_| refusal("migration39 whole-apply deadline exceeded"))??;
+        self.connection = Some(owned.finish());
+        Ok(result)
+    }
+}
+
+fn contract39() -> Option<&'static Migration> {
+    crate::MIGRATOR.iter().find(|migration| migration.version == VERSION39)
+}
+
+/// Only this crate's tests may route a non-embedded version-39 source (the
+/// acceptance suite's private ordinary witnesses) through SQLx's own path.
+const ORDINARY39: bool = cfg!(test);
+
+/// Version 39 is either the exact embedded39 contract (bounded path) or, in
+/// production, refused before any SQL so it can never run unbounded.
+fn route39(
+    migration: &Migration,
+    expected: Option<&Migration>,
+    ordinary39: bool,
+) -> Result<bool, MigrateError> {
+    if selects39(migration, expected) {
+        return Ok(true);
+    }
+    if migration.version == VERSION39 && !ordinary39 {
+        return Err(refusal("migration39 contract mismatch"));
+    }
+    Ok(false)
+}
+
+/// Only the exact embedded39 identity selects the bounded39 path. The
+/// production runner passes exactly that inventory.
+fn selects39(migration: &Migration, expected: Option<&Migration>) -> bool {
+    expected.is_some_and(|expected| {
+        migration.version == VERSION39
+            && expected.version == VERSION39
+            && migration.description == expected.description
+            && migration.sql == expected.sql
+            && migration.checksum == expected.checksum
+            && migration.migration_type == expected.migration_type
+            && migration.no_tx == expected.no_tx
+    })
+}
+
+/// PG12 has no per-command statement timer inside a multi-command simple
+/// Query, so the selected contract must stay one transactional statement.
+/// Only the leading header of blank and `--` lines is skipped: no code
+/// precedes it, so no quote can hide a separator there. Every later line,
+/// comment or not, still counts.
+fn preflight39(migration: &Migration) -> Result<(), MigrateError> {
+    if migration.no_tx || migration.migration_type != MigrationType::Simple {
+        return Err(refusal("migration39 must run inside one SQLx transaction"));
+    }
+    let sql = migration.sql.trim_end();
+    let semicolons: usize = sql
+        .lines()
+        .skip_while(|line| {
+            let line = line.trim_start();
+            line.is_empty() || line.starts_with("--")
+        })
+        .map(|line| line.matches(';').count())
+        .sum();
+    if !sql.ends_with(';') || semicolons != 1 {
+        return Err(refusal("migration39 must be one top-level statement"));
+    }
+    Ok(())
 }
 
 fn preflight(migration: &Migration, expected: Option<&Migration>) -> Result<(), MigrateError> {
@@ -270,6 +374,8 @@ impl Migrate for BoundedMigration {
         Box::pin(async move {
             if migration.version == VERSION {
                 self.apply38(migration).await
+            } else if route39(migration, contract39(), ORDINARY39)? {
+                self.apply39(migration).await
             } else {
                 self.connection()?.apply(migration).await
             }

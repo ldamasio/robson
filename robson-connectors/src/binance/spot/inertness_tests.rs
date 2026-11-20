@@ -7,12 +7,12 @@
 //! - nothing outside `binance/spot/` reaches this module, names a type it
 //!   defines or names a spot endpoint, so no production path, factory included,
 //!   can construct its reader, feed, klines, rules cache or venue;
-//! - 8a's readers, 8c-2a's rules projection and rules cache import no
-//!   `robson_exec` item and implement no port. 8b's feed and klines import
-//!   exactly the existing items of the port each implements (`TradeFeedPort`,
-//!   `OhlcvPort`). 8c-2b's venue, `exchange.rs`, and 8c-3a's order path,
-//!   `trading.rs`, import exactly the contracts they implement or fill and the
-//!   types those carry, by path;
+//! - readers, rules projection and cache implement no port. The exact named
+//!   input boundaries may import 8g1a's pure scalar parser; the cache may not.
+//!   8b's feed and klines additionally import exactly the existing items of the
+//!   port each implements (`TradeFeedPort`, `OhlcvPort`). 8c-2b's venue,
+//!   `exchange.rs`, and 8c-3a's order path, `trading.rs`, import exactly the
+//!   contracts they implement or fill and the types those carry, by path;
 //! - an order leaves only through `trading.rs`: one `post_signed_answer` call,
 //!   inside `SubmitAttemptLedger::submit` on a one-attempt ledger, so it takes
 //!   the journal's grant (8c-1) and the client's gate. A cancel leaves only
@@ -252,8 +252,18 @@ fn flatten_group(group: &str, prefix: &str, out: &mut Vec<String>) {
 
 /// The paths of `code`'s `use robson_exec::{...};`, when it has one.
 fn robson_exec_imports(code: &str) -> Option<Vec<String>> {
-    let at = code.find("use robson_exec::{")?;
-    let body = &code[at + "use robson_exec::{".len()..];
+    for helper in ["balance_costs::exact", "balance_costs::exact::ExactDecimal"] {
+        if code.contains(&format!("use robson_exec::{helper};")) {
+            return Some(vec![helper.to_string()]);
+        }
+    }
+    let (marker, prefix) = if code.contains("use robson_exec::balance_costs::{") {
+        ("use robson_exec::balance_costs::{", "balance_costs::")
+    } else {
+        ("use robson_exec::{", "")
+    };
+    let at = code.find(marker)?;
+    let body = &code[at + marker.len()..];
     let mut depth = 1;
     let close = body.char_indices().find_map(|(at, c)| {
         match c {
@@ -264,7 +274,7 @@ fn robson_exec_imports(code: &str) -> Option<Vec<String>> {
         (depth == 0).then_some(at)
     })?;
     let mut items = Vec::new();
-    flatten_group(&body[..close], "", &mut items);
+    flatten_group(&body[..close], prefix, &mut items);
     items.sort();
     Some(items)
 }
@@ -305,17 +315,45 @@ fn port_contract_violations(file: &str, code: &str) -> Vec<String> {
                 && !code[at + found.len()..].chars().next().is_some_and(is_ident)
         })
         .count();
-    if allowed.is_empty() {
-        if uses > 0 {
-            violations.push("takes from robson_exec".to_string());
-        }
-    } else {
-        let imported = robson_exec_imports(code);
-        let mut expected: Vec<String> = allowed.iter().map(|item| item.to_string()).collect();
-        expected.sort();
-        if uses != 1 || imported.as_ref() != Some(&expected) {
-            violations.push(format!("takes {imported:?} from robson_exec, not {expected:?}"));
-        }
+    // 8g's pure scalar and metadata boundaries are not ports or activation seams.
+    // Allow only these exact imports in their designated input boundaries.
+    let pure: &[&str] = match file {
+        "records.rs" | "rest.rs" | "rules.rs" => &["balance_costs::exact"],
+        "market_data.rs" | "ohlcv.rs" => &["balance_costs::exact::ExactDecimal"],
+        "sizing_inputs.rs" => &[
+            "balance_costs::CostIdentity",
+            "balance_sizing::LotLimits",
+            "balance_sizing::NotionalLimits",
+            "balance_sizing::ObservationRef",
+            "balance_sizing::PriceLimits",
+            "balance_sizing::SizingError",
+            "balance_sizing::SizingRules",
+            "venue::VenueId",
+        ],
+        "costs.rs" => &[
+            "balance_costs::CommissionComponents",
+            "balance_costs::CostCandidate",
+            "balance_costs::CostError",
+            "balance_costs::CostIdentity",
+        ],
+        _ => &[],
+    };
+    let imported = robson_exec_imports(code);
+    let ports = imported.as_ref().map(|items| {
+        items
+            .iter()
+            .filter(|item| !pure.contains(&item.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let mut expected: Vec<String> = allowed.iter().map(|item| item.to_string()).collect();
+    expected.sort();
+    if allowed.is_empty() && uses == 0 {
+        // A reader may have no exec import at all.
+    } else if uses != 1 || ports.as_ref() != Some(&expected) {
+        violations.push(format!(
+            "takes {imported:?} from robson_exec, not {expected:?} plus its exact scalar helper"
+        ));
     }
     // A contract is allowed by its own name, whatever path the import took.
     let names: Vec<&str> =
@@ -620,10 +658,45 @@ fn the_port_allow_list_admits_only_each_adapter_s_own_items() {
     }
 }
 
-/// SD12 point 1: 8a's readers, the rules projection and the cache take nothing
-/// from `robson_exec`, where the port contracts and 8c's additions live; 8b's
-/// feed and klines take only the existing port each implements, and 8c-2's
-/// venue only its exact list. No spot source uses another contract.
+/// SD12 point 1 is retained: 8g1a permits only the pure exact scalar helper
+/// at named input boundaries, without adding a port, runtime caller or factory
+/// reachability. All adapters retain their existing exact port lists.
+#[test]
+fn exact_scalar_imports_do_not_open_any_extra_port_or_runtime_path() {
+    for file in ["records.rs", "rules.rs", "rest.rs"] {
+        let helper = "use robson_exec::balance_costs::exact;";
+        assert!(port_contract_violations(file, helper).is_empty());
+        for extra in [
+            "use robson_exec::gate::OperationGate;",
+            "fn f(_: &dyn AccountPort) {}",
+        ] {
+            assert!(!port_contract_violations(file, &format!("{helper} {extra}")).is_empty());
+        }
+        assert!(!port_contract_violations(file, "use robson_exec::balance_costs::*;").is_empty());
+    }
+    assert!(
+        !port_contract_violations("cache.rs", "use robson_exec::balance_costs::exact;").is_empty()
+    );
+}
+
+#[test]
+fn pure_cost_handoff_imports_cannot_import_a_runtime_port() {
+    let pure = "use robson_exec::balance_costs::{CommissionComponents, CostCandidate, CostError, CostIdentity};";
+    assert!(port_contract_violations("costs.rs", pure).is_empty());
+    for wrong in [
+        "use robson_exec::balance_costs::*;",
+        "use robson_exec::{balance_costs::CostCandidate, AccountPort};",
+    ] {
+        assert!(!port_contract_violations("costs.rs", wrong).is_empty());
+    }
+    assert!(!port_contract_violations("cache.rs", pure).is_empty());
+    assert!(!port_contract_violations(
+        "costs.rs",
+        &format!("{pure} fn f(_: &dyn TradingPort) {{}}")
+    )
+    .is_empty());
+}
+
 #[test]
 fn the_spot_module_uses_no_port_contract_beyond_8b_s_ports() {
     let sources = spot_production_sources();
@@ -943,4 +1016,22 @@ fn the_spot_module_sends_orders_only_through_the_ledger_and_reads_no_configurati
     assert_eq!(code("trading.rs").matches("post_signed_answer").count(), 1, "one POST call");
     assert_eq!(code("trading.rs").matches("delete_signed_answer").count(), 1, "one DELETE call");
     assert!(code("exchange.rs").contains("SubmitAttemptLedger::one_attempt("));
+}
+
+#[test]
+fn pure_sizing_projection_cannot_import_ports_or_wildcards() {
+    let pure = "use robson_exec::{balance_costs::CostIdentity,balance_sizing::{LotLimits,NotionalLimits,ObservationRef,PriceLimits,SizingError,SizingRules},venue::VenueId};";
+    assert!(port_contract_violations("sizing_inputs.rs", pure).is_empty());
+    for wrong in [
+        "use robson_exec::balance_sizing::*;",
+        "use robson_exec::{balance_sizing::SizingRules,AccountPort};",
+    ] {
+        assert!(!port_contract_violations("sizing_inputs.rs", wrong).is_empty());
+    }
+    assert!(!port_contract_violations("cache.rs", pure).is_empty());
+    assert!(!port_contract_violations(
+        "sizing_inputs.rs",
+        &format!("{pure} fn f(_: &dyn TradingPort) {{}} ")
+    )
+    .is_empty());
 }
