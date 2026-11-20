@@ -7,10 +7,11 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use robson_exec::{
     gate::{
-        OperationGate, PendingExecutionEvidence, PendingExecutionOwner, PendingExecutionTicket,
+        OperationGate, PendingExecutionEvidence, PendingExecutionOwner,
+        PendingExecutionRegistration, PendingExecutionTicket,
     },
     venue::{OrderPhase, VenueId, VenueOrderRecord},
-    venue_ledger::{LedgerError, OrderKey, OrderLink, OrderOwner, SeenAt},
+    venue_ledger::{LedgerError, LegOrderKind, OrderKey, OrderLink, OrderOwner, SeenAt},
 };
 use rust_decimal::Decimal;
 
@@ -27,7 +28,7 @@ pub(super) struct OrderExecutionReceiver<'ledger> {
 pub(super) struct RegisteredExecution<'receiver, 'ledger> {
     owner: &'receiver OrderExecutionReceiver<'ledger>,
     ticket: PendingExecutionTicket,
-    record: VenueOrderRecord,
+    record: Arc<VenueOrderRecord>,
     seen: SeenAt,
 }
 
@@ -74,14 +75,32 @@ impl<'ledger> OrderExecutionReceiver<'ledger> {
         &self,
         record: VenueOrderRecord,
         evidence: PendingExecutionEvidence,
-    ) -> Result<RegisteredExecution<'_, 'ledger>, LedgerError> {
+    ) -> Result<Option<RegisteredExecution<'_, 'ledger>>, LedgerError> {
         if OrderKey::from_record(&record, &self.link)? != self.key
             || record.exchange_order_id != self.key.exchange_order_id.to_string()
             || record.client_order_id != self.link.client_order_id
         {
             return Err(LedgerError::IdentityConflict);
         }
-        if record.phase != OrderPhase::Live
+        let side_matches = matches!(
+            (&self.link.owner, record.side),
+            (OrderOwner::Leg { kind: LegOrderKind::Entry, .. }, robson_domain::OrderSide::Buy)
+                | (
+                    OrderOwner::Leg { kind: LegOrderKind::Sell, .. },
+                    robson_domain::OrderSide::Sell
+                )
+        );
+        if !side_matches
+            || record.order_type != "MARKET"
+            || record.protection_kind.is_some()
+            || record.stop_price.is_some_and(|price| price != Decimal::ZERO)
+            || record.expiry_reason.is_some()
+            || record
+                .orig_client_order_id
+                .as_ref()
+                .is_some_and(|id| id != &self.link.client_order_id)
+            || record.cumulative_quote_qty.is_some_and(|qty| qty < Decimal::ZERO)
+            || record.phase != OrderPhase::Live
             || record.status != "PARTIALLY_FILLED"
             || !record.quantities_consistent()
             || record.executed_qty <= Decimal::ZERO
@@ -91,25 +110,49 @@ impl<'ledger> OrderExecutionReceiver<'ledger> {
         {
             return Err(LedgerError::InvalidEvidence("not an exact cumulative execution".into()));
         }
-        let at = DateTime::<Utc>::from_timestamp(
-            evidence.receive.wall_seconds,
-            evidence.receive.wall_nanoseconds,
-        )
-        .ok_or_else(|| LedgerError::InvalidEvidence("invalid receive timestamp".into()))?;
-        let seen = SeenAt {
-            at,
-            clock: None,
-            capture: Some(evidence.receive),
+        let seen = receive_mark(evidence)?;
+        let record = Arc::new(record);
+        match self.gate.register(evidence, Arc::clone(&record)) {
+            PendingExecutionRegistration::Issued(ticket) => {
+                Ok(Some(RegisteredExecution { owner: self, ticket, record, seen }))
+            },
+            PendingExecutionRegistration::Retained => Ok(None),
+            PendingExecutionRegistration::Refused => {
+                Err(LedgerError::InvalidEvidence("pending slot refused observation".into()))
+            },
+        }
+    }
+
+    pub(super) fn take_retained(
+        &self,
+    ) -> Result<Option<RegisteredExecution<'_, 'ledger>>, LedgerError> {
+        let Some((evidence, record, ticket)) = self.gate.take_unissued() else {
+            return Ok(None);
         };
-        let ticket = self.gate.register(evidence).ok_or_else(|| {
-            LedgerError::InvalidEvidence("pending slot refused observation".into())
-        })?;
-        Ok(RegisteredExecution { owner: self, ticket, record, seen })
+        Ok(Some(RegisteredExecution {
+            owner: self,
+            ticket,
+            record,
+            seen: receive_mark(evidence)?,
+        }))
     }
 
     pub(super) fn pending(&self) -> Option<PendingExecutionEvidence> {
         self.gate.pending()
     }
+}
+
+fn receive_mark(evidence: PendingExecutionEvidence) -> Result<SeenAt, LedgerError> {
+    let at = DateTime::<Utc>::from_timestamp(
+        evidence.receive.wall_seconds,
+        evidence.receive.wall_nanoseconds,
+    )
+    .ok_or_else(|| LedgerError::InvalidEvidence("invalid receive timestamp".into()))?;
+    Ok(SeenAt {
+        at,
+        clock: None,
+        capture: Some(evidence.receive),
+    })
 }
 
 impl<'receiver, 'ledger> RegisteredExecution<'receiver, 'ledger> {

@@ -622,7 +622,7 @@ async fn projected_native_order_pending_ack_preserves_newer_execution(pool: PgPo
     };
 
     let first = observe(Decimal::new(25, 2))?;
-    let work = receiver.register(f.record(1, first.executed, OrderPhase::Live), first)?;
+    let work = receiver.register(f.record(1, first.executed, OrderPhase::Live), first)?.context("first ticket")?;
     ensure!(receiver.pending() == Some(first), "registered before any persistence await");
 
     // Hold delivery in the application after a real COMMIT, with no
@@ -643,7 +643,7 @@ async fn projected_native_order_pending_ack_preserves_newer_execution(pool: PgPo
         committed.await?;
         ensure!(readback().await? == (first.executed, intent));
         let second = observe(Decimal::new(50, 2))?;
-        let work = receiver.register(f.record(1, second.executed, OrderPhase::Live), second)?;
+        let work = receiver.register(f.record(1, second.executed, OrderPhase::Live), second)?.context("second ticket")?;
         ensure!(receiver.pending() == Some(second));
         allow_ack.send(()).map_err(|_| anyhow::anyhow!("ACK waiter missing"))?;
         Ok::<_, anyhow::Error>((second, work))
@@ -662,16 +662,46 @@ async fn projected_native_order_pending_ack_preserves_newer_execution(pool: PgPo
     ensure!(ack.accounting_version == initial_version + 2);
     ensure!(readback().await? == (second.executed, intent));
     ensure!(receiver.pending() == Some(second), "only applying the exact ACK retires it");
+    let invalid = observe(Decimal::new(55, 2))?;
+    let mut negative_quote = f.record(1, invalid.executed, OrderPhase::Live);
+    negative_quote.cumulative_quote_qty = Some(-Decimal::ONE);
+    ensure!(matches!(receiver.register(negative_quote, invalid), Err(LedgerError::InvalidEvidence(_))));
+    ensure!(receiver.pending() == Some(second) && ack.apply() && receiver.pending().is_none(),
+        "invalid newer quote preserves the exact valid pending ticket");
+
+    let a = observe(Decimal::new(55, 2))?;
+    let b = observe(Decimal::new(60, 2))?;
+    let a_ticket = receiver.register(f.record(1, a.executed, OrderPhase::Live), a)?.context("first capacity ticket")?;
+    let b_ticket = receiver.register(f.record(1, b.executed, OrderPhase::Live), b)?.context("second capacity ticket")?;
+    let retained = observe(Decimal::new(65, 2))?;
+    let mut complete_record = f.record(1, retained.executed, OrderPhase::Live);
+    complete_record.cumulative_quote_qty = Some(Decimal::new(65, 0));
+    complete_record.update_time_ms = Some(417013);
+    ensure!(receiver.register(complete_record, retained)?.is_none());
+    ensure!(receiver.pending() == Some(retained) && receiver.take_retained()?.is_none());
+    drop(a_ticket);
+    drop(b_ticket);
+    let retained_work = receiver.take_retained()?.context("retained original payload")?;
+    ensure!(receiver.take_retained()?.is_none(), "retained work issued exactly once");
+    let before = ledger.statements_total();
+    let ack = retained_work.persist().await?.context("retained exact PG commit")?;
+    ensure!(ledger.statements_total() - before == 9 && ack.accounting_version == initial_version + 3);
+    let durable: (Decimal, Decimal, i64) = sqlx::query_as(
+        "SELECT executed_cum,cumulative_quote,venue_update_time_ms FROM venue_orders
+         WHERE tenant_id=$1 AND venue_id='binance:spot' AND account_scope=$2
+           AND symbol=$3 AND exchange_order_id='1' AND intent_id=$4",
+    ).bind(f.tenant).bind(&f.scope).bind(SYMBOL).bind(intent).fetch_one(&pool).await?;
+    ensure!(durable == (retained.executed, Decimal::new(65, 0), 417013));
     ensure!(ack.apply() && receiver.pending().is_none());
 
-    let same = observe(second.executed)?;
+    let same = observe(retained.executed)?;
     let before = ledger.statements_total();
-    let replay = receiver.register(f.record(1, same.executed, OrderPhase::Live), same)?;
+    let replay = receiver.register(f.record(1, same.executed, OrderPhase::Live), same)?.context("same ticket")?;
     ensure!(replay.persist().await?.is_none() && ledger.statements_total() - before == 1);
     ensure!(receiver.pending() == Some(same), "no-op returned no proof and preserves pending");
 
     let last = observe(Decimal::new(75, 2))?;
-    let unknown = receiver.register(f.record(1, last.executed, OrderPhase::Live), last)?;
+    let unknown = receiver.register(f.record(1, last.executed, OrderPhase::Live), last)?.context("last ticket")?;
     let before = ledger.statements_total();
     proxy.enable_exact_query_trace(16);
     proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE venue_orders"));
@@ -679,10 +709,10 @@ async fn projected_native_order_pending_ack_preserves_newer_execution(pool: PgPo
     ensure!(ledger.statements_total() - before == 9 && proxy.stats().commit_acks_dropped == 1);
     ensure!(receiver.pending() == Some(last), "lost native reply cannot clear pending");
     ensure!(readback().await? == (last.executed, intent));
-    ensure!(version(&pool, &binding).await? == initial_version + 3);
+    ensure!(version(&pool, &binding).await? == initial_version + 4);
     exact_reference(&pool, &binding).await?;
     ensure!(gate.fenced(), "this recovery proof does not open admissions");
-    eprintln!("C8_EXACT_PENDING_ACK previous=0.25 retained=0.50 cleared_by_exact_ack=1 no_op_retained=1 lost_ack_retained=0.75 changed_sql=9 replay_sql=1");
+    eprintln!("C8_EXACT_PENDING_ACK previous=0.25 retained=0.50 cleared_by_exact_ack=1 no_op_retained=1 lost_ack_retained=0.75 changed_sql=9 replay_sql=1 invalid_quote_refused=1 saturated_payload_resumed=1");
     Ok(())
 }
 
