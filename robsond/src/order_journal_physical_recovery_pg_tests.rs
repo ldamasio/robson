@@ -880,16 +880,25 @@ async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
             "epoch": successor.process_epoch, "generation": successor.generation_id,
         })).await?;
         let owned = owned.context("rehearsal owned J")?;
-        let sample = crate::venue_clock_owner::run_held_inventory_rehearsal(
+        let witness = crate::venue_clock_owner::run_held_inventory_rehearsal(
             &restore, &restored_wire, &new, g.tenant_id, std::sync::Arc::new(clock), rows,
             &successor, &uid, committed.0, SYMBOL, owned,
         ).await?;
+        ensure!(witness.intent == owned && witness.generation == successor.generation_id
+            && witness.lookup_send.epoch == successor.process_epoch
+            && witness.lookup_receive.epoch == successor.process_epoch
+            && witness.lookup_send.after_ns < witness.lookup_receive.before_ns,
+            "pending observation retained across close under its exact binding");
         drop(reader);
         restore.close().await;
         installed.supervisor().phase("rehearsal_complete", json!({
             "epoch": successor.process_epoch, "generation": successor.generation_id,
-            "sample": sample, "handoffs": 4, "weight": 107, "inventory_sql": 0,
+            "sample": witness.sample, "handoffs": 4, "weight": 107, "inventory_sql": 0,
             "uid": uid.parse::<u64>()?, "owned_intent": owned,
+            "lookup_handoffs": witness.lookup_handoffs, "lookup_weight": 4, "lookup_sql": witness.lookup_sql,
+            "cumulative_handoffs": witness.cumulative_handoffs, "cumulative_weight": 111,
+            "lookup_sample": witness.lookup_sample, "durable_executed": witness.durable_executed.normalize().to_string(),
+            "lookup_executed": witness.lookup_executed.normalize().to_string(), "pending_execution_observed": true,
         })).await?;
         return Ok(());
     }

@@ -51,6 +51,9 @@ pub(crate) struct PendingCommission(PendingTime);
 pub(crate) struct PendingAccount(PendingTime, robson_connectors::inventory_loopback::InventoryRead);
 
 #[cfg(all(test, feature = "crash-points"))]
+pub(crate) struct PendingOwnedOrder(PendingTime);
+
+#[cfg(all(test, feature = "crash-points"))]
 impl PendingAccount {
     pub(crate) fn read(&self) -> robson_connectors::inventory_loopback::InventoryRead {
         self.1
@@ -242,6 +245,32 @@ impl SharedBudget {
     pub(crate) fn poll_account_first<M>(
         &self,
         pending: &mut PendingAccount,
+        clock: &NativeClock,
+        epoch: uuid::Uuid,
+        admit_clock: impl FnOnce() -> Result<(TickCapture, M), BudgetError>,
+        poll: impl FnOnce() -> std::task::Poll<reqwest::Result<reqwest::Response>>,
+    ) -> Result<(TickCapture, M, std::task::Poll<reqwest::Result<reqwest::Response>>), BudgetError>
+    {
+        self.poll_reserved_first(&mut pending.0, clock, epoch, admit_clock, poll)
+    }
+
+    #[cfg(all(test, feature = "crash-points"))]
+    pub(crate) fn try_reserve_owned_order(
+        &self,
+        now: TickCapture,
+        deadline: TickCapture,
+    ) -> Result<PendingOwnedOrder, BudgetError> {
+        let mut state = self.0.try_lock().map_err(|_| BudgetError::Deferred)?;
+        self.reserve_steady(
+            &mut state, now, deadline,
+            robson_connectors::inventory_loopback::OWNED_ORDER_WEIGHT,
+        ).map(PendingOwnedOrder)
+    }
+
+    #[cfg(all(test, feature = "crash-points"))]
+    pub(crate) fn poll_owned_order_first<M>(
+        &self,
+        pending: &mut PendingOwnedOrder,
         clock: &NativeClock,
         epoch: uuid::Uuid,
         admit_clock: impl FnOnce() -> Result<(TickCapture, M), BudgetError>,

@@ -5,6 +5,7 @@
 //! action or clean/ready classification. A refused snapshot yields nothing.
 
 use robson_connectors::binance::spot::{SpotOpenOrderList, SpotOrderRecord};
+use rust_decimal::Decimal;
 use sqlx::{
     postgres::{PgConnectOptions, PgRow},
     ConnectOptions, Connection, Row,
@@ -76,6 +77,7 @@ pub(super) struct OrderFact {
     pub(super) side: String,
     pub(super) order_list_id: i64,
     pub(super) fact: Fact,
+    pub(super) durable_executed: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +242,7 @@ pub(super) fn attribute(
             side: order.side.clone(),
             order_list_id: order.order_list_id,
             fact,
+            durable_executed: row.try_get("o_executed").map_err(bad)?,
         });
     }
     Ok(facts)

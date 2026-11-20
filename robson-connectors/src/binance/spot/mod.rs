@@ -35,6 +35,8 @@ mod trading;
 
 pub use commission_send::{PreparedSpotCommission, SignedSpotCommission};
 pub use exchange::{BinanceSpotAdapter, SPOT_FINALITY};
+#[cfg(any(test, feature = "crash-points"))]
+pub(crate) use exchange::decode_fixture_order;
 pub use market_data::{BinanceSpotTradeFeed, SPOT_MARKET_WS_ENDPOINT};
 pub use ohlcv::BinanceSpotOhlcv;
 #[cfg(any(test, feature = "crash-points"))]

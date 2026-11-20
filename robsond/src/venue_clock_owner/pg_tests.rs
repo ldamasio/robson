@@ -33,6 +33,8 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
     let mut account_slot: Option<inventory::AccountPreparation> = None;
     let mut supersession_http = [None, None];
     let mut supersession_slots = [None, None];
+    let mut lookup_control_http = None;
+    let mut lookup_control_slot = None;
     let primary = timeout_at(body_deadline, async {
         ensure!(matches!(bootstrap::production_input(), Err(BudgetError::PrerequisiteRefusal)));
         let clock = Arc::new(NativeClock::initialize()?);
@@ -160,6 +162,16 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
             .map_err(|e| anyhow!("handoffs: {e:?}"))? == 6,
             "one TIME, one accepted triple and two charged rejected ACCOUNT reads");
         eprintln!("C8_INVENTORY_GUARDED time=1 inventory=3 superseded_account=2 handoffs=6 weight_before_faults=107 weight_total=147 no_venue_orders=true");
+        superseded_owned_order(
+            owner, &clock, body_deadline, &mut lookup_control_http, &mut lookup_control_slot,
+        ).await?;
+        ensure!(budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 7,
+            "one new charged lookup survives supersession");
+        // 400 - (107 + 2 * 20 + 4) = 249: twelve ACCOUNT reservations,
+        // then exactly nine unit weights. No fresh lease or refund on EOF.
+        verify_budget_remaining(&budget, &clock, 12, 9)?;
+        eprintln!("C8_LOOKUP_CLOCK_CONTROL superseded_http_400=1 retained_lookup_weight=4 connections=1");
+
         Ok::<_, anyhow::Error>(())
     }).await.map_err(|_| anyhow!("150s fixture body ceiling elapsed")).and_then(|r| r);
 
@@ -183,6 +195,15 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
         if !matches!(retired, Ok(true)) {
             supersession_errors.push(format!("supersession preparation retirement: {retired:?}"));
         }
+    }
+    if let Some(fixture) = lookup_control_http {
+        if let Err(error) = fixture.finish(deadline).await {
+            supersession_errors.push(format!("lookup control listener retirement: {error}"));
+        }
+    }
+    let retired = timeout_at(deadline, jobs::retire(&mut lookup_control_slot)).await;
+    if !matches!(retired, Ok(true)) {
+        supersession_errors.push(format!("lookup control preparation retirement: {retired:?}"));
     }
     let closing = owner.take().map(|owner| {
         // No await or spawned owner can advance this original baseline.
@@ -248,6 +269,22 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
     }
 }
 
+/// A held observation above the native accounting basis. No writer
+/// receives this fixture's evidence and no durable acknowledgement exists.
+pub(crate) struct HeldLookupWitness {
+    pub(crate) sample: Uuid,
+    pub(crate) lookup_sample: Uuid,
+    pub(crate) lookup_send: RawClockCapture,
+    pub(crate) lookup_receive: RawClockCapture,
+    pub(crate) intent: Uuid,
+    pub(crate) generation: Uuid,
+    pub(crate) durable_executed: rust_decimal::Decimal,
+    pub(crate) lookup_executed: rust_decimal::Decimal,
+    pub(crate) lookup_handoffs: u64,
+    pub(crate) cumulative_handoffs: u64,
+    pub(crate) lookup_sql: u64,
+}
+
 /// Consumes the actual C2 bootstrap rows from the held physical restore.
 pub(crate) async fn run_held_inventory_rehearsal(
     pool: &PgPool,
@@ -261,7 +298,10 @@ pub(crate) async fn run_held_inventory_rehearsal(
     version: i64,
     operated: &str,
     owned: Uuid,
-) -> anyhow::Result<Uuid> {
+) -> anyhow::Result<HeldLookupWitness> {
+    use robson_domain::OrderSide;
+    use robson_exec::venue::{OrderObservation, OrderPhase};
+    use rust_decimal::Decimal;
     use c8_attribution::{Divergence, Fact, ListFact, Refusal, Scope};
     let venue_id = VenueId::new(VenueId::BINANCE_SPOT);
     let scope = Scope {
@@ -285,6 +325,8 @@ pub(crate) async fn run_held_inventory_rehearsal(
     let deadline = Instant::now() + Duration::from_secs(135);
     let mut time_http = None;
     let mut inventory_http = None;
+    let mut lookup_http = None;
+    let mut lookup_slot = None;
     let mut owner = None;
     let mut slot = None;
     let primary = timeout_at(deadline, async {
@@ -428,12 +470,70 @@ pub(crate) async fn run_held_inventory_rehearsal(
                 "owned identity mismatch is never a ledger binding");
         }
         ensure!(counters().0 == negatives + 4, "contrary judgments issue no SQL");
-        Ok::<_, anyhow::Error>(sample)
+        let durable = facts[2].durable_executed.context("native owned execution basis")?;
+        ensure!(durable == Decimal::ZERO, "held fixture basis is exact zero");
+        lookup_http = Some(c8_account_http::AccountFixture::owned_order(deadline).await?);
+        let lookup_target = lookup_http.as_ref().context("owned lookup listener")?;
+        let lookup_due = deadline.min(Instant::now() + Duration::from_secs(5));
+        let handoffs_before = budget.handoffs().map_err(|e| anyhow!("{e:?}"))?;
+        let lookup_before = counters();
+        let lookup_signed = owner.commission_signing_time().map_err(|e| anyhow!("{e:?}"))?;
+        let generation = owner.state.lock().map_err(|_| anyhow!("clock lock"))?.generation;
+        let stale_claim = clock.capture()?;
+        owner.state.lock().map_err(|_| anyhow!("clock lock"))?.generation = generation + 1;
+        let refused = owner.read_owned_order(
+            &lookup_signed, stale_claim, &mut lookup_slot, lookup_target.port, lookup_due,
+        ).await;
+        owner.state.lock().map_err(|_| anyhow!("clock lock"))?.generation = generation;
+        ensure!(matches!(refused, Err(TimeError::Budget(BudgetError::Deferred)))
+            && lookup_target.connections() == 0
+            && budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == handoffs_before,
+            "stale lookup before first poll opens no connection and spends no charge");
+        verify_triple_budget(&budget, &clock)?;
+        let lookup = owner.read_owned_order(
+            &lookup_signed, clock.capture()?, &mut lookup_slot, lookup_target.port, lookup_due,
+        ).await.map_err(|e| anyhow!("held exact lookup: {e:?}"))?;
+        let OrderObservation::Found(record) = lookup.observation else {
+            return Err(anyhow!("exact order lookup remained unresolved"));
+        };
+        ensure!(
+            lookup.mark.sample == sample && lookup.mark.generation == generation
+            && lookup.mark.raw.epoch == start.epoch.epoch_id && lookup.receive.epoch == start.epoch.epoch_id
+            && lookup.mark.raw.after_ns < lookup.receive.before_ns
+            && lookup.mark.raw.wall_agrees(&lookup.receive)?
+            && record.symbol == facts[2].symbol && record.exchange_order_id == facts[2].order_id.to_string()
+            && record.client_order_id == facts[2].client_order_id
+            && record.side == OrderSide::Buy && record.order_type == "MARKET"
+            && record.phase == OrderPhase::Live && record.status == "PARTIALLY_FILLED"
+            && record.orig_qty == Decimal::ONE
+            && record.executed_qty > durable && record.executed_qty == Decimal::new(25, 2),
+            "typed observation above the exact order's durable basis"
+        );
+        let total_handoffs = budget.handoffs().map_err(|e| anyhow!("{e:?}"))?;
+        ensure!(lookup_target.connections() == 1 && lookup_slot.is_none()
+            && lookup_target.signing_stamp()? == lookup_signed.timestamp_ms()
+            && total_handoffs == 5 && handoffs_before == 4 && counters() == lookup_before,
+            "one lookup handoff, no retry and no SQL during that request");
+        verify_budget_remaining(&budget, &clock, 14, 9)?;
+        Ok::<_, anyhow::Error>(HeldLookupWitness {
+            sample,
+            lookup_sample: lookup.mark.sample,
+            lookup_send: lookup.mark.raw,
+            lookup_receive: lookup.receive,
+            intent: owned,
+            generation: installed.generation_id,
+            durable_executed: durable,
+            lookup_executed: record.executed_qty,
+            lookup_handoffs: total_handoffs - handoffs_before,
+            cumulative_handoffs: total_handoffs,
+            lookup_sql: counters().0 - lookup_before.0,
+        })
     }).await.context("held inventory window");
 
     let asked_at = Instant::now();
     let stop_deadline = asked_at + crate::stop::StopTimings::default().deadline;
     let preparation = timeout_at(stop_deadline, ClockOwner::retire_account(&mut slot)).await;
+    let lookup_preparation = timeout_at(stop_deadline, jobs::retire(&mut lookup_slot)).await;
     let stopped = if let Some(owner) = owner {
         if !matches!(&primary, Ok(Ok(_))) {
             owner.cancel.cancel();
@@ -449,29 +549,40 @@ pub(crate) async fn run_held_inventory_rehearsal(
     let inventory_stopped = if let Some(listener) = inventory_http {
         listener.finish(stop_deadline).await
     } else { Ok(()) };
+    let lookup_stopped = if let Some(listener) = lookup_http {
+        listener.finish(stop_deadline).await
+    } else { Ok(()) };
     let time_stopped = if let Some(listener) = time_http {
         listener.finish(stop_deadline).await
     } else { Ok(()) };
     ensure!(matches!(preparation, Ok(true)), "held inventory preparation not retired");
+    ensure!(matches!(lookup_preparation, Ok(true)), "held lookup preparation not retired");
     stopped?;
     inventory_stopped?;
+    lookup_stopped?;
     time_stopped?;
     primary?
 }
 
 fn verify_triple_budget(budget: &SharedBudget, clock: &NativeClock) -> anyhow::Result<()> {
+    verify_budget_remaining(budget, clock, 14, 13)
+}
+
+fn verify_budget_remaining(
+    budget: &SharedBudget, clock: &NativeClock, accounts: usize, unit_weight: usize,
+) -> anyhow::Result<()> {
     let now = clock.capture()?;
     let due = crate::venue_clock_owner::after(now, Duration::from_secs(1)).map_err(|e| anyhow!("{e:?}"))?;
     let mut account = Vec::new();
-    for _ in 0..14 {
+    for _ in 0..accounts {
         account.push(budget.try_reserve_account(now, due).map_err(|e| anyhow!("ACCOUNT capacity: {e:?}"))?);
     }
     let mut time = Vec::new();
-    for _ in 0..13 {
+    for _ in 0..unit_weight {
         time.push(budget.try_reserve_time(now, due).map_err(|e| anyhow!("TIME capacity: {e:?}"))?);
     }
     ensure!(matches!(budget.try_reserve_time(now, due), Err(BudgetError::Deferred)),
-        "exactly 293 of 400 steady weight remain");
+        "exact steady weight after observed requests");
     Ok(())
 }
 
@@ -571,6 +682,39 @@ async fn supersession_during_account_body(
         Ok::<_, anyhow::Error>(())
     };
     timeout_at(due, work).await.context("ACCOUNT supersession deadline")?
+}
+
+async fn superseded_owned_order(
+    owner: &ClockOwner,
+    clock: &NativeClock,
+    fixture_deadline: Instant,
+    fixture_slot: &mut Option<c8_account_http::AccountFixture>,
+    slot: &mut Option<inventory::OwnedOrderPreparation>,
+) -> anyhow::Result<()> {
+    let due = (Instant::now() + Duration::from_secs(5)).min(fixture_deadline);
+    let (venue, head, release) = c8_account_http::AccountFixture::held_order_not_found(fixture_deadline).await?;
+    let venue = fixture_slot.insert(venue);
+    let signed = owner.commission_signing_time().map_err(|error| anyhow!("{error:?}"))?;
+    let claim = clock.capture()?;
+    let original = owner.state.lock().map_err(|_| anyhow!("clock lock"))?
+        .published.as_ref().context("positive lookup sample")?.id;
+    let retire_sample = async {
+        timeout_at(due, head).await.context("lookup head deadline")??;
+        owner.state.lock().map_err(|_| anyhow!("clock lock"))?
+            .published.as_mut().context("sample present")?.id = Uuid::now_v7();
+        release.send(()).map_err(|_| anyhow!("release lookup body"))?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (result, changed) = tokio::join!(
+        owner.read_owned_order(&signed, claim, slot, venue.port, due),
+        retire_sample,
+    );
+    owner.state.lock().map_err(|_| anyhow!("clock lock"))?
+        .published.as_mut().context("sample present")?.id = original;
+    changed?;
+    ensure!(matches!(result, Err(TimeError::Native)) && venue.connections() == 1,
+        "superseded EOF refuses the 400 observation after the charged send");
+    Ok(())
 }
 
 async fn close_owner(

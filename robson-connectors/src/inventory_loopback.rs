@@ -85,23 +85,74 @@ impl PreparedRead {
     /// The canonical HMAC GET of the commission binder, with the immutable
     /// caller timestamp as its only parameter, to `127.0.0.1:port` only.
     pub fn sign(self, port: u16, timestamp_ms: i64) -> Result<SignedRead, BinanceRestError> {
-        if timestamp_ms <= 0 {
-            return Err(BinanceRestError::Refused("invalid inventory timestamp".into()));
-        }
-        let endpoint = self.read.path();
-        let query = format!("timestamp={timestamp_ms}");
-        let mut mac = Hmac::<Sha256>::new_from_slice(LOOPBACK_SECRET.as_bytes())
-            .map_err(|e| BinanceRestError::SignatureError(format!("HMAC error: {e}")))?;
-        mac.update(query.as_bytes());
-        let signature = hex::encode(mac.finalize().into_bytes());
-        let url = format!("http://127.0.0.1:{port}{endpoint}?{query}&signature={signature}",);
-        let (transport, request) =
-            self.transport.get(url).header("X-MBX-APIKEY", LOOPBACK_KEY).build_split();
-        let request = request.map_err(|_| {
-            BinanceRestError::Refused("inventory request construction failed".into())
-        })?;
-        Ok(SignedRead { transport, request })
+        sign_loopback(
+            self.transport,
+            port,
+            self.read.path(),
+            &format!("timestamp={timestamp_ms}"),
+            timestamp_ms,
+        )
     }
+}
+
+/// One closed native-order request for the held fixture.
+pub struct PreparedOwnedOrder(Client);
+
+pub const OWNED_ORDER_SYMBOL: &str = "BTCUSDT";
+pub const OWNED_ORDER_ID: u64 = 417013;
+pub const OWNED_ORDER_WEIGHT: u32 = crate::binance::spot::SpotRead::ORDER.weight;
+
+pub fn prepare_owned_order() -> Result<PreparedOwnedOrder, BinanceRestError> {
+    loopback_transport().map(PreparedOwnedOrder)
+}
+
+impl PreparedOwnedOrder {
+    pub fn sign(self, port: u16, timestamp_ms: i64) -> Result<SignedRead, BinanceRestError> {
+        sign_loopback(
+            self.0,
+            port,
+            crate::binance::spot::SpotRead::ORDER.path,
+            &format!(
+                "symbol={OWNED_ORDER_SYMBOL}&orderId={OWNED_ORDER_ID}&timestamp={timestamp_ms}"
+            ),
+            timestamp_ms,
+        )
+    }
+}
+
+fn sign_loopback(
+    transport: Client,
+    port: u16,
+    endpoint: &str,
+    query: &str,
+    timestamp_ms: i64,
+) -> Result<SignedRead, BinanceRestError> {
+    if timestamp_ms <= 0 {
+        return Err(BinanceRestError::Refused("invalid inventory timestamp".into()));
+    }
+    let mut mac = Hmac::<Sha256>::new_from_slice(LOOPBACK_SECRET.as_bytes())
+        .map_err(|e| BinanceRestError::SignatureError(format!("HMAC error: {e}")))?;
+    mac.update(query.as_bytes());
+    let signature = hex::encode(mac.finalize().into_bytes());
+    let url = format!("http://127.0.0.1:{port}{endpoint}?{query}&signature={signature}");
+    let (transport, request) =
+        transport.get(url).header("X-MBX-APIKEY", LOOPBACK_KEY).build_split();
+    let request = request
+        .map_err(|_| BinanceRestError::Refused("inventory request construction failed".into()))?;
+    Ok(SignedRead { transport, request })
+}
+
+pub fn decode_owned_order(
+    status: u16,
+    body: &[u8],
+) -> Result<robson_exec::venue::OrderObservation, BinanceRestError> {
+    let refuse = || BinanceRestError::Refused("invalid fixture order response".into());
+    if body.len() > LOOPBACK_BODY_LIMIT {
+        return Err(refuse());
+    }
+    let body = std::str::from_utf8(body).map_err(|_| refuse())?;
+    crate::binance::spot::decode_fixture_order(status, body, OWNED_ORDER_SYMBOL, OWNED_ORDER_ID)
+        .map_err(|_| refuse())
 }
 
 impl SignedRead {
@@ -175,5 +226,55 @@ pub fn decode(read: InventoryRead, body: &[u8]) -> Result<InventoryBody, Binance
         InventoryRead::OpenOrderLists => spot::decode_open_order_lists(text, LOOPBACK_BODY_LIMIT)
             .map(InventoryBody::OpenOrderLists)
             .map_err(|_| refuse("invalid typed open order lists")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use robson_exec::venue::OrderObservation;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn owned_order_signature_binds_the_fixed_symbol_and_id() {
+        let signed = prepare_owned_order().unwrap().sign(1234, 1500).unwrap();
+        assert_eq!(signed.request.method(), reqwest::Method::GET);
+        assert_eq!(signed.request.url().host_str(), Some("127.0.0.1"));
+        assert_eq!(signed.request.url().port(), Some(1234));
+        assert_eq!(signed.request.url().path(), "/api/v3/order");
+        assert_eq!(signed.request.headers()["X-MBX-APIKEY"], LOOPBACK_KEY);
+        let query = "symbol=BTCUSDT&orderId=417013&timestamp=1500";
+        let mut mac = Hmac::<Sha256>::new_from_slice(LOOPBACK_SECRET.as_bytes()).unwrap();
+        mac.update(query.as_bytes());
+        assert_eq!(
+            signed.request.url().query(),
+            Some(
+                format!("{query}&signature={}", hex::encode(mac.finalize().into_bytes())).as_str()
+            )
+        );
+        assert_eq!(OWNED_ORDER_WEIGHT, 4);
+    }
+
+    #[test]
+    fn owned_order_body_requires_exact_native_id_and_unresolved_status_pairs() {
+        let positive = r#"{"symbol":"BTCUSDT","orderId":417013,"orderListId":-1,"clientOrderId":"fixture","price":"0","origQty":"1","executedQty":"0.25","cummulativeQuoteQty":"25","status":"PARTIALLY_FILLED","timeInForce":"GTC","type":"MARKET","side":"BUY","stopPrice":"0","time":1,"updateTime":2,"workingTime":-1,"selfTradePreventionMode":"EXPIRE_MAKER"}"#;
+        let found = decode_owned_order(200, positive.as_bytes()).unwrap();
+        assert!(
+            matches!(found, OrderObservation::Found(record) if record.exchange_order_id == "417013")
+        );
+        for bad in [
+            positive.replace("417013", "417014"),
+            positive.replace("BTCUSDT", "AAABBB"),
+            positive.replace("0.25", "2"),
+        ] {
+            assert!(decode_owned_order(200, bad.as_bytes()).is_err());
+        }
+        let missing = br#"{"code":-2013,"msg":"fixture"}"#;
+        let archived = br#"{"code":-2026,"msg":"fixture"}"#;
+        assert!(matches!(decode_owned_order(400, missing), Ok(OrderObservation::NotFound)));
+        assert!(matches!(decode_owned_order(400, archived), Ok(OrderObservation::Archived)));
+        assert!(decode_owned_order(500, missing).is_err());
+        assert!(decode_owned_order(404, archived).is_err());
+        assert!(decode_owned_order(400, b"").is_err());
     }
 }

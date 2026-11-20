@@ -49,6 +49,35 @@ impl AccountFixture {
         Self::scripted(deadline, None, attribution_script()).await
     }
 
+    pub(super) async fn owned_order(deadline: Instant) -> anyhow::Result<Self> {
+        Self::owned_order_answer(deadline, None, 200, owned_order_body()).await
+    }
+
+    pub(super) async fn held_order_not_found(
+        deadline: Instant,
+    ) -> anyhow::Result<(Self, oneshot::Receiver<()>, oneshot::Sender<()>)> {
+        let (head, seen) = oneshot::channel();
+        let (release, ready) = oneshot::channel();
+        let fixture = Self::owned_order_answer(
+            deadline,
+            Some((head, ready)),
+            400,
+            r#"{"code":-2013,"msg":"synthetic unresolved order"}"#.into(),
+        )
+        .await?;
+        Ok((fixture, seen, release))
+    }
+
+    async fn owned_order_answer(
+        deadline: Instant,
+        gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+        status: u16,
+        body: String,
+    ) -> anyhow::Result<Self> {
+        const KEY: &str = "/api/v3/order?symbol=BTCUSDT&orderId=417013";
+        Self::respond(deadline, gate, vec![(KEY, status, body)]).await
+    }
+
     async fn with_gate(
         deadline: Instant,
         body_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
@@ -62,13 +91,26 @@ impl AccountFixture {
 
     async fn scripted(
         deadline: Instant,
-        mut body_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+        body_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
         script: Vec<(&'static str, String)>,
+    ) -> anyhow::Result<Self> {
+        Self::respond(
+            deadline,
+            body_gate,
+            script.into_iter().map(|(path, body)| (path, 200, body)).collect(),
+        )
+        .await
+    }
+
+    async fn respond(
+        deadline: Instant,
+        mut body_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+        script: Vec<(&'static str, u16, String)>,
     ) -> anyhow::Result<Self> {
         use robson_connectors::inventory_loopback::{LOOPBACK_BODY_LIMIT, LOOPBACK_KEY};
         ensure!(script
             .iter()
-            .all(|(_, body)| !body.is_empty() && body.len() <= LOOPBACK_BODY_LIMIT));
+            .all(|(_, _, body)| !body.is_empty() && body.len() <= LOOPBACK_BODY_LIMIT));
         let expected = script.len();
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
@@ -86,7 +128,7 @@ impl AccountFixture {
                         next = listener.accept() => next?,
                     };
                     let index = count.fetch_add(1, Ordering::SeqCst);
-                    let (path, body) =
+                    let (path, status, body) =
                         script.get(index).context("unexpected extra physical connection")?;
                     let exchange = async {
                         let mut request = Vec::new();
@@ -99,7 +141,14 @@ impl AccountFixture {
                         let (stamp, signature) = line
                             .strip_prefix("GET ")
                             .and_then(|line| line.strip_prefix(*path))
-                            .and_then(|line| line.strip_prefix("?timestamp="))
+                            .and_then(|line| {
+                                let delimiter = if path.contains('?') {
+                                    "&timestamp="
+                                } else {
+                                    "?timestamp="
+                                };
+                                line.strip_prefix(delimiter)
+                            })
                             .and_then(|line| line.strip_suffix(" HTTP/1.1"))
                             .and_then(|query| query.split_once("&signature="))
                             .context("unexpected signed inventory request shape")?;
@@ -118,7 +167,7 @@ impl AccountFixture {
                         let lower = request.to_ascii_lowercase();
                         ensure!(lower.matches("\r\nx-mbx-apikey: ").count() == 1);
                         ensure!(lower.contains(&format!("\r\nx-mbx-apikey: {LOOPBACK_KEY}\r\n")));
-                        let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        let head = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                         socket.write_all(head.as_bytes()).await?;
                         if let Some((sent, ready)) = body_gate.take() {
                             sent.send(()).map_err(|_| anyhow!("missing body controller"))?;
@@ -236,4 +285,10 @@ pub(super) fn attribution_script() -> Vec<(&'static str, String)> {
         ("/api/v3/openOrders", orders),
         ("/api/v3/openOrderList", lists),
     ]
+}
+
+
+// A synthetic later execution observation, distinct from the zero durable row.
+fn owned_order_body() -> String {
+    r#"{"symbol":"BTCUSDT","orderId":417013,"orderListId":-1,"clientOrderId":"physical-recovery-owned-buy","price":"0","origQty":"1","executedQty":"0.25","cummulativeQuoteQty":"25","status":"PARTIALLY_FILLED","timeInForce":"GTC","type":"MARKET","side":"BUY","stopPrice":"0","time":1,"updateTime":2,"workingTime":-1,"selfTradePreventionMode":"EXPIRE_MAKER"}"#.into()
 }

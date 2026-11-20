@@ -4,15 +4,36 @@
 use std::{future::Future, task::Poll};
 
 use robson_connectors::inventory_loopback::{
-    self, InventoryBody, InventoryRead, PreparedRead, LOOPBACK_BODY_LIMIT, LOOPBACK_UID,
+    self, InventoryBody, InventoryRead, PreparedOwnedOrder, PreparedRead, SignedRead,
+    LOOPBACK_BODY_LIMIT, LOOPBACK_UID,
 };
+use robson_exec::venue::OrderObservation;
 
 use super::{commission::CommissionSigningTime, *};
-use crate::venue_budget::state::PendingAccount;
+use crate::venue_budget::state::{PendingAccount, PendingOwnedOrder};
 
 const RECEIPT_LIMIT: Duration = Duration::from_secs(60);
 
 pub(super) type AccountPreparation = JoinHandle<Result<PreparedRead, BinanceRestError>>;
+pub(super) type OwnedOrderPreparation = JoinHandle<Result<PreparedOwnedOrder, BinanceRestError>>;
+
+enum Reservation<'a> {
+    Inventory(&'a mut PendingAccount),
+    OwnedOrder(&'a mut PendingOwnedOrder),
+}
+
+struct ReadBody {
+    status: u16,
+    body: Vec<u8>,
+    mark: AccountMark,
+    receive: RawClockCapture,
+}
+
+pub(super) struct OwnedOrderReceipt {
+    pub(super) mark: AccountMark,
+    pub(super) receive: RawClockCapture,
+    pub(super) observation: OrderObservation,
+}
 
 /// What the actual locked first-poll admission saw: the published sample and
 /// generation it was judged against and the native poll mark, as produced.
@@ -78,6 +99,21 @@ impl ClockOwner {
         slot: &mut Option<AccountPreparation>,
         deadline: Instant,
     ) -> Result<PreparedRead, TimeError> {
+        let prepared = self
+            .prepare_loopback(slot, deadline, move || inventory_loopback::prepare(read))
+            .await?;
+        if prepared.read() != read {
+            return Err(TimeError::Venue);
+        }
+        Ok(prepared)
+    }
+
+    async fn prepare_loopback<T: Send + 'static>(
+        &self,
+        slot: &mut Option<JoinHandle<Result<T, BinanceRestError>>>,
+        deadline: Instant,
+        prepare: impl FnOnce() -> Result<T, BinanceRestError> + Send + 'static,
+    ) -> Result<T, TimeError> {
         if slot.is_some() {
             return Err(TimeError::Resource);
         }
@@ -91,14 +127,9 @@ impl ClockOwner {
             Arc::clone(&self.workers).try_acquire_owned().map_err(|_| TimeError::Resource)?;
         *slot = Some(tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            inventory_loopback::prepare(read)
+            prepare()
         }));
-        let prepared =
-            jobs::complete(slot, deadline, &self.cancel, |_| TimeError::Transport).await?;
-        if prepared.read() != read {
-            return Err(TimeError::Venue);
-        }
-        Ok(prepared)
+        jobs::complete(slot, deadline, &self.cancel, |_| TimeError::Transport).await
     }
 
     pub(super) async fn retire_account(slot: &mut Option<AccountPreparation>) -> bool {
@@ -107,10 +138,10 @@ impl ClockOwner {
 
     /// The commission first-poll contract, shared: same clock-then-budget
     /// guards, same signed admission, its mark returned rather than rebuilt.
-    pub(super) fn poll_account_first(
+    fn poll_read_first(
         &self,
         signed: &CommissionSigningTime,
-        pending: &mut PendingAccount,
+        pending: &mut Reservation<'_>,
         claim: TickCapture,
         deadline: Instant,
         poll: impl FnOnce() -> Poll<reqwest::Result<reqwest::Response>>,
@@ -119,17 +150,24 @@ impl ClockOwner {
             return Err(BudgetError::Invalid);
         }
         let mut state = self.state.try_lock().map_err(|_| BudgetError::Deferred)?;
-        let (handoff, (generation, sample, raw), result) = self.budget.poll_account_first(
-            pending,
-            &self.clock,
-            self.epoch,
-            || {
-                let (h, raw) = self.admit_signed(&mut state, signed, claim, deadline)?;
-                let sample = state.published.as_ref().map(|s| s.id).ok_or(BudgetError::Deferred)?;
-                Ok((h, (state.generation, sample, raw)))
+        let admit = || {
+            let (handoff, raw) = self.admit_signed(&mut state, signed, claim, deadline)?;
+            let sample = state.published.as_ref().map(|s| s.id).ok_or(BudgetError::Deferred)?;
+            Ok((handoff, (state.generation, sample, raw)))
+        };
+        let (handoff, (generation, sample, raw), result) = match pending {
+            Reservation::Inventory(reservation) => {
+                self.budget
+                    .poll_account_first(reservation, &self.clock, self.epoch, admit, poll)
             },
-            poll,
-        )?;
+            Reservation::OwnedOrder(reservation) => self.budget.poll_owned_order_first(
+                reservation,
+                &self.clock,
+                self.epoch,
+                admit,
+                poll,
+            ),
+        }?;
         Ok((AccountMark { generation, sample, raw, handoff }, result))
     }
 
@@ -174,16 +212,92 @@ impl ClockOwner {
         port: u16,
         deadline: Instant,
     ) -> Result<AccountReceipt, TimeError> {
-        let work = async {
-            if Instant::now() >= deadline {
-                return Err(TimeError::Expired);
-            }
-            let read = pending.read();
-            if prepared.read() != read {
+        self.check_read_deadline(deadline)?;
+        let read = pending.read();
+        if prepared.read() != read {
+            return Err(TimeError::Venue);
+        }
+        let request =
+            prepared.sign(port, signed.timestamp_ms()).map_err(|_| TimeError::Transport)?;
+        let ReadBody { body, mark, receive, .. } = self
+            .receive_loopback(signed, Reservation::Inventory(pending), claim, request, deadline)
+            .await?;
+        let body = inventory_loopback::decode(read, &body).map_err(|_| TimeError::Payload)?;
+        if body.read() != read {
+            return Err(TimeError::Venue);
+        }
+        if let InventoryBody::Account(account) = &body {
+            if account.uid != LOOPBACK_UID {
                 return Err(TimeError::Venue);
             }
-            let request =
-                prepared.sign(port, signed.timestamp_ms()).map_err(|_| TimeError::Transport)?;
+        }
+        self.check_read_deadline(deadline)?;
+        Ok(AccountReceipt {
+            read,
+            generation: mark.generation,
+            sample: mark.sample,
+            send: mark.raw,
+            handoff: mark.handoff,
+            receive,
+            body,
+        })
+    }
+
+    pub(super) async fn read_owned_order(
+        &self,
+        signed: &CommissionSigningTime,
+        claim: TickCapture,
+        slot: &mut Option<OwnedOrderPreparation>,
+        port: u16,
+        deadline: Instant,
+    ) -> Result<OwnedOrderReceipt, TimeError> {
+        let now = self.clock.capture().map_err(|_| TimeError::Native)?;
+        let remaining =
+            deadline.checked_duration_since(Instant::now()).ok_or(TimeError::Expired)?;
+        let mut pending = self
+            .budget
+            .try_reserve_owned_order(now, after(now, remaining)?)
+            .map_err(TimeError::Budget)?;
+        let prepared = self
+            .prepare_loopback(slot, deadline, inventory_loopback::prepare_owned_order)
+            .await?;
+        let request =
+            prepared.sign(port, signed.timestamp_ms()).map_err(|_| TimeError::Transport)?;
+        let ReadBody { status, body, mark, receive } = self
+            .receive_loopback(
+                signed,
+                Reservation::OwnedOrder(&mut pending),
+                claim,
+                request,
+                deadline,
+            )
+            .await?;
+        let observation = inventory_loopback::decode_owned_order(status, &body)
+            .map_err(|_| TimeError::Payload)?;
+        self.check_read_deadline(deadline)?;
+        Ok(OwnedOrderReceipt { mark, receive, observation })
+    }
+
+    fn check_read_deadline(&self, deadline: Instant) -> Result<(), TimeError> {
+        if self.cancel.is_cancelled() {
+            Err(TimeError::Closing)
+        } else if Instant::now() >= deadline {
+            Err(TimeError::Expired)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn receive_loopback(
+        &self,
+        signed: &CommissionSigningTime,
+        mut pending: Reservation<'_>,
+        claim: TickCapture,
+        request: SignedRead,
+        deadline: Instant,
+    ) -> Result<ReadBody, TimeError> {
+        let work = async {
+            self.check_read_deadline(deadline)?;
             let mut sending = std::pin::pin!(request.execute());
             let mut mark = None;
             let mut response = std::future::poll_fn(|cx| {
@@ -191,7 +305,7 @@ impl ClockOwner {
                     return Poll::Ready(Err(TimeError::Expired));
                 }
                 let polled = if mark.is_none() {
-                    self.poll_account_first(signed, pending, claim, deadline, || {
+                    self.poll_read_first(signed, &mut pending, claim, deadline, || {
                         sending.as_mut().poll(cx)
                     })
                     .map(|(admitted, result)| {
@@ -208,7 +322,8 @@ impl ClockOwner {
             })
             .await?;
             let mark = mark.ok_or(TimeError::Resource)?;
-            if response.status() != reqwest::StatusCode::OK {
+            let status = response.status().as_u16();
+            if matches!(&pending, Reservation::Inventory(_)) && status != 200 {
                 return Err(TimeError::Venue);
             }
             let mut body = Vec::new();
@@ -229,31 +344,7 @@ impl ClockOwner {
             if Instant::now() >= deadline {
                 return Err(TimeError::Expired);
             }
-            let body = inventory_loopback::decode(read, &body).map_err(|_| TimeError::Payload)?;
-            if body.read() != read {
-                return Err(TimeError::Venue);
-            }
-            if let InventoryBody::Account(account) = &body {
-                if account.uid != LOOPBACK_UID {
-                    return Err(TimeError::Venue);
-                }
-            }
-            if Instant::now() >= deadline || self.cancel.is_cancelled() {
-                return Err(if self.cancel.is_cancelled() {
-                    TimeError::Closing
-                } else {
-                    TimeError::Expired
-                });
-            }
-            Ok(AccountReceipt {
-                read,
-                generation: mark.generation,
-                sample: mark.sample,
-                send: mark.raw,
-                handoff: mark.handoff,
-                receive,
-                body,
-            })
+            Ok(ReadBody { status, body, mark, receive })
         };
         tokio::select! {
             biased;

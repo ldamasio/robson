@@ -218,6 +218,29 @@ pub(super) fn parse_json<T: DeserializeOwned>(what: &str, body: &str) -> Result<
     serde_json::from_str(body).map_err(|e| SpotReadError::Parse(format!("{what}: {e}")))
 }
 
+pub(super) fn parse_checked_order(
+    body: &str,
+    pair: &str,
+    by: &SpotOrderRef,
+) -> Result<SpotOrderRecord, SpotReadError> {
+    let order = records::parse_order(body)?;
+    if order.symbol != pair {
+        return Err(SpotReadError::Inconsistent(format!(
+            "order lookup on {pair} answered order {} on {}",
+            order.order_id, order.symbol
+        )));
+    }
+    if let SpotOrderRef::OrderId(order_id) = by {
+        if order.order_id != *order_id {
+            return Err(SpotReadError::Inconsistent(format!(
+                "order lookup for {order_id} answered order {}",
+                order.order_id
+            )));
+        }
+    }
+    Ok(order)
+}
+
 /// The spot REST read side: typed reads, no mutation, no port.
 pub struct SpotRestReader {
     client: Arc<BinanceRestClient>,
@@ -331,22 +354,7 @@ impl SpotRestReader {
             SpotOrderRef::ClientOrderId(client_id) => ("origClientOrderId", client_id.clone()),
         };
         let body = self.read(SpotRead::ORDER, vec![("symbol", pair.clone()), id]).await?;
-        let order = records::parse_order(&body)?;
-        if order.symbol != pair {
-            return Err(SpotReadError::Inconsistent(format!(
-                "order lookup on {pair} answered order {} on {}",
-                order.order_id, order.symbol
-            )));
-        }
-        if let SpotOrderRef::OrderId(order_id) = by {
-            if order.order_id != *order_id {
-                return Err(SpotReadError::Inconsistent(format!(
-                    "order lookup for {order_id} answered order {}",
-                    order.order_id
-                )));
-            }
-        }
-        Ok(order)
+        parse_checked_order(&body, &pair, by)
     }
 
     /// Trades on `symbol` for `query`, at most [`MY_TRADES_MAX_PAGES`] pages
