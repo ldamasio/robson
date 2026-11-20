@@ -239,40 +239,40 @@ proptest! {
     }
 
     #[test]
-    fn any_arrival_order_of_fills_reaches_the_same_final_fee(
+    fn any_arrival_order_of_fills_and_terminal_reaches_the_same_final_fee(
         fills in proptest::collection::vec((1i64..=1_000_000, 0i64..=1_000), 1..8),
         rotate in 0usize..8,
+        terminal_a in 0usize..=8,
+        terminal_b in 0usize..=8,
     ) {
-        // Fills arrive in any order and any page split; only the complete set
-        // corroborates, and its totals do not depend on the order.
-        let gross: i64 = fills.iter().map(|fill| fill.0).sum();
+        // Fills arrive in any order and any page split, and the terminal
+        // record before, between or after them; only the complete set after
+        // a terminal record corroborates, and its totals do not depend on
+        // the order.
         let mut order = fills.clone();
         order.rotate_left(rotate % fills.len());
         let mut decided = Vec::new();
-        for arrangement in [&fills, &order] {
-            let mut seen = Decimal::ZERO;
-            let mut fee = Decimal::ZERO;
-            for (index, (qty, commission)) in arrangement.iter().enumerate() {
-                seen += scaled(i128::from(*qty), 8);
-                fee += scaled(i128::from(*commission), 8);
-                let mut input = input();
-                let partition = input.partition.as_mut().unwrap();
-                partition.gross = scaled(i128::from(gross), 8);
-                partition.base_fee = Decimal::ZERO;
-                partition.executable = scaled(i128::from(gross) / 100_000 * 100_000, 8);
-                let entry = input.entry.as_mut().unwrap();
-                entry.executed_cum = partition.gross;
-                entry.fills_qty = seen;
-                input.totals = EntryFillTotals {
-                    fills: index as i64 + 1,
-                    qty: seen,
-                    quote: dec!(100000.00),
-                    base_commission: fee,
-                    non_base_fills: 0,
-                };
-                let plan = plan_entry_fee(&input).unwrap();
-                if index + 1 < arrangement.len() {
-                    prop_assert_eq!(plan, EntryFeePlan::NotReady(EntryFeePending::FillsIncomplete));
+        for (arrangement, terminal_at) in [(&fills, terminal_a), (&order, terminal_b)] {
+            let terminal_at = terminal_at.min(arrangement.len());
+            let events = arrangement.len() + 1;
+            let (mut seen, mut fee, mut count, mut terminal) = (0, 0, 0, false);
+            for event in 0..events {
+                if event == terminal_at {
+                    terminal = true;
+                } else {
+                    let (qty, commission) = arrangement[count];
+                    seen += qty;
+                    fee += commission;
+                    count += 1;
+                }
+                let plan = plan_entry_fee(&arrival(&fills, seen, fee, count, terminal)).unwrap();
+                if event + 1 < events {
+                    let pending = if terminal {
+                        EntryFeePending::FillsIncomplete
+                    } else {
+                        EntryFeePending::NoPartition
+                    };
+                    prop_assert_eq!(plan, EntryFeePlan::NotReady(pending));
                 } else {
                     decided.push(plan);
                 }
@@ -283,4 +283,60 @@ proptest! {
             matches!(decided[0], EntryFeePlan::Finalize { .. } | EntryFeePlan::Held(_));
         prop_assert!(decided_or_held);
     }
+}
+
+/// One read after some fills and, maybe, the terminal record. EP-1 records
+/// the partition only at the terminal record (step 0.001 = 100,000 units).
+fn arrival(
+    fills: &[(i64, i64)],
+    seen: i64,
+    fee: i64,
+    count: usize,
+    terminal: bool,
+) -> EntryFeeInput {
+    let gross: i64 = fills.iter().map(|fill| fill.0).sum();
+    let mut input = input();
+    input.partition = terminal.then(|| LegPartition {
+        gross: scaled(i128::from(gross), 8),
+        cost: dec!(100000.00),
+        base_fee: Decimal::ZERO,
+        base_fee_final: false,
+        executable: scaled(i128::from(gross) / 100_000 * 100_000, 8),
+    });
+    input.entry = Some(EntryOrderFacts {
+        phase: if terminal {
+            OrderPhase::Terminal
+        } else {
+            OrderPhase::Live
+        },
+        executed_cum: scaled(i128::from(if terminal { gross } else { seen }), 8),
+        cumulative_quote: Some(dec!(100000.00)),
+        fills_qty: scaled(i128::from(seen), 8),
+    });
+    input.totals = EntryFillTotals {
+        fills: count as i64,
+        qty: scaled(i128::from(seen), 8),
+        quote: dec!(100000.00),
+        base_commission: scaled(i128::from(fee), 8),
+        non_base_fills: 0,
+    };
+    input
+}
+
+#[test]
+fn an_unrepresentable_reduction_refuses_and_is_never_rounded() {
+    // Corroborated Q = 10 and B = 10⁻²⁸: exact Q − B needs 29 digits.
+    let tiny = Decimal::from_i128_with_scale(1, 28);
+    let mut input = input();
+    input.lot_step = Decimal::ONE;
+    let partition = input.partition.as_mut().unwrap();
+    partition.gross = Decimal::TEN;
+    partition.base_fee = Decimal::ZERO;
+    partition.executable = dec!(9);
+    let entry = input.entry.as_mut().unwrap();
+    entry.executed_cum = Decimal::TEN;
+    entry.fills_qty = Decimal::TEN;
+    input.totals.qty = Decimal::TEN;
+    input.totals.base_commission = tiny;
+    assert_eq!(plan_entry_fee(&input), Err(LedgerError::Unrepresentable));
 }

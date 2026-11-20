@@ -305,25 +305,55 @@ async fn entry_fee_is_independent_of_arrival_order(pool: PgPool) -> Result<()> {
     ensure!(ledger.finalize_entry_fee(terminal_first.position, BASE).await? == done);
 
     // A live entry's first fill, the terminal record, then the last fill.
+    let interleaved = Fixture::new(&pool).await;
+    let ledger = interleaved.ledger(&pool);
+    let link = entry_link(&interleaved);
+    let live = entry(&interleaved, dec!(0.6), dec!(60000.00), false);
+    ensure!(ledger.record_order(&live, &link, later(1)).await?.changed);
+    let key = interleaved.key(ENTRY);
+    let first = page(vec![first_fill.clone()]);
+    ensure!(ledger.record_trades(&key, &first, at()).await?.changed);
+    let unfilled = EntryFeePlan::NotReady(EntryFeePending::NoPartition);
+    ensure!(ledger.finalize_entry_fee(interleaved.position, BASE).await? == unfilled);
+    let terminal = entry(&interleaved, dec!(1.00000000), dec!(100000.00), true);
+    ensure!(ledger.record_order(&terminal, &link, later(2)).await?.changed);
+    ensure!(ledger.finalize_entry_fee(interleaved.position, BASE).await? == incomplete);
+    let last = page(vec![second_fill.clone()]);
+    ensure!(ledger.record_trades(&key, &last, at()).await?.changed);
+    ensure!(ledger.finalize_entry_fee(interleaved.position, BASE).await? == done);
+
+    // Every fill on the live entry, then the terminal record.
     let fills_first = Fixture::new(&pool).await;
     let ledger = fills_first.ledger(&pool);
     let link = entry_link(&fills_first);
-    let live = entry(&fills_first, dec!(0.6), dec!(60000.00), false);
-    ensure!(ledger.record_order(&live, &link, later(1)).await?.changed);
+    let wide = |terminal: bool| VenueOrderRecord {
+        orig_qty: dec!(2),
+        status: if terminal {
+            "EXPIRED"
+        } else {
+            "PARTIALLY_FILLED"
+        }
+        .into(),
+        ..entry(&fills_first, dec!(1.00000000), dec!(100000.00), terminal)
+    };
+    ensure!(ledger.record_order(&wide(false), &link, later(1)).await?.changed);
     let key = fills_first.key(ENTRY);
-    ensure!(ledger.record_trades(&key, &page(vec![first_fill]), at()).await?.changed);
-    let unfilled = EntryFeePlan::NotReady(EntryFeePending::NoPartition);
+    ensure!(
+        ledger
+            .record_trades(&key, &page(vec![first_fill, second_fill]), at())
+            .await?
+            .changed
+    );
     ensure!(ledger.finalize_entry_fee(fills_first.position, BASE).await? == unfilled);
-    let terminal = entry(&fills_first, dec!(1.00000000), dec!(100000.00), true);
-    ensure!(ledger.record_order(&terminal, &link, later(2)).await?.changed);
-    ensure!(ledger.finalize_entry_fee(fills_first.position, BASE).await? == incomplete);
-    ensure!(ledger.record_trades(&key, &page(vec![second_fill]), at()).await?.changed);
+    ensure!(ledger.record_order(&wide(true), &link, later(2)).await?.changed);
     ensure!(ledger.finalize_entry_fee(fills_first.position, BASE).await? == done);
 
     let one = leg_row(&pool, &terminal_first).await?;
-    let other = leg_row(&pool, &fills_first).await?;
-    ensure!(one == other && one.0.is_some_and(|p| p.base_fee_final), "{one:?} {other:?}");
-    println!("EP2_ORDER terminal_first=fills_first final=B0.0015:X0.998");
+    for other in [&interleaved, &fills_first] {
+        let other = leg_row(&pool, other).await?;
+        ensure!(one == other && one.0.is_some_and(|p| p.base_fee_final), "{one:?} {other:?}");
+    }
+    println!("EP2_ORDER terminal_first=interleaved=fills_first final=B0.0015:X0.998");
     Ok(())
 }
 
@@ -391,6 +421,40 @@ async fn entry_fee_is_frozen_and_guarded(pool: PgPool) -> Result<()> {
     ensure!(snapshot(&pool).await == before, "j changed rows");
     // (k) The production statement with a stale request, under the accounting
     // row: identical values would pass M36, so only the compare-and-set refuses.
+    let refused = write_under_lock(&pool, &ledger, &f, &provisional).await?;
+    ensure!(refused_by_cas(&refused), "k: {refused:?}");
+    ensure!(snapshot(&pool).await == before, "k changed rows");
+
+    // The writer never takes C from the fills: a request carrying the fills'
+    // quote instead of the recorded C is refused by the compare-and-set
+    // itself, before M36 would see a changed C.
+    let f = Fixture::new(&pool).await;
+    let ledger = f.ledger(&pool);
+    let terminal = entry(&f, dec!(1.00000000), dec!(100000.00), true);
+    ensure!(ledger.record_order(&terminal, &entry_link(&f), later(1)).await?.changed);
+    let fills = page(vec![
+        fill(1, dec!(0.6), dec!(60000.00), dec!(0.0009), BASE),
+        fill(2, dec!(0.4), dec!(39999.00), dec!(0.0006), BASE),
+    ]);
+    ensure!(ledger.record_trades(&f.key(ENTRY), &fills, at()).await?.changed);
+    let recorded = leg_row(&pool, &f).await?.0.context("mismatched partition")?;
+    let before = snapshot(&pool).await;
+    let from_fills = LegPartition { cost: dec!(99999.00), ..recorded };
+    let refused = write_under_lock(&pool, &ledger, &f, &from_fills).await?;
+    ensure!(refused_by_cas(&refused), "cost: {refused:?}");
+    ensure!(snapshot(&pool).await == before, "cost control changed rows");
+    println!("EP2_FROZEN j=23514x2 k=zero_rows cost_from_fills=zero_rows rows=unchanged");
+    Ok(())
+}
+
+/// The real write helper under a held accounting row, then rolled back: one
+/// statement, whose result is returned.
+async fn write_under_lock(
+    pool: &PgPool,
+    ledger: &PgVenueLedger,
+    f: &Fixture,
+    prior: &LegPartition,
+) -> Result<Result<(), LedgerError>> {
     let mut connection = pool.acquire().await?;
     let mut tx = connection.begin().await?;
     ledger.timeouts(&mut tx).await?;
@@ -403,23 +467,14 @@ async fn entry_fee_is_frozen_and_guarded(pool: PgPool) -> Result<()> {
     ensure!(bumped.rows_affected() == 1);
     let count = ledger.statements_total();
     let venue = support::venue();
-    let refused = ledger
-        .write_entry_fee(
-            &mut tx,
-            f.position,
-            venue.as_str(),
-            &provisional,
-            dec!(0.0015),
-            dec!(0.998),
-        )
+    let written = ledger
+        .write_entry_fee(&mut tx, f.position, venue.as_str(), prior, dec!(0.0015), dec!(0.998))
         .await;
-    ensure!(
-        matches!(&refused, Err(LedgerError::Invariant(reason)) if reason.contains("compare-and-set")),
-        "k: {refused:?}"
-    );
     ensure!(ledger.statements_total() - count == 1);
     tx.rollback().await?;
-    ensure!(snapshot(&pool).await == before, "k changed rows");
-    println!("EP2_FROZEN j=23514x2 k=zero_rows rows=unchanged");
-    Ok(())
+    Ok(written)
+}
+
+fn refused_by_cas(result: &Result<(), LedgerError>) -> bool {
+    matches!(result, Err(LedgerError::Invariant(reason)) if reason.contains("compare-and-set"))
 }
