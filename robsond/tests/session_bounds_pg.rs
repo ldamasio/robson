@@ -173,7 +173,11 @@ fn entry_filled(tenant: Uuid, position_id: Uuid, at: DateTime<Utc>) -> EventEnve
         "invalidation_guard_level": null,
         "timestamp": at,
     });
-    envelope(tenant, "entry_filled", payload, at)
+    // After the inserted row's `last_seq` of 1: the handler's UPDATE only
+    // touches a row with an older `last_seq`.
+    let mut envelope = envelope(tenant, "entry_filled", payload, at);
+    envelope.seq = 2;
+    envelope
 }
 
 async fn insert_position(pool: &PgPool, tenant: Uuid) -> Uuid {
@@ -458,7 +462,22 @@ async fn t2g_projector_position_handler_waits_end_at_the_lock_bound(pool: PgPool
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(state, "entering");
+    assert_eq!(state, "entering", "nothing written by the refused handler");
+    // Without the holder the same handler goes through: the wait above was on
+    // the row it writes.
+    robson_projector::apply_event_to_projections(
+        &root,
+        &entry_filled(tenant, position_id, Utc::now()),
+    )
+    .await
+    .unwrap();
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM positions_current WHERE position_id = $1")
+            .bind(position_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "active");
 }
 
 #[sqlx::test(migrations = "../migrations")]
