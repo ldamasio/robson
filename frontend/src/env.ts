@@ -8,7 +8,47 @@ export const variables = defineEnvVars({
     static: false,
     schema: (value: string | undefined) => value ?? ''
   },
-  PUBLIC_GOOGLE_WEB_CLIENT_ID: {
+  PUBLIC_ROBSON_WEB_AUTH_MODE: {
+    public: true,
+    static: false,
+    schema: (value: string | undefined) => value ?? ''
+  },
+  PUBLIC_RBX_BFF_LOGIN_URL: {
+    public: true,
+    static: false,
+    schema: (value: string | undefined) => value ?? ''
+  },
+  PUBLIC_RBX_OIDC_ISSUER: {
+    public: true,
+    static: false,
+    schema: (value: string | undefined) => value ?? ''
+  },
+  PUBLIC_RBX_OIDC_CLIENT_ID: {
+    public: true,
+    static: false,
+    schema: (value: string | undefined) => value ?? ''
+  },
+  PUBLIC_RBX_OIDC_REDIRECT_URI: {
+    public: true,
+    static: false,
+    schema: (value: string | undefined) => value ?? ''
+  },
+  PUBLIC_RBX_OIDC_SCOPES: {
+    public: true,
+    static: false,
+    schema: (value: string | undefined) => value ?? ''
+  },
+  PUBLIC_RBX_OIDC_ORG_ID: {
+    public: true,
+    static: false,
+    schema: (value: string | undefined) => value ?? ''
+  },
+  PUBLIC_RBX_OIDC_PROJECT_ID: {
+    public: true,
+    static: false,
+    schema: (value: string | undefined) => value ?? ''
+  },
+  PUBLIC_RBX_OIDC_GOOGLE_IDP_ID: {
     public: true,
     static: false,
     schema: (value: string | undefined) => value ?? ''
