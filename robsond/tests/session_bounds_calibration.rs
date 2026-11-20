@@ -52,7 +52,8 @@ async fn c1_seed() {
     sqlx::migrate!("../migrations").run(&pool).await.unwrap();
     let started = Instant::now();
     let statements = [
-        // Eleven past months, so 1,000,000 events spread over 12 partitions.
+        // Eleven past months and the current one: 1,000,000 events spread
+        // evenly from the start of the eleventh month back until now.
         r#"DO $$ DECLARE i int; m timestamp; BEGIN
            FOR i IN 1..11 LOOP
              m := date_trunc('month', (now() AT TIME ZONE 'UTC') - make_interval(months => i));
@@ -64,15 +65,17 @@ async fn c1_seed() {
                   (ARRAY['query_state_changed','entry_signal_received','trailing_stop_updated'])[1 + g % 3],
                   jsonb_build_object('n', g), t.ts, t.ts, 'c1-acct-' || g
            FROM generate_series(1, 200000) g,
-                LATERAL (SELECT (date_trunc('month', now() AT TIME ZONE 'UTC') - interval '11 months') AT TIME ZONE 'UTC'
-                                + (g % 28800) * interval '15 minutes' AS ts) t"#,
+                LATERAL (SELECT s.start AT TIME ZONE 'UTC'
+                                + (g % 28800) * ((now() AT TIME ZONE 'UTC') - s.start) / 28800 AS ts
+                         FROM (SELECT date_trunc('month', now() AT TIME ZONE 'UTC') - interval '11 months' AS start) s) t"#,
         r#"INSERT INTO event_log (tenant_id, stream_key, seq, event_type, payload, occurred_at, ingested_at, idempotency_key)
            SELECT $1, 'position:' || md5('c1-position-' || (g % 10000))::uuid, g / 10000 + 1,
                   (ARRAY['entry_filled','trailing_stop_updated','favorable_extreme_advanced','position_closed'])[1 + (g / 10000) % 4],
                   jsonb_build_object('n', g), t.ts, t.ts, 'c1-pos-' || g
            FROM generate_series(0, 799999) g,
-                LATERAL (SELECT (date_trunc('month', now() AT TIME ZONE 'UTC') - interval '11 months') AT TIME ZONE 'UTC'
-                                + (g % 28800) * interval '15 minutes' AS ts) t"#,
+                LATERAL (SELECT s.start AT TIME ZONE 'UTC'
+                                + (g % 28800) * ((now() AT TIME ZONE 'UTC') - s.start) / 28800 AS ts
+                         FROM (SELECT date_trunc('month', now() AT TIME ZONE 'UTC') - interval '11 months' AS start) s) t"#,
         r#"INSERT INTO stream_state (stream_key, tenant_id, last_seq)
            SELECT stream_key, $1, max(seq) FROM event_log WHERE tenant_id = $1 GROUP BY stream_key"#,
         r#"INSERT INTO positions_current (position_id, tenant_id, account_id, symbol, side, state,
@@ -140,6 +143,16 @@ async fn c1_seed() {
     .unwrap();
     eprintln!("C1_SEED counts={counts:?} seconds={:.1}", started.elapsed().as_secs_f64());
     assert_eq!(counts, (1_000_000, 10_000, 100_000, 100_000, 10_000, 10_000, 2_000));
+    let months: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT to_char(date_trunc('month', occurred_at AT TIME ZONE 'UTC'), 'YYYY_MM'), count(*) \
+         FROM event_log GROUP BY 1 ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    eprintln!("C1_SEED event_log months={months:?}");
+    assert_eq!(months.len(), 12, "events in twelve monthly partitions");
+    assert!(months.iter().all(|(_, n)| *n > 0));
 }
 
 struct Recorder {
