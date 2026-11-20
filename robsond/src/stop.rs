@@ -410,6 +410,7 @@ pub(crate) async fn run_stop_with_clock(
         clock.begin_closing();
     }
     gate.begin_closing();
+    info!(draining_ms = draining.as_millis(), "Stop: closing");
     close();
     let joined = match clock {
         Some(clock) => clock.join(deadline).await,
@@ -596,6 +597,52 @@ mod tests {
         assert_eq!((report.result, report.marker), (StopResult::Clean, MarkerWrite::Written));
         assert_eq!(marker.marked.load(Ordering::SeqCst), 1);
         assert_eq!(report.draining, Duration::ZERO);
+    }
+
+    /// The clock-aware stop keeps the plain stop's closing log, part of the
+    /// shutdown evidence the operator reads.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(start_paused = true)]
+    async fn both_stop_paths_log_the_closing_phase() {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for clock_aware in [false, true] {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let (_backend, journal) = stub_journal();
+            if clock_aware {
+                run_stop_with_clock(
+                    &journal,
+                    Instant::now(),
+                    || {},
+                    None,
+                    None,
+                    StopTimings::default(),
+                )
+                .await;
+            } else {
+                run_stop(&journal, Instant::now(), || {}, None, StopTimings::default()).await;
+            }
+            let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                text.contains("Stop: closing") && text.contains("draining_ms=0"),
+                "clock_aware={clock_aware}: {text}"
+            );
+        }
     }
 
     /// An idle daemon: Draining ends at once, nothing to flush, epoch marked.
