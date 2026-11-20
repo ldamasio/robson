@@ -19,6 +19,9 @@ mod c8_account_http;
 #[path = "c8_attribution.rs"]
 mod c8_attribution;
 
+#[path = "pg_tests/restart_lookup.rs"]
+pub(super) mod restart_lookup;
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Result<()> {

@@ -21,6 +21,11 @@ mod support;
 use support::{at, seen, snapshot, Fixture, SYMBOL};
 
 async fn setup(pool: &PgPool) -> Result<Fixture> {
+    setup_tables(pool).await?;
+    Ok(Fixture::new(pool).await)
+}
+
+async fn setup_tables(pool: &PgPool) -> Result<()> {
     let options = pool.connect_options();
     let mut addresses = tokio::net::lookup_host((options.get_host(), options.get_port())).await?;
     ensure!(addresses.next().is_some_and(|address| address.ip().is_loopback()));
@@ -31,7 +36,7 @@ async fn setup(pool: &PgPool) -> Result<Fixture> {
     sqlx::raw_sql(include_str!("../spot_order_set_reference_pg/cancel_shadow.sql"))
         .execute(pool)
         .await?;
-    Ok(Fixture::new(pool).await)
+    Ok(())
 }
 
 async fn journal(
@@ -1101,3 +1106,7 @@ async fn projected_native_order_checks_old_counts_even_with_zero_or_positive_net
 
 #[path = "plan_skew.rs"]
 mod plan_skew;
+
+#[cfg(feature = "crash-points")]
+#[path = "restart.rs"]
+mod restart;
