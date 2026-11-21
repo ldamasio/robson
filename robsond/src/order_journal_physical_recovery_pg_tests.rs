@@ -581,7 +581,7 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
 
 #[cfg(feature = "crash-points")]
 #[sqlx::test(migrations = false)]
-#[ignore = "requires dedicated physical PG16 no-capital controller"]
+#[ignore = "requires dedicated physical controller: the PG16 no-capital rehearsal"]
 async fn physical_spot_no_capital_rehearsal(pool: PgPool) -> Result<()> {
     physical_spot_restore(pool, true).await
 }

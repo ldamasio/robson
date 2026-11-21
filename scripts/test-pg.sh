@@ -143,6 +143,7 @@ SUITE="bounded_migration::public_pg::"
 CARGO=(cargo test --workspace --exclude robson-connectors --features postgres --no-fail-fast)
 CONTROLLER_TESTS=(
     physical_spot_writer_survives_exact_native_restore
+    physical_spot_no_capital_rehearsal
 )
 SKIP_CONTROLLER=()
 for name in "${CONTROLLER_TESTS[@]}"; do
