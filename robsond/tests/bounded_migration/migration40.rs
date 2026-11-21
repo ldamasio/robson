@@ -483,7 +483,11 @@ async fn fault(pool: PgPool, case: Fault) -> Result<()> {
         let baseline = f.baseline_statements;
         let apply = f.adapter.apply(migration());
         let alter_restore = async {
-            hit.await?;
+            // An apply that fails before the restore stage fails this case
+            // instead of hanging it (as migrations 46 to 50).
+            timeout(CONTROLLER_CEILING, hit)
+                .await
+                .map_err(|_| anyhow::anyhow!("the apply never reached its restore stage"))??;
             assert_eq!(proxy.stats().statements - baseline, 6);
             if case == Fault::RestoreSever {
                 let closed = proxy.closed_relays();

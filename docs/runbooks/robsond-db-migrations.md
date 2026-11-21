@@ -468,13 +468,16 @@ instead of waiting.
 The adapter applies each file like 40, in 7 operations on its dedicated raw
 connection: settings install, SQLx's own unmodified apply (BEGIN, the `DO`
 statement, the `_sqlx_migrations` INSERT, COMMIT, the `execution_time`
-UPDATE), and the settings restore, under the same statement, lock and
-idle-in-transaction timeouts, whole-apply bound and connection and
-advisory-lock bounds as 39. A lock wait longer than the lock timeout fails
-with `55P03` and fails the `robsond-db-migrate` hook. Only the exact embedded
-file of each version is applied; any other source of one of these versions
-is refused before any SQL (`migration46 contract mismatch` to `migration50
-contract mismatch`). SQLx applies them strictly in version order, after 45.
+UPDATE), and the settings restore, under the same 1 s statement, 200 ms lock
+and 1 s idle-in-transaction timeouts, the 15 s whole-apply bound per
+migration and the 5 s connection and advisory-lock bounds as 39. A lock wait
+longer than 200 ms fails with `55P03` and fails the `robsond-db-migrate`
+hook. Each `DO` block is one statement, so all of its DDL must finish within
+the 1 s statement timeout; a slower apply fails with `57014` and rolls back
+that migration. Only the exact embedded file of each version is applied; any
+other source of one of these versions is refused before any SQL
+(`migration46 contract mismatch` to `migration50 contract mismatch`). SQLx
+applies them strictly in version order, after 45.
 
 ### Rollback boundary
 
@@ -492,8 +495,9 @@ and their triggers only guard the new tables.
 
 ### Failure outcomes
 
-Those of migration 39 above, applied to each version. A `55P03` lock timeout
-or a lost answer is reported as `MayHaveCommitted`: wait for the failed
+Those of migration 39 above, applied to each version. A `55P03` lock timeout,
+a `57014` statement timeout or a lost answer is reported as
+`MayHaveCommitted`: wait for the failed
 backend to be gone, rerun `robsond db migrate` after the conflicting
 transaction on the locked table has finished, and confirm every version with
 the query below. After a successful rerun all five rows are present with

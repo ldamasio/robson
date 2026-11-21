@@ -38,11 +38,6 @@ const PRESENT: &str = "SELECT count(*) FILTER (WHERE CASE k
         WHEN 'function' THEN to_regprocedure(n) IS NOT NULL
         ELSE EXISTS(SELECT 1 FROM pg_trigger WHERE tgname=n AND NOT tgisinternal) END)
     FROM unnest($1::text[],$2::text[]) AS o(k,n)";
-/// A raw-dropped backend may still finish a statement under this lineage's
-/// 40 ms statement_timeout; composed with main's bounds this becomes
-/// NATIVE_RETIREMENT, as for migration 40.
-const RETIREMENT: Duration = Duration::from_millis(350);
-
 type MigrationRow = (i64, String, String, bool, Vec<u8>, i64);
 type AdvisoryKey = (i64, i64);
 
@@ -108,8 +103,8 @@ fn objects(version: i64) -> &'static [(&'static str, &'static str)] {
 /// The referenced table a holder locks so that the version's DO must wait:
 /// existing tables and S8-4's own earlier ones, each locked by the DO's first
 /// table, so the lock wait starts before the DO spends its statement bound
-/// (49's dust_ledger locks balance_legs only after a whole table, which on
-/// this lineage's 40 ms bound races the 20 ms lock timeout).
+/// (49's dust_ledger locks balance_legs only after a whole table; the lock
+/// wait then ends at the 200 ms lock timeout, inside the 1 s statement bound).
 fn parent(version: i64) -> &'static str {
     match version {
         VERSION46 => "clock_samples",
@@ -160,11 +155,10 @@ async fn install_through(pool: &PgPool, version: i64) -> Result<()> {
     Ok(())
 }
 
-/// `run_direct` on a fresh bounded adapter. On this lineage's 40 ms
-/// statement bound a fixture DO can exceed the bound under host load
-/// (57014, MayHaveCommitted); the runbook's answer, a rerun that skips what
-/// landed, is applied at most twice and reported. The subject of each test
-/// is never retried.
+/// `run_direct` on a fresh bounded adapter. A fixture DO can still exceed
+/// the 1 s statement bound under host load (57014, MayHaveCommitted); the
+/// runbook's answer, a rerun that skips what landed, is applied at most twice
+/// and reported. The subject of each test is never retried.
 async fn bounded_install(pool: &PgPool, inventory: &Migrator) -> Result<()> {
     let options = pool.connect_options();
     for run in 1..=3 {
@@ -312,7 +306,9 @@ impl Fixture {
         } = self;
         let before = proxy.stats().statements;
         drop(adapter);
-        timeout(RETIREMENT, async {
+        // The raw-dropped backend may still finish a statement under the 1 s
+        // statement_timeout before it notices the closed socket.
+        timeout(NATIVE_RETIREMENT, async {
             loop {
                 let alive: bool = sqlx::query_scalar(EXACT_BACKEND)
                     .bind(pid)
@@ -484,7 +480,7 @@ async fn fault(pool: PgPool, version: i64, case: Fault) -> Result<()> {
         let alter_restore = async {
             // An apply that fails before the restore stage (a DO over the
             // statement bound, say) fails this case instead of hanging it.
-            timeout(APPLY_BOUND + Duration::from_secs(1), hit)
+            timeout(CONTROLLER_CEILING, hit)
                 .await
                 .context("the apply never reached its restore stage")??;
             ensure!(proxy.stats().statements - baseline == 6);
