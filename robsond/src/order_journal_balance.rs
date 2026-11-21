@@ -135,8 +135,20 @@ impl PgJournalBackend {
         let Some(balance) = &batch.balance else {
             return Ok(());
         };
+        self.prepare_accounting_write(&batch.intent.venue_id, balance.commit_bound, tx, started)
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn prepare_accounting_write(
+        &self,
+        venue_id: &str,
+        commit_bound: Duration,
+        tx: &mut Transaction<'_, Postgres>,
+        started: Instant,
+    ) -> Result<i64, CommitFailure> {
         let timeout =
-            format!("{}ms", statement_budget(balance.commit_bound, started.elapsed())?.as_millis());
+            format!("{}ms", statement_budget(commit_bound, started.elapsed())?.as_millis());
         sqlx::query(BOUNDS)
             .bind(timeout)
             .execute(&mut **tx)
@@ -147,13 +159,12 @@ impl PgJournalBackend {
             .map_err(known)?;
         let version = sqlx::query_scalar::<_, i64>(
             "UPDATE accounting_state SET version = version + 1 WHERE tenant_id = $1 AND venue_id = $2 RETURNING version",
-        ).bind(self.tenant_id).bind(&batch.intent.venue_id).fetch_optional(&mut **tx)
+        ).bind(self.tenant_id).bind(venue_id).fetch_optional(&mut **tx)
             .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
             .await.map_err(known)?;
-        if version.is_none() {
-            return Err(CommitFailure::Known("balance journal has no accounting row".to_string()));
-        }
-        Ok(())
+        version.ok_or_else(|| {
+            CommitFailure::Known("balance journal has no accounting row".to_string())
+        })
     }
 
     pub(super) async fn write_balance(

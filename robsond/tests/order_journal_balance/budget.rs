@@ -117,10 +117,9 @@ async fn two_lock_waits_still_reach_the_outer_uncertain_deadline(pool: PgPool) {
     seed_account(&pool, tenant, SPOT).await;
     let batch = balance_batch("two-waits", IntentKind::Exit);
     let backend = Arc::new(PgJournalBackend::new(&pool, tenant));
-    // The legacy row exists; the balance attempt will first wait on accounting,
-    // then on the intent row, as a release-like transaction can hold it.
+    // The intent already exists. The balance attempt waits on accounting,
+    // then on the intent row held by a release-like transaction.
     let mut seeded = batch.clone();
-    seeded.balance = None;
     seeded.attempts.clear();
     backend.commit(&seeded).await.unwrap();
     let mut account = pool.begin().await.unwrap();

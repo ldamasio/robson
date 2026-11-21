@@ -10,6 +10,12 @@ use std::time::{Duration, Instant};
 mod balance;
 #[path = "order_journal_readiness.rs"]
 mod readiness;
+#[allow(
+    dead_code,
+    reason = "local atomic storage primitive awaiting bounded Spot owner"
+)]
+#[path = "order_journal_transition.rs"]
+mod transition;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -19,6 +25,7 @@ use robson_exec::{
         CommitFailure, JournalBackend, JournalBatch, ReleaseCounts, ReleaseRecord,
         StreamSuspensionRow, COMMIT_BOUND, RELEASE_BOUND,
     },
+    venue::VenueId,
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -259,6 +266,11 @@ impl JournalBackend for PgJournalBackend {
         let started = Instant::now();
         if batch.balance.is_some() {
             return Box::pin(self.commit_balance(batch, started)).await;
+        }
+        if batch.intent.venue_id == VenueId::BINANCE_SPOT {
+            return Err(CommitFailure::Known(
+                "Spot journal mutations require accounting-first storage".to_owned(),
+            ));
         }
         let known = |e: sqlx::Error| CommitFailure::Known(e.to_string());
         let connection = self.pool.acquire().await.map_err(known)?;

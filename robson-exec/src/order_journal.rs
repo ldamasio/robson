@@ -2644,8 +2644,9 @@ impl OrderJournal {
 
     /// Run `cancel` as its own intent, under a local id that never reaches the
     /// venue, and classify what it answered. The journal's wait is bounded.
-    /// A spent id on a balance journal withholds the cancel; other refusals
-    /// preserve the bounded send behaviour.
+    /// Spot cancels require the owned path. For other venues, a spent id on a
+    /// balance journal withholds the cancel; other refusals preserve the
+    /// bounded send behaviour.
     pub async fn journaled_cancel<F>(
         &self,
         position_id: Option<PositionId>,
@@ -2655,6 +2656,11 @@ impl OrderJournal {
     where
         F: Future<Output = Result<StopCancelOutcome, ExecError>>,
     {
+        if self.venue_id == VenueId::BINANCE_SPOT {
+            return CancelClass::Errored(
+                SendRefusal::NotSent("Spot cancel requires the owned path".to_owned()).into(),
+            );
+        }
         let intent = self.open_intent(IntentSpec {
             position_id,
             kind: IntentKind::Cancel,
@@ -2674,7 +2680,8 @@ impl OrderJournal {
         class
     }
 
-    /// An orphan sweep's cancel of the `ins-` order `order_id` (design §2.9):
+    /// Spot orphan cancels are withheld here. For other venues, an orphan
+    /// sweep's cancel of the `ins-` order `order_id` (design §2.9) is
     /// withheld with nothing written or sent while the veto holds, checked
     /// once before its journal write; otherwise journaled like any cancel and
     /// run as an orphan sweep's cancel, so the transport re-checks the veto at
@@ -2684,7 +2691,7 @@ impl OrderJournal {
     where
         F: Future<Output = Result<StopCancelOutcome, ExecError>>,
     {
-        if self.gate.orphan_cancel_vetoed() {
+        if self.venue_id == VenueId::BINANCE_SPOT || self.gate.orphan_cancel_vetoed() {
             return OrphanCancel::Withheld;
         }
         let intent = self.open_intent(IntentSpec {
@@ -4554,6 +4561,42 @@ mod tests {
             in_op(&journal, journal.journaled_cancel(None, "77", async { Ok(cancelled()) })).await;
         assert!(matches!(class, CancelClass::Cancelled { .. }));
         assert!(journal.latch_set());
+    }
+
+    #[tokio::test]
+    async fn generic_spot_cancel_wrappers_refuse_before_commit_or_poll() {
+        use std::cell::Cell;
+
+        for balance in [false, true] {
+            for fault in [None, Some(JournalFault::Known), Some(JournalFault::AckLost)] {
+                let backend = Arc::new(StubJournalBackend::default());
+                backend.set_fail_all(fault);
+                let journal = Arc::new(
+                    OrderJournal::new(backend.clone(), &VenueId::new(VenueId::BINANCE_SPOT))
+                        .with_balance_account(balance),
+                );
+                let polled = Cell::new(0);
+                let probe = || async {
+                    polled.set(polled.get() + 1);
+                    Ok(cancelled())
+                };
+                let (result, _op) =
+                    in_op(&journal, journal.journaled_cancel(Some(Uuid::now_v7()), "77", probe()))
+                        .await;
+                assert_eq!(polled.get(), 0, "generic Spot cancel polled its venue future");
+                assert!(
+                    matches!(result, CancelClass::Errored(ExecError::SendRefused(ref reason))
+                    if reason.contains("Spot cancel requires the owned path")),
+                    "{result:?}"
+                );
+
+                let (result, _op) =
+                    in_op(&journal, journal.journaled_orphan_cancel("77", probe())).await;
+                assert_eq!(polled.get(), 0, "generic Spot orphan cancel polled its venue future");
+                assert!(matches!(result, OrphanCancel::Withheld), "{result:?}");
+                assert!(backend.commits().is_empty(), "generic Spot cancel reached journal commit");
+            }
+        }
     }
     // ---- Permits (PR S) --------------------------------------------------
 

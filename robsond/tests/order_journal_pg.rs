@@ -16,6 +16,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use balance::{balance_batch, journal_on, row_counts, seed_account, version};
 use chrono::Utc;
 use proptest::{
     prelude::*,
@@ -1278,6 +1279,9 @@ async fn concurrent_orders_retries_and_lookups_survive_cancellation(pool: PgPool
 // spot.
 const SPOT_INDEX: &str = "idx_submit_attempts_one_per_spot_client_id";
 
+/// The raw canonical Spot shape. The backend refuses it unflagged, so Spot
+/// witnesses commit `balance_batch` on a seeded account; only a venue
+/// override (USD-M) may commit it with `balance: None`.
 fn spot_batch(id: &str) -> JournalBatch {
     let mut intent = intent_row(id);
     intent.venue_id = "binance:spot".into();
@@ -1331,8 +1335,10 @@ async fn the_one_attempt_index_has_its_full_definition(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn a_second_spot_attempt_is_an_id_spent_and_lands_nothing(pool: PgPool) {
-    let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
-    let first = spot_batch("spent");
+    let tenant = Uuid::now_v7();
+    seed_account(&pool, tenant, VenueId::BINANCE_SPOT).await;
+    let backend = PgJournalBackend::new(&pool, tenant);
+    let first = balance_batch("spent", IntentKind::Exit);
     backend.commit(&first).await.unwrap();
     let mut second = first.clone();
     second.attempts = vec![attempt_row(false)];
@@ -1343,29 +1349,33 @@ async fn a_second_spot_attempt_is_an_id_spent_and_lands_nothing(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(ids, [first.attempts[0].attempt_id]);
+    assert_eq!(row_counts(&pool, &["spot_intent_clock"]).await, [1]);
+    assert_eq!(version(&pool, tenant, VenueId::BINANCE_SPOT).await, 1);
 }
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn two_attempts_in_one_spot_batch_land_nothing(pool: PgPool) {
-    let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
-    let mut batch = spot_batch("two");
+    let tenant = Uuid::now_v7();
+    seed_account(&pool, tenant, VenueId::BINANCE_SPOT).await;
+    let backend = PgJournalBackend::new(&pool, tenant);
+    let mut batch = balance_batch("two", IntentKind::Exit);
     batch.attempts.push(attempt_row(false));
     assert_eq!(backend.commit(&batch).await, Err(CommitFailure::IdSpent));
-    let counts: (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT count(*) FROM order_intents),(SELECT count(*) FROM submit_attempts)",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(counts, (0, 0));
+    assert_eq!(
+        row_counts(&pool, &["order_intents", "submit_attempts", "spot_intent_clock"]).await,
+        [0, 0, 0]
+    );
+    assert_eq!(version(&pool, tenant, VenueId::BINANCE_SPOT).await, 0);
 }
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn a_spot_replay_converges_under_the_index(pool: PgPool) {
-    let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
-    let mut batch = spot_batch("replay");
+    let tenant = Uuid::now_v7();
+    seed_account(&pool, tenant, VenueId::BINANCE_SPOT).await;
+    let backend = PgJournalBackend::new(&pool, tenant);
+    let mut batch = balance_batch("replay", IntentKind::Exit);
     backend.commit(&batch).await.unwrap();
     backend.commit(&batch).await.unwrap();
     batch.attempts[0].rejected_at = Some(Utc::now());
@@ -1380,6 +1390,9 @@ async fn a_spot_replay_converges_under_the_index(pool: PgPool) {
 #[ignore = "requires DATABASE_URL"]
 async fn racing_spot_attempts_land_exactly_one(pool: PgPool) {
     spot_attempt_race(&pool, true).await;
+    // The shared accounting row serializes the flagged writers above, so
+    // the index's own concurrent conflict is witnessed natively here.
+    native_spot_index_race(&pool).await;
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -1391,10 +1404,10 @@ async fn racing_full_spot_transactions_land_exactly_one(pool: PgPool) {
 // A concurrency schedule starts after connection establishment, as daemon
 // startup does. Keep the production 250 ms acquisition bound unchanged: cold
 // CI connections must not substitute for the index race being tested.
-async fn prepare_spot_race_workers(pool: &PgPool, count: usize) -> Vec<PgJournalBackend> {
-    let mut workers = Vec::with_capacity(count);
-    for _ in 0..count {
-        let backend = PgJournalBackend::new(pool, Uuid::now_v7());
+async fn prepare_spot_race_workers(pool: &PgPool, tenants: &[Uuid]) -> Vec<PgJournalBackend> {
+    let mut workers = Vec::with_capacity(tenants.len());
+    for tenant in tenants {
+        let backend = PgJournalBackend::new(pool, *tenant);
         backend.check_ready().await.unwrap();
         workers.push(backend);
     }
@@ -1404,10 +1417,13 @@ async fn prepare_spot_race_workers(pool: &PgPool, count: usize) -> Vec<PgJournal
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn spot_race_setup_waits_for_delayed_connections(pool: PgPool) {
+    let tenant = Uuid::now_v7();
+    seed_account(&pool, tenant, VenueId::BINANCE_SPOT).await;
     let (proxy, proxied) = through_proxy(&pool).await;
     let before = proxy.stats().connections;
     proxy.set_mode(ProxyMode::Blackhole);
-    let preparing = tokio::spawn(async move { prepare_spot_race_workers(&proxied, 2).await });
+    let preparing =
+        tokio::spawn(async move { prepare_spot_race_workers(&proxied, &[tenant; 2]).await });
     tokio::time::timeout(Duration::from_secs(2), async {
         while proxy.stats().connections == before {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1424,7 +1440,10 @@ async fn spot_race_setup_waits_for_delayed_connections(pool: PgPool) {
         .expect("worker readiness recovered")
         .unwrap();
     for (index, worker) in workers.iter().enumerate() {
-        worker.commit(&spot_batch(&format!("prepared-{index}"))).await.unwrap();
+        worker
+            .commit(&balance_batch(&format!("prepared-{index}"), IntentKind::Exit))
+            .await
+            .unwrap();
     }
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM submit_attempts")
         .fetch_one(&pool)
@@ -1436,21 +1455,38 @@ async fn spot_race_setup_waits_for_delayed_connections(pool: PgPool) {
 async fn spot_attempt_race(pool: &PgPool, preseed: bool) {
     let schedules = proptest::collection::vec(0u64..5, 2..7);
     let mut runner = TestRunner::deterministic();
+    // The clock trigger binds a clock row to its intent's tenant, so after a
+    // preseed every worker writes as the seeding tenant.
+    let shared = Uuid::now_v7();
+    if preseed {
+        seed_account(pool, shared, VenueId::BINANCE_SPOT).await;
+    }
     for case in 0..24 {
         let delays = schedules.new_tree(&mut runner).unwrap().current();
         let id = format!("spot-race-{case}");
-        let first = spot_batch(&id);
+        let first = balance_batch(&id, IntentKind::Exit);
         // Isolate the attempt race after the shared intent has landed. Racing
         // inserts of that UUID can independently hit its primary key, which is
         // deliberately still a Known error under the narrow 8e-1 mapping.
-        if preseed {
+        let tenants: Vec<Uuid> = if preseed {
             let mut intent_only = first.clone();
             intent_only.attempts.clear();
-            let seed = prepare_spot_race_workers(pool, 1).await.pop().unwrap();
+            let seed = prepare_spot_race_workers(pool, &[shared]).await.pop().unwrap();
             seed.commit(&intent_only).await.unwrap();
-        }
+            vec![shared; delays.len()]
+        } else {
+            // Distinct accounting rows: the full transactions still contend
+            // natively on the intent and the attempt index.
+            let mut tenants = Vec::with_capacity(delays.len());
+            for _ in &delays {
+                let tenant = Uuid::now_v7();
+                seed_account(pool, tenant, VenueId::BINANCE_SPOT).await;
+                tenants.push(tenant);
+            }
+            tenants
+        };
 
-        let workers = prepare_spot_race_workers(pool, delays.len()).await;
+        let workers = prepare_spot_race_workers(pool, &tenants).await;
         let start = Arc::new(tokio::sync::Barrier::new(workers.len() + 1));
         let mut tasks = Vec::new();
         for (backend, delay) in workers.into_iter().zip(&delays) {
@@ -1487,7 +1523,83 @@ async fn spot_attempt_race(pool: &PgPool, preseed: bool) {
         .await
         .unwrap();
         assert_eq!(counts, (case + 1, case + 1), "losing transactions leave no extra rows");
+        assert_eq!(row_counts(pool, &["spot_intent_clock"]).await, [case + 1]);
+        if preseed {
+            // One bump for the seed and one for the winner per case.
+            assert_eq!(version(pool, shared, VenueId::BINANCE_SPOT).await, 2 * (case + 1));
+        } else {
+            let mut bumps = 0;
+            for tenant in &tenants {
+                bumps += version(pool, *tenant, VenueId::BINANCE_SPOT).await;
+            }
+            assert_eq!(bumps, 1, "only the winner bumps its account: case {case}");
+        }
     }
+}
+
+/// Witness a physical index conflict independent of the account-row lock.
+async fn native_spot_index_race(pool: &PgPool) {
+    let id = "spot-native-conflict";
+    sqlx::query("INSERT INTO order_intents (intent_id,tenant_id,venue_id,account_scope,client_order_id,kind,params,created_at) VALUES ($1,$2,'binance:spot',$3,$4,'exit','{}',now())")
+        .bind(Uuid::now_v7()).bind(Uuid::now_v7()).bind(DEFAULT_ACCOUNT_SCOPE).bind(id)
+        .execute(pool).await.unwrap();
+
+    const INSERT: &str = "INSERT INTO submit_attempts
+        (attempt_id,venue_id,account_scope,client_order_id,state,created_at)
+        VALUES ($1,'binance:spot',$2,$3,'started',now())";
+    let mut first = pool.begin().await.unwrap();
+    let mut second = pool.acquire().await.unwrap();
+    let first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *first)
+        .await
+        .unwrap();
+    let second_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *second)
+        .await
+        .unwrap();
+    sqlx::query(INSERT)
+        .bind(Uuid::now_v7())
+        .bind(DEFAULT_ACCOUNT_SCOPE)
+        .bind(id)
+        .execute(&mut *first)
+        .await
+        .unwrap();
+
+    let competing = sqlx::query(INSERT)
+        .bind(Uuid::now_v7())
+        .bind(DEFAULT_ACCOUNT_SCOPE)
+        .bind(id)
+        .execute(&mut *second);
+    tokio::pin!(competing);
+    let blocked = async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT $1 = ANY(pg_blocking_pids($2))")
+                .bind(first_pid)
+                .bind(second_pid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        }
+    };
+    tokio::select! {
+        early = &mut competing => panic!("competing insert finished before index wait: {early:?}"),
+        observed = tokio::time::timeout(Duration::from_secs(2), blocked) => {
+            observed.expect("real index wait on the winning transaction");
+        }
+    }
+    first.commit().await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(2), competing)
+        .await
+        .expect("competing insert completed")
+        .expect_err("only one Spot attempt may land");
+    let database = error.as_database_error().expect("native uniqueness error");
+    assert_eq!(database.code().as_deref(), Some("23505"));
+    assert_eq!(database.constraint(), Some(SPOT_INDEX));
+    assert_eq!(attempt_states_of(pool, id).await, ["started"]);
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -1504,33 +1616,50 @@ async fn usdm_attempts_are_not_limited_by_the_spot_index(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn another_unique_violation_stays_known(pool: PgPool) {
-    sqlx::raw_sql("CREATE FUNCTION another_unique_fault() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture' USING ERRCODE='23505', CONSTRAINT='different_unique_index'; END $$; CREATE TRIGGER another_unique_fault BEFORE INSERT ON submit_attempts FOR EACH ROW EXECUTE FUNCTION another_unique_fault()")
+    let tenant = Uuid::now_v7();
+    seed_account(&pool, tenant, VenueId::BINANCE_SPOT).await;
+    sqlx::raw_sql("CREATE FUNCTION another_unique_fault() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture other constraint' USING ERRCODE='23505', CONSTRAINT='different_unique_index'; END $$; CREATE TRIGGER another_unique_fault BEFORE INSERT ON submit_attempts FOR EACH ROW EXECUTE FUNCTION another_unique_fault()")
         .execute(&pool).await.unwrap();
-    let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
-    let error = backend.commit(&spot_batch("other-violation")).await.unwrap_err();
-    assert!(matches!(error, CommitFailure::Known(_)), "{error:?}");
+    let backend = PgJournalBackend::new(&pool, tenant);
+    // The exact injected message: a Known refusal from anywhere else in the
+    // flagged commit (account row, budget, clock) is not this witness.
+    let error = backend.commit(&balance_batch("other-violation", IntentKind::Exit)).await;
+    assert_eq!(
+        error,
+        Err(CommitFailure::Known(
+            "error returned from database: fixture other constraint".to_string()
+        ))
+    );
     // The name alone is insufficient: another SQLSTATE under that name is not an id
     // collision.
-    sqlx::raw_sql("CREATE OR REPLACE FUNCTION another_unique_fault() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture' USING ERRCODE='23514', CONSTRAINT='idx_submit_attempts_one_per_spot_client_id'; END $$")
+    sqlx::raw_sql("CREATE OR REPLACE FUNCTION another_unique_fault() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture wrong state' USING ERRCODE='23514', CONSTRAINT='idx_submit_attempts_one_per_spot_client_id'; END $$")
         .execute(&pool).await.unwrap();
-    let error = backend.commit(&spot_batch("wrong-state")).await.unwrap_err();
-    assert!(matches!(error, CommitFailure::Known(_)), "{error:?}");
+    let error = backend.commit(&balance_batch("wrong-state", IntentKind::Exit)).await;
+    assert_eq!(
+        error,
+        Err(CommitFailure::Known(
+            "error returned from database: fixture wrong state".to_string()
+        ))
+    );
+    assert_eq!(
+        row_counts(&pool, &["order_intents", "submit_attempts", "spot_intent_clock"]).await,
+        [0, 0, 0]
+    );
+    assert_eq!(version(&pool, tenant, VenueId::BINANCE_SPOT).await, 0);
 }
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn a_bounded_first_send_on_a_spent_spot_id_stays_home(pool: PgPool) {
-    let backend = Arc::new(PgJournalBackend::new(&pool, Uuid::now_v7()));
-    let journal = Arc::new(
-        OrderJournal::new(backend, &VenueId::new(VenueId::BINANCE_SPOT))
-            .with_one_attempt_per_client_id(true),
-    );
+    let tenant = Uuid::now_v7();
+    seed_account(&pool, tenant, VenueId::BINANCE_SPOT).await;
+    let journal = journal_on(&pool, tenant, true, true, VenueId::BINANCE_SPOT);
     journal.check_ready().await.unwrap();
     let (operation, intent) = opened(&journal, "spent", IntentKind::Protection).await;
     // Matching the intent UUID makes the attempt index, not intent ownership,
     // reject the new attempt and exposes a wrong Known fallback.
     sqlx::query("INSERT INTO order_intents (intent_id,tenant_id,venue_id,account_scope,client_order_id,kind,params,created_at) VALUES ($1,$2,'binance:spot',$3,'spent','protection','{}',now())")
-        .bind(intent.intent_id()).bind(Uuid::now_v7()).bind(DEFAULT_ACCOUNT_SCOPE).execute(&pool).await.unwrap();
+        .bind(intent.intent_id()).bind(tenant).bind(DEFAULT_ACCOUNT_SCOPE).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO submit_attempts (attempt_id,venue_id,account_scope,client_order_id,state,created_at) VALUES ($1,'binance:spot',$2,'spent','started',now())")
         .bind(Uuid::now_v7()).bind(DEFAULT_ACCOUNT_SCOPE).execute(&pool).await.unwrap();
 
