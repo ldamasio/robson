@@ -4154,7 +4154,10 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 stop.ask();
-                tokio::time::Instant::now()
+                // When the stop was asked for, by its own clock: the deadline
+                // runs from there. A reading taken here, after the ask, is
+                // late by however long this thread was descheduled between.
+                stop.asked().await
             }
         };
         let running = async { tokio::join!(Box::pin(daemon.run_until(stop.clone())), asking) };
@@ -4198,7 +4201,10 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 stop.ask();
-                tokio::time::Instant::now()
+                // When the stop was asked for, by its own clock: the deadline
+                // runs from there. A reading taken here, after the ask, is
+                // late by however long this thread was descheduled between.
+                stop.asked().await
             }
         };
         let running = async { tokio::join!(Box::pin(daemon.run_until(stop.clone())), asking) };
