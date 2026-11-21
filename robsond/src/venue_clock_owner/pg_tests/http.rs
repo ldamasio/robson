@@ -15,12 +15,18 @@ pub(super) struct Fixture {
     pub(super) base_url: String,
     connections: Arc<AtomicUsize>,
     reply: Arc<Mutex<Option<i64>>>,
+    answers: usize,
     cancel: CancellationToken,
     task: JoinHandle<anyhow::Result<()>>,
 }
 
 impl Fixture {
     pub(super) async fn start(deadline: Instant) -> anyhow::Result<Self> {
+        Self::bounded(deadline, 1).await
+    }
+
+    /// At most `answers` TIME exchanges, one per physical connection.
+    pub(super) async fn bounded(deadline: Instant, answers: usize) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let base_url = format!("http://{}", listener.local_addr()?);
         let connections = Arc::new(AtomicUsize::new(0));
@@ -36,8 +42,8 @@ impl Fixture {
                         next = listener.accept() => next?,
                     };
                     ensure!(
-                        count.fetch_add(1, Ordering::SeqCst) == 0,
-                        "unexpected second physical TIME connection"
+                        count.fetch_add(1, Ordering::SeqCst) < answers,
+                        "unexpected extra physical TIME connection"
                     );
                     let exchange = async {
                         let mut request = Vec::new();
@@ -75,6 +81,7 @@ impl Fixture {
             base_url,
             connections,
             reply,
+            answers,
             cancel,
             task,
         })
@@ -103,7 +110,7 @@ impl Fixture {
                 return Err(anyhow!("HTTP fixture needed abort; join={retired:?}"));
             },
         }?;
-        ensure!(self.connections() <= 1, "second physical connection observed");
+        ensure!(self.connections() <= self.answers, "extra physical connection observed");
         Ok(())
     }
 }

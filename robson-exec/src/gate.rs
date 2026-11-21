@@ -247,10 +247,13 @@ pub enum IncidentReason {
     OperationAborted,
     /// The generation counter of this epoch ran out.
     GenerationExhausted,
+    /// A qualified balance scan found a conflict to fence and page (8k-1 B):
+    /// held until the typed balance release (8k-4), never the F release.
+    VenueDiscrepancy,
 }
 
 impl IncidentReason {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::UncleanStart,
         Self::UncertainOutcome,
         Self::UnlandedSend,
@@ -259,6 +262,7 @@ impl IncidentReason {
         Self::StreamSuspended,
         Self::OperationAborted,
         Self::GenerationExhausted,
+        Self::VenueDiscrepancy,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -271,6 +275,7 @@ impl IncidentReason {
             Self::StreamSuspended => "stream_suspended",
             Self::OperationAborted => "operation_aborted",
             Self::GenerationExhausted => "generation_exhausted",
+            Self::VenueDiscrepancy => "venue_discrepancy",
         }
     }
 
@@ -279,9 +284,17 @@ impl IncidentReason {
     }
 
     /// A latch-class reason sets the journal latch, which only a restart
-    /// clears, so its release waits for the next process.
+    /// clears, so its release waits for the next process. `venue_discrepancy`,
+    /// of migration 38's reason set, is nonlatching (8h2a plan): its release
+    /// is refused in every process instead.
     pub fn latches(self) -> bool {
-        !matches!(self, Self::UncleanStart | Self::UncertainOutcome)
+        !matches!(self, Self::UncleanStart | Self::UncertainOutcome | Self::VenueDiscrepancy)
+    }
+
+    /// Whether only the typed balance release (8k-4) may release it: the F
+    /// release refuses while one is open, in every process (8k-1 B, R2).
+    pub fn awaits_balance_release(self) -> bool {
+        matches!(self, Self::VenueDiscrepancy)
     }
 }
 
@@ -643,6 +656,11 @@ impl GateState {
                 open.origin = None;
             }
         }
+    }
+
+    /// Whether an open incident waits for the typed balance release.
+    pub(crate) fn awaits_balance_release(&self) -> bool {
+        self.incidents.keys().any(|reason| reason.awaits_balance_release())
     }
 
     /// Whether the orphan sweep may not cancel an `ins-` order now (design

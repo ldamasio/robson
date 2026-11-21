@@ -1076,7 +1076,10 @@ with no incident, and neither kind is ever evidence a release relies on.
   a write frees a slot, is discarded and latches a `persistence_failure`. `unlanded_send`, a bounded send whose row did not land, recorded before
   its request leaves; `persistence_failure`, history discarded on a full retry set or a row conflicting on retry;
   `stream_suspended`; `operation_aborted`; `unpermitted_mutation`; `unclean_start`; `generation_exhausted`. All but
-  `unclean_start` and `uncertain_outcome` set the latch, as P's latch sources already did.
+  `unclean_start` and `uncertain_outcome` set the latch, as P's latch sources already did. Step 8k-1 B adds
+  `venue_discrepancy`, a qualified balance scan's fence-and-page finding: it does not latch, and the F release refuses
+  while it is open (`balance_release_required`), so only the typed balance release of 8k-4 can release it. Its rows need
+  8h's 2b cut of the legacy reason CHECK; it has no production caller before then.
 - **Generation.** `epoch_seq << 32 | n`, a signed 64-bit value, its high half from the epoch's strict insert, so it never goes
   back across processes. Every occurrence moves `n`, a repeat of an open reason included. At `2^32 − 1` it is exhausted: the
   latch, `generation_exhausted`, and a fence no release can open before a restart.
@@ -1086,7 +1089,7 @@ with no incident, and neither kind is ever evidence a release relies on.
   in each pass, then suspensions, then intents, each part stopping at its own first failure. **Passes never overlap:** the retry
   loop and the stop's final flush take one async lock for a whole pass, so no snapshot of an incident is written twice, and an
   upsert delayed in one pass cannot land after another pass landed it and a release removed it. At most one upsert per reason
-  waits, beside the 1,024 rows and suspensions and not counted against them (eight at most), so an incident is never the entry a
+  waits, beside the 1,024 rows and suspensions and not counted against them (one per reason), so an incident is never the entry a
   full set drops; `robsond_journal_retry_set_depth` counts them.
 - **The fence.** Closed by any occurrence; checked at the three admission sites, beside the latch (an arm and an approval answer
   `AdmissionsClosed`, 503; a signal re-arms its detector under the governed backoff, `admissions_closed`), and at an entry's send,

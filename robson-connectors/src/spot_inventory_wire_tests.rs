@@ -15,7 +15,7 @@ use tokio::{
 use super::BinanceRestError;
 use crate::inventory_loopback::{
     account_uid, prepare, InventoryRead, LOOPBACK_BODY_LIMIT, LOOPBACK_KEY as KEY,
-    LOOPBACK_SECRET as SECRET, LOOPBACK_UID,
+    LOOPBACK_SECRET as SECRET, LOOPBACK_UID, OPERATED_SYMBOL,
 };
 
 const ACCOUNT: &str = include_str!("binance/spot/testdata/account.json");
@@ -24,6 +24,9 @@ const OPEN_ORDER_LIST: &str = include_str!("binance/spot/testdata/open_order_lis
 
 const STAMP: i64 = 1_800_000_000_000;
 const EXPECTED_SIGNATURE: &str = "5240291be8a1f9092fc18756b920e57afd279112d735c2e1100014969556c238";
+/// The known answer for `symbol=BTCUSDT&timestamp=<STAMP>` under the same key.
+const EXPECTED_SCOPED_SIGNATURE: &str =
+    "b0b44268eb1b217beeddf7bb2bed259bee1f314cc685a60b40e0e78a262d7edf";
 const STEP: Duration = Duration::from_secs(5);
 const OUTER: Duration = Duration::from_secs(20);
 const QUIET: Duration = Duration::from_millis(250);
@@ -53,30 +56,66 @@ async fn assert_quiet(listener: &TcpListener) {
     assert!(timeout(QUIET, listener.accept()).await.is_err(), "no further connection");
 }
 
-/// The expected signature is the known answer for the fixed key and timestamp.
+/// The expected signature is the known answer for the fixed key, the read's
+/// fixed parameters and the timestamp.
 fn expected_line(read: InventoryRead) -> String {
-    format!("GET {}?timestamp={STAMP}&signature={EXPECTED_SIGNATURE} HTTP/1.1", read.path())
+    match read.query() {
+        None => {
+            format!("GET {}?timestamp={STAMP}&signature={EXPECTED_SIGNATURE} HTTP/1.1", read.path())
+        },
+        Some(fixed) => format!(
+            "GET {}?{fixed}&timestamp={STAMP}&signature={EXPECTED_SCOPED_SIGNATURE} HTTP/1.1",
+            read.path()
+        ),
+    }
+}
+
+/// The vendor example's open order moved onto the operated pair: a scoped
+/// answer carries only that symbol.
+fn operated_open_orders() -> String {
+    let mut orders: serde_json::Value = serde_json::from_str(OPEN_ORDERS).unwrap();
+    for order in orders.as_array_mut().unwrap() {
+        order["symbol"] = serde_json::json!(OPERATED_SYMBOL);
+    }
+    serde_json::to_string(&orders).unwrap()
 }
 
 #[test]
 fn the_inventory_reads_are_closed_with_fixed_paths_and_weights() {
     let reads = InventoryRead::ALL;
+    assert_eq!(reads, [
+        InventoryRead::Account,
+        InventoryRead::OperatedOpenOrders,
+        InventoryRead::OpenOrderLists
+    ]);
     assert_eq!(reads.map(InventoryRead::path), [
         "/api/v3/account",
         "/api/v3/openOrders",
         "/api/v3/openOrderList"
     ]);
-    assert_eq!(reads.map(InventoryRead::weight), [20, 80, 6]);
-    assert_eq!(reads.iter().map(|r| r.weight()).sum::<u32>(), 106);
+    assert_eq!(reads.map(InventoryRead::query), [None, Some("symbol=BTCUSDT"), None]);
+    assert_eq!(reads.map(InventoryRead::weight), [20, 6, 6]);
+    assert_eq!(reads.iter().map(|r| r.weight()).sum::<u32>(), 32);
+    // Each exact line, in `ALL` order: the scoped read carries its symbol.
+    assert_eq!(reads.map(expected_line), [
+        format!("GET /api/v3/account?timestamp={STAMP}&signature={EXPECTED_SIGNATURE} HTTP/1.1"),
+        format!(
+            "GET /api/v3/openOrders?symbol=BTCUSDT&timestamp={STAMP}&signature={EXPECTED_SCOPED_SIGNATURE} HTTP/1.1"
+        ),
+        format!(
+            "GET /api/v3/openOrderList?timestamp={STAMP}&signature={EXPECTED_SIGNATURE} HTTP/1.1"
+        ),
+    ]);
 }
 
 #[tokio::test]
 async fn each_read_sends_one_exact_signed_get_and_returns_its_raw_head() {
     bounded(async {
         let mut lines = Vec::new();
+        let operated = operated_open_orders();
         for (read, payload) in [
             (InventoryRead::Account, ACCOUNT),
-            (InventoryRead::AllOpenOrders, OPEN_ORDERS),
+            (InventoryRead::OperatedOpenOrders, operated.as_str()),
             (InventoryRead::OpenOrderLists, OPEN_ORDER_LIST),
         ] {
             let (listener, port) = local().await;
@@ -295,12 +334,13 @@ fn the_account_decode_is_strict_bounded_and_returns_only_the_uid() {
 fn the_inventory_ingress_preserves_keys_and_rejects_untyped_or_conflicting_rows() {
     use crate::inventory_loopback::{decode, InventoryBody};
 
-    let body = decode(InventoryRead::AllOpenOrders, OPEN_ORDERS.as_bytes()).unwrap();
+    let operated = operated_open_orders();
+    let body = decode(InventoryRead::OperatedOpenOrders, operated.as_bytes()).unwrap();
     let InventoryBody::OpenOrders(orders) = body else {
         panic!("expected typed orders");
     };
     assert!(!orders.is_empty());
-    let original: serde_json::Value = serde_json::from_str(OPEN_ORDERS).unwrap();
+    let original: serde_json::Value = serde_json::from_str(&operated).unwrap();
     assert_eq!(orders[0].symbol, original[0]["symbol"].as_str().unwrap());
     assert_eq!(orders[0].order_id, original[0]["orderId"].as_u64().unwrap());
     for key in ["orderId", "clientOrderId"] {
@@ -312,21 +352,33 @@ fn the_inventory_ingress_preserves_keys_and_rejects_untyped_or_conflicting_rows(
             serde_json::json!("distinct_client")
         };
         let body = serde_json::to_vec(&vec![first, second]).unwrap();
-        assert!(decode(InventoryRead::AllOpenOrders, &body).is_err());
+        assert!(decode(InventoryRead::OperatedOpenOrders, &body).is_err());
     }
     for malformed in [
         br#"[[]]"#.as_slice(),
         br#"[{"symbol":"BTCUSDT","symbol":"BTCUSDT"}]"#.as_slice(),
         b"[ ".as_slice(),
     ] {
-        assert!(decode(InventoryRead::AllOpenOrders, malformed).is_err());
+        assert!(decode(InventoryRead::OperatedOpenOrders, malformed).is_err());
+    }
+    // A scoped answer is refused whole when any order is on another pair.
+    let foreign: serde_json::Value = serde_json::from_str(OPEN_ORDERS).unwrap();
+    let operated_rows: serde_json::Value = serde_json::from_str(&operated).unwrap();
+    for body in [
+        serde_json::to_vec(&foreign).unwrap(),
+        serde_json::to_vec(&vec![operated_rows[0].clone(), foreign[0].clone()]).unwrap(),
+    ] {
+        assert!(matches!(
+            decode(InventoryRead::OperatedOpenOrders, &body),
+            Err(BinanceRestError::Refused(detail)) if detail.ends_with("outside the operated symbol")
+        ));
     }
     let malformed_account =
         br#"{"uid":1,"accountType":"SPOT","canTrade":false,"permissions":[],"balances":[["BTC","0","0"]]}"#;
     assert!(decode(InventoryRead::Account, malformed_account).is_err());
     let bodies = [
         (InventoryRead::Account, ACCOUNT),
-        (InventoryRead::AllOpenOrders, OPEN_ORDERS),
+        (InventoryRead::OperatedOpenOrders, operated.as_str()),
         (InventoryRead::OpenOrderLists, OPEN_ORDER_LIST),
     ];
     for (read, body) in bodies {

@@ -1145,3 +1145,7 @@ mod entry_partition;
 #[cfg(feature = "crash-points")]
 #[path = "restart.rs"]
 mod restart;
+
+#[cfg(feature = "crash-points")]
+#[path = "reconciliation.rs"]
+mod reconciliation;

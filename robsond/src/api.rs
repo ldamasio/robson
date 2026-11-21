@@ -1187,6 +1187,9 @@ where
             }))
         },
         Err(ReleaseRefusal::Latched) => Err(refused(StatusCode::CONFLICT, "latched")),
+        Err(ReleaseRefusal::AwaitsBalanceRelease) => {
+            Err(refused(StatusCode::CONFLICT, "balance_release_required"))
+        },
         Err(ReleaseRefusal::Stale { current }) => Err((
             StatusCode::CONFLICT,
             Json(ReleaseRefusedResponse {
@@ -7048,6 +7051,30 @@ mod tests {
         let latest = journal.gate().generation();
         let (status, body) = post_release(&app, Some(LEGACY), release_body(latest, "x")).await;
         assert_eq!((status, body["error"].clone()), (StatusCode::CONFLICT, json!("latched")));
+        assert!(journal.gate().fenced());
+    }
+
+    /// 8k-1 B, R2: an open `venue_discrepancy` refuses the release with 409
+    /// `balance_release_required`; the backend is not called and the fence
+    /// stays closed.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn the_release_endpoint_refuses_a_venue_discrepancy() {
+        use robson_exec::{gate::IncidentReason, order_journal::StubJournalBackend};
+
+        let backend = Arc::new(StubJournalBackend::default());
+        let journal = Arc::new(OrderJournal::new(backend.clone(), &VenueId::new("test:venue")));
+        journal.gate().record(IncidentReason::VenueDiscrepancy);
+        journal.flush_pending().await;
+        let app = recovery_app(unreachable_pool(), Arc::clone(&journal), Some(LEGACY), None).await;
+        let current = journal.gate().generation();
+
+        let (status, body) = post_release(&app, Some(LEGACY), release_body(current, "x")).await;
+        assert_eq!(
+            (status, body["error"].clone()),
+            (StatusCode::CONFLICT, json!("balance_release_required"))
+        );
+        assert!(backend.releases().is_empty());
         assert!(journal.gate().fenced());
     }
 
