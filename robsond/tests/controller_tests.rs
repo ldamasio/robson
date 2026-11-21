@@ -12,7 +12,7 @@
 //! the local gates run it.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -115,19 +115,18 @@ fn test_pg_runs_exactly_the_isolated_tests_alone() {
     assert!(script.contains("for name in \"${ISOLATED_TESTS[@]}\"; do"));
     assert!(script.contains("-- --ignored \"${name}\" \"${SKIP_CONTROLLER[@]}\" --test-threads=1"));
     // Phase 3 is skipped only on the explicit switch, and only CI's database
-    // step sets it: every other caller of the script still runs the envelopes.
-    const SWITCH: &str = "ROBSON_TEST_PG_SKIP_MEASUREMENTS";
-    let gate = format!(
-        "    if [[ \"${{{SWITCH}:-0}}\" == \"1\" ]]; then\n        warn \"Phase 3 skipped \
-         ({SWITCH}=1): ${{ISOLATED_TESTS[*]}} run on the local gate host.\"\n    else\n        \
-         for name in \"${{ISOLATED_TESTS[@]}}\"; do\n"
-    );
-    assert!(script.contains(&gate), "the switch must gate phase 3 only:\n{script}");
-    // Outside comments the switch appears exactly where something may read or
-    // set it: the two gate lines of test-pg.sh and the one setting in CI's
-    // database step. Any other read, assignment or export, in the script, the
-    // other scripts, the justfile or any workflow, fails here.
-    let mut uses = Vec::new();
+    // step sets it. Both places are pinned verbatim: the script's whole
+    // default dispatch and the whole CI step. Moving another phase under the
+    // switch, or the setting into another step, changes a pinned block and
+    // fails here; a deliberate change updates the block in the same commit.
+    let workflow = fs::read_to_string(root.join(".github/workflows/robsond.yml")).unwrap();
+    assert_eq!(script.matches(DEFAULT_DISPATCH).count(), 1, "{script}");
+    assert_eq!(workflow.matches(CI_DATABASE_STEP).count(), 1, "{workflow}");
+    assert_eq!(workflow.matches("- name: Run the DATABASE_URL-gated tests").count(), 1);
+    // Outside comments the switch appears only in those pinned blocks: twice
+    // in the script (the test and its warning) and once in the workflow. Any
+    // other read, assignment or export, in the scripts, the justfile or any
+    // workflow, fails here.
     let mut files = vec![root.join("justfile")];
     let mut dirs = vec![root.join("scripts"), root.join(".github/workflows")];
     while let Some(dir) = dirs.pop() {
@@ -140,43 +139,104 @@ fn test_pg_runs_exactly_the_isolated_tests_alone() {
             }
         }
     }
+    let mut uses = BTreeMap::new();
     for path in &files {
         let name = path.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
-        // Bytecode caches and other binaries cannot set a shell variable.
-        let Ok(text) = fs::read_to_string(path) else {
-            continue;
-        };
-        let mut step = String::new();
-        for line in text.lines().map(str::trim) {
-            if let Some(title) = line.strip_prefix("- name:") {
-                step = title.trim().to_string();
-            }
-            if line.contains(SWITCH) && !line.starts_with('#') {
-                let place = if name.ends_with(".yml") {
-                    step.clone()
-                } else {
-                    String::new()
-                };
-                uses.push((name.clone(), place, line.to_string()));
-            }
+        let count = switch_uses(&fs::read(path).unwrap());
+        if count > 0 {
+            uses.insert(name, count);
         }
     }
-    uses.sort();
-    let gate_lines: Vec<&str> =
-        gate.lines().map(str::trim).filter(|l| l.contains(SWITCH)).collect();
-    let mut expected = vec![(
-        ".github/workflows/robsond.yml".to_string(),
-        "Run the DATABASE_URL-gated tests".to_string(),
-        format!("{SWITCH}: \"1\""),
-    )];
-    for line in gate_lines {
-        expected.push(("scripts/test-pg.sh".to_string(), String::new(), line.to_string()));
-    }
-    expected.sort();
     assert_eq!(
-        uses, expected,
+        uses,
+        BTreeMap::from([
+            (".github/workflows/robsond.yml".to_string(), 1),
+            ("scripts/test-pg.sh".to_string(), 2),
+        ]),
         "the switch may be read by phase 3 and set only by CI's database step"
     );
+}
+
+const SWITCH: &str = "ROBSON_TEST_PG_SKIP_MEASUREMENTS";
+
+/// `scripts/test-pg.sh`'s whole default dispatch, verbatim.
+const DEFAULT_DISPATCH: &str = r##"else
+    status=0
+    info "Phase 1: every ignored test outside ${SUITE}"
+    "${CARGO[@]}" -- --ignored --skip "${SUITE}" "${SKIP_CONTROLLER[@]}" "${SKIP_ISOLATED[@]}" || status=1
+    info "Phase 2: ${SUITE} one test at a time"
+    "${CARGO[@]}" -- --ignored "${SUITE}" "${SKIP_CONTROLLER[@]}" --test-threads=1 || status=1
+    if [[ "${ROBSON_TEST_PG_SKIP_MEASUREMENTS:-0}" == "1" ]]; then
+        warn "Phase 3 skipped (ROBSON_TEST_PG_SKIP_MEASUREMENTS=1): ${ISOLATED_TESTS[*]} run on the local gate host."
+    else
+        for name in "${ISOLATED_TESTS[@]}"; do
+            info "Phase 3: ${name} alone"
+            "${CARGO[@]}" -- --ignored "${name}" "${SKIP_CONTROLLER[@]}" --test-threads=1 || status=1
+        done
+    fi
+    if [[ ${status} -ne 0 ]]; then
+        fail "Postgres integration tests failed."
+        exit 1
+    fi
+fi
+"##;
+
+/// CI's database step in `.github/workflows/robsond.yml`, verbatim.
+const CI_DATABASE_STEP: &str = r##"      - name: Run the DATABASE_URL-gated tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/robson_migration_ci
+          # Phase 3's wall-clock envelopes depend on the host, and a hosted
+          # runner's speed varies; the local gates run them (see test-pg.sh).
+          ROBSON_TEST_PG_SKIP_MEASUREMENTS: "1"
+        # The canonical script runs everything else with the default
+        # concurrency, then the migration38 suite (bounded_migration::public_pg::)
+        # one test at a time.
+        run: bash scripts/test-pg.sh
+"##;
+
+/// Lines of a text file that name [`SWITCH`] outside a comment. A file with a
+/// NUL byte, or that is not UTF-8, is binary and cannot set a shell variable.
+/// A shell or YAML comment starts at a `#` outside quotes that begins the line
+/// or follows whitespace.
+fn switch_uses(bytes: &[u8]) -> usize {
+    if bytes.contains(&0) {
+        return 0;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return 0;
+    };
+    text.lines().map(code_part).filter(|code| code.contains(SWITCH)).count()
+}
+
+/// The part of a shell or YAML line before its comment.
+fn code_part(line: &str) -> &str {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    let mut previous = ' ';
+    for (at, c) in line.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if !single => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '#' if !single && !double && previous.is_whitespace() => return &line[..at],
+            _ => {},
+        }
+        previous = c;
+    }
+    line
+}
+
+#[test]
+fn switch_uses_skip_comments_and_binaries_only() {
+    assert_eq!(switch_uses(b"# ROBSON_TEST_PG_SKIP_MEASUREMENTS=1"), 0);
+    assert_eq!(switch_uses(b"run: x # ROBSON_TEST_PG_SKIP_MEASUREMENTS"), 0);
+    assert_eq!(switch_uses(b"export ROBSON_TEST_PG_SKIP_MEASUREMENTS=1"), 1);
+    assert_eq!(switch_uses(b"echo \" #\"; export ROBSON_TEST_PG_SKIP_MEASUREMENTS=1"), 1);
+    assert_eq!(switch_uses(b"n=${#a[@]} ROBSON_TEST_PG_SKIP_MEASUREMENTS=1"), 1);
+    assert_eq!(switch_uses(b"\0ROBSON_TEST_PG_SKIP_MEASUREMENTS"), 0);
+    assert_eq!(switch_uses(&[0xff, b'R']), 0);
+    assert_eq!(switch_uses(DEFAULT_DISPATCH.as_bytes()), 2);
+    assert_eq!(switch_uses(CI_DATABASE_STEP.as_bytes()), 1);
 }
 
 #[test]
