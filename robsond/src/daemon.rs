@@ -2888,7 +2888,8 @@ mod tests {
 
         let first =
             supervised(SpotReady::unsupervised_fixture(start, installed.clone(), pool.clone()));
-        // The worker's context, as Daemon::run takes it from the manager.
+        // The worker's context, as Daemon::run takes it from the manager, on
+        // this test venue's own identity (a balance account, not Spot).
         let context = first.position_manager.read().await.balance_accounting().unwrap();
         assert_eq!(context.generation.current(), Some(installed.clone()), "the manager's cell");
         let journal = first.journal_for_startup_witness();
@@ -2922,7 +2923,24 @@ mod tests {
             prev_hash: None,
             hash: None,
         };
+        // This balance test venue is not Binance Spot, so the worker's context
+        // refuses the published generation before any write (an empty cell
+        // would have bumped unopted): the worker read the published cell.
         let step = crate::balance_accounting::projector_step(Some(&context));
+        let refused = robson_projector::apply_event_to_projections_with(&pool, &reset, step).await;
+        assert!(
+            matches!(&refused, Err(robson_projector::ProjectionError::Accounting(e))
+                if e.contains("not this context's")),
+            "{refused:?}"
+        );
+        assert_eq!(versions().await, (2, 2));
+        // The same cell under the identity a Spot daemon's context carries:
+        // the worker's apply bumps once, with the CAS.
+        let spot = crate::balance_accounting::BalanceAccounting {
+            venue: robson_exec::venue::VenueId::new(robson_exec::venue::VenueId::BINANCE_SPOT),
+            ..context.clone()
+        };
+        let step = crate::balance_accounting::projector_step(Some(&spot));
         robson_projector::apply_event_to_projections_with(&pool, &reset, step)
             .await
             .unwrap();
