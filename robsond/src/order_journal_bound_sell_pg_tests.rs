@@ -1,4 +1,5 @@
-//! Native first, replay, transfer and refusal controls for scoped SELL projection.
+//! Native first, replay, transfer and refusal controls for scoped SELL
+//! projection.
 use super::*;
 
 const SYMBOL: &str = "BTCUSDT";

@@ -1,4 +1,5 @@
-//! Test-only real Journal/Spot audit composition driven by a disposable PG16 controller.
+//! Test-only real Journal/Spot audit composition driven by a disposable PG16
+//! controller.
 use std::io::{self, BufRead, Read, Write};
 
 use robson_domain::OrderSide;
@@ -12,16 +13,17 @@ use tokio::time::Instant;
 
 use super::*;
 use crate::{
-    spot_order_set_store::cold_install::{
-        install, ClosedWriterFence, FencePhase, FenceReceipt, FixtureFenceError,
+    spot_order_set_store::{
+        cold_install::{install, ClosedWriterFence, FencePhase, FenceReceipt, FixtureFenceError},
+        cold_owner::{capture, OwnerRequest, RestoreIdentity},
+        observe_generation,
+        physical_fixture::{
+            audit_cold_sources, AttemptSource, ColdAuditRefusal, ColdAuditScope, ColdSourceSink,
+            Family, IntentSource, OrderSource, PageBudget, RouteClass, RouteSource, SinkFull,
+            SourceKey,
+        },
+        ExpectedGeneration,
     },
-    spot_order_set_store::cold_owner::{capture, OwnerRequest, RestoreIdentity},
-    spot_order_set_store::physical_fixture::{
-        audit_cold_sources, AttemptSource, ColdAuditRefusal, ColdAuditScope, ColdSourceSink,
-        Family, IntentSource, OrderSource, PageBudget, RouteClass, RouteSource, SinkFull,
-        SourceKey,
-    },
-    spot_order_set_store::{observe_generation, ExpectedGeneration},
     venue_budget::{fixture as budget_fixture, physical_recovery as budget_recovery},
     venue_ledger_store::PgVenueLedger,
 };
@@ -183,15 +185,11 @@ async fn seed_native_sources(pool: &PgPool, g: &JournalGeneration) -> Result<()>
     };
     ensure!(
         ledger
-            .record_order(
-                &buy,
-                &link,
-                SeenAt {
-                    at: Utc::now(),
-                    clock: None,
-                    capture: None
-                }
-            )
+            .record_order(&buy, &link, SeenAt {
+                at: Utc::now(),
+                clock: None,
+                capture: None
+            })
             .await?
             .changed
     );

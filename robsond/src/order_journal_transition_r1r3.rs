@@ -648,30 +648,17 @@ async fn local_r1_r3_classifies_initialized_order_set_cells(pool: PgPool) -> Res
         // consumed 1 from the native fill exceeds X 0.5: no G exists.
         ("deficit", &deficit, R1::Unresolved, R3::Deficit { excess: Decimal::new(5, 1) }),
         // Discharged member; terminal status is descriptive only.
-        (
-            "terminal",
-            &terminal,
-            R1::Clear,
-            R3::Terminal {
-                status: "CANCELED".into(),
-                executed: Decimal::ZERO,
-            },
-        ),
-        (
-            "terminal_with_execution",
-            &terminal_fill,
-            R1::Clear,
-            R3::Terminal {
-                status: "CANCELED".into(),
-                executed: Decimal::ONE,
-            },
-        ),
-        (
-            "terminal_deficit",
-            &terminal_deficit,
-            R1::Unresolved,
-            R3::Deficit { excess: Decimal::new(5, 1) },
-        ),
+        ("terminal", &terminal, R1::Clear, R3::Terminal {
+            status: "CANCELED".into(),
+            executed: Decimal::ZERO,
+        }),
+        ("terminal_with_execution", &terminal_fill, R1::Clear, R3::Terminal {
+            status: "CANCELED".into(),
+            executed: Decimal::ONE,
+        }),
+        ("terminal_deficit", &terminal_deficit, R1::Unresolved, R3::Deficit {
+            excess: Decimal::new(5, 1),
+        }),
         (
             "terminal_unrecorded",
             &terminal_missing,
@@ -818,13 +805,10 @@ async fn local_r1_r3_rejects_active_target_cancel(pool: PgPool) -> Result<()> {
     .await?;
     let terminal = observe(&ready, &pool, &leg).await?;
     assert_eq!(terminal.r1, R1::Clear);
-    assert_eq!(
-        terminal.r3,
-        R3::Terminal {
-            status: "CANCELED".into(),
-            executed: Decimal::ZERO
-        }
-    );
+    assert_eq!(terminal.r3, R3::Terminal {
+        status: "CANCELED".into(),
+        executed: Decimal::ZERO
+    });
     eprintln!("SPOT_LOCAL_R1_R3 active_target_cancel=held native_terminal=discharged");
     Ok(())
 }

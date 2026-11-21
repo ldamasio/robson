@@ -503,16 +503,13 @@ async fn venue_complement_preserves_unlinked_orders_across_frozen_pages(pool: Pg
 
     let fresh = audit(&pool, s).await.unwrap();
     assert!(ids(&fresh).contains(&late_journal.intent.intent_id));
-    assert_eq!(
-        complement(&fresh),
-        [
-            ("10", MissingJournal),
-            ("20", MissingJournal),
-            ("30", RouteUnowned),
-            ("35", MissingJournal),
-            ("50", MissingJournal)
-        ]
-    );
+    assert_eq!(complement(&fresh), [
+        ("10", MissingJournal),
+        ("20", MissingJournal),
+        ("30", RouteUnowned),
+        ("35", MissingJournal),
+        ("50", MissingJournal)
+    ]);
     assert_eq!(fresh.venue_page_lengths, [2, 2, 2, 0]);
     assert!(fresh.version > frozen.version);
 }
@@ -569,13 +566,10 @@ async fn terminal_client_and_kind_conflicts_survive_original_cancel_lookup(pool:
         assert_eq!(target.target_status.as_deref(), Some("CANCELED"));
         assert_eq!(target.target_conflict, expected_conflict, "cancel target {id}");
     }
-    assert_eq!(
-        complement(&report),
-        [
-            ("101", VenueLinkage::JournalConflict),
-            ("102", VenueLinkage::JournalConflict)
-        ]
-    );
+    assert_eq!(complement(&report), [
+        ("101", VenueLinkage::JournalConflict),
+        ("102", VenueLinkage::JournalConflict)
+    ]);
 }
 
 async fn generated_case(

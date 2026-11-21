@@ -61,14 +61,11 @@ impl PreparedFeeOwner {
         for loaded in entries {
             let symbol = loaded.key.symbol;
             let identity = expected.remove(&symbol).ok_or(AgeError::Identity)?;
-            keys.insert(
-                symbol,
-                Key {
-                    identity,
-                    outcome: loaded.prior.and_then(|claim| claim.result),
-                    receipt: loaded.receipt,
-                },
-            );
+            keys.insert(symbol, Key {
+                identity,
+                outcome: loaded.prior.and_then(|claim| claim.result),
+                receipt: loaded.receipt,
+            });
         }
         if !expected.is_empty() {
             return Err(AgeError::Identity);

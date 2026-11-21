@@ -237,7 +237,8 @@ async fn backend(conn: &mut PgConnection) -> anyhow::Result<Backend> {
     .await?)
 }
 
-/// Blockers of one exact backend while it lock-waits inside the repair statement.
+/// Blockers of one exact backend while it lock-waits inside the repair
+/// statement.
 async fn repair_blockers(pool: &PgPool, who: Backend) -> anyhow::Result<Option<Vec<i32>>> {
     Ok(sqlx::query_scalar(
         "SELECT pg_blocking_pids(a.pid) FROM pg_stat_activity a

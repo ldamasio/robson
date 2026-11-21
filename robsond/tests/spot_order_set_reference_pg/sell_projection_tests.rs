@@ -1,10 +1,3 @@
-use super::{
-    audit, batch,
-    fixture::{backend_pid, retired, through_proxy_limit, unowned},
-    linked_sell,
-    reader::{Report, Scope},
-    scope, seen, zero_execution_order, Fixture, VENUE,
-};
 use robson_exec::{
     order_journal::{AttemptRow, IntentKind, JournalBackend, OutcomeRow, VenueOutcome},
     ports::TradeFill,
@@ -16,6 +9,14 @@ use robsond::{order_journal_store::PgJournalBackend, venue_ledger_store::PgVenue
 use rust_decimal::Decimal;
 use sqlx::{postgres::PgArguments, query::QueryAs, PgPool, Postgres};
 use uuid::Uuid;
+
+use super::{
+    audit, batch,
+    fixture::{backend_pid, retired, through_proxy_limit, unowned},
+    linked_sell,
+    reader::{Report, Scope},
+    scope, seen, zero_execution_order, Fixture, VENUE,
+};
 
 #[path = "../venue_ledger_schema/empty_budget.rs"]
 mod empty_budget;
@@ -146,7 +147,8 @@ fn cold_sells(report: &Report) -> Sells {
         if row.no_send || row.has_durable_rejection() || proved_terminal {
             continue;
         }
-        // An exact pair is one member. Mismatches stay on both native and journal paths.
+        // An exact pair is one member. Mismatches stay on both native and journal
+        // paths.
         let conflict = contradictory_outcome
             || (row.named_id.is_some() && !exact_sell)
             || row.named_phase.as_deref() == Some("terminal");
@@ -516,14 +518,11 @@ async fn terminal_masks_active_cancel_but_preserves_conflict_in_every_scope(pool
     }
     let all_conflicting = Liability { active: 1, conflicts: 1 };
     let live = checkpoint(&pool, s, "all-cancel-channels-positive", (0, 0), None).await;
-    assert_eq!(
-        live.cancels(),
-        Cancels {
-            grouped: all_conflicting,
-            ungroupable: all_conflicting,
-            unbound: all_conflicting
-        }
-    );
+    assert_eq!(live.cancels(), Cancels {
+        grouped: all_conflicting,
+        ungroupable: all_conflicting,
+        unbound: all_conflicting
+    });
 
     let original = batch(s, IntentKind::Exit, None);
     journal.commit(&original).await.unwrap();
@@ -533,14 +532,11 @@ async fn terminal_masks_active_cancel_but_preserves_conflict_in_every_scope(pool
     own_terminal.client_order_id = link.client_order_id.clone();
     assert!(f.ledger.record_order(&own_terminal, &link, seen(1)).await.unwrap().changed);
     let masked = checkpoint(&pool, s, "terminal-masks-active-retains-conflict", (0, 0), None).await;
-    assert_eq!(
-        masked.cancels(),
-        Cancels {
-            grouped: Liability { active: 0, conflicts: 1 },
-            ungroupable: all_conflicting,
-            unbound: all_conflicting,
-        }
-    );
+    assert_eq!(masked.cancels(), Cancels {
+        grouped: Liability { active: 0, conflicts: 1 },
+        ungroupable: all_conflicting,
+        unbound: all_conflicting,
+    });
 
     // Even recognized terminal evidence on an unowned SELL cannot be
     // attributed to either leg. Its unresolved conflict is shared by symbol.
@@ -557,13 +553,10 @@ async fn terminal_masks_active_cancel_but_preserves_conflict_in_every_scope(pool
     let sibling_hot =
         checkpoint(&pool, other, "sibling-shares-account-and-symbol", (0, 1), None).await;
     assert_eq!(sibling_hot.sells().symbol, all_conflicting);
-    assert_eq!(
-        sibling_hot.cancels(),
-        Cancels {
-            unbound: all_conflicting,
-            ..Cancels::default()
-        }
-    );
+    assert_eq!(sibling_hot.cancels(), Cancels {
+        unbound: all_conflicting,
+        ..Cancels::default()
+    });
 }
 
 #[path = "sell_scale_tests.rs"]

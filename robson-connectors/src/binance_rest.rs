@@ -299,8 +299,9 @@ impl BinanceRestClient {
         );
         let (transport, request) =
             transport.get(url).header("X-MBX-APIKEY", &self.api_key).build_split();
-        let request = request
-            .map_err(|_| BinanceRestError::Refused("commission request construction failed".into()))?;
+        let request = request.map_err(|_| {
+            BinanceRestError::Refused("commission request construction failed".into())
+        })?;
         Ok((transport, request))
     }
 
@@ -2293,11 +2294,12 @@ mod tests {
     #[tokio::test]
     async fn commission_signer_rejects_a_stored_builder_error_before_send() {
         let client = BinanceRestClient::new("invalid\nfixture-key".into(), "fixture-secret".into());
-        let result = client.bind_spot_commission(single_shot().unwrap(), "BTCUSDT", 1_800_000_000_000);
+        let result =
+            client.bind_spot_commission(single_shot().unwrap(), "BTCUSDT", 1_800_000_000_000);
         match result {
             Err(BinanceRestError::Refused(detail)) => {
                 assert_eq!(detail, "commission request construction failed");
-            }
+            },
             _ => panic!("an invalid fixture header should fail before constructing a send future"),
         }
     }
@@ -2311,7 +2313,10 @@ mod tests {
         use sha2::{Digest, Sha256};
         let goldens = [
             ("    fn build_signed_query(", BUILD_SIGNED_QUERY),
-            ("    pub(crate) fn bind_spot_commission(", "a1c0ee8006959b079a865bd367aa591229781bf02ab3870c799e92a377667c87"),
+            (
+                "    pub(crate) fn bind_spot_commission(",
+                "a1c0ee8006959b079a865bd367aa591229781bf02ab3870c799e92a377667c87",
+            ),
             ("    async fn legacy_answer(&self, request: RequestBuilder)", ANSWER),
             ("    async fn exchange(&self, request: RequestBuilder)", EXCHANGE),
             ("    fn pass_gate(&self, method: &str, endpoint: &str)", PASS_GATE),

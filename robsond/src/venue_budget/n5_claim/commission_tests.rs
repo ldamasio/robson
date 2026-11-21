@@ -1,7 +1,8 @@
 #![cfg(all(test, feature = "crash-points"))]
 
-//! Native test composition with a real loopback venue and a disposable SQLx database.
-//! The registered prior claims are fixture data, not startup or recovery evidence.
+//! Native test composition with a real loopback venue and a disposable SQLx
+//! database. The registered prior claims are fixture data, not startup or
+//! recovery evidence.
 
 use std::{
     fmt::Write,
@@ -37,21 +38,20 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::{
+    super::{
+        cold_load::{self, fixture_manifest, ReceiptState, Registration},
+        ClaimIdentity, ClaimResult, FrequencyKey, PriorClaim, PriorEligibility, Trace,
+    },
+    content_digest, CommissionOwner, CostIdentity, RefreshOutcome, VerifiedCommissionAccount,
+    WIRE_LIMIT,
+};
 use crate::{
     process_epoch::{self, Epoch},
     venue_budget::{self, bootstrap, restore, state::SharedBudget},
     venue_clock_http::TimeError,
     venue_clock_owner::ClockOwner,
     venue_clock_store::ClockSampleStore,
-};
-
-use super::super::{
-    cold_load::{self, fixture_manifest, ReceiptState, Registration},
-    ClaimIdentity, ClaimResult, FrequencyKey, PriorClaim, PriorEligibility, Trace,
-};
-use super::{
-    content_digest, CommissionOwner, CostIdentity, RefreshOutcome, VerifiedCommissionAccount,
-    WIRE_LIMIT,
 };
 
 impl VerifiedCommissionAccount {
@@ -723,13 +723,10 @@ async fn signed_writer(pool: PgPool, base_url: &str) -> anyhow::Result<WriteRepo
     .bind(tenant)
     .fetch_one(&pool)
     .await?;
-    process_epoch::mark_clean_stop(
-        &pool,
-        Epoch {
-            epoch_id: predecessor.0,
-            epoch_seq: predecessor.1,
-        },
-    )
+    process_epoch::mark_clean_stop(&pool, Epoch {
+        epoch_id: predecessor.0,
+        epoch_seq: predecessor.1,
+    })
     .await
     .map_err(|_| anyhow!("fixture predecessor stop marker"))?;
     let start = process_epoch::start_epoch(&pool, tenant, "N5-loopback").await?;

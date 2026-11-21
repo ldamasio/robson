@@ -1,13 +1,14 @@
+use std::time::{Duration, Instant};
+
+use rust_decimal::Decimal;
+use serde_json::Value;
+
 use super::{
     batch, cold_cancels, cold_sells, empty_budget, hot_query, install, linked_sell, scope, seen,
     through_proxy_limit, zero_execution_order, Cancels, Fixture, IntentKind, JournalBackend,
     LegOrderKind, Liability, OrderKey, OrderOwner, OrderPhase, PgJournalBackend, PgPool,
     ProtectionKind, Scope, Sells, TradeFill, TradePage, HOT,
 };
-use rust_decimal::Decimal;
-use serde_json::Value;
-use std::time::{Duration, Instant};
-
 use crate::reader::Snapshot;
 
 const STOP_ID: &str = "900001";
@@ -60,7 +61,8 @@ fn explain_rows(node: &Value, field: &str) -> u64 {
 }
 
 async fn measure(pool: &PgPool, s: Scope, expected_closed: i64) {
-    // The history inventory and its joins are fixture assertions outside the timed query.
+    // The history inventory and its joins are fixture assertions outside the timed
+    // query.
     let (closed, venue_rows, intent_rows): (i64, i64, i64) = sqlx::query_as(
         "SELECT (
              SELECT count(*) FROM venue_orders o JOIN order_intents j ON j.intent_id=o.intent_id
@@ -90,13 +92,10 @@ async fn measure(pool: &PgPool, s: Scope, expected_closed: i64) {
     .unwrap();
     let sells = cold_sells(&cold);
     let cancels = cold_cancels(&cold);
-    assert_eq!(
-        sells,
-        Sells {
-            leg: Liability { active: 1, conflicts: 0 },
-            ..Sells::default()
-        }
-    );
+    assert_eq!(sells, Sells {
+        leg: Liability { active: 1, conflicts: 0 },
+        ..Sells::default()
+    });
     assert_eq!(cancels, Cancels::default());
     println!(
         "order-set closed_history={closed} exhausted_cold_ms={}",
@@ -128,8 +127,9 @@ async fn measure(pool: &PgPool, s: Scope, expected_closed: i64) {
     assert_eq!(proxy.query_trace_dropped(), 0);
     println!("order-set closed_history={closed} hot_sql_per_read=1 query={:?}", trace[0]);
 
-    // EXPLAIN adds real execution and reporting overhead. Its calls are deliberately
-    // outside the proxied application statement measurements and retain default plans.
+    // EXPLAIN adds real execution and reporting overhead. Its calls are
+    // deliberately outside the proxied application statement measurements and
+    // retain default plans.
     for candidate in [STOP_ID, MISSING_ID] {
         let explain = explain_hot(pool, s, candidate).await;
         println!("order-set closed_history={closed} candidate={candidate} explain={explain}");

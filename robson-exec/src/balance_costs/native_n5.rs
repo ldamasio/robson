@@ -1,6 +1,14 @@
 //! Native history evidence and dormant prepared N5 selection. This path
 //! cannot open entry or classify unresolved results as confirmed absence.
 
+use std::{collections::BTreeMap, time::Duration};
+
+use chrono::{DateTime, Utc};
+use robson_store::native_n5::{Observation, ObservedRow, ReadError, MAX_ACTIVE};
+use sha2::{Digest, Sha256};
+use tokio::time::Instant;
+use uuid::Uuid;
+
 use super::{
     retained_n5::decode_retained, CostCandidate, CostIdentity, EvidenceIdentity,
     COST_VALIDATION_VERSION,
@@ -10,12 +18,6 @@ use crate::{
     venue::VenueId,
     venue_clock::{ClockDomain, ClockError, NativeClock, TickCapture},
 };
-use chrono::{DateTime, Utc};
-use robson_store::native_n5::{Observation, ObservedRow, ReadError, MAX_ACTIVE};
-use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, time::Duration};
-use tokio::time::Instant;
-use uuid::Uuid;
 
 pub const DAY_NS: u128 = 86_400_000_000_000;
 pub const HANDOFF_NS: u128 = 60_000_000_000;

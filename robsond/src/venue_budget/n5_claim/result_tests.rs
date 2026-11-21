@@ -1,23 +1,26 @@
 #![cfg(test)]
 
-//! Native witnesses for the dormant result sink and its exact persisted receipt.
-use super::super::result::{
-    confirm_result_once, publish_result, PreparedSnapshot, Publication, ResultRequest,
-};
-use super::{
-    assert_claim_sql, assert_confirm_sql, assert_native_claim, claim, deadline, seed, snapshot,
-    tick, unchanged_row, BudgetError, ClaimIdentity, ClaimObservation, ClaimOutcome, ClaimRequest,
-    ClaimResult, ClockDomain, Measured, PriorClaim, PriorEligibility, ProxyMode, Trace, DAY,
-};
+//! Native witnesses for the dormant result sink and its exact persisted
+//! receipt.
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use robson_connectors::binance::spot::SpotCommission;
 use robson_domain::Symbol;
 use robson_exec::{balance_costs::CostIdentity, venue::VenueId, venue_clock::TickCapture};
 use serde_json::json;
 use sqlx::{PgPool, Row};
-use std::time::Duration;
 use tokio::time::{sleep, timeout, Instant};
 use uuid::Uuid;
+
+use super::{
+    super::result::{
+        confirm_result_once, publish_result, PreparedSnapshot, Publication, ResultRequest,
+    },
+    assert_claim_sql, assert_confirm_sql, assert_native_claim, claim, deadline, seed, snapshot,
+    tick, unchanged_row, BudgetError, ClaimIdentity, ClaimObservation, ClaimOutcome, ClaimRequest,
+    ClaimResult, ClockDomain, Measured, PriorClaim, PriorEligibility, ProxyMode, Trace, DAY,
+};
 
 const UID: u64 = u64::MAX;
 const SCOPE: &str = "bounded-result-fixture";
@@ -336,20 +339,17 @@ async fn terminal_non_success_preserves_snapshot_and_late_replay_cannot_overwrit
         captured: offset(request.handoff.unwrap(), DAY, 0),
         audit_at: request.claim.identity.audit_at + chrono::Duration::days(1),
     };
-    let claim = stored_claim(
-        &pool,
-        ClaimRequest {
-            key: request.key.clone(),
-            prior: PriorClaim {
-                revision: request.claim.revision,
-                identity: request.claim.identity.clone(),
-                eligibility: PriorEligibility::SameDomain,
-                handoff: request.handoff,
-                result: Some(request.conclusion),
-            },
-            next,
+    let claim = stored_claim(&pool, ClaimRequest {
+        key: request.key.clone(),
+        prior: PriorClaim {
+            revision: request.claim.revision,
+            identity: request.claim.identity.clone(),
+            eligibility: PriorEligibility::SameDomain,
+            handoff: request.handoff,
+            result: Some(request.conclusion),
         },
-    )
+        next,
+    })
     .await;
     let no_send = ResultRequest {
         key: request.key.clone(),

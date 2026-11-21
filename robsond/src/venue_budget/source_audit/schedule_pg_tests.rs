@@ -10,8 +10,10 @@ use robson_testkit::db_proxy::{
 use sqlx::postgres::{PgPoolOptions, PgSslMode};
 use tokio::time::timeout;
 
-use super::super::run::{Fault, Phase};
-use super::*;
+use super::{
+    super::run::{Fault, Phase},
+    *,
+};
 
 #[path = "terminal_schedule_pg_tests.rs"]
 mod terminal;

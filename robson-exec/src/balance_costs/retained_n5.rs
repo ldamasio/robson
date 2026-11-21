@@ -161,19 +161,15 @@ impl FeeFields {
         if self.symbol != identity.symbol().as_pair() {
             return Err(CostError::Identity);
         }
-        CostCandidate::commission(
-            identity,
-            as_of,
-            CommissionComponents {
-                standard: self.standard_commission.exact()?,
-                tax: self.tax_commission.exact()?,
-                special: self.special_commission.exact()?,
-                enabled_for_account: self.discount.enabled_for_account,
-                enabled_for_symbol: self.discount.enabled_for_symbol,
-                discount: self.discount.discount.parse().map_err(|_| CostError::Rate)?,
-                discount_asset: self.discount.discount_asset.clone(),
-            },
-        )
+        CostCandidate::commission(identity, as_of, CommissionComponents {
+            standard: self.standard_commission.exact()?,
+            tax: self.tax_commission.exact()?,
+            special: self.special_commission.exact()?,
+            enabled_for_account: self.discount.enabled_for_account,
+            enabled_for_symbol: self.discount.enabled_for_symbol,
+            discount: self.discount.discount.parse().map_err(|_| CostError::Rate)?,
+            discount_asset: self.discount.discount_asset.clone(),
+        })
     }
 }
 

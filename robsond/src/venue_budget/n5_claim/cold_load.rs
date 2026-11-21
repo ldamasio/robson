@@ -1,5 +1,8 @@
 //! Adapter for the dormant native N5 read and exec-owned history validation.
-use super::{BudgetError, Trace, STORE_LIMIT};
+#[cfg(all(test, feature = "crash-points"))]
+pub(super) use robson_exec::balance_costs::native_n5::{
+    fixture_manifest, ReceiptState, Registration,
+};
 use robson_exec::{
     balance_costs::{
         native_n5::{verify_history, HistoryError, VerifiedHistory},
@@ -11,10 +14,7 @@ use robson_store::native_n5::{self, Observation, MAX_ACTIVE};
 use sqlx::PgPool;
 use tokio::time::Instant;
 
-#[cfg(all(test, feature = "crash-points"))]
-pub(super) use robson_exec::balance_costs::native_n5::{
-    fixture_manifest, ReceiptState, Registration,
-};
+use super::{BudgetError, Trace, STORE_LIMIT};
 
 pub(super) async fn load(
     pool: &PgPool,

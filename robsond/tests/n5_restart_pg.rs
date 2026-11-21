@@ -12,6 +12,7 @@ use std::{
 };
 
 use chrono::{DateTime, TimeZone, Utc};
+use fixture::{advance_unresolved, seed_empty, seed_registry, seed_success};
 use robson_domain::value_objects::Symbol;
 use robson_exec::{
     balance_costs::{
@@ -27,8 +28,6 @@ use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, PgPool};
 use tokio::process::Command;
 use uuid::Uuid;
-
-use fixture::{advance_unresolved, seed_empty, seed_registry, seed_success};
 
 const LOAD_SQL: &str = include_str!("n5_restart_pg/load.sql");
 const MAX_KEYS: usize = 4096;
@@ -282,19 +281,15 @@ fn candidate(req: &RequestKey, data: Payload) -> Result<CostCandidate, Refusal> 
         symbol,
     )
     .map_err(|_| Refusal::Receipt)?;
-    CostCandidate::commission(
-        identity,
-        data.as_of,
-        CommissionComponents {
-            standard: data.standard,
-            tax: data.tax,
-            special: data.special,
-            enabled_for_account: data.enabled_for_account,
-            enabled_for_symbol: data.enabled_for_symbol,
-            discount: data.discount,
-            discount_asset: data.discount_asset,
-        },
-    )
+    CostCandidate::commission(identity, data.as_of, CommissionComponents {
+        standard: data.standard,
+        tax: data.tax,
+        special: data.special,
+        enabled_for_account: data.enabled_for_account,
+        enabled_for_symbol: data.enabled_for_symbol,
+        discount: data.discount,
+        discount_asset: data.discount_asset,
+    })
     .map_err(|_| Refusal::Receipt)
 }
 

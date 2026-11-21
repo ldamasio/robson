@@ -231,13 +231,10 @@ pub(super) fn rebuild_sell<'a>(
         let order = order_by_journal.get(&journal.intent_id).copied();
         let attempt = attempt_by_client.get(journal.client_order_id.as_str()).copied();
         if let Some(contribution) = journal_contribution(journal, order, attempt, scope) {
-            projection.intents.insert(
-                journal.intent_id,
-                SellIntent {
-                    source_position: journal.position_id,
-                    contribution,
-                },
-            );
+            projection.intents.insert(journal.intent_id, SellIntent {
+                source_position: journal.position_id,
+                contribution,
+            });
             projection.add(contribution)?;
         }
     }

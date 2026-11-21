@@ -1,10 +1,3 @@
-use super::{
-    audit, batch,
-    fixture::{backend_pid, retired, through_proxy_limit, unowned},
-    linked_sell,
-    reader::Scope,
-    scope, seen, zero_execution_order, Fixture,
-};
 use robson_exec::{
     order_journal::{IntentKind, JournalBackend, JournalBatch, OutcomeRow, VenueOutcome},
     venue::OrderPhase,
@@ -14,6 +7,14 @@ use robson_testkit::db_proxy::ProxyMode;
 use robsond::{order_journal_store::PgJournalBackend, venue_ledger_store::PgVenueLedger};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+use super::{
+    audit, batch,
+    fixture::{backend_pid, retired, through_proxy_limit, unowned},
+    linked_sell,
+    reader::Scope,
+    scope, seen, zero_execution_order, Fixture,
+};
 
 async fn install(pool: &PgPool) {
     sqlx::raw_sql(include_str!("cancel_shadow.sql")).execute(pool).await.unwrap();
@@ -278,10 +279,11 @@ async fn cancel_shadow_keeps_wrong_targets_and_contradictions_unresolved(pool: P
     terminal.client_order_id = link.client_order_id.clone();
     f.ledger.record_order(&terminal, &link, seen(1)).await.unwrap();
     assert_eq!(group(&pool, s, "500").await, (1, 1, true));
-    assert_eq!(
-        members(&pool, s, "500").await,
-        [(contradictions[0].intent.intent_id, true, true)]
-    );
+    assert_eq!(members(&pool, s, "500").await, [(
+        contradictions[0].intent.intent_id,
+        true,
+        true
+    )]);
     assert_leg(&pool, s, (4, 1)).await;
 }
 

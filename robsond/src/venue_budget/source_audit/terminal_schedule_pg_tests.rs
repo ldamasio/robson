@@ -1,7 +1,6 @@
 //! The private terminal audit's native wire and concurrent successor controls.
-use crate::venue_budget::source_audit::run::{finish_audit, Terminal};
-
 use super::*;
+use crate::venue_budget::source_audit::run::{finish_audit, Terminal};
 
 async fn lock_original_venue(
     pool: &PgPool,
@@ -57,14 +56,11 @@ async fn terminal_status(
 }
 
 async fn populate_terminal_cut(pool: &PgPool) -> anyhow::Result<()> {
-    let tenant = seed(
-        pool,
-        &[
-            (1, "binance:spot"),
-            (3, "binance:spot"),
-            (5, "binance:usdm"),
-        ],
-    )
+    let tenant = seed(pool, &[
+        (1, "binance:spot"),
+        (3, "binance:spot"),
+        (5, "binance:usdm"),
+    ])
     .await?;
     project_healthy_spot(pool, tenant).await
 }

@@ -7,8 +7,8 @@ use proptest::{
     strategy::{Strategy, ValueTree},
     test_runner::{Config, RngSeed, TestRunner},
 };
-use robson_exec::order_journal::JournalBatch;
 use robson_exec::{
+    order_journal::JournalBatch,
     venue::ProtectionKind,
     venue_ledger::{LegOrderKind, OrderOwner},
 };
@@ -17,22 +17,21 @@ use rust_decimal::Decimal;
 use tokio::time::timeout;
 
 use self::ready::{
-    initialize, initialize_at, probe, relation_nodes, statement, Keys, ProjectionReady, ReplayOrder, Stage,
-    ORDER_SET_COLUMNS,
+    initialize, initialize_at, probe, relation_nodes, statement, Keys, ProjectionReady,
+    ReplayOrder, Stage, ORDER_SET_COLUMNS,
 };
-use super::sell_nested_work_tests::seed_history;
 use super::{
     audit, batch, cancel_conflict, cold_cancels, cold_sells, empty_budget, linked_sell, scope,
-    seen, terminal, through_proxy_limit, unowned, zero_execution_order, AttemptRow, Fixture, Hot,
-    IntentKind, JournalBackend, OrderPhase, OutcomeRow, PgJournalBackend, PgPool, Scope, Uuid,
-    VenueOutcome,
+    seen, sell_nested_work_tests::seed_history, terminal, through_proxy_limit, unowned,
+    zero_execution_order, AttemptRow, Fixture, Hot, IntentKind, JournalBackend, OrderPhase,
+    OutcomeRow, PgJournalBackend, PgPool, Scope, Uuid, VenueOutcome,
 };
 use crate::fixture::retired;
 
-#[path = "initialized_fixture.rs"]
-mod ready;
 #[path = "late_member_tests.rs"]
 mod late_member_tests;
+#[path = "initialized_fixture.rs"]
+mod ready;
 
 #[derive(Debug, sqlx::FromRow)]
 struct InitializedOrderSet {
@@ -72,11 +71,9 @@ async fn measure_candidate_read(
     history: i64,
 ) -> anyhow::Result<()> {
     // Default PostgreSQL plans, measured after collecting real fixture statistics.
-    sqlx::raw_sql(
-        "ANALYZE venue_orders, order_intents, sell_shadow_orders, cancel_shadow_groups",
-    )
-    .execute(pool)
-    .await?;
+    sqlx::raw_sql("ANALYZE venue_orders, order_intents, sell_shadow_orders, cancel_shadow_groups")
+        .execute(pool)
+        .await?;
     let (venue_rows, intent_rows, active_members, cancel_groups): (i64, i64, i64, i64) =
         sqlx::query_as(
             "SELECT (SELECT count(*) FROM venue_orders),
@@ -90,10 +87,8 @@ async fn measure_candidate_read(
     let sql = candidate_statement();
     for (candidate, present) in [("1000", true), ("99000001", false)] {
         let before = proxy.stats().statements;
-        let read: CandidateOrderSet = ready
-            .query_as(&sql, keys(scope), Some(candidate))
-            .fetch_one(actor)
-            .await?;
+        let read: CandidateOrderSet =
+            ready.query_as(&sql, keys(scope), Some(candidate)).fetch_one(actor).await?;
         ensure!(proxy.stats().statements - before == 1);
         ensure!(proxy.query_trace().last() == Some(&sql));
         ensure!(read.set.facts.stop_id.as_deref() == present.then_some(candidate));
@@ -127,7 +122,11 @@ async fn measure_candidate_read(
                 ensure!(rows + removed <= u64::try_from(inventory)?, "{relation}: {node}");
             }
         }
-        for relation in ["cancel_shadow_members", "sell_shadow_intents", "submit_attempts"] {
+        for relation in [
+            "cancel_shadow_members",
+            "sell_shadow_intents",
+            "submit_attempts",
+        ] {
             let mut nodes = Vec::new();
             relation_nodes(plan, relation, &mut nodes);
             ensure!(nodes.is_empty(), "unexpected historical {relation} read: {plan}");

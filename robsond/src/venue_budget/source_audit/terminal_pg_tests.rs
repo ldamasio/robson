@@ -1,9 +1,8 @@
 //! Terminal outcome and reverse charge closure on native M38/M40 fixtures.
+use super::*;
 use crate::venue_budget::source_audit::run::{
     finish_audit, Fault, Inconsistency, Phase, Terminal, Witness,
 };
-
-use super::*;
 
 async fn final_run(pool: &PgPool, trace: &Trace) -> anyhow::Result<Run> {
     let mut run = start(pool, Uuid::now_v7(), envelope()?, trace)
@@ -19,14 +18,11 @@ async fn final_run(pool: &PgPool, trace: &Trace) -> anyhow::Result<Run> {
 }
 
 async fn populate(pool: &PgPool) -> anyhow::Result<Uuid> {
-    let tenant = seed(
-        pool,
-        &[
-            (1, "binance:spot"),
-            (3, "binance:spot"),
-            (5, "binance:usdm"),
-        ],
-    )
+    let tenant = seed(pool, &[
+        (1, "binance:spot"),
+        (3, "binance:spot"),
+        (5, "binance:usdm"),
+    ])
     .await?;
     project_healthy_spot(pool, tenant).await?;
     Ok(tenant)

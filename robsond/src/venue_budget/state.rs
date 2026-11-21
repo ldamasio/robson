@@ -163,7 +163,8 @@ impl SharedBudget {
         epoch: uuid::Uuid,
         admit_clock: impl FnOnce() -> Result<TickCapture, BudgetError>,
         poll: impl FnOnce() -> std::task::Poll<reqwest::Result<reqwest::Response>>,
-    ) -> Result<(TickCapture, std::task::Poll<reqwest::Result<reqwest::Response>>), BudgetError> {
+    ) -> Result<(TickCapture, std::task::Poll<reqwest::Result<reqwest::Response>>), BudgetError>
+    {
         if !Arc::ptr_eq(&self.0, &pending.0.owner.0) {
             return Err(BudgetError::Invalid);
         }

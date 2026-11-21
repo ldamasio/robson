@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use robson_connectors::binance::spot::SpotCommission;
+pub(super) use robson_exec::balance_costs::retained_n5::MAX_RESPONSE_BYTES;
 use robson_exec::{
     balance_costs::{
         retained_n5::{encode_retained, RetentionError},
@@ -12,8 +13,6 @@ use robson_exec::{
 };
 
 use super::{result::PreparedSnapshot, ClaimResult};
-
-pub(super) use robson_exec::balance_costs::retained_n5::MAX_RESPONSE_BYTES;
 
 pub(super) fn prepare_response(
     body: &[u8],

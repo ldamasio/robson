@@ -1,5 +1,6 @@
 //! Pure CANCEL reconstruction for the bounded, validated cold Spot source cut.
-//! The audit owns account binding and verification of both named-edge directions.
+//! The audit owns account binding and verification of both named-edge
+//! directions.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -124,8 +125,9 @@ fn terminal_group<'a>(
     })
 }
 
-/// Rebuild five sparse leaf sets for one validated tenant, Spot venue and account.
-/// `remaining_leaf_rows` is the shared ten-table budget minus the other leaves.
+/// Rebuild five sparse leaf sets for one validated tenant, Spot venue and
+/// account. `remaining_leaf_rows` is the shared ten-table budget minus the
+/// other leaves.
 pub(super) fn rebuild_cancel<'a>(
     tenant_id: Uuid,
     account_scope: &str,
@@ -208,16 +210,13 @@ pub(super) fn rebuild_cancel<'a>(
             || (intent.not_sent
                 && (intent.venue_outcome.is_some() || intent.venue_evidence_present));
         let pending = !intent.not_sent || conflict;
-        leaves.members.insert(
-            intent.intent_id,
-            CancelMember {
-                source_position: intent.position_id,
-                leg,
-                target_id,
-                pending,
-                conflict,
-            },
-        );
+        leaves.members.insert(intent.intent_id, CancelMember {
+            source_position: intent.position_id,
+            leg,
+            target_id,
+            pending,
+            conflict,
+        });
 
         match (leg, target_id) {
             (Some(leg), Some(target_id)) => {

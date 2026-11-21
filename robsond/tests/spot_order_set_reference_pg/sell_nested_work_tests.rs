@@ -1,14 +1,16 @@
 //! Native plan instrumentation for actual projection writers. The normal wire
 //! and latency controls run separately from these auto_explain samples.
 
+use std::time::Duration;
+
+use robson_testkit::db_proxy::DbProxy;
+use sqlx::{postgres::PgPoolOptions, PgPool};
+
 use super::{
     batch, empty_budget, hot_query, install, linked_sell, scope, seen, through_proxy_limit,
     unowned, zero_execution_order, AttemptRow, Fixture, IntentKind, JournalBackend, OrderPhase,
     OutcomeRow, PgJournalBackend, PgVenueLedger, Scope, Uuid, VenueOutcome,
 };
-use robson_testkit::db_proxy::DbProxy;
-use sqlx::{postgres::PgPoolOptions, PgPool};
-use std::time::Duration;
 
 const PROJECTION_HEAD: &str = "3aab1ef77d6315a35c6489f6d5293c3e23fb3811";
 const TARGET: &str = "800001";

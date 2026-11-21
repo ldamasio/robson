@@ -1,7 +1,6 @@
 //! End-to-end timing through the healthy historical envelope on disposable PG.
-use crate::venue_budget::source_audit::run::{finish_audit, Terminal, TERMINAL};
-
 use super::*;
+use crate::venue_budget::source_audit::run::{finish_audit, Terminal, TERMINAL};
 
 const SOURCE_ROWS: i64 = 1_000_000;
 

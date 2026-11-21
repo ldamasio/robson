@@ -90,14 +90,11 @@ async fn generation(pool: &PgPool, f: &Fixture) -> Result<JournalGeneration> {
 }
 
 fn linked(f: &Fixture, order: u64, intent: Uuid) -> OrderLink {
-    f.link(
-        order,
-        OrderOwner::Leg {
-            position_id: f.position,
-            intent_id: intent,
-            kind: LegOrderKind::Sell,
-        },
-    )
+    f.link(order, OrderOwner::Leg {
+        position_id: f.position,
+        intent_id: intent,
+        kind: LegOrderKind::Sell,
+    })
 }
 
 async fn version(pool: &PgPool, b: &JournalGeneration) -> Result<i64> {

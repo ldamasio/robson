@@ -849,10 +849,10 @@ async fn r2_seed_native_edge(
     })
 }
 
-use super::super::cold_owner::{
-    capture, AnchorDefect, OwnerRequest, PriorGeneration, RestoreIdentity,
+use super::super::{
+    cold_owner::{capture, AnchorDefect, OwnerRequest, PriorGeneration, RestoreIdentity},
+    cold_source::Edge,
 };
-use super::super::cold_source::Edge;
 
 fn r2_request<'a>(tenant: Uuid, epoch: Uuid, version: i64, uid: &'a str) -> OwnerRequest<'a> {
     OwnerRequest {
@@ -1694,12 +1694,13 @@ async fn r2_local_entry(
     g: &super::super::JournalGeneration,
     position: Uuid,
 ) -> Result<robson_exec::order_journal::JournalBatch> {
+    use std::sync::Arc;
+
     use chrono::{NaiveDate, Utc};
     use robson_exec::order_journal::{
         AdmissionRow, BalanceBatch, IntentKind, IntentRow, JournalBatch,
     };
     use rust_decimal::Decimal;
-    use std::sync::Arc;
     let ledger = crate::venue_ledger_store::PgVenueLedger::new(pool, g.tenant_id);
     let venue = robson_exec::venue::VenueId::new("binance:spot");
     let id = Uuid::now_v7();

@@ -1,6 +1,6 @@
-//! Receipt-age boundary. The dormant 8h native proof has a private implementation.
-//! No wall clock, process-start timestamp or caller-supplied duration can
-//! qualify a receipt through this public API.
+//! Receipt-age boundary. The dormant 8h native proof has a private
+//! implementation. No wall clock, process-start timestamp or caller-supplied
+//! duration can qualify a receipt through this public API.
 
 use std::time::Duration;
 
@@ -48,7 +48,8 @@ impl AgeInterval {
 
 /// Synchronous selection-time assessment; no cached proof supplied by a caller.
 /// Implementing the private supertrait is reserved to receipt authorities in
-/// this crate. The dormant native positive-evidence path never confirms absence.
+/// this crate. The dormant native positive-evidence path never confirms
+/// absence.
 ///
 /// ```compile_fail
 /// use robson_exec::balance_costs::{AgeError, AgeInterval, CostAgeAuthority, CostIdentity, EvidenceIdentity};

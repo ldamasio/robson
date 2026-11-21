@@ -543,8 +543,9 @@ fn clock_references(text: &str) -> impl Iterator<Item = &str> {
 
 fn n5_reference_lines(path: &Path) -> &'static [&'static str] {
     match path.to_str() {
-        Some("robson-exec/src/balance_costs/terms.rs") =>
-            &[r#"const API_SOURCE: &str = "binance:spot /api/v3/account/commission";"#],
+        Some("robson-exec/src/balance_costs/terms.rs") => {
+            &[r#"const API_SOURCE: &str = "binance:spot /api/v3/account/commission";"#]
+        },
         Some("robson-testkit/src/fake_spot_venue_tests.rs") => &[
             r#"let (status, _) = get(&venue, "/api/v3/account/commission", "symbol=BTCUSDT&timestamp=1").await;"#,
             r#"&& unserved[1].starts_with("GET /api/v3/account/commission?")"#,
@@ -1117,10 +1118,14 @@ fn the_commission_transport_allowance_rejects_changed_send_or_client() {
     for (before, after) in [
         ("single_shot()?", "reqwest::Client::new()"),
         ("bind_spot_commission", "bind_spot_order"),
-        ("self.transport.execute(self.request)", "self.transport.clone().execute(self.request)"),
+        (
+            "self.transport.execute(self.request)",
+            "self.transport.clone().execute(self.request)",
+        ),
     ] {
         assert!(original.contains(before));
-        assert!(!prepared_commission_mutation_violations(&original.replacen(before, after, 1)).is_empty());
+        assert!(!prepared_commission_mutation_violations(&original.replacen(before, after, 1))
+            .is_empty());
     }
 }
 

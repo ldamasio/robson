@@ -267,17 +267,14 @@ impl PreparedFirstCancel<'_> {
         }
         bridge
             .backend
-            .commit_first_cancel(
-                intent,
-                TransitionWrite {
-                    symbol: self.symbol,
-                    kind,
-                    target_trigger,
-                    reason,
-                    expected_accounting_version: self.observed_accounting_version,
-                    expected_transition: self.expected_transition,
-                },
-            )
+            .commit_first_cancel(intent, TransitionWrite {
+                symbol: self.symbol,
+                kind,
+                target_trigger,
+                reason,
+                expected_accounting_version: self.observed_accounting_version,
+                expected_transition: self.expected_transition,
+            })
             .await
             .map_err(Refusal::Write)
     }
@@ -589,13 +586,10 @@ async fn prepared_first_cancel_bridge_new_and_existing_open(pool: PgPool) -> Res
         let prepared = bridge.prepare(&intent, SYMBOL).await.map_err(|r| anyhow!("{r:?}"))?;
         assert_trace(&wire, &[READ]);
         assert_eq!(prepared.observed_accounting_version, version);
-        assert_eq!(
-            prepared.target_intent,
-            match leg.stop_link.owner {
-                OrderOwner::Leg { intent_id, .. } => intent_id,
-                _ => unreachable!(),
-            }
-        );
+        assert_eq!(prepared.target_intent, match leg.stop_link.owner {
+            OrderOwner::Leg { intent_id, .. } => intent_id,
+            _ => unreachable!(),
+        });
         let transition = match (existing, prepared.expected_transition) {
             (Some(open), ExpectedTransition::ExistingOpen(id)) if id == open => id,
             (None, ExpectedTransition::New(id)) if !id.is_nil() => id,
@@ -606,14 +600,11 @@ async fn prepared_first_cancel_bridge_new_and_existing_open(pool: PgPool) -> Res
                 .write(&bridge, &intent, TransitionKind::Replace, Decimal::new(96, 0), "bridge")
                 .await,
         )?;
-        assert_eq!(
-            stored,
-            StoredFirstCancel {
-                transition_id: transition,
-                intent_id: intent.intent_id,
-                accounting_version: version + 1,
-            }
-        );
+        assert_eq!(stored, StoredFirstCancel {
+            transition_id: transition,
+            intent_id: intent.intent_id,
+            accounting_version: version + 1,
+        });
         let transition_sql = if existing.is_some() {
             "UPDATE balance_transitions"
         } else {
