@@ -213,6 +213,7 @@ impl PgJournalBackend {
 
     /// The one maintenance statement after the original source effects, in
     /// the same transaction and under the original deadline.
+    #[allow(clippy::too_many_arguments)]
     async fn maintain_order_set(
         &self,
         generation: &JournalGeneration,
@@ -229,7 +230,7 @@ impl PgJournalBackend {
                 JournalPrior::Sell { potential, conflict },
             ) => {
                 maintain_unbound_journal(
-                    &mut **tx,
+                    tx,
                     generation,
                     version,
                     &batch.intent,
@@ -239,15 +240,8 @@ impl PgJournalBackend {
                 .await
             },
             (IntentKind::Cancel, JournalPrior::Cancel { pending, conflict }) => {
-                maintain_cancel_outcome(
-                    &mut **tx,
-                    generation,
-                    version,
-                    &batch.intent,
-                    pending,
-                    conflict,
-                )
-                .await
+                maintain_cancel_outcome(tx, generation, version, &batch.intent, pending, conflict)
+                    .await
             },
             (IntentKind::Entry, JournalPrior::Entry { birth }) => {
                 let Some(admission) = batch.balance.as_ref().and_then(|b| b.admission.as_ref())
@@ -257,7 +251,7 @@ impl PgJournalBackend {
                     ));
                 };
                 maintain_entry_admission(
-                    &mut **tx,
+                    tx,
                     generation,
                     version,
                     &batch.intent,

@@ -37,6 +37,7 @@ pub(super) struct ResultRequest {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(super) enum Publication {
     Published,
     Replayed,

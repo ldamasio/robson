@@ -236,7 +236,7 @@ async fn traverse(
             }
             None
         },
-        Some(request) => Some(read_anchor(&mut *tx, request).await?),
+        Some(request) => Some(read_anchor(&mut tx, request).await?),
     };
     statements += 1;
     let edges = owner.is_some();
@@ -259,7 +259,7 @@ async fn traverse(
     let mut intents = Walk::new(Family::Intents, budget.intents);
     loop {
         let after = intents.cursor().map(client_order);
-        let page = read_intent_page(&mut *tx, account_scope, tenant, after)
+        let page = read_intent_page(&mut tx, account_scope, tenant, after)
             .await
             .map_err(db(*stage))?;
         for row in &page.rows {
@@ -287,7 +287,7 @@ async fn traverse(
     let mut attempts = Walk::new(Family::Attempts, budget.attempts);
     loop {
         let after = attempts.cursor().map(client_order);
-        let page = read_attempt_page(&mut *tx, account_scope, tenant, after)
+        let page = read_attempt_page(&mut tx, account_scope, tenant, after)
             .await
             .map_err(db(*stage))?;
         for row in &page.rows {
@@ -319,7 +319,7 @@ async fn traverse(
             },
             _ => None,
         };
-        let page = read_order_page(&mut *tx, account_scope, tenant, after)
+        let page = read_order_page(&mut tx, account_scope, tenant, after)
             .await
             .map_err(db(*stage))?;
         for row in &page.rows {
@@ -355,7 +355,7 @@ async fn traverse(
             Some(SourceKey::Route(position)) => Some(*position),
             _ => None,
         };
-        let page = read_route_page(&mut *tx, account_scope, tenant, after)
+        let page = read_route_page(&mut tx, account_scope, tenant, after)
             .await
             .map_err(db(*stage))?;
         for row in &page.rows {

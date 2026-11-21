@@ -971,7 +971,7 @@ async fn local_r1_r3_typed_read_stays_keyed_at_history_and_membership_scale(
             .await
             .map_err(|error| anyhow!("dense policy snapshot: {error:?}"))?;
         assert_trace(&wire, &[READ]);
-        assert_eq!(wire.proxy.query_trace(), [sql.clone()]);
+        assert_eq!(wire.proxy.query_trace(), std::slice::from_ref(&sql));
         if present {
             assert_eq!(observed.r3, protected(10, FeeEvidence::FinalCommission));
         } else {

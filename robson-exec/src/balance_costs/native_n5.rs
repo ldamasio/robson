@@ -131,7 +131,7 @@ pub struct PriorClaim {
 
 pub fn valid_audit_at(audit_at: DateTime<Utc>) -> bool {
     let subsec = audit_at.timestamp_subsec_nanos();
-    subsec < 1_000_000_000 && subsec % 1_000 == 0
+    subsec < 1_000_000_000 && subsec.is_multiple_of(1_000)
 }
 
 pub fn valid_identity(identity: &ClaimIdentity) -> bool {
@@ -260,6 +260,7 @@ pub struct LoadedKey {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum ReceiptState {
     /// Selection and absence are both unproved, including for revision zero.
     Unproven,

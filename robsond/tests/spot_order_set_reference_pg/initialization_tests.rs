@@ -592,7 +592,7 @@ async fn committed_event(
             event.attempts.push(AttemptRow {
                 attempt_id: Uuid::now_v7(),
                 created_at: seen(601).at,
-                rejected_at: (index % 2 == 0).then_some(seen(602).at),
+                rejected_at: index.is_multiple_of(2).then_some(seen(602).at),
             });
             event.outcome = Some(OutcomeRow {
                 venue_outcome: Some(VenueOutcome::Rejected),

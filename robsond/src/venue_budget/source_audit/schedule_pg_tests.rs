@@ -400,7 +400,7 @@ async fn held_commit(pool: &PgPool, cancel: bool) -> anyhow::Result<()> {
     let commit_sent = trace
         .iter()
         .any(|text| text.lines().any(|sql| sql.trim().trim_end_matches(';') == "COMMIT"));
-    ensure!(commit_sent == !cancel, "audit trace through original boundary: {trace:?}");
+    ensure!(commit_sent != cancel, "audit trace through original boundary: {trace:?}");
     drop(gate);
     ensure!(control.close().await.map_err(|e| anyhow!("{e:?}"))? == observed);
     Ok(())

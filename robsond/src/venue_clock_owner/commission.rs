@@ -207,7 +207,7 @@ impl ClockOwner {
 
 #[cfg(test)]
 mod tests {
-    use robson_connectors::{binance::spot::PreparedSpotCommission, BinanceRestError};
+    use robson_connectors::BinanceRestError;
 
     use super::{window_allows, ClockOwner, CommissionPreparation};
 
@@ -223,11 +223,10 @@ mod tests {
         }));
         assert!(ClockOwner::retire_commission(&mut refused).await);
         assert!(refused.is_none());
-        let mut panicked: Option<CommissionPreparation> = Some(tokio::task::spawn_blocking(
-            || -> Result<PreparedSpotCommission, BinanceRestError> {
-                panic!("fixture preparation panicked")
-            },
-        ));
+        // The slot's own type fixes the job's output; the Spot type stays
+        // unnamed outside its approved lines.
+        let mut panicked: Option<CommissionPreparation> =
+            Some(tokio::task::spawn_blocking(|| panic!("fixture preparation panicked")));
         assert!(!ClockOwner::retire_commission(&mut panicked).await);
         assert!(panicked.is_none());
     }

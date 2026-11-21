@@ -34,6 +34,7 @@ async fn setup(pool: &PgPool) -> Result<Fixture> {
     Ok(Fixture::new(pool).await)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn journal(
     pool: &PgPool,
     f: &Fixture,

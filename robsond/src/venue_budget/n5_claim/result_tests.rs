@@ -1,4 +1,8 @@
 #![cfg(test)]
+#![allow(
+    clippy::duplicated_attributes,
+    reason = "the Spot inertness scan requires this file's own gate beside its declaration's"
+)]
 
 //! Native witnesses for the dormant result sink and its exact persisted
 //! receipt.

@@ -42,6 +42,10 @@ use crate::{order_journal_store::PgJournalBackend, venue_ledger_store::PgVenueLe
 #[path = "../tests/spot_order_set_reference_pg/initialized_fixture.rs"]
 mod ready;
 
+#[allow(
+    clippy::duplicate_mod,
+    reason = "the shared empty-budget fixture is also loaded by another test module"
+)]
 #[path = "../tests/venue_ledger_schema/empty_budget.rs"]
 mod empty_budget;
 
@@ -918,7 +922,6 @@ async fn prepared_first_cancel_unanswered_commit_blocks_new_reader(pool: PgPool)
     assert!(matches!(result, Err(Refusal::Write(CommitFailure::Uncertain(_)))), "{result:?}");
     wire.retires(&pool).await?;
     assert_eq!(durable(&pool, leg.tenant).await?, before);
-    drop(bridge);
 
     let next_wire = Wire::new(&pool, leg.tenant).await?;
     let next = FirstCancelBridge::new(&ready, &next_wire.store);

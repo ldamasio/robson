@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate as robsond;
 use crate::{process_epoch, spot_order_set_store::JournalGeneration};
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::duplicate_mod)]
 #[path = "support.rs"]
 mod support;
 use support::{at, page, seen, snapshot, through_proxy, Fixture, SYMBOL};
