@@ -117,6 +117,8 @@ pub struct BinanceRestClient {
     testnet: bool,
     /// The permit gate every signed mutation passes; none checks nothing.
     gate: OnceLock<Arc<OperationGate>>,
+    /// Set once by [`Self::close_unbudgeted_sends`] and never cleared.
+    closed: OnceLock<()>,
     request_timeout: Duration,
     /// Test seam: serve every endpoint from a local listener.
     #[cfg(any(test, feature = "crash-points"))]
@@ -132,6 +134,7 @@ impl BinanceRestClient {
             api_secret,
             testnet: false,
             gate: OnceLock::new(),
+            closed: OnceLock::new(),
             request_timeout: REQUEST_TIMEOUT,
             #[cfg(any(test, feature = "crash-points"))]
             local_base_url: None,
@@ -146,6 +149,7 @@ impl BinanceRestClient {
             api_secret,
             testnet: true,
             gate: OnceLock::new(),
+            closed: OnceLock::new(),
             request_timeout: REQUEST_TIMEOUT,
             #[cfg(any(test, feature = "crash-points"))]
             local_base_url: None,
@@ -156,6 +160,38 @@ impl BinanceRestClient {
     /// 7). The first gate stays.
     pub fn attach_gate(&self, gate: Arc<OperationGate>) {
         let _ = self.gate.set(gate);
+    }
+
+    /// Close this client to every request but the prepared one-shot reads a
+    /// budgeted owner sends (the TIME, commission and closed read sets, each
+    /// a GET), for the production Spot start (PS-4). From then on every other
+    /// sender refuses before it builds a transport, and nothing is sent. One
+    /// way: nothing reopens it.
+    pub fn close_unbudgeted_sends(&self) {
+        let _ = self.closed.set(());
+    }
+
+    /// Whether [`Self::close_unbudgeted_sends`] was called.
+    pub fn is_closed(&self) -> bool {
+        self.closed.get().is_some()
+    }
+
+    /// The refusal of every unbudgeted sender of a closed client, checked
+    /// first: by [`Self::answer`], through which every legacy request goes,
+    /// and by each one-shot answer helper before its transport is built. A
+    /// `mutation` (method, endpoint) is shown to the attached gate first, as
+    /// on an open client, so the gate's refusals and their accounting see it;
+    /// whatever the gate answers, nothing is sent.
+    fn refuse_if_closed(&self, mutation: Option<(&str, &str)>) -> Result<(), BinanceRestError> {
+        if !self.is_closed() {
+            return Ok(());
+        }
+        if let Some((method, endpoint)) = mutation {
+            self.pass_gate(method, endpoint)?;
+        }
+        const REFUSED: &str = "budgeted Spot client: unbudgeted request refused, nothing sent";
+        tracing::warn!("{REFUSED}");
+        Err(BinanceRestError::Refused(REFUSED.into()))
     }
 
     /// Shorten the per-request bound, for tests that wait it out.
@@ -305,10 +341,38 @@ impl BinanceRestClient {
         Ok((transport, request))
     }
 
+    /// The signer of one read of the closed set (PS-4), beside the
+    /// commission binder: `query` (the read's fixed parameters, then the
+    /// owner's timestamp) signed exactly as sent, as one GET with the key
+    /// header on the prebuilt one-shot transport. The caller's fixed
+    /// parameters are constants of unreserved characters: nothing is encoded.
+    pub(crate) fn bind_spot_read(
+        &self,
+        transport: Client,
+        endpoint: &str,
+        query: &str,
+    ) -> Result<(Client, reqwest::Request), BinanceRestError> {
+        use hmac::{Hmac, Mac};
+
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(self.api_secret.as_bytes())
+            .map_err(|e| BinanceRestError::SignatureError(format!("HMAC error: {e}")))?;
+        mac.update(query.as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes());
+        let base = self.endpoint_base_url(endpoint);
+        let url = format!("{base}{endpoint}?{query}&signature={signature}");
+        let (transport, request) =
+            transport.get(url).header("X-MBX-APIKEY", &self.api_key).build_split();
+        let request = request
+            .map_err(|_| BinanceRestError::Refused("read request construction failed".into()))?;
+        Ok((transport, request))
+    }
+
     /// Send one request and read its body under one bound for both
     /// (ADR-0056 step 7, D19). A timeout is uncertain: the request may have
-    /// reached the venue. Every HTTP status is an answer here.
+    /// reached the venue. Every HTTP status is an answer here. A closed
+    /// client refuses first, nothing sent.
     async fn answer(&self, request: RequestBuilder) -> Result<RestAnswer, BinanceRestError> {
+        self.refuse_if_closed(None)?;
         if !robson_exec::observation::reconciliation_active() {
             return self.legacy_answer(request).await;
         }
@@ -457,6 +521,7 @@ impl BinanceRestClient {
         endpoint: &str,
         params: Vec<(&str, String)>,
     ) -> Result<RestAnswer, BinanceRestError> {
+        self.refuse_if_closed(None)?;
         let transport = single_shot()?;
         let query = self.build_signed_query(encoded(params))?;
         let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
@@ -472,6 +537,7 @@ impl BinanceRestClient {
         endpoint: &str,
         params: Vec<(&str, String)>,
     ) -> Result<RestAnswer, BinanceRestError> {
+        self.refuse_if_closed(None)?;
         let transport = single_shot()?;
         let query: Vec<String> =
             encoded(params).iter().map(|(name, value)| format!("{name}={value}")).collect();
@@ -499,6 +565,7 @@ impl BinanceRestClient {
         endpoint: &str,
         params: Vec<(&str, String)>,
     ) -> Result<RestAnswer, BinanceRestError> {
+        self.refuse_if_closed(Some(("POST", endpoint)))?;
         let transport = single_shot()?;
         self.pass_gate("POST", endpoint)?;
         let query = self.build_signed_query(encoded(params))?;
@@ -515,6 +582,7 @@ impl BinanceRestClient {
         endpoint: &str,
         params: Vec<(&str, String)>,
     ) -> Result<RestAnswer, BinanceRestError> {
+        self.refuse_if_closed(Some(("DELETE", endpoint)))?;
         let transport = single_shot()?;
         self.pass_gate("DELETE", endpoint)?;
         let query = self.build_signed_query(encoded(params))?;

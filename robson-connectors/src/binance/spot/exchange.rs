@@ -106,6 +106,16 @@ impl BinanceSpotAdapter {
         })
     }
 
+    /// The venue of a non-trading daemon (PS-4, production Spot start). The
+    /// shared `client` is closed first (`close_unbudgeted_sends`), before the
+    /// reader, the order path and the gate wrap it: every request this venue
+    /// can make is then refused with nothing sent, and only the owner's
+    /// prepared, budgeted reads remain on that client.
+    pub fn non_trading(client: Arc<BinanceRestClient>) -> Result<Self, ExecError> {
+        client.close_unbudgeted_sends();
+        Self::new(client)
+    }
+
     /// The whole venue rules last validated for `symbol` (STP modes,
     /// precisions, filters), with no request.
     pub fn validated_symbol_rules(&self, symbol: &Symbol) -> Option<SpotSymbolRules> {

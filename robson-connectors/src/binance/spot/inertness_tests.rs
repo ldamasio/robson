@@ -28,6 +28,12 @@
 //!   helper (8c-3, round 2);
 //! - they read no configuration and name no testnet host.
 //!
+//! PS-4 (production non-trading Spot start) adds the closed set of budgeted
+//! reads (`reads.rs`, checked as every other spot file) and its one-shot
+//! transport (`read_send.rs`, pinned byte for byte as the commission
+//! transport is). Outside this module only the transport's signer, defined
+//! in `binance_rest.rs`, may name it; PS-5 names its owner here.
+//!
 //! `robsond`'s venue tests check the other half: the factory still refuses
 //! `binance_spot`, builds no spot venue, and builds no feed on the spot stream
 //! base. The bounded clock owner and receiver have a separate, exact
@@ -597,8 +603,22 @@ fn detector_reference_lines(path: &Path) -> &'static [&'static str] {
     }
 }
 
+/// PS-4's prepared read transport: outside this module, exactly its signer's
+/// definition in the REST client. No owner calls it yet (PS-5 adds one).
+fn read_reference_lines(path: &Path) -> &'static [&'static str] {
+    match path.to_str() {
+        Some("robson-connectors/src/binance_rest.rs") => &["pub(crate) fn bind_spot_read("],
+        _ => &[],
+    }
+}
+
 fn strip_n5_references(path: &Path, text: &str) -> String {
-    let mut allowed = [n5_reference_lines(path), detector_reference_lines(path)].concat();
+    let mut allowed = [
+        n5_reference_lines(path),
+        detector_reference_lines(path),
+        read_reference_lines(path),
+    ]
+    .concat();
     text.lines()
         .filter(|line| {
             if let Some(i) = allowed.iter().position(|expected| *expected == line.trim()) {
@@ -691,6 +711,17 @@ fn outside_spot_violations(path: &Path, text: &str, names: &[String]) -> Vec<Str
         || text.contains(".bind_spot_commission(")
     {
         found.push("names a Spot commission path outside its approved source lines".into());
+    }
+    if [
+        "PreparedSpotRead",
+        "SpotReadRequest",
+        "prepare_spot_read",
+        "bind_spot_read",
+    ]
+    .iter()
+    .any(|name| has_word(text, name))
+    {
+        found.push("names the prepared Spot read transport outside its approved lines".into());
     }
     if names_spot_endpoint(text) {
         found.push("names a spot endpoint".into());
@@ -1255,6 +1286,72 @@ fn prepared_commission_mutation_violations(text: &str) -> Vec<String> {
     }
 }
 
+fn prepared_read_mutation_violations(text: &str) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    // PS-4's closed read transport, reviewed whole; its signer
+    // `bind_spot_read` sits beside the commission binder in binance_rest.rs.
+    const EXACT_READ_TRANSPORT: &str =
+        "27d156f00c3d9e80cb11dd4292fc19ee2a25b5ad0de15cb57b43c44990632aa4";
+    if hex::encode(Sha256::digest(text.as_bytes())) == EXACT_READ_TRANSPORT {
+        Vec::new()
+    } else {
+        vec!["changes the closed Spot read transport".into()]
+    }
+}
+
+/// PS-4: the read transport is admitted byte for byte; another client, a
+/// mutation verb, a resend or another signer is not.
+#[test]
+fn the_read_transport_allowance_rejects_changed_send_or_client() {
+    let original = include_str!("read_send.rs");
+    assert!(prepared_read_mutation_violations(original).is_empty());
+    assert!(
+        !mutation_violations("read_send.rs", original).is_empty(),
+        "it holds a transport"
+    );
+    for (before, after) in [
+        ("single_shot()?", "reqwest::Client::new()"),
+        ("transport.get(url)", "transport.post(url)"),
+        ("signer.bind_spot_read(", "signer.bind_spot_commission("),
+        (
+            "self.transport.execute(self.request)",
+            "self.transport.clone().execute(self.request)",
+        ),
+    ] {
+        assert!(original.contains(before), "negative control must change the source: {before}");
+        let changed = original.replacen(before, after, 1);
+        assert!(!prepared_read_mutation_violations(&changed).is_empty(), "{after}");
+    }
+}
+
+/// PS-4: outside this module only the signer's definition may name the read
+/// transport. The same line elsewhere or twice, or a preparation, type or
+/// call by any other line, is found.
+#[test]
+fn the_read_allowance_admits_only_its_named_owner() {
+    let names = spot_type_names();
+    let workspace = crate_dir().parent().unwrap();
+    let owner = Path::new("robson-connectors/src/binance_rest.rs");
+    let text = fs::read_to_string(workspace.join(owner)).unwrap();
+    assert!(outside_spot_violations(owner, &text, &names).is_empty());
+    let exact = read_reference_lines(owner).join("\n");
+    let other = Path::new("robsond/src/venue.rs");
+    assert!(outside_spot_violations(owner, &exact, &names).is_empty());
+    assert!(!outside_spot_violations(other, &exact, &names).is_empty());
+    assert!(!outside_spot_violations(owner, &format!("{exact}\n{exact}"), &names).is_empty());
+    for extra in [
+        "let prepared = client.prepare_spot_read(read)?;",
+        "fn f(_: PreparedSpotRead) {}",
+        "fn f(_: SpotReadRequest) {}",
+        "let read = SpotPreparedRead::Account;",
+        "self.bind_spot_read(transport, path, None, stamp)",
+    ] {
+        assert!(!outside_spot_violations(other, extra, &names).is_empty(), "{extra}");
+        let widened = format!("{text}\n{extra}");
+        assert!(!outside_spot_violations(owner, &widened, &names).is_empty(), "{extra}");
+    }
+}
+
 #[test]
 fn the_commission_transport_allowance_rejects_changed_send_or_client() {
     let original = include_str!("commission_send.rs");
@@ -1440,6 +1537,7 @@ fn the_spot_module_sends_orders_only_through_the_ledger_and_reads_no_configurati
     let sources = spot_production_sources();
     let time = spot_dir().join("time.rs");
     let commission = spot_dir().join("commission_send.rs");
+    let read_transport = spot_dir().join("read_send.rs");
     let root = spot_dir().join("mod.rs");
     assert!(sources.len() >= 7, "{} production sources", sources.len());
     for (path, text) in &sources {
@@ -1448,6 +1546,8 @@ fn the_spot_module_sends_orders_only_through_the_ledger_and_reads_no_configurati
             prepared_time_mutation_violations(text)
         } else if path == &commission {
             prepared_commission_mutation_violations(text)
+        } else if path == &read_transport {
+            prepared_read_mutation_violations(text)
         } else {
             let permitted: &[&str] = if path == &root {
                 &["pub use time::PreparedSpotTime;"]
@@ -1462,6 +1562,10 @@ fn the_spot_module_sends_orders_only_through_the_ledger_and_reads_no_configurati
             mutation_violations(&file, text)
         };
         assert!(violations.is_empty(), "{}: {violations:?}", path.display());
+        if path != &read_transport {
+            let signs = has_word(text, "bind_spot_read");
+            assert!(!signs, "{} signs a closed read outside its transport", path.display());
+        }
         for configuration in ["env::var", "std::env", "ROBSON_", "dotenv"] {
             assert!(!text.contains(configuration), "{} reads {configuration}", path.display());
         }

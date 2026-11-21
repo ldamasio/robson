@@ -15,6 +15,12 @@
 //! [`SpotRestReader`], [`BinanceSpotTradeFeed`], [`BinanceSpotOhlcv`] or
 //! [`BinanceSpotAdapter`] (SD12; `inertness_tests.rs`).
 //!
+//! For the production non-trading Spot start (PS-4): the closed set of
+//! budgeted reads ([`SpotPreparedRead`], `reads.rs`) and its one-shot
+//! transport (`read_send.rs`), and [`BinanceSpotAdapter::non_trading`], which
+//! closes the shared client to every other request before wrapping it
+//! (`BinanceRestClient::close_unbudgeted_sends`).
+//!
 //! Venue facts are from Binance's spot API documentation at commit
 //! `995f6eb3` of `binance/binance-spot-api-docs`, read 2026-11-10,
 //! 2026-11-11 and 2026-11-13 (design note v16 §2, F13–F17, F22, F23, F25).
@@ -25,6 +31,8 @@ mod costs;
 mod exchange;
 mod market_data;
 mod ohlcv;
+mod read_send;
+mod reads;
 mod records;
 mod rest;
 mod rules;
@@ -39,12 +47,14 @@ pub(crate) use exchange::decode_fixture_order;
 pub use exchange::{BinanceSpotAdapter, SPOT_FINALITY};
 pub use market_data::{BinanceSpotTradeFeed, SPOT_MARKET_WS_ENDPOINT};
 pub use ohlcv::BinanceSpotOhlcv;
+pub use read_send::{PreparedSpotRead, SpotReadRequest};
+pub use reads::{SpotPreparedRead, SpotReadBody, SPOT_COMMISSION_BODY_CAP, SPOT_OPERATED_SYMBOL};
 #[cfg(any(test, feature = "crash-points"))]
-pub use records::{decode_account, decode_open_orders, SpotInventoryError};
+pub use records::{decode_account, decode_open_orders};
 pub use records::{
     decode_open_order_lists, SpotAccount, SpotAccountBalance, SpotCommission,
-    SpotCommissionDiscount, SpotCommissionRates, SpotOpenOrderList, SpotOrderListError,
-    SpotOrderListMember, SpotOrderRecord,
+    SpotCommissionDiscount, SpotCommissionRates, SpotInventoryError, SpotOpenOrderList,
+    SpotOrderListError, SpotOrderListMember, SpotOrderRecord,
 };
 pub use rest::{SpotOrderRef, SpotRead, SpotReadError, SpotRestReader};
 pub use rules::{SpotLotFilter, SpotNotionalFilter, SpotPriceFilter, SpotSymbolRules};
@@ -57,6 +67,8 @@ pub use trading::{SpotWrite, SPOT_STP_MODE};
 
 #[cfg(test)]
 mod adapter_tests;
+#[cfg(test)]
+mod budgeted_read_tests;
 #[cfg(test)]
 mod cancel_tests;
 #[cfg(test)]
