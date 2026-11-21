@@ -35,11 +35,15 @@ mod trading;
 
 pub use commission_send::{PreparedSpotCommission, SignedSpotCommission};
 pub use exchange::{BinanceSpotAdapter, SPOT_FINALITY};
+#[cfg(any(test, feature = "crash-points"))]
+pub(crate) use exchange::decode_fixture_order;
 pub use market_data::{BinanceSpotTradeFeed, SPOT_MARKET_WS_ENDPOINT};
 pub use ohlcv::BinanceSpotOhlcv;
+#[cfg(any(test, feature = "crash-points"))]
+pub use records::{decode_account, decode_open_orders, SpotInventoryError};
 pub use records::{
-    SpotAccount, SpotAccountBalance, SpotCommission, SpotCommissionDiscount, SpotCommissionRates,
-    SpotOrderRecord,
+    decode_open_order_lists, SpotAccount, SpotAccountBalance, SpotCommission, SpotCommissionDiscount,
+    SpotCommissionRates, SpotOpenOrderList, SpotOrderListError, SpotOrderListMember, SpotOrderRecord,
 };
 pub use rest::{SpotOrderRef, SpotRead, SpotReadError, SpotRestReader};
 pub use rules::{SpotLotFilter, SpotNotionalFilter, SpotPriceFilter, SpotSymbolRules};

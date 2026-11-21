@@ -28,11 +28,15 @@ use crate::{
 mod clock_state;
 mod commission;
 pub(crate) use commission::CommissionPreparation;
+#[cfg(all(test, feature = "crash-points"))]
+mod inventory;
 mod jobs;
 mod lifecycle;
 mod metrics;
 #[cfg(all(test, feature = "crash-points"))]
 mod pg_tests;
+#[cfg(all(test, feature = "crash-points"))]
+pub(crate) use pg_tests::run_held_inventory_rehearsal;
 mod watchdog;
 pub(crate) use lifecycle::ClockClosing;
 

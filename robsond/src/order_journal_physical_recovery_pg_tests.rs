@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Test-only real Journal/Spot audit composition driven by a disposable PG16
 //! controller.
 use std::{io, os::fd::AsFd, sync::Arc};
@@ -38,6 +40,8 @@ use crate::{
 const SYMBOL: &str = "BTCUSDT";
 const BUY_ID: &str = "417011";
 const BUY_CLIENT: &str = "physical-recovery-observed-buy";
+const OWNED_ID: &str = "417013";
+const OWNED_CLIENT: &str = "physical-recovery-owned-buy";
 const BUDGET: PageBudget = PageBudget {
     intents: 1,
     attempts: 1,
@@ -176,12 +180,97 @@ async fn validate_writer_roles(pool: &PgPool, old: &str, new: &str) -> Result<()
     Ok(())
 }
 
-async fn seed_native_sources(pool: &PgPool, g: &JournalGeneration) -> Result<()> {
+/// Rehearsal only: one authored entry J through the ordinary writer, which
+/// writes its admission in the same transaction, then its native order under
+/// the existing route 1. Synthetic fixture success, no attempt or clock.
+async fn seed_owned_entry(pool: &PgPool, g: &JournalGeneration) -> Result<Uuid> {
+    use robson_exec::{
+        order_journal::{AdmissionRow, OutcomeRow, VenueOutcome},
+        venue_ledger::LegOrderKind,
+    };
+    let position = Uuid::from_u128(1);
+    let mut batch = sell();
+    batch.intent.kind = IntentKind::Entry;
+    batch.intent.client_order_id = OWNED_CLIENT.into();
+    batch.intent.position_id = Some(position);
+    batch.intent.account_scope = g.account_scope.clone();
+    batch.outcome = Some(OutcomeRow {
+        venue_outcome: Some(VenueOutcome::Success),
+        venue_evidence: Some(json!({"fixture": true, "symbol": SYMBOL,
+            "orderId": OWNED_ID, "clientOrderId": OWNED_CLIENT})),
+        ..OutcomeRow::default()
+    });
+    batch.balance.as_mut().context("balance batch")?.admission = Some(Arc::new(AdmissionRow {
+        position_id: position,
+        symbol: SYMBOL.to_owned(),
+        decided_month: chrono::NaiveDate::from_ymd_opt(2026, 11, 1).context("month")?,
+        taker_bps: Decimal::new(10, 0),
+        gap_bps: Decimal::new(10, 0),
+        notional_margin_bps: Decimal::new(2, 0),
+        min_notional: Decimal::new(10, 0),
+        lot_step: Decimal::new(1, 3),
+        fee_asset_policy: "base".into(),
+        envelope_source: "isolated-entry-terms".into(),
+        envelope_as_of: Utc::now(),
+        envelope_hash: "fixture".into(),
+        planned_qty: Decimal::ONE,
+        requested_qty: Decimal::ONE,
+        reference_price: Decimal::new(100, 0),
+        remainder_reserve: Decimal::new(1, 1),
+        admission_charge: Decimal::new(10, 0),
+        initial_trigger: Decimal::new(90, 0),
+    }));
+    let start = fields(pool, g).await?.0;
+    insist(PgJournalBackend::new(pool, g.tenant_id).commit(&batch).await)?;
+    ensure!(fields(pool, g).await?.0 == start + 1, "ordinary J commit bumps once");
+    let owned = VenueOrderRecord {
+        exchange_order_id: OWNED_ID.into(),
+        client_order_id: OWNED_CLIENT.into(),
+        orig_client_order_id: None,
+        symbol: SYMBOL.into(),
+        side: OrderSide::Buy,
+        order_type: "MARKET".into(),
+        protection_kind: None,
+        status: "NEW".into(),
+        phase: OrderPhase::Live,
+        orig_qty: Decimal::ONE,
+        executed_qty: Decimal::ZERO,
+        cumulative_quote_qty: None,
+        stop_price: None,
+        expiry_reason: None,
+        transact_time_ms: None,
+        time_ms: None,
+        update_time_ms: None,
+        working_time_ms: None,
+    };
+    let link = OrderLink {
+        venue: VenueId::new(VenueId::BINANCE_SPOT),
+        account_scope: g.account_scope.clone(),
+        owner: OrderOwner::Leg {
+            intent_id: batch.intent.intent_id,
+            position_id: position,
+            kind: LegOrderKind::Entry,
+        },
+        client_order_id: OWNED_CLIENT.into(),
+    };
+    let written = PgVenueLedger::new(pool, g.tenant_id)
+        .record_order(&owned, &link, SeenAt { at: Utc::now(), clock: None, capture: None })
+        .await?;
+    ensure!(written.changed && fields(pool, g).await?.0 == start + 2);
+    Ok(batch.intent.intent_id)
+}
+
+async fn seed_native_sources(
+    pool: &PgPool,
+    g: &JournalGeneration,
+    uid: &str,
+    rehearsal: bool,
+) -> Result<Option<Uuid>> {
     let venue = VenueId::new(VenueId::BINANCE_SPOT);
     sqlx::query(
         "INSERT INTO public.venue_accounts(venue_id,account_scope,tenant_id,uid,bound_at,cutover_id)
-         VALUES('binance:spot',$1,$2,'physical-recovery-fixture',now(),$3)",
-    ).bind(&g.account_scope).bind(g.tenant_id).bind(Uuid::now_v7()).execute(pool).await?;
+         VALUES('binance:spot',$1,$2,$3,now(),$4)",
+    ).bind(&g.account_scope).bind(g.tenant_id).bind(uid).bind(Uuid::now_v7()).execute(pool).await?;
     sqlx::query("CREATE INDEX idx_leg_routes_spot_scope_position ON public.leg_routes(account_scope,position_id) WHERE venue_id='binance:spot'")
         .execute(pool).await?;
     let ledger = PgVenueLedger::new(pool, g.tenant_id);
@@ -224,6 +313,11 @@ async fn seed_native_sources(pool: &PgPool, g: &JournalGeneration) -> Result<()>
             .await?
             .changed
     );
+    let owned = if rehearsal {
+        Some(seed_owned_entry(pool, g).await?)
+    } else {
+        None
+    };
     let seeded = sqlx::query(
         "UPDATE public.spot_order_set_generation g SET accounting_version=a.version
          FROM public.accounting_state a
@@ -236,19 +330,27 @@ async fn seed_native_sources(pool: &PgPool, g: &JournalGeneration) -> Result<()>
     .execute(pool)
     .await?;
     ensure!(seeded.rows_affected() == 1);
-    Ok(())
+    Ok(owned)
 }
 
+/// `owned` admits the one rehearsal J/order pair at route 1.
 #[derive(Default)]
 struct NativeKeys {
+    owned: bool,
     intents: Vec<(Uuid, String, Option<Uuid>)>,
     attempts: usize,
     orders: Vec<(String, String, String)>,
     routes: Vec<Uuid>,
+    legs: usize,
+}
+impl NativeKeys {
+    fn cap(&self) -> usize {
+        1 + usize::from(self.owned)
+    }
 }
 impl ColdSourceSink for NativeKeys {
     fn intents(&mut self, rows: &[IntentSource]) -> std::result::Result<(), SinkFull> {
-        if self.intents.len() + rows.len() > 1 {
+        if self.intents.len() + rows.len() > self.cap() {
             return Err(SinkFull);
         }
         self.intents
@@ -263,7 +365,7 @@ impl ColdSourceSink for NativeKeys {
         Ok(())
     }
     fn orders(&mut self, rows: &[OrderSource]) -> std::result::Result<(), SinkFull> {
-        if self.orders.len() + rows.len() > 1 {
+        if self.orders.len() + rows.len() > self.cap() {
             return Err(SinkFull);
         }
         self.orders.extend(
@@ -273,11 +375,18 @@ impl ColdSourceSink for NativeKeys {
         Ok(())
     }
     fn routes(&mut self, rows: &[RouteSource]) -> std::result::Result<(), SinkFull> {
+        let owned = self.owned;
+        let leg = move |r: &RouteSource| {
+            owned
+                && r.position_id == Uuid::from_u128(1)
+                && r.classify() == RouteClass::Leg { closed: false }
+        };
         if self.routes.len() + rows.len() > 8
-            || rows.iter().any(|r| r.classify() != RouteClass::ArmedOnly)
+            || rows.iter().any(|r| !leg(r) && r.classify() != RouteClass::ArmedOnly)
         {
             return Err(SinkFull);
         }
+        self.legs += rows.iter().filter(|r| leg(r)).count();
         self.routes.extend(rows.iter().map(|r| r.position_id));
         Ok(())
     }
@@ -467,6 +576,26 @@ async fn witness_daemon_start(
 #[sqlx::test(migrations = false)]
 #[ignore = "requires dedicated physical controller and isolated PG16 over loopback"]
 async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Result<()> {
+    physical_spot_restore(pool, false).await
+}
+
+#[cfg(feature = "crash-points")]
+#[sqlx::test(migrations = false)]
+#[ignore = "requires dedicated physical PG16 no-capital controller"]
+async fn physical_spot_no_capital_rehearsal(pool: PgPool) -> Result<()> {
+    physical_spot_restore(pool, true).await
+}
+
+async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
+    #[cfg(not(feature = "crash-points"))]
+    ensure!(!rehearsal, "rehearsal compiler gate");
+    let uid = "physical-recovery-fixture".to_owned();
+    #[cfg(feature = "crash-points")]
+    let uid = if rehearsal {
+        robson_connectors::inventory_loopback::LOOPBACK_UID.to_string()
+    } else {
+        uid
+    };
     let (mut channel, greeting) = Channel::open().await?;
     let old_role = Channel::string(&greeting, "old_user")?;
     let new_role = Channel::string(&greeting, "new_user")?;
@@ -489,9 +618,17 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     .await
     .map_err(|e| anyhow::anyhow!("initialize disposable budget: {e:?}"))?;
     let g = seed_generation_for(&pool, robson_exec::order_journal::DEFAULT_ACCOUNT_SCOPE).await?;
-    seed_native_sources(&pool, &g).await?;
+    let owned = seed_native_sources(&pool, &g, &uid, rehearsal).await?;
+    #[cfg(feature = "crash-points")]
+    if rehearsal {
+        crate::venue_budget::n5_claim::rehearsal_c2::seed_manifest(&pool, SYMBOL).await?;
+    }
     validate_writer_roles(&pool, old_role, new_role).await?;
     let before = fields(&pool, &g).await?;
+    ensure!(
+        before.0 == before.1 && before.0 == if rehearsal { 3 } else { 1 },
+        "pre-fence setup versions"
+    );
     let proxy = DbProxy::start(server).await?;
     let old_options = upstream
         .as_ref()
@@ -512,10 +649,11 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     ).fetch_one(&old_pool).await?;
     ensure!(user == old_role);
     channel
-        .phase(
+        .phase_at(
             "old_connected",
             json!({"database":db,"pid":pid,"backend_start":birth,
         "current_user":user,"tenant":g.tenant_id}),
+            Instant::now() + if rehearsal { Duration::from_secs(10) } else { PIPE_BOUND },
         )
         .await?;
     if std::env::var("ROBSON_PHYSICAL_FAULT").as_deref() == Ok("eof") {
@@ -642,18 +780,18 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
         scope,
         PageBudget { routes: 1, ..BUDGET },
         deadline,
-        &mut NativeKeys::default(),
+        &mut NativeKeys { owned: rehearsal, ..NativeKeys::default() },
     )
     .await;
     ensure!(
         matches!(stopped,Err(ColdAuditRefusal::PageBudget {family:Family::Routes,last_key:Some(SourceKey::Route(key))}) if key==Uuid::from_u128(8))
     );
     let mut captured = epoched
-        .capture("physical-recovery-fixture", committed.0)
+        .capture(&uid, committed.0)
         .await
         .map_err(|e| anyhow::anyhow!("supervised Spot capture: {e:?}"))?;
     let cut = captured.cut();
-    let mut keys = NativeKeys::default();
+    let mut keys = NativeKeys { owned: rehearsal, ..NativeKeys::default() };
     keys.intents(cut.intents())
         .map_err(|_| anyhow::anyhow!("original J fixture oracle"))?;
     keys.attempts(cut.attempts())
@@ -667,34 +805,56 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
             && receipt.account_scope == g.account_scope
             && receipt.statements == 11
     );
+    let mut intents = vec![(
+        original.intent.intent_id,
+        original.intent.client_order_id.clone(),
+        original.intent.position_id,
+    )];
+    let mut orders: Vec<(String, String, String)> =
+        vec![(SYMBOL.into(), BUY_ID.into(), "BUY".into())];
+    if let Some(owned) = owned {
+        intents.push((owned, OWNED_CLIENT.into(), Some(Uuid::from_u128(1))));
+        orders.push((SYMBOL.into(), OWNED_ID.into(), "BUY".into()));
+    }
+    // Source order is by key, so compare as sets of exact identities.
+    keys.intents.sort();
+    intents.sort();
+    keys.orders.sort();
+    orders.sort();
     ensure!(
-        keys.intents
-            == [(
-                original.intent.intent_id,
-                original.intent.client_order_id.clone(),
-                original.intent.position_id
-            )]
+        keys.intents == intents
             && keys.attempts == 0
-            && keys.orders == [(SYMBOL.into(), BUY_ID.into(), "BUY".into())]
+            && keys.orders == orders
             && keys.routes == (1..=8).map(Uuid::from_u128).collect::<Vec<_>>()
+            && keys.legs == usize::from(rehearsal)
     );
     let families=receipt.families.iter().zip(["intents","attempts","orders","routes"])
         .map(|(f,name)| json!({"family":name,"rows":f.rows,"pages":f.pages,"last_key":key_value(f.last_key.as_ref())}))
         .collect::<Vec<_>>();
     let statements = receipt.statements;
-    captured
-        .supervisor()
-        .phase(
-            "cold",
-            json!({"tenant":g.tenant_id,"scope":g.account_scope,"epoch":new.epoch.epoch_id,
-        "version":committed.0,"families":families,"statements":statements}),
-        )
-        .await?;
+    let cold_facts = json!({"tenant":g.tenant_id,"scope":g.account_scope,"epoch":new.epoch.epoch_id,
+        "version":committed.0,"families":families,"statements":statements});
+    if rehearsal {
+        captured.supervisor().phase_at("cold", cold_facts, Instant::now() + Duration::from_secs(12)).await?;
+    } else {
+        captured.supervisor().phase("cold", cold_facts).await?;
+    }
+    #[cfg(feature = "crash-points")]
+    if rehearsal {
+        crate::venue_budget::n5_claim::rehearsal_c2::cut_legacy_reason(&restore).await?;
+        captured.supervisor().phase("catalogue_cut", json!({"target_id": restore_identity.target})).await?;
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
     let audit = budget_recovery::audit_empty_budget(&restore, &copied_budget, deadline).await?;
     captured.supervisor().phase("budget",json!({"audit":audit.audit,"quiescence_generation":audit.generation,
         "source":0,"clocks":0,"charges":0,"statements":audit.start_commands+audit.pass_commands+audit.terminal_commands})).await?;
-    let bootstrap = budget_recovery::bootstrap_empty_budget(
+    #[cfg(feature = "crash-points")]
+    if rehearsal {
+        crate::venue_budget::n5_claim::rehearsal_c2::load_fixture_registry(
+            &restore, g.tenant_id, &g.account_scope, uid.parse()?, SYMBOL, &clock, deadline,
+        ).await?;
+    }
+    let (bootstrap, rows) = budget_recovery::bootstrap_empty_budget(
         &restore,
         g.tenant_id,
         &new,
@@ -715,6 +875,35 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     ensure!(observe_generation(&mut reader, binding(&g, &venue)).await?.is_none());
     installed.supervisor().phase("installed",json!({"tenant":g.tenant_id,"scope":g.account_scope,"epoch":successor.process_epoch,
         "version":committed.0,"audit":successor.source_audit_id,"generation":successor.generation_id})).await?;
+    #[cfg(feature = "crash-points")]
+    if rehearsal {
+        installed.supervisor().phase("rehearsal_begin", json!({
+            "epoch": successor.process_epoch, "generation": successor.generation_id,
+        })).await?;
+        let owned = owned.context("rehearsal owned J")?;
+        let witness = crate::venue_clock_owner::run_held_inventory_rehearsal(
+            &restore, &restored_wire, &new, g.tenant_id, std::sync::Arc::new(clock), rows,
+            &successor, &uid, committed.0, SYMBOL, owned,
+        ).await?;
+        ensure!(witness.intent == owned && witness.generation == successor.generation_id
+            && witness.lookup_send.epoch == successor.process_epoch
+            && witness.lookup_receive.epoch == successor.process_epoch
+            && witness.lookup_send.after_ns < witness.lookup_receive.before_ns,
+            "pending observation retained across close under its exact binding");
+        drop(reader);
+        restore.close().await;
+        installed.supervisor().phase("rehearsal_complete", json!({
+            "epoch": successor.process_epoch, "generation": successor.generation_id,
+            "sample": witness.sample, "handoffs": 4, "weight": 107, "inventory_sql": 0,
+            "uid": uid.parse::<u64>()?, "owned_intent": owned,
+            "lookup_handoffs": witness.lookup_handoffs, "lookup_weight": 4, "lookup_sql": witness.lookup_sql,
+            "cumulative_handoffs": witness.cumulative_handoffs, "cumulative_weight": 111,
+            "lookup_sample": witness.lookup_sample, "durable_executed": witness.durable_executed.normalize().to_string(),
+            "lookup_executed": witness.lookup_executed.normalize().to_string(), "pending_execution_observed": true,
+        })).await?;
+        return Ok(());
+    }
+    drop(rows);
     let before_admit = restored_wire.query_trace().len();
     let (ready, mut channel) = installed
         .admit()

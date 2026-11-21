@@ -2758,3 +2758,7 @@ mod tests {
         assert_eq!(order.quantity, dec!(0.004));
     }
 }
+
+#[cfg(test)]
+#[path = "spot_inventory_wire_tests.rs"]
+mod spot_inventory_wire_tests;

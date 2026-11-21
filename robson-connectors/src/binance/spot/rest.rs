@@ -24,7 +24,7 @@ use serde::{de::DeserializeOwned, Deserialize};
 use thiserror::Error;
 
 use super::{
-    records::{self, SpotAccount, SpotCommission, SpotOrderRecord},
+    records::{self, SpotAccount, SpotCommission, SpotOpenOrderList, SpotOrderRecord},
     rules::{self, SpotSymbolRules},
     trades::{
         self, SpotTradePage, SpotTradeSet, SpotTradesQuery, SpotTradesRead, MY_TRADES_MAX_PAGES,
@@ -218,6 +218,29 @@ pub(super) fn parse_json<T: DeserializeOwned>(what: &str, body: &str) -> Result<
     serde_json::from_str(body).map_err(|e| SpotReadError::Parse(format!("{what}: {e}")))
 }
 
+pub(super) fn parse_checked_order(
+    body: &str,
+    pair: &str,
+    by: &SpotOrderRef,
+) -> Result<SpotOrderRecord, SpotReadError> {
+    let order = records::parse_order(body)?;
+    if order.symbol != pair {
+        return Err(SpotReadError::Inconsistent(format!(
+            "order lookup on {pair} answered order {} on {}",
+            order.order_id, order.symbol
+        )));
+    }
+    if let SpotOrderRef::OrderId(order_id) = by {
+        if order.order_id != *order_id {
+            return Err(SpotReadError::Inconsistent(format!(
+                "order lookup for {order_id} answered order {}",
+                order.order_id
+            )));
+        }
+    }
+    Ok(order)
+}
+
 /// The spot REST read side: typed reads, no mutation, no port.
 pub struct SpotRestReader {
     client: Arc<BinanceRestClient>,
@@ -301,12 +324,20 @@ impl SpotRestReader {
         records::parse_orders(&body)
     }
 
-    /// How many order lists are open on the account
-    /// ([`SpotRead::OPEN_ORDER_LISTS`]). Robson places none, so only the
-    /// count is read.
-    pub async fn open_order_list_count(&self) -> Result<usize, SpotReadError> {
+    /// Every order list open on the account, with each list's ID, raw
+    /// symbol and member references ([`SpotRead::OPEN_ORDER_LISTS`]).
+    /// Descriptive only: the legacy body is buffered whole before the
+    /// decoder sees it, so its length is the envelope (no C8 claim).
+    pub async fn open_order_lists(&self) -> Result<Vec<SpotOpenOrderList>, SpotReadError> {
         let body = self.read(SpotRead::OPEN_ORDER_LISTS, vec![]).await?;
-        records::parse_order_list_count(&body)
+        records::parse_open_order_lists(&body)
+    }
+
+    /// How many order lists are open on the account
+    /// ([`SpotRead::OPEN_ORDER_LISTS`]): the same one read, decoded whole,
+    /// so an ambiguous list fails the count. Robson places none.
+    pub async fn open_order_list_count(&self) -> Result<usize, SpotReadError> {
+        Ok(self.open_order_lists().await?.len())
     }
 
     /// One order's full record ([`SpotRead::ORDER`]). A record on another
@@ -323,22 +354,7 @@ impl SpotRestReader {
             SpotOrderRef::ClientOrderId(client_id) => ("origClientOrderId", client_id.clone()),
         };
         let body = self.read(SpotRead::ORDER, vec![("symbol", pair.clone()), id]).await?;
-        let order = records::parse_order(&body)?;
-        if order.symbol != pair {
-            return Err(SpotReadError::Inconsistent(format!(
-                "order lookup on {pair} answered order {} on {}",
-                order.order_id, order.symbol
-            )));
-        }
-        if let SpotOrderRef::OrderId(order_id) = by {
-            if order.order_id != *order_id {
-                return Err(SpotReadError::Inconsistent(format!(
-                    "order lookup for {order_id} answered order {}",
-                    order.order_id
-                )));
-            }
-        }
-        Ok(order)
+        parse_checked_order(&body, &pair, by)
     }
 
     /// Trades on `symbol` for `query`, at most [`MY_TRADES_MAX_PAGES`] pages

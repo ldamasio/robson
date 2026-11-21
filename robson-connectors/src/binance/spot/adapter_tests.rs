@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 use super::{
     stand_in::{self, Seen, Seens},
-    BinanceSpotAdapter, SpotRead, SPOT_FINALITY,
+    BinanceSpotAdapter, SpotRead, SpotReadError, SPOT_FINALITY,
 };
 use crate::binance_rest::BinanceRestClient;
 
@@ -577,6 +577,59 @@ async fn an_open_order_on_a_symbol_robson_cannot_name_fails_the_observation() {
     })
     .await;
     assert!(venue.account_observation().await.is_err());
+}
+
+/// The typed open order lists and their count are each the one signed read
+/// of weight 6; an ambiguous member fails both and the observation.
+#[tokio::test]
+async fn open_order_lists_are_one_read_kept_raw_or_refused_whole() {
+    let (reader_venue, seen) = answering(200, OPEN_ORDER_LIST).await;
+    let lists = reader_venue.reader().open_order_lists().await.unwrap();
+    assert_eq!(
+        (lists.len(), lists[0].order_list_id, lists[0].symbol.as_str()),
+        (1, 31, "LTCBTC")
+    );
+    let members: Vec<(&str, u64, &str)> = lists[0]
+        .orders
+        .iter()
+        .map(|m| (m.symbol.as_str(), m.order_id, m.client_order_id.as_str()))
+        .collect();
+    assert_eq!(members, [
+        ("LTCBTC", 4, "r3EH2N76dHfLoSZWIUw1bT"),
+        ("LTCBTC", 5, "Cv1SnyPD3qhqpbjpYEHbd2")
+    ]);
+    assert_eq!(reader_venue.reader().open_order_list_count().await.unwrap(), 1);
+    assert_eq!(requests(&seen), ["GET /api/v3/openOrderList", "GET /api/v3/openOrderList"]);
+    assert_eq!(reader_venue.reader().sent(), [SpotRead::OPEN_ORDER_LISTS; 2]);
+
+    let mut conflicting: Value = serde_json::from_str(OPEN_ORDER_LIST).unwrap();
+    conflicting[0]["orders"][1]["orderId"] = json!(4);
+    let conflicting = conflicting.to_string();
+    let (venue, seen) = venue(move |request| match request.path.as_str() {
+        "/api/v3/account" => (200, ACCOUNT.to_string()),
+        "/api/v3/openOrders" => (200, "[]".to_string()),
+        "/api/v3/openOrderList" => (200, conflicting.clone()),
+        other => panic!("unexpected request {other}"),
+    })
+    .await;
+    assert!(matches!(
+        venue.reader().open_order_lists().await,
+        Err(SpotReadError::Inconsistent(_))
+    ));
+    assert!(matches!(
+        venue.reader().open_order_list_count().await,
+        Err(SpotReadError::Inconsistent(_))
+    ));
+    assert!(venue.account_observation().await.is_err());
+    assert_eq!(requests(&seen), [
+        "GET /api/v3/openOrderList",
+        "GET /api/v3/openOrderList",
+        "GET /api/v3/account",
+        "GET /api/v3/openOrders",
+        "GET /api/v3/openOrderList",
+    ]);
+    let weights: Vec<u32> = venue.reader().sent().iter().map(|read| read.weight).collect();
+    assert_eq!(weights, [6, 6, 20, 80, 6]);
 }
 
 #[tokio::test]
