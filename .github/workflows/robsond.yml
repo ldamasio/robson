@@ -131,10 +131,12 @@ jobs:
       - name: Run the DATABASE_URL-gated tests
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/robson_migration_ci
-        # The canonical script runs them in three phases: everything else with
-        # the default concurrency, the migration38 suite
-        # (bounded_migration::public_pg::) one test at a time, then each
-        # wall-clock measurement (ISOLATED_TESTS) alone on the server.
+          # Phase 3's wall-clock envelopes depend on the host, and a hosted
+          # runner's speed varies; the local gates run them (see test-pg.sh).
+          ROBSON_TEST_PG_SKIP_MEASUREMENTS: "1"
+        # The canonical script runs everything else with the default
+        # concurrency, then the migration38 suite (bounded_migration::public_pg::)
+        # one test at a time.
         run: bash scripts/test-pg.sh
 
       # Crash harness (ADR-0056 step 7): the crash-points feature must never

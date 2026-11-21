@@ -6,8 +6,10 @@
 //! keeps selecting every other ignored test.
 //!
 //! Measurement runs whose ignore reason starts with [`ISOLATED_REASON`] assert
-//! a wall-clock envelope, so the script keeps them out of the concurrent first
-//! phase and runs each alone in phase 3 (`ISOLATED_TESTS`).
+//! a wall-clock envelope of their host, so the script keeps them out of the
+//! concurrent first phase and runs each alone in phase 3 (`ISOLATED_TESTS`).
+//! Only CI's database step skips phase 3 (`ROBSON_TEST_PG_SKIP_MEASUREMENTS`);
+//! the local gates run it.
 
 use std::{
     collections::BTreeSet,
@@ -112,6 +114,28 @@ fn test_pg_runs_exactly_the_isolated_tests_alone() {
     assert!(phase1.contains("\"${SKIP_ISOLATED[@]}\""), "{phase1}");
     assert!(script.contains("for name in \"${ISOLATED_TESTS[@]}\"; do"));
     assert!(script.contains("-- --ignored \"${name}\" \"${SKIP_CONTROLLER[@]}\" --test-threads=1"));
+    // Phase 3 is skipped only on the explicit switch, and only CI's database
+    // step sets it: every other caller of the script still runs the envelopes.
+    const SWITCH: &str = "ROBSON_TEST_PG_SKIP_MEASUREMENTS";
+    assert_eq!(script.matches(&format!("\"${{{SWITCH}:-0}}\" == \"1\"")).count(), 1, "{script}");
+    let workflows = root.join(".github/workflows");
+    let mut setters = Vec::new();
+    for entry in fs::read_dir(&workflows).unwrap() {
+        let path = entry.unwrap().path();
+        let text = fs::read_to_string(&path).unwrap();
+        for line in text.lines().filter(|l| l.contains(SWITCH) && !l.trim_start().starts_with('#'))
+        {
+            setters.push((
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                line.trim().to_string(),
+            ));
+        }
+    }
+    assert_eq!(
+        setters,
+        [("robsond.yml".to_string(), format!("{SWITCH}: \"1\""))],
+        "only CI's DATABASE_URL step may skip the measurements"
+    );
 }
 
 #[test]
