@@ -19,6 +19,11 @@ use robson_exec::{
 
 use super::BudgetError;
 
+/// Registers the restriction level at start, at 0 (PLAN §6.11).
+pub(crate) fn register_level() {
+    LazyLock::force(&LEVEL);
+}
+
 #[derive(Clone, Copy)]
 struct Observation {
     severity: u8,

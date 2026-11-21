@@ -59,7 +59,7 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
         ).await.map_err(|e| anyhow!("bootstrap: {e:?}"))?;
         ensure!(trace.issued() == 6, "bootstrap SQL count");
         restore::existing_pause(
-            &pool, tenant, &mut rows, &clock, Instant::now() + Duration::from_secs(2), &trace,
+            &pool, tenant, rows.pause.as_mut(), &clock, Instant::now() + Duration::from_secs(2), &trace,
         ).await.map_err(|e| anyhow!("restore: {e:?}"))?;
         ensure!(trace.issued() == 6, "absent pause issues no SQL");
         let budget = SharedBudget::from_rows(rows, start.predecessor.unclean_reason().is_some())
@@ -342,9 +342,16 @@ pub(crate) async fn run_held_inventory_rehearsal(
         ensure!(start.predecessor.unclean_reason().is_some());
         ensure!(matches!(bootstrap::production_input(), Err(BudgetError::PrerequisiteRefusal)));
         let restore_trace = Trace::default();
-        restore::existing_pause(pool, tenant, &mut rows, &clock, deadline, &restore_trace)
-            .await
-            .map_err(|e| anyhow!("held pause: {e:?}"))?;
+        restore::existing_pause(
+            pool,
+            tenant,
+            rows.pause.as_mut(),
+            &clock,
+            deadline,
+            &restore_trace,
+        )
+        .await
+        .map_err(|e| anyhow!("held pause: {e:?}"))?;
         ensure!(restore_trace.issued() == 0, "empty fixture has no restored pause");
         let budget =
             SharedBudget::from_rows(rows, true).map_err(|e| anyhow!("held budget: {e:?}"))?;

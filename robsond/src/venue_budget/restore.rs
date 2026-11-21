@@ -9,19 +9,22 @@ use uuid::Uuid;
 use super::{
     bootstrap::issue,
     completion,
+    pause_value::PauseValue,
     snapshot::{get, integer},
-    BootstrapRows, BudgetError, Trace,
+    BudgetError, Trace,
 };
 
+/// Re-anchors the decoded stored pause, when it was restored in another clock
+/// domain, to its full duration in this one (one statement).
 pub(crate) async fn existing_pause(
     pool: &PgPool,
     tenant: Uuid,
-    rows: &mut BootstrapRows,
+    pause: Option<&mut PauseValue>,
     clock: &NativeClock,
     deadline: Instant,
     trace: &Trace,
 ) -> Result<(), BudgetError> {
-    let Some(pause) = rows.pause.as_mut() else {
+    let Some(pause) = pause else {
         return Ok(());
     };
     let now = clock.capture().map_err(|_| BudgetError::Invalid)?;
@@ -41,6 +44,9 @@ pub(crate) async fn existing_pause(
         .ok_or(BudgetError::Invalid)?;
     let new_domain = now.domain();
     let (seconds, nanos) = new_domain.offset();
+    // The restoration read with the pause: the UPSERT updates only that row.
+    let (read_domain, read_anchor, _) = pause.restored.ok_or(BudgetError::Invalid)?;
+    let (read_seconds, read_nanos) = read_domain.offset();
     let options = (*pool.connect_options()).clone().options([
         ("lock_timeout", "300ms"),
         ("statement_timeout", "1s"),
@@ -62,7 +68,12 @@ pub(crate) async fn existing_pause(
                 .bind(seconds)
                 .bind(i32::try_from(nanos).map_err(|_| BudgetError::Invalid)?)
                 .bind(anchor.to_string())
-                .bind(at),
+                .bind(at)
+                .bind(read_domain.boot())
+                .bind(read_seconds)
+                .bind(i32::try_from(read_nanos).map_err(|_| BudgetError::Invalid)?)
+                .bind(read_anchor.to_string())
+                .bind(pause.recorded_us),
         )
         .await?;
         let (original_domain, original_tick) = pause.original.ok_or(BudgetError::Invalid)?;
@@ -89,7 +100,8 @@ pub(crate) async fn existing_pause(
             || integer(&get::<String>(&row, "restoration_anchor_text")?, true)? != anchor
             || integer(&get::<String>(&row, "deadline_tick_text")?, true)? != end
             || get::<Option<String>>(&row, "until_audit")? != pause._observed.2
-            || get::<i64>(&row, "recorded_at_us")? != at.timestamp_micros()
+            // GREATEST(new, stored): a backward wall step keeps the stored one.
+            || get::<i64>(&row, "recorded_at_us")? != at.timestamp_micros().max(pause.recorded_us)
         {
             return Err(BudgetError::Invalid);
         }
@@ -100,5 +112,6 @@ pub(crate) async fn existing_pause(
     };
     timeout_at(deadline, work).await.map_err(|_| BudgetError::Expired)??;
     pause.restored = Some((new_domain, anchor, end));
+    pause.recorded_us = pause.recorded_us.max(at.timestamp_micros());
     Ok(())
 }

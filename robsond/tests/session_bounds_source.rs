@@ -630,6 +630,12 @@ fn every_daemon_pool_and_connection_is_built_where_the_bounds_reach_it() {
         // and the pause restoration (300 ms lock, 1 s statement, 1 s idle at
         // startup).
         ("venue_budget/restore.rs", "", "existing_pause"),
+        // PS-2a's non-trading budget bootstrap (no production caller until
+        // PS-6 composes the non-trading start): one raw connection from the
+        // pool's options with 300 ms lock, 1 s statement and 1 s idle at
+        // startup, then sql/settings.sql checked; 5 s overall with the
+        // restoration.
+        ("venue_budget/bootstrap.rs", "", "observe_non_trading"),
         // Package 3's dormant Spot owners (no production caller) do the
         // same, so the bounds of the pool they are given are inherited:
         // the N5 claim store (1 s statement and idle at startup, then
@@ -701,13 +707,22 @@ fn every_mention_of_a_session_bound_is_a_known_one() {
         // session statement that confirms them on each new connection.
         ("venue_clock_store.rs", [each("name"), each("set_config session")].concat()),
         // Package 2's budget bootstrap: its two Startup options, and the
-        // names it checks in the settings row its first statement returns.
-        ("venue_budget/bootstrap.rs", vec![
-            "name idle_in_transaction_session_timeout".to_string(),
-            "name lock_timeout".to_string(),
-            "name statement_timeout".to_string(),
-            "name statement_timeout".to_string(),
-        ]),
+        // names it checks in the settings row its first statement returns;
+        // PS-2a's non-trading bootstrap: its three Startup options (it
+        // checks the same settings row).
+        (
+            "venue_budget/bootstrap.rs",
+            [
+                vec![
+                    "name idle_in_transaction_session_timeout".to_string(),
+                    "name lock_timeout".to_string(),
+                    "name statement_timeout".to_string(),
+                    "name statement_timeout".to_string(),
+                ],
+                each("name"),
+            ]
+            .concat(),
+        ),
         // That first statement: transaction-local, like the journal's and
         // the ledger's; two of its result columns are named after a bound.
         (
@@ -997,4 +1012,44 @@ fn package5a_owners_stay_dormant_or_bounded() {
     assert!(
         daemon.contains("letaccounting=self.position_manager.read().await.balance_accounting();")
     );
+}
+
+/// PS-2a's non-trading budget bootstrap (its connection owner is allowed
+/// above), the budget it builds and PS-3's TIME owner on it have no
+/// production caller until PS-6 composes the non-trading start.
+#[test]
+fn ps2a_non_trading_budget_stays_dormant() {
+    let sources = production_sources();
+    // PS-3: the TIME owner's non-trading constructor takes the budget and its
+    // TIME handle; nothing else does, and nothing calls the constructor yet.
+    for (needle, owner) in [
+        ("observe_non_trading", None),
+        ("bootstrap::non_trading(", None),
+        ("NonTradingBudget", Some("venue_clock_owner.rs")),
+        (".time_owner()", Some("venue_clock_owner.rs")),
+        ("ClockOwner::non_trading(", None),
+    ] {
+        let outside: BTreeSet<&str> = sources
+            .iter()
+            .filter(|s| s.text.contains(needle) && !s.file.starts_with("venue_budget/"))
+            .map(|s| s.file.as_str())
+            .filter(|file| Some(*file) != owner)
+            .collect();
+        assert!(outside.is_empty(), "{needle} reached from {outside:?}");
+    }
+    let owner = source("venue_clock_owner.rs");
+    assert_eq!(owner.matches(".time_owner()").count(), 1, "{owner}");
+    // Its one connection inherits the pool's bounds and tightens them at
+    // startup, before its first statement.
+    let observe = squeeze(&function(
+        &source("venue_budget/bootstrap.rs"),
+        "pub(crate) async fn observe_non_trading(",
+    ));
+    assert!(
+        observe.contains(
+            r#"letoptions=(*pool.connect_options()).clone().options([("lock_timeout","300ms"),("statement_timeout","1s"),("idle_in_transaction_session_timeout","1s"),]);"#
+        ),
+        "{observe}"
+    );
+    assert!(observe.contains("letmutconnection=options.connect().await"), "{observe}");
 }

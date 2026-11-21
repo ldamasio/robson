@@ -20,6 +20,7 @@ pub(crate) mod restore;
 mod snapshot;
 pub(crate) mod state;
 
+pub(crate) use heads::register_level as register_restriction_level;
 pub(crate) use snapshot::BootstrapRows;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,9 @@ impl Trace {
 
 #[cfg(test)]
 mod fixture_tests;
+// PS-2a: the non-trading bootstrap, restoration and budget on PG16.
+#[cfg(test)]
+mod non_trading_pg_tests;
 // Descriptive page plus private running/failed audit foundation only; no
 // production readiness consumer until the external C2 barrier exists.
 #[allow(

@@ -70,6 +70,77 @@ impl Drop for PendingTime {
     }
 }
 
+/// The closed set of a non-trading Spot process's reads, each with its fixed
+/// request weight (PLAN §6.7); no caller chooses a weight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadKind {
+    Account,
+    OperatedOpenOrders,
+    OpenOrderLists,
+    ExchangeInfo,
+    Kline,
+    Commission,
+}
+
+impl ReadKind {
+    pub(crate) const fn weight(self) -> u32 {
+        match self {
+            Self::Account | Self::ExchangeInfo | Self::Commission => 20,
+            Self::OperatedOpenOrders | Self::OpenOrderLists => 6,
+            Self::Kline => 2,
+        }
+    }
+}
+
+/// One closed read's reservation, bound to the read whose weight it charged.
+pub(crate) struct PendingRead(PendingTime, ReadKind);
+
+impl PendingRead {
+    pub(crate) fn read(&self) -> ReadKind {
+        self.1
+    }
+}
+
+/// A non-trading process's budget (PLAN §6.4). Every reservation is steady
+/// and zero-order: TIME (weight 1) or one closed read at its fixed weight.
+/// There is no order, protective, emergency or caller-chosen-weight method.
+#[derive(Clone)]
+pub(crate) struct NonTradingBudget(SharedBudget);
+
+impl NonTradingBudget {
+    pub(crate) fn start(&self) -> Result<TickCapture, BudgetError> {
+        self.0.start()
+    }
+
+    /// The TIME owner's handle on this budget (PLAN §6.6): its cycle reserves
+    /// TIME (weight 1) and polls its send through it, and the stop closes it.
+    /// Only the owner's non-trading constructor takes it (T8 guard).
+    pub(crate) fn time_owner(&self) -> SharedBudget {
+        self.0.clone()
+    }
+
+    pub(crate) fn try_reserve_time(
+        &self,
+        now: TickCapture,
+        deadline: TickCapture,
+    ) -> Result<PendingTime, BudgetError> {
+        self.0.try_reserve_time(now, deadline)
+    }
+
+    /// Non-blocking: a busy budget is `Deferred`, nothing reserved.
+    pub(crate) fn try_reserve_read(
+        &self,
+        read: ReadKind,
+        now: TickCapture,
+        deadline: TickCapture,
+    ) -> Result<PendingRead, BudgetError> {
+        let mut state = self.0 .0.try_lock().map_err(|_| BudgetError::Deferred)?;
+        self.0
+            .reserve_steady(&mut state, now, deadline, read.weight())
+            .map(|pending| PendingRead(pending, read))
+    }
+}
+
 pub(crate) struct ProtectiveWaiter(SharedBudget);
 impl Drop for ProtectiveWaiter {
     fn drop(&mut self) {
@@ -97,14 +168,35 @@ impl SharedBudget {
         self.0.lock().map(|state| state.handoffs).map_err(|_| BudgetError::Invalid)
     }
     pub(crate) fn from_rows(rows: BootstrapRows, unclean: bool) -> Result<Self, BudgetError> {
-        let model = BudgetTransitions::unknown_history(rows.start).map_err(transition)?;
         let daily = u64::try_from(rows.active.len()).map_err(|_| BudgetError::Invalid)?;
+        Self::new(rows.start, daily, rows.pause, unclean)
+    }
+
+    /// A non-trading process's budget (PLAN §6.4): the same unknown-history
+    /// model (no weight before start + 60 s) and the same checks (unclean ⇒
+    /// nothing before start + 120 s, the stored pause, heads, closing). Its
+    /// daily input is the zero-order constant: no reservation of this type
+    /// can carry an order.
+    pub(crate) fn non_trading(
+        start: TickCapture,
+        pause: Option<PauseValue>,
+        unclean: bool,
+    ) -> Result<NonTradingBudget, BudgetError> {
+        Self::new(start, 0, pause, unclean).map(NonTradingBudget)
+    }
+
+    fn new(
+        start: TickCapture,
+        daily: u64,
+        pause: Option<PauseValue>,
+        unclean: bool,
+    ) -> Result<Self, BudgetError> {
         Ok(Self(Arc::new(Mutex::new(State {
-            model,
-            start: rows.start,
+            model: BudgetTransitions::unknown_history(start).map_err(transition)?,
+            start,
             unclean,
             daily,
-            pause: rows.pause,
+            pause,
             protective_waiters: 0,
             handoffs: 0,
             closing: false,
@@ -355,3 +447,7 @@ impl SharedBudget {
 #[cfg(test)]
 #[path = "state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "non_trading_tests.rs"]
+mod non_trading_tests;
