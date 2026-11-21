@@ -1367,15 +1367,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self
     }
 
-    /// The accounting context the daemon gave this manager (5a composition
-    /// proof: the daemon's one generation cell).
-    #[cfg(all(test, feature = "postgres"))]
-    pub(crate) fn balance_accounting(
-        &self,
-    ) -> Option<&crate::balance_accounting::BalanceAccounting> {
-        self.balance_accounting.as_ref()
-    }
-
     // =========================================================================
     // Eventlog persistence bridge (MIG-v2.5#2)
     // =========================================================================

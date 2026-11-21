@@ -2769,18 +2769,19 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
-    /// 5a composition of 8l-4a's generation cell with package 4's supervised
+    /// 5a composition of 8l-4's generation cell with package 4's supervised
     /// start (ROOT-decision-8l4a-generation-handoff, option A). A supervised
     /// start publishes the generation it installed and admitted into the
     /// daemon's one cell before its journal is built, and the manager's
-    /// accounting context reads that same cell. The supervised journal's
-    /// durable incident and suspension writes then bump the accounting
-    /// version and CAS against the installed generation, which stays current.
-    /// A restart's successor (the 8j rebuild: a rotated generation in a new
-    /// epoch, as `cold_install`'s `publish.sql` writes it) reaches its own
-    /// daemon the same way: its writes advance the rotated generation, and
-    /// the predecessor's journal, still on the old identity, is refused and
-    /// keeps its writes pending.
+    /// accounting context, which `Daemon::run` hands to the projection worker
+    /// (8l-4b), reads that same cell. The supervised journal's durable
+    /// incident and suspension writes and the worker's projector apply then
+    /// bump the accounting version and CAS against the installed generation,
+    /// which stays current. A restart's successor (the 8j rebuild: a rotated
+    /// generation in a new epoch, as `cold_install`'s `publish.sql` writes
+    /// it) reaches its own daemon the same way: its writes advance the
+    /// rotated generation, and the predecessor's journal, still on the old
+    /// identity, is refused and keeps its writes pending.
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
@@ -2887,7 +2888,8 @@ mod tests {
 
         let first =
             supervised(SpotReady::unsupervised_fixture(start, installed.clone(), pool.clone()));
-        let context = first.position_manager.read().await.balance_accounting().cloned().unwrap();
+        // The worker's context, as Daemon::run takes it from the manager.
+        let context = first.position_manager.read().await.balance_accounting().unwrap();
         assert_eq!(context.generation.current(), Some(installed.clone()), "the manager's cell");
         let journal = first.journal_for_startup_witness();
         assert!(journal.balance_account());
@@ -2895,6 +2897,36 @@ mod tests {
         assert_eq!(journal.flush_pending().await, 2, "the incident and the suspension land");
         assert_eq!(journal.retry_set_depth(), 0);
         assert_eq!(versions().await, (2, 2), "two bumps, each with the CAS");
+        assert!(current(installed.clone()).await);
+        let at = Utc.with_ymd_and_hms(2027, 4, 1, 0, 0, 10).unwrap();
+        let reset = robson_eventlog::EventEnvelope {
+            event_id: uuid::Uuid::now_v7(),
+            tenant_id: tenant,
+            stream_key: "test:5a".to_string(),
+            seq: 1,
+            event_type: "month_boundary_reset".to_string(),
+            payload: serde_json::json!({
+                "capital_base": "10000", "carried_positions_risk": "0",
+                "month": 4, "year": 2027, "timestamp": at,
+            }),
+            payload_schema_version: 1,
+            occurred_at: at,
+            ingested_at: at,
+            idempotency_key: uuid::Uuid::now_v7().to_string(),
+            trace_id: None,
+            causation_id: None,
+            command_id: None,
+            workflow_id: None,
+            actor_type: Some(ActorType::Daemon),
+            actor_id: None,
+            prev_hash: None,
+            hash: None,
+        };
+        let step = crate::balance_accounting::projector_step(Some(&context));
+        robson_projector::apply_event_to_projections_with(&pool, &reset, step)
+            .await
+            .unwrap();
+        assert_eq!(versions().await, (3, 3), "the worker's apply bumps once, with the CAS");
         assert!(current(installed.clone()).await);
 
         // The successor installs a rotated generation in its own epoch.
@@ -2926,12 +2958,12 @@ mod tests {
         assert!(current(rotated.clone()).await && !current(installed.clone()).await);
         let second =
             supervised(SpotReady::unsupervised_fixture(successor, rotated.clone(), pool.clone()));
-        let context = second.position_manager.read().await.balance_accounting().cloned().unwrap();
+        let context = second.position_manager.read().await.balance_accounting().unwrap();
         assert_eq!(context.generation.current(), Some(rotated.clone()));
         let renewed = second.journal_for_startup_witness();
         renewed.record_suspension(suspension());
         assert_eq!(renewed.flush_pending().await, 2);
-        assert_eq!(versions().await, (4, 4), "the successor's writes advance its generation");
+        assert_eq!(versions().await, (5, 5), "the successor's writes advance its generation");
         assert!(current(rotated.clone()).await);
 
         // The predecessor's journal still reads the old identity: refused, and
@@ -2939,7 +2971,7 @@ mod tests {
         journal.record_suspension(suspension());
         assert_eq!(journal.flush_pending().await, 0);
         assert_eq!(journal.retry_set_depth(), 2);
-        assert_eq!(versions().await, (4, 4));
+        assert_eq!(versions().await, (5, 5));
         assert!(current(rotated).await);
     }
 
