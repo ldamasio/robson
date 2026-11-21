@@ -870,7 +870,10 @@ async fn rollback_boundary(pool: &PgPool, only_41: bool) -> Result<()> {
     if only_41 {
         f.adapter.apply(migration()).await?;
     } else {
-        crate::MIGRATOR.run_direct(&mut f.adapter).await?;
+        // The production inventory frozen at 45, as the canonical resume
+        // below: this boundary is 41 to 45's (migration46.rs proves 46 to
+        // 50's).
+        through(VERSION45).run_direct(&mut f.adapter).await?;
     }
     f.adapter.unlock().await?;
     let held: bool = sqlx::query_scalar(HOLDS)
