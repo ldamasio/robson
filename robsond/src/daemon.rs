@@ -2606,6 +2606,136 @@ mod tests {
     #[cfg(feature = "postgres")]
     use crate::query_engine::QueryStateChangedEvent;
 
+    /// A release on `journal` while `order_intents` is locked, given two
+    /// seconds: `None` if it was still waiting for the lock, else its
+    /// refusal text (`Ok` if it went through).
+    #[cfg(feature = "postgres")]
+    async fn release_under_lock(
+        pool: &sqlx::PgPool,
+        journal: &OrderJournal,
+    ) -> Option<Result<(), String>> {
+        use robson_exec::order_journal::{ReleaseRecord, ReleaseRefusal};
+
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE order_intents IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        let record = ReleaseRecord {
+            decision_id: uuid::Uuid::now_v7(),
+            generation: journal.gate().generation(),
+            actor: "operator@example.test".to_string(),
+            auth_kind: "verified",
+            note: "finding-2 lock wait".to_string(),
+            treatment: "unbooked_accepted",
+            decided_at: Utc::now(),
+        };
+        let waited = tokio::time::timeout(Duration::from_secs(2), journal.release(record)).await;
+        held.rollback().await.unwrap();
+        waited.ok().map(|released| {
+            released.map(|_| ()).map_err(|refusal| match refusal {
+                ReleaseRefusal::Backend(reason) => reason,
+                other => format!("{other:?}"),
+            })
+        })
+    }
+
+    /// D5 finding 2 through package 4's journal attachment: the daemon bounds
+    /// the auxiliary transactions of whatever backend it attaches to a
+    /// balance venue, from the venue's account kind, and leaves a position
+    /// account's as they were. A release waiting on a lock ends at the server
+    /// bound only for the balance venue.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn the_attached_backend_takes_the_balance_bounds_from_the_venue(pool: sqlx::PgPool) {
+        use robson_exec::venue::AccountKind;
+
+        use crate::capability::test_exchange::RestrictedExchange;
+        for balance in [true, false] {
+            let mut capabilities = robson_testkit::balance_stub::spot_capabilities();
+            if !balance {
+                capabilities.account_kind = AccountKind::PositionAccount;
+            }
+            let venue = Arc::new(RestrictedExchange::new().with_capabilities(capabilities));
+            let executor = Executor::new(
+                Arc::clone(&venue),
+                Arc::new(IntentJournal::new()),
+                Arc::new(MemoryStore::new()),
+            );
+            let backend =
+                crate::order_journal_store::PgJournalBackend::new(&pool, uuid::Uuid::now_v7());
+            let executor = with_order_journal_backend(executor, &venue, backend);
+            let journal = executor.order_journal();
+            assert_eq!(journal.balance_account(), balance);
+            journal.check_ready().await.unwrap();
+            let started = std::time::Instant::now();
+            let released = release_under_lock(&pool, &journal).await;
+            if balance {
+                let error = released
+                    .expect("the server bound must end the lock wait")
+                    .expect_err("a lock wait past the bound must fail");
+                assert!(
+                    error.contains("lock timeout") || error.contains("statement timeout"),
+                    "{error}"
+                );
+                assert!(started.elapsed() < Duration::from_secs(2));
+            } else {
+                assert!(released.is_none(), "a position account's release is bounded: {released:?}");
+            }
+        }
+    }
+
+    /// The supervised Spot backend is a bounded balance backend by itself
+    /// (D5 finding 2), not only once the daemon attaches it: an incident
+    /// waiting on a lock ends at the server bound.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn the_supervised_spot_backend_bounds_its_incidents(pool: sqlx::PgPool) {
+        use robson_exec::{
+            gate::{Incident, IncidentReason},
+            order_journal::{JournalBackend as _, DEFAULT_ACCOUNT_SCOPE},
+        };
+
+        use crate::spot_order_set_store::{spot_startup::SpotReady, JournalGeneration};
+        let tenant = uuid::Uuid::now_v7();
+        let start =
+            crate::process_epoch::start_epoch(&pool, tenant, "supervised-bounds").await.unwrap();
+        let generation = JournalGeneration {
+            tenant_id: tenant,
+            account_scope: DEFAULT_ACCOUNT_SCOPE.to_string(),
+            generation_id: uuid::Uuid::now_v7(),
+            process_epoch: start.epoch.epoch_id,
+            source_audit_id: uuid::Uuid::now_v7(),
+        };
+        let ready = SpotReady::unsupervised_fixture(start, generation, pool.clone());
+        let backend = crate::order_journal_store::PgJournalBackend::supervised(&ready);
+        let incident = Incident {
+            reason: IncidentReason::UncertainOutcome,
+            first_at: Utc::now(),
+            last_at: Utc::now(),
+            count: 1,
+            first_generation: 1,
+            last_generation: 1,
+        };
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE recovery_incidents IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let waited =
+            tokio::time::timeout(Duration::from_secs(2), backend.upsert_incident(&incident)).await;
+        held.rollback().await.unwrap();
+        let failure = waited
+            .expect("the server bound must end the lock wait")
+            .expect_err("a lock wait past the bound must fail");
+        let error = format!("{failure:?}");
+        assert!(error.contains("lock timeout") || error.contains("statement timeout"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]

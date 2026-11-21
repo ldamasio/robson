@@ -532,3 +532,15 @@ impl SpotReady {
     }
 }
 
+/// Test-only: a handoff over `writer` without the supervised startup, for the
+/// tests of what consumes one. Production has no constructor.
+#[cfg(test)]
+impl SpotReady {
+    pub(crate) fn unsupervised_fixture(
+        start: EpochStart,
+        generation: JournalGeneration,
+        writer: PgPool,
+    ) -> Self {
+        Self { start, generation, writer }
+    }
+}
