@@ -819,8 +819,11 @@ fn nothing_outside_the_spot_module_names_it() {
         // 8l-2: the settlement barrier and the gate's pending slot;
         "robsond/src/venue_ledger_store/settlement.rs",
         "robson-exec/src/gate/pending_execution.rs",
-        // 8l-4a: the balance accounting context.
+        // 8l-4a: the balance accounting context;
         "robsond/src/balance_accounting.rs",
+        // 8l-4b: the projector's accounting step and the worker passing it.
+        "robson-projector/src/accounting.rs",
+        "robsond/src/projection_worker.rs",
     ] {
         assert!(outside.iter().any(|path| path.ends_with(must)), "{must} not scanned");
     }

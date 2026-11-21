@@ -926,7 +926,7 @@ fn package4_supervised_startup_stays_out_of_production() {
 }
 
 /// Package 5a's owners on a balance daemon, one line each: what 8k-1 B,
-/// 8k-2, 8l-1, 8l-2 and 8l-4a add to its database paths, and that each
+/// 8k-2, 8l-1, 8l-2, 8l-4a and 8l-4b add to its database paths, and that each
 /// dormant one keeps no production caller. Its one connection owner is
 /// allowed above, with its reason; its one bound site is known above.
 #[test]
@@ -982,4 +982,19 @@ fn package5a_owners_stay_dormant_or_bounded() {
     let daemon = squeeze(&source("daemon.rs"));
     assert_eq!(daemon.matches("generation.publish(").count(), 1, "{daemon}");
     assert!(daemon.contains("Some(ready)=>{generation.publish(ready.generation().clone());"));
+    // 8l-4b: every production projector apply passes the context's step (its
+    // bounds first, on the projector's pool): the append path, the stream
+    // repair and the projection worker, which takes the manager's context.
+    assert_eq!(naming("apply_event_to_projections("), none);
+    let steps: BTreeSet<String> = [
+        "event_streams.rs",
+        "position_manager.rs",
+        "projection_worker.rs",
+    ]
+    .map(String::from)
+    .into();
+    assert_eq!(outside("projector_step(", "balance_accounting.rs"), steps);
+    assert!(
+        daemon.contains("letaccounting=self.position_manager.read().await.balance_accounting();")
+    );
 }
