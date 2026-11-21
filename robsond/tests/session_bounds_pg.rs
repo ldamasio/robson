@@ -75,7 +75,7 @@ async fn settings(connection: &mut PgConnection) -> (String, String, String, i32
 
 fn shown(bounds: SessionBounds) -> (String, String, String) {
     let show = |ms: u64| {
-        if ms % 1_000 == 0 {
+        if ms.is_multiple_of(1_000) {
             format!("{}s", ms / 1_000)
         } else {
             format!("{ms}ms")

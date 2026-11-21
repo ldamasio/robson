@@ -20,7 +20,10 @@ use std::{
 use chrono::{Datelike, Utc};
 use robson_domain::MonthlyBudgetModel;
 use robson_eventlog::{append_event, query_events, query_stream_in_seq_order, Event, QueryOptions};
-use robson_exec::venue::{AccountKind, VenueId};
+use robson_exec::{
+    gate::IncidentReason,
+    venue::{AccountKind, VenueId},
+};
 use robsond::{db_session::connect_daemon_pool, venue_ledger_store::PgVenueLedger};
 use serde_json::json;
 use sqlx::PgPool;
@@ -338,6 +341,17 @@ async fn measure_pass(root: &PgPool, plain: &PgPool, pass: &'static str, round: 
         .await
         .unwrap()
     });
+    let open_unclean = || async {
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT count, last_generation FROM recovery_incidents \
+             WHERE tenant_id = $1 AND reason = 'unclean_start' AND released_at IS NULL",
+        )
+        .bind(TENANT)
+        .fetch_optional(plain)
+        .await
+        .unwrap()
+    };
+    let before = open_unclean().await.map_or(0, |(count, _)| count);
     let start = timed!(
         rec,
         "start_epoch_unclean",
@@ -346,6 +360,24 @@ async fn measure_pass(root: &PgPool, plain: &PgPool, pass: &'static str, round: 
         { robsond::process_epoch::start_epoch(root, TENANT, "c1").await.unwrap() }
     );
     assert_eq!(start.stamped_intents, 1_000, "{pass}: the unclean start stamps 1,000 intents");
+    // PLAN §6: the same transaction records the unclean start's incident, which
+    // the start reports open and the database holds committed.
+    let generation = start
+        .unclean_generation
+        .unwrap_or_else(|| panic!("{pass}: the start is unclean"));
+    assert!(
+        start.open_incidents.iter().any(|incident| {
+            matches!(incident.reason, IncidentReason::UncleanStart)
+                && incident.last_generation == generation
+        }),
+        "{pass}: the start reports its open unclean_start incident: {:?}",
+        start.open_incidents
+    );
+    assert_eq!(
+        open_unclean().await,
+        Some((before + 1, generation)),
+        "{pass}: the committed unclean_start incident counts this start at its generation"
+    );
     for (op, parent) in [
         ("create_event_log_partitions", "event_log"),
         ("create_snapshot_partitions", "snapshots"),
