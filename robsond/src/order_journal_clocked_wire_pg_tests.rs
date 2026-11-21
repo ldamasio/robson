@@ -90,6 +90,7 @@ impl Wire {
             daemon_pool: pool.clone(),
             tenant_id: tenant,
             ready_wait: super::super::JOURNAL_READY_WAIT,
+            balance_account: false,
             order_set_projection: None,
         };
         Ok(Self {

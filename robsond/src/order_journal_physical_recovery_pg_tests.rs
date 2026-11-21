@@ -360,6 +360,7 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
         daemon_pool: pool.clone(),
         tenant_id: g.tenant_id,
         ready_wait: JOURNAL_READY_WAIT,
+        balance_account: false,
         order_set_projection: Some(g.clone()),
     };
     proxy.enable_exact_query_trace(12);
@@ -547,6 +548,7 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
         daemon_pool: restore.clone(),
         tenant_id: g.tenant_id,
         ready_wait: JOURNAL_READY_WAIT,
+        balance_account: false,
         order_set_projection: Some(successor.clone()),
     };
     let j = sell();

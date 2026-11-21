@@ -366,6 +366,7 @@ async fn proxied_journal(
         daemon_pool: pool.clone(),
         tenant_id: g.tenant_id,
         ready_wait: JOURNAL_READY_WAIT,
+        balance_account: false,
         order_set_projection: Some(g.clone()),
     };
     Ok((stored, proxy, pid, birth))
