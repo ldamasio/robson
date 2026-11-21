@@ -2,23 +2,39 @@
 //! restored target closed from before the epoch through admission; each stage
 //! owns the next, and only the last yields the writer the daemon serves on.
 //! No environment switch, raw id, lock or installed marker grants anything.
+//!
+//! Package 4 compiles only [`SpotReady`] in production, and nothing there
+//! constructs one: the supervisor, the epoch, the capture, the install, the
+//! source audit and the admission that produce it run only in tests, like
+//! the cold installer and the cold owner's capture they drive.
+#[cfg(test)]
 use std::{future::Future, time::Duration};
 
+#[cfg(test)]
 use robson_exec::venue::VenueId;
-use sqlx::{PgConnection, PgPool};
+#[cfg(test)]
+use sqlx::PgConnection;
+use sqlx::PgPool;
+#[cfg(test)]
 use tokio::time::{timeout, timeout_at, Instant};
+#[cfg(test)]
 use uuid::Uuid;
 
+use super::JournalGeneration;
+#[cfg(test)]
 use super::{
     cold_audit::{ColdAuditRefusal, ColdAuditScope},
     cold_install::{
         install, ClosedWriterFence, FencePhase, FenceReceipt, FixtureFenceError, InstallRefusal,
     },
     cold_owner::{capture, ColdOwnerCut, OwnerRequest, RestoreIdentity},
-    observe_generation, ExpectedGeneration, JournalGeneration,
+    observe_generation, ExpectedGeneration,
 };
-use crate::{error::DaemonError, ledger_connection::LedgerConnection, process_epoch::EpochStart};
+use crate::process_epoch::EpochStart;
+#[cfg(test)]
+use crate::{error::DaemonError, ledger_connection::LedgerConnection};
 
+#[cfg(test)]
 /// The installer's own session and cluster, read once before the epoch.
 const INSTALLER: &str = "SELECT current_user::text, session_user::text, current_database()::text,
     inet_server_addr()::text, inet_server_port(), pg_postmaster_start_time()::text,
@@ -26,13 +42,16 @@ const INSTALLER: &str = "SELECT current_user::text, session_user::text, current_
     FROM pg_control_system() c
     WHERE EXISTS (SELECT 1 FROM public.venue_accounts
                   WHERE (venue_id, account_scope)=('binance:spot',$2) AND tenant_id=$1)";
+#[cfg(test)]
 /// The admitted writer's session: what a restricted login can read.
 const WRITER: &str = "SELECT current_user::text, session_user::text, current_database()::text,
     inet_server_addr()::text, inet_server_port(), pg_postmaster_start_time()::text";
+#[cfg(test)]
 /// A refused writer pool is closed within this, whatever is left of the
 /// deadline.
 const WRITER_CLOSE_BOUND: Duration = Duration::from_millis(250);
 
+#[cfg(test)]
 /// The restored target the supervisor verified and holds closed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RestoredTarget {
@@ -44,12 +63,14 @@ pub(crate) struct RestoredTarget {
     pub(crate) postmaster_started: String,
 }
 
+#[cfg(test)]
 /// What the supervisor is asked to admit, after install and readback.
 pub(crate) struct Admission<'a> {
     pub(crate) generation: &'a JournalGeneration,
     pub(crate) login: &'a str,
 }
 
+#[cfg(test)]
 /// The trusted supervisor of one exclusive restore operation. While it lives
 /// it denies both writer logins except as admitted here and tracks the
 /// previous backend's retirement and the target's incarnation. Every answer
@@ -67,6 +88,7 @@ pub(crate) trait SpotSupervisor: ClosedWriterFence {
     ) -> Result<PgPool, FixtureFenceError>;
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartupStage {
     BeforeEpoch,
@@ -78,6 +100,7 @@ pub(crate) enum StartupStage {
     Admit,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum StartupRefusal {
     Deadline(StartupStage),
@@ -95,6 +118,7 @@ pub(crate) enum StartupRefusal {
     Generation,
 }
 
+#[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 struct Session {
     login: String,
@@ -105,9 +129,12 @@ struct Session {
     postmaster_started: String,
 }
 
+#[cfg(test)]
 type WriterRow = (String, String, String, Option<String>, Option<i32>, String);
+#[cfg(test)]
 type InstallerRow = (String, String, String, Option<String>, Option<i32>, String, String, String);
 
+#[cfg(test)]
 impl From<WriterRow> for Session {
     fn from(row: WriterRow) -> Self {
         let (login, session_login, database, address, port, postmaster_started) = row;
@@ -122,6 +149,7 @@ impl From<WriterRow> for Session {
     }
 }
 
+#[cfg(test)]
 async fn bounded<T>(
     stage: StartupStage,
     deadline: Instant,
@@ -130,6 +158,7 @@ async fn bounded<T>(
     timeout_at(deadline, work).await.map_err(|_| StartupRefusal::Deadline(stage))
 }
 
+#[cfg(test)]
 /// One owner, operation and target from before the epoch on.
 struct Held<S> {
     supervisor: S,
@@ -142,6 +171,7 @@ struct Held<S> {
     deadline: Instant,
 }
 
+#[cfg(test)]
 impl<S: SpotSupervisor> Held<S> {
     async fn check(
         &mut self,
@@ -157,6 +187,7 @@ impl<S: SpotSupervisor> Held<S> {
     }
 }
 
+#[cfg(test)]
 /// The supervisor's fence holding the receipt it gave before the epoch: the
 /// installer's own phases refuse any other owner, operation or target.
 struct Continuous<'a, S> {
@@ -164,6 +195,7 @@ struct Continuous<'a, S> {
     receipt: FenceReceipt,
 }
 
+#[cfg(test)]
 impl<S: ClosedWriterFence> ClosedWriterFence for Continuous<'_, S> {
     async fn check(
         &mut self,
@@ -179,6 +211,7 @@ impl<S: ClosedWriterFence> ClosedWriterFence for Continuous<'_, S> {
     }
 }
 
+#[cfg(test)]
 /// The fence and target checked against the installer's actual connection,
 /// then exactly one strict epoch. A refusal before the insert writes nothing.
 pub(crate) async fn record_epoch<S: SpotSupervisor>(
@@ -236,6 +269,7 @@ pub(crate) async fn record_epoch<S: SpotSupervisor>(
     })
 }
 
+#[cfg(test)]
 async fn read_installer(
     pool: &PgPool,
     tenant_id: Uuid,
@@ -255,12 +289,14 @@ async fn read_installer(
     Ok((installer, (system, directory)))
 }
 
+#[cfg(test)]
 /// The one fresh epoch, under the held fence.
 pub(crate) struct Epoched<S> {
     held: Held<S>,
     start: EpochStart,
 }
 
+#[cfg(test)]
 impl<S: SpotSupervisor> Epoched<S> {
     pub(crate) fn epoch(&self) -> &EpochStart {
         &self.start
@@ -299,6 +335,7 @@ impl<S: SpotSupervisor> Epoched<S> {
     }
 }
 
+#[cfg(test)]
 /// The cut, still under the held fence.
 pub(crate) struct Captured<S> {
     held: Held<S>,
@@ -306,6 +343,7 @@ pub(crate) struct Captured<S> {
     cut: ColdOwnerCut,
 }
 
+#[cfg(test)]
 impl<S: SpotSupervisor> Captured<S> {
     pub(crate) fn epoch(&self) -> &EpochStart {
         &self.start
@@ -347,6 +385,7 @@ impl<S: SpotSupervisor> Captured<S> {
     }
 }
 
+#[cfg(test)]
 /// The installed and independently read back generation.
 pub(crate) struct InstalledSpot<S> {
     held: Held<S>,
@@ -355,6 +394,7 @@ pub(crate) struct InstalledSpot<S> {
     accounting_version: i64,
 }
 
+#[cfg(test)]
 impl<S: SpotSupervisor> InstalledSpot<S> {
     pub(crate) fn epoch(&self) -> &EpochStart {
         &self.start
@@ -423,6 +463,7 @@ impl<S: SpotSupervisor> InstalledSpot<S> {
     }
 }
 
+#[cfg(test)]
 async fn authenticate(
     writer: &PgPool,
     installer: &Session,
@@ -490,3 +531,4 @@ impl SpotReady {
         &self.writer
     }
 }
+

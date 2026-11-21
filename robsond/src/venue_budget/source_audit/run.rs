@@ -268,6 +268,7 @@ pub(super) async fn start(
     start_with_initialization(pool, audit, envelope, trace, false).await
 }
 
+#[cfg(test)]
 pub(super) async fn start_existing(
     pool: &PgPool,
     audit: Uuid,

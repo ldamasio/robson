@@ -139,6 +139,8 @@ fn decode(
 mod run;
 
 /// A fresh descriptive terminal audit. This carries no bootstrap capability.
+/// Test-only in package 4, like the supervised startup that runs it.
+#[cfg(test)]
 pub(crate) struct DescriptiveAudit {
     pub(crate) id: Uuid,
     pub(crate) examined: i64,
@@ -147,6 +149,7 @@ pub(crate) struct DescriptiveAudit {
 
 /// Run only against a target held closed by the supervisor. Retain exactly
 /// one acknowledged continuation and never retry a refused or uncertain run.
+#[cfg(test)]
 pub(crate) async fn describe_existing_source(
     pool: &PgPool,
     deadline: Instant,

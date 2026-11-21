@@ -862,3 +862,48 @@ fn package3_test_only_owners_stay_out_of_production() {
         assert!(!owner.contains(test_only), "{test_only} is production code");
     }
 }
+
+/// Package 4's supervised startup is the only producer of the Spot writer a
+/// daemon can serve on, and it runs only in tests, like the cold installer
+/// and the cold owner's capture it drives. Production compiles the handoff
+/// type and the daemon's private assembly that would consume one, but no
+/// code that constructs a handoff or builds a daemon from it, and neither
+/// the supervised preflight (with its own loopback pool) nor its command.
+#[test]
+fn package4_supervised_startup_stays_out_of_production() {
+    let sources = production_sources();
+    let files: BTreeSet<&str> = sources.iter().map(|s| s.file.as_str()).collect();
+    assert!(
+        !files.contains("spot_supervised_preflight.rs"),
+        "the supervised preflight is production code: {files:?}"
+    );
+    let startup = source("spot_order_set_store/spot_startup.rs");
+    assert!(startup.contains("pub(crate) struct SpotReady {"), "{startup}");
+    for test_only in [
+        "trait SpotSupervisor",
+        "fn record_epoch",
+        "fn capture",
+        "fn install",
+        "fn audit_source_for_preflight",
+        "fn admit",
+        "fn authenticate",
+        "INSTALLER",
+    ] {
+        assert!(!startup.contains(test_only), "{test_only} is production code");
+    }
+    // The definition is the only production `SpotReady {`: nothing builds one.
+    let built: Vec<(&str, usize)> = sources
+        .iter()
+        .map(|s| (s.file.as_str(), s.text.matches("SpotReady {").count()))
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    assert_eq!(built, [("spot_order_set_store/spot_startup.rs", 1)]);
+    assert!(!source("daemon.rs").contains("fn with_supervised_spot("));
+    let main = source("main.rs");
+    assert!(
+        !main.contains("spot_supervised_preflight") && !main.contains("spot-supervised-preflight"),
+        "{main}"
+    );
+    assert!(!source("venue_budget/source_audit.rs").contains("fn describe_existing_source("));
+    assert!(!source("venue_budget/source_audit/run.rs").contains("fn start_existing("));
+}

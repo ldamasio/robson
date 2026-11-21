@@ -6,9 +6,14 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 mod cold_audit;
+#[cfg(test)]
 pub(crate) mod cold_install;
+#[cfg(not(test))]
+mod cold_owner;
+#[cfg(test)]
 pub(crate) mod cold_owner;
 mod cold_source;
+// Production keeps only its SpotReady, which nothing there constructs.
 pub(crate) mod spot_startup;
 pub(crate) mod warm;
 

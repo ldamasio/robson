@@ -656,8 +656,9 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
 
     /// Build the Spot daemon only from the supervised startup handoff. The
     /// installed generation and restricted pool both come from that operation.
-    #[cfg(feature = "postgres")]
-    #[allow(dead_code, reason = "the deployed supervisor is not wired yet")]
+    /// Test-only in package 4, like the supervised startup itself: production
+    /// assembles every daemon without a handoff.
+    #[cfg(all(test, feature = "postgres"))]
     pub(crate) fn with_supervised_spot(
         config: Config,
         venue: Arc<E>,
