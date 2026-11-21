@@ -949,13 +949,19 @@ fn package5a_owners_stay_dormant_or_bounded() {
     assert_eq!(outside("VenueDiscrepancy", "balance_reconciliation/"), none);
     // 8k-2: the detector is declared and nothing calls it; its pre reader is
     // the connection owner allowed above.
-    assert_eq!(outside("balance_reconciliation", "balance_reconciliation/"), only("lib.rs"));
+    // 8l-3b's dormant cash writer takes 8k-2's qualified verdict and its
+    // interval (`BaseVerdict`, `ObservationInterval`) as its input.
+    let detector_users =
+        BTreeSet::from(["lib.rs", "venue_ledger_store/cash/writer.rs"].map(String::from));
+    assert_eq!(outside("balance_reconciliation", "balance_reconciliation/"), detector_users);
     assert_eq!(source("lib.rs").matches("mod balance_reconciliation;").count(), 1);
     assert_eq!(outside("read_pre", "balance_reconciliation/"), none);
     // 8l-1: S8-4's tables are migrations only; the production texts that
     // name any of them are 8l-2's read-only barrier statement, 8l-3a's
-    // read-only cash statements, and record_trades' one write, the
-    // unattributed-fill invalidation (PLAN-r4 §6.10).
+    // read-only cash statements, record_trades' one write, the
+    // unattributed-fill invalidation (PLAN-r4 §6.10), and 8l-3b's cash
+    // writer (its context read and its checkpoint, discrepancy and sighting
+    // writes; PLAN-r4 §6.4), which has no production caller.
     let tables = [
         "cash_anchors",
         "cash_checkpoints",
@@ -973,13 +979,18 @@ fn package5a_owners_stay_dormant_or_bounded() {
         "venue_ledger_store/cash/state.sql",
     ];
     let (barrier, trades) = ("venue_ledger_store/settlement.sql", "venue_ledger_store/trades.rs");
+    let writer = [
+        "venue_ledger_store/cash/context.sql",
+        "venue_ledger_store/cash/writer.rs",
+    ];
     let expected: BTreeSet<String> = cash_sql
         .iter()
         .chain([&barrier, &trades])
+        .chain(&writer)
         .map(|file| file.to_string())
         .collect();
     assert_eq!(named, expected);
-    for file in cash_sql.iter().chain([&barrier]) {
+    for file in cash_sql.iter().chain([&barrier, &writer[0]]) {
         let text = source(file);
         assert!(["INSERT", "UPDATE", "DELETE"].iter().all(|w| !text.contains(w)), "{file}");
     }
@@ -988,12 +999,18 @@ fn package5a_owners_stay_dormant_or_bounded() {
     // and have no production caller yet (8l-3b, 8l-8, 8p, 8n).
     assert_eq!(outside("read_cash_state", "venue_ledger_store/cash"), none);
     assert_eq!(outside("CASH_STATE", "venue_ledger_store/cash"), none);
+    // 8l-3b: the cash writer is declared and nothing calls it (8k-3 will).
+    assert_eq!(outside("CashWriter", "venue_ledger_store/cash"), none);
+    assert_eq!(naming(".conclude("), none);
     // 8l-2: the barrier runs on its caller's connection, and neither it nor
     // the gate's invalidity marks has a production caller yet (8l-3, 8l-7,
     // 8l-8, 8n).
     assert_eq!(outside("read_settlement", "venue_ledger_store/settlement.rs"), none);
-    assert_eq!(outside("SETTLEMENT_BARRIER", "venue_ledger_store/settlement.rs"), none);
-    assert_eq!(naming("invalidity_marks"), none);
+    // 8l-3b's context read embeds the barrier (one statement, PLAN-r4 §6.4)
+    // and its final qualification reads the marks; the writer is dormant.
+    let writer_rs = only("venue_ledger_store/cash/writer.rs");
+    assert_eq!(outside("SETTLEMENT_BARRIER", "venue_ledger_store/settlement.rs"), writer_rs);
+    assert_eq!(naming("invalidity_marks"), writer_rs);
     assert_eq!(naming(".pending_evidence("), none);
     // 8l-4a: its writers run on the journal's and the clear's bounded
     // transactions (balance_accounting.rs, a known bound site above); the

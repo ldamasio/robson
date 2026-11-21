@@ -44,6 +44,10 @@ crash_points! {
     // A startup repair applied a page of a suspended stream and recorded its
     // checkpoint; the next page has not started.
     REPAIR_AFTER_PAGE = "repair_after_page";
+    // The cash writer read its context holding the accounting rows (8l-3b).
+    CASH_AFTER_CONTEXT = "cash_after_context";
+    // The cash writer sent its writes; COMMIT is not sent (8l-3b).
+    CASH_BEFORE_COMMIT = "cash_before_commit";
 }
 
 /// Crash point to arm.

@@ -1,7 +1,9 @@
-//! The cash ledger of one balance-account venue (ADR-0056 step 8l-3a; v16
+//! The cash ledger of one balance-account venue (ADR-0056 step 8l-3; v16
 //! §C1, §C8; PLAN-r4 §6.4, §6.6, §6.10): `E(t)` with its read-time
-//! impairment rule and the cash validity predicates. Inert: no production
-//! caller until 8l-3b's writer, 8l-8, 8p and 8n read them.
+//! impairment rule and the cash validity predicates (8l-3a), and the cash
+//! writer ([`writer`], 8l-3b). Inert: no production caller until 8k-3 hands
+//! the writer its qualified attempts and 8l-8, 8p and 8n read the
+//! predicates.
 //!
 //! A discrepancy is evidence, never accounting: `E(t)` reads observed
 //! anchors, leg-owned fills and attested flows only, and nothing here writes
@@ -23,6 +25,14 @@ use super::{
 
 #[cfg(test)]
 mod pg_tests;
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "8l-3b cash writer: no production caller until 8k-3"
+    )
+)]
+pub(crate) mod writer;
 
 const EXPECTED: &str = include_str!("cash/expected.sql");
 const DISCREPANCY: &str = include_str!("cash/discrepancy.sql");

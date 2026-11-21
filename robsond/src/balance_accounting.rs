@@ -34,6 +34,12 @@ mod pg_tests;
 /// `BEGIN` of every transaction this context opens (PLAN-r4 §7.2).
 pub(crate) const BOUNDS: &str = "SELECT set_config('lock_timeout', '300ms', true), set_config('statement_timeout', '1s', true), set_config('idle_in_transaction_session_timeout', '1s', true)";
 
+/// Every accounting row of the tenant, locked in (tenant, venue) order, as
+/// [`BUMP`] takes them: the cash writer's row lock and a balance daemon's
+/// epoch insert (ADR-0056 step 8l-3b), so neither waits on the other in a
+/// cycle and a conclusion holding them is never overtaken by a new epoch.
+pub(crate) const ACCOUNTING_ROWS: &str = "SELECT venue_id, version FROM public.accounting_state WHERE tenant_id = $1 ORDER BY venue_id FOR UPDATE";
+
 /// One bump of every accounting row of the tenant, locked in (tenant, venue)
 /// order, so writers that take several rows never wait on each other in a
 /// cycle. A tenant with no row yet (8m's cutover creates it) moves nothing.

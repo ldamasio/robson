@@ -62,6 +62,9 @@
 //!   settlement barrier read found unsettled (ADR-0056 step 8l-2)
 //! - `robsond_cash_impaired` — 1 while the latest cash read found `E(now)`
 //!   impaired by late evidence (ADR-0056 step 8l-3a)
+//! - `robsond_cash_conclusions_total{outcome}` — cash writer attempts by
+//!   outcome: `clean`, `missing`, `extra`, `refused` or `uncertain` (ADR-0056
+//!   step 8l-3b)
 
 use std::sync::LazyLock;
 
@@ -291,6 +294,21 @@ pub static CASH_IMPAIRED: LazyLock<IntGauge> = LazyLock::new(|| {
 
 pub fn observe_cash_impaired(impaired: bool) {
     CASH_IMPAIRED.set(i64::from(impaired));
+}
+
+/// Cash writer attempts by outcome (ADR-0056 step 8l-3b): a published
+/// conclusion is `clean`, `missing` or `extra` by its Δ; one that wrote
+/// nothing is `refused`; a COMMIT without an answer is `uncertain`. No
+/// production writer yet.
+pub static CASH_CONCLUSIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!("robsond_cash_conclusions_total", "Cash writer attempts by outcome", &[
+        "outcome"
+    ])
+    .expect("failed to register robsond_cash_conclusions_total")
+});
+
+pub fn observe_cash_conclusion(outcome: &str) {
+    CASH_CONCLUSIONS.with_label_values(&[outcome]).inc();
 }
 
 /// Publish how many streams of each kind are suspended; both kinds export,

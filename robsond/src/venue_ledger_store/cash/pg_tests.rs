@@ -25,7 +25,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use super::*;
 
 const SYMBOL: &str = "BTCUSDT"; // A labelled fixture pair, never a policy restriction.
-const ASSETS: &[CommissionAssets<'static>] = &[CommissionAssets {
+pub(super) const ASSETS: &[CommissionAssets<'static>] = &[CommissionAssets {
     symbol: SYMBOL,
     base: "BTC",
     quote: "USDT",
@@ -33,33 +33,33 @@ const ASSETS: &[CommissionAssets<'static>] = &[CommissionAssets {
 static IDS: AtomicU64 = AtomicU64::new(1);
 
 /// `ms` milliseconds after 2026-11-10T12:00:00Z.
-fn at(ms: i64) -> DateTime<Utc> {
+pub(super) fn at(ms: i64) -> DateTime<Utc> {
     "2026-11-10T12:00:00Z".parse::<DateTime<Utc>>().expect("fixture time")
         + TimeDelta::milliseconds(ms)
 }
 
-fn utc(text: &str) -> DateTime<Utc> {
+pub(super) fn utc(text: &str) -> DateTime<Utc> {
     text.parse().expect("RFC 3339 fixture time")
 }
 
-fn micro() -> TimeDelta {
+pub(super) fn micro() -> TimeDelta {
     TimeDelta::microseconds(1)
 }
 
 /// One order and its one fill.
-struct Fill<'a> {
-    leg: bool,
-    buy: bool,
-    qty: Decimal,
-    price: Decimal,
-    fee: Decimal,
-    asset: &'a str,
-    time: DateTime<Utc>,
+pub(super) struct Fill<'a> {
+    pub(super) leg: bool,
+    pub(super) buy: bool,
+    pub(super) qty: Decimal,
+    pub(super) price: Decimal,
+    pub(super) fee: Decimal,
+    pub(super) asset: &'a str,
+    pub(super) time: DateTime<Utc>,
 }
 
 impl Fill<'static> {
     /// A discovered order's fill: no leg, no `E` flow, but late evidence.
-    fn foreign(time: DateTime<Utc>) -> Self {
+    pub(super) fn foreign(time: DateTime<Utc>) -> Self {
         Self {
             leg: false,
             buy: true,
@@ -74,16 +74,16 @@ impl Fill<'static> {
 
 /// One tenant's balance-account venue: its version row, a process epoch, a
 /// clock sample, and one leg for leg-owned orders.
-struct Book {
-    tenant: Uuid,
-    scope: String,
-    sample: Uuid,
-    epoch: Uuid,
-    leg: Uuid,
+pub(super) struct Book {
+    pub(super) tenant: Uuid,
+    pub(super) scope: String,
+    pub(super) sample: Uuid,
+    pub(super) epoch: Uuid,
+    pub(super) leg: Uuid,
 }
 
 impl Book {
-    async fn new(pool: &PgPool) -> Result<Self> {
+    pub(super) async fn new(pool: &PgPool) -> Result<Self> {
         let (tenant, epoch, sample) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
         let (leg, admission, scope) = (Uuid::now_v7(), Uuid::now_v7(), format!("cash-{tenant}"));
         sqlx::query("INSERT INTO accounting_state (tenant_id,venue_id,budget_model) VALUES ($1,'binance:spot','net_from_start_non_expanding_v1')")
@@ -114,7 +114,7 @@ impl Book {
 
     /// An observed anchor whose O2 interval is [as_of, as_of + 500 ms], on
     /// the hull [hull_start, as_of + 500 ms].
-    async fn anchor(
+    pub(super) async fn anchor(
         &self,
         pool: &PgPool,
         as_of: DateTime<Utc>,
@@ -130,14 +130,14 @@ impl Book {
     }
 
     /// A cutover anchor before completion: no `as_of` and no observation.
-    async fn pending(&self, pool: &PgPool, quote: Decimal) -> Result<Uuid> {
+    pub(super) async fn pending(&self, pool: &PgPool, quote: Decimal) -> Result<Uuid> {
         let id = Uuid::now_v7();
         sqlx::query("INSERT INTO cash_anchors (anchor_id,tenant_id,venue_id,kind,cutover_id,quote) VALUES ($1,$2,'binance:spot','cutover',$3,$4)")
             .bind(id).bind(self.tenant).bind(Uuid::now_v7()).bind(quote).execute(pool).await?;
         Ok(id)
     }
 
-    async fn fill(&self, pool: &PgPool, fill: &Fill<'_>) -> Result<()> {
+    pub(super) async fn fill(&self, pool: &PgPool, fill: &Fill<'_>) -> Result<()> {
         let id = IDS.fetch_add(1, Ordering::Relaxed).to_string();
         let (owner, leg) = if fill.leg {
             ("leg", Some(self.leg))
@@ -166,7 +166,7 @@ impl Book {
     /// Δ = 0, dating copy [dating, dating + 500 ms], and the sightings of
     /// `resolved` it used, less `excluded`.
     #[allow(clippy::too_many_arguments)]
-    async fn reanchor(
+    pub(super) async fn reanchor(
         &self,
         pool: &PgPool,
         old: Uuid,
@@ -192,7 +192,7 @@ impl Book {
         Ok(id)
     }
 
-    async fn flow(
+    pub(super) async fn flow(
         &self,
         pool: &PgPool,
         reanchor: Uuid,
@@ -215,7 +215,7 @@ impl Book {
     /// A discrepancy in `state` whose first sighting (seq 1) is `first` at
     /// cut `first_cut`, with the checkpoint copy at `checkpoint`; then its
     /// further sightings, seq 2 onward, each [cut, cut + 500 ms].
-    async fn discrepancy(
+    pub(super) async fn discrepancy(
         &self,
         pool: &PgPool,
         state: &str,
@@ -242,7 +242,7 @@ impl Book {
         Ok(id)
     }
 
-    async fn state(
+    pub(super) async fn state(
         &self,
         pool: &PgPool,
         t: DateTime<Utc>,
@@ -259,7 +259,7 @@ impl Book {
         Ok(read_cash_state(&mut *pool.acquire().await?, &query).await?)
     }
 
-    async fn expected(&self, pool: &PgPool, t: DateTime<Utc>) -> Result<ExpectedQuote> {
+    pub(super) async fn expected(&self, pool: &PgPool, t: DateTime<Utc>) -> Result<ExpectedQuote> {
         Ok(self.state(pool, t, t).await?.expected)
     }
 }
@@ -925,14 +925,13 @@ async fn impairment_spans_match_an_independent_oracle(pool: PgPool) -> Result<()
 
 // ---- one statement and its bound at PLAN-r4 §7.2's cardinality ----
 
-/// 200 legs, 2,000 intents, 1,000 orders and 10,000 fills (8l-2's shape),
-/// 51 anchors and 50 re-anchors each resolving a discrepancy of 10 sightings,
-/// and an open discrepancy of 500 sightings: one statement per read, each
-/// well inside the 1 s statement budget of an 8l transaction.
-#[sqlx::test(migrations = "../migrations")]
-#[ignore = "requires DATABASE_URL"]
-async fn cash_state_is_one_statement_within_its_bound(pool: PgPool) -> Result<()> {
-    let book = Book::new(&pool).await?;
+/// PLAN-r4 §7.2's cardinality on `book`'s venue: 200 legs (half closed with
+/// their dust rows), 2,000 intents, 1,000 orders and 10,000 fills (8l-2's
+/// shape, all settled), 51 anchors and 50 re-anchors each resolving a
+/// discrepancy of 10 sightings, and an open missing discrepancy of 500
+/// sightings (-100). Shared with 8l-3b's writer bound. Returns the counts of
+/// fills, sightings, re-anchors, legs and intents.
+pub(super) async fn bound_fixture(pool: &PgPool, book: &Book) -> Result<(i64, i64, i64, i64, i64)> {
     let (tenant, scope, sample, epoch) = (book.tenant, &book.scope, book.sample, book.epoch);
     sqlx::raw_sql(&format!("
         CREATE TEMP TABLE g AS SELECT n, ('10000000-0000-0000-0000-'||lpad(n::text,12,'0'))::uuid AS p,
@@ -944,6 +943,8 @@ async fn cash_state_is_one_statement_within_its_bound(pool: PgPool) -> Result<()
         INSERT INTO balance_legs (position_id,tenant_id,venue_id,account_scope,symbol,admission_intent_id,decided_month,target_trigger,gross_qty,acquisition_cost,base_commission,base_commission_final,executable_qty,consumed_cum,created_at,closed_at)
             SELECT p,'{tenant}','binance:spot','{scope}','{SYMBOL}',a,'2026-10-01',90,1,100,0.001,true,0.9,
                    CASE WHEN closed THEN 0.9 ELSE 0 END,'2026-10-01T00:00:00Z',CASE WHEN closed THEN timestamptz '2026-10-20T00:00:00Z' END FROM g;
+        INSERT INTO dust_ledger (position_id,tenant_id,venue_id,account_scope,symbol,entry_dust,write_off,pooled,close_at,last_fill_at)
+            SELECT p,'{tenant}','binance:spot','{scope}','{SYMBOL}',0.099,0,0.099,'2026-10-20T00:00:00Z','2026-10-20T00:00:00Z' FROM g WHERE closed;
         CREATE TEMP TABLE j AS SELECT g.p, k, ('30000000-0000-0000-'||lpad(g.n::text,4,'0')||'-'||lpad(k::text,12,'0'))::uuid AS i
             FROM g, generate_series(1,10) k;
         INSERT INTO order_intents (intent_id,tenant_id,venue_id,account_scope,client_order_id,position_id,kind,params,venue_outcome,created_at)
@@ -983,13 +984,13 @@ async fn cash_state_is_one_statement_within_its_bound(pool: PgPool) -> Result<()
                     '2026-11-19T00:00:00Z','2026-11-19T00:00:00.5Z',-100,'2026-09-03T02:00:00Z','2026-09-03T02:00:00Z','2026-09-03T02:00:00.5Z',2,'2026-11-19T00:00:00.35Z',-100);
         INSERT INTO cash_sightings SELECT '70000000-0000-0000-0000-000000000001',k,'{tenant}','binance:spot',ts+interval '150 ms',ts+interval '350 ms',150000000,'{sample}','{epoch}',ts,ts+interval '500 ms',-100
             FROM (SELECT k, timestamptz '2026-11-19T00:00:00Z' + (k-1) * interval '10 s' AS ts FROM generate_series(1,500) k) s;
-    ")).execute(&pool).await?;
+    ")).execute(pool).await?;
     // Production statistics: autovacuum would have analyzed these by now.
-    sqlx::raw_sql("ANALYZE balance_legs, venue_orders, order_fills, order_intents, cash_anchors, cash_reanchors, cash_discrepancies, cash_sightings")
-        .execute(&pool)
+    sqlx::raw_sql("ANALYZE balance_legs, dust_ledger, venue_orders, order_fills, order_intents, cash_anchors, cash_reanchors, cash_discrepancies, cash_sightings")
+        .execute(pool)
         .await?;
     let counts: (i64, i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM order_fills),(SELECT count(*) FROM cash_sightings),(SELECT count(*) FROM cash_reanchors),(SELECT count(*) FROM balance_legs),(SELECT count(*) FROM order_intents)")
-        .fetch_one(&pool).await?;
+        .fetch_one(pool).await?;
     ensure!(
         counts.0 >= 10_000
             && counts.1 >= 1_000
@@ -998,6 +999,17 @@ async fn cash_state_is_one_statement_within_its_bound(pool: PgPool) -> Result<()
             && counts.4 >= 2_000,
         "{counts:?}"
     );
+    Ok(counts)
+}
+
+/// PLAN-r4 §7.2's cardinality ([`bound_fixture`]): one statement per read,
+/// each well inside the 1 s statement budget of an 8l transaction.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn cash_state_is_one_statement_within_its_bound(pool: PgPool) -> Result<()> {
+    let book = Book::new(&pool).await?;
+    let counts = bound_fixture(&pool, &book).await?;
+    let tenant = book.tenant;
 
     let options = pool.connect_options();
     let upstream = tokio::net::lookup_host((options.get_host(), options.get_port()))
