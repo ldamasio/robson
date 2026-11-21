@@ -380,3 +380,64 @@ finished, and confirm with the query below.
 SELECT version, success, execution_time
 FROM _sqlx_migrations WHERE version = 20240101000040;
 ```
+
+## Migrations 41 to 45: Spot order-set projections through the bounded adapter
+
+Migrations 41 to 45 create the dormant Spot order-set projection tables. Each
+file is one `DO $migrationNN$` block:
+
+| Version | File | Changes |
+|---|---|---|
+| 41 | `20240101000041_spot_order_set_generation.sql` | creates `spot_order_set_generation`, `spot_order_set_sell_intents` and `spot_order_set_sell_orders`, and a partial index on `spot_order_set_sell_intents` |
+| 42 | `20240101000042_spot_order_set_sell_aggregates.sql` | creates `spot_order_set_sell_legs`, `spot_order_set_sell_symbols` and `spot_order_set_sell_unbound` |
+| 43 | `20240101000043_spot_order_set_cancel_membership.sql` | creates `spot_order_set_cancel_members`, `spot_order_set_cancel_groups` and `spot_order_set_cancel_legs` |
+| 44 | `20240101000044_spot_order_set_cancel_aggregates.sql` | creates `spot_order_set_cancel_unbound` and `spot_order_set_cancel_ungroupable` |
+| 45 | `20240101000045_spot_order_set_original_cancel_position.sql` | adds `source_position` and a partial index to `spot_order_set_cancel_members`, and `position_hints_complete` (`NOT NULL DEFAULT false`) to `spot_order_set_generation` |
+
+None of them changes an existing table or row: the new tables have no foreign
+key to, and no trigger on, any table outside this set, so their apply takes no
+lock on an existing table. Migration 45 takes `ACCESS EXCLUSIVE` on two tables
+of the set, which no production code writes while the Spot owner stays
+inactive.
+
+One `robsond db migrate` run applies them in order, each like 40 in 7
+operations on the same dedicated raw connection: settings install, SQLx's own
+unmodified apply (BEGIN, the `DO` statement, the `_sqlx_migrations` INSERT,
+COMMIT, the `execution_time` UPDATE), and the settings restore, under the same
+1 s statement, 200 ms lock and 1 s idle-in-transaction timeouts, the 15 s
+whole-apply bound per migration and the 5 s connection and advisory-lock
+bounds. Each `DO` block is one statement, so all of its DDL must finish
+within the 1 s statement timeout; a slower apply fails with `57014` and rolls
+back that migration. Only the exact embedded file is applied; any other
+source for one of these versions is refused before any SQL (`migrationNN
+contract mismatch`).
+
+### Rollback boundary
+
+Record the deployed image digest before the merge that carries 41 to 45.
+**Once 41 is applied, an image without 41 (such as the package 2 image that
+ends at 40) is not a deploy rollback target**: its `robsond db migrate`
+rejects the applied 41 missing from its embedded set
+(`VersionMissing(20240101000041)`) before applying anything, the hook fails
+and the sync stops. This holds whether all five are applied or the hook
+stopped after 41. The earliest compatible rollback artifact is the first
+image that embeds 41 to 45. There is no down migration. A daemon of an image
+without 41 that is already running is unaffected: it never names the order-set
+tables.
+
+### Failure outcomes
+
+Those of migration 39 above, applied to the failing version. Versions applied
+before the failure stay committed; the failing one rolls back. Rerunning
+`robsond db migrate` with the same image skips the committed versions by
+checksum and applies the rest. A `55P03` lock timeout, a `57014` statement
+timeout or a lost answer is reported as `MayHaveCommitted`: wait for the
+failed backend to be gone, rerun `robsond db migrate`, and confirm with the
+query below.
+
+```sql
+SELECT version, success, execution_time
+FROM _sqlx_migrations
+WHERE version BETWEEN 20240101000041 AND 20240101000045
+ORDER BY version;
+```

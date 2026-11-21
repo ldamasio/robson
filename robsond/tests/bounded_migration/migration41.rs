@@ -170,7 +170,9 @@ impl Fixture {
     }
 
     async fn retired(&mut self) -> Result<()> {
-        timeout(Duration::from_millis(350), async {
+        // The raw-dropped backend may still finish a statement under the 1 s
+        // statement_timeout before it notices the closed socket.
+        timeout(NATIVE_RETIREMENT, async {
             loop {
                 let live: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM pg_stat_activity
@@ -395,27 +397,26 @@ async fn migration41_transport_blackhole_fires_whole_apply_deadline(pool: PgPool
 async fn transport_blackhole(mut f: Fixture) -> Result<()> {
     let migration = f.migration;
     let (hit, release) = stages::arm(&f.adapter.gate, Stage::Install, Edge::AfterReturn)?;
-    let watchdog = Duration::from_secs(1);
     let started = Instant::now();
     let (result, armed) = {
         let producer = f.adapter.apply(migration);
         let controller = async {
-            timeout(Duration::from_millis(250), hit).await??;
+            timeout(CONTROLLER_CEILING, hit).await??;
             ensure!(f.proxy.stats().statements - f.wire == 1);
             f.proxy.set_mode(ProxyMode::Blackhole);
             release.send(()).map_err(|_| anyhow::anyhow!("install gate closed"))?;
             Ok::<(), anyhow::Error>(())
         };
-        tokio::join!(timeout(watchdog, producer), controller)
+        tokio::join!(timeout(APPLY_FIXTURE, producer), controller)
     };
     let elapsed = started.elapsed();
     armed?;
     let error = result
-        .context("M41 blackhole did not return at its own 200 ms deadline")?
+        .context("M41 blackhole did not return at its own whole-apply deadline")?
         .expect_err("M41 blackhole must refuse");
     let expected = format!("migration{} whole-apply deadline exceeded", migration.version % 100);
     ensure!(matches!(error, MigrateError::Source(source) if source.to_string() == expected));
-    ensure!((APPLY_BOUND..watchdog).contains(&elapsed));
+    ensure!((APPLY_BOUND..APPLY_FIXTURE).contains(&elapsed));
     ensure!(f.adapter.status() == DELEGATED_RETIREMENT);
     ensure!(refuses_after_retirement(&mut f.adapter).await);
     f.retired().await?;

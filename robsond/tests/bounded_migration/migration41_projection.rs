@@ -183,7 +183,12 @@ async fn migration41_expanded_keys_and_late_hint_page_follow_native_index(
     };
     let (run, evidence) = tokio::join!(
         crate::MIGRATOR.run_direct(&mut f.adapter),
-        timeout(Duration::from_millis(1150), assert_stage),
+        // Five applies, each inside APPLY_BOUND, and the witness reads
+        // (formerly 1150 ms over the 200 ms bound).
+        timeout(
+            APPLY_BOUND.saturating_mul(5).saturating_add(Duration::from_millis(150)),
+            assert_stage
+        ),
     );
     run?;
     evidence.context("five native schema/advisory witness stages")??;

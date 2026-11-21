@@ -1,8 +1,8 @@
 //! Owned migration adapter. Only the private embedded38 contract selects the
 //! bounded path; tests may override it with a private synthetic fixture. The
-//! exact embedded39 and embedded40 migrations use a delegated bounded path.
+//! exact embedded39 to embedded45 migrations use a delegated bounded path.
 //! Other version-39 sources are refused outside this crate's tests, and every
-//! other version-40 source is refused.
+//! other source for versions 40 to 45 is refused.
 use std::{future::Future, pin::Pin, time::Duration};
 
 use sqlx::{
