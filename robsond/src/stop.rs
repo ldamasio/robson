@@ -338,14 +338,30 @@ pub async fn stop_when_asked(
     timings: StopTimings,
 ) -> StopReport {
     let asked_at = stop.asked().await;
+    log_requested(&stop, asked_at);
+    let report = run_stop(&journal, asked_at, close, marker.as_deref(), timings).await;
+    report_stopped(&journal, &report);
+    report
+}
+
+/// The log both stop wrappers write once the stop is asked for.
+fn log_requested(stop: &StopRequest, asked_at: Instant) {
+    #[cfg(test)]
+    tests::WRAPPER_LOGS.with(|logs| logs.borrow_mut().push("requested"));
     info!(
         cause = stop.cause(),
         waited_ms = asked_at.elapsed().as_millis(),
         "Stop requested: draining"
     );
-    let report = run_stop(&journal, asked_at, close, marker.as_deref(), timings).await;
+}
+
+/// The metrics and outcome log both stop wrappers record once the stop has
+/// its result: a stop that is not clean warns.
+fn report_stopped(journal: &OrderJournal, report: &StopReport) {
+    #[cfg(test)]
+    tests::WRAPPER_LOGS.with(|logs| logs.borrow_mut().push("reported"));
     crate::metrics::GRACEFUL_STOP.with_label_values(&[report.result.label()]).inc();
-    crate::metrics::observe_order_journal(&journal);
+    crate::metrics::observe_order_journal(journal);
     let (draining_ms, closing_ms) = (report.draining.as_millis(), report.closing.as_millis());
     let result = report.result.label();
     match (report.result, report.marker) {
@@ -361,7 +377,6 @@ pub async fn stop_when_asked(
         ),
         _ => warn!(draining_ms, closing_ms, result, "Stop: not clean, no marker written"),
     }
-    report
 }
 
 /// The same bounded stop with the concrete controlled TIME participant.
@@ -377,6 +392,7 @@ pub(crate) async fn stop_when_asked_with_clock(
     timings: StopTimings,
 ) -> StopReport {
     let asked_at = stop.asked().await;
+    log_requested(&stop, asked_at);
     let report = run_stop_with_clock(
         &journal,
         asked_at,
@@ -386,9 +402,7 @@ pub(crate) async fn stop_when_asked_with_clock(
         timings,
     )
     .await;
-    crate::metrics::GRACEFUL_STOP.with_label_values(&[report.result.label()]).inc();
-    crate::metrics::observe_order_journal(&journal);
-    info!(result = report.result.label(), marker = ?report.marker, "Stop completed");
+    report_stopped(&journal, &report);
     report
 }
 
@@ -608,6 +622,8 @@ mod tests {
 
     thread_local! {
         pub(super) static CLOSING_LOGS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        pub(super) static WRAPPER_LOGS: std::cell::RefCell<Vec<&'static str>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
     /// The clock-aware stop keeps the plain stop's closing log, part of the
@@ -633,6 +649,32 @@ mod tests {
                 run_stop(&journal, Instant::now(), || {}, None, StopTimings::default()).await;
             }
             assert_eq!(CLOSING_LOGS.with(std::cell::Cell::get), 1, "clock_aware={clock_aware}");
+        }
+    }
+
+    /// The clock-aware stop wrapper keeps the plain wrapper's request log and
+    /// outcome report (cause, phase durations, a warning on a stop that is not
+    /// clean): both write them through the same two helpers.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(start_paused = true)]
+    async fn both_stop_wrappers_log_the_request_and_report_the_outcome() {
+        for clock_aware in [false, true] {
+            WRAPPER_LOGS.with(|logs| logs.borrow_mut().clear());
+            let (_backend, journal) = stub_journal();
+            let stop = StopRequest::default();
+            stop.ask();
+            let report = if clock_aware {
+                stop_when_asked_with_clock(stop, journal, || {}, None, None, StopTimings::default())
+                    .await
+            } else {
+                stop_when_asked(stop, journal, || {}, None, StopTimings::default()).await
+            };
+            assert_eq!(report.result, StopResult::Clean, "clock_aware={clock_aware}");
+            assert_eq!(
+                WRAPPER_LOGS.with(|logs| logs.borrow().clone()),
+                ["requested", "reported"],
+                "clock_aware={clock_aware}"
+            );
         }
     }
 
