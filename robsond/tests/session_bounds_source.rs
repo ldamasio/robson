@@ -122,9 +122,16 @@ fn segments(text: &str) -> Vec<(Kind, &str)> {
     out
 }
 
-fn is_test_attribute(line: &str) -> bool {
-    let line = line.trim_start();
-    line.starts_with("#[cfg(test)]") || line.starts_with("#[cfg(all(test,")
+/// Whether the attribute that starts `rest` gates its item to tests. The
+/// whole attribute is read, whitespace removed, as rustfmt may split it
+/// over lines.
+fn is_test_attribute(rest: &str) -> bool {
+    let rest = rest.trim_start();
+    if !rest.starts_with("#[cfg(") {
+        return false;
+    }
+    let attribute = squeeze(&rest[..rest.find(']').map_or(rest.len(), |end| end + 1)]);
+    attribute.starts_with("#[cfg(test)]") || attribute.starts_with("#[cfg(all(test,")
 }
 
 /// Byte offset just past the item that starts at `start` (its attributes
@@ -175,7 +182,7 @@ fn production(text: &str) -> String {
     for line in code.split_inclusive('\n') {
         let start = offset;
         offset += line.len();
-        if start >= cursor && is_test_attribute(line) {
+        if start >= cursor && is_test_attribute(&code[start..]) {
             out.push_str(&code[cursor..start]);
             cursor = item_end(&code, start);
         }
@@ -582,6 +589,8 @@ fn the_guard_reads_production_code_only() {
          mod tests {\n    fn gone() { let s = r#\"}\"#; }\n}\n\
          #[cfg(all(test, feature = \"postgres\"))]\n\
          use gone::Thing;\n\
+         #[cfg(all(\n    test,\n    target_os = \"linux\"\n))]\n\
+         mod gone_too;\n\
          fn also_kept<'a>(x: &'a str) {}\n",
     );
     assert!(text.contains("fn kept()") && text.contains("fn also_kept"), "{text}");
