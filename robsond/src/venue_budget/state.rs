@@ -178,7 +178,8 @@ impl SharedBudget {
         epoch: uuid::Uuid,
         admit_clock: impl FnOnce() -> Result<TickCapture, BudgetError>,
         poll: impl FnOnce() -> std::task::Poll<reqwest::Result<reqwest::Response>>,
-    ) -> Result<(TickCapture, std::task::Poll<reqwest::Result<reqwest::Response>>), BudgetError> {
+    ) -> Result<(TickCapture, std::task::Poll<reqwest::Result<reqwest::Response>>), BudgetError>
+    {
         let admit = || admit_clock().map(|h| (h, ()));
         self.poll_reserved_first(&mut pending.0, clock, epoch, admit, poll)
             .map(|(now, (), result)| (now, result))
@@ -262,9 +263,12 @@ impl SharedBudget {
     ) -> Result<PendingOwnedOrder, BudgetError> {
         let mut state = self.0.try_lock().map_err(|_| BudgetError::Deferred)?;
         self.reserve_steady(
-            &mut state, now, deadline,
+            &mut state,
+            now,
+            deadline,
             robson_connectors::inventory_loopback::OWNED_ORDER_WEIGHT,
-        ).map(PendingOwnedOrder)
+        )
+        .map(PendingOwnedOrder)
     }
 
     #[cfg(all(test, feature = "crash-points"))]

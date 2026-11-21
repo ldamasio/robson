@@ -254,7 +254,11 @@ async fn seed_owned_entry(pool: &PgPool, g: &JournalGeneration) -> Result<Uuid> 
         client_order_id: OWNED_CLIENT.into(),
     };
     let written = PgVenueLedger::new(pool, g.tenant_id)
-        .record_order(&owned, &link, SeenAt { at: Utc::now(), clock: None, capture: None })
+        .record_order(&owned, &link, SeenAt {
+            at: Utc::now(),
+            clock: None,
+            capture: None,
+        })
         .await?;
     ensure!(written.changed && fields(pool, g).await?.0 == start + 2);
     Ok(batch.intent.intent_id)
@@ -653,7 +657,12 @@ async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
             "old_connected",
             json!({"database":db,"pid":pid,"backend_start":birth,
         "current_user":user,"tenant":g.tenant_id}),
-            Instant::now() + if rehearsal { Duration::from_secs(10) } else { PIPE_BOUND },
+            Instant::now()
+                + if rehearsal {
+                    Duration::from_secs(10)
+                } else {
+                    PIPE_BOUND
+                },
         )
         .await?;
     if std::env::var("ROBSON_PHYSICAL_FAULT").as_deref() == Ok("eof") {
@@ -780,7 +789,10 @@ async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
         scope,
         PageBudget { routes: 1, ..BUDGET },
         deadline,
-        &mut NativeKeys { owned: rehearsal, ..NativeKeys::default() },
+        &mut NativeKeys {
+            owned: rehearsal,
+            ..NativeKeys::default()
+        },
     )
     .await;
     ensure!(
@@ -791,7 +803,10 @@ async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("supervised Spot capture: {e:?}"))?;
     let cut = captured.cut();
-    let mut keys = NativeKeys { owned: rehearsal, ..NativeKeys::default() };
+    let mut keys = NativeKeys {
+        owned: rehearsal,
+        ..NativeKeys::default()
+    };
     keys.intents(cut.intents())
         .map_err(|_| anyhow::anyhow!("original J fixture oracle"))?;
     keys.attempts(cut.attempts())
@@ -835,14 +850,20 @@ async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
     let cold_facts = json!({"tenant":g.tenant_id,"scope":g.account_scope,"epoch":new.epoch.epoch_id,
         "version":committed.0,"families":families,"statements":statements});
     if rehearsal {
-        captured.supervisor().phase_at("cold", cold_facts, Instant::now() + Duration::from_secs(12)).await?;
+        captured
+            .supervisor()
+            .phase_at("cold", cold_facts, Instant::now() + Duration::from_secs(12))
+            .await?;
     } else {
         captured.supervisor().phase("cold", cold_facts).await?;
     }
     #[cfg(feature = "crash-points")]
     if rehearsal {
         crate::venue_budget::n5_claim::rehearsal_c2::cut_legacy_reason(&restore).await?;
-        captured.supervisor().phase("catalogue_cut", json!({"target_id": restore_identity.target})).await?;
+        captured
+            .supervisor()
+            .phase("catalogue_cut", json!({"target_id": restore_identity.target}))
+            .await?;
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     let audit = budget_recovery::audit_empty_budget(&restore, &copied_budget, deadline).await?;
@@ -851,8 +872,15 @@ async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
     #[cfg(feature = "crash-points")]
     if rehearsal {
         crate::venue_budget::n5_claim::rehearsal_c2::load_fixture_registry(
-            &restore, g.tenant_id, &g.account_scope, uid.parse()?, SYMBOL, &clock, deadline,
-        ).await?;
+            &restore,
+            g.tenant_id,
+            &g.account_scope,
+            uid.parse()?,
+            SYMBOL,
+            &clock,
+            deadline,
+        )
+        .await?;
     }
     let (bootstrap, rows) = budget_recovery::bootstrap_empty_budget(
         &restore,
@@ -877,19 +905,38 @@ async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
         "version":committed.0,"audit":successor.source_audit_id,"generation":successor.generation_id})).await?;
     #[cfg(feature = "crash-points")]
     if rehearsal {
-        installed.supervisor().phase("rehearsal_begin", json!({
-            "epoch": successor.process_epoch, "generation": successor.generation_id,
-        })).await?;
+        installed
+            .supervisor()
+            .phase(
+                "rehearsal_begin",
+                json!({
+                    "epoch": successor.process_epoch, "generation": successor.generation_id,
+                }),
+            )
+            .await?;
         let owned = owned.context("rehearsal owned J")?;
         let witness = crate::venue_clock_owner::run_held_inventory_rehearsal(
-            &restore, &restored_wire, &new, g.tenant_id, std::sync::Arc::new(clock), rows,
-            &successor, &uid, committed.0, SYMBOL, owned,
-        ).await?;
-        ensure!(witness.intent == owned && witness.generation == successor.generation_id
-            && witness.lookup_send.epoch == successor.process_epoch
-            && witness.lookup_receive.epoch == successor.process_epoch
-            && witness.lookup_send.after_ns < witness.lookup_receive.before_ns,
-            "pending observation retained across close under its exact binding");
+            &restore,
+            &restored_wire,
+            &new,
+            g.tenant_id,
+            std::sync::Arc::new(clock),
+            rows,
+            &successor,
+            &uid,
+            committed.0,
+            SYMBOL,
+            owned,
+        )
+        .await?;
+        ensure!(
+            witness.intent == owned
+                && witness.generation == successor.generation_id
+                && witness.lookup_send.epoch == successor.process_epoch
+                && witness.lookup_receive.epoch == successor.process_epoch
+                && witness.lookup_send.after_ns < witness.lookup_receive.before_ns,
+            "pending observation retained across close under its exact binding"
+        );
         drop(reader);
         restore.close().await;
         installed.supervisor().phase("rehearsal_complete", json!({

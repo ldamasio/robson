@@ -338,7 +338,10 @@ pub fn decode_open_order_lists(
             return Err(SpotOrderListError::InvalidIdentity { list_id, field: "symbol" });
         }
         if list.list_client_order_id.as_deref().is_some_and(|id| !valid_identity(id)) {
-            return Err(SpotOrderListError::InvalidIdentity { list_id, field: "listClientOrderId" });
+            return Err(SpotOrderListError::InvalidIdentity {
+                list_id,
+                field: "listClientOrderId",
+            });
         }
         if list.orders.is_empty() {
             return Err(SpotOrderListError::NoMembers(list_id));
@@ -400,7 +403,12 @@ pub enum SpotInventoryError {
 #[cfg(any(test, feature = "crash-points"))]
 fn malformed(e: serde_json::Error) -> SpotInventoryError {
     // Category and position only: a serde message may quote the input.
-    SpotInventoryError::Malformed(format!("{:?} at line {} column {}", e.classify(), e.line(), e.column()))
+    SpotInventoryError::Malformed(format!(
+        "{:?} at line {} column {}",
+        e.classify(),
+        e.line(),
+        e.column()
+    ))
 }
 
 /// Decode a completed `GET /api/v3/account` body within `max_bytes`: one
@@ -423,7 +431,9 @@ pub fn decode_account(body: &str, max_bytes: usize) -> Result<SpotAccount, SpotI
 
     let Object(account): Object<Account> = serde_json::from_str(body).map_err(malformed)?;
     let mut assets = HashSet::new();
-    assets.try_reserve(account.balances.len()).map_err(|_| SpotInventoryError::Allocation)?;
+    assets
+        .try_reserve(account.balances.len())
+        .map_err(|_| SpotInventoryError::Allocation)?;
     if account.balances.iter().any(|b| !assets.insert(b.asset.as_str())) {
         return Err(SpotInventoryError::DuplicateAsset);
     }
@@ -451,9 +461,13 @@ pub fn decode_open_orders(
     }
     let OpenOrderEntries(orders) = serde_json::from_str(body).map_err(malformed)?;
     let mut by_order_id: HashSet<(&str, u64)> = HashSet::new();
-    by_order_id.try_reserve(orders.len()).map_err(|_| SpotInventoryError::Allocation)?;
+    by_order_id
+        .try_reserve(orders.len())
+        .map_err(|_| SpotInventoryError::Allocation)?;
     let mut by_client_id: HashSet<(&str, &str)> = HashSet::new();
-    by_client_id.try_reserve(orders.len()).map_err(|_| SpotInventoryError::Allocation)?;
+    by_client_id
+        .try_reserve(orders.len())
+        .map_err(|_| SpotInventoryError::Allocation)?;
     for order in &orders {
         let symbol = order.symbol.as_str();
         if !valid_identity(symbol) || !valid_identity(&order.client_order_id) {

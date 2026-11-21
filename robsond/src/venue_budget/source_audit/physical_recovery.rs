@@ -285,18 +285,21 @@ pub(crate) async fn bootstrap_empty_budget(
                 == fresh.started_at
         );
         ensure!(matches!(bootstrap::production_input(), Err(BudgetError::PrerequisiteRefusal)));
-        Ok((BudgetBootstrapEvidence {
-            audit: fresh.audit,
-            generation: fresh.generation,
-            process_epoch,
-            predecessor_epoch,
-            predecessor_clean,
-            start,
-            committed_by,
-            recorded_at: *recorded_at,
-            stale_commands,
-            bootstrap_commands,
-        }, rows))
+        Ok((
+            BudgetBootstrapEvidence {
+                audit: fresh.audit,
+                generation: fresh.generation,
+                process_epoch,
+                predecessor_epoch,
+                predecessor_clean,
+                start,
+                committed_by,
+                recorded_at: *recorded_at,
+                stale_commands,
+                bootstrap_commands,
+            },
+            rows,
+        ))
     })
     .await?
 }

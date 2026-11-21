@@ -70,7 +70,8 @@ use crate::order_journal::{self, OPERATIONS_CAPACITY};
 mod pending_execution;
 #[cfg(feature = "crash-points")]
 pub use pending_execution::{
-    PendingExecutionEvidence, PendingExecutionOwner, PendingExecutionRegistration, PendingExecutionTicket,
+    PendingExecutionEvidence, PendingExecutionOwner, PendingExecutionRegistration,
+    PendingExecutionTicket,
 };
 
 /// Ordinary API operations at once.

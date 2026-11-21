@@ -2681,7 +2681,10 @@ mod tests {
                 );
                 assert!(started.elapsed() < Duration::from_secs(2));
             } else {
-                assert!(released.is_none(), "a position account's release is bounded: {released:?}");
+                assert!(
+                    released.is_none(),
+                    "a position account's release is bounded: {released:?}"
+                );
             }
         }
     }
@@ -2700,8 +2703,9 @@ mod tests {
 
         use crate::spot_order_set_store::{spot_startup::SpotReady, JournalGeneration};
         let tenant = uuid::Uuid::now_v7();
-        let start =
-            crate::process_epoch::start_epoch(&pool, tenant, "supervised-bounds").await.unwrap();
+        let start = crate::process_epoch::start_epoch(&pool, tenant, "supervised-bounds")
+            .await
+            .unwrap();
         let generation = JournalGeneration {
             tenant_id: tenant,
             account_scope: DEFAULT_ACCOUNT_SCOPE.to_string(),

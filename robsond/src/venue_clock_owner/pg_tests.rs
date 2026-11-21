@@ -185,8 +185,7 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
     let deadline = asked_at + crate::stop::StopTimings::default().deadline;
     // The test-owned ACCOUNT preparation retires on every path, before the
     // owner's worker permit is needed by its own retirement.
-    let account_retired =
-        timeout_at(deadline, ClockOwner::retire_account(&mut account_slot)).await;
+    let account_retired = timeout_at(deadline, ClockOwner::retire_account(&mut account_slot)).await;
     let mut supersession_errors = Vec::new();
     for (fixture, slot) in supersession_http.into_iter().zip(&mut supersession_slots) {
         if let Some(fixture) = fixture {
@@ -302,10 +301,10 @@ pub(crate) async fn run_held_inventory_rehearsal(
     operated: &str,
     owned: Uuid,
 ) -> anyhow::Result<HeldLookupWitness> {
+    use c8_attribution::{Divergence, Fact, ListFact, Refusal, Scope};
     use robson_domain::OrderSide;
     use robson_exec::venue::{OrderObservation, OrderPhase};
     use rust_decimal::Decimal;
-    use c8_attribution::{Divergence, Fact, ListFact, Refusal, Scope};
     let venue_id = VenueId::new(VenueId::BINANCE_SPOT);
     let scope = Scope {
         expected: crate::spot_order_set_store::ExpectedGeneration {
@@ -337,19 +336,31 @@ pub(crate) async fn run_held_inventory_rehearsal(
         ensure!(matches!(bootstrap::production_input(), Err(BudgetError::PrerequisiteRefusal)));
         let restore_trace = Trace::default();
         restore::existing_pause(pool, tenant, &mut rows, &clock, deadline, &restore_trace)
-            .await.map_err(|e| anyhow!("held pause: {e:?}"))?;
+            .await
+            .map_err(|e| anyhow!("held pause: {e:?}"))?;
         ensure!(restore_trace.issued() == 0, "empty fixture has no restored pause");
-        let budget = SharedBudget::from_rows(rows, true).map_err(|e| anyhow!("held budget: {e:?}"))?;
+        let budget =
+            SharedBudget::from_rows(rows, true).map_err(|e| anyhow!("held budget: {e:?}"))?;
 
         time_http = Some(http::Fixture::start(deadline).await?);
         let time = time_http.as_ref().context("owned TIME listener")?;
         let client = Arc::new(BinanceRestClient::with_harness_base_url(
-            time.base_url.clone(), String::new(), String::new(),
+            time.base_url.clone(),
+            String::new(),
+            String::new(),
         ));
         let store = ClockSampleStore::from_committed_epoch(pool, tenant, start);
-        owner = Some(ClockOwner::controlled(
-            Arc::clone(&clock), client, store, budget.clone(), tenant, start.epoch.epoch_id,
-        ).map_err(|e| anyhow!("held clock owner: {e:?}"))?);
+        owner = Some(
+            ClockOwner::controlled(
+                Arc::clone(&clock),
+                client,
+                store,
+                budget.clone(),
+                tenant,
+                start.epoch.epoch_id,
+            )
+            .map_err(|e| anyhow!("held clock owner: {e:?}"))?,
+        );
         let owner = owner.as_mut().context("owned ClockOwner")?;
         ensure!(matches!(owner.run_cycle().await, Err(TimeError::Budget(BudgetError::Deferred))));
         ensure!(time.connections() == 0 && budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 0);
@@ -359,31 +370,50 @@ pub(crate) async fn run_held_inventory_rehearsal(
         let durable: Vec<(Uuid, i64)> = sqlx::query_as(
             "SELECT sample_id, server_ms FROM public.clock_samples WHERE tenant_id=$1
              AND process_epoch=$2 AND venue_id='binance:spot' AND numeric_failures=0 LIMIT 2",
-        ).bind(tenant).bind(start.epoch.epoch_id).fetch_all(pool).await?;
+        )
+        .bind(tenant)
+        .bind(start.epoch.epoch_id)
+        .fetch_all(pool)
+        .await?;
         ensure!(durable == [(sample, time.server_ms()?)]);
         ensure!(time.connections() == 1 && budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 1);
 
         inventory_http = Some(c8_account_http::AccountFixture::attribution(deadline).await?);
         let listener = inventory_http.as_ref().context("owned inventory listener")?;
         let scan_deadline = deadline.min(Instant::now() + Duration::from_secs(10));
-        let counters = || (wire.stats().statements, wire.prepared_statement_parses(),
-            wire.query_trace().len(), wire.query_trace_dropped());
+        let counters = || {
+            (
+                wire.stats().statements,
+                wire.prepared_statement_parses(),
+                wire.query_trace().len(),
+                wire.query_trace_dropped(),
+            )
+        };
         // One scoped pre-snapshot, autocommit: nothing is held across HTTP.
         let before_pre = counters();
         let pre = c8_attribution::snapshot(&attribution_options, scope, &[], scan_deadline)
-            .await.map_err(|e| anyhow!("attribution pre-snapshot: {e:?}"))?;
+            .await
+            .map_err(|e| anyhow!("attribution pre-snapshot: {e:?}"))?;
         ensure!(c8_attribution::attribute(scope, &[], &pre)
-            .map_err(|e| anyhow!("pre header: {e:?}"))?.is_empty());
+            .map_err(|e| anyhow!("pre header: {e:?}"))?
+            .is_empty());
         ensure!(counters().0 == before_pre.0 + 1, "one pre-snapshot statement");
         let signed = owner.commission_signing_time().map_err(|e| anyhow!("{e:?}"))?;
         let claim = clock.capture()?;
         let previous = counters();
         ensure!(previous.3 == 0, "bounded restored wire trace");
-        let triple = owner.read_inventory_triple(&signed, claim, &mut slot, listener.port, scan_deadline)
-            .await.map_err(|e| anyhow!("held inventory: {e:?}"))?;
+        let triple = owner
+            .read_inventory_triple(&signed, claim, &mut slot, listener.port, scan_deadline)
+            .await
+            .map_err(|e| anyhow!("held inventory: {e:?}"))?;
         ensure!(counters() == previous, "no SQL execution or preparation during inventory");
-        ensure!(triple.receipts.iter().all(|r| r.sample == sample && r.send.epoch == start.epoch.epoch_id));
-        ensure!(listener.connections() == 3 && listener.signing_stamps()? == [signed.timestamp_ms(); 3]);
+        ensure!(triple
+            .receipts
+            .iter()
+            .all(|r| r.sample == sample && r.send.epoch == start.epoch.epoch_id));
+        ensure!(
+            listener.connections() == 3 && listener.signing_stamps()? == [signed.timestamp_ms(); 3]
+        );
         ensure!(budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 4);
         verify_triple_budget(&budget, &clock)?;
 
@@ -394,27 +424,60 @@ pub(crate) async fn run_held_inventory_rehearsal(
         };
         let selected = c8_attribution::select(scope, orders, lists)
             .map_err(|e| anyhow!("operated subset: {e:?}"))?;
-        ensure!(selected.unrelated_orders == 1 && selected.unrelated_lists == 1,
-            "unrelated pair and list kept, never parsed as another asset");
-        ensure!(selected.lists == [ListFact {
-            order_list_id: 9,
-            list_client_order_id: "c8-operated-list".into(),
-            members: vec![(417012, "c8-absent-sell".into())],
-        }], "operated list keeps its own native and client identity");
-        let post = c8_attribution::snapshot(&attribution_options, scope, &selected.orders, scan_deadline)
-            .await.map_err(|e| anyhow!("attribution post-snapshot: {e:?}"))?;
-        ensure!(counters().0 == previous.0 + 1 && counters().3 == 0,
-            "one bounded post-snapshot statement");
+        ensure!(
+            selected.unrelated_orders == 1 && selected.unrelated_lists == 1,
+            "unrelated pair and list kept, never parsed as another asset"
+        );
+        ensure!(
+            selected.lists
+                == [ListFact {
+                    order_list_id: 9,
+                    list_client_order_id: "c8-operated-list".into(),
+                    members: vec![(417012, "c8-absent-sell".into())],
+                }],
+            "operated list keeps its own native and client identity"
+        );
+        let post =
+            c8_attribution::snapshot(&attribution_options, scope, &selected.orders, scan_deadline)
+                .await
+                .map_err(|e| anyhow!("attribution post-snapshot: {e:?}"))?;
+        ensure!(
+            counters().0 == previous.0 + 1 && counters().3 == 0,
+            "one bounded post-snapshot statement"
+        );
         let facts = c8_attribution::attribute(scope, &selected.orders, &post)
             .map_err(|e| anyhow!("attribution: {e:?}"))?;
-        let summary: Vec<_> = facts.iter().map(|f| (f.symbol.as_str(), f.order_id,
-            f.client_order_id.as_str(), f.side.as_str(), f.order_list_id, f.fact.clone())).collect();
-        ensure!(summary == [
-            ("BTCUSDT", 417011, "physical-recovery-observed-buy", "BUY", -1, Fact::Discovered),
-            ("BTCUSDT", 417012, "c8-absent-sell", "SELL", 9, Fact::Absent),
-            ("BTCUSDT", 417013, "physical-recovery-owned-buy", "BUY", -1,
-                Fact::Ledger { intent_id: owned }),
-        ], "exact discovered, absent and owned operated facts: {summary:?}");
+        let summary: Vec<_> = facts
+            .iter()
+            .map(|f| {
+                (
+                    f.symbol.as_str(),
+                    f.order_id,
+                    f.client_order_id.as_str(),
+                    f.side.as_str(),
+                    f.order_list_id,
+                    f.fact.clone(),
+                )
+            })
+            .collect();
+        ensure!(
+            summary
+                == [
+                    (
+                        "BTCUSDT",
+                        417011,
+                        "physical-recovery-observed-buy",
+                        "BUY",
+                        -1,
+                        Fact::Discovered
+                    ),
+                    ("BTCUSDT", 417012, "c8-absent-sell", "SELL", 9, Fact::Absent),
+                    ("BTCUSDT", 417013, "physical-recovery-owned-buy", "BUY", -1, Fact::Ledger {
+                        intent_id: owned
+                    }),
+                ],
+            "exact discovered, absent and owned operated facts: {summary:?}"
+        );
 
         // Negative controls, counted outside the live scan.
         let negatives = counters().0;
@@ -422,25 +485,47 @@ pub(crate) async fn run_held_inventory_rehearsal(
         let moved = [
             Scope { uid: "0", ..scope },
             Scope { version: version + 1, ..scope },
-            Scope { expected: crate::spot_order_set_store::ExpectedGeneration {
-                account_scope: &other_scope, ..scope.expected }, ..scope },
-            Scope { expected: crate::spot_order_set_store::ExpectedGeneration {
-                generation_id: Uuid::now_v7(), ..scope.expected }, ..scope },
+            Scope {
+                expected: crate::spot_order_set_store::ExpectedGeneration {
+                    account_scope: &other_scope,
+                    ..scope.expected
+                },
+                ..scope
+            },
+            Scope {
+                expected: crate::spot_order_set_store::ExpectedGeneration {
+                    generation_id: Uuid::now_v7(),
+                    ..scope.expected
+                },
+                ..scope
+            },
         ];
         for wrong in moved {
-            let refused = c8_attribution::snapshot(&attribution_options, wrong, &selected.orders, scan_deadline).await;
-            ensure!(matches!(refused, Err(Refusal::Scope)), "moved identity refused: {:?}",
-                refused.as_ref().err());
+            let refused = c8_attribution::snapshot(
+                &attribution_options,
+                wrong,
+                &selected.orders,
+                scan_deadline,
+            )
+            .await;
+            ensure!(
+                matches!(refused, Err(Refusal::Scope)),
+                "moved identity refused: {:?}",
+                refused.as_ref().err()
+            );
         }
         ensure!(counters().0 == negatives + 4, "one statement per moved-identity control");
         let many: Vec<_> = std::iter::repeat(selected.orders[0])
-            .take(c8_attribution::FIXTURE_KEY_CAP + 1).collect();
-        ensure!(matches!(c8_attribution::snapshot(&attribution_options, scope, &many, scan_deadline).await,
-            Err(Refusal::Cap)) && counters().0 == negatives + 4, "cap refuses before SQL");
-        for (mutate, expected) in [
-            (0, Divergence::Client),
-            (1, Divergence::Side),
-        ] {
+            .take(c8_attribution::FIXTURE_KEY_CAP + 1)
+            .collect();
+        ensure!(
+            matches!(
+                c8_attribution::snapshot(&attribution_options, scope, &many, scan_deadline).await,
+                Err(Refusal::Cap)
+            ) && counters().0 == negatives + 4,
+            "cap refuses before SQL"
+        );
+        for (mutate, expected) in [(0, Divergence::Client), (1, Divergence::Side)] {
             let mut contrary = selected.orders[0].clone();
             if mutate == 0 {
                 contrary.client_order_id = "c8-contrary-client".into();
@@ -450,15 +535,15 @@ pub(crate) async fn run_held_inventory_rehearsal(
             let keyed = [&contrary, selected.orders[1], selected.orders[2]];
             let judged = c8_attribution::attribute(scope, &keyed, &post)
                 .map_err(|e| anyhow!("contrary attribution: {e:?}"))?;
-            ensure!(judged[0].fact == Fact::Contradiction(expected) && judged[1].fact == Fact::Absent
-                && judged[2].fact == Fact::Ledger { intent_id: owned },
-                "contradiction under the exact original key never reads as absence");
+            ensure!(
+                judged[0].fact == Fact::Contradiction(expected)
+                    && judged[1].fact == Fact::Absent
+                    && judged[2].fact == Fact::Ledger { intent_id: owned },
+                "contradiction under the exact original key never reads as absence"
+            );
         }
         // The same owned post row against a contrary wire type or client.
-        for (mutate, expected) in [
-            (0, Divergence::Journal),
-            (1, Divergence::Client),
-        ] {
+        for (mutate, expected) in [(0, Divergence::Journal), (1, Divergence::Client)] {
             let mut contrary = selected.orders[2].clone();
             if mutate == 0 {
                 contrary.order_type = "LIMIT".into();
@@ -468,9 +553,12 @@ pub(crate) async fn run_held_inventory_rehearsal(
             let keyed = [selected.orders[0], selected.orders[1], &contrary];
             let judged = c8_attribution::attribute(scope, &keyed, &post)
                 .map_err(|e| anyhow!("contrary owned attribution: {e:?}"))?;
-            ensure!(judged[0].fact == Fact::Discovered && judged[1].fact == Fact::Absent
-                && judged[2].fact == Fact::Contradiction(expected),
-                "owned identity mismatch is never a ledger binding");
+            ensure!(
+                judged[0].fact == Fact::Discovered
+                    && judged[1].fact == Fact::Absent
+                    && judged[2].fact == Fact::Contradiction(expected),
+                "owned identity mismatch is never a ledger binding"
+            );
         }
         ensure!(counters().0 == negatives + 4, "contrary judgments issue no SQL");
         let durable = facts[2].durable_executed.context("native owned execution basis")?;
@@ -484,39 +572,65 @@ pub(crate) async fn run_held_inventory_rehearsal(
         let generation = owner.state.lock().map_err(|_| anyhow!("clock lock"))?.generation;
         let stale_claim = clock.capture()?;
         owner.state.lock().map_err(|_| anyhow!("clock lock"))?.generation = generation + 1;
-        let refused = owner.read_owned_order(
-            &lookup_signed, stale_claim, &mut lookup_slot, lookup_target.port, lookup_due,
-        ).await;
+        let refused = owner
+            .read_owned_order(
+                &lookup_signed,
+                stale_claim,
+                &mut lookup_slot,
+                lookup_target.port,
+                lookup_due,
+            )
+            .await;
         owner.state.lock().map_err(|_| anyhow!("clock lock"))?.generation = generation;
-        ensure!(matches!(refused, Err(TimeError::Budget(BudgetError::Deferred)))
-            && lookup_target.connections() == 0
-            && budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == handoffs_before,
-            "stale lookup before first poll opens no connection and spends no charge");
+        ensure!(
+            matches!(refused, Err(TimeError::Budget(BudgetError::Deferred)))
+                && lookup_target.connections() == 0
+                && budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == handoffs_before,
+            "stale lookup before first poll opens no connection and spends no charge"
+        );
         verify_triple_budget(&budget, &clock)?;
-        let lookup = owner.read_owned_order(
-            &lookup_signed, clock.capture()?, &mut lookup_slot, lookup_target.port, lookup_due,
-        ).await.map_err(|e| anyhow!("held exact lookup: {e:?}"))?;
+        let lookup = owner
+            .read_owned_order(
+                &lookup_signed,
+                clock.capture()?,
+                &mut lookup_slot,
+                lookup_target.port,
+                lookup_due,
+            )
+            .await
+            .map_err(|e| anyhow!("held exact lookup: {e:?}"))?;
         let OrderObservation::Found(record) = lookup.observation else {
             return Err(anyhow!("exact order lookup remained unresolved"));
         };
         ensure!(
-            lookup.mark.sample == sample && lookup.mark.generation == generation
-            && lookup.mark.raw.epoch == start.epoch.epoch_id && lookup.receive.epoch == start.epoch.epoch_id
-            && lookup.mark.raw.after_ns < lookup.receive.before_ns
-            && lookup.mark.raw.wall_agrees(&lookup.receive)?
-            && record.symbol == facts[2].symbol && record.exchange_order_id == facts[2].order_id.to_string()
-            && record.client_order_id == facts[2].client_order_id
-            && record.side == OrderSide::Buy && record.order_type == "MARKET"
-            && record.phase == OrderPhase::Live && record.status == "PARTIALLY_FILLED"
-            && record.orig_qty == Decimal::ONE
-            && record.executed_qty > durable && record.executed_qty == Decimal::new(25, 2),
+            lookup.mark.sample == sample
+                && lookup.mark.generation == generation
+                && lookup.mark.raw.epoch == start.epoch.epoch_id
+                && lookup.receive.epoch == start.epoch.epoch_id
+                && lookup.mark.raw.after_ns < lookup.receive.before_ns
+                && lookup.mark.raw.wall_agrees(&lookup.receive)?
+                && record.symbol == facts[2].symbol
+                && record.exchange_order_id == facts[2].order_id.to_string()
+                && record.client_order_id == facts[2].client_order_id
+                && record.side == OrderSide::Buy
+                && record.order_type == "MARKET"
+                && record.phase == OrderPhase::Live
+                && record.status == "PARTIALLY_FILLED"
+                && record.orig_qty == Decimal::ONE
+                && record.executed_qty > durable
+                && record.executed_qty == Decimal::new(25, 2),
             "typed observation above the exact order's durable basis"
         );
         let total_handoffs = budget.handoffs().map_err(|e| anyhow!("{e:?}"))?;
-        ensure!(lookup_target.connections() == 1 && lookup_slot.is_none()
-            && lookup_target.signing_stamp()? == lookup_signed.timestamp_ms()
-            && total_handoffs == 5 && handoffs_before == 4 && counters() == lookup_before,
-            "one lookup handoff, no retry and no SQL during that request");
+        ensure!(
+            lookup_target.connections() == 1
+                && lookup_slot.is_none()
+                && lookup_target.signing_stamp()? == lookup_signed.timestamp_ms()
+                && total_handoffs == 5
+                && handoffs_before == 4
+                && counters() == lookup_before,
+            "one lookup handoff, no retry and no SQL during that request"
+        );
         verify_budget_remaining(&budget, &clock, 14, 9)?;
         Ok::<_, anyhow::Error>(HeldLookupWitness {
             sample,
@@ -531,7 +645,9 @@ pub(crate) async fn run_held_inventory_rehearsal(
             cumulative_handoffs: total_handoffs,
             lookup_sql: counters().0 - lookup_before.0,
         })
-    }).await.context("held inventory window");
+    })
+    .await
+    .context("held inventory window");
 
     let asked_at = Instant::now();
     let stop_deadline = asked_at + crate::stop::StopTimings::default().deadline;
@@ -551,13 +667,19 @@ pub(crate) async fn run_held_inventory_rehearsal(
     };
     let inventory_stopped = if let Some(listener) = inventory_http {
         listener.finish(stop_deadline).await
-    } else { Ok(()) };
+    } else {
+        Ok(())
+    };
     let lookup_stopped = if let Some(listener) = lookup_http {
         listener.finish(stop_deadline).await
-    } else { Ok(()) };
+    } else {
+        Ok(())
+    };
     let time_stopped = if let Some(listener) = time_http {
         listener.finish(stop_deadline).await
-    } else { Ok(()) };
+    } else {
+        Ok(())
+    };
     ensure!(matches!(preparation, Ok(true)), "held inventory preparation not retired");
     ensure!(matches!(lookup_preparation, Ok(true)), "held lookup preparation not retired");
     stopped?;
@@ -572,27 +694,34 @@ fn verify_triple_budget(budget: &SharedBudget, clock: &NativeClock) -> anyhow::R
 }
 
 fn verify_budget_remaining(
-    budget: &SharedBudget, clock: &NativeClock, accounts: usize, unit_weight: usize,
+    budget: &SharedBudget,
+    clock: &NativeClock,
+    accounts: usize,
+    unit_weight: usize,
 ) -> anyhow::Result<()> {
     let now = clock.capture()?;
-    let due = crate::venue_clock_owner::after(now, Duration::from_secs(1)).map_err(|e| anyhow!("{e:?}"))?;
+    let due = crate::venue_clock_owner::after(now, Duration::from_secs(1))
+        .map_err(|e| anyhow!("{e:?}"))?;
     let mut account = Vec::new();
     for _ in 0..accounts {
-        account.push(budget.try_reserve_account(now, due).map_err(|e| anyhow!("ACCOUNT capacity: {e:?}"))?);
+        account.push(
+            budget
+                .try_reserve_account(now, due)
+                .map_err(|e| anyhow!("ACCOUNT capacity: {e:?}"))?,
+        );
     }
     let mut time = Vec::new();
     for _ in 0..unit_weight {
         time.push(budget.try_reserve_time(now, due).map_err(|e| anyhow!("TIME capacity: {e:?}"))?);
     }
-    ensure!(matches!(budget.try_reserve_time(now, due), Err(BudgetError::Deferred)),
-        "exact steady weight after observed requests");
+    ensure!(
+        matches!(budget.try_reserve_time(now, due), Err(BudgetError::Deferred)),
+        "exact steady weight after observed requests"
+    );
     Ok(())
 }
 
-fn commission_admission_precedence(
-    owner: &ClockOwner,
-    clock: &NativeClock,
-) -> anyhow::Result<()> {
+fn commission_admission_precedence(owner: &ClockOwner, clock: &NativeClock) -> anyhow::Result<()> {
     let due = Instant::now() + Duration::from_secs(3);
     let old = owner.budget.start().map_err(|e| anyhow!("{e:?}"))?;
     let fresh = clock.capture()?;
@@ -629,8 +758,10 @@ fn commission_admission_precedence(
         })
     });
     owner.state.lock().map_err(|_| anyhow!("clock lock"))?.generation = generation;
-    ensure!(matches!(results, [Err(BudgetError::Expired), Err(BudgetError::Deferred)]),
-        "command deadline precedes generation, which precedes claim age");
+    ensure!(
+        matches!(results, [Err(BudgetError::Expired), Err(BudgetError::Deferred)]),
+        "command deadline precedes generation, which precedes claim age"
+    );
     drop(waiting);
     drop(pending);
     ensure!(owner.budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 4);
@@ -695,28 +826,47 @@ async fn superseded_owned_order(
     slot: &mut Option<inventory::OwnedOrderPreparation>,
 ) -> anyhow::Result<()> {
     let due = (Instant::now() + Duration::from_secs(5)).min(fixture_deadline);
-    let (venue, head, release) = c8_account_http::AccountFixture::held_order_not_found(fixture_deadline).await?;
+    let (venue, head, release) =
+        c8_account_http::AccountFixture::held_order_not_found(fixture_deadline).await?;
     let venue = fixture_slot.insert(venue);
     let signed = owner.commission_signing_time().map_err(|error| anyhow!("{error:?}"))?;
     let claim = clock.capture()?;
-    let original = owner.state.lock().map_err(|_| anyhow!("clock lock"))?
-        .published.as_ref().context("positive lookup sample")?.id;
+    let original = owner
+        .state
+        .lock()
+        .map_err(|_| anyhow!("clock lock"))?
+        .published
+        .as_ref()
+        .context("positive lookup sample")?
+        .id;
     let retire_sample = async {
         timeout_at(due, head).await.context("lookup head deadline")??;
-        owner.state.lock().map_err(|_| anyhow!("clock lock"))?
-            .published.as_mut().context("sample present")?.id = Uuid::now_v7();
+        owner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("clock lock"))?
+            .published
+            .as_mut()
+            .context("sample present")?
+            .id = Uuid::now_v7();
         release.send(()).map_err(|_| anyhow!("release lookup body"))?;
         Ok::<_, anyhow::Error>(())
     };
-    let (result, changed) = tokio::join!(
-        owner.read_owned_order(&signed, claim, slot, venue.port, due),
-        retire_sample,
-    );
-    owner.state.lock().map_err(|_| anyhow!("clock lock"))?
-        .published.as_mut().context("sample present")?.id = original;
+    let (result, changed) =
+        tokio::join!(owner.read_owned_order(&signed, claim, slot, venue.port, due), retire_sample,);
+    owner
+        .state
+        .lock()
+        .map_err(|_| anyhow!("clock lock"))?
+        .published
+        .as_mut()
+        .context("sample present")?
+        .id = original;
     changed?;
-    ensure!(matches!(result, Err(TimeError::Native)) && venue.connections() == 1,
-        "superseded EOF refuses the 400 observation after the charged send");
+    ensure!(
+        matches!(result, Err(TimeError::Native)) && venue.connections() == 1,
+        "superseded EOF refuses the 400 observation after the charged send"
+    );
     Ok(())
 }
 

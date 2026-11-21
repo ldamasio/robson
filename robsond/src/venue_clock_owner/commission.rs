@@ -184,8 +184,9 @@ impl ClockOwner {
         if state.generation != signed.generation || signed.capture.epoch != self.epoch {
             return Err(BudgetError::Deferred);
         }
-        let poll_mark =
-            state.capture_native(&self.clock, self.epoch).map_err(|_| BudgetError::Invalid)?;
+        let poll_mark = state
+            .capture_native(&self.clock, self.epoch)
+            .map_err(|_| BudgetError::Invalid)?;
         let sample = state
             .published
             .as_ref()

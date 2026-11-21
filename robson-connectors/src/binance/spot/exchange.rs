@@ -276,7 +276,9 @@ fn observe_spot_order(
     match parsed {
         Ok(order) => Ok(OrderObservation::Found(Box::new(venue_record(order)?))),
         Err(SpotReadError::NoSuchOrder { http_status: 400, .. }) => Ok(OrderObservation::NotFound),
-        Err(SpotReadError::OrderArchived { http_status: 400, .. }) => Ok(OrderObservation::Archived),
+        Err(SpotReadError::OrderArchived { http_status: 400, .. }) => {
+            Ok(OrderObservation::Archived)
+        },
         Err(error) => Err(read_error(error)),
     }
 }
