@@ -10,7 +10,30 @@ impl ClockState {
         }
         self.closing = true;
         self.published = None;
+        metrics::evidence(None);
         // Normal shutdown is not a fabricated native failure or alert.
+    }
+
+    /// The publication CAS (C8): a sample persisted by the cycle that began
+    /// at `generation` is published only if no fault edge, stop or closing
+    /// moved the generation since; it clears the active faults.
+    pub(super) fn publish(
+        &mut self,
+        generation: u64,
+        sample: Published,
+        received: TickCapture,
+    ) -> Result<Uuid, TimeError> {
+        if self.closing || self.generation != generation {
+            return Err(TimeError::Expired);
+        }
+        self.last_valid = Some(received);
+        self.faults = 0;
+        self.active_faults = 0;
+        metrics::faults(0, 0);
+        metrics::evidence(Some(sample.u2));
+        let id = sample.id;
+        self.published = Some(sample);
+        Ok(id)
     }
 
     pub(super) fn native_ok(&mut self) {
@@ -48,6 +71,7 @@ impl ClockState {
 
     pub(super) fn invalidate(&mut self, fault: ClockFault) {
         self.published = None;
+        metrics::evidence(None);
         let edge = fault == ClockFault::WallStep || self.active_faults & fault as u8 == 0;
         if edge {
             match self.generation.checked_add(1) {

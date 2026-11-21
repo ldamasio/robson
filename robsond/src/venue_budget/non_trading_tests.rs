@@ -42,7 +42,16 @@ fn the_non_trading_budget_has_no_order_path() {
             &name[..name.find(['(', '<']).unwrap()]
         })
         .collect();
-    assert_eq!(methods, ["start", "try_reserve_time", "try_reserve_read"], "{body}");
+    assert_eq!(
+        methods,
+        [
+            "start",
+            "time_owner",
+            "try_reserve_time",
+            "try_reserve_read"
+        ],
+        "{body}"
+    );
     for forbidden in [
         "order",
         "protective",
@@ -59,7 +68,8 @@ fn the_non_trading_budget_has_no_order_path() {
         "{body}"
     );
     // Its one field is private and nothing else is implemented for it: no
-    // Deref or conversion reaches the shared handle's other methods.
+    // Deref or conversion reaches the shared handle's other methods; the TIME
+    // owner's handle (`time_owner`) has its one production caller (T8).
     assert_eq!(production.matches("NonTradingBudget(").count(), 1, "{production}");
     assert!(production.contains("pub(crate) struct NonTradingBudget(SharedBudget);"));
     assert_eq!(production.matches("map(NonTradingBudget)").count(), 1, "{production}");

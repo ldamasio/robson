@@ -112,6 +112,13 @@ impl NonTradingBudget {
         self.0.start()
     }
 
+    /// The TIME owner's handle on this budget (PLAN §6.6): its cycle reserves
+    /// TIME (weight 1) and polls its send through it, and the stop closes it.
+    /// Only the owner's non-trading constructor takes it (T8 guard).
+    pub(crate) fn time_owner(&self) -> SharedBudget {
+        self.0.clone()
+    }
+
     pub(crate) fn try_reserve_time(
         &self,
         now: TickCapture,

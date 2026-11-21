@@ -1015,23 +1015,30 @@ fn package5a_owners_stay_dormant_or_bounded() {
 }
 
 /// PS-2a's non-trading budget bootstrap (its connection owner is allowed
-/// above) and the budget it builds have no production caller outside the
-/// budget module until PS-6 composes the non-trading start.
+/// above), the budget it builds and PS-3's TIME owner on it have no
+/// production caller until PS-6 composes the non-trading start.
 #[test]
 fn ps2a_non_trading_budget_stays_dormant() {
     let sources = production_sources();
-    for needle in [
-        "observe_non_trading",
-        "bootstrap::non_trading(",
-        "NonTradingBudget",
+    // PS-3: the TIME owner's non-trading constructor takes the budget and its
+    // TIME handle; nothing else does, and nothing calls the constructor yet.
+    for (needle, owner) in [
+        ("observe_non_trading", None),
+        ("bootstrap::non_trading(", None),
+        ("NonTradingBudget", Some("venue_clock_owner.rs")),
+        (".time_owner()", Some("venue_clock_owner.rs")),
+        ("ClockOwner::non_trading(", None),
     ] {
         let outside: BTreeSet<&str> = sources
             .iter()
             .filter(|s| s.text.contains(needle) && !s.file.starts_with("venue_budget/"))
             .map(|s| s.file.as_str())
+            .filter(|file| Some(*file) != owner)
             .collect();
         assert!(outside.is_empty(), "{needle} reached from {outside:?}");
     }
+    let owner = source("venue_clock_owner.rs");
+    assert_eq!(owner.matches(".time_owner()").count(), 1, "{owner}");
     // Its one connection inherits the pool's bounds and tightens them at
     // startup, before its first statement.
     let observe = squeeze(&function(

@@ -20,6 +20,7 @@ pub(crate) mod restore;
 mod snapshot;
 pub(crate) mod state;
 
+pub(crate) use heads::register_level as register_restriction_level;
 pub(crate) use snapshot::BootstrapRows;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
