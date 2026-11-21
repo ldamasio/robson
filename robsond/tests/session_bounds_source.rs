@@ -933,7 +933,11 @@ fn package4_supervised_startup_stays_out_of_production() {
 fn package5a_owners_stay_dormant_or_bounded() {
     let sources = production_sources();
     let naming = |needle: &str| -> BTreeSet<String> {
-        sources.iter().filter(|s| s.text.contains(needle)).map(|s| s.file.clone()).collect()
+        sources
+            .iter()
+            .filter(|s| s.text.contains(needle))
+            .map(|s| s.file.clone())
+            .collect()
     };
     let outside = |needle: &str, owner: &str| -> BTreeSet<String> {
         naming(needle).into_iter().filter(|file| !file.starts_with(owner)).collect()

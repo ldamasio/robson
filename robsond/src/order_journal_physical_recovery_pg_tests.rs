@@ -942,8 +942,10 @@ async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
         restore.close().await;
         // TIME 1 + the scoped triple 20 + 6 + 6, then the weight-4 exact lookup.
         let (weight, lookup_weight, cumulative_weight) = (33, 4, 37);
-        ensure!(cumulative_weight == weight + lookup_weight && cumulative_weight == 37,
-            "cumulative evidence weight is the triple's plus the lookup's");
+        ensure!(
+            cumulative_weight == weight + lookup_weight && cumulative_weight == 37,
+            "cumulative evidence weight is the triple's plus the lookup's"
+        );
         installed.supervisor().phase("rehearsal_complete", json!({
             "epoch": successor.process_epoch, "generation": successor.generation_id,
             "sample": witness.sample, "handoffs": 4, "weight": weight, "inventory_sql": 0,

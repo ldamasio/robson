@@ -82,10 +82,11 @@ async fn the_ledger_schema_installs_fresh(pool: PgPool) {
         20240101000050
     ]);
     // The embedded chain has no gap: every version from 0 to 50, in order.
-    let chain: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+    let chain: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     let expected: Vec<i64> = (0..=50).map(|n| 20240101000000 + n).collect();
     assert_eq!(chain, expected);
     // Migrations 41 to 45 create the order-set projection tables empty.

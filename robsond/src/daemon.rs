@@ -2803,9 +2803,8 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let start = crate::process_epoch::start_epoch(&pool, tenant, "5a-supervised")
-            .await
-            .unwrap();
+        let start =
+            crate::process_epoch::start_epoch(&pool, tenant, "5a-supervised").await.unwrap();
         let installed = JournalGeneration {
             tenant_id: tenant,
             account_scope: DEFAULT_ACCOUNT_SCOPE.to_string(),
@@ -2843,7 +2842,8 @@ mod tests {
         let current = |generation: JournalGeneration| {
             let pool = pool.clone();
             async move {
-                let venue = robson_exec::venue::VenueId::new(robson_exec::venue::VenueId::BINANCE_SPOT);
+                let venue =
+                    robson_exec::venue::VenueId::new(robson_exec::venue::VenueId::BINANCE_SPOT);
                 let mut connection = pool.acquire().await.unwrap();
                 let expected = ExpectedGeneration {
                     tenant_id: generation.tenant_id,
@@ -2880,7 +2880,8 @@ mod tests {
             )
         };
 
-        let first = supervised(SpotReady::unsupervised_fixture(start, installed.clone(), pool.clone()));
+        let first =
+            supervised(SpotReady::unsupervised_fixture(start, installed.clone(), pool.clone()));
         let context = first.position_manager.read().await.balance_accounting().cloned().unwrap();
         assert_eq!(context.generation.current(), Some(installed.clone()), "the manager's cell");
         let journal = first.journal_for_startup_witness();
@@ -2892,9 +2893,8 @@ mod tests {
         assert!(current(installed.clone()).await);
 
         // The successor installs a rotated generation in its own epoch.
-        let successor = crate::process_epoch::start_epoch(&pool, tenant, "5a-successor")
-            .await
-            .unwrap();
+        let successor =
+            crate::process_epoch::start_epoch(&pool, tenant, "5a-successor").await.unwrap();
         let rotated = JournalGeneration {
             generation_id: uuid::Uuid::now_v7(),
             process_epoch: successor.epoch.epoch_id,
