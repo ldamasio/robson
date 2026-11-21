@@ -130,9 +130,14 @@ impl PgJournalBackend {
 
     /// The supervised Spot backend: orders and a release both on the admitted
     /// writer, bound to its installed generation. The installer's pool never
-    /// reaches it.
+    /// reaches it. Its incidents, suspensions and releases read `generation`,
+    /// the daemon's one cell, into which the supervised start publishes
+    /// (ADR-0056 step 8l-4, 5a).
     #[allow(dead_code, reason = "no production supervisor yet")]
-    pub(crate) fn supervised(ready: &SpotReady) -> Self {
+    pub(crate) fn supervised(
+        ready: &SpotReady,
+        generation: &crate::balance_accounting::GenerationCell,
+    ) -> Self {
         Self {
             pool: ready.writer().clone(),
             daemon_pool: ready.writer().clone(),
@@ -142,6 +147,7 @@ impl PgJournalBackend {
             // suspensions and releases run under the server bounds.
             balance_account: true,
             order_set_projection: Some(ready.generation().clone()),
+            accounting_generation: generation.clone(),
         }
     }
 

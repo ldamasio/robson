@@ -707,14 +707,19 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
         let store = Arc::new(MemoryStore::new());
         let executor = Executor::new(Arc::clone(&venue), journal, store.clone());
         // ADR-0056 step 8l-4: one order-set generation cell for the journal and
-        // the accounting context.
+        // the accounting context. A supervised start publishes the generation
+        // it installed and admitted into it before the journal is built, so
+        // the journal and the manager's context read that generation (5a).
         let generation = crate::balance_accounting::GenerationCell::default();
         let executor = Arc::new(match &ready {
-            Some(ready) => with_order_journal_backend(
-                executor,
-                &venue,
-                crate::order_journal_store::PgJournalBackend::supervised(ready),
-            ),
+            Some(ready) => {
+                generation.publish(ready.generation().clone());
+                with_order_journal_backend(
+                    executor,
+                    &venue,
+                    crate::order_journal_store::PgJournalBackend::supervised(ready, &generation),
+                )
+            },
             None => with_durable_order_journal(executor, &venue, &pg_pool, &config, &generation),
         });
         let order_journal = gated(&venue, &executor);
@@ -2730,7 +2735,10 @@ mod tests {
             source_audit_id: uuid::Uuid::now_v7(),
         };
         let ready = SpotReady::unsupervised_fixture(start, generation, pool.clone());
-        let backend = crate::order_journal_store::PgJournalBackend::supervised(&ready);
+        let backend = crate::order_journal_store::PgJournalBackend::supervised(
+            &ready,
+            &crate::balance_accounting::GenerationCell::default(),
+        );
         let incident = Incident {
             reason: IncidentReason::UncertainOutcome,
             first_at: Utc::now(),
@@ -2754,6 +2762,180 @@ mod tests {
         let error = format!("{failure:?}");
         assert!(error.contains("lock timeout") || error.contains("statement timeout"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// 5a composition of 8l-4a's generation cell with package 4's supervised
+    /// start (ROOT-decision-8l4a-generation-handoff, option A). A supervised
+    /// start publishes the generation it installed and admitted into the
+    /// daemon's one cell before its journal is built, and the manager's
+    /// accounting context reads that same cell. The supervised journal's
+    /// durable incident and suspension writes then bump the accounting
+    /// version and CAS against the installed generation, which stays current.
+    /// A restart's successor (the 8j rebuild: a rotated generation in a new
+    /// epoch, as `cold_install`'s `publish.sql` writes it) reaches its own
+    /// daemon the same way: its writes advance the rotated generation, and
+    /// the predecessor's journal, still on the old identity, is refused and
+    /// keeps its writes pending.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_supervised_start_publishes_its_generation_to_the_journal_and_the_manager(
+        pool: sqlx::PgPool,
+    ) {
+        use robson_exec::{
+            order_journal::{StreamSuspensionRow, DEFAULT_ACCOUNT_SCOPE},
+            venue::AccountKind,
+            StubOhlcv, StubTradeFeed,
+        };
+
+        use crate::{
+            capability::worker_venue::WorkerVenue,
+            spot_order_set_store::{
+                observe_generation, spot_startup::SpotReady, ExpectedGeneration, JournalGeneration,
+            },
+        };
+        let tenant = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO accounting_state (tenant_id, venue_id, budget_model) \
+             VALUES ($1, 'binance:spot', 'net_from_start_non_expanding_v1')",
+        )
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let start = crate::process_epoch::start_epoch(&pool, tenant, "5a-supervised")
+            .await
+            .unwrap();
+        let installed = JournalGeneration {
+            tenant_id: tenant,
+            account_scope: DEFAULT_ACCOUNT_SCOPE.to_string(),
+            generation_id: uuid::Uuid::now_v7(),
+            process_epoch: start.epoch.epoch_id,
+            source_audit_id: uuid::Uuid::now_v7(),
+        };
+        sqlx::query(
+            "INSERT INTO spot_order_set_generation (tenant_id, venue_id, account_scope, \
+             generation_id, process_epoch, source_audit_id, accounting_version) \
+             VALUES ($1, 'binance:spot', $2, $3, $4, $5, 0)",
+        )
+        .bind(tenant)
+        .bind(&installed.account_scope)
+        .bind(installed.generation_id)
+        .bind(installed.process_epoch)
+        .bind(installed.source_audit_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let versions = || {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (i64, i64)>(
+                    "SELECT a.version, g.accounting_version FROM accounting_state a \
+                     JOIN spot_order_set_generation g USING (tenant_id, venue_id) \
+                     WHERE (a.tenant_id, a.venue_id) = ($1, 'binance:spot')",
+                )
+                .bind(tenant)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let current = |generation: JournalGeneration| {
+            let pool = pool.clone();
+            async move {
+                let venue = robson_exec::venue::VenueId::new(robson_exec::venue::VenueId::BINANCE_SPOT);
+                let mut connection = pool.acquire().await.unwrap();
+                let expected = ExpectedGeneration {
+                    tenant_id: generation.tenant_id,
+                    venue: &venue,
+                    account_scope: &generation.account_scope,
+                    generation_id: generation.generation_id,
+                    process_epoch: generation.process_epoch,
+                    source_audit_id: generation.source_audit_id,
+                };
+                observe_generation(&mut connection, expected).await.unwrap().is_some()
+            }
+        };
+        let suspension = || StreamSuspensionRow {
+            suspension_id: uuid::Uuid::now_v7(),
+            stream_key: format!("position:{}", uuid::Uuid::now_v7()),
+            stream_kind: "position",
+            failed_seq: None,
+            month: None,
+            error: "5a supervised start".to_string(),
+            epoch_id: None,
+            suspended_at: Utc::now(),
+        };
+        let supervised = |ready: SpotReady| {
+            let mut config = Config::test();
+            config.projection.tenant_id = Some(tenant);
+            Daemon::assemble_with_recovery(
+                config,
+                Arc::new(WorkerVenue::new(AccountKind::BalanceAccount, false)),
+                Arc::new(StubTradeFeed::default()),
+                Arc::new(StubOhlcv::default()),
+                None,
+                Some(Arc::new(ready.writer().clone())),
+                Some(ready),
+            )
+        };
+
+        let first = supervised(SpotReady::unsupervised_fixture(start, installed.clone(), pool.clone()));
+        let context = first.position_manager.read().await.balance_accounting().cloned().unwrap();
+        assert_eq!(context.generation.current(), Some(installed.clone()), "the manager's cell");
+        let journal = first.journal_for_startup_witness();
+        assert!(journal.balance_account());
+        journal.record_suspension(suspension());
+        assert_eq!(journal.flush_pending().await, 2, "the incident and the suspension land");
+        assert_eq!(journal.retry_set_depth(), 0);
+        assert_eq!(versions().await, (2, 2), "two bumps, each with the CAS");
+        assert!(current(installed.clone()).await);
+
+        // The successor installs a rotated generation in its own epoch.
+        let successor = crate::process_epoch::start_epoch(&pool, tenant, "5a-successor")
+            .await
+            .unwrap();
+        let rotated = JournalGeneration {
+            generation_id: uuid::Uuid::now_v7(),
+            process_epoch: successor.epoch.epoch_id,
+            source_audit_id: uuid::Uuid::now_v7(),
+            ..installed.clone()
+        };
+        sqlx::query(
+            "UPDATE public.spot_order_set_generation g SET generation_id = $3, \
+             process_epoch = $4, source_audit_id = $5, accounting_version = a.version, \
+             position_hints_complete = true FROM public.accounting_state a \
+             WHERE (a.tenant_id, a.venue_id) = (g.tenant_id, g.venue_id) \
+             AND (g.tenant_id, g.venue_id, g.account_scope) = ($1, 'binance:spot', $2) \
+             AND g.generation_id = $6",
+        )
+        .bind(tenant)
+        .bind(&rotated.account_scope)
+        .bind(rotated.generation_id)
+        .bind(rotated.process_epoch)
+        .bind(rotated.source_audit_id)
+        .bind(installed.generation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(current(rotated.clone()).await && !current(installed.clone()).await);
+        let second =
+            supervised(SpotReady::unsupervised_fixture(successor, rotated.clone(), pool.clone()));
+        let context = second.position_manager.read().await.balance_accounting().cloned().unwrap();
+        assert_eq!(context.generation.current(), Some(rotated.clone()));
+        let renewed = second.journal_for_startup_witness();
+        renewed.record_suspension(suspension());
+        assert_eq!(renewed.flush_pending().await, 2);
+        assert_eq!(versions().await, (4, 4), "the successor's writes advance its generation");
+        assert!(current(rotated.clone()).await);
+
+        // The predecessor's journal still reads the old identity: refused, and
+        // its writes stay pending with nothing moved.
+        journal.record_suspension(suspension());
+        assert_eq!(journal.flush_pending().await, 0);
+        assert_eq!(journal.retry_set_depth(), 2);
+        assert_eq!(versions().await, (4, 4));
+        assert!(current(rotated).await);
     }
 
     #[cfg(feature = "postgres")]
