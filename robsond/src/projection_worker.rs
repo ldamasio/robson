@@ -3,13 +3,17 @@
 //! Uses a PostgreSQL checkpoint row to track last processed sequence number.
 
 use robson_eventlog::EventEnvelope;
-use robson_projector::apply_event_to_projections;
+use robson_projector::apply_event_to_projections_with;
 use sqlx::PgPool;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::{config::ProjectionConfig, error::DaemonResult};
+use crate::{
+    balance_accounting::{projector_step, BalanceAccounting},
+    config::ProjectionConfig,
+    error::DaemonResult,
+};
 
 const PROJECTION_NAME: &str = "robson-projector";
 
@@ -18,12 +22,26 @@ pub struct ProjectionWorker {
     pool: PgPool,
     config: ProjectionConfig,
     tenant_id: Uuid,
+    /// A balance-account daemon's accounting context (ADR-0056 step 8l-4).
+    balance_accounting: Option<BalanceAccounting>,
 }
 
 impl ProjectionWorker {
     /// Create a new projection worker.
     pub fn new(pool: PgPool, config: ProjectionConfig, tenant_id: Uuid) -> Self {
-        Self { pool, config, tenant_id }
+        Self {
+            pool,
+            config,
+            tenant_id,
+            balance_accounting: None,
+        }
+    }
+
+    /// Apply as a balance-account daemon (ADR-0056 step 8l-4): each
+    /// `monthly_state` write bumps the accounting version first.
+    pub(crate) fn with_balance_accounting(mut self, accounting: Option<BalanceAccounting>) -> Self {
+        self.balance_accounting = accounting;
+        self
     }
 
     /// Run the projection worker loop.
@@ -96,7 +114,8 @@ impl ProjectionWorker {
 
         let mut applied = 0;
         for event in &events {
-            match apply_event_to_projections(&self.pool, event).await {
+            let step = projector_step(self.balance_accounting.as_ref());
+            match apply_event_to_projections_with(&self.pool, event, step).await {
                 Ok(()) => {
                     info!(
                         seq = event.seq,

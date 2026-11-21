@@ -1,13 +1,17 @@
-//! ADR-0056 step 8l-4a proofs (PLAN-r4 §8): proxy traces of the journal's
-//! incident, suspension and release writes and of the suspension clear on a
-//! balance-account daemon and on USD-M, generation progress, a stale
-//! generation's refusal kept pending, and the runbook model switch.
+//! ADR-0056 step 8l-4 proofs (PLAN-r4 §8): proxy traces of the journal's
+//! incident, suspension and release writes, of the suspension clear and of
+//! the projector's `monthly_state` writes on a balance-account daemon and on
+//! USD-M, the lock order, generation progress through the owner's cell, a
+//! stale generation's refusal kept pending, 8m's `v₁ + 2` and the runbook
+//! model switch.
 use std::{
     future::Future,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Datelike, TimeZone, Utc};
+use robson_eventlog::{ActorType, EventEnvelope};
 use robson_exec::{
     gate::{Incident, IncidentReason},
     order_journal::{
@@ -16,11 +20,13 @@ use robson_exec::{
     },
     venue::{AccountKind, VenueId},
 };
+use robson_projector::{apply_event_to_projections_with, ProjectionError};
 use robson_testkit::db_proxy::{DbProxy, ProxyMode};
+use rust_decimal::Decimal;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use uuid::Uuid;
 
-use super::{AccountingRefusal, BalanceAccounting, GenerationCell};
+use super::{projector_step, AccountingRefusal, BalanceAccounting, GenerationCell, BOUNDS};
 use crate::{
     event_streams::{
         repair_position_stream, EventStreams, ManagedStream, RepairOutcome, Suspended,
@@ -31,6 +37,7 @@ use crate::{
 };
 
 const SPOT: &str = VenueId::BINANCE_SPOT;
+const BEGIN_TX: [&str; 4] = ["begin", "bounds", "bump", "cas"];
 
 /// An accounting row of `venue` for `tenant_id`, at version 0.
 async fn account(pool: &PgPool, tenant_id: Uuid, venue: &str) {
@@ -227,6 +234,10 @@ async fn traced<T>(proxy: &DbProxy, work: impl Future<Output = T>) -> (T, Vec<&'
             sql if sql.starts_with("SELECT set_config('lock_timeout'") => "bounds",
             sql if sql.starts_with("WITH locked AS (") => "bump",
             sql if sql.contains("UPDATE public.spot_order_set_generation") => "cas",
+            sql if sql.starts_with("UPDATE positions_current") => "positions",
+            sql if sql.starts_with("INSERT INTO monthly_state") => "monthly",
+            sql if sql.starts_with("UPDATE monthly_state") => "monthly",
+            sql if sql.starts_with("LOCK TABLE monthly_state") => "lock",
             sql if sql.starts_with("UPDATE stream_suspensions SET cleared_at") => "clear",
             sql if sql.starts_with("INSERT INTO stream_suspensions") => "suspension",
             sql if sql.starts_with("INSERT INTO recovery_incidents") => "incident",
@@ -900,4 +911,374 @@ fn only_a_balance_account_daemon_builds_a_context() {
     let repair = manager.split("repair_position_stream(").nth(1).unwrap();
     let call = &repair[..repair.find(".await").unwrap()];
     assert!(call.contains("self.balance_accounting.as_ref()"), "{call}");
+}
+
+fn envelope(event_type: &str, payload: serde_json::Value, at: DateTime<Utc>) -> EventEnvelope {
+    EventEnvelope {
+        event_id: Uuid::now_v7(),
+        tenant_id: Uuid::now_v7(),
+        stream_key: "test:8l-4".to_string(),
+        seq: 1,
+        event_type: event_type.to_string(),
+        payload,
+        payload_schema_version: 1,
+        occurred_at: at,
+        ingested_at: at,
+        idempotency_key: Uuid::now_v7().to_string(),
+        trace_id: None,
+        causation_id: None,
+        command_id: None,
+        workflow_id: None,
+        actor_type: Some(ActorType::Daemon),
+        actor_id: None,
+        prev_hash: None,
+        hash: None,
+    }
+}
+
+fn reset(at: DateTime<Utc>, base: &str) -> EventEnvelope {
+    let payload = serde_json::json!({
+        "capital_base": base, "carried_positions_risk": "0",
+        "month": at.month(), "year": at.year(), "timestamp": at,
+    });
+    envelope("month_boundary_reset", payload, at)
+}
+
+fn recalibration(at: DateTime<Utc>, base: &str) -> EventEnvelope {
+    let payload = serde_json::json!({
+        "previous_capital_base": "10000", "new_capital_base": base, "wallet_balance": base,
+        "carried_risk": "0", "reason": "spot_cutover_basis", "evidence": "8l-4",
+        "month": at.month(), "year": at.year(), "timestamp": at,
+    });
+    envelope("capital_base_recalibrated", payload, at)
+}
+
+fn fill(at: DateTime<Utc>) -> EventEnvelope {
+    let payload = serde_json::json!({
+        "position_id": Uuid::now_v7(), "order_id": Uuid::now_v7(), "fill_price": "100",
+        "filled_quantity": "1", "fee": "0.1", "initial_stop": "90",
+        "invalidation_guard_level": null, "timestamp": at,
+    });
+    envelope("entry_filled", payload, at)
+}
+
+fn losing_close(at: DateTime<Utc>) -> EventEnvelope {
+    let payload = serde_json::json!({
+        "position_id": Uuid::now_v7(), "exit_reason": "TrailingStop", "entry_price": "100",
+        "exit_price": "90", "realized_pnl": "-10", "total_fees": "1", "timestamp": at,
+    });
+    envelope("position_closed", payload, at)
+}
+
+fn april() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2027, 4, 1, 0, 0, 10).unwrap()
+}
+
+/// The month's capital base, carried risk and model.
+async fn month(pool: &PgPool, at: DateTime<Utc>) -> (Decimal, Decimal, String) {
+    sqlx::query_as(
+        "SELECT capital_base, carried_risk, monthly_budget_model FROM monthly_state \
+         WHERE year = $1 AND month = $2",
+    )
+    .bind(at.year() as i16)
+    .bind(at.month() as i16)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Balance daemon: each autocommit `monthly_state` path is one transaction of
+/// six (BEGIN, bounds, one bump, CAS, the write, COMMIT); the counter fallback
+/// is 6 + 7 = 13; each transaction bumps once and keeps the generation
+/// current. Without an installed generation it is one statement shorter.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn balance_projector_sends_six_per_path_and_thirteen_on_the_fallback(pool: PgPool) {
+    let installed = seed(&pool, true).await;
+    let (proxy, proxied) = through_proxy(&pool).await;
+    let may = Utc.with_ymd_and_hms(2027, 5, 2, 0, 0, 10).unwrap();
+    let tx = [&BEGIN_TX[..], &["monthly", "commit"][..]].concat();
+    let fallback = [&BEGIN_TX[..], &["lock", "monthly", "commit"][..]].concat();
+    let cases = [
+        (reset(april(), "10000"), tx.clone(), 1),
+        (recalibration(april(), "9000"), tx.clone(), 1),
+        (fill(april()), [&["positions"][..], &tx[..]].concat(), 1),
+        (losing_close(april()), [&["positions"][..], &tx[..]].concat(), 1),
+        (fill(may), [&["positions"][..], &tx[..], &fallback[..]].concat(), 2),
+    ];
+    let step = projector_step(Some(&installed));
+    for (event, expected, bumps) in cases {
+        let (version, generation) = versions(&pool, &installed).await;
+        let applied = apply_event_to_projections_with(&proxied, &event, step);
+        let (applied, shape) = traced(&proxy, applied).await;
+        applied.unwrap();
+        assert_eq!(shape, expected, "{}", event.event_type);
+        let moved = (version + bumps, generation.map(|g| g + bumps));
+        assert_eq!(versions(&pool, &installed).await, moved, "{}", event.event_type);
+        assert!(qualifies(&pool, &installed).await, "{}", event.event_type);
+    }
+
+    let unopted = seed(&pool, false).await;
+    let event = reset(may, "10000");
+    let applied = apply_event_to_projections_with(&proxied, &event, projector_step(Some(&unopted)));
+    let (applied, shape) = traced(&proxy, applied).await;
+    applied.unwrap();
+    assert_eq!(shape, ["begin", "bounds", "bump", "monthly", "commit"]);
+    assert_eq!(versions(&pool, &unopted).await, (1, None));
+}
+
+/// USD-M (a position account) gets no context from the daemon, and every
+/// `monthly_state` path sends exactly its pre-8l statements: one autocommit
+/// write, or the counter fallback's five; no accounting row of the tenant
+/// moves.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_usdm_projector_issues_its_pre_8l_statements(pool: PgPool) {
+    let tenant_id = Uuid::now_v7();
+    let usdm = VenueId::new(VenueId::BINANCE_USDM);
+    sqlx::query(
+        "INSERT INTO accounting_state (tenant_id, venue_id, budget_model) \
+         VALUES ($1, $2, 'hwm_v1')",
+    )
+    .bind(tenant_id)
+    .bind(usdm.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let cell = GenerationCell::default();
+    let accounting =
+        BalanceAccounting::for_daemon(AccountKind::PositionAccount, tenant_id, &usdm, &cell);
+    let step = projector_step(accounting.as_ref());
+    let (proxy, proxied) = through_proxy(&pool).await;
+    let may = Utc.with_ymd_and_hms(2027, 5, 2, 0, 0, 10).unwrap();
+    let cases: [(EventEnvelope, &[&str]); 5] = [
+        (reset(april(), "10000"), &["monthly"]),
+        (recalibration(april(), "9000"), &["monthly"]),
+        (fill(april()), &["positions", "monthly"]),
+        (losing_close(april()), &["positions", "monthly"]),
+        (fill(may), &["positions", "monthly", "begin", "lock", "monthly", "commit"]),
+    ];
+    for (event, expected) in cases {
+        let applied = apply_event_to_projections_with(&proxied, &event, step);
+        let (applied, shape) = traced(&proxy, applied).await;
+        applied.unwrap();
+        assert_eq!(shape, expected, "{}", event.event_type);
+    }
+    let version: i64 =
+        sqlx::query_scalar("SELECT version FROM accounting_state WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(version, 0);
+}
+
+/// The projector takes the accounting rows before `monthly_state`: the bump
+/// precedes the write in its trace, and while another transaction holds the
+/// tenant's accounting row the waiting apply holds no `monthly_state` lock.
+/// It then lands whole or, past its 300 ms lock bound, not at all.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn projector_takes_the_accounting_row_before_monthly_state(pool: PgPool) {
+    let installed = seed(&pool, true).await;
+    let (proxy, proxied) = through_proxy(&pool).await;
+    let step = projector_step(Some(&installed));
+    let event = reset(april(), "10000");
+    let applied = apply_event_to_projections_with(&proxied, &event, step);
+    let (applied, shape) = traced(&proxy, applied).await;
+    applied.unwrap();
+    let at = |kind: &str| shape.iter().position(|s| *s == kind).unwrap();
+    assert!(at("bump") < at("monthly"), "{shape:?}");
+
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT version FROM accounting_state WHERE tenant_id = $1 FOR UPDATE")
+        .bind(installed.tenant_id)
+        .fetch_all(&mut *holder)
+        .await
+        .unwrap();
+    let waiting = {
+        let (pool, installed) = (pool.clone(), installed.clone());
+        tokio::spawn(async move {
+            let event = recalibration(april(), "9000");
+            apply_event_to_projections_with(&pool, &event, projector_step(Some(&installed))).await
+        })
+    };
+    let pid: i32 = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let found = sqlx::query_scalar(
+                "SELECT pid FROM pg_stat_activity WHERE datname = current_database() \
+                 AND wait_event_type = 'Lock' AND query LIKE 'WITH locked AS (%'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if let Some(pid) = found {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the apply must wait on the accounting row");
+    let monthly_locks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks WHERE pid = $1 AND relation = 'monthly_state'::regclass",
+    )
+    .bind(pid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    holder.rollback().await.unwrap();
+    let applied = waiting.await.unwrap();
+    assert_eq!(monthly_locks, 0, "monthly_state locked before the accounting row");
+    let (base, _, _) = month(&pool, april()).await;
+    match applied {
+        Ok(()) => {
+            assert_eq!((versions(&pool, &installed).await, base), ((2, Some(2)), 9000.into()))
+        },
+        Err(_) => {
+            assert_eq!((versions(&pool, &installed).await, base), ((1, Some(1)), 10000.into()))
+        },
+    }
+}
+
+/// Healthy progress: repeated applies on a balance daemon each advance the
+/// version and the installed generation together, so the order-set scan
+/// qualifies after every one; each apply ends inside PLAN-r4 §7.2's 400 ms
+/// holder target (its slowest is printed). A generation left stale by a writer
+/// that bumped without it refuses the next apply whole: no `monthly_state`
+/// change, no version move.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn projector_apply_then_scan_qualifies(pool: PgPool) {
+    let installed = seed(&pool, true).await;
+    let step = projector_step(Some(&installed));
+    let mut slowest = Duration::ZERO;
+    for round in 0..40 {
+        let event = match round % 4 {
+            0 => reset(april(), "10000"),
+            1 => recalibration(april(), "9000"),
+            2 => fill(april()),
+            _ => losing_close(april()),
+        };
+        let started = Instant::now();
+        apply_event_to_projections_with(&pool, &event, step).await.unwrap();
+        slowest = slowest.max(started.elapsed());
+        assert!(qualifies(&pool, &installed).await, "round {round}");
+    }
+    println!("ACCOUNTING_8L4_BOUND applies=40 slowest_us={}", slowest.as_micros());
+    assert!(slowest < Duration::from_millis(400), "{slowest:?}");
+    assert_eq!(versions(&pool, &installed).await, (40, Some(40)));
+
+    stale(&pool, &installed).await;
+    let before = month(&pool, april()).await;
+    let refused =
+        apply_event_to_projections_with(&pool, &recalibration(april(), "8000"), step).await;
+    assert!(matches!(refused, Err(ProjectionError::Accounting(_))), "{refused:?}");
+    assert_eq!(month(&pool, april()).await, before);
+    assert_eq!(versions(&pool, &installed).await, (41, Some(40)));
+    assert!(!qualifies(&pool, &installed).await);
+}
+
+/// 8m's tx2 with the real handlers (v16 §C10 certificate steps 3-6): the
+/// recalibration's projection apply bumps the version once and 8m's anchor
+/// and activation-basis transaction once more, so completion's conditional
+/// bump finds exactly `v₁ + 2`. The month carries the new base and zero
+/// carried risk, its model unchanged.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn recalibration_apply_bumps_once_for_the_cutover(pool: PgPool) {
+    let installed = seed(&pool, true).await;
+    let step = projector_step(Some(&installed));
+    apply_event_to_projections_with(&pool, &reset(april(), "10000"), step)
+        .await
+        .unwrap();
+    let (v1, _) = versions(&pool, &installed).await;
+    let (_, _, model) = month(&pool, april()).await;
+
+    let recalibrated = recalibration(april(), "9000.5");
+    apply_event_to_projections_with(&pool, &recalibrated, step).await.unwrap();
+    assert_eq!(versions(&pool, &installed).await, (v1 + 1, Some(v1 + 1)));
+    // 8m's one transaction: its anchor and activation-basis writes are 8m's;
+    // its accounting step is this context's.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(BOUNDS).execute(&mut *tx).await.unwrap();
+    assert_eq!(installed.advance(&mut tx).await.unwrap(), Some(v1 + 2));
+    tx.commit().await.unwrap();
+    let completed = sqlx::query(
+        "UPDATE accounting_state SET version = version + 1 \
+         WHERE tenant_id = $1 AND venue_id = $2 AND version = $3",
+    )
+    .bind(installed.tenant_id)
+    .bind(SPOT)
+    .bind(v1 + 2)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(completed.rows_affected(), 1);
+    let expected = ("9000.5".parse().unwrap(), Decimal::ZERO, model);
+    assert_eq!(month(&pool, april()).await, expected);
+}
+
+/// Source guard (PLAN-r4 §6.7): every caller of the projector in robsond's
+/// production code (the append path, the projection worker and the stream
+/// repair) passes the balance context, and the daemon builds it for both
+/// the manager and the worker.
+#[test]
+fn every_projector_caller_on_a_balance_daemon_passes_its_context() {
+    let callers = [
+        ("position_manager.rs", include_str!("position_manager.rs")),
+        ("projection_worker.rs", include_str!("projection_worker.rs")),
+        ("event_streams.rs", include_str!("event_streams.rs")),
+    ];
+    // Each caller's own context reaches its one apply: the manager's, the
+    // repair's (from the manager, checked in 8l-4a's wiring test) and the
+    // worker's (from the manager, checked below).
+    let flows: [&[&str]; 3] = [
+        &[
+            "let accounting = self.balance_accounting.as_ref(); \
+             match Self::append_and_apply(pool, tenant_id, &stream_key, event, accounting)",
+            "let step = crate::balance_accounting::projector_step(accounting); \
+             apply_event_to_projections_with(pool, &envelope, step)",
+        ],
+        &[
+            "let step = projector_step(self.balance_accounting.as_ref()); \
+             match apply_event_to_projections_with(&self.pool, event, step)",
+        ],
+        &[
+            "repair_under_lock(pool, tenant_id, streams, stream_key, suspended, accounting)",
+            "let step = projector_step(accounting); if let Err(error) = \
+             robson_projector::apply_event_to_projections_with(pool, envelope, step)",
+        ],
+    ];
+    let squeezed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for ((file, source), flow) in callers.iter().zip(flows) {
+        let source = squeezed(production(source));
+        assert!(!source.contains("apply_event_to_projections("), "{file}");
+        assert_eq!(source.matches("apply_event_to_projections_with(").count(), 1, "{file}");
+        for step in flow {
+            assert!(source.contains(&squeezed(step)), "{file}: {step}");
+        }
+    }
+    let mut pending = vec![std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src"
+    ))];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                pending.push(path);
+            } else if name.ends_with(".rs") && !name.contains("test") {
+                let known = callers.iter().any(|(caller, _)| *caller == name);
+                let source = std::fs::read_to_string(&path).unwrap();
+                let applies = production(&source).contains("apply_event_to_projections");
+                assert!(known || !applies, "{} applies projections", path.display());
+            }
+        }
+    }
+    // The worker shares the manager's context, so the journal's cell.
+    let daemon = production(include_str!("daemon.rs"));
+    assert_eq!(daemon.matches(".with_balance_accounting(accounting)").count(), 2);
+    assert!(daemon.contains("self.position_manager.read().await.balance_accounting()"));
 }

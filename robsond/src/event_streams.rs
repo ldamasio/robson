@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "postgres")]
 use crate::{
-    balance_accounting::{AccountingRefusal, BalanceAccounting, BOUNDS},
+    balance_accounting::{projector_step, AccountingRefusal, BalanceAccounting, BOUNDS},
     ledger_connection::LedgerConnection,
 };
 
@@ -325,8 +325,8 @@ pub(crate) enum RepairOutcome {
 /// event re-applied whose position part was already applied adds again. They
 /// drive neither the budget nor the API.
 ///
-/// On a balance-account daemon the clear is one transaction with the
-/// accounting bump (ADR-0056 step 8l-4).
+/// On a balance-account daemon, `accounting` goes to every apply and the
+/// clear is one transaction with the accounting bump (ADR-0056 step 8l-4).
 #[cfg(feature = "postgres")]
 pub(crate) async fn repair_position_stream(
     pool: &sqlx::PgPool,
@@ -337,7 +337,8 @@ pub(crate) async fn repair_position_stream(
     accounting: Option<&BalanceAccounting>,
 ) -> RepairOutcome {
     let _stream = streams.lock(stream_key).await;
-    let outcome = match repair_under_lock(pool, tenant_id, streams, stream_key, suspended).await {
+    let repaired = repair_under_lock(pool, tenant_id, streams, stream_key, suspended, accounting);
+    let outcome = match repaired.await {
         Ok(outcome) => outcome,
         Err(error) => RepairOutcome::Failed { error: error.to_string() },
     };
@@ -427,6 +428,7 @@ async fn repair_under_lock(
     streams: &EventStreams,
     stream_key: &str,
     suspended: &Suspended,
+    accounting: Option<&BalanceAccounting>,
 ) -> Result<RepairOutcome, sqlx::Error> {
     let ManagedStream::Position(position_id) = suspended.stream else {
         return Ok(RepairOutcome::Refused {
@@ -492,7 +494,10 @@ async fn repair_under_lock(
             break;
         };
         for envelope in &page {
-            if let Err(error) = robson_projector::apply_event_to_projections(pool, envelope).await {
+            let step = projector_step(accounting);
+            if let Err(error) =
+                robson_projector::apply_event_to_projections_with(pool, envelope, step).await
+            {
                 return Ok(RepairOutcome::Failed {
                     error: format!("seq {}: {}: {error}", envelope.seq, envelope.event_type),
                 });

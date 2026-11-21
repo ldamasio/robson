@@ -774,8 +774,8 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             config.engine.position_monitor_tick_interval_secs,
         ));
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
-            // ADR-0056 step 8l-4: on a balance account, the stream repair's
-            // suspension clear bumps the accounting version.
+            // ADR-0056 step 8l-4: on a balance account, the append path and
+            // the stream repair bump the accounting version.
             let accounting = crate::balance_accounting::BalanceAccounting::for_daemon(
                 venue.capabilities().account_kind,
                 tenant_id,
@@ -1237,8 +1237,13 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 "Starting projection worker with shared pool"
             );
 
+            // ADR-0056 step 8l-4: a balance account's projector bumps its
+            // accounting version in every `monthly_state` write, on the
+            // manager's context and so on the journal's generation cell.
+            let accounting = self.position_manager.read().await.balance_accounting();
             let worker =
-                ProjectionWorker::new((**pool).clone(), self.config.projection.clone(), tenant_id);
+                ProjectionWorker::new((**pool).clone(), self.config.projection.clone(), tenant_id)
+                    .with_balance_accounting(accounting);
 
             let worker_shutdown = shutdown.clone();
             workers.push(tokio::spawn(async move {
