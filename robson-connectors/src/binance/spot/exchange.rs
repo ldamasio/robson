@@ -255,6 +255,34 @@ fn venue_record(order: SpotOrderRecord) -> Result<VenueOrderRecord, ExecError> {
     Ok(record)
 }
 
+#[cfg(any(test, feature = "crash-points"))]
+pub(crate) fn decode_fixture_order(
+    status: u16,
+    body: &str,
+    pair: &str,
+    id: u64,
+) -> Result<OrderObservation, ExecError> {
+    let parsed = if status == 200 {
+        super::rest::parse_checked_order(body, pair, &SpotOrderRef::OrderId(id))
+    } else {
+        Err(SpotReadError::from_answer(status, body.to_owned()))
+    };
+    observe_spot_order(parsed)
+}
+
+fn observe_spot_order(
+    parsed: Result<SpotOrderRecord, SpotReadError>,
+) -> Result<OrderObservation, ExecError> {
+    match parsed {
+        Ok(order) => Ok(OrderObservation::Found(Box::new(venue_record(order)?))),
+        Err(SpotReadError::NoSuchOrder { http_status: 400, .. }) => Ok(OrderObservation::NotFound),
+        Err(SpotReadError::OrderArchived { http_status: 400, .. }) => {
+            Ok(OrderObservation::Archived)
+        },
+        Err(error) => Err(read_error(error)),
+    }
+}
+
 /// What a record says of the order's lifecycle. A lookup gives no fills.
 fn order_lookup(record: &VenueOrderRecord) -> OrderLookup {
     let filled_qty = record.executed_qty;
@@ -767,16 +795,7 @@ impl InventoryPort for BinanceSpotAdapter {
             OrderRef::ExchangeId(id) => SpotOrderRef::OrderId(order_id(id)?),
             OrderRef::ClientId(id) => SpotOrderRef::ClientOrderId(id.clone()),
         };
-        match self.reader.order(symbol, &by).await {
-            Ok(order) => Ok(OrderObservation::Found(Box::new(venue_record(order)?))),
-            Err(SpotReadError::NoSuchOrder { http_status: 400, .. }) => {
-                Ok(OrderObservation::NotFound)
-            },
-            Err(SpotReadError::OrderArchived { http_status: 400, .. }) => {
-                Ok(OrderObservation::Archived)
-            },
-            Err(error) => Err(read_error(error)),
-        }
+        observe_spot_order(self.reader.order(symbol, &by).await)
     }
 
     /// One `myTrades` page by order from `from_id` (weight 5), each trade with

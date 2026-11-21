@@ -66,6 +66,14 @@ use tracing::{error, warn};
 
 use crate::order_journal::{self, OPERATIONS_CAPACITY};
 
+#[cfg(feature = "crash-points")]
+mod pending_execution;
+#[cfg(feature = "crash-points")]
+pub use pending_execution::{
+    PendingExecutionEvidence, PendingExecutionOwner, PendingExecutionRegistration,
+    PendingExecutionTicket,
+};
+
 /// Ordinary API operations at once.
 pub const ORDINARY_API_SLOTS: u32 = 16;
 /// Protective API operations at once; ordinary ones never take these.
@@ -476,6 +484,9 @@ pub(crate) struct GateState {
     orphan_cancels_passed: u64,
     orphan_cancels_withheld: u64,
     entries_refused_ownership: u64,
+    /// The controlled composition's slot; never part of the snapshot.
+    #[cfg(feature = "crash-points")]
+    pending_execution: Option<pending_execution::PendingExecutionSlot>,
 }
 
 impl GateState {
@@ -500,6 +511,8 @@ impl GateState {
             orphan_cancels_passed: 0,
             orphan_cancels_withheld: 0,
             entries_refused_ownership: 0,
+            #[cfg(feature = "crash-points")]
+            pending_execution: None,
         }
     }
 

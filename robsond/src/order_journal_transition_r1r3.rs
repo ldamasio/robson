@@ -493,7 +493,8 @@ fn classify(
 }
 
 /// Recorded Q/B/X for a fixture leg under its accounting row, before any
-/// read. No canonical entry-partition writer exists in this scope; the
+/// read. The canonical writers set the partition from the venue's entry and
+/// fills; this fixture seeds final-fee and closed shapes directly. The
 /// evaluator only reads these values and never derives or changes X.
 async fn record_partition(
     pool: &PgPool,

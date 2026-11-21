@@ -138,6 +138,60 @@ fn decode(
 #[path = "source_audit/run.rs"]
 mod run;
 
+/// A fresh descriptive terminal audit. This carries no bootstrap capability.
+/// Test-only in package 4, like the supervised startup that runs it.
+#[cfg(test)]
+pub(crate) struct DescriptiveAudit {
+    pub(crate) id: Uuid,
+    pub(crate) examined: i64,
+    pub(crate) commands: u64,
+}
+
+/// Run only against a target held closed by the supervisor. Retain exactly
+/// one acknowledged continuation and never retry a refused or uncertain run.
+#[cfg(test)]
+pub(crate) async fn describe_existing_source(
+    pool: &PgPool,
+    deadline: Instant,
+) -> Result<DescriptiveAudit, BudgetError> {
+    use run::{Envelope, Pass, Terminal};
+
+    const MAX_PASSES: u64 = 1_000;
+    let envelope = Envelope::new(deadline)?;
+    let trace = Trace::default();
+    let id = Uuid::now_v7();
+    let mut current = run::start_existing(pool, id, envelope, &trace)
+        .await
+        .map_err(|fault| fault.error)?;
+    let mut passes = 0;
+    while current.cursor != current.high_water {
+        if passes == MAX_PASSES {
+            return Err(BudgetError::Invalid);
+        }
+        current = match run::pass(pool, current, &trace).await.map_err(|fault| fault.error)? {
+            Pass::Checkpointed(next) => next,
+            Pass::Exhausted | Pass::Failed(_) | Pass::Stale => {
+                return Err(BudgetError::Unpublished)
+            },
+        };
+        passes += 1;
+    }
+
+    let examined = current.examined;
+    let result = run::finish_audit(pool, current, &trace).await.map_err(|fault| fault.error)?;
+    let Terminal::Complete(complete) = result else {
+        return Err(BudgetError::Unpublished);
+    };
+    if Instant::now() >= deadline {
+        return Err(BudgetError::Expired);
+    }
+    let commands = trace.issued();
+    if complete.audit != id || complete.examined != examined || commands != 10 + 5 * passes {
+        return Err(BudgetError::Invalid);
+    }
+    Ok(DescriptiveAudit { id, examined, commands })
+}
+
 #[cfg(test)]
 #[path = "source_audit/pg_tests.rs"]
 mod pg_tests;

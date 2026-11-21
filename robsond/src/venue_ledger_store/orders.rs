@@ -7,8 +7,9 @@ use robson_domain::OrderSide;
 use robson_exec::{
     venue::{OrderPhase, VenueId, VenueOrderRecord},
     venue_ledger::{
-        merge_order, ClockEvidence, ClockVerdict, LedgerError, LegOrderKind, OrderKey, OrderLeg,
-        OrderLink, OrderOwner, OrderWriteResult, SeenAt, StoredOrder,
+        merge_order, AdmissionTerms, ClockEvidence, ClockVerdict, LedgerError, LegOrderKind,
+        LegPartition, OrderKey, OrderLeg, OrderLink, OrderOwner, OrderWriteResult, SeenAt,
+        StoredOrder,
     },
 };
 use rust_decimal::Decimal;
@@ -17,6 +18,7 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 use super::{backend, commit_error, LedgerConnection, PgVenueLedger};
+use crate::spot_order_set_store::JournalGeneration;
 
 /// One statement from four bounded sections; see order_source.sql.
 pub(super) const ORDER_PROJECTION: &str = concat!(
@@ -29,6 +31,41 @@ pub(super) const ORDER_PROJECTION: &str = concat!(
 pub(super) struct OrderContext {
     pub(super) order: Option<StoredOrder>,
     pub(super) leg: Option<OrderLeg>,
+}
+
+/// Privately constructed coordinate of one opted, leg-owned, changed order
+/// write whose COMMIT positively succeeded. It is not an observation ACK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct OrderCommit {
+    key: OrderKey,
+    owner: OrderOwner,
+    generation: JournalGeneration,
+    executed_cum: Decimal,
+    accounting_version: i64,
+}
+
+#[cfg(test)]
+impl OrderCommit {
+    pub(super) fn key(&self) -> &OrderKey {
+        &self.key
+    }
+
+    pub(super) fn owner(&self) -> &OrderOwner {
+        &self.owner
+    }
+
+    pub(super) fn generation(&self) -> &JournalGeneration {
+        &self.generation
+    }
+
+    pub(super) fn executed_cum(&self) -> Decimal {
+        self.executed_cum
+    }
+
+    pub(super) fn accounting_version(&self) -> i64 {
+        self.accounting_version
+    }
 }
 
 use crate::venue_clock_store::codec::CaptureBind;
@@ -51,6 +88,30 @@ impl PgVenueLedger {
         link: &OrderLink,
         seen: SeenAt,
     ) -> Result<OrderWriteResult, LedgerError> {
+        self.record_order_core::<false>(record, link, seen)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// Test-only observer: the same write, plus the commit coordinate of an
+    /// opted, leg-owned, changed write whose COMMIT positively succeeded.
+    #[cfg(test)]
+    pub(super) async fn record_order_observed(
+        &self,
+        record: &VenueOrderRecord,
+        link: &OrderLink,
+        seen: SeenAt,
+    ) -> Result<(OrderWriteResult, Option<OrderCommit>), LedgerError> {
+        self.record_order_core::<true>(record, link, seen).await
+    }
+
+    // Ordinary traffic passes CAPTURE=false and never builds a coordinate.
+    async fn record_order_core<const CAPTURE: bool>(
+        &self,
+        record: &VenueOrderRecord,
+        link: &OrderLink,
+        seen: SeenAt,
+    ) -> Result<(OrderWriteResult, Option<OrderCommit>), LedgerError> {
         let committing = AtomicBool::new(false);
         self.bounded(async {
             let key = OrderKey::from_record(record,link)?;
@@ -72,7 +133,7 @@ impl PgVenueLedger {
                 self.statement();
                 tx.rollback().await.map_err(backend)?;
                 held.finished=true;
-                return Ok(OrderWriteResult {changed:false,anomalies:proposed.anomalies});
+                return Ok((OrderWriteResult {changed:false,anomalies:proposed.anomalies},None));
             }
             self.statement();
             // The opted branch only adds RETURNING; legacy keeps its statement.
@@ -92,18 +153,14 @@ impl PgVenueLedger {
                 self.statement();
                 tx.rollback().await.map_err(backend)?;
                 held.finished=true;
-                return Ok(OrderWriteResult {changed:false,anomalies:merged.anomalies});
+                return Ok((OrderWriteResult {changed:false,anomalies:merged.anomalies},None));
             }
             self.write_order(&mut tx,&merged.order,locked.order.is_some()).await?;
-            if merged.consumed_delta>Decimal::ZERO || merged.set_cohort {
+            if merged.consumed_delta>Decimal::ZERO || merged.set_cohort || merged.set_partition.is_some() {
                 let OrderOwner::Leg {position_id,..}=merged.order.owner else {
                     return Err(LedgerError::Invariant("unowned order changes a leg".into()));
                 };
-                self.statement();
-                let updated=sqlx::query("UPDATE balance_legs SET consumed_cum=consumed_cum+$1,cohort_month=CASE WHEN $2 THEN COALESCE(cohort_month,decided_month) ELSE cohort_month END WHERE position_id=$3 AND tenant_id=$4 AND venue_id=$5")
-                    .bind(merged.consumed_delta).bind(merged.set_cohort).bind(position_id).bind(self.tenant_id).bind(key.venue.as_str())
-                    .execute(&mut *tx).await.map_err(order_error)?;
-                if updated.rows_affected()!=1 {return Err(LedgerError::Invariant("order leg disappeared".into()));}
+                self.update_leg(&mut tx,position_id,&key.venue,merged.consumed_delta,merged.set_cohort,merged.set_partition.as_ref()).await?;
             }
             if let (Some(generation),Some(version))=(&self.order_projection,version) {
                 // The locked pre-state fingerprint lets the statement verify the
@@ -132,12 +189,74 @@ impl PgVenueLedger {
             committing.store(true,Ordering::Relaxed);
             tx.commit().await.map_err(commit_error)?;
             held.finished=true;
-            Ok(OrderWriteResult {changed:true,anomalies:merged.anomalies})
+            // Built only after a confirmed COMMIT from values already held:
+            // no statement, and never for an unowned or unprojected write.
+            let commit = match (CAPTURE, &self.order_projection, version, merged.order.owner) {
+                (true, Some(generation), Some(accounting_version), owner @ OrderOwner::Leg { .. }) => {
+                    Some(OrderCommit {
+                        key,
+                        owner,
+                        generation: generation.clone(),
+                        executed_cum: merged.order.executed_cum,
+                        accounting_version,
+                    })
+                },
+                _ => None,
+            };
+            Ok((OrderWriteResult { changed: true, anomalies: merged.anomalies }, commit))
         },&committing).await
     }
 
-    /// Optional order and its incoming/already-linked leg in ONE statement.
-    /// Numeric columns stay native NUMERIC/Decimal: no JSON/f64 intermediary.
+    /// The order write's one leg statement. Only a partition first set is
+    /// guarded by `gross_qty IS NULL`; consumed and cohort updates are not.
+    pub(super) async fn update_leg(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        position_id: Uuid,
+        venue: &VenueId,
+        consumed_delta: Decimal,
+        set_cohort: bool,
+        partition: Option<&LegPartition>,
+    ) -> Result<(), LedgerError> {
+        self.statement();
+        let updated = sqlx::query(
+            "UPDATE balance_legs SET consumed_cum=consumed_cum+$1,
+            cohort_month=CASE WHEN $2 THEN COALESCE(cohort_month,decided_month) ELSE cohort_month END,
+            gross_qty=CASE WHEN $6 THEN $7 ELSE gross_qty END,
+            acquisition_cost=CASE WHEN $6 THEN $8 ELSE acquisition_cost END,
+            base_commission=CASE WHEN $6 THEN $9 ELSE base_commission END,
+            executable_qty=CASE WHEN $6 THEN $10 ELSE executable_qty END
+            WHERE position_id=$3 AND tenant_id=$4 AND venue_id=$5 AND (NOT $6 OR gross_qty IS NULL)",
+        )
+        .bind(consumed_delta)
+        .bind(set_cohort)
+        .bind(position_id)
+        .bind(self.tenant_id)
+        .bind(venue.as_str())
+        .bind(partition.is_some())
+        .bind(partition.map(|p| p.gross))
+        .bind(partition.map(|p| p.cost))
+        .bind(partition.map(|p| p.base_fee))
+        .bind(partition.map(|p| p.executable))
+        .execute(&mut **tx)
+        .await
+        .map_err(order_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(LedgerError::Invariant(
+                if partition.is_some() {
+                    "order leg disappeared or its partition is already set"
+                } else {
+                    "order leg disappeared"
+                }
+                .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Optional order, its incoming/already-linked leg and that leg's current
+    /// admission terms in ONE statement. Numeric columns stay native
+    /// NUMERIC/Decimal: no JSON/f64 intermediary.
     pub(super) async fn read_order_context(
         &self,
         connection: &mut PgConnection,
@@ -150,11 +269,16 @@ impl PgVenueLedger {
             "SELECT {ORDER_COLUMNS}, l.position_id AS leg_position_id,l.tenant_id AS leg_tenant_id,
             l.venue_id AS leg_venue_id,l.account_scope AS leg_scope,l.symbol AS leg_symbol,
             l.admission_intent_id AS leg_admission,l.decided_month AS leg_month,
-            l.cohort_month AS leg_cohort,l.consumed_cum AS leg_consumed,l.closed_at AS leg_closed
+            l.cohort_month AS leg_cohort,l.consumed_cum AS leg_consumed,l.closed_at AS leg_closed,
+            l.gross_qty AS leg_gross,l.acquisition_cost AS leg_cost,l.base_commission AS leg_fee,
+            l.base_commission_final AS leg_fee_final,l.executable_qty AS leg_executable,
+            a.taker_bps AS leg_taker_bps,a.lot_step AS leg_lot_step
             FROM (VALUES(1)) AS seed(n)
             LEFT JOIN LATERAL (SELECT * FROM venue_orders WHERE venue_id=$1 AND account_scope=$2
                 AND symbol=$3 AND exchange_order_id=$4{lock}) o ON true
-            LEFT JOIN balance_legs l ON l.position_id=COALESCE($5,o.position_id)"
+            LEFT JOIN balance_legs l ON l.position_id=COALESCE($5,o.position_id)
+            LEFT JOIN balance_leg_admissions a ON a.entry_intent_id=l.admission_intent_id
+                AND a.position_id=l.position_id AND a.superseded_at IS NULL"
         );
         self.statement();
         let row = sqlx::query(&sql)
@@ -425,6 +549,27 @@ fn decode_leg(row: &PgRow, tenant: Uuid) -> Result<Option<OrderLeg>, LedgerError
     if row.try_get::<Uuid, _>("leg_tenant_id").map_err(backend)? != tenant {
         return Err(LedgerError::IdentityConflict);
     }
+    let amount = |column: &str| row.try_get::<Option<Decimal>, _>(column).map_err(backend);
+    let partition = match (
+        amount("leg_gross")?,
+        amount("leg_cost")?,
+        amount("leg_fee")?,
+        amount("leg_executable")?,
+    ) {
+        (Some(gross), Some(cost), Some(base_fee), Some(executable)) => Some(LegPartition {
+            gross,
+            cost,
+            base_fee,
+            base_fee_final: row.try_get("leg_fee_final").map_err(backend)?,
+            executable,
+        }),
+        (None, None, None, None) => None,
+        _ => return Err(LedgerError::Invariant("partial leg partition".into())),
+    };
+    let terms = match (amount("leg_taker_bps")?, amount("leg_lot_step")?) {
+        (Some(taker_bps), Some(lot_step)) => Some(AdmissionTerms { taker_bps, lot_step }),
+        _ => None,
+    };
     Ok(Some(OrderLeg {
         position_id,
         venue: VenueId::new(row.try_get::<String, _>("leg_venue_id").map_err(backend)?),
@@ -435,6 +580,8 @@ fn decode_leg(row: &PgRow, tenant: Uuid) -> Result<Option<OrderLeg>, LedgerError
         cohort_month: row.try_get("leg_cohort").map_err(backend)?,
         consumed_cum: row.try_get("leg_consumed").map_err(backend)?,
         closed_at: row.try_get("leg_closed").map_err(backend)?,
+        partition,
+        terms,
     }))
 }
 

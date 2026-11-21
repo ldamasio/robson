@@ -130,6 +130,10 @@ pub struct Daemon<E: Venue + 'static, S: Store + 'static> {
     /// (ADR-0056 step 7). Held here so nothing reaches it through the manager
     /// lock.
     order_journal: Arc<OrderJournal>,
+    /// The epoch a supervised Spot startup already recorded, taken once by
+    /// the start instead of inserting another. `None` on every other daemon.
+    #[cfg(feature = "postgres")]
+    supervised_epoch: Option<crate::process_epoch::EpochStart>,
     /// Bounds of the two-phase stop.
     stop_timings: StopTimings,
 }
@@ -187,18 +191,32 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     pool: &Option<Arc<sqlx::PgPool>>,
     config: &Config,
 ) -> Executor<E, S> {
+    // The supervised startup owns the Spot backend. Even warm-up of a
+    // legacy pool would authenticate with the wrong login during closure.
+    if venue.id().as_str() == robson_exec::venue::VenueId::BINANCE_SPOT {
+        return executor;
+    }
     let (Some(pool), Some(tenant_id)) = (pool, config.projection.tenant_id) else {
         return executor;
     };
+    let backend = crate::order_journal_store::PgJournalBackend::new(pool, tenant_id);
+    with_order_journal_backend(executor, venue, backend)
+}
+
+/// The executor's journal on `backend`, attached to the venue before it is
+/// shared.
+#[cfg(feature = "postgres")]
+fn with_order_journal_backend<E: Venue + 'static, S: Store + 'static>(
+    executor: Executor<E, S>,
+    venue: &Arc<E>,
+    backend: crate::order_journal_store::PgJournalBackend,
+) -> Executor<E, S> {
     // ADR-0056 step 8: the capability is fixed before the journal is shared,
     // and its backend bounds the same account's transactions.
     let one_attempt = venue.capabilities().one_attempt_per_client_id;
     let balance =
         venue.capabilities().account_kind == robson_exec::venue::AccountKind::BalanceAccount;
-    let backend = Arc::new(
-        crate::order_journal_store::PgJournalBackend::new(pool, tenant_id)
-            .with_balance_account(balance),
-    );
+    let backend = Arc::new(backend.with_balance_account(balance));
     let journal = Arc::new(
         OrderJournal::new(backend, venue.id())
             .with_one_attempt_per_client_id(one_attempt)
@@ -342,6 +360,8 @@ impl Daemon<StubExchange, MemoryStore> {
             last_month_check: initial_month_check(),
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
+            #[cfg(feature = "postgres")]
+            supervised_epoch: None,
             stop_timings: StopTimings::default(),
         }
     }
@@ -421,6 +441,8 @@ impl Daemon<StubExchange, MemoryStore> {
             last_month_check: initial_month_check(),
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
+            #[cfg(feature = "postgres")]
+            supervised_epoch: None,
             stop_timings: StopTimings::default(),
         })
     }
@@ -525,6 +547,8 @@ impl Daemon<StubExchange, MemoryStore> {
             last_month_check: initial_month_check(),
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
+            #[cfg(feature = "postgres")]
+            supervised_epoch: None,
             stop_timings: StopTimings::default(),
         }
     }
@@ -603,6 +627,8 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             last_month_check: initial_month_check(),
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
+            #[cfg(feature = "postgres")]
+            supervised_epoch: None,
             stop_timings: StopTimings::default(),
         }
     }
@@ -617,12 +643,75 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
         projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
         pg_pool: Option<Arc<sqlx::PgPool>>,
     ) -> Self {
+        Self::assemble_with_recovery(
+            config,
+            venue,
+            market_data,
+            ohlcv_port,
+            projection_recovery,
+            pg_pool,
+            None,
+        )
+    }
+
+    /// Build the Spot daemon only from the supervised startup handoff. The
+    /// installed generation and restricted pool both come from that operation.
+    /// Test-only in package 4, like the supervised startup itself: production
+    /// assembles every daemon without a handoff.
+    #[cfg(all(test, feature = "postgres"))]
+    pub(crate) fn with_supervised_spot(
+        config: Config,
+        venue: Arc<E>,
+        market_data: Arc<dyn TradeFeedPort>,
+        ohlcv_port: Arc<dyn OhlcvPort>,
+        ready: crate::spot_order_set_store::spot_startup::SpotReady,
+    ) -> DaemonResult<Self> {
+        let generation = ready.generation();
+        if venue.id().as_str() != robson_exec::venue::VenueId::BINANCE_SPOT
+            || !generation.is_valid()
+            || config.projection.tenant_id != Some(generation.tenant_id)
+            || ready.epoch().epoch.epoch_id != generation.process_epoch
+            || generation.account_scope != robson_exec::order_journal::DEFAULT_ACCOUNT_SCOPE
+        {
+            return Err(DaemonError::Config(
+                "Spot journal authority does not match configured venue, tenant and scope".into(),
+            ));
+        }
+        let pool = Some(Arc::new(ready.writer().clone()));
+        Ok(Self::assemble_with_recovery(
+            config,
+            venue,
+            market_data,
+            ohlcv_port,
+            None,
+            pool,
+            Some(ready),
+        ))
+    }
+
+    #[cfg(feature = "postgres")]
+    fn assemble_with_recovery(
+        config: Config,
+        venue: Arc<E>,
+        market_data: Arc<dyn TradeFeedPort>,
+        ohlcv_port: Arc<dyn OhlcvPort>,
+        projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
+        pg_pool: Option<Arc<sqlx::PgPool>>,
+        ready: Option<crate::spot_order_set_store::spot_startup::SpotReady>,
+    ) -> Self {
         use robson_domain::RiskConfig;
 
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Executor::new(Arc::clone(&venue), journal, store.clone());
-        let executor = Arc::new(with_durable_order_journal(executor, &venue, &pg_pool, &config));
+        let executor = Arc::new(match &ready {
+            Some(ready) => with_order_journal_backend(
+                executor,
+                &venue,
+                crate::order_journal_store::PgJournalBackend::supervised(ready),
+            ),
+            None => with_durable_order_journal(executor, &venue, &pg_pool, &config),
+        });
         let order_journal = gated(&venue, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
 
@@ -692,12 +781,19 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             last_month_check: initial_month_check(),
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
+            #[cfg(feature = "postgres")]
+            supervised_epoch: ready.map(|ready| ready.epoch().clone()),
             stop_timings: StopTimings::default(),
         }
     }
 }
 
 impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
+    #[cfg(all(test, feature = "postgres"))]
+    pub(crate) fn journal_for_startup_witness(&self) -> Arc<OrderJournal> {
+        Arc::clone(&self.order_journal)
+    }
+
     /// Set where older unfinished funding sagas are recovered when the venue
     /// has no funding surface.
     pub fn with_funding_recovery_route(mut self, route: Option<Arc<E>>) -> Self {
@@ -939,6 +1035,12 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     /// epoch, with a strict commit (ADR-0056 step 7). Only the stub starts
     /// without one. The marker a clean stop writes on it.
     async fn prepare_start(&self, journal: &OrderJournal) -> DaemonResult<PreparedStart> {
+        #[cfg(feature = "postgres")]
+        if self.exchange.id().as_str() == robson_exec::venue::VenueId::BINANCE_SPOT
+            && self.supervised_epoch.is_none()
+        {
+            return Err(DaemonError::Config("Spot startup requires a supervised journal".into()));
+        }
         journal
             .check_ready()
             .await
@@ -1232,8 +1334,13 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             refuse_an_epochless_venue(self.exchange.id())?;
             return Ok(PreparedStart { marker: None, clock: None });
         };
-        let start =
-            crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION")).await?;
+        let start = if self.exchange.id().as_str() == robson_exec::venue::VenueId::BINANCE_SPOT {
+            self.supervised_epoch.clone().ok_or_else(|| {
+                DaemonError::Config("Spot startup requires a supervised journal".into())
+            })?
+        } else {
+            crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION")).await?
+        };
         crate::process_epoch::record_start(&start);
         let view = robson_exec::gate::EpochView {
             epoch_seq: start.epoch.epoch_seq,
@@ -2498,6 +2605,141 @@ mod tests {
     use crate::query::{ActorKind, ExecutionQuery, QueryKind};
     #[cfg(feature = "postgres")]
     use crate::query_engine::QueryStateChangedEvent;
+
+    /// A release on `journal` while `order_intents` is locked, given two
+    /// seconds: `None` if it was still waiting for the lock, else its
+    /// refusal text (`Ok` if it went through).
+    #[cfg(feature = "postgres")]
+    async fn release_under_lock(
+        pool: &sqlx::PgPool,
+        journal: &OrderJournal,
+    ) -> Option<Result<(), String>> {
+        use robson_exec::order_journal::{ReleaseRecord, ReleaseRefusal};
+
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE order_intents IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        let record = ReleaseRecord {
+            decision_id: uuid::Uuid::now_v7(),
+            generation: journal.gate().generation(),
+            actor: "operator@example.test".to_string(),
+            auth_kind: "verified",
+            note: "finding-2 lock wait".to_string(),
+            treatment: "unbooked_accepted",
+            decided_at: Utc::now(),
+        };
+        let waited = tokio::time::timeout(Duration::from_secs(2), journal.release(record)).await;
+        held.rollback().await.unwrap();
+        waited.ok().map(|released| {
+            released.map(|_| ()).map_err(|refusal| match refusal {
+                ReleaseRefusal::Backend(reason) => reason,
+                other => format!("{other:?}"),
+            })
+        })
+    }
+
+    /// `venue`'s executor with a plain backend attached as the daemon attaches
+    /// one: whether its journal serves a balance account, then
+    /// [`release_under_lock`] on it.
+    #[cfg(feature = "postgres")]
+    async fn attached_release<E: Venue + 'static>(
+        pool: &sqlx::PgPool,
+        venue: Arc<E>,
+    ) -> (bool, Option<Result<(), String>>, std::time::Duration) {
+        let executor = Executor::new(
+            Arc::clone(&venue),
+            Arc::new(IntentJournal::new()),
+            Arc::new(MemoryStore::new()),
+        );
+        let backend = crate::order_journal_store::PgJournalBackend::new(pool, uuid::Uuid::now_v7());
+        // No readiness check: the release runs on the daemon pool, which is
+        // already connected, and readiness is not what is measured here.
+        let journal = with_order_journal_backend(executor, &venue, backend).order_journal();
+        let started = std::time::Instant::now();
+        let released = release_under_lock(pool, &journal).await;
+        (journal.balance_account(), released, started.elapsed())
+    }
+
+    /// D5 finding 2 through package 4's journal attachment: the daemon bounds
+    /// the auxiliary transactions of whatever backend it attaches to a
+    /// balance venue, from the venue's account kind, and leaves a position
+    /// account's as they were. A release waiting on a lock ends at the server
+    /// bound only for the balance venue.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn the_attached_backend_takes_the_balance_bounds_from_the_venue(pool: sqlx::PgPool) {
+        use robson_exec::venue::AccountKind;
+
+        use crate::capability::worker_venue::WorkerVenue;
+        let venue = |kind| Arc::new(WorkerVenue::new(kind, false));
+        let (balance, released, elapsed) =
+            attached_release(&pool, venue(AccountKind::BalanceAccount)).await;
+        assert!(balance);
+        let error = released
+            .expect("the server bound must end the lock wait")
+            .expect_err("a lock wait past the bound must fail");
+        assert!(error.contains("lock timeout") || error.contains("statement timeout"), "{error}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+
+        let (balance, released, _) =
+            attached_release(&pool, venue(AccountKind::PositionAccount)).await;
+        assert!(!balance);
+        assert!(released.is_none(), "a position account's release is bounded: {released:?}");
+    }
+
+    /// The supervised Spot backend is a bounded balance backend by itself
+    /// (D5 finding 2), not only once the daemon attaches it: an incident
+    /// waiting on a lock ends at the server bound.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn the_supervised_spot_backend_bounds_its_incidents(pool: sqlx::PgPool) {
+        use robson_exec::{
+            gate::{Incident, IncidentReason},
+            order_journal::{JournalBackend as _, DEFAULT_ACCOUNT_SCOPE},
+        };
+
+        use crate::spot_order_set_store::{spot_startup::SpotReady, JournalGeneration};
+        let tenant = uuid::Uuid::now_v7();
+        let start = crate::process_epoch::start_epoch(&pool, tenant, "supervised-bounds")
+            .await
+            .unwrap();
+        let generation = JournalGeneration {
+            tenant_id: tenant,
+            account_scope: DEFAULT_ACCOUNT_SCOPE.to_string(),
+            generation_id: uuid::Uuid::now_v7(),
+            process_epoch: start.epoch.epoch_id,
+            source_audit_id: uuid::Uuid::now_v7(),
+        };
+        let ready = SpotReady::unsupervised_fixture(start, generation, pool.clone());
+        let backend = crate::order_journal_store::PgJournalBackend::supervised(&ready);
+        let incident = Incident {
+            reason: IncidentReason::UncertainOutcome,
+            first_at: Utc::now(),
+            last_at: Utc::now(),
+            count: 1,
+            first_generation: 1,
+            last_generation: 1,
+        };
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE recovery_incidents IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let waited =
+            tokio::time::timeout(Duration::from_secs(2), backend.upsert_incident(&incident)).await;
+        held.rollback().await.unwrap();
+        let failure = waited
+            .expect("the server bound must end the lock wait")
+            .expect_err("a lock wait past the bound must fail");
+        let error = format!("{failure:?}");
+        assert!(error.contains("lock timeout") || error.contains("statement timeout"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]

@@ -70,6 +70,10 @@ pub mod reconciliation_worker;
     reason = "the order-set owner will consume the observed persisted identity"
 )]
 mod spot_order_set_store;
+// Test-only in package 4: it drives the supervised startup, the cold owner's
+// capture and the cold installer, none of which is production code.
+#[cfg(all(test, target_os = "linux", feature = "postgres"))]
+pub mod spot_supervised_preflight;
 mod sse;
 #[cfg(test)]
 mod stack_budget_tests;

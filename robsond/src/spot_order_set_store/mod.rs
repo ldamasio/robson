@@ -13,6 +13,8 @@ mod cold_owner;
 #[cfg(test)]
 pub(crate) mod cold_owner;
 mod cold_source;
+// Production keeps only its SpotReady, which nothing there constructs.
+pub(crate) mod spot_startup;
 pub(crate) mod warm;
 
 /// Private opt-in owner and structural binding for journal maintenance. Only
@@ -176,9 +178,11 @@ pub(crate) struct ObservedGeneration {
     pub(crate) process_epoch: Uuid,
     pub(crate) source_audit_id: Uuid,
     pub(crate) accounting_version: i64,
+    pub(crate) position_hints_complete: bool,
 }
 
-const READ: &str = "SELECT g.generation_id,g.process_epoch,g.source_audit_id,g.accounting_version
+const READ: &str = "SELECT g.generation_id,g.process_epoch,g.source_audit_id,g.accounting_version,
+    g.position_hints_complete
     FROM public.spot_order_set_generation g
     JOIN public.accounting_state a
       ON (a.tenant_id,a.venue_id)=(g.tenant_id,g.venue_id)
@@ -197,7 +201,7 @@ pub(crate) async fn observe_generation(
     if !expected.is_valid() {
         return Ok(None);
     }
-    let row = sqlx::query_as::<_, (Uuid, Uuid, Uuid, i64)>(READ)
+    let row = sqlx::query_as::<_, (Uuid, Uuid, Uuid, i64, bool)>(READ)
         .bind(expected.tenant_id)
         .bind(expected.venue.as_str())
         .bind(expected.account_scope)
@@ -206,14 +210,23 @@ pub(crate) async fn observe_generation(
         .bind(expected.source_audit_id)
         .fetch_optional(connection)
         .await?;
-    Ok(row.map(|(generation_id, process_epoch, source_audit_id, accounting_version)| {
-        ObservedGeneration {
+    Ok(row.map(
+        |(
             generation_id,
             process_epoch,
             source_audit_id,
             accounting_version,
-        }
-    }))
+            position_hints_complete,
+        )| {
+            ObservedGeneration {
+                generation_id,
+                process_epoch,
+                source_audit_id,
+                accounting_version,
+                position_hints_complete,
+            }
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -293,6 +306,7 @@ mod tests {
                     process_epoch: binding.process_epoch,
                     source_audit_id: binding.source_audit_id,
                     accounting_version: version,
+                    position_hints_complete: false,
                 }),
             "persisted exact same-snapshot identity"
         );

@@ -588,7 +588,21 @@ fn strip_n5_references(path: &Path, text: &str) -> String {
         .join("\n")
 }
 
-fn isolated_n5_fixture(
+/// Package 3's order-writer inventory (robsond/tests/venue_ledger_pg.rs,
+/// `order_ledger_has_no_production_callers`) names the physical recovery
+/// fixture once, as data, to prove its declaration test-only: it neither
+/// declares nor includes it, so it is not a second inclusion site. Only that
+/// file, and only so, is not counted as a reference.
+fn names_only_as_data(path: &Path, text: &str, inclusion: &str) -> bool {
+    path.ends_with("robsond/tests/venue_ledger_pg.rs")
+        && text.matches(inclusion).count() == 1
+        && !text.contains(&format!("#[path = {inclusion}]"))
+        && !["include!(", "include_str!(", "include_bytes!("]
+            .iter()
+            .any(|form| text.contains(&format!("{form}{inclusion}")))
+}
+
+fn isolated_test_fixture(
     owner: &str,
     fixture: &str,
     name: &str,
@@ -598,7 +612,7 @@ fn isolated_n5_fixture(
     owner_path: &Path,
 ) -> bool {
     let parent_cfg = cfg.replacen("#![", "#[", 1);
-    let gate = format!("{parent_cfg}#[path = \"{name}\"]\nmod {module};");
+    let gate = format!("{parent_cfg}#[path = \"{name}\"]\n{module};");
     fixture.starts_with(cfg)
         && owner.matches(&gate).count() == 1
         && owner.matches(name).count() == 1
@@ -683,7 +697,15 @@ fn commission_allowance_admits_only_its_named_owner_and_test_gates() {
     let gate = "#[cfg(all(test, feature = \"crash-points\"))]\n#[path = \"commission_tests.rs\"]\nmod tests;";
     let owner = PathBuf::from(paths[1]);
     let check = |gate, fixture, references: &[PathBuf]| {
-        isolated_n5_fixture(gate, fixture, "commission_tests.rs", "tests", cfg, references, &owner)
+        isolated_test_fixture(
+            gate,
+            fixture,
+            "commission_tests.rs",
+            "mod tests",
+            cfg,
+            references,
+            &owner,
+        )
     };
     let only = std::slice::from_ref(&owner);
     assert!(check(gate, cfg, only));
@@ -747,39 +769,83 @@ fn nothing_outside_the_spot_module_names_it() {
         fs::read_to_string(workspace.join("robsond/src/operation_observation_http_tests.rs"))
             .unwrap();
     let fixture_isolated = isolated_observation_fixture(&owner, &fixture, &references);
-    let n5_dir = workspace.join("robsond/src/venue_budget/n5_claim");
-    for (name, owner_name, module, cfg) in [
+    let daemon_dir = workspace.join("robsond/src");
+    let n5_dir = daemon_dir.join("venue_budget/n5_claim");
+    let connector_dir = crate_dir().join("src");
+    let clock_dir = daemon_dir.join("venue_clock_owner");
+    let fixtures = [
         (
-            "commission_tests.rs",
-            "commission.rs",
-            "tests",
+            connector_dir.as_path(),
+            "inventory_loopback.rs",
+            "lib.rs",
+            "pub mod inventory_loopback",
+            "#![cfg(any(test, feature = \"crash-points\"))]\n",
+        ),
+        (
+            clock_dir.as_path(),
+            "c8_account_http.rs",
+            "pg_tests.rs",
+            "mod c8_account_http",
             "#![cfg(all(test, feature = \"crash-points\"))]\n",
         ),
         (
-            "result_tests.rs",
-            "tests.rs",
-            "result_tests",
+            clock_dir.as_path(),
+            "c8_attribution.rs",
+            "pg_tests.rs",
+            "mod c8_attribution",
+            "#![cfg(all(test, feature = \"crash-points\"))]\n",
+        ),
+        (
+            connector_dir.as_path(),
+            "spot_inventory_wire_tests.rs",
+            "binance_rest.rs",
+            "mod spot_inventory_wire_tests",
+            "#![cfg(all(test, any(test, feature = \"crash-points\")))]\n",
+        ),
+        (
+            daemon_dir.as_path(),
+            "order_journal_physical_recovery_pg_tests.rs",
+            "order_journal_projected_pg_tests.rs",
+            "mod physical_recovery",
             "#![cfg(all(test, feature = \"postgres\"))]\n",
         ),
-    ] {
-        let owner_path = n5_dir.join(owner_name);
+        (
+            n5_dir.as_path(),
+            "commission_tests.rs",
+            "commission.rs",
+            "mod tests",
+            "#![cfg(all(test, feature = \"crash-points\"))]\n",
+        ),
+        (
+            n5_dir.as_path(),
+            "result_tests.rs",
+            "tests.rs",
+            "mod result_tests",
+            "#![cfg(all(test, feature = \"postgres\"))]\n",
+        ),
+    ];
+    for (dir, name, owner_name, module, cfg) in fixtures {
+        let owner_path = dir.join(owner_name);
         let owner = fs::read_to_string(&owner_path).unwrap();
-        let fixture = fs::read_to_string(n5_dir.join(name)).unwrap();
+        let fixture = fs::read_to_string(dir.join(name)).unwrap();
         let inclusion = format!("\"{name}\"");
         let references: Vec<_> = outside
             .iter()
-            .filter(|path| fs::read_to_string(path).unwrap().contains(&inclusion))
+            .filter(|path| {
+                let text = fs::read_to_string(path).unwrap();
+                text.contains(&inclusion) && !names_only_as_data(path, &text, &inclusion)
+            })
             .cloned()
             .collect();
         assert!(
-            isolated_n5_fixture(&owner, &fixture, name, module, cfg, &references, &owner_path),
-            "N5 fixture {name} is not uniquely test-gated"
+            isolated_test_fixture(&owner, &fixture, name, module, cfg, &references, &owner_path),
+            "fixture {name} is not uniquely test-gated"
         );
     }
     let names = spot_type_names();
     let mut found = Vec::new();
     for path in &outside {
-        if path == &n5_dir.join("commission_tests.rs") || path == &n5_dir.join("result_tests.rs") {
+        if fixtures.iter().any(|(dir, name, ..)| path == &dir.join(name)) {
             continue;
         }
         if path.ends_with("robsond/src/operation_observation_http_tests.rs") {

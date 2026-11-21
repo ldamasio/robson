@@ -17,6 +17,8 @@ const CONFIRM: &str = include_str!("confirm.sql");
 
 mod cold_load;
 mod commission;
+#[cfg(all(test, feature = "crash-points"))]
+pub(crate) mod rehearsal_c2;
 mod response;
 mod result;
 

@@ -258,11 +258,32 @@ fn expired(step: &Step<'_>) -> Fault {
 }
 
 /// Five executions: BEGIN, settings, venue lock, binding/audit CTE, COMMIT.
+#[cfg(test)]
 pub(super) async fn start(
     pool: &PgPool,
     audit: Uuid,
     envelope: Envelope,
     trace: &Trace,
+) -> Result<Run, Fault> {
+    start_with_initialization(pool, audit, envelope, trace, false).await
+}
+
+#[cfg(test)]
+pub(super) async fn start_existing(
+    pool: &PgPool,
+    audit: Uuid,
+    envelope: Envelope,
+    trace: &Trace,
+) -> Result<Run, Fault> {
+    start_with_initialization(pool, audit, envelope, trace, true).await
+}
+
+async fn start_with_initialization(
+    pool: &PgPool,
+    audit: Uuid,
+    envelope: Envelope,
+    trace: &Trace,
+    require_initialized: bool,
 ) -> Result<Run, Fault> {
     let mut step = Step {
         phase: Phase::Connect,
@@ -294,6 +315,15 @@ pub(super) async fn start(
             || prior == Some(audit)
         {
             return Err(step.fault(BudgetError::Invalid));
+        }
+        if require_initialized {
+            let initialized: String =
+                get(&locked, "initialization_state").map_err(|e| step.fault(e))?;
+            let identity: Option<Uuid> =
+                get(&locked, "initialization_id").map_err(|e| step.fault(e))?;
+            if initialized != "complete" || identity.is_none_or(|id| id.is_nil()) {
+                return Err(step.fault(BudgetError::PrerequisiteRefusal));
+            }
         }
         let next = generation.checked_add(1).ok_or_else(|| step.fault(BudgetError::Invalid))?;
         step.at(Phase::Setup)?;

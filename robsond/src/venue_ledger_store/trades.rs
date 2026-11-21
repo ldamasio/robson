@@ -24,7 +24,8 @@ const FILL_COLUMNS: &str = "f.trade_id AS fill_trade_id,f.exchange_order_id AS f
     f.tenant_id AS fill_tenant_id,f.price AS fill_price,f.qty AS fill_qty,
     f.quote_qty AS fill_quote_qty,f.commission AS fill_commission,
     f.commission_asset AS fill_asset,f.trade_time AS fill_time,f.recorded_at AS fill_recorded_at";
-const TRADE_GENERATION: &str = include_str!("../spot_order_set_store/trade_generation.sql");
+pub(super) const TRADE_GENERATION: &str =
+    include_str!("../spot_order_set_store/trade_generation.sql");
 
 impl PgVenueLedger {
     /// One page, at most 1,000 trades and ten statements, the pre-read already

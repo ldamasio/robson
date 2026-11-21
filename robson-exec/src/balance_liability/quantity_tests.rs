@@ -66,6 +66,17 @@ fn exact_provisional_product_on_lot_boundary_is_not_rounded() {
 }
 
 #[test]
+fn venue_scaled_gross_with_zero_dust_is_exact() {
+    // Q as the venue prints it; B̂ and X export at fewer places, so zero dust
+    // carries Q's scale while B̂ keeps its own.
+    let gross = dec!(0.30000000);
+    let out = initial_quantity(provisional(gross, dec!(0.0010), dec!(0.00001))).unwrap();
+    assert_eq!((out.base_fee(), out.executable()), (dec!(0.0003), dec!(0.2997)));
+    assert_eq!(out.facts().dust(), Decimal::ZERO);
+    assert_conserved(gross, &out);
+}
+
+#[test]
 fn unrepresentable_positive_product_is_refused_not_rounded() {
     // Q*f_L needs scale 30; native Decimal multiplication would round it.
     let gross = Decimal::from_i128_with_scale(100_000_000_000_000_000_001, 20);
