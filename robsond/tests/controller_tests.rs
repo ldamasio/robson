@@ -117,24 +117,65 @@ fn test_pg_runs_exactly_the_isolated_tests_alone() {
     // Phase 3 is skipped only on the explicit switch, and only CI's database
     // step sets it: every other caller of the script still runs the envelopes.
     const SWITCH: &str = "ROBSON_TEST_PG_SKIP_MEASUREMENTS";
-    assert_eq!(script.matches(&format!("\"${{{SWITCH}:-0}}\" == \"1\"")).count(), 1, "{script}");
-    let workflows = root.join(".github/workflows");
-    let mut setters = Vec::new();
-    for entry in fs::read_dir(&workflows).unwrap() {
-        let path = entry.unwrap().path();
-        let text = fs::read_to_string(&path).unwrap();
-        for line in text.lines().filter(|l| l.contains(SWITCH) && !l.trim_start().starts_with('#'))
-        {
-            setters.push((
-                path.file_name().unwrap().to_string_lossy().into_owned(),
-                line.trim().to_string(),
-            ));
+    let gate = format!(
+        "    if [[ \"${{{SWITCH}:-0}}\" == \"1\" ]]; then\n        warn \"Phase 3 skipped \
+         ({SWITCH}=1): ${{ISOLATED_TESTS[*]}} run on the local gate host.\"\n    else\n        \
+         for name in \"${{ISOLATED_TESTS[@]}}\"; do\n"
+    );
+    assert!(script.contains(&gate), "the switch must gate phase 3 only:\n{script}");
+    // Outside comments the switch appears exactly where something may read or
+    // set it: the two gate lines of test-pg.sh and the one setting in CI's
+    // database step. Any other read, assignment or export, in the script, the
+    // other scripts, the justfile or any workflow, fails here.
+    let mut uses = Vec::new();
+    let mut files = vec![root.join("justfile")];
+    let mut dirs = vec![root.join("scripts"), root.join(".github/workflows")];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
         }
     }
+    for path in &files {
+        let name = path.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
+        // Bytecode caches and other binaries cannot set a shell variable.
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        let mut step = String::new();
+        for line in text.lines().map(str::trim) {
+            if let Some(title) = line.strip_prefix("- name:") {
+                step = title.trim().to_string();
+            }
+            if line.contains(SWITCH) && !line.starts_with('#') {
+                let place = if name.ends_with(".yml") {
+                    step.clone()
+                } else {
+                    String::new()
+                };
+                uses.push((name.clone(), place, line.to_string()));
+            }
+        }
+    }
+    uses.sort();
+    let gate_lines: Vec<&str> =
+        gate.lines().map(str::trim).filter(|l| l.contains(SWITCH)).collect();
+    let mut expected = vec![(
+        ".github/workflows/robsond.yml".to_string(),
+        "Run the DATABASE_URL-gated tests".to_string(),
+        format!("{SWITCH}: \"1\""),
+    )];
+    for line in gate_lines {
+        expected.push(("scripts/test-pg.sh".to_string(), String::new(), line.to_string()));
+    }
+    expected.sort();
     assert_eq!(
-        setters,
-        [("robsond.yml".to_string(), format!("{SWITCH}: \"1\""))],
-        "only CI's DATABASE_URL step may skip the measurements"
+        uses, expected,
+        "the switch may be read by phase 3 and set only by CI's database step"
     );
 }
 
