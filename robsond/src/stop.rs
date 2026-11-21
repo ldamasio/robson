@@ -392,7 +392,6 @@ pub(crate) async fn stop_when_asked_with_clock(
     report
 }
 
-#[cfg(feature = "postgres")]
 /// The closing log both stop paths write once the drain ends.
 fn log_closing(draining: Duration) {
     #[cfg(test)]
@@ -400,6 +399,7 @@ fn log_closing(draining: Duration) {
     info!(draining_ms = draining.as_millis(), "Stop: closing");
 }
 
+#[cfg(feature = "postgres")]
 pub(crate) async fn run_stop_with_clock(
     journal: &OrderJournal,
     asked_at: Instant,
