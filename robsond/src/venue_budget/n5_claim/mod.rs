@@ -2,10 +2,14 @@
 //! startup authority nor an unused transport token.
 use std::time::Duration;
 
+#[cfg(test)]
 use chrono::{DateTime, Utc};
-use robson_exec::{clock_records::TICK_MAX, venue_clock::TickCapture};
+use robson_exec::clock_records::TICK_MAX;
+#[cfg(test)]
+use robson_exec::venue_clock::TickCapture;
 use sqlx::{ConnectOptions, Executor, PgConnection, PgPool, Row};
 use tokio::time::{timeout_at, Instant};
+#[cfg(test)]
 use uuid::Uuid;
 
 use super::{bootstrap::issue, completion, BudgetError, Trace};
@@ -22,9 +26,11 @@ mod commission;
 mod response;
 mod result;
 
+#[cfg(test)]
+pub(crate) use robson_exec::balance_costs::native_n5::PriorEligibility;
 pub(crate) use robson_exec::balance_costs::native_n5::{
-    valid_audit_at, valid_identity, ClaimIdentity, ClaimResult, FrequencyKey, PriorClaim,
-    PriorEligibility, DAY_NS, HANDOFF_NS,
+    valid_audit_at, valid_identity, ClaimIdentity, ClaimResult, FrequencyKey, PriorClaim, DAY_NS,
+    HANDOFF_NS,
 };
 
 #[derive(Clone, Debug)]

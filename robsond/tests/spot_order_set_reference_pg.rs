@@ -10,6 +10,10 @@ mod cancel_shadow_tests;
 )]
 #[path = "venue_ledger_orders/fixture.rs"]
 mod fixture;
+#[allow(
+    dead_code,
+    reason = "the frozen reference reader decodes complete rows; this target reads some columns"
+)]
 #[path = "spot_order_set_reference_pg/reader.rs"]
 mod reader;
 #[path = "spot_order_set_reference_pg/sell_projection_tests.rs"]

@@ -53,14 +53,14 @@ pub(super) struct ObservedAnchor {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(super) enum AnchorDefect {
+pub(crate) enum AnchorDefect {
     Epoch,
     AccountingVersion,
     PriorGenerationShape,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(super) enum EdgeDefect {
+pub(crate) enum EdgeDefect {
     Intent(Uuid),
     Order {
         symbol: String,

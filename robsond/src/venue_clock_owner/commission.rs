@@ -207,7 +207,30 @@ impl ClockOwner {
 
 #[cfg(test)]
 mod tests {
-    use super::window_allows;
+    use robson_connectors::{binance::spot::PreparedSpotCommission, BinanceRestError};
+
+    use super::{window_allows, ClockOwner, CommissionPreparation};
+
+    /// Retiring a commission preparation waits for its job and clears the
+    /// slot. An empty slot or a completed job retires cleanly, whatever the
+    /// preparation answered; only a job that panicked reports false.
+    #[tokio::test]
+    async fn retiring_a_commission_preparation_waits_and_clears_its_slot() {
+        let mut empty: Option<CommissionPreparation> = None;
+        assert!(ClockOwner::retire_commission(&mut empty).await);
+        let mut refused: Option<CommissionPreparation> = Some(tokio::task::spawn_blocking(|| {
+            Err(BinanceRestError::Refused("fixture refusal".into()))
+        }));
+        assert!(ClockOwner::retire_commission(&mut refused).await);
+        assert!(refused.is_none());
+        let mut panicked: Option<CommissionPreparation> = Some(tokio::task::spawn_blocking(
+            || -> Result<PreparedSpotCommission, BinanceRestError> {
+                panic!("fixture preparation panicked")
+            },
+        ));
+        assert!(!ClockOwner::retire_commission(&mut panicked).await);
+        assert!(panicked.is_none());
+    }
 
     #[test]
     fn signed_window_edges_are_strict_future_and_inclusive_past() {

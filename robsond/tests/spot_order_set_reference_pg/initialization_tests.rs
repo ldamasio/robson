@@ -30,6 +30,10 @@ use crate::fixture::retired;
 
 #[path = "late_member_tests.rs"]
 mod late_member_tests;
+#[allow(
+    dead_code,
+    reason = "the shared initialization fixture includes the prepared first-cancel bridge's controls"
+)]
 #[path = "initialized_fixture.rs"]
 mod ready;
 
