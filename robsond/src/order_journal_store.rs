@@ -90,6 +90,13 @@ impl PgJournalBackend {
         self
     }
 
+    /// The journal's own pool, so the daemon wiring's proof can read its
+    /// session settings (ADR-0056 step 8).
+    #[doc(hidden)]
+    pub fn session_pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Change how long the startup check may take.
     pub fn with_ready_wait(mut self, ready_wait: Duration) -> Self {
         self.ready_wait = ready_wait;

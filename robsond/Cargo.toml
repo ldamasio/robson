@@ -10,6 +10,9 @@ default = []
 postgres = ["robson-store/postgres", "sqlx"]
 # Test harness only (ADR-0056 step 7): never in a production build.
 crash-points = ["robson-exec/crash-points", "robson-connectors/crash-points"]
+# Test harness only (PLAN r4 §6 C1): the session-bounds calibration, run on
+# demand; never in a production build, so the PostgreSQL tiers skip it.
+calibration = ["postgres"]
 
 [[bin]]
 name = "robsond"

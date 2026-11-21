@@ -75,6 +75,13 @@ impl BudgetBasisAlarm {
         }
     }
 
+    /// The alarm's own pool, so the daemon wiring's proof can read its session
+    /// settings (ADR-0056 step 8).
+    #[doc(hidden)]
+    pub fn session_pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Read the basis on a timer until shutdown, starting immediately.
     pub async fn run(self, shutdown: CancellationToken) {
         let mut interval = tokio::time::interval(self.read_interval);
