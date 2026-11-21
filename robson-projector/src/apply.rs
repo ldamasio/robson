@@ -3,7 +3,7 @@
 //! Routes events to their appropriate projection handlers.
 
 use robson_eventlog::{EventEnvelope, QUERY_STATE_CHANGED_EVENT_TYPE};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use crate::{
     accounting::AccountingStep,
@@ -369,6 +369,21 @@ pub async fn apply_event_to_projections_with(
     }
 
     Ok(())
+}
+
+/// [`apply_event_to_projections_with`] of a `month_boundary_reset` on a
+/// connection its caller owns (ADR-0056 step 8p-2): the same transaction
+/// (`BEGIN`, `accounting`, the write, `COMMIT`), so a caller that drops it
+/// unfinished, at its deadline or with the `COMMIT` unanswered, can retire
+/// that connection raw instead of returning it to a pool. A payload that is
+/// not a reset's is refused (`InvalidPayload`).
+pub async fn apply_month_boundary_reset_on(
+    connection: &mut PgConnection,
+    envelope: &EventEnvelope,
+    accounting: &dyn AccountingStep,
+) -> Result<()> {
+    handlers::monthly_state::handle_month_boundary_reset(connection, envelope, Some(accounting))
+        .await
 }
 
 #[cfg(test)]

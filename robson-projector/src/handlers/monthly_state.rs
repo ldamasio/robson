@@ -19,7 +19,7 @@ use rust_decimal::Decimal;
 use sqlx::{
     postgres::{PgArguments, PgQueryResult},
     query::Query,
-    PgPool, Postgres,
+    Acquire, PgExecutor, PgPool, Postgres,
 };
 use tracing::Instrument as _;
 
@@ -41,21 +41,22 @@ const INHERIT_BUDGET_MODEL: &str = r#"COALESCE(
 /// One `monthly_state` statement: autocommit, as it always was, or on a
 /// balance-account daemon (ADR-0056 step 8l-4) `BEGIN`, the daemon's
 /// accounting step, the statement and `COMMIT`, so the accounting rows are
-/// taken before `monthly_state` and a refused step writes nothing.
-async fn write(
-    pool: &PgPool,
+/// taken before `monthly_state` and a refused step writes nothing. `on` is
+/// the pool, or (8p-2) a connection its caller owns and retires.
+async fn write<'c>(
+    on: impl Acquire<'c, Database = Postgres> + PgExecutor<'c>,
     accounting: Option<&dyn AccountingStep>,
     statement: Query<'_, Postgres, PgArguments>,
 ) -> Result<PgQueryResult> {
     let Some(step) = accounting else {
         return Ok(statement
-            .execute(pool)
+            .execute(on)
             .instrument(
                 tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
             )
             .await?);
     };
-    let mut tx = pool
+    let mut tx = on
         .begin()
         .instrument(
             tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
@@ -78,8 +79,8 @@ async fn write(
     Ok(written)
 }
 
-pub(crate) async fn handle_month_boundary_reset(
-    pool: &PgPool,
+pub(crate) async fn handle_month_boundary_reset<'c>(
+    on: impl Acquire<'c, Database = Postgres> + PgExecutor<'c>,
     envelope: &EventEnvelope,
     accounting: Option<&dyn AccountingStep>,
 ) -> Result<()> {
@@ -121,7 +122,7 @@ pub(crate) async fn handle_month_boundary_reset(
         "#,
     );
     write(
-        pool,
+        on,
         accounting,
         sqlx::query(&statement)
             .bind(year)

@@ -1071,6 +1071,17 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     /// The startup phase, under the startup permit: capital, recovery from the
     /// event log, the stale-active gate, the startup scan and startup recovery.
     async fn start_up(&self, shutdown: &tokio_util::sync::CancellationToken) -> DaemonResult<()> {
+        // ADR-0056 step 8p-2: a balance account first writes the pending rows
+        // of every boundary it crossed, before capital, stream repair, the
+        // store and any recovery (8p PLAN-r3 §6.2). Without them it does not
+        // start.
+        #[cfg(feature = "postgres")]
+        if let Some((pool, accounting)) = self.boundary_owner().await {
+            crate::boundary::write_pending(&pool, &accounting, Utc::now()).await.map_err(
+                |error| DaemonError::MonthBoundaryDeferred { reason: error.to_string() },
+            )?;
+        }
+
         // 0. Initialize capital from exchange (best-effort)
         self.initialize_capital().await;
 
@@ -1406,7 +1417,82 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         Ok(PreparedStart { marker: None })
     }
 
+    /// The pool and accounting context a balance account's boundary is owned
+    /// on: `None` on a position account, which has no context, or without a
+    /// database.
+    #[cfg(feature = "postgres")]
+    async fn boundary_owner(
+        &self,
+    ) -> Option<(Arc<sqlx::PgPool>, crate::balance_accounting::BalanceAccounting)> {
+        let accounting = self.position_manager.read().await.balance_accounting()?;
+        Some((Arc::clone(self.pg_pool.as_ref()?), accounting))
+    }
+
+    /// ADR-0056 step 8p-2: a balance account's boundary poll (8p PLAN-r3
+    /// §6.2). The partitions once per new month, the pending rows, and before
+    /// any certificate 8p's zero reset of a month nobody reset, which resets
+    /// the breaker and is broadcast as the legacy reset is; then both pending
+    /// gauges. A failure at a new month leaves `robsond_month_boundary_pending`
+    /// at 1, as the legacy poll does; the next poll retries.
+    #[cfg(feature = "postgres")]
+    async fn boundary_tick(&self, now: DateTime<Utc>) -> DaemonResult<bool> {
+        let Some((pool, accounting)) = self.boundary_owner().await else {
+            return Ok(false);
+        };
+        let current_month = (now.year(), now.month());
+        let new_month = *self.last_month_check.read().await != current_month;
+        let ticked = async {
+            if new_month {
+                sqlx::query("SELECT create_event_log_partitions(3)").execute(&*pool).await?;
+                sqlx::query("SELECT create_snapshot_partitions(3)").execute(&*pool).await?;
+            }
+            crate::boundary::write_pending(&pool, &accounting, now).await?;
+            let (zero_due, mut landed, owed) =
+                crate::boundary::read_month(&*pool, &accounting, now).await?;
+            if zero_due {
+                let manager = self.position_manager.read().await;
+                let (streams, journal) = (manager.event_streams(), &self.order_journal);
+                if crate::boundary::zero_reset(&pool, &accounting, streams, journal, now).await? {
+                    let _ = manager.circuit_breaker().reset().await;
+                    info!(year = now.year(), month = now.month(), "Month boundary reset at 0");
+                    self.event_bus.send(DaemonEvent::MonthBoundaryProcessed {
+                        year: now.year(),
+                        month: now.month(),
+                        capital_base: Decimal::ZERO,
+                    });
+                    landed = true;
+                }
+            }
+            Ok::<_, crate::boundary::Failure>((landed, owed))
+        };
+        let (landed, owed) = ticked.await.map_err(|error| {
+            if new_month {
+                self.month_boundary_pending.set(1.0);
+            }
+            DaemonError::MonthBoundaryDeferred { reason: error.to_string() }
+        })?;
+        self.month_boundary_pending.set(if landed { 0.0 } else { 1.0 });
+        crate::metrics::BOUNDARY_SNAPSHOT_PENDING
+            .with_label_values(&[accounting.venue.as_str()])
+            .set(if owed { 1.0 } else { 0.0 });
+        *self.last_month_check.write().await = current_month;
+        Ok(new_month)
+    }
+
+    /// Without PostgreSQL a balance account has no boundary to own.
+    #[cfg(not(feature = "postgres"))]
+    async fn boundary_tick(&self, _now: DateTime<Utc>) -> DaemonResult<bool> {
+        Ok(false)
+    }
+
     async fn poll_month_boundary(&self, now: DateTime<Utc>) -> DaemonResult<bool> {
+        // ADR-0056 step 8p-2, R1: a balance account's boundary is 8p's, and
+        // the futures-wallet reset below never runs on one.
+        if self.exchange.capabilities().account_kind
+            == robson_exec::venue::AccountKind::BalanceAccount
+        {
+            return self.boundary_tick(now).await;
+        }
         let current_month = (now.year(), now.month());
         let previous_month = { *self.last_month_check.read().await };
 
@@ -5537,3 +5623,6 @@ mod tests {
 
 #[cfg(test)]
 mod account_worker_tests;
+
+#[cfg(all(test, feature = "postgres"))]
+mod boundary_tests;

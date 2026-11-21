@@ -926,9 +926,9 @@ fn package4_supervised_startup_stays_out_of_production() {
 }
 
 /// Package 5a's owners on a balance daemon, one line each: what 8k-1 B,
-/// 8k-2, 8l-1, 8l-2, 8l-4a, 8l-4b and 8p-1 add to its database paths, and that
-/// each dormant one keeps no production caller. Its one connection owner is
-/// allowed above, with its reason; its one bound site is known above.
+/// 8k-2, 8l-1, 8l-2, 8l-4a, 8l-4b, 8p-1 and 8p-2 add to its database paths,
+/// and that each dormant one keeps no production caller. Its one connection
+/// owner is allowed above, with its reason; its one bound site is known above.
 #[test]
 fn package5a_owners_stay_dormant_or_bounded() {
     let sources = production_sources();
@@ -966,16 +966,21 @@ fn package5a_owners_stay_dormant_or_bounded() {
     ];
     let named: BTreeSet<String> = tables.iter().flat_map(|table| naming(table)).collect();
     assert_eq!(named, only("venue_ledger_store/settlement.sql"));
-    // 8p-1: S8-5's tables are migrations only, with no writer or reader yet
-    // (8p-2..9, 8m).
-    let boundary = [
-        "boundary_snapshots",
+    // 8p-1: S8-5's tables are migrations; 8p-2's boundary owner is the one
+    // production text naming any of them. It inserts the pending snapshot
+    // rows and reads the activation basis 8m will write, on the bounds of
+    // balance_accounting.rs; the other three wait for 8p-5..9.
+    assert_eq!(naming("boundary_snapshots"), only("boundary.rs"));
+    assert_eq!(naming("activation_bases"), only("boundary.rs"));
+    let later = [
         "boundary_reopenings",
         "boundary_snapshot_revisions",
         "boundary_carried_legs",
-        "activation_bases",
     ];
-    assert_eq!(boundary.iter().flat_map(|table| naming(table)).collect::<BTreeSet<_>>(), none);
+    assert_eq!(later.iter().flat_map(|table| naming(table)).collect::<BTreeSet<_>>(), none);
+    let boundary = squeeze(&source("boundary.rs"));
+    assert!(boundary.contains("sqlx::query(BOUNDS)"), "{boundary}");
+    assert!(!boundary.contains("set_config"), "only the ledger's bounds: {boundary}");
     // 8l-2: the barrier runs on its caller's connection, and neither it nor
     // the gate's invalidity marks has a production caller yet (8l-3, 8l-7,
     // 8l-8, 8n).
@@ -1006,5 +1011,35 @@ fn package5a_owners_stay_dormant_or_bounded() {
     assert_eq!(outside("projector_step(", "balance_accounting.rs"), steps);
     assert!(
         daemon.contains("letaccounting=self.position_manager.read().await.balance_accounting();")
+    );
+    // 8p-2's zero reset runs the same step through the projector's
+    // owned-connection entry, on a connection it holds as a LedgerConnection,
+    // so a late or failed apply retires it raw.
+    assert_eq!(naming("apply_month_boundary_reset_on("), only("boundary.rs"));
+    let zero_reset = squeeze(&function(&source("boundary.rs"), "async fn zero_reset("));
+    assert!(
+        zero_reset.contains(
+            "letmutheld=LedgerConnection::new(pool.acquire().await?);letfetch=sqlx::query_as::<_,\
+             EventEnvelope>(ENVELOPE).bind(event_id);letenvelope=fetch.fetch_one(held.connection())\
+             .await?;failed_seq=Some(envelope.seq);apply_month_boundary_reset_on(held.connection(),\
+             &envelope,accounting).await?;held.finished=true;"
+        ),
+        "{zero_reset}"
+    );
+    // 8p-2: the owner's two callers are the daemon's. Its balance-account
+    // poll is routed before the legacy reset (R1), and its startup writes the
+    // pending rows first. No production daemon is a balance account yet: the
+    // factory refuses Spot and a Spot start needs a supervised handoff.
+    assert_eq!(outside("boundary::", "boundary.rs"), only("daemon.rs"));
+    assert!(daemon.contains(
+        "==robson_exec::venue::AccountKind::BalanceAccount{returnself.boundary_tick(now).await;}"
+    ));
+    let start_up = squeeze(&function(&source("daemon.rs"), "async fn start_up("));
+    assert!(
+        start_up.contains(
+            "->DaemonResult<()>{#[cfg(feature=\"postgres\")]ifletSome((pool,accounting))=self.\
+             boundary_owner().await{crate::boundary::write_pending(&pool,&accounting,Utc::now())"
+        ),
+        "{start_up}"
     );
 }

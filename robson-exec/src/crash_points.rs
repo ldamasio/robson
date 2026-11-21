@@ -44,6 +44,9 @@ crash_points! {
     // A startup repair applied a page of a suspended stream and recorded its
     // checkpoint; the next page has not started.
     REPAIR_AFTER_PAGE = "repair_after_page";
+    // A balance account's pending boundary snapshot rows are committed;
+    // nothing after them has run (ADR-0056 step 8p-2).
+    BOUNDARY_AFTER_PENDING = "boundary_after_pending";
 }
 
 /// Crash point to arm.
