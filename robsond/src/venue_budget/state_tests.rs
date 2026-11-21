@@ -133,7 +133,8 @@ proptest! {
         let (mut closing, mut pause, mut charged, mut dropped) = (false, false, false, false);
         let mut waiter = None;
         let mut handoffs = 0u64;
-        let mut c_pending = Some(commission.try_reserve_commission(tick(now), tick(now + 10)).unwrap());
+        let first = || Ok::<_, BudgetError>((tick(now), tick(now + 10)));
+        let mut c_pending = Some(commission.try_reserve_commission(first).unwrap());
         let mut a_pending = Some(account.try_reserve_account(tick(now), tick(now + 10)).unwrap());
         for event in events {
             let refuse = event == 5;

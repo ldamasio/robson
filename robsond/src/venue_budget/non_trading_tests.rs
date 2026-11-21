@@ -48,6 +48,7 @@ fn the_non_trading_budget_has_no_order_path() {
             "start",
             "time_owner",
             "try_reserve_time",
+            "reserve_read_now",
             "try_reserve_read"
         ],
         "{body}"

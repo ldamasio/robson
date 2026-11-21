@@ -51,6 +51,13 @@ impl BudgetTransitions {
             .map_err(error)
     }
 
+    /// The rolling usage at `now`, pending charges included: descriptive,
+    /// for the bucket gauge (PS-5). Like every transition, `now` must not be
+    /// older than the last observed.
+    pub fn usage(&mut self, now: TickCapture) -> Result<UsageFacts, TransitionError> {
+        self.0.usage_at(now).map_err(error)
+    }
+
     pub fn cancel(&mut self, pending: PendingCharge) -> Result<(), TransitionError> {
         self.0.cancel_pending_candidate(pending.0).map(|_| ()).map_err(error)
     }

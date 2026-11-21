@@ -15,11 +15,13 @@ const HANDOFF_LIMIT: Duration = Duration::from_secs(60);
 pub(crate) type CommissionPreparation =
     JoinHandle<Result<PreparedSpotCommission, BinanceRestError>>;
 
+/// A signed request's owner timestamp and the sample and generation it was
+/// taken under: the N5 commission's, and every signed budgeted read's (PS-5).
 pub(crate) struct CommissionSigningTime {
     pub(super) state: Arc<Mutex<ClockState>>,
     generation: u64,
     sample: Uuid,
-    capture: RawClockCapture,
+    pub(super) capture: RawClockCapture,
     timestamp_ms: i64,
 }
 
@@ -75,12 +77,12 @@ impl ClockOwner {
         &self,
         deadline: Instant,
     ) -> Result<PendingCommission, TimeError> {
-        let now = self.clock.capture().map_err(|_| TimeError::Native)?;
-        let remaining =
-            deadline.checked_duration_since(Instant::now()).ok_or(TimeError::Expired)?;
-        self.budget
-            .try_reserve_commission(now, after(now, remaining)?)
-            .map_err(TimeError::Budget)
+        self.budget.try_reserve_commission(|| {
+            let now = self.clock.capture().map_err(|_| TimeError::Native)?;
+            let remaining =
+                deadline.checked_duration_since(Instant::now()).ok_or(TimeError::Expired)?;
+            Ok((now, after(now, remaining)?))
+        })
     }
 
     pub(crate) async fn prepare_commission(
@@ -119,28 +121,7 @@ impl ClockOwner {
     }
 
     pub(crate) fn commission_signing_time(&self) -> Result<CommissionSigningTime, TimeError> {
-        let mut state =
-            self.state.try_lock().map_err(|_| TimeError::Budget(BudgetError::Deferred))?;
-        if state.closing || self.cancel.is_cancelled() {
-            return Err(TimeError::Closing);
-        }
-        let capture = state.capture_native(&self.clock, self.epoch)?;
-        let sample = state.published.as_ref().ok_or(TimeError::Native)?;
-        if sample.arithmetic.fits_capture(&capture) != Ok(true) {
-            return Err(TimeError::Native);
-        }
-        let ms = wall_ns(&capture).ok_or(TimeError::Native)?.div_euclid(MILLIS_NS);
-        let timestamp_ms = i64::try_from(ms).map_err(|_| TimeError::Native)?;
-        if timestamp_ms <= 0 {
-            return Err(TimeError::Native);
-        }
-        Ok(CommissionSigningTime {
-            state: Arc::clone(&self.state),
-            generation: state.generation,
-            sample: sample.id,
-            capture,
-            timestamp_ms,
-        })
+        self.handle().signing_time()
     }
 
     pub(crate) fn poll_commission_first(
@@ -163,6 +144,53 @@ impl ClockOwner {
             || self.admit_signed(&mut state, signed, claim, deadline).map(|(h, _)| h),
             poll,
         )
+    }
+
+    pub(super) fn admit_signed(
+        &self,
+        state: &mut ClockState,
+        signed: &CommissionSigningTime,
+        claim: TickCapture,
+        deadline: Instant,
+    ) -> Result<(TickCapture, RawClockCapture), BudgetError> {
+        self.handle().admit_signed(state, signed, claim, deadline)
+    }
+
+    pub(crate) fn poll_commission_again(
+        &self,
+        poll: impl FnOnce() -> Poll<reqwest::Result<reqwest::Response>>,
+    ) -> Result<Poll<reqwest::Result<reqwest::Response>>, BudgetError> {
+        self.budget.poll_send(&mut None, &self.clock, self.epoch, poll)
+    }
+}
+
+impl ClockHandle {
+    /// The owner timestamp of a signed request (the commission's, every
+    /// signed read's): the published sample of this epoch fits a fresh
+    /// capture, whose wall time, in milliseconds, it is.
+    pub(crate) fn signing_time(&self) -> Result<CommissionSigningTime, TimeError> {
+        let mut state =
+            self.state.try_lock().map_err(|_| TimeError::Budget(BudgetError::Deferred))?;
+        if state.closing || self.cancel.is_cancelled() {
+            return Err(TimeError::Closing);
+        }
+        let capture = state.capture_native(&self.clock, self.epoch)?;
+        let sample = state.published.as_ref().ok_or(TimeError::Native)?;
+        if sample.arithmetic.fits_capture(&capture) != Ok(true) {
+            return Err(TimeError::Native);
+        }
+        let ms = wall_ns(&capture).ok_or(TimeError::Native)?.div_euclid(MILLIS_NS);
+        let timestamp_ms = i64::try_from(ms).map_err(|_| TimeError::Native)?;
+        if timestamp_ms <= 0 {
+            return Err(TimeError::Native);
+        }
+        Ok(CommissionSigningTime {
+            state: Arc::clone(&self.state),
+            generation: state.generation,
+            sample: sample.id,
+            capture,
+            timestamp_ms,
+        })
     }
 
     /// The original signed first-poll clock admission, run by the budget core
@@ -206,13 +234,6 @@ impl ClockOwner {
             return Err(BudgetError::Deferred);
         }
         Ok((h, poll_mark))
-    }
-
-    pub(crate) fn poll_commission_again(
-        &self,
-        poll: impl FnOnce() -> Poll<reqwest::Result<reqwest::Response>>,
-    ) -> Result<Poll<reqwest::Result<reqwest::Response>>, BudgetError> {
-        self.budget.poll_send(&mut None, &self.clock, self.epoch, poll)
     }
 }
 

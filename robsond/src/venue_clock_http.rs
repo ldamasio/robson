@@ -32,6 +32,12 @@ pub(crate) enum TimeError {
     Venue,
 }
 
+impl From<BudgetError> for TimeError {
+    fn from(error: BudgetError) -> Self {
+        Self::Budget(error)
+    }
+}
+
 /// A TIME answer is tens of bytes. A body over this size is refused before it
 /// is accumulated, so a broken or hostile intermediary cannot grow memory, and
 /// decoding then works on at most this many bytes.

@@ -77,7 +77,30 @@ pub(super) fn register() {
     }
     evidence(None);
     LazyLock::force(&BOUND);
+    bucket(Some((0, 0)));
     crate::venue_budget::register_restriction_level();
+}
+
+static BUCKET: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!("robsond_venue_bucket_used", "Rolling limiter bucket usage", &[
+        "bucket", "class"
+    ])
+    .expect("register venue bucket usage")
+});
+
+/// The steady buckets' rolling usage (v16 §10): the minute's weight and the
+/// 10 s orders, refreshed after each TIME cycle (and, with PS-5b, each read).
+pub(super) fn bucket(usage: Option<(u64, u64)>) {
+    set_bucket(&BUCKET, usage);
+}
+
+fn set_bucket(gauge: &IntGaugeVec, usage: Option<(u64, u64)>) {
+    if let Some((weight, orders)) = usage {
+        for (bucket, used) in [("weight_1m", weight), ("orders_10s", orders)] {
+            let used = i64::try_from(used).unwrap_or(i64::MAX);
+            gauge.with_label_values(&[bucket, "steady"]).set(used);
+        }
+    }
 }
 
 pub(super) fn cycle(error: Option<super::TimeError>) {
@@ -96,4 +119,23 @@ pub(super) fn cycle(error: Option<super::TimeError>) {
         Some(TimeError::Storage(_)) => "storage",
     };
     CYCLES.with_label_values(&[label]).inc();
+}
+
+#[cfg(test)]
+mod tests {
+    /// PS-5a: the bucket gauge shows the steady buckets' usage as given and
+    /// keeps its last value when none is given. On a gauge of its own: the
+    /// process's one is reset by every owner another test constructs.
+    #[test]
+    fn the_bucket_gauge_shows_the_steady_usage() {
+        let opts = prometheus::Opts::new("bucket_used_under_test", "test");
+        let gauge = prometheus::IntGaugeVec::new(opts, &["bucket", "class"]).unwrap();
+        let used = |bucket: &str| gauge.with_label_values(&[bucket, "steady"]).get();
+        super::set_bucket(&gauge, Some((26, 0)));
+        assert_eq!((used("weight_1m"), used("orders_10s")), (26, 0));
+        super::set_bucket(&gauge, None);
+        assert_eq!(used("weight_1m"), 26);
+        super::set_bucket(&gauge, Some((u64::MAX, 1)));
+        assert_eq!((used("weight_1m"), used("orders_10s")), (i64::MAX, 1));
+    }
 }

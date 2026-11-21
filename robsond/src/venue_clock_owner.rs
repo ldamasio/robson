@@ -247,9 +247,16 @@ impl ClockOwner {
             self.last_opportunity = Some(admitted);
         }
         let http_deadline = bounded(limit, Instant::now() + Duration::from_secs(10));
+        // `now` under the budget lock (PS-5): readers reserve beside this
+        // cycle. `admitted` stays for the spacing rule and the persistence
+        // bound (the cycle's remaining 60 s), not for the reservation.
+        let clock = &self.clock;
         let pending = self
             .budget
-            .try_reserve_time(admitted, after(admitted, Duration::from_secs(10))?)
+            .reserve_now(1, || {
+                let now = clock.capture().map_err(|_| BudgetError::Invalid)?;
+                Ok((now, after(now, Duration::from_secs(10)).map_err(|_| BudgetError::Invalid)?))
+            })
             .map_err(TimeError::Budget)?;
         if limit.is_some() {
             self.last_on_demand = Some(Instant::now());

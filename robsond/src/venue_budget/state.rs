@@ -127,6 +127,16 @@ impl NonTradingBudget {
         self.0.try_reserve_time(now, deadline)
     }
 
+    /// One closed read at its fixed weight, `now` and its deadline captured
+    /// by `at` under the budget lock (see [`SharedBudget::reserve_now`]).
+    pub(crate) fn reserve_read_now(
+        &self,
+        read: ReadKind,
+        at: impl FnOnce() -> Result<(TickCapture, TickCapture), BudgetError>,
+    ) -> Result<PendingRead, BudgetError> {
+        self.0.reserve_now(read.weight(), at).map(|pending| PendingRead(pending, read))
+    }
+
     /// Non-blocking: a busy budget is `Deferred`, nothing reserved.
     pub(crate) fn try_reserve_read(
         &self,
@@ -217,13 +227,39 @@ impl SharedBudget {
         self.reserve_steady(&mut state, now, deadline, 1)
     }
 
-    pub(crate) fn try_reserve_commission(
+    /// The commission's reservation (weight 20), `now` and its deadline
+    /// captured by `at` once the lock is held, as [`Self::reserve_now`]'s;
+    /// non-blocking: a busy budget is `Deferred`, `at` not called.
+    pub(crate) fn try_reserve_commission<E: From<BudgetError>>(
         &self,
-        now: TickCapture,
-        deadline: TickCapture,
-    ) -> Result<PendingCommission, BudgetError> {
+        at: impl FnOnce() -> Result<(TickCapture, TickCapture), E>,
+    ) -> Result<PendingCommission, E> {
         let mut state = self.0.try_lock().map_err(|_| BudgetError::Deferred)?;
-        self.reserve_steady(&mut state, now, deadline, 20).map(PendingCommission)
+        let (now, deadline) = at()?;
+        Ok(PendingCommission(self.reserve_steady(&mut state, now, deadline, 20)?))
+    }
+
+    /// A steady reservation whose `now` and deadline `at` captures once the
+    /// budget lock is held (PS-5a). The model refuses for good a `now` older
+    /// than the last it observed, and a capture taken before the lock can be
+    /// once readers reserve beside the TIME sampler.
+    pub(crate) fn reserve_now(
+        &self,
+        weight: u32,
+        at: impl FnOnce() -> Result<(TickCapture, TickCapture), BudgetError>,
+    ) -> Result<PendingTime, BudgetError> {
+        let mut state = self.0.lock().map_err(|_| BudgetError::Invalid)?;
+        let (now, deadline) = at()?;
+        self.reserve_steady(&mut state, now, deadline, weight)
+    }
+
+    /// The rolling-minute weight and 10 s orders charged (pending included),
+    /// for the bucket gauge; `now` taken by `at` under the lock, as for a
+    /// reservation. `None` when the budget is busy or the clock fails.
+    pub(crate) fn usage(&self, at: impl FnOnce() -> Option<TickCapture>) -> Option<(u64, u64)> {
+        let mut state = self.0.try_lock().ok()?;
+        let usage = state.model.usage(at()?).ok()?;
+        Some((usage.weight(), usage.short_orders()))
     }
 
     fn reserve_steady(
@@ -451,3 +487,7 @@ mod tests;
 #[cfg(test)]
 #[path = "non_trading_tests.rs"]
 mod non_trading_tests;
+
+#[cfg(test)]
+#[path = "now_ordering_tests.rs"]
+mod now_ordering_tests;

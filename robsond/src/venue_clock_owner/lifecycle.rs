@@ -50,6 +50,7 @@ impl ClockOwner {
                 None => self.run_cycle().await,
             };
             metrics::cycle(result.as_ref().err().copied());
+            metrics::bucket(self.budget.usage(|| self.clock.capture().ok()));
             if let Some(request) = request {
                 request.answer(result);
             }
