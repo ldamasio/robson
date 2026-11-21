@@ -19,9 +19,9 @@ use uuid::Uuid;
 use crate as robsond;
 use crate::{process_epoch, spot_order_set_store::JournalGeneration};
 
-#[allow(dead_code, clippy::duplicate_mod)]
+#[allow(dead_code)]
 #[path = "support.rs"]
-mod support;
+pub(super) mod support;
 use support::{at, page, seen, snapshot, through_proxy, Fixture, SYMBOL};
 
 async fn migrate(pool: &PgPool) -> Result<()> {

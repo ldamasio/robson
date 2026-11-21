@@ -10,15 +10,11 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate as robsond;
+// The trade tests load the shared support module once for both.
+use super::projected_trades::support::{self, at, seen, snapshot, Fixture, SYMBOL};
 use crate::{
     process_epoch, spot_order_set_store::JournalGeneration, venue_ledger_store::PgVenueLedger,
 };
-
-#[allow(dead_code)]
-#[path = "../venue_ledger_trades/support.rs"]
-mod support;
-use support::{at, seen, snapshot, Fixture, SYMBOL};
 
 async fn setup(pool: &PgPool) -> Result<Fixture> {
     let options = pool.connect_options();

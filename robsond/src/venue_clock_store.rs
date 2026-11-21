@@ -266,4 +266,4 @@ mod backend_tests;
 
 #[cfg(test)]
 #[path = "../tests/venue_clock_store_fixture/legacy_pg.rs"]
-mod legacy_pg;
+pub(crate) mod legacy_pg;

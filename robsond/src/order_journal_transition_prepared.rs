@@ -42,13 +42,6 @@ use crate::{order_journal_store::PgJournalBackend, venue_ledger_store::PgVenueLe
 #[path = "../tests/spot_order_set_reference_pg/initialized_fixture.rs"]
 mod ready;
 
-#[allow(
-    clippy::duplicate_mod,
-    reason = "the shared empty-budget fixture is also loaded by another test module"
-)]
-#[path = "../tests/venue_ledger_schema/empty_budget.rs"]
-mod empty_budget;
-
 #[path = "order_journal_transition_r1r3.rs"]
 mod r1r3;
 
@@ -551,7 +544,9 @@ impl ProtectedLeg {
 
 async fn fixture(pool: &PgPool) -> Result<()> {
     migrate_fixture(pool).await?;
-    empty_budget::initialize(pool, seen(0).at).await?;
+    // The one load of the shared empty-budget fixture in this crate.
+    crate::venue_clock_store::legacy_pg::schema_fixture::empty_budget::initialize(pool, seen(0).at)
+        .await?;
     Ok(())
 }
 

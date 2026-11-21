@@ -755,7 +755,12 @@ fn nothing_outside_the_spot_module_names_it() {
             "tests",
             "#![cfg(all(test, feature = \"crash-points\"))]\n",
         ),
-        ("result_tests.rs", "tests.rs", "result_tests", "#![cfg(test)]\n"),
+        (
+            "result_tests.rs",
+            "tests.rs",
+            "result_tests",
+            "#![cfg(all(test, feature = \"postgres\"))]\n",
+        ),
     ] {
         let owner_path = n5_dir.join(owner_name);
         let owner = fs::read_to_string(&owner_path).unwrap();

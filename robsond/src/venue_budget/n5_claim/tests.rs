@@ -669,6 +669,6 @@ async fn postgres_lock_and_statement_timeouts_hard_retire(pool: PgPool) {
     assert_eq!(unchanged_row(&pool).await, previous_row);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 #[path = "result_tests.rs"]
 mod result_tests;

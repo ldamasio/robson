@@ -1,8 +1,4 @@
-#![cfg(test)]
-#![allow(
-    clippy::duplicated_attributes,
-    reason = "the Spot inertness scan requires this file's own gate beside its declaration's"
-)]
+#![cfg(all(test, feature = "postgres"))]
 
 //! Native witnesses for the dormant result sink and its exact persisted
 //! receipt.
