@@ -5232,6 +5232,29 @@ mod tests {
         assert!(rows[0].released_by.is_none());
     }
 
+    /// 5a composition of 8k-1 B and 8l-2 on one `GateState` (PLAN-r4 §9 risk
+    /// 4): a `venue_discrepancy` occurrence moves the invalidity generation
+    /// like every occurrence, and its refused F release moves neither the
+    /// invalidity generation nor the pending evidence.
+    #[tokio::test]
+    async fn a_venue_discrepancy_moves_the_invalidity_marks_and_its_refused_release_does_not() {
+        let (backend, journal) = journal();
+        epoch(&journal, 5);
+        let before = journal.gate().invalidity_marks();
+        journal.gate().record(IncidentReason::VenueDiscrepancy);
+        journal.flush_pending().await;
+        let raised = journal.gate().invalidity_marks();
+        assert_eq!(raised.generation, before.generation + 1);
+        assert_eq!(raised.pending, before.pending);
+
+        let refused = journal.release(release_of(journal.gate().generation())).await;
+        assert_eq!(refused, Err(ReleaseRefusal::AwaitsBalanceRelease));
+        assert!(backend.releases().is_empty());
+        assert_eq!(journal.gate().invalidity_marks(), raised, "a refused release moves nothing");
+        journal.gate().record(IncidentReason::VenueDiscrepancy);
+        assert_eq!(journal.gate().invalidity_marks().generation, raised.generation + 1);
+    }
+
     /// The same release with only `unclean_start` open still releases it and
     /// opens the fence: no other reason waits for the balance release.
     #[tokio::test]
