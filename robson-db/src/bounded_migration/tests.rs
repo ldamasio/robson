@@ -255,3 +255,264 @@ async fn retired_adapter_cannot_be_reused_by_any_migrate_entry() {
     assert!(adapter.revert(&ordinary).await.is_err());
     assert_eq!(adapter.status(), status);
 }
+
+type Preflight = fn(&Migration) -> Result<(), MigrateError>;
+
+/// The S8-4 files (PLAN-r4 §4.2): version, exact bytes, DO delimiter,
+/// preflight and the DDL commands of each, in order.
+const SPOT_ACCOUNTING: [(i64, &str, &str, Preflight, &[&str]); 5] = [
+    (
+        VERSION46,
+        include_str!("../../../migrations/20240101000046_spot_cash_anchors.sql"),
+        "$migration46$",
+        preflight46,
+        &[
+            "CREATE FUNCTION public.cash_anchor_moves_forward()",
+            "CREATE TABLE public.cash_anchors",
+            "CREATE TRIGGER cash_anchors_move_forward",
+            "CREATE TABLE public.cash_checkpoints",
+        ],
+    ),
+    (
+        VERSION47,
+        include_str!("../../../migrations/20240101000047_spot_cash_discrepancies.sql"),
+        "$migration47$",
+        preflight47,
+        &[
+            "CREATE FUNCTION public.cash_discrepancy_moves_forward()",
+            "CREATE TABLE public.cash_discrepancies",
+            "CREATE TRIGGER cash_discrepancies_move_forward",
+            "CREATE UNIQUE INDEX idx_cash_discrepancies_open",
+        ],
+    ),
+    (
+        VERSION48,
+        include_str!("../../../migrations/20240101000048_spot_cash_reanchors.sql"),
+        "$migration48$",
+        preflight48,
+        &[
+            "CREATE TABLE public.cash_sightings",
+            "CREATE TRIGGER cash_sightings_are_immutable",
+            "CREATE TABLE public.cash_reanchors",
+            "CREATE TRIGGER cash_reanchors_are_immutable",
+        ],
+    ),
+    (
+        VERSION49,
+        include_str!("../../../migrations/20240101000049_spot_cash_flows_dust.sql"),
+        "$migration49$",
+        preflight49,
+        &[
+            "CREATE TABLE public.cash_attested_flows",
+            "CREATE TRIGGER cash_attested_flows_are_immutable",
+            "CREATE TABLE public.dust_ledger",
+            "CREATE TRIGGER dust_ledger_is_immutable",
+        ],
+    ),
+    (
+        VERSION50,
+        include_str!("../../../migrations/20240101000050_spot_accounting_invalidations.sql"),
+        "$migration50$",
+        preflight50,
+        &[
+            "CREATE TABLE public.accounting_invalidations",
+            "CREATE TRIGGER accounting_invalidations_are_immutable",
+        ],
+    ),
+];
+
+fn spot_accounting_contract(version: i64) -> &'static Migration {
+    match version {
+        VERSION46 => contract46(),
+        VERSION47 => contract47(),
+        VERSION48 => contract48(),
+        VERSION49 => contract49(),
+        VERSION50 => contract50(),
+        _ => None,
+    }
+    .expect("embedded S8-4 contract")
+}
+
+#[test]
+fn embedded46_to_50_identity_and_canonical_do_shape() {
+    for (version, file, delimiter, preflight, _) in SPOT_ACCOUNTING {
+        let contract = spot_accounting_contract(version);
+        assert_eq!(contract.version, version);
+        assert_eq!(contract.sql.as_ref(), file);
+        assert!(!contract.no_tx && contract.migration_type == MigrationType::Simple);
+        assert!(matches_embedded(&contract.clone(), contract));
+        assert!(preflight(contract).is_ok());
+
+        let mut changed = vec![contract.clone(); 6];
+        changed[0].version += 1;
+        changed[1].description = "other".into();
+        changed[2].sql = "SELECT 1".into();
+        changed[3].checksum.to_mut()[0] ^= 1;
+        changed[4].migration_type = MigrationType::ReversibleUp;
+        changed[5].no_tx = true;
+        assert!(changed.iter().all(|candidate| !matches_embedded(candidate, contract)));
+        assert!(preflight(&changed[4]).is_err());
+        assert!(preflight(&changed[5]).is_err());
+
+        for sql in [
+            format!("DO {delimiter}\nBEGIN NULL; END;\n{delimiter}"),
+            format!("-- header\nDO {delimiter}\nBEGIN NULL; END;\n{delimiter};"),
+            format!("DO {delimiter}\nBEGIN NULL; END;\n{delimiter}; SELECT 1;"),
+            format!(
+                "DO {delimiter}\nBEGIN NULL; END;\n{delimiter}; DO {delimiter}\nBEGIN NULL; END;\n{delimiter};"
+            ),
+            "DO $migration45$\nBEGIN NULL; END;\n$migration45$;".to_owned(),
+        ] {
+            let mut invalid = contract.clone();
+            invalid.sql = sql.clone().into();
+            assert!(preflight(&invalid).is_err(), "accepted {sql}");
+        }
+        for (other, ..) in SPOT_ACCOUNTING {
+            if other != version {
+                let foreign = spot_accounting_contract(other);
+                let mut renumbered = foreign.clone();
+                renumbered.version = version;
+                assert!(!matches_embedded(&renumbered, contract), "{other} as {version}");
+                assert!(preflight(foreign).is_err(), "{version} accepted {other}'s DO");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_identical_46_to_50_are_refused_before_any_connection_use() {
+    // No connection at all: a refusal must come from the contract check, an
+    // identical source reaches the owned apply and finds the connection gone.
+    let mut adapter = BoundedMigration {
+        connection: None,
+        status: Status { phase: Phase::Preflight, failure: None },
+        contract: None,
+        gate: Default::default(),
+    };
+    for (version, ..) in SPOT_ACCOUNTING {
+        let contract = spot_accounting_contract(version);
+        let expected = format!("migration{} contract mismatch", version % 100);
+        let mut checksum = contract.clone();
+        checksum.checksum.to_mut()[0] ^= 1;
+        let mut sql = contract.clone();
+        sql.sql = "SELECT 1".into();
+        let mut no_tx = contract.clone();
+        no_tx.no_tx = true;
+        let mut description = contract.clone();
+        description.description = "other".into();
+        for wrong in [checksum, sql, no_tx, description] {
+            let error = adapter.apply(&wrong).await.expect_err("non-identical source applied");
+            assert!(
+                matches!(&error, MigrateError::Source(source) if source.to_string() == expected),
+                "{version}: {error}"
+            );
+        }
+        let identical = adapter.apply(contract).await.expect_err("no connection");
+        assert!(matches!(
+            &identical,
+            MigrateError::Source(source) if source.to_string() == "migration connection is retired"
+        ));
+        assert_eq!(adapter.status(), Status { phase: Phase::Preflight, failure: None });
+    }
+}
+
+/// Top-level statements of a canonical DO body between its `BEGIN` and final
+/// `END;`, read past comments, string literals and nested dollar quotes.
+fn do_body_statements(sql: &str, delimiter: &str) -> Vec<String> {
+    let body = sql
+        .trim_end()
+        .strip_prefix(&format!("DO {delimiter}\n"))
+        .and_then(|sql| sql.strip_suffix(&format!("\n{delimiter};")))
+        .expect("canonical DO wrapper");
+    let body = body
+        .trim()
+        .strip_prefix("BEGIN")
+        .and_then(|body| body.strip_suffix("END;"))
+        .expect("one BEGIN ... END; block");
+    let chars: Vec<char> = body.chars().collect();
+    let (mut statements, mut current, mut i) = (Vec::new(), String::new(), 0);
+    while i < chars.len() {
+        match chars[i] {
+            '-' if chars.get(i + 1) == Some(&'-') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            },
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                let rest: String = chars[i..].iter().collect();
+                let end = rest.find("*/").expect("closed block comment");
+                i += rest[..end + 2].chars().count();
+            },
+            '\'' => {
+                let mut j = i + 1;
+                loop {
+                    assert!(j < chars.len(), "unclosed string literal");
+                    if chars[j] == '\'' && chars.get(j + 1) == Some(&'\'') {
+                        j += 2;
+                    } else if chars[j] == '\'' {
+                        break;
+                    } else {
+                        j += 1;
+                    }
+                }
+                current.extend(&chars[i..=j]);
+                i = j + 1;
+            },
+            '$' if !chars.get(i + 1).is_some_and(char::is_ascii_digit) => {
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                assert_eq!(chars.get(j), Some(&'$'), "dollar sign outside a quote tag");
+                let tag: String = chars[i..=j].iter().collect();
+                let after: String = chars[j + 1..].iter().collect();
+                let end = after.find(&tag).expect("closed dollar quote");
+                let quoted = tag.chars().count() * 2 + after[..end].chars().count();
+                current.extend(&chars[i..i + quoted]);
+                i += quoted;
+            },
+            ';' => {
+                statements.push(current.split_whitespace().collect::<Vec<_>>().join(" "));
+                current.clear();
+                i += 1;
+            },
+            c => {
+                current.push(c);
+                i += 1;
+            },
+        }
+    }
+    assert!(current.trim().is_empty(), "text after the last statement: {current:?}");
+    statements
+}
+
+#[test]
+fn spot_accounting_dos_have_at_most_four_ddl() {
+    // Main's statement bound is 1 s for the whole DO and the measured
+    // production p90 is 152 ms per DDL command, so each S8-4 DO stays at
+    // four DDL commands at most, constraints inline (PLAN-r4 §4.2).
+    for (version, file, delimiter, _, inventory) in SPOT_ACCOUNTING {
+        let statements = do_body_statements(file, delimiter);
+        assert!(statements.len() <= 4, "{version} has {} DDL commands", statements.len());
+        let ddl: Vec<String> = statements
+            .iter()
+            .map(|statement| {
+                let words: Vec<&str> = statement.split_whitespace().collect();
+                let len = if words.get(1) == Some(&"UNIQUE") {
+                    4
+                } else {
+                    3
+                };
+                words[..len.min(words.len())].join(" ")
+            })
+            .collect();
+        assert_eq!(ddl, inventory.to_vec(), "{version} is not its PLAN-r4 §4.2 DDL inventory");
+        assert!(statements.iter().all(|statement| statement.starts_with("CREATE ")));
+    }
+    // The reader itself: a nested body's semicolons, quoted ones and
+    // comments are not commands.
+    let witness = "DO $m$\nBEGIN\n    -- a; b;\n    CREATE TABLE t (c TEXT CHECK (c <> ';'));\n    \
+                   CREATE FUNCTION f() RETURNS INT LANGUAGE plpgsql AS $f$ BEGIN RETURN 1; END; $f$;\n    \
+                   /* x; */ CREATE INDEX i ON t (c);\nEND;\n$m$;";
+    assert_eq!(do_body_statements(witness, "$m$").len(), 3);
+}

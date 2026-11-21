@@ -313,3 +313,68 @@ transaction has finished.
 SELECT version, success, execution_time
 FROM _sqlx_migrations WHERE version = 20240101000039;
 ```
+
+## Migrations 46 to 50: Spot accounting schema through the bounded adapter
+
+Migrations 46 to 50 are the S8-4 Spot accounting schema (ADR-0056 step 8l-1).
+Each file is one `DO` block of at most four DDL commands that creates new,
+empty tables; no existing table or row changes and nothing writes the new
+tables yet:
+
+| Version | File | Creates |
+|---|---|---|
+| `20240101000046` | `20240101000046_spot_cash_anchors.sql` | `cash_anchors` and its move-forward trigger; `cash_checkpoints` |
+| `20240101000047` | `20240101000047_spot_cash_discrepancies.sql` | `cash_discrepancies`, its move-forward trigger and the one-open-per-venue index |
+| `20240101000048` | `20240101000048_spot_cash_reanchors.sql` | `cash_sightings`, `cash_reanchors` (with its `mode`: `attested` or `recovery`), both immutable |
+| `20240101000049` | `20240101000049_spot_cash_flows_dust.sql` | `cash_attested_flows`, `dust_ledger`, both immutable |
+| `20240101000050` | `20240101000050_spot_accounting_invalidations.sql` | `accounting_invalidations`, immutable |
+
+Their foreign keys take `SHARE ROW EXCLUSIVE` locks on the referenced tables:
+`accounting_state`, `clock_samples` and `balance_legs`, and the earlier new
+tables. Each apply waits behind any open transaction that wrote one of them
+and, while it holds them, briefly blocks their writers. In production these
+tables are expected to be unwritten while Spot is refused by the production
+factory; a transaction that holds one makes the apply fail with `55P03`
+instead of waiting.
+
+The adapter applies each file like 40, in 7 operations on its dedicated raw
+connection: settings install, SQLx's own unmodified apply (BEGIN, the `DO`
+statement, the `_sqlx_migrations` INSERT, COMMIT, the `execution_time`
+UPDATE), and the settings restore, under the same statement, lock and
+idle-in-transaction timeouts, whole-apply bound and connection and
+advisory-lock bounds as 39. A lock wait longer than the lock timeout fails
+with `55P03` and fails the `robsond-db-migrate` hook. Only the exact embedded
+file of each version is applied; any other source of one of these versions
+is refused before any SQL (`migration46 contract mismatch` to `migration50
+contract mismatch`). SQLx applies them strictly in version order, after 45.
+
+### Rollback boundary
+
+Record the deployed image digest before the merge that carries 46 to 50.
+**Once one of them is applied, an image without it is not a deploy rollback
+target**: its `robsond db migrate` rejects the first applied version missing
+from its embedded set (`VersionMissing(20240101000046)` for an image that
+ends at 45, up to `VersionMissing(20240101000050)` for one that ends at 49),
+before any apply; the hook fails and the sync stops. The earliest compatible
+rollback artifact is the first image that embeds every migration already
+applied, which after package 5 includes its later files too. There is no down
+migration; a correction is a new numbered migration. A daemon of an older
+image that is already running is unaffected: it names none of these tables,
+and their triggers only guard the new tables.
+
+### Failure outcomes
+
+Those of migration 39 above, applied to each version. A `55P03` lock timeout
+or a lost answer is reported as `MayHaveCommitted`: wait for the failed
+backend to be gone, rerun `robsond db migrate` after the conflicting
+transaction on the locked table has finished, and confirm every version with
+the query below. After a successful rerun all five rows are present with
+`success = true`; an `execution_time` of `-1` only means the post-commit
+UPDATE did not land, and SQLx treats that version as applied.
+
+```sql
+SELECT version, success, execution_time
+FROM _sqlx_migrations
+WHERE version BETWEEN 20240101000046 AND 20240101000050
+ORDER BY version;
+```

@@ -181,8 +181,13 @@ async fn migration41_expanded_keys_and_late_hint_page_follow_native_index(
         }
         Ok::<_, anyhow::Error>(())
     };
+    // The production inventory frozen at 45: migrations 46 to 50 take
+    // SHARE ROW EXCLUSIVE on accounting_state for their foreign keys, so they
+    // cannot run beside this ROW EXCLUSIVE witness (migration46.rs runs them
+    // through the official runner).
+    let through45 = through(VERSION45);
     let (run, evidence) = tokio::join!(
-        crate::MIGRATOR.run_direct(&mut f.adapter),
+        through45.run_direct(&mut f.adapter),
         timeout(Duration::from_millis(1150), assert_stage),
     );
     run?;
