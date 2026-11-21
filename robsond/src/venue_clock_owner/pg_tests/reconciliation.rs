@@ -282,10 +282,18 @@ impl ReconciliationRig {
 
     /// A gate on this epoch and its bound pending-execution owner.
     pub(crate) fn gate(&self) -> anyhow::Result<(OrderJournal, PendingExecutionOwner)> {
-        let journal = OrderJournal::new(
+        self.journal(OrderJournal::new(
             Arc::new(StubJournalBackend::default()),
             &VenueId::new(VenueId::BINANCE_SPOT),
-        );
+        ))
+    }
+
+    /// `journal` begun on this epoch, as a start seeds it, and its bound
+    /// pending-execution owner.
+    pub(crate) fn journal(
+        &self,
+        journal: OrderJournal,
+    ) -> anyhow::Result<(OrderJournal, PendingExecutionOwner)> {
         journal.gate().begin_epoch(
             EpochView {
                 epoch_seq: self.start.epoch.epoch_seq,

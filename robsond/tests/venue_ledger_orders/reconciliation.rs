@@ -7,11 +7,13 @@ use std::{sync::Arc, time::Duration};
 use anyhow::anyhow;
 use robson_connectors::inventory_loopback::LOOPBACK_UID;
 use robson_exec::{
+    cancel::CancelClass,
     clock_records::RawClockCapture,
-    gate::{IncidentReason, PendingExecutionOwner, PendingExecutionRegistration},
+    gate::{Incident, IncidentReason, PendingExecutionOwner, PendingExecutionRegistration},
     order_journal::{
-        BalanceBatch, IntentKind, IntentRow, JournalBackend, JournalBatch, OrderJournal,
-        OutcomeRow, VenueOutcome,
+        AdmissionRow, BalanceBatch, CommitFailure, IntentKind, IntentRow, IntentSpec,
+        JournalBackend, JournalBatch, OrderJournal, OutcomeRow, ReleaseRecord, ReleaseRefusal,
+        SendRefusal, VenueOutcome, WriteClass, DEFAULT_ACCOUNT_SCOPE,
     },
     ports::TradeFill,
     venue::{ProtectionKind, TradePage, VenueId},
@@ -28,6 +30,7 @@ use crate::{
         consequence, AttemptOutcome, BaseVerdict, Consequence, DetectorScope, Finding,
         IncompleteReason, ObservationInterval, ScanCost, UnqualifiedReason,
     },
+    metrics::{observe_fence, ADMISSION_FENCE_CLOSED, RECOVERY_INCIDENTS_OPEN},
     order_journal_store::PgJournalBackend,
     spot_order_set_store::ExpectedGeneration,
     venue_clock_owner::{AccountSeen, Hook, Listener, ReconciliationRig, ScanInputs, Scanned},
@@ -363,26 +366,31 @@ struct Ctx {
     options: PgConnectOptions,
     venue: VenueId,
     uid: String,
-    journal: OrderJournal,
+    journal: Arc<OrderJournal>,
     pending: PendingExecutionOwner,
 }
 
 impl Ctx {
     async fn new(pool: &PgPool, rig: &ReconciliationRig) -> Result<Self> {
+        Self::on(pool, rig.gate()?).await
+    }
+
+    /// The same over a journal begun on the rig's epoch.
+    async fn on(pool: &PgPool, begun: (OrderJournal, PendingExecutionOwner)) -> Result<Self> {
+        let (journal, pending) = begun;
         let (proxy, proxied) = through_proxy(pool, 2).await;
         let options = proxied.connect_options().as_ref().clone().options([
             ("default_transaction_read_only", "on"),
             ("lock_timeout", "300ms"),
             ("statement_timeout", "1s"),
         ]);
-        let (journal, pending) = rig.gate()?;
         Ok(Self {
             proxy,
             proxied,
             options,
             venue: VenueId::new(VenueId::BINANCE_SPOT),
             uid: LOOPBACK_UID.to_string(),
-            journal,
+            journal: Arc::new(journal),
             pending,
         })
     }
@@ -1098,5 +1106,385 @@ async fn restart_case(
         wall(&account.send),
         recomputed.start_ns
     );
+    Ok(())
+}
+
+/// 8k-1 B (PLAN-B-r3 §3): BTC locked by another pair's order, which the
+/// scoped OPEN_ORDERS no longer shows, records `venue_discrepancy` through
+/// `apply` on a journal persisted to this database: the admission fence
+/// closes, with the error log and both gauges at 1; a second scan keeps it, a
+/// Clean scan clears nothing; an entry is refused at its send while a
+/// protective cancel passes; the F release is refused (R2); and the restart is
+/// fenced before any scan. The alert rules that page from the log and gauges
+/// live outside this repository and are not proved here.
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn btc_foreign_lock_fences_entries(pool: PgPool) -> Result<()> {
+    setup_tables(&pool).await?;
+    let tenant = Uuid::now_v7();
+    let mut rig = ReconciliationRig::open(&pool, tenant).await?;
+    let first = Box::pin(foreign_lock_cases(&pool, tenant, &mut rig)).await;
+    let closed = rig.close().await;
+    first?;
+    let reopen = closed?;
+    // The restart: a new epoch, owner and journal; nothing of the closed rig.
+    let fresh = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await?;
+    let rig = ReconciliationRig::reopen(&fresh, tenant, reopen).await?;
+    let restarted = foreign_lock_restart(&fresh, tenant, &rig).await;
+    let closed = rig.close().await;
+    fresh.close().await;
+    restarted?;
+    closed?;
+    Ok(())
+}
+
+/// A journal on this database for the tenant, in the Spot balance mode.
+fn durable_journal(pool: &PgPool, tenant: Uuid) -> OrderJournal {
+    OrderJournal::new(
+        Arc::new(PgJournalBackend::new(pool, tenant)),
+        &VenueId::new(VenueId::BINANCE_SPOT),
+    )
+    .with_balance_account(true)
+}
+
+fn release_of(generation: i64) -> ReleaseRecord {
+    ReleaseRecord {
+        decision_id: Uuid::now_v7(),
+        generation,
+        actor: "fixture-operator".into(),
+        auth_kind: "verified",
+        note: "8k-1 B rehearsal".into(),
+        treatment: "unbooked_accepted",
+        decided_at: chrono::Utc::now(),
+    }
+}
+
+/// Open incidents on record, by reason, with their counts.
+async fn open_rows(pool: &PgPool, tenant: Uuid) -> Result<Vec<(String, i64)>> {
+    Ok(sqlx::query_as(
+        "SELECT reason, count FROM recovery_incidents
+         WHERE tenant_id = $1 AND released_at IS NULL ORDER BY reason",
+    )
+    .bind(tenant)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// The fence and incident gauges of `venue_discrepancy`, as exported.
+fn discrepancy_gauges(journal: &OrderJournal) -> (i64, i64) {
+    observe_fence(journal);
+    let label = [IncidentReason::VenueDiscrepancy.as_str()];
+    (
+        ADMISSION_FENCE_CLOSED.with_label_values(&label).get(),
+        RECOVERY_INCIDENTS_OPEN.with_label_values(&label).get(),
+    )
+}
+
+/// Logged events, by level and `reason` field.
+type Events = Vec<(tracing::Level, Option<String>)>;
+
+/// Every event `work` logs.
+fn logged<T>(work: impl FnOnce() -> T) -> (T, Events) {
+    use std::sync::Mutex;
+
+    use tracing::{field::Field, Event, Subscriber};
+    use tracing_subscriber::layer::{Context as LayerContext, Layer, SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Events>>);
+
+    struct Reason(Option<String>);
+
+    impl tracing::field::Visit for Reason {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "reason" {
+                self.0 = Some(value.to_owned());
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "reason" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for Capture {
+        fn on_event(&self, event: &Event<'_>, _ctx: LayerContext<'_, S>) {
+            let mut reason = Reason(None);
+            event.record(&mut reason);
+            if let Ok(mut seen) = self.0.lock() {
+                seen.push((*event.metadata().level(), reason.0));
+            }
+        }
+    }
+
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::LevelFilter::TRACE)
+        .with(capture.clone());
+    let output = tracing::subscriber::with_default(subscriber, || {
+        // Callsite interest is cached process-wide; rebuild it with this
+        // capture in place (as `query_engine.rs` does).
+        tracing::callsite::rebuild_interest_cache();
+        work()
+    });
+    let seen = capture.0.lock().map(|seen| seen.clone()).unwrap_or_default();
+    (output, seen)
+}
+
+async fn foreign_lock_cases(
+    pool: &PgPool,
+    tenant: Uuid,
+    rig: &mut ReconciliationRig,
+) -> Result<()> {
+    use tracing::Level;
+
+    use crate::balance_reconciliation::apply;
+
+    let mut seen = Seen(0);
+    let (a, a_stop) = protected(pool, tenant, &mut seen).await?;
+
+    // Negative control on the backend alone: before 8h's cut the legacy
+    // reason CHECK refuses the reason, and nothing lands.
+    let now = chrono::Utc::now();
+    let probe = Incident {
+        reason: IncidentReason::VenueDiscrepancy,
+        first_at: now,
+        last_at: now,
+        count: 1,
+        first_generation: 1,
+        last_generation: 1,
+    };
+    let refused = PgJournalBackend::new(pool, tenant).upsert_incident(&probe).await;
+    ensure!(
+        matches!(&refused, Err(CommitFailure::Known(error))
+            if error.contains("recovery_incidents_reason_check")),
+        "the legacy reason CHECK must refuse it: {refused:?}"
+    );
+    ensure!(open_rows(pool, tenant)
+        .await?
+        .iter()
+        .all(|(reason, _)| reason != "venue_discrepancy"));
+    // The same cut 8h's 2b phase makes, in this test database only: v38 is
+    // validated over the fixture's rows, then the legacy CHECK dropped.
+    sqlx::query(
+        "ALTER TABLE public.recovery_incidents VALIDATE CONSTRAINT recovery_incidents_reason_v38",
+    )
+    .execute(pool)
+    .await?;
+    crate::venue_budget::n5_claim::rehearsal_c2::cut_legacy_reason(pool).await?;
+
+    rig.ready().await?;
+    let ctx = Ctx::on(pool, rig.journal(durable_journal(pool, tenant))?).await?;
+    let journal = &ctx.journal;
+    let gate = journal.gate();
+    // Baseline: the rig's first start is unclean; release that, and the fence
+    // is open with no discrepancy anywhere.
+    ensure!(gate.fenced(), "an unclean first start is fenced");
+    let opened = journal
+        .release(release_of(gate.generation()))
+        .await
+        .map_err(|e| anyhow!("baseline release: {e}"))?;
+    ensure!(opened.fence_open && !gate.fenced() && gate.open_incidents().is_empty());
+    ensure!(open_rows(pool, tenant).await?.is_empty(), "baseline: nothing open on record");
+    ensure!(discrepancy_gauges(journal) == (0, 0), "baseline gauges");
+
+    let b = install(pool, &a, rig.start.epoch.epoch_id, false).await?;
+    let robson = listed(&a_stop, STOP, Decimal::ZERO);
+    let foreign_lock = || {
+        [triple(
+            btc(dec!(0), dec!(1)),
+            std::slice::from_ref(&robson),
+            &[list("ETHBTC", 5, "foreign-oco", 77)],
+        )]
+    };
+    let locked = [Finding::LockedForeign { locked: dec!(1), robson: dec!(0.999) }];
+
+    // Scan A opens the incident: fenced, one ERROR, one row of count 1.
+    let scan_a = scan(rig, &ctx.inputs(&b), 1, &foreign_lock(), None).await?;
+    findings("B-A", &scan_a, &locked)?;
+    let (recorded, events) = logged(|| apply(&scan_a.verdict, gate));
+    let recorded = recorded.context("B-A: a fence-and-page finding records")?;
+    ensure!(
+        recorded.opened && recorded.reason.as_str() == "venue_discrepancy",
+        "B-A: {recorded:?}"
+    );
+    ensure!(
+        events == [(Level::ERROR, Some("venue_discrepancy".to_owned()))],
+        "B-A: one ERROR naming the reason: {events:?}"
+    );
+    ensure!(gate.fenced() && !journal.latch_set(), "B-A: fenced, not latched");
+    journal.flush_pending().await;
+    let mut rows = vec![("venue_discrepancy".to_owned(), 1_i64)];
+    ensure!(open_rows(pool, tenant).await? == rows, "B-A: one row of count 1");
+    ensure!(discrepancy_gauges(journal) == (1, 1), "B-A: both gauges at 1");
+    let rendered = crate::metrics::render();
+    for metric in [
+        "robsond_admission_fence_closed",
+        "robsond_recovery_incidents_open",
+    ] {
+        ensure!(
+            rendered.contains(&format!("{metric}{{reason=\"venue_discrepancy\"}} 1")),
+            "B-A: {metric} exported at 1"
+        );
+    }
+
+    // Scan B finds the lock again: counted, still fenced.
+    let scan_b = scan(rig, &ctx.inputs(&b), 1, &foreign_lock(), None).await?;
+    findings("B-B", &scan_b, &locked)?;
+    let (again, events) = logged(|| apply(&scan_b.verdict, gate));
+    let again = again.context("B-B: recorded again")?;
+    ensure!(!again.opened && gate.fenced(), "B-B: {again:?}");
+    ensure!(
+        events == [(Level::WARN, Some("venue_discrepancy".to_owned()))],
+        "B-B: {events:?}"
+    );
+    journal.flush_pending().await;
+    rows[0].1 = 2;
+    ensure!(open_rows(pool, tenant).await? == rows, "B-B: the row counts 2");
+
+    // Scan C finds the lock explained: Clean, and it clears nothing.
+    let scan_c = scan(
+        rig,
+        &ctx.inputs(&b),
+        1,
+        &[triple(
+            btc(dec!(0), dec!(0.999)),
+            std::slice::from_ref(&robson),
+            &[],
+        )],
+        None,
+    )
+    .await?;
+    clean("B-C", &scan_c)?;
+    ensure!(
+        apply(&scan_c.verdict, gate).is_none() && gate.fenced(),
+        "B-C: Clean clears nothing"
+    );
+    ensure!(open_rows(pool, tenant).await? == rows, "B-C: the row is unchanged");
+
+    // After the last scan (accounting-first commits move the version a scan
+    // binds): an entry is refused at its send, a protective cancel passes.
+    let position = Uuid::now_v7();
+    PgVenueLedger::new(pool, tenant)
+        .insert_route(
+            position,
+            &VenueId::new(VenueId::BINANCE_SPOT),
+            DEFAULT_ACCOUNT_SCOPE,
+            chrono::Utc::now(),
+        )
+        .await?;
+    let admitted = a.entry.balance.as_ref().and_then(|b| b.admission.as_deref());
+    let terms = AdmissionRow {
+        position_id: position,
+        ..admitted.context("fixture terms")?.clone()
+    };
+    let spec = |kind, cancels: Option<&str>| IntentSpec {
+        position_id: Some(position),
+        kind,
+        client_order_id: Uuid::now_v7().simple().to_string(),
+        cancels_order_id: cancels.map(str::to_owned),
+        params: serde_json::json!({ "symbol": SYMBOL }),
+    };
+    let operation = journal.begin_operation();
+    let (entry, cancel) = operation
+        .scope(async {
+            let entry = journal
+                .open_balance_entry(spec(IntentKind::Entry, None), terms)
+                .map_err(|e| anyhow!("entry: {e:?}"))?;
+            journal
+                .before_send(&entry, WriteClass::Strict)
+                .await
+                .map_err(|e| anyhow!("entry attempt: {e:?}"))?;
+            ensure!(!journal.latch_set(), "the entry's attempt landed");
+            let refused = robson_exec::order_journal::begin_send(entry.client_order_id());
+            ensure!(
+                matches!(&refused, Err(SendRefusal::NotSent(why)) if why.contains("fenced")),
+                "the entry is refused at its send: {refused:?}"
+            );
+            ensure!(!journal.ticket_issued(&entry), "no entry ticket");
+            journal.finish_failed(&entry).await;
+
+            let cancel = journal.open_intent(spec(IntentKind::Cancel, Some("4242")));
+            journal
+                .before_send(&cancel, WriteClass::Strict)
+                .await
+                .map_err(|e| anyhow!("cancel attempt: {e:?}"))?;
+            robson_exec::order_journal::begin_send(cancel.client_order_id())
+                .map_err(|e| anyhow!("the protective cancel passes its send: {e:?}"))?;
+            ensure!(journal.ticket_issued(&cancel), "the cancel has its ticket");
+            journal
+                .finish_cancel(&cancel, &CancelClass::Cancelled {
+                    filled_before_cancel: Decimal::ZERO,
+                    fills: None,
+                })
+                .await;
+            Ok::<_, anyhow::Error>((entry.intent_id(), cancel.intent_id()))
+        })
+        .await?;
+    drop(operation);
+    journal.flush_pending().await;
+    let landed: Vec<(uuid::Uuid, bool, i64)> = sqlx::query_as(
+        "SELECT i.intent_id, i.not_sent,
+                (SELECT count(*) FROM submit_attempts a
+                  WHERE (a.venue_id, a.account_scope, a.client_order_id)
+                      = (i.venue_id, i.account_scope, i.client_order_id))
+         FROM order_intents i WHERE i.intent_id = ANY($1) ORDER BY i.intent_id",
+    )
+    .bind(vec![entry, cancel])
+    .fetch_all(pool)
+    .await?;
+    ensure!(
+        landed == [(entry, true, 1), (cancel, false, 1)],
+        "entry journaled and not sent, cancel journaled and sent: {landed:?}"
+    );
+    ensure!(
+        journal.retry_set_depth() == 0
+            && !journal.latch_set()
+            && open_rows(pool, tenant).await? == rows,
+        "nothing else is uncertain or open"
+    );
+
+    // R2: the F release is refused and changes nothing.
+    let refused = journal.release(release_of(gate.generation())).await;
+    ensure!(matches!(refused, Err(ReleaseRefusal::AwaitsBalanceRelease)), "R2: {refused:?}");
+    ensure!(gate.fenced() && open_rows(pool, tenant).await? == rows, "R2: still fenced");
+    ctx.proxied.close().await;
+    println!(
+        "RECON_8K1B case=fence opened=true error_log=1 gauges=1,1 second_scan_count=2 \
+         clean_clears=false entry_refused_at_send=true cancel_passed=true release=AwaitsBalanceRelease"
+    );
+    Ok(())
+}
+
+/// After the restart, before any scan: fenced by the restored discrepancy,
+/// gauges at 1, and the F release still refused.
+async fn foreign_lock_restart(pool: &PgPool, tenant: Uuid, rig: &ReconciliationRig) -> Result<()> {
+    let (journal, _pending) = rig.journal(durable_journal(pool, tenant))?;
+    let gate = journal.gate();
+    let open = gate.open_incidents();
+    let restored = open.iter().find(|i| i.reason == IncidentReason::VenueDiscrepancy);
+    ensure!(
+        gate.fenced()
+            && restored.is_some_and(|incident| incident.count == 2)
+            && open.iter().any(|i| i.reason == IncidentReason::UncleanStart),
+        "restart: fenced by the restored discrepancy before any scan: {open:?}"
+    );
+    ensure!(discrepancy_gauges(&journal) == (1, 1), "restart: gauges at 1");
+    let refused = journal.release(release_of(gate.generation())).await;
+    ensure!(
+        matches!(refused, Err(ReleaseRefusal::AwaitsBalanceRelease)),
+        "restart R2: {refused:?}"
+    );
+    let rows = open_rows(pool, tenant).await?;
+    ensure!(
+        rows.contains(&("venue_discrepancy".to_owned(), 2)) && gate.fenced(),
+        "restart: the row stays open: {rows:?}"
+    );
+    println!("RECON_8K1B case=restart fenced_before_scan=true restored_count=2 release=AwaitsBalanceRelease");
     Ok(())
 }

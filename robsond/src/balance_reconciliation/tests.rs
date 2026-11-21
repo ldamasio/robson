@@ -467,6 +467,103 @@ fn consequences_never_sell() {
     }
 }
 
+fn interval() -> ObservationInterval {
+    ObservationInterval { start_ns: 1, end_ns: 2, cut_ns: 1 }
+}
+
+fn discrepancy(findings: Vec<Finding>) -> BaseVerdict {
+    BaseVerdict::Discrepancy { findings, interval: interval() }
+}
+
+fn fence_and_page() -> [Finding; 4] {
+    [
+        Finding::LockedForeign { locked: dec!(1), robson: dec!(0.999) },
+        Finding::BaseExcess { holdings: dec!(1.5), upper: dec!(1) },
+        Finding::BaseDeficit { holdings: dec!(0.5), lower: dec!(0.999) },
+        Finding::OperatedOrderList { order_list_id: 9 },
+    ]
+}
+
+fn other_consequences() -> [Finding; 4] {
+    [
+        Finding::LockedShort {
+            locked: dec!(0.5),
+            robson: dec!(0.999),
+            stops: vec!["41".into()],
+        },
+        Finding::NeedsExactEvidence { exchange_order_id: "41".into() },
+        Finding::UnlinkedOperatedOrder { order_id: 900 },
+        Finding::WithinClaims {
+            holdings: dec!(0),
+            lower: dec!(0),
+            upper: dec!(1),
+        },
+    ]
+}
+
+#[test]
+fn apply_fences_on_each_fence_and_page_finding() {
+    for finding in fence_and_page() {
+        let journal = robson_exec::order_journal::OrderJournal::unpersisted();
+        let gate = journal.gate();
+        let occurrence = apply(&discrepancy(vec![finding.clone()]), gate).expect("recorded");
+        assert_eq!(occurrence.reason.as_str(), "venue_discrepancy", "{finding:?}");
+        assert!(occurrence.opened && gate.fenced() && !journal.latch_set(), "{finding:?}");
+        assert_eq!(gate.open_incidents().len(), 1, "{finding:?}");
+    }
+}
+
+#[test]
+fn apply_ignores_verdicts_without_a_fence_and_page_finding() {
+    let mut verdicts = vec![
+        BaseVerdict::Clean { interval: interval() },
+        BaseVerdict::Incomplete {
+            reason: IncompleteReason::Deficit,
+            interval: interval(),
+        },
+        BaseVerdict::Unqualified(UnqualifiedReason::Venue),
+    ];
+    verdicts.extend(other_consequences().into_iter().map(|finding| discrepancy(vec![finding])));
+    for verdict in verdicts {
+        let journal = robson_exec::order_journal::OrderJournal::unpersisted();
+        let gate = journal.gate();
+        let generation = gate.generation();
+        assert_eq!(apply(&verdict, gate), None, "{verdict:?}");
+        assert!(
+            !gate.fenced() && gate.generation() == generation && gate.open_incidents().is_empty(),
+            "{verdict:?}"
+        );
+    }
+}
+
+#[test]
+fn apply_records_once_for_several_findings() {
+    let [locked, excess, ..] = fence_and_page();
+    let [short, ..] = other_consequences();
+    let journal = robson_exec::order_journal::OrderJournal::unpersisted();
+    let gate = journal.gate();
+    let generation = gate.generation();
+    apply(&discrepancy(vec![locked, short, excess]), gate).expect("recorded");
+    let open = gate.open_incidents();
+    assert_eq!((open.len(), open[0].count, gate.generation()), (1, 1, generation + 1));
+}
+
+#[test]
+fn a_clean_verdict_never_clears_an_open_discrepancy() {
+    let journal = robson_exec::order_journal::OrderJournal::unpersisted();
+    let gate = journal.gate();
+    let [locked, ..] = fence_and_page();
+    apply(&discrepancy(vec![locked]), gate).expect("recorded");
+    for later in [
+        BaseVerdict::Clean { interval: interval() },
+        BaseVerdict::Unqualified(UnqualifiedReason::Clock),
+    ] {
+        assert_eq!(apply(&later, gate), None, "{later:?}");
+        let open: Vec<_> = gate.open_incidents().iter().map(|i| i.reason.as_str()).collect();
+        assert!(gate.fenced() && open == ["venue_discrepancy"], "{later:?}: {open:?}");
+    }
+}
+
 fn capture(seconds: i64, nanos: u32, before: i128, after: i128) -> RawClockCapture {
     RawClockCapture {
         epoch: Uuid::from_u128(3),

@@ -1,7 +1,8 @@
 //! 8k-2 pilot detector (ADR-0056 step 8k; v16 §3.10, §C8): the operated
 //! pair's base and locked base against Robson's durable ledger. Inert: no
-//! production caller. It reads and classifies; it applies no consequence and
-//! writes nothing. Production transport (8k-1), consequences and late
+//! production caller. It reads and classifies; [`apply`] records the one
+//! consequence 8k-1 B needs, `venue_discrepancy` on the gate, and nothing here
+//! writes. Production transport (8k-1), the other consequences and late
 //! evidence (8k-3), release (8k-4) and cash (8l) are later slices. USDT and
 //! every other asset are not evaluated here (SD7).
 //!
@@ -9,7 +10,10 @@
 //! triple, the operated subset and the keyed attribution post statement,
 //! gate marks again, then [`qualify`]. Only a qualified attempt is
 //! classified; [`Scan`] keeps at most three attempts and their actual cost.
-use robson_exec::clock_records::RawClockCapture;
+use robson_exec::{
+    clock_records::RawClockCapture,
+    gate::{IncidentReason, Occurrence, OperationGate},
+};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -375,6 +379,21 @@ pub(crate) fn conclude(scan: &ScanOutcome, classification: Option<Classification
             Classification::Incomplete(reason) => BaseVerdict::Incomplete { reason, interval },
         },
     }
+}
+
+/// The 8k-1 B consequence of one verdict: a qualified Discrepancy with a
+/// fence-and-page finding records `venue_discrepancy`, which closes the
+/// admission fence until the typed balance release (8k-4); the journal's
+/// retry pass persists it. Nothing is sold, cancelled or written here. Every
+/// other verdict changes nothing, so a later Clean clears nothing.
+pub(crate) fn apply(verdict: &BaseVerdict, gate: &OperationGate) -> Option<Occurrence> {
+    let BaseVerdict::Discrepancy { findings, .. } = verdict else {
+        return None;
+    };
+    findings
+        .iter()
+        .any(|finding| consequence(finding) == Consequence::FenceAndPage)
+        .then(|| gate.record(IncidentReason::VenueDiscrepancy))
 }
 
 #[cfg(test)]
