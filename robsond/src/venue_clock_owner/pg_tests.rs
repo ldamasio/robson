@@ -288,6 +288,10 @@ pub(crate) struct HeldLookupWitness {
 }
 
 /// Consumes the actual C2 bootstrap rows from the held physical restore.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the held rehearsal's physical bindings, each checked separately by its caller"
+)]
 pub(crate) async fn run_held_inventory_rehearsal(
     pool: &PgPool,
     wire: &robson_testkit::db_proxy::DbProxy,
@@ -515,9 +519,8 @@ pub(crate) async fn run_held_inventory_rehearsal(
             );
         }
         ensure!(counters().0 == negatives + 4, "one statement per moved-identity control");
-        let many: Vec<_> = std::iter::repeat(selected.orders[0])
-            .take(c8_attribution::FIXTURE_KEY_CAP + 1)
-            .collect();
+        let many: Vec<_> =
+            std::iter::repeat_n(selected.orders[0], c8_attribution::FIXTURE_KEY_CAP + 1).collect();
         ensure!(
             matches!(
                 c8_attribution::snapshot(&attribution_options, scope, &many, scan_deadline).await,

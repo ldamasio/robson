@@ -552,7 +552,7 @@ fn an_ambiguous_or_invalid_identity_is_refused_typed() {
 /// set; every one-field corruption of every order decodes to nothing.
 #[test]
 fn permutations_agree_and_no_corruption_decodes() {
-    let lists = vec![
+    let lists = [
         value(OPEN_ORDER_LIST)[0].clone(),
         json!({"orderListId": 0, "symbol": "BNBBTC", "orders": [
             {"symbol": "BNBBTC", "orderId": 4, "clientOrderId": "b4"},
@@ -665,10 +665,7 @@ fn the_byte_envelope_is_checked_before_parsing() {
         decode_open_order_lists("{not json", 3),
         Err(SpotOrderListError::Oversize { len: 9, limit: 3 })
     ));
-    assert!(
-        matches!(parse_open_order_lists(&over), Ok(_)),
-        "legacy envelope is the body itself"
-    );
+    assert!(parse_open_order_lists(&over).is_ok(), "legacy envelope is the body itself");
 }
 
 #[test]

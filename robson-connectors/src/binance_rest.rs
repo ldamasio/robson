@@ -2759,6 +2759,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(test, feature = "crash-points")))]
 #[path = "spot_inventory_wire_tests.rs"]
 mod spot_inventory_wire_tests;

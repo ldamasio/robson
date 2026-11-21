@@ -1,4 +1,4 @@
-#![cfg(test)]
+#![cfg(all(test, feature = "postgres"))]
 
 //! Test-only real Journal/Spot audit composition driven by a disposable PG16
 //! controller.

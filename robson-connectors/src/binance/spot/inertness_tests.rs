@@ -800,14 +800,14 @@ fn nothing_outside_the_spot_module_names_it() {
             "spot_inventory_wire_tests.rs",
             "binance_rest.rs",
             "mod spot_inventory_wire_tests",
-            "#![cfg(test)]\n",
+            "#![cfg(all(test, any(test, feature = \"crash-points\")))]\n",
         ),
         (
             daemon_dir.as_path(),
             "order_journal_physical_recovery_pg_tests.rs",
             "order_journal_projected_pg_tests.rs",
             "mod physical_recovery",
-            "#![cfg(test)]\n",
+            "#![cfg(all(test, feature = \"postgres\"))]\n",
         ),
         (
             n5_dir.as_path(),

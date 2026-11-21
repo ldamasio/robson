@@ -1,4 +1,4 @@
-#![cfg(test)]
+#![cfg(all(test, any(test, feature = "crash-points")))]
 //! Test-only C8 loopback wire contract for the three signed Spot inventory
 //! reads. The eventual owner will supply the real clock, budget and ledger.
 

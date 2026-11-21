@@ -721,6 +721,6 @@ mod entry;
 #[path = "order_journal_bound_sell_pg_tests.rs"]
 mod bound_sell;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 #[path = "order_journal_physical_recovery_pg_tests.rs"]
 mod physical_recovery;

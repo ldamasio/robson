@@ -228,7 +228,7 @@ fn dropped_unpolled_weight_is_refunded_and_handed_off_weight_remains_charged() {
         let (now, due) = (tick(120), tick(130));
         let mut pending = budget.try_reserve_account(now, due).unwrap();
         if redeemed {
-            budget
+            let _ = budget
                 .poll_account_first(
                     &mut pending,
                     &clock,
@@ -265,7 +265,7 @@ proptest! {
         let mut reservation = budget.try_reserve_inventory(read, now, due).unwrap();
         prop_assert_eq!(reservation.read(), read);
         if handed_off {
-            budget.poll_account_first(&mut reservation, &clock, Uuid::from_u128(3),
+            let _ = budget.poll_account_first(&mut reservation, &clock, Uuid::from_u128(3),
                 || Ok((now, ())), || std::task::Poll::Pending).unwrap();
         }
         drop(reservation);

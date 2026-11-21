@@ -25,10 +25,6 @@ pub(super) struct AccountFixture {
 }
 
 impl AccountFixture {
-    pub(super) async fn start(deadline: Instant) -> anyhow::Result<Self> {
-        Self::with_gate(deadline, None).await
-    }
-
     pub(super) async fn held_body(
         deadline: Instant,
     ) -> anyhow::Result<(Self, oneshot::Receiver<()>, oneshot::Sender<()>)> {
