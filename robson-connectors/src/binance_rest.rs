@@ -547,6 +547,23 @@ impl BinanceRestClient {
         Self::parse_open_positions(&body)
     }
 
+    /// The account's open positions, open orders and open algo orders across
+    /// every symbol: three signed reads (`positionRisk`, `openOrders` and
+    /// `openAlgoOrders`, each without a symbol), what the Spot cutover's C6
+    /// counts (ADR-0056 step 8m-3). Reads only; the first refusal ends it.
+    pub async fn open_book_counts(&self) -> Result<[usize; 3], BinanceRestError> {
+        let mut counts = [self.get_all_open_positions().await?.len(), 0, 0];
+        for (count, endpoint) in
+            counts[1..].iter_mut().zip(["/fapi/v1/openOrders", "/fapi/v1/openAlgoOrders"])
+        {
+            let body = self.get_signed(endpoint, vec![]).await?;
+            let open: Vec<serde_json::Value> = serde_json::from_str(&body)
+                .map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+            *count = open.len();
+        }
+        Ok(counts)
+    }
+
     // =========================================================================
     // Order API
     // =========================================================================
@@ -1822,6 +1839,109 @@ mod tests {
     };
 
     use super::*;
+
+    /// Answer each request by its path from `answers` (status, body) until
+    /// the client stops asking; return the request targets seen.
+    async fn by_path(
+        answers: &'static [(&'static str, u16, &'static str)],
+    ) -> (BinanceRestClient, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+            {
+                let mut head = Vec::new();
+                let mut buf = [0_u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let target = head.split_whitespace().nth(1).unwrap_or_default().to_string();
+                let path = target.split('?').next().unwrap_or_default();
+                let (status, body) = answers
+                    .iter()
+                    .find(|(p, ..)| *p == path)
+                    .map_or((404, "{}"), |(_, status, body)| (*status, *body));
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                seen.push(target);
+            }
+            seen
+        });
+        (BinanceRestClient::with_local_base_url(origin), server)
+    }
+
+    /// ADR-0056 step 8m-3, C6: the three account-wide reads, each signed and
+    /// without a symbol, counted; a refused one fails the whole read.
+    #[tokio::test]
+    async fn open_book_counts_reads_every_symbol_once() {
+        static OPEN: [(&str, u16, &str); 3] = [
+            (
+                "/fapi/v2/positionRisk",
+                200,
+                r#"[
+                {"symbol": "BTCUSDT", "initialMargin": "5", "maintMargin": "0.5", "unrealizedProfit": "0.1",
+                 "positionInitialMargin": "5", "openOrderInitialMargin": "0", "leverage": "1", "isolated": false,
+                 "entryPrice": "75000", "maxNotional": "1000000", "positionSide": "BOTH", "positionAmt": "0.001",
+                 "updatedTime": 1234567890000},
+                {"symbol": "ETHUSDT", "initialMargin": "0", "maintMargin": "0", "unrealizedProfit": "0",
+                 "positionInitialMargin": "0", "openOrderInitialMargin": "0", "leverage": "1", "isolated": false,
+                 "entryPrice": "0", "maxNotional": "1000000", "positionSide": "BOTH", "positionAmt": "0",
+                 "updatedTime": 1234567890000}]"#,
+            ),
+            ("/fapi/v1/openOrders", 200, r#"[{"orderId": 1}, {"orderId": 2}]"#),
+            ("/fapi/v1/openAlgoOrders", 200, r#"[{"algoId": 3}]"#),
+        ];
+        let (client, server) = by_path(&OPEN).await;
+        assert_eq!(client.open_book_counts().await.unwrap(), [1, 2, 1]);
+        let seen = server.await.unwrap();
+        let paths: Vec<&str> = seen.iter().map(|t| t.split('?').next().unwrap()).collect();
+        assert_eq!(paths, [
+            "/fapi/v2/positionRisk",
+            "/fapi/v1/openOrders",
+            "/fapi/v1/openAlgoOrders"
+        ]);
+        assert!(
+            seen.iter().all(|t| t.contains("signature=") && !t.contains("symbol=")),
+            "{seen:?}"
+        );
+        // Q1: a key without the read permission is refused at the third read.
+        static REFUSED: [(&str, u16, &str); 3] = [
+            ("/fapi/v2/positionRisk", 200, "[]"),
+            ("/fapi/v1/openOrders", 200, "[]"),
+            (
+                "/fapi/v1/openAlgoOrders",
+                401,
+                r#"{"code": -2015, "msg": "Invalid API-key, IP, or permissions for action."}"#,
+            ),
+        ];
+        let (client, server) = by_path(&REFUSED).await;
+        let refused = client.open_book_counts().await.unwrap_err();
+        assert!(
+            matches!(refused, BinanceRestError::ApiError { code: -2015, http_status: 401, .. }),
+            "{refused:?}"
+        );
+        assert_eq!(server.await.unwrap().len(), 3);
+        // Without Binance's JSON body, the status stays in the text the
+        // cutover report classifies (robsond's `usdm_refusal`).
+        static BARE: [(&str, u16, &str); 1] = [("/fapi/v2/positionRisk", 403, "<html></html>")];
+        let (client, server) = by_path(&BARE).await;
+        let refused = client.open_book_counts().await.unwrap_err();
+        assert!(
+            matches!(&refused, BinanceRestError::RequestFailed(text) if text.starts_with("HTTP 403")),
+            "{refused:?}"
+        );
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
 
     #[tokio::test]
     async fn measured_reconciliation_preserves_signed_request_and_never_follows_redirect() {
