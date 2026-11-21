@@ -17,7 +17,7 @@ use rust_decimal::Decimal;
 use tokio::time::timeout;
 
 use self::ready::{
-    initialize, initialize_at, probe, statement, Keys, ProjectionReady, ReplayOrder, Stage,
+    initialize, initialize_at, probe, relation_nodes, statement, Keys, ProjectionReady, ReplayOrder, Stage,
     ORDER_SET_COLUMNS,
 };
 use super::sell_nested_work_tests::seed_history;
@@ -31,6 +31,8 @@ use crate::fixture::retired;
 
 #[path = "initialized_fixture.rs"]
 mod ready;
+#[path = "late_member_tests.rs"]
+mod late_member_tests;
 
 #[derive(Debug, sqlx::FromRow)]
 struct InitializedOrderSet {
@@ -38,6 +40,106 @@ struct InitializedOrderSet {
     facts: Hot,
     unbound_sell: i64,
     unbound_sell_conflicts: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct CandidateOrderSet {
+    #[sqlx(flatten)]
+    set: InitializedOrderSet,
+    base_commission_final: bool,
+    candidate_scope: Option<String>,
+    candidate_position: Option<Uuid>,
+    candidate_potential: Option<bool>,
+    candidate_conflict: Option<bool>,
+    target_cancel_pending: Option<i64>,
+    target_cancel_conflicts: Option<i64>,
+    target_cancel_terminal: Option<bool>,
+}
+
+fn candidate_statement() -> String {
+    statement(
+        &format!("{ORDER_SET_COLUMNS}, {}", ready::CANDIDATE_COLUMNS),
+        ready::CANDIDATE_JOINS,
+    )
+}
+
+async fn measure_candidate_read(
+    pool: &PgPool,
+    actor: &PgPool,
+    proxy: &DbProxy,
+    ready: &ProjectionReady,
+    scope: Scope,
+    history: i64,
+) -> anyhow::Result<()> {
+    // Default PostgreSQL plans, measured after collecting real fixture statistics.
+    sqlx::raw_sql(
+        "ANALYZE venue_orders, order_intents, sell_shadow_orders, cancel_shadow_groups",
+    )
+    .execute(pool)
+    .await?;
+    let (venue_rows, intent_rows, active_members, cancel_groups): (i64, i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT (SELECT count(*) FROM venue_orders),
+                    (SELECT count(*) FROM order_intents),
+                    (SELECT count(*) FROM sell_shadow_orders),
+                    (SELECT count(*) FROM cancel_shadow_groups)",
+        )
+        .fetch_one(pool)
+        .await?;
+    ensure!(venue_rows >= history && intent_rows >= history && cancel_groups >= history);
+    let sql = candidate_statement();
+    for (candidate, present) in [("1000", true), ("99000001", false)] {
+        let before = proxy.stats().statements;
+        let read: CandidateOrderSet = ready
+            .query_as(&sql, keys(scope), Some(candidate))
+            .fetch_one(actor)
+            .await?;
+        ensure!(proxy.stats().statements - before == 1);
+        ensure!(proxy.query_trace().last() == Some(&sql));
+        ensure!(read.set.facts.stop_id.as_deref() == present.then_some(candidate));
+        ensure!(read.target_cancel_terminal == present.then_some(true));
+
+        // EXPLAIN executes independently of the application wire measurement.
+        let physical = ready.explain(pool, &sql, keys(scope), candidate).await?;
+        let plan = &physical[0]["Plan"];
+        ensure!(plan["Actual Rows"].as_u64() == Some(1));
+        for (relation, inventory) in [
+            ("venue_orders", venue_rows),
+            ("order_intents", intent_rows),
+            ("sell_shadow_orders", active_members),
+            ("cancel_shadow_groups", cancel_groups),
+        ] {
+            let mut nodes = Vec::new();
+            relation_nodes(plan, relation, &mut nodes);
+            ensure!(nodes.len() == 1, "expected one {relation} probe: {plan}");
+            let node = nodes[0];
+            let loops = node["Actual Loops"].as_u64().context("native probe loops")?;
+            let rows = node["Actual Rows"].as_u64().context("native probe rows")?;
+            ensure!(loops <= 1, "{relation}: {node}");
+            let removed = node["Rows Removed by Filter"].as_u64().unwrap_or(0)
+                + node["Rows Removed by Index Recheck"].as_u64().unwrap_or(0);
+            if inventory >= 512 && loops != 0 {
+                ensure!(node["Index Cond"].is_string(), "expected indexed {relation}: {node}");
+                ensure!(rows <= 1 && removed == 0, "{relation}: {node}");
+            } else {
+                // Terminal SELL history is absent from the member table.
+                // On tiny physical relations PostgreSQL can choose a scan.
+                ensure!(rows + removed <= u64::try_from(inventory)?, "{relation}: {node}");
+            }
+        }
+        for relation in ["cancel_shadow_members", "sell_shadow_intents", "submit_attempts"] {
+            let mut nodes = Vec::new();
+            relation_nodes(plan, relation, &mut nodes);
+            ensure!(nodes.is_empty(), "unexpected historical {relation} read: {plan}");
+        }
+        eprintln!(
+            "SPOT_INIT_CANDIDATE_WORK history={history} present={present} wire=1
+             venue_rows={venue_rows} intent_rows={intent_rows} active_members={active_members}
+             cancel_groups={cancel_groups} plan={}",
+            physical
+        );
+    }
+    Ok(())
 }
 
 fn keys(s: Scope) -> Keys<'static> {
@@ -354,6 +456,46 @@ async fn fenced_initialization_replays_existing_journal_and_venue_state(
     );
     let decoy = ready.read(&pool, s, Some("101")).await?.context("non-stop candidate")?;
     ensure!(decoy.facts.stop_id.as_deref() == Some("101") && !decoy.facts.exact_stop_identity);
+
+    let sql = candidate_statement();
+    let (proxy, measured) = through_proxy_limit(&pool, 1).await;
+    let before = proxy.stats().statements;
+    let own: CandidateOrderSet = ready
+        .query_as(&sql, keys(s), Some("103"))
+        .fetch_optional(&measured)
+        .await?
+        .context("exact candidate membership")?;
+    ensure!(proxy.stats().statements - before == 1, "one keyed candidate read");
+    measured.close().await;
+    let recorded_fee_final: bool =
+        sqlx::query_scalar("SELECT base_commission_final FROM balance_legs WHERE position_id=$1")
+            .bind(s.position)
+            .fetch_one(&pool)
+            .await?;
+    ensure!(
+        own.set.facts.exact_stop_identity
+            && own.base_commission_final == recorded_fee_final
+            && own.candidate_scope.as_deref() == Some("leg")
+            && own.candidate_position == Some(s.position)
+            && own.candidate_potential == Some(true)
+            && own.candidate_conflict == Some(false)
+            && own.target_cancel_pending.is_none()
+            && own.target_cancel_conflicts.is_none()
+            && own.target_cancel_terminal.is_none(),
+        "own live stop is exactly one nonconflicting leg member with no target cancel"
+    );
+    journal_commit(&journal, &batch(s, IntentKind::Cancel, Some("103"))).await?;
+    let cancelled: CandidateOrderSet = ready
+        .query_as(&sql, keys(s), Some("103"))
+        .fetch_optional(&pool)
+        .await?
+        .context("candidate under a target cancel")?;
+    ensure!(
+        cancelled.target_cancel_pending.is_some_and(|pending| pending > 0)
+            && cancelled.target_cancel_conflicts == Some(0)
+            && cancelled.target_cancel_terminal == Some(false),
+        "an outstanding target cancel is visible on the candidate's own key"
+    );
     Ok(())
 }
 
@@ -487,6 +629,10 @@ async fn generated_history(
         PgJournalBackend::new(pool, second.tenant),
     ];
     seed_history(&fixtures[0], &journals[0], first, history).await;
+    for target in 1001..1000 + history {
+        journal_commit(&journals[0], &batch(first, IntentKind::Cancel, Some(&target.to_string())))
+            .await?;
+    }
     for _ in 0..cancels {
         journal_commit(&journals[0], &batch(first, IntentKind::Cancel, Some("1000"))).await?;
     }
@@ -576,6 +722,7 @@ async fn generated_history(
     let read_start = proxy.stats().statements;
     ensure!(ready.read(&actor, second, None).await?.is_some());
     ensure!(proxy.stats().statements - read_start == 1);
+    measure_candidate_read(pool, &actor, &proxy, &ready, first, history).await?;
     actor.close().await;
     ensure!(
         sqlx::query_scalar::<_, bool>(

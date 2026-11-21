@@ -11,9 +11,11 @@
 -- one native row (PK or idx_venue_orders_intent), one leg (PK), one attempt
 -- (the M37 partial unique key) and the touched member rows.
 --
--- Uncovered here: a J written before its leg row stays in sell_shadow_unbound
--- until its next journal, attempt or native event; sweep_close is not a
--- suspected SELL kind; J identity columns are assumed immutable.
+-- A J written before its leg row stays in sell_shadow_unbound until its next
+-- journal, attempt or native event, or until an explicit exact
+-- sell_shadow_repair_exact call for that one intent (nothing schedules it).
+-- Uncovered here: sweep_close is not a suspected SELL kind; J identity
+-- columns are assumed immutable.
 
 CREATE TYPE sell_shadow_class AS (
     scope_kind text, tenant_id uuid, venue_id text, account_scope text,
@@ -459,3 +461,89 @@ $$;
 
 CREATE TRIGGER sell_shadow_venue AFTER INSERT OR UPDATE OF phase, status, owner, intent_id,
     position_id, kind ON venue_orders FOR EACH ROW EXECUTE FUNCTION sell_shadow_venue_changed();
+
+-- Explicit late reclassification of one exact unbound journal member. Keyed
+-- probes only: the owner's accounting_state row (locked, not bumped), J by PK,
+-- its leg by PK, the J member by PK and native by idx_venue_orders_intent.
+-- Any missing or foreign owner, leg, member or native link returns false
+-- before a member row is touched.
+CREATE FUNCTION sell_shadow_repair_exact(
+    p_tenant uuid, p_venue text, p_scope text, p_intent uuid
+) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    j order_intents%ROWTYPE;
+    o venue_orders%ROWTYPE;
+    has_o boolean;
+    leg balance_legs%ROWTYPE;
+    member sell_shadow_intents%ROWTYPE;
+    n_probes integer := 0;
+BEGIN
+    IF p_tenant IS NULL OR p_venue IS NULL OR p_scope IS NULL OR p_intent IS NULL
+       OR p_venue <> 'binance:spot'
+       OR current_setting('transaction_isolation') <> 'read committed' THEN
+        RETURN false;
+    END IF;
+    PERFORM 1 FROM accounting_state a
+    WHERE (a.tenant_id, a.venue_id) = (p_tenant, p_venue) FOR UPDATE;
+    n_probes := n_probes + 1;
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+
+    SELECT i.* INTO j FROM order_intents i WHERE i.intent_id = p_intent;
+    n_probes := n_probes + 1;
+    IF NOT FOUND
+       OR (j.tenant_id, j.venue_id, j.account_scope) IS DISTINCT FROM (p_tenant, p_venue, p_scope)
+       OR j.kind IS NULL OR j.kind NOT IN ('protection', 'exit')
+       OR j.position_id IS NULL THEN
+        RETURN false;
+    END IF;
+
+    -- The typed symbol is the leg's own, never a caller or J claim.
+    SELECT l.* INTO leg FROM balance_legs l WHERE l.position_id = j.position_id;
+    n_probes := n_probes + 1;
+    IF NOT FOUND
+       OR (leg.tenant_id, leg.venue_id, leg.account_scope)
+          IS DISTINCT FROM (p_tenant, p_venue, p_scope)
+       OR leg.symbol IS NULL THEN
+        RETURN false;
+    END IF;
+
+    SELECT m.* INTO member FROM sell_shadow_intents m WHERE m.intent_id = p_intent;
+    n_probes := n_probes + 1;
+    IF NOT FOUND OR NOT (member.potential OR member.conflict) THEN
+        RETURN false;
+    END IF;
+    IF member.scope_kind = 'unbound' THEN
+        IF (member.scope_tenant, member.scope_venue, member.scope_account,
+            member.scope_symbol, member.scope_position)
+           IS DISTINCT FROM (p_tenant, p_venue, p_scope, NULL::text, NULL::uuid) THEN
+            RETURN false;
+        END IF;
+    ELSIF member.scope_kind = 'leg' THEN
+        IF (member.scope_tenant, member.scope_venue, member.scope_account,
+            member.scope_symbol, member.scope_position)
+           IS DISTINCT FROM (p_tenant, p_venue, p_scope, leg.symbol, leg.position_id) THEN
+            RETURN false;
+        END IF;
+    ELSE
+        RETURN false;
+    END IF;
+
+    -- A native row must already be the exact typed SELL link on this leg.
+    SELECT v.* INTO o FROM venue_orders v WHERE v.intent_id = p_intent;
+    has_o := FOUND;
+    n_probes := n_probes + 1;
+    IF has_o AND NOT (sell_shadow_exact_link(j, o)
+                      AND o.symbol IS NOT DISTINCT FROM leg.symbol) THEN
+        RETURN false;
+    END IF;
+
+    IF member.scope_kind = 'leg' AND NOT has_o THEN
+        RETURN true;
+    END IF;
+
+    PERFORM sell_shadow_sync(j, true, o, has_o, 'late_exact_repair', n_probes);
+    RETURN true;
+END;
+$$;

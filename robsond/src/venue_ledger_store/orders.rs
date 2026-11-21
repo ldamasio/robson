@@ -13,9 +13,18 @@ use robson_exec::{
 };
 use rust_decimal::Decimal;
 use sqlx::{postgres::PgRow, Connection, PgConnection, Postgres, Row, Transaction};
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 use super::{backend, commit_error, LedgerConnection, PgVenueLedger};
+
+/// One statement from four bounded sections; see order_source.sql.
+pub(super) const ORDER_PROJECTION: &str = concat!(
+    include_str!("../spot_order_set_store/order_source.sql"),
+    include_str!("../spot_order_set_store/order_sell.sql"),
+    include_str!("../spot_order_set_store/order_cancel.sql"),
+    include_str!("../spot_order_set_store/order_write.sql"),
+);
 
 pub(super) struct OrderContext {
     pub(super) order: Option<StoredOrder>,
@@ -34,7 +43,8 @@ impl PgVenueLedger {
     /// or a placement's un-timed FULL fills. At most eight statements,
     /// including the pre-read, which already runs under the server bounds. A
     /// replay without new evidence is BEGIN, the bounds, one read and
-    /// ROLLBACK, with no bump.
+    /// ROLLBACK, with no bump. An opted changed write adds one exact
+    /// membership statement.
     pub async fn record_order(
         &self,
         record: &VenueOrderRecord,
@@ -44,6 +54,12 @@ impl PgVenueLedger {
         let committing = AtomicBool::new(false);
         self.bounded(async {
             let key = OrderKey::from_record(record,link)?;
+            if let Some(generation)=&self.order_projection {
+                if !generation.is_valid() || generation.tenant_id!=self.tenant_id
+                    || key.venue.as_str()!=VenueId::BINANCE_SPOT || generation.account_scope!=key.account_scope {
+                    return Err(LedgerError::Invariant("order projection scope mismatch".into()));
+                }
+            }
             let position = match link.owner { OrderOwner::Leg {position_id,..} => Some(position_id), _ => None };
             let connection = self.pool.acquire().await.map_err(backend)?;
             let mut held = LedgerConnection::new(connection);
@@ -59,9 +75,17 @@ impl PgVenueLedger {
                 return Ok(OrderWriteResult {changed:false,anomalies:proposed.anomalies});
             }
             self.statement();
-            let bumped=sqlx::query("UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id=$2")
-                .bind(self.tenant_id).bind(key.venue.as_str()).execute(&mut *tx).await.map_err(backend)?;
-            if bumped.rows_affected()!=1 {return Err(LedgerError::NoAccountingRow);}
+            // The opted branch only adds RETURNING; legacy keeps its statement.
+            let version=if self.order_projection.is_some() {
+                let version=sqlx::query_scalar::<_,i64>("UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id=$2 RETURNING version")
+                    .bind(self.tenant_id).bind(key.venue.as_str()).fetch_optional(&mut *tx).await.map_err(backend)?;
+                Some(version.ok_or(LedgerError::NoAccountingRow)?)
+            } else {
+                let bumped=sqlx::query("UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id=$2")
+                    .bind(self.tenant_id).bind(key.venue.as_str()).execute(&mut *tx).await.map_err(backend)?;
+                if bumped.rows_affected()!=1 {return Err(LedgerError::NoAccountingRow);}
+                None
+            };
             let locked=self.read_order_context(&mut tx,&key,position,true).await?;
             let merged=merge_order(locked.order.as_ref(),record,link,&seen,locked.leg.as_ref())?;
             if !merged.changed {
@@ -80,6 +104,29 @@ impl PgVenueLedger {
                     .bind(merged.consumed_delta).bind(merged.set_cohort).bind(position_id).bind(self.tenant_id).bind(key.venue.as_str())
                     .execute(&mut *tx).await.map_err(order_error)?;
                 if updated.rows_affected()!=1 {return Err(LedgerError::Invariant("order leg disappeared".into()));}
+            }
+            if let (Some(generation),Some(version))=(&self.order_projection,version) {
+                // The locked pre-state fingerprint lets the statement verify the
+                // exact prior members. A refusal returns unfinished, so the guard
+                // retires the connection and rolls back every native write.
+                let prior=locked.order.as_ref();
+                let (owner,intent,prior_position,kind)=prior.map_or((None,None,None,None),|order| {
+                    let (owner,intent,position,kind)=owner_values(&order.owner);
+                    (Some(owner),intent,position,kind)
+                });
+                self.statement();
+                let advanced=sqlx::query_scalar::<_,i64>(ORDER_PROJECTION)
+                    .bind(generation.tenant_id).bind(&generation.account_scope).bind(generation.generation_id)
+                    .bind(generation.process_epoch).bind(generation.source_audit_id).bind(version)
+                    .bind(&key.symbol).bind(key.exchange_order_id.to_string())
+                    .bind(prior.is_some()).bind(owner).bind(intent).bind(prior_position).bind(kind)
+                    .bind(prior.map(|order| phase_text(order.phase))).bind(prior.map(|order| order.status.as_str()))
+                    .fetch_optional(&mut *tx)
+                    .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
+                    .await.map_err(backend)?;
+                if advanced!=Some(version) {
+                    return Err(LedgerError::Invariant("order projection membership refused".into()));
+                }
             }
             self.statement();
             committing.store(true,Ordering::Relaxed);

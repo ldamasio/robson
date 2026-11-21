@@ -13,10 +13,28 @@ use robson_exec::{venue::VenueId, venue_ledger::LedgerError};
 use sqlx::{Connection, PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use crate::ledger_connection::LedgerConnection;
+use crate::{ledger_connection::LedgerConnection, spot_order_set_store::JournalGeneration};
 
 mod orders;
 mod trades;
+
+#[cfg(test)]
+#[path = "../tests/venue_ledger_trades/projected.rs"]
+mod projected_trades;
+
+#[cfg(test)]
+#[path = "../tests/venue_ledger_orders/projected.rs"]
+mod projected_orders;
+
+/// Test-only access to the private venue-order row decoder, for a fixture
+/// statement that selects `ORDER_COLUMNS` under otherwise unused names.
+#[cfg(test)]
+pub(crate) fn decode_order_row(
+    row: &sqlx::postgres::PgRow,
+    tenant: Uuid,
+) -> Result<Option<robson_exec::venue_ledger::StoredOrder>, LedgerError> {
+    orders::decode_order(row, tenant)
+}
 
 const WRITE_BOUND: Duration = Duration::from_secs(2);
 
@@ -33,6 +51,10 @@ pub struct PgVenueLedger {
     pool: PgPool,
     tenant_id: Uuid,
     statements: AtomicU64,
+    /// Private opt-in generation maintenance; only `record_trades` reads it.
+    trade_projection: Option<JournalGeneration>,
+    /// Private opt-in membership maintenance; only `record_order` reads it.
+    order_projection: Option<JournalGeneration>,
 }
 
 impl PgVenueLedger {
@@ -41,7 +63,26 @@ impl PgVenueLedger {
             pool: daemon_pool.clone(),
             tenant_id,
             statements: AtomicU64::new(0),
+            trade_projection: None,
+            order_projection: None,
         }
+    }
+
+    /// Isolated integrations only; nothing in the runtime selects this.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_trade_order_set_projection(mut self, generation: JournalGeneration) -> Self {
+        self.trade_projection = Some(generation);
+        self
+    }
+
+    /// Isolated integrations only; nothing in the runtime selects this.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_native_order_set_projection(
+        mut self,
+        generation: JournalGeneration,
+    ) -> Self {
+        self.order_projection = Some(generation);
+        self
     }
 
     pub fn statements_total(&self) -> u64 {

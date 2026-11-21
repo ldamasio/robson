@@ -35,4 +35,4 @@ SELECT ARRAY(SELECT attempt_id FROM page ORDER BY attempt_id) AS examined,
        ARRAY(SELECT attempt_id FROM checked WHERE no_charge ORDER BY attempt_id) AS missing_charge,
        ARRAY(SELECT attempt_id FROM checked WHERE mismatch ORDER BY attempt_id) AS mismatched,
        ARRAY(SELECT attempt_id FROM checked WHERE is_cancel ORDER BY attempt_id) AS cancels,
-       ARRAY(SELECT attempt_id FROM checked WHERE legacy_null ORDER BY attempt_id) AS legacy_null;
+       ARRAY(SELECT attempt_id FROM checked WHERE legacy_null ORDER BY attempt_id) AS legacy_null

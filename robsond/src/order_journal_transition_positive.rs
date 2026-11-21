@@ -41,14 +41,28 @@ impl PositiveLeg {
     /// accounting version once, as its first write. Assumes a migrated pool.
     pub(super) async fn admit(pool: &PgPool) -> Result<Self> {
         let tenant = Uuid::now_v7();
-        Self::admit_on(pool, tenant, &format!("atomic-local-{tenant}"), ORIGINAL).await
+        Self::admit_on(pool, tenant, &format!("atomic-local-{tenant}"), ORIGINAL, SYMBOL).await
     }
 
     pub(super) async fn another_leg(&self, pool: &PgPool, original: &str) -> Result<Self> {
-        Self::admit_on(pool, self.tenant, &self.scope, original).await
+        Self::admit_on(pool, self.tenant, &self.scope, original, SYMBOL).await
     }
 
-    async fn admit_on(pool: &PgPool, tenant: Uuid, scope: &str, original: &str) -> Result<Self> {
+    pub(super) async fn alias_on_another_symbol(
+        &self,
+        pool: &PgPool,
+        symbol: &str,
+    ) -> Result<Self> {
+        Self::admit_on(pool, self.tenant, &self.scope, &self.original, symbol).await
+    }
+
+    async fn admit_on(
+        pool: &PgPool,
+        tenant: Uuid,
+        scope: &str,
+        original: &str,
+        symbol: &str,
+    ) -> Result<Self> {
         let venue = VenueId::BINANCE_SPOT;
         let position = Uuid::now_v7();
         let entry = Uuid::now_v7();
@@ -98,7 +112,7 @@ impl PositiveLeg {
         .bind(tenant)
         .bind(venue)
         .bind(scope)
-        .bind(SYMBOL)
+        .bind(symbol)
         .bind(position)
         .bind(entry)
         .execute(&mut *tx)
@@ -112,7 +126,7 @@ impl PositiveLeg {
         )
         .bind(venue)
         .bind(scope)
-        .bind(SYMBOL)
+        .bind(symbol)
         .bind(original)
         .bind(tenant)
         .bind(stop)
