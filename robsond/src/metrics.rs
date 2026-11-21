@@ -202,6 +202,17 @@ pub static UNPERMITTED_MUTATIONS: LazyLock<Counter> = LazyLock::new(|| {
     .expect("failed to register robsond_unpermitted_mutations_total")
 });
 
+/// Venue mutations a read-only process refused at the choke point, by
+/// reason (PS-1): nothing sent, no latch, no incident; each pages.
+pub static REFUSED_MUTATIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        "robsond_venue_mutation_refused_total",
+        "Venue mutations refused by a read-only process",
+        &["reason"]
+    )
+    .expect("failed to register robsond_venue_mutation_refused_total")
+});
+
 /// Operations whose permit was dropped before they completed: cancelled or
 /// panicked mid-flight. Each sets the journal latch.
 pub static ABORTED_OPERATIONS: LazyLock<Counter> = LazyLock::new(|| {
@@ -412,6 +423,10 @@ impl robson_exec::gate::GateObserver for GateMetrics {
 
     fn entry_refused_ownership(&self) {
         ENTRY_REFUSED_OWNERSHIP.inc();
+    }
+
+    fn mutation_refused(&self, reason: robson_exec::gate::ReadOnlyReason) {
+        REFUSED_MUTATIONS.with_label_values(&[reason.as_str()]).inc();
     }
 }
 

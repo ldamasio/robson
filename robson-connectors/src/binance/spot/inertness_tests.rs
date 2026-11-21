@@ -913,6 +913,14 @@ fn nothing_outside_the_spot_module_names_it() {
             "mod physical_recovery",
             "#![cfg(all(test, feature = \"postgres\"))]\n",
         ),
+        // PS-1: the non-trading start's daemon tests build the Spot venue.
+        (
+            daemon_dir.as_path(),
+            "daemon_non_trading_pg_tests.rs",
+            "daemon.rs",
+            "mod non_trading_pg_tests",
+            "#![cfg(all(test, feature = \"postgres\"))]\n",
+        ),
         (
             n5_dir.as_path(),
             "commission_tests.rs",

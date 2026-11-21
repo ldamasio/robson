@@ -119,6 +119,7 @@ impl Wire {
             balance_account: false,
             order_set_projection: None,
             accounting_generation: Default::default(),
+            non_trading: false,
         };
         Ok(Self { proxy, store, pid, birth, baseline })
     }
