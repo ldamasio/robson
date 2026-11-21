@@ -34,8 +34,10 @@ Any other checksum mismatch remains a hard failure.
 ## Deployment Flow
 
 1. The Robson CI builds and publishes the `robsond` image.
-2. The CI updates both `robsond-deploy.yml` and `robsond-db-migrate-job.yml` in
-   `rbx-infra` to the same image tag.
+2. The CI bumps the single image pin, `images[].newTag` in
+   `apps/prod/robson/kustomization.yml` in `rbxrobotica/rbx-infra`. The
+   `robsond` Deployment and the migrate Job both take their tag from it, and
+   their manifests keep a `sha-REPLACE_ME` placeholder on purpose.
 3. ArgoCD runs `robsond-db-migrate` as a Sync hook at wave `-1`.
 4. Only after the migration hook succeeds does ArgoCD apply the `robsond`
    Deployment in the default wave.
@@ -48,17 +50,36 @@ Check ArgoCD:
 kubectl get application robson-prod -n argocd -o wide
 ```
 
-Check the migration hook logs during a deploy:
+Check the migration hook logs during a deploy, while its pod exists:
 
 ```bash
-kubectl logs -n robson -l job-name=robsond-db-migrate
+kubectl logs -n robson -l job-name=robsond-db-migrate --tail=-1
 ```
 
-Check migration status from the runtime image:
+The pod does not outlive the hook, so `No resources found` after a deploy says
+nothing about the result:
+
+- On success, ArgoCD deletes the Job and its pod (`HookSucceeded`).
+- On failure, Kubernetes removes the pod when the Job reaches its backoff limit
+  (`restartPolicy: OnFailure`, `backoffLimit: 5`). The Job stays until the next
+  sync replaces it (`BeforeHookCreation`).
+
+After that, read the hook's output in Grafana, from the Loki data source:
+
+```text
+{namespace="robson", pod=~"robsond-db-migrate-.*"}
+```
+
+Check migration status from the running `robsond` pod:
 
 ```bash
-robsond db status
+kubectl -n robson exec deploy/robsond -- sh -c 'RUST_LOG=robson_db=info robsond db status'
 ```
+
+This lists the latest 10 migrations, newest first, so a version older than those
+can be applied and still not appear. Keep the `RUST_LOG` override: `status()`
+reports through `info!`, and the production ConfigMap's `RUST_LOG` omits
+`robson_db`, so a plain `robsond db status` exits 0 and prints no versions.
 
 ## CI Guard
 
