@@ -226,6 +226,98 @@ fn embedded40_identity_and_canonical_do_shape() {
     }
 }
 
+#[test]
+fn embedded41_to_45_identity_and_canonical_do_shapes() {
+    type Contract = fn() -> Option<&'static Migration>;
+    type Preflight = fn(&Migration) -> Result<(), MigrateError>;
+    let versions: [(i64, Contract, Preflight, &str, &str); 5] = [
+        (
+            VERSION41,
+            contract41,
+            preflight41,
+            "$migration41$",
+            include_str!("../../../migrations/20240101000041_spot_order_set_generation.sql"),
+        ),
+        (
+            VERSION42,
+            contract42,
+            preflight42,
+            "$migration42$",
+            include_str!("../../../migrations/20240101000042_spot_order_set_sell_aggregates.sql"),
+        ),
+        (
+            VERSION43,
+            contract43,
+            preflight43,
+            "$migration43$",
+            include_str!("../../../migrations/20240101000043_spot_order_set_cancel_membership.sql"),
+        ),
+        (
+            VERSION44,
+            contract44,
+            preflight44,
+            "$migration44$",
+            include_str!("../../../migrations/20240101000044_spot_order_set_cancel_aggregates.sql"),
+        ),
+        (
+            VERSION45,
+            contract45,
+            preflight45,
+            "$migration45$",
+            include_str!(
+                "../../../migrations/20240101000045_spot_order_set_original_cancel_position.sql"
+            ),
+        ),
+    ];
+    for (version, contract, preflight, delimiter, file) in versions {
+        let contract = contract().expect("embedded contract");
+        assert_eq!(contract.sql.as_ref(), file);
+        assert_eq!(contract.version, version);
+        assert!(matches_embedded(&contract.clone(), contract));
+        assert!(preflight(contract).is_ok(), "{version}");
+
+        let mut changed = [
+            contract.clone(),
+            contract.clone(),
+            contract.clone(),
+            contract.clone(),
+            contract.clone(),
+            contract.clone(),
+        ];
+        changed[0].version += 1;
+        changed[1].description = "other".into();
+        changed[2].sql = "SELECT 1".into();
+        changed[3].checksum.to_mut()[0] ^= 1;
+        changed[4].migration_type = MigrationType::ReversibleDown;
+        changed[5].no_tx = true;
+        assert!(changed.iter().all(|candidate| !matches_embedded(candidate, contract)));
+        assert!(preflight(&changed[4]).is_err());
+        assert!(preflight(&changed[5]).is_err());
+
+        let mut canonical = contract.clone();
+        canonical.sql = format!("DO {delimiter}\nBEGIN NULL; END;\n{delimiter};").into();
+        assert!(preflight(&canonical).is_ok(), "{version} refused its canonical shape");
+        let other = if version == VERSION41 {
+            "$migration42$"
+        } else {
+            "$migration41$"
+        };
+        for sql in [
+            format!("DO {delimiter}\nBEGIN NULL; END;\n{delimiter}"),
+            format!("-- header\nDO {delimiter}\nBEGIN NULL; END;\n{delimiter};"),
+            format!("DO {delimiter}\nBEGIN NULL; END;\n{delimiter}; SELECT 1;"),
+            format!(
+                "DO {delimiter}\nBEGIN NULL; END;\n{delimiter}; DO {delimiter}\nBEGIN NULL; END;\n{delimiter};"
+            ),
+            format!("DO {other}\nBEGIN NULL; END;\n{other};"),
+        ] {
+            let mut invalid = contract.clone();
+            invalid.sql = sql.clone().into();
+            assert!(preflight(&invalid).is_err(), "{version} accepted {sql}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn retired_adapter_cannot_be_reused_by_any_migrate_entry() {
     let failure = Failure {

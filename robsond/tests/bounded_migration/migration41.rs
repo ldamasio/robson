@@ -355,9 +355,14 @@ async fn migration41_contended_catalog_rolls_back_with_native_timeout(pool: PgPo
 async fn contended_catalog(pool: &PgPool, mut f: Fixture) -> Result<()> {
     let migration = f.migration;
     let mut holder = pool.begin().await?;
-    sqlx::raw_sql(&format!("{} (held integer)", f.first_create()))
-        .execute(&mut *holder)
-        .await?;
+    let held = if migration.version == VERSION45 {
+        // 45 alters a table of the set: an open reader holds the lock its
+        // ALTER waits for.
+        "LOCK TABLE public.spot_order_set_cancel_members IN ACCESS SHARE MODE".to_owned()
+    } else {
+        format!("{} (held integer)", f.first_create())
+    };
+    sqlx::raw_sql(&held).execute(&mut *holder).await?;
     ensure!(!f.table_exists().await?, "original cannot see the uncommitted holder");
 
     let started = Instant::now();
@@ -744,6 +749,35 @@ async fn migration44_lost_ddl_ack_leaves_three_preceding_migrations(pool: PgPool
     Ok(())
 }
 
+fn original_position_migration() -> &'static Migration {
+    contract45().expect("exact embedded M45")
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn migration45_wrong_binding_refuses_without_sql(pool: PgPool) -> Result<()> {
+    wrong_binding(Fixture::for_migration(&pool, original_position_migration()).await?).await
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn migration45_contended_table_rolls_back_with_native_timeout(pool: PgPool) -> Result<()> {
+    contended_catalog(&pool, Fixture::for_migration(&pool, original_position_migration()).await?)
+        .await
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn migration45_transport_blackhole_fires_whole_apply_deadline(pool: PgPool) -> Result<()> {
+    transport_blackhole(Fixture::for_migration(&pool, original_position_migration()).await?).await
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn migration45_caller_cancellation_after_commit_retires_original(pool: PgPool) -> Result<()> {
+    caller_cancel(Fixture::for_migration(&pool, original_position_migration()).await?).await
+}
+
 #[sqlx::test(migrations = false)]
 #[ignore = "requires isolated PostgreSQL DATABASE_URL"]
 async fn migration45_preserves_legacy_hints_as_incomplete(pool: PgPool) -> Result<()> {
@@ -817,4 +851,131 @@ async fn migration45_lost_commit_ack_leaves_exact_metadata(pool: PgPool) -> Resu
         true,
     )
     .await
+}
+
+/// Rollback boundary of migrations 41 to 45. Once 41 is committed, alone (a
+/// hook that failed on a later one) or with 42 to 45, a binary embedding only
+/// up to 40 (package 2's image) refuses with `VersionMissing(41)` before any
+/// apply, while holding SQLx's advisory key, which only its raw retirement
+/// releases. The canonical binary then skips every durable version by
+/// checksum, applies any missing one and unlocks. History is never rewritten.
+async fn rollback_boundary(pool: &PgPool, only_41: bool) -> Result<()> {
+    const HISTORY: &str = "SELECT version,description,installed_on::text,success,checksum,execution_time FROM _sqlx_migrations ORDER BY version";
+    const KEY: &str = "SELECT classid::bigint,objid::bigint FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND granted AND objsubid=1";
+    const HOLDS: &str = "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND granted AND objsubid=1 AND classid::bigint=$2 AND objid::bigint=$3)";
+    const ALIVE: &str = "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND backend_start::text=$2 AND datname=current_database())";
+    type Row = (i64, String, String, bool, Vec<u8>, i64);
+    let mut f = Fixture::new(pool).await?;
+    let key: (i64, i64) = sqlx::query_as(KEY).bind(f.pid).fetch_one(&mut f.observer).await?;
+    if only_41 {
+        f.adapter.apply(migration()).await?;
+    } else {
+        crate::MIGRATOR.run_direct(&mut f.adapter).await?;
+    }
+    f.adapter.unlock().await?;
+    let held: bool = sqlx::query_scalar(HOLDS)
+        .bind(f.pid)
+        .bind(key.0)
+        .bind(key.1)
+        .fetch_one(&mut f.observer)
+        .await?;
+    ensure!(!held, "the applying adapter released SQLx's key");
+    let landed: Vec<i64> = if only_41 {
+        vec![VERSION41]
+    } else {
+        (VERSION41..=VERSION45).collect()
+    };
+    let options = pool.connect_options();
+    let mut watcher = options.connect().await?;
+    let before: Vec<Row> = sqlx::query_as(HISTORY).fetch_all(&mut watcher).await?;
+    let newer: Vec<(i64, bool)> = before
+        .iter()
+        .filter(|row| row.0 >= VERSION41)
+        .map(|row| (row.0, row.3))
+        .collect();
+    ensure!(newer == landed.iter().map(|v| (*v, true)).collect::<Vec<_>>(), "{newer:?}");
+
+    let mut old = options.connect().await?;
+    let (old_pid, old_birth): (i32, String) = sqlx::query_as(
+        "SELECT pid,backend_start::text FROM pg_stat_activity WHERE pid=pg_backend_pid()",
+    )
+    .fetch_one(&mut old)
+    .await?;
+    let rollback = timeout(ACQUIRE_BOUND, through(VERSION40).run_direct(&mut old)).await;
+    let leaked: bool = sqlx::query_scalar(HOLDS)
+        .bind(old_pid)
+        .bind(key.0)
+        .bind(key.1)
+        .fetch_one(&mut watcher)
+        .await?;
+    drop(old); // Raw drop: the key retires with its backend, never unlock SQL.
+    let retired = timeout(NATIVE_RETIREMENT, async {
+        while sqlx::query_scalar::<_, bool>(ALIVE)
+            .bind(old_pid)
+            .bind(&old_birth)
+            .fetch_one(&mut watcher)
+            .await?
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok::<_, sqlx::Error>(())
+    })
+    .await;
+    let unchanged: Vec<Row> = sqlx::query_as(HISTORY).fetch_all(&mut watcher).await?;
+
+    // The canonical binary migrates through the bounded adapter, as
+    // `robsond db migrate` does.
+    let mut current = BoundedMigration::connect(options.as_ref()).await?;
+    let current_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(current.connection()?)
+        .await?;
+    let resume = APPLY_BOUND.saturating_mul(4).saturating_add(ACQUIRE_BOUND);
+    let canonical = timeout(resume, through(VERSION45).run_direct(&mut current)).await;
+    let kept: bool = sqlx::query_scalar(HOLDS)
+        .bind(current_pid)
+        .bind(key.0)
+        .bind(key.1)
+        .fetch_one(&mut watcher)
+        .await?;
+    let after: Vec<Row> = sqlx::query_as(HISTORY).fetch_all(&mut watcher).await?;
+    eprintln!("rollback41 only_41={only_41} result={rollback:?} leaked={leaked} retired={retired:?} canonical={canonical:?} kept={kept}");
+    ensure!(
+        matches!(rollback, Ok(Err(MigrateError::VersionMissing(v))) if v == VERSION41),
+        "a binary embedding only up to 40 must refuse the committed 41"
+    );
+    ensure!(
+        leaked,
+        "SQLx's refusal boundary changed: the refusing binary does not hold the key"
+    );
+    retired
+        .map_err(|_| anyhow::anyhow!("the refusing backend survived with the key"))?
+        .map_err(anyhow::Error::from)?;
+    ensure!(unchanged == before, "the refusing binary changed migration history");
+    ensure!(
+        matches!(canonical, Ok(Ok(()))),
+        "the canonical binary must resume from the durable history"
+    );
+    ensure!(!kept, "the canonical binary kept the advisory key");
+    ensure!(after[..before.len()] == before[..], "a binary rewrote migration history");
+    let complete: Vec<(i64, bool)> = after
+        .iter()
+        .filter(|row| row.0 >= VERSION41)
+        .map(|row| (row.0, row.3))
+        .collect();
+    ensure!(complete == (VERSION41..=VERSION45).map(|v| (v, true)).collect::<Vec<_>>());
+    Ok(())
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn migration41_to_45_rollback_binary_refuses_committed_41(pool: PgPool) -> Result<()> {
+    rollback_boundary(&pool, false).await
+}
+
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn migration41_partial_rollback_binary_refuses_and_canonical_resumes(
+    pool: PgPool,
+) -> Result<()> {
+    rollback_boundary(&pool, true).await
 }
