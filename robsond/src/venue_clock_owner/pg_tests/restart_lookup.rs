@@ -79,7 +79,7 @@ impl RestartLookup {
             .await
             .map_err(|e| anyhow!("successor budget bootstrap: {e:?}"))?;
         ensure!(trace.issued() == 6);
-        restore::existing_pause(pool, tenant, &mut rows, &self.clock, due, &trace)
+        restore::existing_pause(pool, tenant, rows.pause.as_mut(), &self.clock, due, &trace)
             .await
             .map_err(|e| anyhow!("successor budget pause: {e:?}"))?;
         ensure!(trace.issued() == 6);

@@ -46,6 +46,9 @@ impl Trace {
 
 #[cfg(test)]
 mod fixture_tests;
+// PS-2a: the non-trading bootstrap, restoration and budget on PG16.
+#[cfg(test)]
+mod non_trading_pg_tests;
 // Descriptive page plus private running/failed audit foundation only; no
 // production readiness consumer until the external C2 barrier exists.
 #[allow(

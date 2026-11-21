@@ -1,8 +1,14 @@
 -- P01 is a separately labelled one-statement restoration UPSERT, NOT B01-B06.
--- 8 binds: tenant UUID,venue TEXT,observed UUID,new boot UUID,offset BIGINT,
--- offset ns INTEGER,original new-domain anchor TEXT,frozen audit TIMESTAMPTZ.
+-- 13 binds: tenant UUID,venue TEXT,observed UUID,new boot UUID,offset BIGINT,
+-- offset ns INTEGER,original new-domain anchor TEXT,frozen audit TIMESTAMPTZ,
+-- then the restoration read before it (boot UUID,offset BIGINT,offset ns
+-- INTEGER,anchor TEXT) and its recorded_at in microseconds BIGINT: a row
+-- changed since that read is not updated (0 rows, the start is refused), so
+-- a concurrent restoration is never overwritten.
 -- Requires existing bounded original duration, actual observation identity.
 -- Original fields remain unchanged; no fabricated pause without a head.
+-- recorded_at never moves backward (GREATEST): a backward wall step can never
+-- make budget_pause_moves_forward refuse the restoration.
 INSERT INTO venue_pauses(tenant_id,venue_id,status,code,pause_state,observation_id,
     original_domain,observed_tick,duration_ns,restoration_domain,
     restoration_anchor,deadline_tick,until_at,recorded_at)
@@ -20,9 +26,14 @@ WHERE p.tenant_id=$1::uuid AND p.venue_id=$2::text
 ON CONFLICT(tenant_id,venue_id) DO UPDATE SET
     restoration_domain=EXCLUDED.restoration_domain,
     restoration_anchor=EXCLUDED.restoration_anchor,
-    deadline_tick=EXCLUDED.deadline_tick,recorded_at=EXCLUDED.recorded_at
+    deadline_tick=EXCLUDED.deadline_tick,
+    recorded_at=GREATEST(EXCLUDED.recorded_at,venue_pauses.recorded_at)
 WHERE venue_pauses.observation_id=EXCLUDED.observation_id
   AND venue_pauses.restoration_domain IS DISTINCT FROM EXCLUDED.restoration_domain
+  AND venue_pauses.restoration_domain IS NOT DISTINCT FROM
+      ROW('boottime'::text,$9::uuid,$10::bigint,$11::integer)::budget_clock_domain_v38
+  AND venue_pauses.restoration_anchor=$12::text::numeric
+  AND (extract(epoch FROM venue_pauses.recorded_at)*1000000)::bigint=$13::bigint
   AND (venue_pauses.status,venue_pauses.code,venue_pauses.original_domain,
        venue_pauses.observed_tick,venue_pauses.duration_ns)
       IS NOT DISTINCT FROM

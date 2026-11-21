@@ -43,7 +43,7 @@ type ObservedState = (Uuid, Uuid, i64, i64, String, Option<Uuid>, Option<Uuid>, 
 pub(crate) struct BootstrapRows {
     pub(super) start: TickCapture,
     pub(super) active: Vec<(Uuid, Option<TickCapture>)>,
-    pub(super) pause: Option<PauseValue>,
+    pub(crate) pause: Option<PauseValue>,
     // Retain the observed state; none of these descriptive fields grants
     // current-domain comparability or production readiness.
     _state: ObservedState,
@@ -90,7 +90,7 @@ fn epochs(row: &PgRow, group: &str, now: i128) -> Result<Vec<Uuid>, BudgetError>
 }
 
 pub(super) fn decode(row: &PgRow, input: &BootstrapInput) -> Result<BootstrapRows, BudgetError> {
-    if row.len() != 58
+    if row.len() != 59
         || !get::<bool>(row, "state_ok")?
         || !get::<bool>(row, "audit_ok")?
         || get::<bool>(row, "future_same_domain_epoch")?
@@ -183,10 +183,10 @@ pub(super) fn decode(row: &PgRow, input: &BootstrapInput) -> Result<BootstrapRow
 pub(super) fn check_epoch(
     row: &PgRow,
     epoch: &EpochStart,
-    input: &BootstrapInput,
+    start: TickCapture,
     audit: DateTime<Utc>,
 ) -> Result<(), BudgetError> {
-    let domain = input.start.domain();
+    let domain = start.domain();
     let (seconds, nanos) = domain.offset();
     let clean = epoch.predecessor_epoch_id.map(|_| epoch.predecessor.unclean_reason().is_none());
     if row.len() != 11
@@ -198,7 +198,7 @@ pub(super) fn check_epoch(
         || get::<i32>(row, "domain_offset_ns")?
             != i32::try_from(nanos).map_err(|_| BudgetError::Invalid)?
         || integer(&get::<String>(row, "start_tick_text")?, get(row, "start_tick_fits")?)?
-            != i128::try_from(input.start.nanoseconds()).map_err(|_| BudgetError::Invalid)?
+            != i128::try_from(start.nanoseconds()).map_err(|_| BudgetError::Invalid)?
         || get::<Option<Uuid>>(row, "predecessor_epoch")? != epoch.predecessor_epoch_id
         || get::<Option<bool>>(row, "predecessor_clean")? != clean
         || get::<i64>(row, "recorded_at_us")? != audit.timestamp_micros()
