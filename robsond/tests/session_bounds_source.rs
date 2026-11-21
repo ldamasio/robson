@@ -840,3 +840,25 @@ fn package3_connection_owners_inherit_the_pool_bounds() {
         "name statement_timeout"
     ]);
 }
+
+/// Package 3's cold installer and the cold owner's capture, with the rows it
+/// retains, run only in tests: neither is production code. Production keeps
+/// the owner's anchor read, which the cold snapshot uses.
+#[test]
+fn package3_test_only_owners_stay_out_of_production() {
+    let files: BTreeSet<String> = production_sources().into_iter().map(|s| s.file).collect();
+    assert!(
+        !files.iter().any(|file| file.starts_with("spot_order_set_store/cold_install")),
+        "the cold installer is production code: {files:?}"
+    );
+    let owner = source("spot_order_set_store/cold_owner.rs");
+    assert!(owner.contains("pub(super) async fn read_anchor("), "{owner}");
+    for test_only in [
+        "fn capture(",
+        "ColdOwnerCut",
+        "CapturedRows",
+        "impl ColdSourceSink",
+    ] {
+        assert!(!owner.contains(test_only), "{test_only} is production code");
+    }
+}

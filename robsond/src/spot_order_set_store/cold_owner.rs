@@ -1,22 +1,30 @@
 //! Typed source cut for the private cold-generation owner. The external
 //! restore identity is correlation data. It cannot authorize publication.
+#[cfg(test)]
 use std::{collections::BTreeMap, mem::size_of};
 
-use sqlx::{PgConnection, PgPool};
+use sqlx::PgConnection;
+#[cfg(test)]
+use sqlx::PgPool;
+#[cfg(test)]
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use super::cold_audit::{ColdAuditRefusal, ColdAuditScope, Stage};
+// The owner's capture and its retained rows are test-only: production
+// compiles only the anchor read the cold snapshot uses.
+#[cfg(test)]
 use super::{
-    cold_audit::{
-        audit, ColdAuditRefusal, ColdAuditScope, ColdSourceReceipt, ColdSourceSink, PageBudget,
-        SinkFull, Stage,
-    },
+    cold_audit::{audit, ColdSourceReceipt, ColdSourceSink, PageBudget, SinkFull},
     cold_source::{AttemptSource, Edge, IntentSource, OrderSource, RouteSource, TEXT_LIMIT},
 };
 
 const ANCHOR: &str = include_str!("cold_owner_anchor.sql");
+#[cfg(test)]
 const PAGES: u32 = 8;
+#[cfg(test)]
 const ROWS: usize = 63;
+#[cfg(test)]
 const BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +134,7 @@ pub(super) async fn read_anchor(
     })
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct ColdOwnerCut {
     pub(super) anchor: ObservedAnchor,
@@ -134,6 +143,7 @@ pub(crate) struct ColdOwnerCut {
     rows: CapturedRows,
 }
 
+#[cfg(test)]
 impl ColdOwnerCut {
     pub(crate) fn intents(&self) -> &[IntentSource] {
         &self.rows.intents
@@ -149,6 +159,7 @@ impl ColdOwnerCut {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn capture(
     pool: &PgPool,
     request: &OwnerRequest<'_>,
@@ -186,6 +197,7 @@ pub(crate) async fn capture(
     })
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct CapturedRows {
     intents: Vec<IntentSource>,
@@ -195,6 +207,7 @@ struct CapturedRows {
     bytes: usize,
 }
 
+#[cfg(test)]
 impl CapturedRows {
     fn new() -> Self {
         Self {
@@ -250,10 +263,12 @@ impl CapturedRows {
     }
 }
 
+#[cfg(test)]
 fn text_len(values: &[Option<&str>]) -> usize {
     values.iter().flatten().map(|text| text.len()).sum()
 }
 
+#[cfg(test)]
 fn append<T: Clone>(
     retained: &mut Vec<T>,
     bytes: &mut usize,
@@ -270,6 +285,7 @@ fn append<T: Clone>(
     Ok(())
 }
 
+#[cfg(test)]
 impl ColdSourceSink for CapturedRows {
     fn intents(&mut self, rows: &[IntentSource]) -> Result<(), SinkFull> {
         append(&mut self.intents, &mut self.bytes, rows, |r| {
