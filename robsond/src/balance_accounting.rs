@@ -2,18 +2,24 @@
 //! (ADR-0056 step 8l-4; PLAN-r4 §6.5, §6.7).
 //!
 //! On a balance-account daemon a stream suspension's registration and its
-//! clearing, an incident and a release bump `accounting_state.version` in
-//! their own transaction and, when an order-set generation is installed,
-//! advance it by the exact non-membership CAS of `trade_generation.sql`: none
-//! of them touches a SELL/CANCEL membership input. A missing CAS row refuses,
-//! and the caller rolls its whole transaction back. A position account
-//! (USD-M) builds no context, so its statements are the ones it always sent.
-use std::sync::{Arc, PoisonError, RwLock};
+//! clearing, an incident, a release and every `monthly_state` write bump
+//! `accounting_state.version` in their own transaction and, when an order-set
+//! generation is installed, advance it by the exact non-membership CAS of
+//! `trade_generation.sql`: none of them touches a SELL/CANCEL membership
+//! input. A missing CAS row refuses, and the caller rolls its whole
+//! transaction back. A position account (USD-M) builds no context, so its
+//! statements are the ones it always sent.
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, PoisonError, RwLock},
+};
 
 use robson_exec::{
     order_journal::DEFAULT_ACCOUNT_SCOPE,
     venue::{AccountKind, VenueId},
 };
+use robson_projector::AccountingStep;
 use sqlx::PgConnection;
 use tracing::Instrument as _;
 use uuid::Uuid;
@@ -66,7 +72,8 @@ impl GenerationCell {
 }
 
 /// A balance-account daemon's accounting identity, built by the daemon and
-/// consumed by its suspension clear and the accounting writers after it.
+/// consumed by its projector, its suspension clear and the accounting writers
+/// after it.
 #[derive(Debug, Clone)]
 pub(crate) struct BalanceAccounting {
     pub(crate) tenant_id: Uuid,
@@ -179,4 +186,30 @@ impl BalanceAccounting {
         }
         Ok(())
     }
+}
+
+/// The projector's step: the bounds, then [`BalanceAccounting::advance`].
+impl AccountingStep for BalanceAccounting {
+    fn run<'c>(
+        &'c self,
+        connection: &'c mut PgConnection,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'c>> {
+        Box::pin(async move {
+            sqlx::query(BOUNDS)
+                .execute(&mut *connection)
+                .instrument(
+                    tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            self.advance(connection).await.map(drop).map_err(|error| error.to_string())
+        })
+    }
+}
+
+/// What every projector caller on a balance-account daemon passes.
+pub(crate) fn projector_step(
+    accounting: Option<&BalanceAccounting>,
+) -> Option<&dyn AccountingStep> {
+    accounting.map(|accounting| accounting as &dyn AccountingStep)
 }

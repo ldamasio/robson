@@ -47,7 +47,7 @@ use robson_exec::{
     ActionResult, ExchangePort, ExchangePosition, ExecError, Executor, OhlcvPort, StubOhlcv,
 };
 #[cfg(feature = "postgres")]
-use robson_projector::apply_event_to_projections;
+use robson_projector::apply_event_to_projections_with;
 use robson_store::Store;
 use rust_decimal::Decimal;
 #[cfg(feature = "postgres")]
@@ -249,7 +249,7 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     #[cfg(feature = "postgres")]
     event_log_tenant_id: Option<Uuid>,
     /// A balance-account daemon's accounting context (ADR-0056 step 8l-4),
-    /// passed by the startup stream repair.
+    /// passed by the append path's apply and the startup stream repair.
     #[cfg(feature = "postgres")]
     balance_accounting: Option<crate::balance_accounting::BalanceAccounting>,
 }
@@ -1347,8 +1347,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self
     }
 
-    /// Run this manager's suspension clears as a balance-account daemon's
-    /// (ADR-0056 step 8l-4). `None` changes nothing.
+    /// The context the daemon's projection worker shares (ADR-0056 step
+    /// 8l-4): the same generation cell as this manager's and the journal's.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn balance_accounting(
+        &self,
+    ) -> Option<crate::balance_accounting::BalanceAccounting> {
+        self.balance_accounting.clone()
+    }
+
+    /// Run this manager's `monthly_state` writes and suspension clears as a
+    /// balance-account daemon's (ADR-0056 step 8l-4). `None` changes nothing.
     #[cfg(feature = "postgres")]
     pub(crate) fn with_balance_accounting(
         mut self,
@@ -1401,7 +1410,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             (Some(pool), Some(tid)) => (pool, *tid),
             _ => return Ok(()), // No eventlog configured — in-memory only mode
         };
-        match Self::append_and_apply(pool, tenant_id, &stream_key, event).await {
+        let accounting = self.balance_accounting.as_ref();
+        match Self::append_and_apply(pool, tenant_id, &stream_key, event, accounting).await {
             Ok(seq) => {
                 tracing::debug!(
                     event_type = event.event_type(),
@@ -1437,6 +1447,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         tenant_id: Uuid,
         stream_key: &str,
         event: &Event,
+        accounting: Option<&crate::balance_accounting::BalanceAccounting>,
     ) -> Result<i64, (Option<i64>, String)> {
         let event_type = event.event_type().to_string();
 
@@ -1504,7 +1515,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             )
         })?;
 
-        apply_event_to_projections(pool, &envelope).await.map_err(|e| {
+        let step = crate::balance_accounting::projector_step(accounting);
+        apply_event_to_projections_with(pool, &envelope, step).await.map_err(|e| {
             (
                 Some(envelope.seq),
                 format!(
@@ -14130,7 +14142,7 @@ mod tests {
                 WriterCase::Projector { name, event_type, payload } => {
                     let envelope =
                         projector_test_envelope(event_type, payload, target, index as i64 + 1);
-                    apply_event_to_projections(&pool, &envelope).await.unwrap();
+                    robson_projector::apply_event_to_projections(&pool, &envelope).await.unwrap();
                     name
                 },
                 WriterCase::PeakRefresh => {
@@ -14204,7 +14216,7 @@ mod tests {
             now,
             1,
         );
-        apply_event_to_projections(&pool, &envelope).await.unwrap();
+        robson_projector::apply_event_to_projections(&pool, &envelope).await.unwrap();
 
         // No row, so no zero: the base is the configured capital, and invalid
         // only because the month's reset has not landed.
