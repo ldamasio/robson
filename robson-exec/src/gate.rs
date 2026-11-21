@@ -66,11 +66,12 @@ use tracing::{error, warn};
 
 use crate::order_journal::{self, OPERATIONS_CAPACITY};
 
-#[cfg(feature = "crash-points")]
 mod pending_execution;
+pub use pending_execution::PendingEvidence;
 #[cfg(feature = "crash-points")]
 pub use pending_execution::{
-    PendingExecutionEvidence, PendingExecutionOwner, PendingExecutionRegistration, PendingExecutionTicket,
+    PendingExecutionEvidence, PendingExecutionOwner, PendingExecutionRegistration,
+    PendingExecutionTicket,
 };
 
 /// Ordinary API operations at once.
@@ -483,9 +484,23 @@ pub(crate) struct GateState {
     orphan_cancels_passed: u64,
     orphan_cancels_withheld: u64,
     entries_refused_ownership: u64,
-    /// The controlled composition's slot; never part of the snapshot.
-    #[cfg(feature = "crash-points")]
+    /// The invalidity generation (ADR-0056 step 8l-2, v16 §3.7.3 R5-1): moved
+    /// by every occurrence and every pending-evidence rise, never by a fall or
+    /// a release. The incident generation is not reused: a rise must not close
+    /// the fence. Per process, from 0: a capture never outlives its epoch.
+    invalidity: u64,
+    /// The pending-evidence slot, `None` until a receiver binds it; never
+    /// part of the snapshot.
     pending_execution: Option<pending_execution::PendingExecutionSlot>,
+}
+
+/// The marks a cash observation, a snapshot or an entry authorization
+/// captures and checks again (ADR-0056 step 8l-2): read together, under the
+/// gate mutex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidityMarks {
+    pub generation: u64,
+    pub pending: PendingEvidence,
 }
 
 impl GateState {
@@ -510,9 +525,16 @@ impl GateState {
             orphan_cancels_passed: 0,
             orphan_cancels_withheld: 0,
             entries_refused_ownership: 0,
-            #[cfg(feature = "crash-points")]
+            invalidity: 0,
             pending_execution: None,
         }
+    }
+
+    /// Move the invalidity generation; the caller holds the gate mutex. 2^64
+    /// moves cannot happen in one process, so wrapping never returns a value
+    /// a capture still holds.
+    fn invalidate(&mut self) {
+        self.invalidity = self.invalidity.wrapping_add(1);
     }
 
     /// Whether an entry may start its send now. Anything else may in every
@@ -552,6 +574,7 @@ impl GateState {
             self.latch.store(true, Ordering::SeqCst);
         }
         self.fenced = true;
+        self.invalidate();
         let exhausted = self.counter < GENERATION_COUNTER_LIMIT && {
             self.counter += 1;
             self.counter == GENERATION_COUNTER_LIMIT
@@ -721,6 +744,23 @@ impl OperationGate {
     /// The current generation, which a release must quote.
     pub fn generation(&self) -> i64 {
         self.lock().generation()
+    }
+
+    /// The invalidity generation and the pending evidence, read together
+    /// under the mutex (ADR-0056 step 8l-2). No production caller yet: the
+    /// cash writer (8l-3), the snapshot (8l-8) and the entry authorization
+    /// (8l-7) capture them and check them again.
+    pub fn invalidity_marks(&self) -> InvalidityMarks {
+        let state = self.lock();
+        InvalidityMarks {
+            generation: state.invalidity,
+            pending: state.pending_evidence(),
+        }
+    }
+
+    /// The pending evidence alone; see [`PendingEvidence`].
+    pub fn pending_evidence(&self) -> PendingEvidence {
+        self.lock().pending_evidence()
     }
 
     /// The open incidents as this process knows them: those loaded at start
@@ -1103,5 +1143,78 @@ mod tests {
         let started = Instant::now();
         assert!(!gate.wait_no_permits(started + std::time::Duration::from_secs(10)).await);
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(10));
+    }
+
+    /// Every occurrence moves the invalidity generation once, under the
+    /// mutex; the release that opens the fence again moves nothing.
+    #[test]
+    fn occurrence_moves_the_invalidity_generation() {
+        let gate = gate();
+        let mut expected = 0;
+        assert_eq!(gate.invalidity_marks().generation, expected);
+        for reason in IncidentReason::ALL {
+            gate.record(reason);
+            expected += 1;
+            assert_eq!(gate.invalidity_marks().generation, expected, "{reason:?}");
+        }
+        assert_eq!(gate.mutation("POST /order"), Ok(()), "unpermitted: an occurrence");
+        gate.abort(OperationKind::Arm);
+        assert_eq!(gate.invalidity_marks().generation, expected + 2);
+
+        let fresh = self::gate();
+        fresh.record(IncidentReason::UncertainOutcome);
+        assert!(fresh.release_through(fresh.generation()), "a non-latching release opens");
+        assert_eq!(fresh.invalidity_marks().generation, 1, "a release never moves it");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+
+        /// Concurrent invalidators of every reason and a reader: each read is
+        /// ordered wholly before or after each move, so reads never go back
+        /// and the final value counts every move.
+        #[test]
+        fn invalidity_generation_counts_every_concurrent_move(
+            plan in proptest::collection::vec((0..IncidentReason::ALL.len(), 1_u64..120), 1..6)
+        ) {
+            let gate = gate();
+            let total: u64 = plan.iter().map(|(_, moves)| moves).sum();
+            std::thread::scope(|scope| {
+                for &(reason, moves) in &plan {
+                    let gate = &gate;
+                    scope.spawn(move || {
+                        for _ in 0..moves {
+                            gate.record(IncidentReason::ALL[reason]);
+                        }
+                    });
+                }
+                scope.spawn(|| {
+                    let mut last = 0;
+                    while last < total {
+                        let read = gate.invalidity_marks().generation;
+                        assert!(read >= last, "{read} after {last}");
+                        last = read;
+                    }
+                });
+            });
+            proptest::prop_assert_eq!(gate.invalidity_marks().generation, total);
+        }
+    }
+
+    /// No receiver can be bound in a production build, so no evidence can be
+    /// registered: unbound reads as none pending for publication, and stays
+    /// distinguishable for the entry path (8l-7).
+    #[test]
+    fn unbound_slot_reads_no_pending() {
+        let gate = gate();
+        assert_eq!(gate.pending_evidence(), PendingEvidence::Unbound);
+        assert!(!gate.pending_evidence().blocks_publication());
+        assert!(PendingEvidence::Pending.blocks_publication());
+        assert!(!PendingEvidence::Clear.blocks_publication());
+        gate.record(IncidentReason::StreamSuspended);
+        assert_eq!(gate.invalidity_marks(), InvalidityMarks {
+            generation: 1,
+            pending: PendingEvidence::Unbound
+        });
     }
 }
