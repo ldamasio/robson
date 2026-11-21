@@ -552,7 +552,7 @@ fn n5_reference_lines(path: &Path) -> &'static [&'static str] {
         ],
         Some("robson-connectors/src/binance_rest.rs") => &[
             r#"const ENDPOINT: &str = "/api/v3/account/commission";"#,
-            r#"let result = client.bind_spot_commission(single_shot().unwrap(), "BTCUSDT", 1_800_000_000_000);"#,
+            r#"client.bind_spot_commission(single_shot().unwrap(), "BTCUSDT", 1_800_000_000_000);"#,
         ],
         Some("robsond/src/venue_clock_owner/commission.rs") => &[
             "use robson_connectors::binance::spot::PreparedSpotCommission;",

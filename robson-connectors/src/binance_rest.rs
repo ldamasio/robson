@@ -2315,7 +2315,7 @@ mod tests {
             ("    fn build_signed_query(", BUILD_SIGNED_QUERY),
             (
                 "    pub(crate) fn bind_spot_commission(",
-                "a1c0ee8006959b079a865bd367aa591229781bf02ab3870c799e92a377667c87",
+                "8cc7de0b875b4a7448d2d425d3a2e5f3993bca25b3ae04bc1b52e9c6627efa6a",
             ),
             ("    async fn legacy_answer(&self, request: RequestBuilder)", ANSWER),
             ("    async fn exchange(&self, request: RequestBuilder)", EXCHANGE),
