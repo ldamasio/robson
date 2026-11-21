@@ -201,11 +201,12 @@ async fn entry_partition_first_set_writes_once_with_measured_statements(
                     ensure!(super::version(&pool, b).await? == version + 1);
                     exact_reference(&pool, b).await?;
                 }
-                // (c) The identical terminal replay is one read and no write.
+                // (c) The identical terminal replay writes nothing: BEGIN, the
+                // server bounds, one read and ROLLBACK (main's d8e002e1).
                 let before = snapshot(&pool).await;
                 let (changed, count) =
                     measured(&ledger, &proxy, &terminal, &link, later(3)).await?;
-                ensure!(!changed && count == 1, "{case}: replay {count}");
+                ensure!(!changed && count == 4, "{case}: replay {count}");
                 ensure!(snapshot(&pool).await == before, "{case}: replay changed rows");
                 counts.push(count);
                 proxied.close().await;

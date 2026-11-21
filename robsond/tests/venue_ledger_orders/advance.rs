@@ -371,12 +371,14 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
         let projected = super::super::projection_snapshot(&fixture, &current).await?;
 
         // The same original record through the same projected writer, at its
-        // original receive mark: one read, no commit, still pending.
+        // original receive mark: no commit, still pending. Four statements
+        // (BEGIN, the server bounds, one read, ROLLBACK): main's bounded
+        // pre-read (d8e002e1).
         let before = current_ledger.statements_total();
         let (changed, commit) = receiver.replay_original(&record, evidence).await?;
         let duplicate_sql = current_ledger.statements_total() - before;
         let duplicate_commits = usize::from(commit);
-        ensure!(!changed && duplicate_commits == 0 && duplicate_sql == 1);
+        ensure!(!changed && duplicate_commits == 0 && duplicate_sql == 4);
         ensure!(receiver.pending() == Some(evidence));
         ensure!(
             support::snapshot(&fixture).await == committed

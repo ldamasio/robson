@@ -508,13 +508,17 @@ async fn projected_native_order_commit_coordinate_only_follows_confirmed_commit(
     ensure!(commit.accounting_version() == v + 1);
     exact_reference(&pool, &b).await?;
 
-    // The same record at the exact same SeenAt is one read and no coordinate.
+    // The same record at the exact same SeenAt writes nothing and has no
+    // coordinate: BEGIN, the server bounds, one read and ROLLBACK (main's
+    // d8e002e1).
     let commands = ledger.statements_total();
     proxy.enable_exact_query_trace(16);
     let (result, commit) = ledger.record_order_observed(&first, &first_link, later(1)).await?;
     let trace = proxy.query_trace();
     ensure!(!result.changed && commit.is_none());
-    ensure!(ledger.statements_total() - commands == 1 && trace.len() == 1, "{trace:?}");
+    ensure!(ledger.statements_total() - commands == 4 && trace.len() == 4, "{trace:?}");
+    ensure!(trace.first().is_some_and(|cmd| cmd == "BEGIN"), "{trace:?}");
+    ensure!(trace.last().is_some_and(|cmd| cmd == "ROLLBACK"), "{trace:?}");
     ensure!(version(&pool, &b).await? == v + 1);
 
     let (pid, birth): (i32, String) = sqlx::query_as(
@@ -724,7 +728,8 @@ async fn projected_native_order_pending_ack_preserves_newer_execution(pool: PgPo
     let replay = receiver
         .register(f.record(1, same.executed, OrderPhase::Live), same)?
         .context("same ticket")?;
-    ensure!(replay.persist().await?.is_none() && ledger.statements_total() - before == 1);
+    // No write: BEGIN, the server bounds, one read and ROLLBACK (d8e002e1).
+    ensure!(replay.persist().await?.is_none() && ledger.statements_total() - before == 4);
     ensure!(
         receiver.pending() == Some(same),
         "no-op returned no proof and preserves pending"
