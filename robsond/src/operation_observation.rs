@@ -1,18 +1,26 @@
 //! Fixed-size whole-scan observations. Query attempts are not wire
 //! acknowledgements.
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, LazyLock,
+//!
+//! Counted operation roots: `reconciliation_work` (its own metrics, as they
+//! always were) and, for every other job, [`job`]'s root (8p-O), labelled by
+//! the job's name in `robsond_operation_*`. Each `operation_io` attempt counts
+//! once, under its nearest root.
+use std::{
+    future::Future,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, LazyLock,
+    },
 };
 
 use prometheus::{
-    register_histogram, register_int_counter, register_int_counter_vec, register_int_gauge,
-    Histogram, IntCounter, IntCounterVec, IntGauge,
+    register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
+    register_int_gauge, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
 };
 use tracing::{
     field::{Field, Visit},
     span::{Attributes, Id, Record},
-    Subscriber,
+    Instrument as _, Subscriber,
 };
 use tracing_subscriber::{
     layer::{Context, Layer},
@@ -32,6 +40,30 @@ const ENDPOINTS: [&str; 10] = [
     "klines",
     "other",
 ];
+
+/// A counted job: one root per job, alerted above the same threshold (8p-O).
+/// A job root counts the attempts it reaches but a nested root's, and each
+/// job operation nested in it as one: a job whose proven count exceeds 15
+/// splits its operations (8p PLAN-r3 §7.2's), and a loop of them still shows
+/// in its parent's score.
+#[derive(Clone, Copy, Debug)]
+pub enum Job {
+    /// A balance account's boundary poll (partitions, pending rows, the
+    /// month's view: 9 statements; with the zero reset and its apply, 11) and
+    /// its startup's pending rows.
+    BoundaryTick,
+    /// 8p-2's zero reset append: 8 statements, 4 refused, 7 deduplicated.
+    BoundaryZeroReset,
+    /// A month reset's fetch and apply: 7 statements, 6 without a generation.
+    BoundaryApply,
+}
+/// The [`Job`]s' `operation` labels, in its order.
+const JOBS: [&str; 3] = ["boundary_tick", "boundary_zero_reset", "boundary_apply"];
+/// Serializes the tests that run job roots, so each reads its own global
+/// deltas exactly.
+#[cfg(test)]
+pub(crate) static JOB_METRICS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Clone, Copy)]
 #[repr(u64)]
 enum IoKind {
@@ -107,6 +139,39 @@ static LOCAL: LazyLock<IntCounter> = LazyLock::new(|| {
     )
     .unwrap()
 });
+static JOB_OVER: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "robsond_operation_over_threshold_total",
+        "Job operations crossing DB attempts, twice HTTP submissions and nested job operations > 15",
+        &["operation"]
+    )
+    .unwrap()
+});
+static JOB_INCOMPLETE: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "robsond_operation_incomplete_total",
+        "Job operations with incomplete attribution or saturated counters",
+        &["operation"]
+    )
+    .unwrap()
+});
+static JOB_WORK: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "robsond_operation_work",
+        "Work per job operation: DB attempts, twice HTTP submissions and nested job operations",
+        &["operation"],
+        vec![0., 1., 2., 4., 8., 15., 16., 24., 32., 64., 128., 256., 1024.]
+    )
+    .unwrap()
+});
+static JOB_OUTCOMES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "robsond_operation_observations_total",
+        "Final observed outcome of each job operation",
+        &["operation", "outcome"]
+    )
+    .unwrap()
+});
 
 #[derive(Default)]
 struct Counts {
@@ -119,11 +184,22 @@ struct Counts {
     over: AtomicBool,
     incomplete: AtomicBool,
     outcome: AtomicU64,
+    /// `None` for `reconciliation_work`; a job root's index in [`JOBS`].
+    job: Option<usize>,
 }
 impl Counts {
     fn incomplete(&self) {
         if !self.incomplete.swap(true, Ordering::Relaxed) {
-            INCOMPLETE.inc();
+            match self.job {
+                None => INCOMPLETE.inc(),
+                Some(job) => JOB_INCOMPLETE.with_label_values(&[JOBS[job]]).inc(),
+            }
+        }
+    }
+    /// A reconciliation scan's global attempt counter; a job has none.
+    fn reconciliation(&self, counter: &IntCounter) {
+        if self.job.is_none() {
+            counter.inc();
         }
     }
     fn add(&self, counter: &AtomicU64, amount: u64) -> u64 {
@@ -143,22 +219,24 @@ impl Counts {
         let weight = match IoKind::from_code(kind) {
             Some(IoKind::Query | IoKind::Begin | IoKind::Commit | IoKind::RollbackQueued) => {
                 self.add(&self.db, 1);
-                DB.inc();
+                self.reconciliation(&DB);
                 1
             },
             Some(IoKind::Http) => {
                 self.add(&self.http, 1);
-                HTTP.inc();
+                self.reconciliation(&HTTP);
                 let index = endpoint.and_then(|v| usize::try_from(v).ok()).filter(|v| *v < 9);
                 if index.is_none() {
                     self.incomplete();
                 }
-                HTTP_ENDPOINT.with_label_values(&[ENDPOINTS[index.unwrap_or(9)]]).inc();
+                self.reconciliation(
+                    &HTTP_ENDPOINT.with_label_values(&[ENDPOINTS[index.unwrap_or(9)]]),
+                );
                 2
             },
             Some(IoKind::Local) => {
                 self.add(&self.local, 1);
-                LOCAL.inc();
+                self.reconciliation(&LOCAL);
                 0
             },
             Some(IoKind::Incomplete) => {
@@ -170,8 +248,17 @@ impl Counts {
                 0
             },
         };
+        self.score(weight);
+    }
+    /// Add `weight` to the score, alerting once when it crosses the threshold.
+    fn score(&self, weight: u64) {
         let score = self.add(&self.score, weight);
         if score > REVIEW_THRESHOLD && !self.over.swap(true, Ordering::Relaxed) {
+            if let Some(job) = self.job {
+                JOB_OVER.with_label_values(&[JOBS[job]]).inc();
+                tracing::warn!(target: "robsond::operation_summary", operation = JOBS[job], score, threshold = REVIEW_THRESHOLD, "Operation work requires cardinality review and optimization");
+                return;
+            }
             OVER.inc();
             tracing::warn!(target: "robsond::operation_summary", score, threshold = REVIEW_THRESHOLD, "Reconciliation work requires cardinality review and optimization");
         }
@@ -189,6 +276,7 @@ struct Fields {
     kind: Option<u64>,
     endpoint: Option<u64>,
     outcome: Option<u64>,
+    operation: Option<u64>,
 }
 impl Visit for Fields {
     fn record_u64(&mut self, field: &Field, value: u64) {
@@ -196,6 +284,7 @@ impl Visit for Fields {
             "io_kind" => self.kind = Some(value),
             "io_endpoint" => self.endpoint = Some(value),
             "outcome" => self.outcome = Some(value),
+            "operation" => self.operation = Some(value),
             _ => {},
         }
     }
@@ -232,6 +321,24 @@ pub fn initialize_metrics() {
     for outcome in ["success", "error", "cancelled"] {
         OUTCOMES.with_label_values(&[outcome]);
     }
+    for job in JOBS {
+        JOB_OVER.with_label_values(&[job]);
+        JOB_INCOMPLETE.with_label_values(&[job]);
+        JOB_WORK.with_label_values(&[job]);
+        for outcome in ["success", "error", "cancelled"] {
+            JOB_OUTCOMES.with_label_values(&[job, outcome]);
+        }
+    }
+}
+/// Count `work` as one operation of `job`: each `operation_io` attempt it
+/// reaches (a nested root's excepted), alerted above 15, and its outcome from
+/// its result; dropped unfinished, it is cancelled and incomplete. Adopting a
+/// root is `job(Job::X, work).await` around the job's existing future.
+pub async fn job<T, E>(job: Job, work: impl Future<Output = Result<T, E>>) -> Result<T, E> {
+    let root = tracing::info_span!(target: "robson_operation", "operation_work", operation = job as u64, outcome = tracing::field::Empty);
+    let result = work.instrument(root.clone()).await;
+    root.record("outcome", if result.is_ok() { 1_u64 } else { 2_u64 });
+    result
 }
 /// Independent of the text log filter. No SQL/URL/identifier fields are
 /// visited.
@@ -262,6 +369,21 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for OperationLayer {
         }
         let mut fields = Fields::default();
         attrs.record(&mut fields);
+        if attrs.metadata().name() == "operation_work" {
+            let job = fields.operation.and_then(|job| usize::try_from(job).ok());
+            if let Some(job) = job.filter(|job| *job < JOBS.len()) {
+                // One unit of its parent job's work, whatever its own count.
+                let parent = span.scope().skip(1).find_map(|parent| {
+                    parent.extensions().get::<Root>().map(|root| Arc::clone(&root.0))
+                });
+                if let Some(parent) = parent.filter(|parent| parent.job.is_some()) {
+                    parent.score(1);
+                }
+                let counts = Counts { job: Some(job), ..Counts::default() };
+                span.extensions_mut().insert(Root(Arc::new(counts)));
+            }
+            return;
+        }
         let Some(kind) = fields.kind else {
             return;
         };
@@ -310,16 +432,21 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for OperationLayer {
             if counts.outcome.load(Ordering::Relaxed) == 0 {
                 counts.incomplete();
             }
-            OUTCOMES
-                .with_label_values(&[match counts.outcome.load(Ordering::Relaxed) {
-                    1 => "success",
-                    2 => "error",
-                    _ => "cancelled",
-                }])
-                .inc();
+            let outcome = match counts.outcome.load(Ordering::Relaxed) {
+                1 => "success",
+                2 => "error",
+                _ => "cancelled",
+            };
             // Prometheus requires f64; this is a non-financial integer work count.
             #[allow(clippy::disallowed_types)]
             let work_count_for_histogram = counts.score.load(Ordering::Relaxed) as f64;
+            if let Some(job) = counts.job {
+                JOB_OUTCOMES.with_label_values(&[JOBS[job], outcome]).inc();
+                JOB_WORK.with_label_values(&[JOBS[job]]).observe(work_count_for_histogram);
+                tracing::info!(target: "robsond::operation_summary", operation = JOBS[job], db_attempts = counts.db.load(Ordering::Relaxed), http_submissions = counts.http.load(Ordering::Relaxed), incomplete = counts.incomplete.load(Ordering::Relaxed), outcome, "Operation observation ended");
+                return;
+            }
+            OUTCOMES.with_label_values(&[outcome]).inc();
             WORK.observe(work_count_for_histogram);
             PENDING.dec();
             tracing::info!(target: "robsond::operation_summary", db_attempts = counts.db.load(Ordering::Relaxed), http_submissions = counts.http.load(Ordering::Relaxed), local_calls = counts.local.load(Ordering::Relaxed), incomplete = counts.incomplete.load(Ordering::Relaxed), outcome = counts.outcome.load(Ordering::Relaxed), "Reconciliation observation ended after its retained work");
@@ -335,14 +462,41 @@ pub(crate) mod probe {
 
     use super::*;
     type Latest = Arc<Mutex<Option<Arc<Counts>>>>;
+    type Jobs = Arc<Mutex<Vec<Arc<Counts>>>>;
+    type Events = Arc<Mutex<Vec<(&'static str, u64)>>>;
+    /// A job root as [`Probe::take_jobs`] reports it.
+    pub(crate) type JobObservation = (&'static str, [u64; 4], u64, bool, bool, u64);
+    /// The latest reconciliation root, every job root, and each attempt a job
+    /// root owns, in the order of their first enter (8p-O).
     #[derive(Clone)]
-    struct Capture(Latest);
+    struct Capture(Latest, Jobs, Events);
+    /// An attempt whose first enter is logged.
+    struct Logged;
     impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
         fn on_new_span(&self, _: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
             if let Some(span) = ctx.span(id) {
                 if let Some(root) = span.extensions().get::<Root>() {
-                    *self.0.lock().unwrap() = Some(Arc::clone(&root.0));
+                    match root.0.job {
+                        None => *self.0.lock().unwrap() = Some(Arc::clone(&root.0)),
+                        Some(_) => self.1.lock().unwrap().push(Arc::clone(&root.0)),
+                    }
                 }
+            }
+        }
+        fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
+            let Some(span) = ctx.span(id) else {
+                return;
+            };
+            let event = {
+                let extensions = span.extensions();
+                match (extensions.get::<Attempt>(), extensions.get::<Logged>()) {
+                    (Some(attempt), None) => attempt.owner.job.map(|job| (JOBS[job], attempt.kind)),
+                    _ => None,
+                }
+            };
+            if let Some(event) = event {
+                span.extensions_mut().insert(Logged);
+                self.2.lock().unwrap().push(event);
             }
         }
     }
@@ -352,22 +506,55 @@ pub(crate) mod probe {
         // It is never installed as a default and enables no callsite.
         _registration_guard: tracing::Dispatch,
         latest: Latest,
+        jobs: Jobs,
+        events: Events,
     }
     impl Probe {
         pub(crate) fn new() -> Self {
             let latest = Arc::new(Mutex::new(None));
+            let jobs = Jobs::default();
+            let events = Events::default();
             // tracing-core 0.1.36's JustOne callsite path asks the registering
             // thread's default. An unobserved peer can otherwise cache NEVER
             // while this local probe is the only registered dispatcher.
             let registration_guard =
                 tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-            let subscriber =
-                tracing_subscriber::registry().with(layer()).with(Capture(Arc::clone(&latest)));
+            let capture = Capture(Arc::clone(&latest), Arc::clone(&jobs), Arc::clone(&events));
+            let subscriber = tracing_subscriber::registry().with(layer()).with(capture);
             Self {
                 dispatch: tracing::Dispatch::new(subscriber),
                 _registration_guard: registration_guard,
                 latest,
+                jobs,
+                events,
             }
+        }
+        /// Each attempt a job root owned since the last call, in the order of
+        /// its first enter: the owner's label and the attempt's `io_kind`.
+        pub(crate) fn take_events(&self) -> Vec<(&'static str, u64)> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+        }
+        /// Each job root observed since the last call, in creation order: its
+        /// label, its DB attempts by kind (statement, `BEGIN`, `COMMIT`,
+        /// `ROLLBACK`), its score (those plus one per nested job operation),
+        /// whether it crossed 15, whether it is incomplete, and its outcome
+        /// (1 success, 2 error, 0 none yet).
+        pub(crate) fn take_jobs(&self) -> Vec<JobObservation> {
+            let jobs = std::mem::take(&mut *self.jobs.lock().unwrap());
+            jobs.iter()
+                .map(|c| {
+                    let kinds = c.db_kinds.each_ref().map(|k| k.load(Ordering::Relaxed));
+                    assert_eq!(c.db.load(Ordering::Relaxed), kinds.iter().sum::<u64>());
+                    (
+                        JOBS[c.job.unwrap()],
+                        kinds,
+                        c.score.load(Ordering::Relaxed),
+                        c.over.load(Ordering::Relaxed),
+                        c.incomplete.load(Ordering::Relaxed),
+                        c.outcome.load(Ordering::Relaxed),
+                    )
+                })
+                .collect()
         }
         pub(crate) fn dispatch(&self) -> tracing::Dispatch {
             self.dispatch.clone()
@@ -380,6 +567,8 @@ pub(crate) mod probe {
         /// strong-count ownership checks see only the test's own reference.
         pub(crate) fn release(self) {
             self.latest.lock().unwrap().take();
+            self.jobs.lock().unwrap().clear();
+            self.events.lock().unwrap().clear();
         }
         pub(crate) fn snapshot(&self) -> [u64; 9] {
             let guard = self.latest.lock().unwrap();
@@ -440,6 +629,47 @@ pub(crate) mod probe {
                 [1, 0, 0, 1, 0, 1, 0, 0, 0],
                 "the one reached boundary remains observed after an unobserved first registration"
             );
+        }
+
+        /// 8p-O, review round 2: two job roots that swap a statement of one
+        /// kind keep their totals by kind and score, but not the ordered owners
+        /// of their attempts, which the boundary tests compare with the proxy.
+        #[test]
+        fn a_compensating_swap_keeps_totals_but_not_owners() {
+            let _serial = JOB_METRICS.blocking_lock();
+            let run = |swapped: bool| {
+                let probe = Probe::new();
+                tracing::dispatcher::with_default(&probe.dispatch(), || {
+                    let root = |job: Job| {
+                        let operation = job as u64;
+                        tracing::info_span!(target: "robson_operation", "operation_work", operation, outcome = 1_u64)
+                    };
+                    let (append, apply) = (root(Job::BoundaryZeroReset), root(Job::BoundaryApply));
+                    let wire = [(&append, 1_u64), (&append, 3), (&apply, 1), (&apply, 2)];
+                    let owners = if swapped { [2, 1, 0, 3] } else { [0, 1, 2, 3] };
+                    for (statement, owner) in wire.iter().zip(owners) {
+                        let kind = statement.1;
+                        let owner = wire[owner].0;
+                        tracing::info_span!(target: "robson_operation", parent: owner, "operation_io", io_kind = kind)
+                            .in_scope(|| {});
+                    }
+                });
+                let totals: Vec<_> =
+                    probe.take_jobs().into_iter().map(|job| (job.0, job.1, job.2)).collect();
+                let events = probe.take_events();
+                probe.release();
+                (totals, events)
+            };
+            let (correct, swapped) = (run(false), run(true));
+            assert_eq!(correct.0, swapped.0, "the same totals by kind and score");
+            let expected: [(&str, u64); 4] = [
+                ("boundary_zero_reset", 1),
+                ("boundary_zero_reset", 3),
+                ("boundary_apply", 1),
+                ("boundary_apply", 2),
+            ];
+            assert_eq!(correct.1, expected);
+            assert_ne!(swapped.1, expected, "the swap is visible in the owners");
         }
     }
 }
@@ -835,6 +1065,159 @@ mod tests {
         }
         .with_subscriber(tracing_subscriber::registry().with(layer()))
         .await;
+    }
+
+    /// `job`'s global values: its outcomes (success, error, cancelled), its
+    /// crossings, its incomplete operations, its observations and their work.
+    fn job_metrics(job: Job) -> [u64; 7] {
+        let label = JOBS[job as usize];
+        let outcome = |outcome: &str| JOB_OUTCOMES.with_label_values(&[label, outcome]).get();
+        let work = JOB_WORK.with_label_values(&[label]);
+        [
+            outcome("success"),
+            outcome("error"),
+            outcome("cancelled"),
+            JOB_OVER.with_label_values(&[label]).get(),
+            JOB_INCOMPLETE.with_label_values(&[label]).get(),
+            work.get_sample_count(),
+            work.get_sample_sum() as u64,
+        ]
+    }
+
+    async fn attempts(n: u64) {
+        for _ in 0..n {
+            async {}.instrument(io(1)).await;
+        }
+    }
+
+    /// 8p-O: the nearest root owns each attempt, a job's or a reconciliation
+    /// scan's, either way round; a scan's work moves no job metric.
+    #[tokio::test]
+    async fn job_and_reconciliation_roots_each_own_their_attempts() {
+        let _serial = JOB_METRICS.lock().await;
+        let before = job_metrics(Job::BoundaryApply);
+        async {
+            robson_exec::observation::reconciliation(async {
+                let scan = current();
+                attempts(16).await;
+                job(Job::BoundaryApply, async {
+                    attempts(3).await;
+                    Ok::<_, ()>(())
+                })
+                .await
+                .unwrap();
+                assert_eq!(scan.db.load(Ordering::Relaxed), 16, "the nested job's are its own");
+                assert!(scan.over.load(Ordering::Relaxed));
+                tracing::Span::current().record("outcome", 1_u64);
+            })
+            .await;
+            job(Job::BoundaryApply, async {
+                attempts(2).await;
+                robson_exec::observation::reconciliation(async {
+                    attempts(20).await;
+                    assert_eq!(current().db.load(Ordering::Relaxed), 20);
+                    tracing::Span::current().record("outcome", 1_u64);
+                })
+                .await;
+                Err::<(), _>(())
+            })
+            .await
+            .unwrap_err();
+        }
+        .with_subscriber(tracing_subscriber::registry().with(layer()))
+        .await;
+        let after = job_metrics(Job::BoundaryApply);
+        let delta: Vec<u64> =
+            after.iter().zip(before).map(|(after, before)| after - before).collect();
+        assert_eq!(delta, [1, 1, 0, 0, 0, 2, 5], "two operations of 3 and 2 attempts, no crossing");
+    }
+
+    /// 8p-O, a loop of sub-operations: each job operation nested in a job is
+    /// one unit of its parent's score, so a tick that loops over applies
+    /// crosses 15 by itself (9 + 7 > 15) while ordinary ticks around it (9 + 1)
+    /// and every apply (7) stay under it.
+    #[tokio::test]
+    async fn a_loop_of_sub_operations_crosses_only_its_tick() {
+        let _serial = JOB_METRICS.lock().await;
+        let (tick, apply) = (job_metrics(Job::BoundaryTick), job_metrics(Job::BoundaryApply));
+        async {
+            for applies in [1, 1, 7, 1, 1] {
+                let poll = async {
+                    attempts(9).await;
+                    for _ in 0..applies {
+                        let one = async {
+                            attempts(7).await;
+                            Ok::<_, ()>(())
+                        };
+                        job(Job::BoundaryApply, one).await?;
+                    }
+                    Ok::<_, ()>(())
+                };
+                job(Job::BoundaryTick, poll).await.unwrap();
+            }
+        }
+        .with_subscriber(tracing_subscriber::registry().with(layer()))
+        .await;
+        let delta =
+            |after: [u64; 7], before: [u64; 7]| [after[3] - before[3], after[5] - before[5]];
+        assert_eq!(delta(job_metrics(Job::BoundaryTick), tick), [1, 5], "one tick crosses");
+        assert_eq!(delta(job_metrics(Job::BoundaryApply), apply), [0, 11], "no apply crosses");
+    }
+
+    /// 8p-O: a job's attempts move none of a reconciliation scan's global
+    /// counters (a peer's scans can only add far fewer meanwhile).
+    #[tokio::test]
+    async fn a_job_moves_no_reconciliation_counter() {
+        let _serial = JOB_METRICS.lock().await;
+        let before = DB.get();
+        let before_job = job_metrics(Job::BoundaryZeroReset);
+        let work = async {
+            attempts(10_000).await;
+            Ok::<_, ()>(())
+        };
+        job(Job::BoundaryZeroReset, work)
+            .with_subscriber(tracing_subscriber::registry().with(layer()))
+            .await
+            .unwrap();
+        assert!(DB.get() - before < 10_000, "a job's attempts are not a scan's");
+        let after_job = job_metrics(Job::BoundaryZeroReset);
+        assert_eq!(after_job[5] - before_job[5], 1);
+        assert_eq!(after_job[6] - before_job[6], 10_000);
+    }
+
+    proptest::proptest! {
+        /// Guardrails §1.1 and §1.2 (8p-O): over any sequence of a job's
+        /// operations each counter equals its operations: one outcome each (a
+        /// dropped one cancelled and incomplete), one crossing for each above
+        /// 15 attempts and none at or below, and every attempt in its work.
+        #[test]
+        fn job_counters_equal_their_operations(operations in proptest::collection::vec((0_u64..=40, 0_u8..3), 0..8)) {
+            let _serial = JOB_METRICS.blocking_lock();
+            let before = job_metrics(Job::BoundaryTick);
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                for &(n, end) in &operations {
+                    let work = async move {
+                        attempts(n).await;
+                        match end {
+                            0 => Ok(()),
+                            1 => Err(()),
+                            _ => std::future::pending().await,
+                        }
+                    };
+                    let mut root = Box::pin(job(Job::BoundaryTick, work));
+                    let polled = poll_fn(|cx| Poll::Ready(root.as_mut().poll(cx))).await;
+                    assert_eq!(polled.is_pending(), end == 2, "a pending operation is dropped");
+                }
+            }.with_subscriber(tracing_subscriber::registry().with(layer())));
+            let after = job_metrics(Job::BoundaryTick);
+            let ends = |end: u8| operations.iter().filter(|o| o.1 == end).count() as u64;
+            let over = operations.iter().filter(|o| o.0 > 15).count() as u64;
+            let work: u64 = operations.iter().map(|o| o.0).sum();
+            let expected = [ends(0), ends(1), ends(2), over, ends(2), operations.len() as u64, work];
+            let delta: Vec<u64> = after.iter().zip(before).map(|(after, before)| after - before).collect();
+            proptest::prop_assert_eq!(delta, expected.to_vec());
+        }
     }
 }
 

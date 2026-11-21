@@ -1077,9 +1077,13 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         // start.
         #[cfg(feature = "postgres")]
         if let Some((pool, accounting)) = self.boundary_owner().await {
-            crate::boundary::write_pending(&pool, &accounting, Utc::now()).await.map_err(
-                |error| DaemonError::MonthBoundaryDeferred { reason: error.to_string() },
-            )?;
+            let pending = crate::boundary::write_pending(&pool, &accounting, Utc::now());
+            crate::operation_observation::job(
+                crate::operation_observation::Job::BoundaryTick,
+                pending,
+            )
+            .await
+            .map_err(|error| DaemonError::MonthBoundaryDeferred { reason: error.to_string() })?;
         }
 
         // 0. Initialize capital from exchange (best-effort)
@@ -1439,12 +1443,19 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         let Some((pool, accounting)) = self.boundary_owner().await else {
             return Ok(false);
         };
+        use tracing::Instrument as _;
+
+        use crate::{boundary::io, operation_observation::Job};
         let current_month = (now.year(), now.month());
         let new_month = *self.last_month_check.read().await != current_month;
-        let ticked = async {
+        // 8p-O: every statement of the tick but the zero reset's (its own
+        // operations) counts under the tick's root.
+        let ticked = crate::operation_observation::job(Job::BoundaryTick, async {
             if new_month {
-                sqlx::query("SELECT create_event_log_partitions(3)").execute(&*pool).await?;
-                sqlx::query("SELECT create_snapshot_partitions(3)").execute(&*pool).await?;
+                let events = sqlx::query("SELECT create_event_log_partitions(3)").execute(&*pool);
+                events.instrument(io(1)).await?;
+                let snapshots = sqlx::query("SELECT create_snapshot_partitions(3)").execute(&*pool);
+                snapshots.instrument(io(1)).await?;
             }
             crate::boundary::write_pending(&pool, &accounting, now).await?;
             let (zero_due, mut landed, owed) =
@@ -1464,7 +1475,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 }
             }
             Ok::<_, crate::boundary::Failure>((landed, owed))
-        };
+        });
         let (landed, owed) = ticked.await.map_err(|error| {
             if new_month {
                 self.month_boundary_pending.set(1.0);

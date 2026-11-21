@@ -11,6 +11,10 @@
 //! [`DEADLINE`] on a connection it owns; a late or failed one is dropped and
 //! its connection retired raw. The daemon's main loop is the only caller
 //! besides the startup, so the tick is single flight.
+//!
+//! 8p-O: each statement attempt here is an `operation_io` span, counted under
+//! its operation's root: the tick's (the daemon's) or the zero reset's append
+//! and apply, each its own [`Job`] (8p PLAN-r3 §7.2's operations).
 use std::{future::Future, time::Duration};
 
 use chrono::{DateTime, Datelike as _, Utc};
@@ -20,12 +24,14 @@ use robson_projector::apply::apply_month_boundary_reset_on;
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
 use sqlx::{Connection as _, PgExecutor, PgPool, Postgres, Transaction};
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::{
     balance_accounting::{BalanceAccounting, BOUNDS},
     event_streams::{EventStreams, MONTH_STREAM_PREFIX},
     ledger_connection::LedgerConnection,
+    operation_observation::{job, Job},
 };
 
 /// Why a boundary step wrote nothing (but after an unanswered `COMMIT`,
@@ -78,12 +84,18 @@ pub(crate) fn reset_command_id(venue: &str, year: i32, month: u32) -> Uuid {
     command_id(&format!("month_reset:{}:{year:04}-{month:02}", venue.replace(':', "_")))
 }
 
+/// One statement attempt's observation span: `kind` 1 a statement, 2
+/// `BEGIN`, 3 `COMMIT`, 4 `ROLLBACK`; 7 marks its operation incomplete.
+pub(crate) fn io(kind: u64) -> tracing::Span {
+    tracing::info_span!(target: "robson_operation", "operation_io", io_kind = kind)
+}
+
 /// `BEGIN` and the ledger's bounds, the head of every transaction that
 /// writes here. 8m-2a's shared certificate key goes right after the bounds
 /// (8m PLAN-r4 §6.7), where `advance` then finds it taken.
 async fn begin(held: &mut LedgerConnection) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
-    let mut tx = held.connection().begin().await?;
-    sqlx::query(BOUNDS).execute(&mut *tx).await?;
+    let mut tx = held.connection().begin().instrument(io(2)).await?;
+    sqlx::query(BOUNDS).execute(&mut *tx).instrument(io(1)).await?;
     Ok(tx)
 }
 
@@ -108,7 +120,8 @@ pub(crate) async fn read_month(
         .bind(now.date_naive().with_day(1).expect("every month has a first day"))
         .bind(now.year() as i16)
         .bind(now.month() as i16)
-        .fetch_one(executor);
+        .fetch_one(executor)
+        .instrument(io(1));
     bounded(read).await
 }
 
@@ -131,12 +144,13 @@ pub(crate) async fn write_pending(
             .bind(accounting.venue.as_str())
             .bind(now)
             .fetch_all(&mut *tx)
+            .instrument(io(1))
             .await?
             .len();
         if written == 0 {
-            tx.rollback().await?;
+            tx.rollback().instrument(io(4)).await?;
         } else {
-            tx.commit().await?;
+            tx.commit().instrument(io(3)).await?;
             robson_exec::crash_point!(BOUNDARY_AFTER_PENDING);
         }
         held.finished = true;
@@ -180,7 +194,7 @@ pub(crate) async fn zero_reset(
         robson_eventlog::Event::new(accounting.tenant_id, &key, reset.event_type(), payload)
             .with_actor(ActorType::Daemon, Some("robsond".to_string()))
             .with_command_id(reset_command_id(accounting.venue.as_str(), year, month));
-    let appended = bounded(async {
+    let append = bounded(async {
         let mut held = LedgerConnection::new(pool.acquire().await?);
         let mut tx = begin(&mut held).await?;
         let appended = match read_month(&mut *tx, accounting, now).await?.0 {
@@ -192,13 +206,13 @@ pub(crate) async fn zero_reset(
             },
         };
         match appended {
-            Some((_, true)) => tx.commit().await?,
-            _ => tx.rollback().await?,
+            Some((_, true)) => tx.commit().instrument(io(3)).await?,
+            _ => tx.rollback().instrument(io(4)).await?,
         }
         held.finished = true;
         Ok::<_, Failure>(appended.map(|(event_id, _)| event_id))
-    })
-    .await?;
+    });
+    let appended = job(Job::BoundaryZeroReset, append).await?;
     let Some(event_id) = appended else {
         return Ok(false);
     };
@@ -206,16 +220,19 @@ pub(crate) async fn zero_reset(
     let apply = async {
         let mut held = LedgerConnection::new(pool.acquire().await?);
         let fetch = sqlx::query_as::<_, EventEnvelope>(ENVELOPE).bind(event_id);
-        let envelope = fetch.fetch_one(held.connection()).await?;
+        let envelope = fetch.fetch_one(held.connection()).instrument(io(1)).await?;
         failed_seq = Some(envelope.seq);
         apply_month_boundary_reset_on(held.connection(), &envelope, accounting).await?;
         held.finished = true;
         Ok::<_, Failure>(())
     };
-    let applied = bounded(apply).await;
+    let applied = job(Job::BoundaryApply, bounded(apply)).await;
     if let Err(error) = applied {
         let message = format!("applying the month's reset {event_id}: {error}");
         if let Some(suspension) = streams.suspend(&key, failed_seq, &message) {
+            // The journal's retry loop writes it, uncounted: what the
+            // enclosing operation caused is not all observed.
+            io(7).in_scope(|| {});
             journal.record_suspension(suspension);
         }
         return Err(message.into());

@@ -1021,8 +1021,9 @@ fn package5a_owners_stay_dormant_or_bounded() {
         zero_reset.contains(
             "letmutheld=LedgerConnection::new(pool.acquire().await?);letfetch=sqlx::query_as::<_,\
              EventEnvelope>(ENVELOPE).bind(event_id);letenvelope=fetch.fetch_one(held.connection())\
-             .await?;failed_seq=Some(envelope.seq);apply_month_boundary_reset_on(held.connection(),\
-             &envelope,accounting).await?;held.finished=true;"
+             .instrument(io(1)).await?;failed_seq=Some(envelope.seq);\
+             apply_month_boundary_reset_on(held.connection(),&envelope,accounting).await?;\
+             held.finished=true;"
         ),
         "{zero_reset}"
     );
@@ -1038,7 +1039,9 @@ fn package5a_owners_stay_dormant_or_bounded() {
     assert!(
         start_up.contains(
             "->DaemonResult<()>{#[cfg(feature=\"postgres\")]ifletSome((pool,accounting))=self.\
-             boundary_owner().await{crate::boundary::write_pending(&pool,&accounting,Utc::now())"
+             boundary_owner().await{letpending=crate::boundary::write_pending(&pool,&accounting,\
+             Utc::now());crate::operation_observation::job(crate::operation_observation::Job::\
+             BoundaryTick,pending,)"
         ),
         "{start_up}"
     );
