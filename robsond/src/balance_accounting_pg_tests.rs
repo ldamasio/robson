@@ -56,10 +56,12 @@ async fn install(pool: &PgPool, tenant_id: Uuid, account_scope: &str) -> Journal
         process_epoch: start.epoch.epoch_id,
         source_audit_id: Uuid::now_v7(),
     };
+    // Position hints complete, as the cold installer publishes a generation,
+    // so 8k-2's pre statement can qualify it (`qualifies`).
     sqlx::query(
         "INSERT INTO spot_order_set_generation (tenant_id, venue_id, account_scope, \
-         generation_id, process_epoch, source_audit_id, accounting_version) \
-         VALUES ($1, $2, $3, $4, $5, $6, 0)",
+         generation_id, process_epoch, source_audit_id, accounting_version, \
+         position_hints_complete) VALUES ($1, $2, $3, $4, $5, $6, 0, true)",
     )
     .bind(tenant_id)
     .bind(SPOT)
@@ -130,10 +132,47 @@ fn cell_of(generation: JournalGeneration) -> GenerationCell {
     cell
 }
 
-/// The order-set scan's qualification: the context's generation is the
-/// current one at the accounting version (`observe_generation`).
+/// The order-set scan's qualification at pre: 8k-2's pre statement
+/// (`btc_partition.sql` through `read_pre`) returns its header only while
+/// the context's generation is the current one at the accounting version in
+/// the live epoch. With 8k-2 composed (5a) it replaces 8l-4a's stand-in,
+/// `observe_generation`, which must agree with it. The tenant's venue UID is
+/// bound first, as 8k-2's rig binds it.
 async fn qualifies(pool: &PgPool, accounting: &BalanceAccounting) -> bool {
-    current(pool, &accounting.generation.current().unwrap()).await
+    use crate::balance_reconciliation::{read_pre, DetectorScope};
+    const UID: &str = "5a-scan";
+    let installed = accounting.generation.current().unwrap();
+    sqlx::query(
+        "INSERT INTO venue_accounts (venue_id, account_scope, tenant_id, uid, bound_at, \
+         cutover_id) VALUES ($1, $2, $3, $4, now(), $5) ON CONFLICT DO NOTHING",
+    )
+    .bind(SPOT)
+    .bind(&installed.account_scope)
+    .bind(installed.tenant_id)
+    .bind(UID)
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await
+    .unwrap();
+    let venue = VenueId::new(SPOT);
+    let scope = DetectorScope {
+        expected: ExpectedGeneration {
+            tenant_id: installed.tenant_id,
+            venue: &venue,
+            account_scope: &installed.account_scope,
+            generation_id: installed.generation_id,
+            process_epoch: installed.process_epoch,
+            source_audit_id: installed.source_audit_id,
+        },
+        uid: UID,
+        operated: "BTCUSDT",
+        base_asset: "BTC",
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let pre = read_pre(&pool.connect_options(), scope, deadline).await;
+    let qualified = pre.is_ok();
+    assert_eq!(qualified, current(pool, &installed).await, "8k-2's pre and observe_generation");
+    qualified
 }
 
 async fn current(pool: &PgPool, installed: &JournalGeneration) -> bool {
