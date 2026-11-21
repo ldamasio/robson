@@ -26,7 +26,8 @@
 #   Phase 2 is the migration38 suite: its server-side 1 s statement and 15 s
 #   apply bounds are measured, so its tests never run beside each other. Phase 1
 #   keeps libtest's default concurrency. Both phases run; the script fails if
-#   either failed. Together they select every ignored test exactly once.
+#   either failed. Together they select every ignored test exactly once, except
+#   the controller tests below.
 # With extra args (a caller subset), one invocation:
 #   cargo test --workspace --exclude robson-connectors --features postgres
 #              --no-fail-fast -- --ignored [extra args] --test-threads=1
@@ -34,6 +35,12 @@
 #   subset that reaches the suite cannot run it concurrently.
 #   robson-connectors is excluded, as in CI: its ignored tests call the live
 #   Binance API and need no database.
+#   Every invocation except --crash-harness skips CONTROLLER_TESTS by name:
+#   each needs a dedicated physical controller (a private frame protocol on
+#   its stdin and stdout, and isolated PostgreSQL 16 roles over loopback), so
+#   only that controller runs it. Their ignore reason starts with "requires
+#   dedicated physical controller", and robsond/tests/controller_tests.rs
+#   keeps this list equal to the tests that carry it.
 #   With --crash-harness (robsond/tests/crash_harness.rs, ADR-0056 step 7):
 #     cargo test -p robsond --features postgres,crash-points --test crash_harness
 #                --no-fail-fast -- --include-ignored --test-threads=2 [extra args]
@@ -134,6 +141,13 @@ echo ""
 
 SUITE="bounded_migration::public_pg::"
 CARGO=(cargo test --workspace --exclude robson-connectors --features postgres --no-fail-fast)
+CONTROLLER_TESTS=(
+    physical_spot_writer_survives_exact_native_restore
+)
+SKIP_CONTROLLER=()
+for name in "${CONTROLLER_TESTS[@]}"; do
+    SKIP_CONTROLLER+=(--skip "${name}")
+done
 
 if [[ $# -gt 0 ]]; then
     args=()
@@ -146,13 +160,13 @@ if [[ $# -gt 0 ]]; then
             *) args+=("${arg}") ;;
         esac
     done
-    "${CARGO[@]}" -- --ignored "${args[@]}" --test-threads=1
+    "${CARGO[@]}" -- --ignored "${SKIP_CONTROLLER[@]}" "${args[@]}" --test-threads=1
 else
     status=0
     info "Phase 1: every ignored test outside ${SUITE}"
-    "${CARGO[@]}" -- --ignored --skip "${SUITE}" || status=1
+    "${CARGO[@]}" -- --ignored --skip "${SUITE}" "${SKIP_CONTROLLER[@]}" || status=1
     info "Phase 2: ${SUITE} one test at a time"
-    "${CARGO[@]}" -- --ignored "${SUITE}" --test-threads=1 || status=1
+    "${CARGO[@]}" -- --ignored "${SUITE}" "${SKIP_CONTROLLER[@]}" --test-threads=1 || status=1
     if [[ ${status} -ne 0 ]]; then
         fail "Postgres integration tests failed."
         exit 1

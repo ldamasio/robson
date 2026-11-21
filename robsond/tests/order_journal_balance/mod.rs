@@ -2,8 +2,7 @@
 use chrono::{DateTime, NaiveDate};
 use robson_domain::MonthlyBudgetModel;
 use robson_exec::{
-    cancel::CancelClass,
-    order_journal::{AdmissionRow, BalanceBatch, OrphanCancel},
+    order_journal::{AdmissionRow, BalanceBatch},
     venue_ledger::LedgerError,
 };
 use robsond::venue_ledger_store::PgVenueLedger;
@@ -58,7 +57,7 @@ fn terms(position_id: Uuid) -> AdmissionRow {
     }
 }
 
-fn balance_batch(id: &str, kind: IntentKind) -> JournalBatch {
+pub(super) fn balance_batch(id: &str, kind: IntentKind) -> JournalBatch {
     let mut batch = spot_batch(id);
     batch.intent.kind = kind;
     batch.balance = Some(BalanceBatch {
@@ -69,7 +68,7 @@ fn balance_batch(id: &str, kind: IntentKind) -> JournalBatch {
     batch
 }
 
-async fn seed_account(pool: &PgPool, tenant: Uuid, venue: &str) {
+pub(super) async fn seed_account(pool: &PgPool, tenant: Uuid, venue: &str) {
     if venue == SPOT {
         spot_budget_ready(pool).await;
     }
@@ -95,7 +94,7 @@ async fn entry_batch(pool: &PgPool, tenant: Uuid, id: &str) -> JournalBatch {
     batch
 }
 
-fn journal_on(
+pub(super) fn journal_on(
     pool: &PgPool,
     tenant: Uuid,
     balance: bool,
@@ -112,7 +111,7 @@ fn journal_on(
     )
 }
 
-async fn version(pool: &PgPool, tenant: Uuid, venue: &str) -> i64 {
+pub(super) async fn version(pool: &PgPool, tenant: Uuid, venue: &str) -> i64 {
     sqlx::query_scalar("SELECT version FROM accounting_state WHERE tenant_id=$1 AND venue_id=$2")
         .bind(tenant)
         .bind(venue)
@@ -454,49 +453,47 @@ async fn a_lost_ack_on_a_spot_commit_converges_on_replay(pool: PgPool) {
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
-async fn a_spent_cancel_id_is_not_sent_on_a_balance_journal(pool: PgPool) {
+async fn a_spent_flagged_cancel_rolls_back_on_the_native_index_error(pool: PgPool) {
     let tenant = Uuid::now_v7();
     seed_account(&pool, tenant, SPOT).await;
     sqlx::raw_sql("CREATE FUNCTION refuse_cancel_attempt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE unique_violation USING CONSTRAINT='idx_submit_attempts_one_per_spot_client_id'; END $$; CREATE TRIGGER refuse_cancel_attempt BEFORE INSERT ON submit_attempts FOR EACH ROW EXECUTE FUNCTION refuse_cancel_attempt();").execute(&pool).await.unwrap();
-    let journal = journal_on(&pool, tenant, true, true, SPOT);
-    let polled = std::sync::atomic::AtomicUsize::new(0);
-    for orphan in [false, true] {
-        let op = journal.begin_operation();
-        op.scope(async {
-            let cancel = async {
-                polled.fetch_add(1, Ordering::SeqCst);
-                Ok(StopCancelOutcome::Indeterminate)
-            };
-            if orphan {
-                assert!(matches!(
-                    journal.journaled_orphan_cancel("ins-1", cancel).await,
-                    OrphanCancel::Withheld
-                ));
-            } else {
-                assert!(matches!(
-                    journal.journaled_cancel(None, "ins-1", cancel).await,
-                    CancelClass::Errored(ExecError::SendRefused(_))
-                ));
-            }
-        })
-        .await;
-    }
-    assert_eq!(polled.load(Ordering::SeqCst), 0);
+    // The generic cancel writers now refuse Spot before any write; the flagged
+    // commit of the cancel they would have journaled keeps the index oracle.
+    let backend = PgJournalBackend::new(&pool, tenant);
+    let mut batch = balance_batch(&format!("cxl-{}", Uuid::now_v7().simple()), IntentKind::Cancel);
+    batch.intent.cancels_order_id = Some("77".to_string());
+    batch.intent.params = serde_json::Value::Null;
+    let tables = [
+        "order_intents",
+        "submit_attempts",
+        "spot_intent_clock",
+        "recovery_incidents",
+    ];
+    assert_eq!(backend.commit(&batch).await, Err(CommitFailure::IdSpent));
+    assert_eq!(row_counts(&pool, &tables).await, [0, 0, 0, 0]);
     assert_eq!(version(&pool, tenant, SPOT).await, 0);
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM order_intents")
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM recovery_incidents")
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-        0
-    );
+
+    // Positive control: without the fault the same batch lands whole.
+    sqlx::query("DROP TRIGGER refuse_cancel_attempt ON submit_attempts")
+        .execute(&pool)
+        .await
+        .unwrap();
+    backend.commit(&batch).await.unwrap();
+    assert_eq!(row_counts(&pool, &tables).await, [1, 1, 1, 0]);
+    assert_eq!(version(&pool, tenant, SPOT).await, 1);
+}
+
+pub(super) async fn row_counts(pool: &PgPool, tables: &[&str]) -> Vec<i64> {
+    let mut counts = Vec::with_capacity(tables.len());
+    for table in tables {
+        counts.push(
+            sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+        );
+    }
+    counts
 }
 
 #[path = "admission.rs"]

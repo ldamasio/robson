@@ -6,7 +6,7 @@ use sqlx::{pool::PoolConnection, Connection, PgConnection, Postgres, Transaction
 use tracing::Instrument as _;
 
 use super::{PgJournalBackend, RetiringConnection, RollbackObservation};
-use crate::ledger_connection::LedgerConnection;
+use crate::{ledger_connection::LedgerConnection, spot_order_set_store::JournalGeneration};
 
 /// Transaction-local server bounds, the first statement of every balance
 /// journal transaction: lock and statement timeouts from one statement budget.
@@ -100,6 +100,8 @@ impl PgJournalBackend {
         &self,
         batch: &JournalBatch,
         started: Instant,
+        bound: Duration,
+        projection: Option<&JournalGeneration>,
     ) -> Result<(), CommitFailure> {
         let connection = self.pool.acquire().await.map_err(known)?;
         let mut write = LedgerConnection::new(connection);
@@ -113,8 +115,20 @@ impl PgJournalBackend {
             )
             .await
             .map_err(known)?;
-        Box::pin(self.prepare_balance(batch, &mut tx, started)).await?;
-        self.write(batch, &mut tx).await?;
+        let version = Box::pin(self.prepare_accounting_write(
+            &batch.intent.venue_id,
+            bound,
+            &mut tx,
+            started,
+        ))
+        .await?;
+        let prior = self.write(batch, &mut tx).await?;
+        if let Some(generation) = projection {
+            Box::pin(
+                self.maintain_order_set(generation, batch, version, prior, &mut tx, started, bound),
+            )
+            .await?;
+        }
         // Preserve J's existing conservative COMMIT classification.
         tx.commit()
             .instrument(
@@ -126,17 +140,15 @@ impl PgJournalBackend {
         Ok(())
     }
 
-    pub(super) async fn prepare_balance(
+    pub(super) async fn prepare_accounting_write(
         &self,
-        batch: &JournalBatch,
+        venue_id: &str,
+        commit_bound: Duration,
         tx: &mut Transaction<'_, Postgres>,
         started: Instant,
-    ) -> Result<(), CommitFailure> {
-        let Some(balance) = &batch.balance else {
-            return Ok(());
-        };
+    ) -> Result<i64, CommitFailure> {
         let timeout =
-            format!("{}ms", statement_budget(balance.commit_bound, started.elapsed())?.as_millis());
+            format!("{}ms", statement_budget(commit_bound, started.elapsed())?.as_millis());
         sqlx::query(BOUNDS)
             .bind(timeout)
             .execute(&mut **tx)
@@ -147,25 +159,30 @@ impl PgJournalBackend {
             .map_err(known)?;
         let version = sqlx::query_scalar::<_, i64>(
             "UPDATE accounting_state SET version = version + 1 WHERE tenant_id = $1 AND venue_id = $2 RETURNING version",
-        ).bind(self.tenant_id).bind(&batch.intent.venue_id).fetch_optional(&mut **tx)
+        ).bind(self.tenant_id).bind(venue_id).fetch_optional(&mut **tx)
             .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
             .await.map_err(known)?;
-        if version.is_none() {
-            return Err(CommitFailure::Known("balance journal has no accounting row".to_string()));
-        }
-        Ok(())
+        version.ok_or_else(|| {
+            CommitFailure::Known("balance journal has no accounting row".to_string())
+        })
     }
 
     pub(super) async fn write_balance(
         &self,
         batch: &JournalBatch,
         tx: &mut Transaction<'_, Postgres>,
-    ) -> Result<(), CommitFailure> {
+        clock: Option<&super::clocked::Prepared>,
+    ) -> Result<Vec<super::clocked::ClockReceipt>, CommitFailure> {
         let Some(balance) = &batch.balance else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let intent = &batch.intent;
-        if !batch.attempts.is_empty() {
+        let mut receipts = Vec::new();
+        if let Some(clock) = clock {
+            // Replaces the five-field insert: inserting a NULL clock first
+            // would make the immutable row conflict with the receipt.
+            receipts = Box::pin(self.insert_clocks(batch, clock, tx)).await?;
+        } else if !batch.attempts.is_empty() {
             let ids: Vec<_> = batch.attempts.iter().map(|attempt| attempt.attempt_id).collect();
             let created: Vec<_> = batch.attempts.iter().map(|attempt| attempt.created_at).collect();
             sqlx::query(
@@ -192,7 +209,7 @@ impl PgJournalBackend {
                 .instrument(tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64))
                 .await.map_err(known)?;
         }
-        Ok(())
+        Ok(receipts)
     }
 }
 

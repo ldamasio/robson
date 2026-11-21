@@ -1,8 +1,8 @@
 //! Owned migration adapter. Only the private embedded38 contract selects the
 //! bounded path; tests may override it with a private synthetic fixture. The
-//! exact embedded39 and embedded40 migrations use a delegated bounded path.
+//! exact embedded39 to embedded45 migrations use a delegated bounded path.
 //! Other version-39 sources are refused outside this crate's tests, and every
-//! other version-40 source is refused.
+//! other source for versions 40 to 45 is refused.
 use std::{future::Future, pin::Pin, time::Duration};
 
 use sqlx::{
@@ -24,6 +24,11 @@ type MigrationFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, MigrateError
 const VERSION: i64 = 20240101000038;
 const VERSION39: i64 = 20240101000039;
 const VERSION40: i64 = 20240101000040;
+const VERSION41: i64 = 20240101000041;
+const VERSION42: i64 = 20240101000042;
+const VERSION43: i64 = 20240101000043;
+const VERSION44: i64 = 20240101000044;
+const VERSION45: i64 = 20240101000045;
 const APPLY_BOUND: Duration = Duration::from_secs(15);
 const ACQUIRE_BOUND: Duration = Duration::from_secs(5);
 
@@ -281,6 +286,26 @@ fn contract40() -> Option<&'static Migration> {
     crate::MIGRATOR.iter().find(|migration| migration.version == VERSION40)
 }
 
+fn contract41() -> Option<&'static Migration> {
+    crate::MIGRATOR.iter().find(|migration| migration.version == VERSION41)
+}
+
+fn contract42() -> Option<&'static Migration> {
+    crate::MIGRATOR.iter().find(|migration| migration.version == VERSION42)
+}
+
+fn contract43() -> Option<&'static Migration> {
+    crate::MIGRATOR.iter().find(|migration| migration.version == VERSION43)
+}
+
+fn contract44() -> Option<&'static Migration> {
+    crate::MIGRATOR.iter().find(|migration| migration.version == VERSION44)
+}
+
+fn contract45() -> Option<&'static Migration> {
+    crate::MIGRATOR.iter().find(|migration| migration.version == VERSION45)
+}
+
 /// Only this crate's tests may route a non-embedded version-39 source (the
 /// acceptance suite's private ordinary witnesses) through SQLx's own path.
 const ORDINARY39: bool = cfg!(test);
@@ -342,18 +367,79 @@ fn preflight39(migration: &Migration) -> Result<(), MigrateError> {
 }
 
 fn preflight40(migration: &Migration) -> Result<(), MigrateError> {
+    preflight_delegated_do(
+        migration,
+        "$migration40$",
+        "migration40 must run inside one SQLx transaction",
+        "migration40 must be one top-level DO statement",
+    )
+}
+
+fn preflight41(migration: &Migration) -> Result<(), MigrateError> {
+    preflight_delegated_do(
+        migration,
+        "$migration41$",
+        "migration41 must run inside one SQLx transaction",
+        "migration41 must be one top-level DO statement",
+    )
+}
+
+fn preflight42(migration: &Migration) -> Result<(), MigrateError> {
+    preflight_delegated_do(
+        migration,
+        "$migration42$",
+        "migration42 must run inside one SQLx transaction",
+        "migration42 must be one top-level DO statement",
+    )
+}
+
+fn preflight43(migration: &Migration) -> Result<(), MigrateError> {
+    preflight_delegated_do(
+        migration,
+        "$migration43$",
+        "migration43 must run inside one SQLx transaction",
+        "migration43 must be one top-level DO statement",
+    )
+}
+
+fn preflight44(migration: &Migration) -> Result<(), MigrateError> {
+    preflight_delegated_do(
+        migration,
+        "$migration44$",
+        "migration44 must run inside one SQLx transaction",
+        "migration44 must be one top-level DO statement",
+    )
+}
+
+fn preflight45(migration: &Migration) -> Result<(), MigrateError> {
+    preflight_delegated_do(
+        migration,
+        "$migration45$",
+        "migration45 must run inside one SQLx transaction",
+        "migration45 must be one top-level DO statement",
+    )
+}
+
+fn preflight_delegated_do(
+    migration: &Migration,
+    delimiter: &str,
+    transaction_error: &'static str,
+    shape_error: &'static str,
+) -> Result<(), MigrateError> {
     if migration.no_tx || migration.migration_type != MigrationType::Simple {
-        return Err(refusal("migration40 must run inside one SQLx transaction"));
+        return Err(refusal(transaction_error));
     }
     // The first matching dollar delimiter ends the PostgreSQL DO body. No
     // SQL or comments may precede or follow the canonical wrapper.
+    let prefix = format!("DO {delimiter}\n");
+    let suffix = format!("\n{delimiter};");
     let body = migration
         .sql
         .trim_end()
-        .strip_prefix("DO $migration40$\n")
-        .and_then(|sql| sql.strip_suffix("\n$migration40$;"));
-    if body.is_none_or(|body| body.is_empty() || body.contains("$migration40$")) {
-        return Err(refusal("migration40 must be one top-level DO statement"));
+        .strip_prefix(prefix.as_str())
+        .and_then(|sql| sql.strip_suffix(suffix.as_str()));
+    if body.is_none_or(|body| body.is_empty() || body.contains(delimiter)) {
+        return Err(refusal(shape_error));
     }
     Ok(())
 }
@@ -420,6 +506,56 @@ impl Migrate for BoundedMigration {
                     migration,
                     preflight40(migration),
                     "migration40 whole-apply deadline exceeded",
+                )
+                .await
+            } else if migration.version == VERSION41 {
+                if !contract41().is_some_and(|expected| matches_embedded(migration, expected)) {
+                    return Err(refusal("migration41 contract mismatch"));
+                }
+                self.apply_delegated(
+                    migration,
+                    preflight41(migration),
+                    "migration41 whole-apply deadline exceeded",
+                )
+                .await
+            } else if migration.version == VERSION42 {
+                if !contract42().is_some_and(|expected| matches_embedded(migration, expected)) {
+                    return Err(refusal("migration42 contract mismatch"));
+                }
+                self.apply_delegated(
+                    migration,
+                    preflight42(migration),
+                    "migration42 whole-apply deadline exceeded",
+                )
+                .await
+            } else if migration.version == VERSION43 {
+                if !contract43().is_some_and(|expected| matches_embedded(migration, expected)) {
+                    return Err(refusal("migration43 contract mismatch"));
+                }
+                self.apply_delegated(
+                    migration,
+                    preflight43(migration),
+                    "migration43 whole-apply deadline exceeded",
+                )
+                .await
+            } else if migration.version == VERSION44 {
+                if !contract44().is_some_and(|expected| matches_embedded(migration, expected)) {
+                    return Err(refusal("migration44 contract mismatch"));
+                }
+                self.apply_delegated(
+                    migration,
+                    preflight44(migration),
+                    "migration44 whole-apply deadline exceeded",
+                )
+                .await
+            } else if migration.version == VERSION45 {
+                if !contract45().is_some_and(|expected| matches_embedded(migration, expected)) {
+                    return Err(refusal("migration45 contract mismatch"));
+                }
+                self.apply_delegated(
+                    migration,
+                    preflight45(migration),
+                    "migration45 whole-apply deadline exceeded",
                 )
                 .await
             } else if route39(migration, contract39(), ORDINARY39)? {

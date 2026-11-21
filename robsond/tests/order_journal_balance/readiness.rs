@@ -107,8 +107,10 @@ async fn a_one_attempt_journal_is_not_ready_with_a_wrong_definition(pool: PgPool
 #[ignore = "requires DATABASE_URL"]
 async fn a_one_attempt_journal_is_not_ready_with_an_invalid_index(pool: PgPool) {
     sqlx::query(&format!("DROP INDEX {SPOT_INDEX}")).execute(&pool).await.unwrap();
-    let backend = PgJournalBackend::new(&pool, Uuid::now_v7());
-    let mut batch = spot_batch("duplicate");
+    let tenant = Uuid::now_v7();
+    seed_account(&pool, tenant, SPOT).await;
+    let backend = PgJournalBackend::new(&pool, tenant);
+    let mut batch = balance_batch("duplicate", IntentKind::Exit);
     backend.commit(&batch).await.unwrap();
     batch.attempts = vec![attempt_row(false)];
     backend.commit(&batch).await.unwrap();
@@ -158,8 +160,9 @@ async fn a_usdm_journal_ignores_a_missing_invalid_or_mismatched_spot_index(pool:
     }
     // A real failed concurrent build leaves an invalid index under the right name.
     sqlx::query(&format!("DROP INDEX {SPOT_INDEX}")).execute(&pool).await.unwrap();
+    seed_account(&pool, tenant, SPOT).await;
     let backend = PgJournalBackend::new(&pool, tenant);
-    let mut duplicate = spot_batch("invalid");
+    let mut duplicate = balance_batch("invalid", IntentKind::Exit);
     backend.commit(&duplicate).await.unwrap();
     duplicate.attempts = vec![attempt_row(false)];
     backend.commit(&duplicate).await.unwrap();

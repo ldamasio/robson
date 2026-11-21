@@ -21,7 +21,7 @@ mod order_fixture;
     reason = "shared integration fixture keeps its other cases intact"
 )]
 #[path = "../venue_ledger_schema/fixture.rs"]
-mod schema_fixture;
+pub(crate) mod schema_fixture;
 use order_fixture::{record, seen, Fixture as OrderFixture};
 use schema_fixture::{constraint, execute, refused, Fixture as SchemaFixture};
 

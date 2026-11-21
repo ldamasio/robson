@@ -4,6 +4,10 @@
 pub(crate) mod age;
 mod config;
 pub mod exact;
+#[cfg(feature = "n5-native")]
+pub mod native_n5;
+#[cfg(feature = "n5-native")]
+pub mod retained_n5;
 mod terms;
 
 pub use age::{AgeError, AgeInterval, CostAgeAuthority};

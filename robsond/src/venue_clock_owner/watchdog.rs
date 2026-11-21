@@ -124,6 +124,7 @@ mod tests {
         Published {
             id: raw.id,
             arithmetic: raw.arithmetic().unwrap(),
+            u2: raw.numbers().unwrap().u2,
         }
     }
 

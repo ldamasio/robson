@@ -129,7 +129,7 @@ fn state(
 // Only the explicit fresh-macro fixture path calls this, before creating
 // intents. No arbitrary database name or caller-supplied ready/checksum flag is
 // trusted.
-pub(super) async fn initialize(pool: &PgPool, at: DateTime<Utc>) -> Result<(), sqlx::Error> {
+pub(crate) async fn initialize(pool: &PgPool, at: DateTime<Utc>) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin_with("BEGIN ISOLATION LEVEL READ COMMITTED").await?;
     let checked = async {
     let settings = sqlx::query("SELECT set_config('lock_timeout','300ms',true), set_config('statement_timeout','1s',true), set_config('idle_in_transaction_session_timeout','1s',true)")

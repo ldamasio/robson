@@ -541,6 +541,71 @@ fn clock_references(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+fn n5_reference_lines(path: &Path) -> &'static [&'static str] {
+    match path.to_str() {
+        Some("robson-exec/src/balance_costs/terms.rs") => {
+            &[r#"const API_SOURCE: &str = "binance:spot /api/v3/account/commission";"#]
+        },
+        Some("robson-testkit/src/fake_spot_venue_tests.rs") => &[
+            r#"let (status, _) = get(&venue, "/api/v3/account/commission", "symbol=BTCUSDT&timestamp=1").await;"#,
+            r#"&& unserved[1].starts_with("GET /api/v3/account/commission?")"#,
+        ],
+        Some("robson-connectors/src/binance_rest.rs") => &[
+            r#"const ENDPOINT: &str = "/api/v3/account/commission";"#,
+            r#"client.bind_spot_commission(single_shot().unwrap(), "BTCUSDT", 1_800_000_000_000);"#,
+        ],
+        Some("robsond/src/venue_clock_owner/commission.rs") => &[
+            "use robson_connectors::binance::spot::PreparedSpotCommission;",
+            "JoinHandle<Result<PreparedSpotCommission, BinanceRestError>>;",
+            ") -> Result<PreparedSpotCommission, TimeError> {",
+            "client.prepare_spot_commission(&symbol)",
+        ],
+        Some("robsond/src/venue_budget/n5_claim/commission.rs") => &[
+            "use robson_connectors::{binance::spot::PreparedSpotCommission, BinanceRestClient};",
+            "prepared: PreparedSpotCommission,",
+            r#"b"GET /api/v3/account/commission".as_slice(),"#,
+        ],
+        Some("robsond/src/venue_budget/n5_claim/response.rs") => &[
+            "use robson_connectors::binance::spot::SpotCommission;",
+            "let parsed: SpotCommission =",
+        ],
+        _ => &[],
+    }
+}
+
+fn strip_n5_references(path: &Path, text: &str) -> String {
+    let mut allowed = n5_reference_lines(path).to_vec();
+    text.lines()
+        .filter(|line| {
+            if let Some(i) = allowed.iter().position(|expected| *expected == line.trim()) {
+                allowed.remove(i);
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn isolated_n5_fixture(
+    owner: &str,
+    fixture: &str,
+    name: &str,
+    module: &str,
+    cfg: &str,
+    reference_paths: &[PathBuf],
+    owner_path: &Path,
+) -> bool {
+    let parent_cfg = cfg.replacen("#![", "#[", 1);
+    let gate = format!("{parent_cfg}#[path = \"{name}\"]\nmod {module};");
+    fixture.starts_with(cfg)
+        && owner.matches(&gate).count() == 1
+        && owner.matches(name).count() == 1
+        && reference_paths.len() == 1
+        && reference_paths[0].as_path() == owner_path
+}
+
 fn outside_spot_violations(path: &Path, text: &str, names: &[String]) -> Vec<String> {
     let allowed_clock_references: &[&str] = match path.to_str() {
         Some("robsond/src/venue_clock_http.rs") => &[
@@ -572,8 +637,22 @@ fn outside_spot_violations(path: &Path, text: &str, names: &[String]) -> Vec<Str
         },
         _ => text,
     };
+    let text = strip_n5_references(path, text);
+    let text = text.as_str();
     if reaches_spot(text) {
         found.push("reaches binance::spot".into());
+    }
+    if [
+        "PreparedSpotCommission",
+        "SignedSpotCommission",
+        "prepare_spot_commission",
+    ]
+    .iter()
+    .any(|name| has_word(text, name))
+        || text.contains("/api/v3/account/commission")
+        || text.contains(".bind_spot_commission(")
+    {
+        found.push("names a Spot commission path outside its approved source lines".into());
     }
     if names_spot_endpoint(text) {
         found.push("names a spot endpoint".into());
@@ -582,6 +661,35 @@ fn outside_spot_violations(path: &Path, text: &str, names: &[String]) -> Vec<Str
         found.push(format!("names {name}"));
     }
     found
+}
+
+#[test]
+fn commission_allowance_admits_only_its_named_owner_and_test_gates() {
+    let paths = [
+        "robsond/src/venue_clock_owner/commission.rs",
+        "robsond/src/venue_budget/n5_claim/commission.rs",
+        "robsond/src/venue_budget/n5_claim/response.rs",
+    ];
+    let names = spot_type_names();
+    let other = Path::new("robsond/src/venue.rs");
+    for owner in paths.map(Path::new) {
+        let exact = n5_reference_lines(owner).join("\n");
+        assert!(outside_spot_violations(owner, &exact, &names).is_empty());
+        assert!(!outside_spot_violations(other, &exact, &names).is_empty());
+        assert!(!outside_spot_violations(owner, &format!("{exact}\n{exact}"), &names).is_empty());
+    }
+
+    let cfg = "#![cfg(all(test, feature = \"crash-points\"))]\n";
+    let gate = "#[cfg(all(test, feature = \"crash-points\"))]\n#[path = \"commission_tests.rs\"]\nmod tests;";
+    let owner = PathBuf::from(paths[1]);
+    let check = |gate, fixture, references: &[PathBuf]| {
+        isolated_n5_fixture(gate, fixture, "commission_tests.rs", "tests", cfg, references, &owner)
+    };
+    let only = std::slice::from_ref(&owner);
+    assert!(check(gate, cfg, only));
+    assert!(!check(gate, "", only));
+    assert!(!check(gate.split_once('\n').unwrap().1, cfg, only));
+    assert!(!check(gate, cfg, &[owner.clone(), other.to_owned()]));
 }
 
 #[test]
@@ -639,9 +747,41 @@ fn nothing_outside_the_spot_module_names_it() {
         fs::read_to_string(workspace.join("robsond/src/operation_observation_http_tests.rs"))
             .unwrap();
     let fixture_isolated = isolated_observation_fixture(&owner, &fixture, &references);
+    let n5_dir = workspace.join("robsond/src/venue_budget/n5_claim");
+    for (name, owner_name, module, cfg) in [
+        (
+            "commission_tests.rs",
+            "commission.rs",
+            "tests",
+            "#![cfg(all(test, feature = \"crash-points\"))]\n",
+        ),
+        (
+            "result_tests.rs",
+            "tests.rs",
+            "result_tests",
+            "#![cfg(all(test, feature = \"postgres\"))]\n",
+        ),
+    ] {
+        let owner_path = n5_dir.join(owner_name);
+        let owner = fs::read_to_string(&owner_path).unwrap();
+        let fixture = fs::read_to_string(n5_dir.join(name)).unwrap();
+        let inclusion = format!("\"{name}\"");
+        let references: Vec<_> = outside
+            .iter()
+            .filter(|path| fs::read_to_string(path).unwrap().contains(&inclusion))
+            .cloned()
+            .collect();
+        assert!(
+            isolated_n5_fixture(&owner, &fixture, name, module, cfg, &references, &owner_path),
+            "N5 fixture {name} is not uniquely test-gated"
+        );
+    }
     let names = spot_type_names();
     let mut found = Vec::new();
     for path in &outside {
+        if path == &n5_dir.join("commission_tests.rs") || path == &n5_dir.join("result_tests.rs") {
+            continue;
+        }
         if path.ends_with("robsond/src/operation_observation_http_tests.rs") {
             assert!(fixture_isolated, "observation fixture is not uniquely test-gated");
             assert!(clock_references(&fixture).next().is_none());
@@ -963,6 +1103,37 @@ mod tests;
     violations
 }
 
+fn prepared_commission_mutation_violations(text: &str) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    // The companion ::bind_spot_commission signer is pinned separately with
+    // the other exact transport bodies in binance_rest.rs.
+    const EXACT_FIXED_TRANSPORT: &str =
+        "db1d5c686bca0ac2fda8a858bb8c8049504fb4907beb03cefcf59e23bd11834b";
+    if hex::encode(Sha256::digest(text.as_bytes())) == EXACT_FIXED_TRANSPORT {
+        Vec::new()
+    } else {
+        vec!["changes the fixed signed Spot commission transport".into()]
+    }
+}
+
+#[test]
+fn the_commission_transport_allowance_rejects_changed_send_or_client() {
+    let original = include_str!("commission_send.rs");
+    assert!(prepared_commission_mutation_violations(original).is_empty());
+    for (before, after) in [
+        ("single_shot()?", "reqwest::Client::new()"),
+        ("bind_spot_commission", "bind_spot_order"),
+        (
+            "self.transport.execute(self.request)",
+            "self.transport.clone().execute(self.request)",
+        ),
+    ] {
+        assert!(original.contains(before));
+        assert!(!prepared_commission_mutation_violations(&original.replacen(before, after, 1))
+            .is_empty());
+    }
+}
+
 #[test]
 fn the_clock_transport_allowance_rejects_changed_target_and_extra_transport() {
     let approved = include_str!("time.rs");
@@ -1129,12 +1300,15 @@ fn the_mutation_checker_refuses_every_way_around_the_ledger() {
 fn the_spot_module_sends_orders_only_through_the_ledger_and_reads_no_configuration() {
     let sources = spot_production_sources();
     let time = spot_dir().join("time.rs");
+    let commission = spot_dir().join("commission_send.rs");
     let root = spot_dir().join("mod.rs");
     assert!(sources.len() >= 7, "{} production sources", sources.len());
     for (path, text) in &sources {
         let file = path.file_name().unwrap().to_string_lossy().into_owned();
         let violations = if path == &time {
             prepared_time_mutation_violations(text)
+        } else if path == &commission {
+            prepared_commission_mutation_violations(text)
         } else {
             let permitted: &[&str] = if path == &root {
                 &["pub use time::PreparedSpotTime;"]

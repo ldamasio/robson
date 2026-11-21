@@ -10,6 +10,11 @@ use robson_exec::{
     venue_ledger::{LedgerError, OrderOwner},
 };
 use robson_testkit::db_proxy::ProxyMode;
+#[allow(
+    clippy::single_component_path_imports,
+    reason = "the shared support module reaches the crate as super::robsond"
+)]
+use robsond;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use sqlx::{PgPool, Row};

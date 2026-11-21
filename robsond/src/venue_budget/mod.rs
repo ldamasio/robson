@@ -10,6 +10,11 @@ mod completion;
 #[cfg(test)]
 pub(crate) mod fixture;
 mod heads;
+#[allow(
+    dead_code,
+    reason = "dormant N5 storage awaits the reviewed receipt producer"
+)]
+pub(crate) mod n5_claim;
 mod pause_value;
 pub(crate) mod restore;
 mod snapshot;
@@ -41,9 +46,16 @@ impl Trace {
 
 #[cfg(test)]
 mod fixture_tests;
-// Descriptive audit-page control only; no production readiness consumer.
-#[cfg(test)]
+// Descriptive page plus private running/failed audit foundation only; no
+// production readiness consumer until the external C2 barrier exists.
+#[allow(
+    dead_code,
+    reason = "private audit controller awaits the external C2 barrier"
+)]
 mod source_audit;
 // Direct SQL migration38 store-guard behavior controls; TEST-ONLY.
 #[cfg(test)]
 mod store_guard_pg_tests;
+
+#[cfg(test)]
+pub(crate) use source_audit::physical_recovery;

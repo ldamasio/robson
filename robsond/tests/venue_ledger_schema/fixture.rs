@@ -4,7 +4,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 #[path = "empty_budget.rs"]
-mod empty_budget;
+pub(crate) mod empty_budget;
 
 pub(super) const VENUE: &str = "binance:spot";
 // Synthetic chart fixture: the second support identified by its analysis.

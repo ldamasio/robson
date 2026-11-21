@@ -630,6 +630,17 @@ fn every_daemon_pool_and_connection_is_built_where_the_bounds_reach_it() {
         // and the pause restoration (300 ms lock, 1 s statement, 1 s idle at
         // startup).
         ("venue_budget/restore.rs", "", "existing_pause"),
+        // Package 3's dormant Spot owners (no production caller) do the
+        // same, so the bounds of the pool they are given are inherited:
+        // the N5 claim store (1 s statement and idle at startup, then
+        // sql/settings.sql as its first statement: 300 ms lock),
+        ("venue_budget/n5_claim/mod.rs", "", "raw_connection"),
+        // the cold source-audit page reader (read-only, 1 s statement and
+        // idle at startup; its lock bound is the inherited one),
+        ("venue_budget/source_audit.rs", "", "observe"),
+        // and the cold source-audit run (1 s statement and idle at startup,
+        // then sql/settings.sql: 300 ms lock).
+        ("venue_budget/source_audit/run.rs", "", "begin"),
     ]
     .into_iter()
     .collect();
@@ -659,6 +670,14 @@ fn every_daemon_pool_and_connection_is_built_where_the_bounds_reach_it() {
 #[test]
 fn every_mention_of_a_session_bound_is_a_known_one() {
     let each = |how: &str| GUCS.iter().map(|guc| format!("{how} {guc}")).collect::<Vec<_>>();
+    // Package 3 embeds package 2's sql/settings.sql twice more.
+    let settings_sql = || {
+        [each("set_config local"), vec![
+            "other lock_timeout".to_string(),
+            "other statement_timeout".to_string(),
+        ]]
+        .concat()
+    };
     let mut expected: BTreeMap<String, Vec<String>> = [
         // The three Startup options, the self-check's read and its message.
         ("db_session.rs", [each("name"), each("read"), each("other")].concat()),
@@ -691,6 +710,35 @@ fn every_mention_of_a_session_bound_is_a_known_one() {
         ),
         // Package 2's pause restoration: its three Startup options.
         ("venue_budget/restore.rs", each("name")),
+        // Package 3's cold snapshot: transaction-local limits (20 ms lock,
+        // 40 ms statement, 1 s idle) set after BEGIN on a connection of the
+        // pool it is given, so the inherited bounds cover BEGIN itself.
+        ("spot_order_set_store/cold_audit.rs", each("set_config local")),
+        // Package 3's N5 claim store: its two Startup options, and the
+        // names it checks in the settings row its first statement returns.
+        ("venue_budget/n5_claim/mod.rs", vec![
+            "name idle_in_transaction_session_timeout".to_string(),
+            "name lock_timeout".to_string(),
+            "name statement_timeout".to_string(),
+            "name statement_timeout".to_string(),
+        ]),
+        // Package 3's cold source-audit page reader: its two Startup options.
+        ("venue_budget/source_audit.rs", vec![
+            "name idle_in_transaction_session_timeout".to_string(),
+            "name statement_timeout".to_string(),
+        ]),
+        // Package 3's cold source-audit run: like the N5 claim store.
+        ("venue_budget/source_audit/run.rs", vec![
+            "name idle_in_transaction_session_timeout".to_string(),
+            "name lock_timeout".to_string(),
+            "name statement_timeout".to_string(),
+            "name statement_timeout".to_string(),
+        ]),
+        // The same sql/settings.sql, embedded by the N5 claim store and by
+        // the source-audit run: the guard names each by the path it is
+        // reached through.
+        ("venue_budget/n5_claim/../sql/settings.sql", settings_sql()),
+        ("venue_budget/source_audit/../sql/settings.sql", settings_sql()),
     ]
     .into_iter()
     .map(|(file, mentions)| (file.to_string(), mentions))
@@ -749,4 +797,68 @@ fn a_position_account_pool_is_exactly_the_original_connect() {
         1,
         "one position-account branch: {body}"
     );
+}
+
+/// Package 3's dormant connection owners build from the connect options of
+/// the pool they are given, so a balance daemon's bounds are inherited, and
+/// append stricter Startup options. One of them, the N5 cold read, lives in
+/// robson-store, outside the robsond sources the other checks read; robsond's
+/// N5 claim store passes it its pool. Its only connection and bound names are
+/// checked here.
+#[test]
+fn package3_connection_owners_inherit_the_pool_bounds() {
+    let stricter = r#".clone().options([("statement_timeout","1s"),("idle_in_transaction_session_timeout","1s"),])"#;
+    let n5 =
+        squeeze(&function(&source("venue_budget/n5_claim/mod.rs"), "async fn raw_connection("));
+    assert!(n5.contains(&format!("letoptions=(*pool.connect_options()){stricter};")), "{n5}");
+    let run = source("venue_budget/source_audit/run.rs");
+    let options = squeeze(&function(&run, "fn options(pool: &PgPool)"));
+    assert!(options.contains(&format!("(*pool.connect_options()){stricter}")), "{options}");
+    assert!(squeeze(&function(&run, "async fn begin(")).contains("options(pool).connect()"));
+    let observe = squeeze(&function(&source("venue_budget/source_audit.rs"), "async fn observe("));
+    assert!(
+        observe.contains(
+            r#"letoptions=(*pool.connect_options()).clone().options([("default_transaction_read_only","on"),("statement_timeout","1s"),("idle_in_transaction_session_timeout","1s"),]);"#
+        ),
+        "{observe}"
+    );
+
+    let store = Path::new(env!("CARGO_MANIFEST_DIR")).join("../robson-store/src/native_n5.rs");
+    let code = production(&fs::read_to_string(store).unwrap());
+    let built: Vec<String> = constructors(&code)
+        .into_iter()
+        .map(|(ty, function, needle)| format!("{ty}::{function} {needle}"))
+        .collect();
+    assert_eq!(built, ["::read .connect()"]);
+    let read = squeeze(&function(&code, "pub async fn read("));
+    assert!(
+        read.contains(&format!("letoptions=(*pool.connect_options()){stricter};")),
+        "{read}"
+    );
+    assert_eq!(bound_mentions(&code), [
+        "name idle_in_transaction_session_timeout",
+        "name statement_timeout"
+    ]);
+}
+
+/// Package 3's cold installer and the cold owner's capture, with the rows it
+/// retains, run only in tests: neither is production code. Production keeps
+/// the owner's anchor read, which the cold snapshot uses.
+#[test]
+fn package3_test_only_owners_stay_out_of_production() {
+    let files: BTreeSet<String> = production_sources().into_iter().map(|s| s.file).collect();
+    assert!(
+        !files.iter().any(|file| file.starts_with("spot_order_set_store/cold_install")),
+        "the cold installer is production code: {files:?}"
+    );
+    let owner = source("spot_order_set_store/cold_owner.rs");
+    assert!(owner.contains("pub(super) async fn read_anchor("), "{owner}");
+    for test_only in [
+        "fn capture(",
+        "ColdOwnerCut",
+        "CapturedRows",
+        "impl ColdSourceSink",
+    ] {
+        assert!(!owner.contains(test_only), "{test_only} is production code");
+    }
 }
