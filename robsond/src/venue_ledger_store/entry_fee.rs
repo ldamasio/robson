@@ -53,10 +53,11 @@ struct EntryFeeContext {
 
 impl PgVenueLedger {
     /// Make the leg's entry commission B final once its terminal entry's fill
-    /// set is complete and corroborates Q and C. No runtime caller yet. One
-    /// read when nothing changes; a finalization is seven statements, eight
-    /// when opted. `base_asset` comes from the Spot rules: the ledger stores
-    /// none. Returns the plan acted on; `Finalize` was committed.
+    /// set is complete and corroborates Q and C. No runtime caller yet. Four
+    /// statements when nothing changes (BEGIN, the bounds, one read,
+    /// ROLLBACK); a finalization is seven statements, eight when opted.
+    /// `base_asset` comes from the Spot rules: the ledger stores none.
+    /// Returns the plan acted on; `Finalize` was committed.
     pub async fn finalize_entry_fee(
         &self,
         position_id: Uuid,
@@ -76,7 +77,13 @@ impl PgVenueLedger {
             }
             let connection = self.pool.acquire().await.map_err(backend)?;
             let mut held = LedgerConnection::new(connection);
-            let before = self.read_entry_fee(held.connection(), position_id, base_asset).await?;
+            // The pre-read runs inside the bounded transaction, as main's
+            // order and trade pre-reads do (d8e002e1): never a bare SELECT
+            // before the ledger's timeouts.
+            self.statement();
+            let mut tx = held.connection().begin().await.map_err(backend)?;
+            self.timeouts(&mut tx).await?;
+            let before = self.read_entry_fee(&mut tx, position_id, base_asset).await?;
             // Consistency only: the Spot rules are the authority on the asset.
             if !before.symbol.starts_with(base_asset) {
                 return Err(LedgerError::InvalidEvidence(
@@ -94,13 +101,12 @@ impl PgVenueLedger {
             }
             let proposed = plan_entry_fee(&before.input)?;
             if !matches!(proposed, EntryFeePlan::Finalize { .. }) {
+                self.statement();
+                tx.rollback().await.map_err(backend)?;
                 held.finished = true;
                 return Ok(proposed);
             }
             let venue = before.venue;
-            self.statement();
-            let mut tx = held.connection().begin().await.map_err(backend)?;
-            self.timeouts(&mut tx).await?;
             self.statement();
             let version = if generation.is_some() {
                 let version = sqlx::query_scalar::<_, i64>("UPDATE accounting_state SET version=version+1 WHERE tenant_id=$1 AND venue_id=$2 RETURNING version")

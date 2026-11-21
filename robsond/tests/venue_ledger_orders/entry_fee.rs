@@ -116,8 +116,9 @@ async fn entry_fee_finalizes_once_with_measured_statements(pool: PgPool) -> Resu
         }
         let rows = snapshot(&pool).await;
         let (replay, replayed) = fee_measured(&ledger, &proxy, &f).await?;
+        // BEGIN, the server bounds, one read and ROLLBACK.
         ensure!(
-            replay == EntryFeePlan::Unchanged && replayed == 1,
+            replay == EntryFeePlan::Unchanged && replayed == 4,
             "replay {replay:?} {replayed}"
         );
         ensure!(snapshot(&pool).await == rows, "replay changed rows");
@@ -191,7 +192,7 @@ async fn entry_fee_waits_or_holds_without_writing(pool: PgPool) -> Result<()> {
     let before = snapshot(&pool).await;
     let (plan, count) = fee_measured(&ledger, &proxy, &f).await?;
     ensure!(
-        plan == EntryFeePlan::NotReady(EntryFeePending::FillsIncomplete) && count == 1,
+        plan == EntryFeePlan::NotReady(EntryFeePending::FillsIncomplete) && count == 4,
         "d: {plan:?} {count}"
     );
     ensure!(snapshot(&pool).await == before, "d changed rows");
@@ -240,7 +241,7 @@ async fn entry_fee_waits_or_holds_without_writing(pool: PgPool) -> Result<()> {
         };
         let before = snapshot(&pool).await;
         let (plan, count) = fee_measured(&ledger, &proxy, &f).await?;
-        ensure!(plan == held && count == 1, "{case}: {plan:?} {count}");
+        ensure!(plan == held && count == 4, "{case}: {plan:?} {count}");
         ensure!(snapshot(&pool).await == before, "{case} changed rows");
         proxied.close().await;
     }
@@ -269,14 +270,54 @@ async fn entry_fee_waits_or_holds_without_writing(pool: PgPool) -> Result<()> {
         let (count, wire) = (ledger.statements_total(), proxy.stats().statements);
         let refused = ledger.finalize_entry_fee(f.position, BASE).await;
         ensure!(matches!(refused, Err(LedgerError::Unrepresentable)), "l {case}: {refused:?}");
-        ensure!(ledger.statements_total() - count == 1 && proxy.stats().statements - wire == 1);
+        // BEGIN, the server bounds and the refused read; the connection is
+        // retired raw, so no ROLLBACK follows on the wire.
+        ensure!(ledger.statements_total() - count == 3 && proxy.stats().statements - wire == 3);
         ensure!(snapshot(&pool).await == before, "l {case} changed rows");
         proxied.close().await;
     }
     println!(
-        "EP2_WAIT_HOLD d=FillsIncomplete/1>Finalize/7 e=QuoteMismatch/1 f=NonBaseCommission/1 \
-         g=NoPartition/1 l_quote=Unrepresentable/1 l_fee=Unrepresentable/1 rows=unchanged"
+        "EP2_WAIT_HOLD d=FillsIncomplete/4>Finalize/7 e=QuoteMismatch/4 f=NonBaseCommission/4 \
+         g=NoPartition/4 l_quote=Unrepresentable/3 l_fee=Unrepresentable/3 rows=unchanged"
     );
+    Ok(())
+}
+
+/// The pre-read runs under the ledger's server bounds, as main's order and
+/// trade pre-reads do (d8e002e1): a table lock on the leg ends it at the
+/// server's lock timeout, well before the 2 s client bound, with nothing
+/// written; once the lock is gone the same call finalizes.
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn entry_fee_pre_read_lock_wait_ends_at_the_server_bound(pool: PgPool) -> Result<()> {
+    setup_tables(&pool).await?;
+    let f = Fixture::new(&pool).await;
+    let ledger = f.ledger(&pool);
+    complete_entry(&ledger, &f, dec!(0.0009), dec!(0.0006)).await?;
+    let before = snapshot(&pool).await;
+    let mut held = pool.begin().await?;
+    sqlx::query("LOCK TABLE balance_legs IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *held)
+        .await?;
+    let start = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        ledger.finalize_entry_fee(f.position, BASE),
+    )
+    .await
+    .context("finalize_entry_fee exceeded its outer deadline")?;
+    let elapsed = start.elapsed();
+    held.rollback().await?;
+    ensure!(
+        matches!(&result, Err(robson_exec::venue_ledger::LedgerError::Backend(reason))
+            if reason.contains("lock timeout")),
+        "{result:?}"
+    );
+    ensure!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+    ensure!(snapshot(&pool).await == before, "a refused pre-read changed rows");
+    let plan = ledger.finalize_entry_fee(f.position, BASE).await?;
+    ensure!(matches!(plan, EntryFeePlan::Finalize { .. }), "{plan:?}");
+    println!("EP2_PRE_READ lock_timeout elapsed_lt_1s rows=unchanged then=Finalize");
     Ok(())
 }
 
