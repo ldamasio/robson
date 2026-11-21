@@ -926,9 +926,10 @@ fn package4_supervised_startup_stays_out_of_production() {
 }
 
 /// Package 5a's owners on a balance daemon, one line each: what 8k-1 B,
-/// 8k-2, 8l-1, 8l-2, 8l-4a, 8l-4b, 8p-1 and 8p-2 add to its database paths,
-/// and that each dormant one keeps no production caller. Its one connection
-/// owner is allowed above, with its reason; its one bound site is known above.
+/// 8k-2, 8l-1, 8l-2, 8l-4a, 8l-4b, 8p-1, 8p-2 and 8p-4 add to its database
+/// paths, and that each dormant one keeps no production caller. Its one
+/// connection owner is allowed above, with its reason; its one bound site is
+/// known above.
 #[test]
 fn package5a_owners_stay_dormant_or_bounded() {
     let sources = production_sources();
@@ -952,8 +953,9 @@ fn package5a_owners_stay_dormant_or_bounded() {
     assert_eq!(outside("balance_reconciliation", "balance_reconciliation/"), only("lib.rs"));
     assert_eq!(source("lib.rs").matches("mod balance_reconciliation;").count(), 1);
     assert_eq!(outside("read_pre", "balance_reconciliation/"), none);
-    // 8l-1: S8-4's tables are migrations only; the one production text that
-    // names any of them is 8l-2's read-only barrier statement.
+    // 8l-1: S8-4's tables are migrations only; the production texts that name
+    // any of them are 8l-2's read-only barrier statement and 8p-4's read-only
+    // leg-facts statement, which names dust_ledger only.
     let tables = [
         "cash_anchors",
         "cash_checkpoints",
@@ -965,7 +967,18 @@ fn package5a_owners_stay_dormant_or_bounded() {
         "accounting_invalidations",
     ];
     let named: BTreeSet<String> = tables.iter().flat_map(|table| naming(table)).collect();
-    assert_eq!(named, only("venue_ledger_store/settlement.sql"));
+    let statements: BTreeSet<String> = [
+        "venue_ledger_store/settlement.sql",
+        "venue_ledger_store/leg_facts.sql",
+    ]
+    .map(String::from)
+    .into();
+    assert_eq!(named, statements);
+    let leg_facts: Vec<&str> = tables
+        .into_iter()
+        .filter(|table| naming(table).contains("venue_ledger_store/leg_facts.sql"))
+        .collect();
+    assert_eq!(leg_facts, ["dust_ledger"]);
     // 8p-1: S8-5's tables are migrations; 8p-2's boundary owner is the one
     // production text naming any of them. It inserts the pending snapshot
     // rows and reads the activation basis 8m will write, on the bounds of
@@ -1042,4 +1055,10 @@ fn package5a_owners_stay_dormant_or_bounded() {
         ),
         "{start_up}"
     );
+    // 8p-4: the leg-facts reader runs its one statement (above) on the
+    // connection its caller passes, so it opens none and sets no bound; nothing
+    // outside it calls it or names its statement until 8p-5.
+    let reader = "venue_ledger_store/leg_facts.rs";
+    assert_eq!(outside("read_leg_facts", reader), none);
+    assert_eq!(outside("LEG_FACTS", reader), none);
 }

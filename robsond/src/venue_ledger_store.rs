@@ -16,6 +16,8 @@ use uuid::Uuid;
 use crate::{ledger_connection::LedgerConnection, spot_order_set_store::JournalGeneration};
 
 mod entry_fee;
+// ADR-0056 step 8p-4: the leg facts of a month boundary.
+pub mod leg_facts;
 mod orders;
 pub mod settlement;
 mod trades;

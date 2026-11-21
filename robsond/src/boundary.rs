@@ -28,6 +28,10 @@ use crate::{
     ledger_connection::LedgerConnection,
 };
 
+// 8p-4's mark and owner seams; 8p-5's completion is their first caller.
+#[cfg_attr(not(test), allow(dead_code, reason = "8p-5 is the first caller"))]
+pub(crate) mod mark;
+
 /// Why a boundary step wrote nothing (but after an unanswered `COMMIT`,
 /// which may have landed, PLAN-r3 §7.1); the next poll retries.
 pub(crate) type Failure = Box<dyn std::error::Error + Send + Sync>;

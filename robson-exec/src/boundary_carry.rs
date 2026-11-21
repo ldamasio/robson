@@ -16,6 +16,7 @@
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeDelta, Utc};
 use robson_domain::PositionId;
 use rust_decimal::Decimal;
+use serde::Deserialize;
 
 use crate::{
     venue::OrderPhase,
@@ -52,7 +53,8 @@ pub enum Hold {
 
 /// A time Robson recorded, with its clock evidence's verdict. `None` is NULL
 /// evidence and proves nothing, as an `invalid` verdict (v16 §C4, R11-2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RobsonTime {
     pub at: DateTime<Utc>,
     pub verdict: Option<ClockVerdict>,
@@ -75,7 +77,8 @@ impl RobsonTime {
 /// One venue trade of the leg's order (`order_fills`); `trade_time` is the
 /// venue's. `commission` is a sell's quote fee; a buy's base fee is already
 /// out of X.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Fill {
     pub trade_time: DateTime<Utc>,
     pub qty: Decimal,
@@ -103,7 +106,8 @@ pub struct Lookup {
 
 /// One order of the leg (`venue_orders`), with its intent's first attempt
 /// (`spot_intent_clock`), its trades and, for a stop, the owner's lookup.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LegOrder {
     pub exchange_order_id: VenueIntId,
     pub kind: LegOrderKind,
@@ -116,7 +120,11 @@ pub struct LegOrder {
     pub terminal_seen: Option<RobsonTime>,
     pub first_attempt: Option<RobsonTime>,
     pub fills: Vec<Fill>,
+    /// Never read from the ledger: 8p-5 attaches the owner's answer.
+    #[serde(skip)]
     pub lookup: Option<Lookup>,
+    /// Never read from the ledger (v16 §C4, R9-4).
+    #[serde(skip)]
     pub venue_record_times: VenueRecordTimes,
 }
 
@@ -157,7 +165,8 @@ impl LegOrder {
 
 /// One of Robson's cancel intents of the leg (`order_intents`, kind
 /// `cancel`), with its first attempt's time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancelIntent {
     pub position_id: PositionId,
     pub cancels_order_id: VenueIntId,
@@ -167,7 +176,8 @@ pub struct CancelIntent {
 }
 
 /// The leg's dust row (`dust_ledger`): the write-off R and its close.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Dust {
     pub write_off: Decimal,
     pub close_at: RobsonTime,
@@ -176,7 +186,8 @@ pub struct Dust {
 }
 
 /// The current admission's terms (`balance_leg_admissions`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LegTerms {
     pub gap_bps: Decimal,
     pub taker_bps: Decimal,
@@ -188,7 +199,8 @@ pub struct LegTerms {
 
 /// A candidate leg of month K (§6.4): its cohort, X, terms, entry and
 /// sell-capable orders, Robson's cancels of them and its dust row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CandidateLeg {
     pub position_id: PositionId,
     pub cohort_month: Option<NaiveDate>,
