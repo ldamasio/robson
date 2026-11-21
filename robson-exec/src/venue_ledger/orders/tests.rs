@@ -55,6 +55,12 @@ fn leg() -> OrderLeg {
         cohort_month: None,
         consumed_cum: Decimal::ZERO,
         closed_at: None,
+        partition: None,
+        // Fixture exchange metadata, never a policy rate or lot.
+        terms: Some(AdmissionTerms {
+            taker_bps: dec!(10),
+            lot_step: dec!(0.00001),
+        }),
     }
 }
 
@@ -748,3 +754,6 @@ fn original_exact_capture_and_legacy_absence_never_get_enriched() {
     assert!(!replay.changed);
     assert_eq!(replay.order.terminal_seen.unwrap().capture, Some(raw));
 }
+
+#[path = "partition_tests.rs"]
+mod partition;

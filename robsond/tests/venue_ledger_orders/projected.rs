@@ -1102,6 +1102,9 @@ async fn projected_native_order_checks_old_counts_even_with_zero_or_positive_net
 #[path = "plan_skew.rs"]
 mod plan_skew;
 
+#[path = "entry_partition.rs"]
+mod entry_partition;
+
 #[cfg(feature = "crash-points")]
 #[path = "restart.rs"]
 mod restart;
