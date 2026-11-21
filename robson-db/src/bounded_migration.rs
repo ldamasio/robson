@@ -1,9 +1,10 @@
 //! Owned migration adapter. Only the private embedded38 contract selects the
 //! bounded path; tests may override it with a private synthetic fixture. The
-//! exact embedded39, embedded40 to embedded45, embedded46 to embedded50 and
-//! embedded51 to embedded54 migrations use a delegated bounded path. Other
-//! version-39 sources are refused outside this crate's tests, and every other
-//! source of a version from 40 to 54 is refused.
+//! exact embedded39, embedded40 to embedded45, embedded46 to embedded50,
+//! embedded51 to embedded54 and embedded55 to embedded56 migrations use a
+//! delegated bounded path. Other version-39 sources are refused outside this
+//! crate's tests, and every other source of a version from 40 to 56 is
+//! refused.
 use std::{future::Future, pin::Pin, time::Duration};
 
 use sqlx::{
@@ -39,6 +40,8 @@ const VERSION51: i64 = 20240101000051;
 const VERSION52: i64 = 20240101000052;
 const VERSION53: i64 = 20240101000053;
 const VERSION54: i64 = 20240101000054;
+const VERSION55: i64 = 20240101000055;
+const VERSION56: i64 = 20240101000056;
 const APPLY_BOUND: Duration = Duration::from_secs(15);
 const ACQUIRE_BOUND: Duration = Duration::from_secs(5);
 
@@ -352,6 +355,14 @@ fn contract54() -> Option<&'static Migration> {
     crate::MIGRATOR.iter().find(|migration| migration.version == VERSION54)
 }
 
+fn contract55() -> Option<&'static Migration> {
+    crate::MIGRATOR.iter().find(|migration| migration.version == VERSION55)
+}
+
+fn contract56() -> Option<&'static Migration> {
+    crate::MIGRATOR.iter().find(|migration| migration.version == VERSION56)
+}
+
 /// Only this crate's tests may route a non-embedded version-39 source (the
 /// acceptance suite's private ordinary witnesses) through SQLx's own path.
 const ORDINARY39: bool = cfg!(test);
@@ -544,6 +555,24 @@ fn preflight54(migration: &Migration) -> Result<(), MigrateError> {
         "$migration54$",
         "migration54 must run inside one SQLx transaction",
         "migration54 must be one top-level DO statement",
+    )
+}
+
+fn preflight55(migration: &Migration) -> Result<(), MigrateError> {
+    preflight_delegated_do(
+        migration,
+        "$migration55$",
+        "migration55 must run inside one SQLx transaction",
+        "migration55 must be one top-level DO statement",
+    )
+}
+
+fn preflight56(migration: &Migration) -> Result<(), MigrateError> {
+    preflight_delegated_do(
+        migration,
+        "$migration56$",
+        "migration56 must run inside one SQLx transaction",
+        "migration56 must be one top-level DO statement",
     )
 }
 
@@ -773,6 +802,26 @@ impl Migrate for BoundedMigration {
                     migration,
                     preflight54(migration),
                     "migration54 whole-apply deadline exceeded",
+                )
+                .await
+            } else if migration.version == VERSION55 {
+                if !contract55().is_some_and(|expected| matches_embedded(migration, expected)) {
+                    return Err(refusal("migration55 contract mismatch"));
+                }
+                self.apply_delegated(
+                    migration,
+                    preflight55(migration),
+                    "migration55 whole-apply deadline exceeded",
+                )
+                .await
+            } else if migration.version == VERSION56 {
+                if !contract56().is_some_and(|expected| matches_embedded(migration, expected)) {
+                    return Err(refusal("migration56 contract mismatch"));
+                }
+                self.apply_delegated(
+                    migration,
+                    preflight56(migration),
+                    "migration56 whole-apply deadline exceeded",
                 )
                 .await
             } else if route39(migration, contract39(), ORDINARY39)? {

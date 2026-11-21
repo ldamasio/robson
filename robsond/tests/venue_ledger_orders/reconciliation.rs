@@ -262,12 +262,17 @@ async fn install(pool: &PgPool, f: &Fixture, epoch: Uuid, seed: bool) -> Result<
         source_audit_id: Uuid::now_v7(),
         process_epoch: epoch,
     };
-    sqlx::query(
-        "INSERT INTO public.venue_accounts (venue_id,account_scope,tenant_id,uid,bound_at,cutover_id)
-         VALUES ('binance:spot',$1,$2,$3,now(),$4) ON CONFLICT DO NOTHING",
-    )
-    .bind(&f.scope).bind(f.tenant).bind(LOOPBACK_UID.to_string()).bind(Uuid::now_v7())
-    .execute(pool).await?;
+    // Bound to a cutover run of the tenant (M56's foreign key).
+    sqlx::query(concat!(
+        include_str!("../fixtures/bound_venue_account.sql"),
+        " ON CONFLICT DO NOTHING"
+    ))
+    .bind("binance:spot")
+    .bind(&f.scope)
+    .bind(f.tenant)
+    .bind(LOOPBACK_UID.to_string())
+    .execute(pool)
+    .await?;
     sqlx::query(
         "INSERT INTO public.spot_order_set_generation (
             tenant_id,venue_id,account_scope,generation_id,source_audit_id,process_epoch,accounting_version)

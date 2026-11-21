@@ -926,9 +926,9 @@ fn package4_supervised_startup_stays_out_of_production() {
 }
 
 /// Package 5a's owners on a balance daemon, one line each: what 8k-1 B,
-/// 8k-2, 8l-1, 8l-2, 8l-4a, 8l-4b and 8p-1 add to its database paths, and that
-/// each dormant one keeps no production caller. Its one connection owner is
-/// allowed above, with its reason; its one bound site is known above.
+/// 8k-2, 8l-1, 8l-2, 8l-4a, 8l-4b, 8p-1 and 8m-1 add to its database paths, and
+/// that each dormant one keeps no production caller. Its one connection owner
+/// is allowed above, with its reason; its one bound site is known above.
 #[test]
 fn package5a_owners_stay_dormant_or_bounded() {
     let sources = production_sources();
@@ -976,6 +976,9 @@ fn package5a_owners_stay_dormant_or_bounded() {
         "activation_bases",
     ];
     assert_eq!(boundary.iter().flat_map(|table| naming(table)).collect::<BTreeSet<_>>(), none);
+    // 8m-1: S8-6's runs are migrations only, with no writer or reader yet
+    // (8m-3..6).
+    assert_eq!(naming("venue_cutover"), none);
     // 8l-2: the barrier runs on its caller's connection, and neither it nor
     // the gate's invalidity marks has a production caller yet (8l-3, 8l-7,
     // 8l-8, 8n).

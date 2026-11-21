@@ -193,11 +193,14 @@ async fn restart_after_lost_ack(pool: &PgPool) -> Result<Restart> {
     let intent = Uuid::now_v7();
     journal(&pool, &f, intent, CLIENT, "exit", Some(f.position), None, false).await?;
     let (binding, old) = generation_and_start(&pool, &f).await?;
-    sqlx::query(
-        "INSERT INTO public.venue_accounts(venue_id,account_scope,tenant_id,uid,bound_at,cutover_id)
-         VALUES('binance:spot',$1,$2,$3,now(),$4)",
-    ).bind(&f.scope).bind(f.tenant).bind(LOOPBACK_UID.to_string()).bind(Uuid::now_v7())
-    .execute(&pool).await?;
+    // Bound to a cutover run of the tenant (M56's foreign key).
+    sqlx::query(include_str!("../fixtures/bound_venue_account.sql"))
+        .bind("binance:spot")
+        .bind(&f.scope)
+        .bind(f.tenant)
+        .bind(LOOPBACK_UID.to_string())
+        .execute(&pool)
+        .await?;
     let ledger = f.ledger(&pool).with_native_order_set_projection(binding.clone());
     let order_link = link(&f.scope, f.position, intent);
     // The known pre-existing live linked SELL the old owner later advances.

@@ -271,10 +271,14 @@ async fn seed_native_sources(
     rehearsal: bool,
 ) -> Result<Option<Uuid>> {
     let venue = VenueId::new(VenueId::BINANCE_SPOT);
-    sqlx::query(
-        "INSERT INTO public.venue_accounts(venue_id,account_scope,tenant_id,uid,bound_at,cutover_id)
-         VALUES('binance:spot',$1,$2,$3,now(),$4)",
-    ).bind(&g.account_scope).bind(g.tenant_id).bind(uid).bind(Uuid::now_v7()).execute(pool).await?;
+    // Bound to a cutover run of the tenant (M56's foreign key).
+    sqlx::query(include_str!("../tests/fixtures/bound_venue_account.sql"))
+        .bind("binance:spot")
+        .bind(&g.account_scope)
+        .bind(g.tenant_id)
+        .bind(uid)
+        .execute(pool)
+        .await?;
     sqlx::query("CREATE INDEX idx_leg_routes_spot_scope_position ON public.leg_routes(account_scope,position_id) WHERE venue_id='binance:spot'")
         .execute(pool).await?;
     let ledger = PgVenueLedger::new(pool, g.tenant_id);

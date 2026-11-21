@@ -464,6 +464,35 @@ const BOUNDARY_CARRY: [DoFile; 4] = [
     ),
 ];
 
+/// The S8-6 files (8m PLAN-r4 §4.2): 56 adds its foreign keys to existing
+/// tables, each inventoried by its table and constraint name.
+const CUTOVER: [DoFile; 2] = [
+    (
+        VERSION55,
+        include_str!("../../../migrations/20240101000055_venue_cutovers.sql"),
+        "$migration55$",
+        preflight55,
+        &[
+            "CREATE FUNCTION public.venue_cutover_moves_forward()",
+            "CREATE TABLE public.venue_cutovers",
+            "CREATE TRIGGER venue_cutovers_move_forward",
+            "CREATE UNIQUE INDEX idx_venue_cutovers_complete",
+        ],
+    ),
+    (
+        VERSION56,
+        include_str!("../../../migrations/20240101000056_venue_cutover_links.sql"),
+        "$migration56$",
+        preflight56,
+        &[
+            "CREATE UNIQUE INDEX idx_venue_cutovers_pending",
+            "ALTER TABLE public.venue_accounts ADD CONSTRAINT venue_accounts_venue_cutover",
+            "ALTER TABLE public.cash_anchors ADD CONSTRAINT cash_anchors_venue_cutover",
+            "ALTER TABLE public.activation_bases ADD CONSTRAINT activation_bases_venue_cutover",
+        ],
+    ),
+];
+
 fn spot_accounting_contract(version: i64) -> &'static Migration {
     match version {
         VERSION46 => contract46(),
@@ -475,9 +504,11 @@ fn spot_accounting_contract(version: i64) -> &'static Migration {
         VERSION52 => contract52(),
         VERSION53 => contract53(),
         VERSION54 => contract54(),
+        VERSION55 => contract55(),
+        VERSION56 => contract56(),
         _ => None,
     }
-    .expect("embedded S8-4 or S8-5 contract")
+    .expect("embedded S8-4, S8-5 or S8-6 contract")
 }
 
 #[test]
@@ -488,6 +519,11 @@ fn embedded46_to_50_identity_and_canonical_do_shape() {
 #[test]
 fn embedded51_to_54_identity_and_canonical_do_shape() {
     identity_and_canonical_do_shape(&BOUNDARY_CARRY, "$migration50$");
+}
+
+#[test]
+fn embedded55_to_56_identity_and_canonical_do_shape() {
+    identity_and_canonical_do_shape(&CUTOVER, "$migration54$");
 }
 
 /// Each file is its exact embedded contract and its preflight accepts only
@@ -546,6 +582,11 @@ async fn non_identical_46_to_50_are_refused_before_any_connection_use() {
 #[tokio::test]
 async fn non_identical_51_to_54_are_refused_before_any_connection_use() {
     refused_before_any_connection_use(&BOUNDARY_CARRY).await;
+}
+
+#[tokio::test]
+async fn non_identical_55_to_56_are_refused_before_any_connection_use() {
+    refused_before_any_connection_use(&CUTOVER).await;
 }
 
 async fn refused_before_any_connection_use(files: &[DoFile]) {
@@ -670,11 +711,17 @@ fn boundary_carry_dos_have_at_most_four_ddl() {
     at_most_four_ddl(&BOUNDARY_CARRY);
 }
 
+#[test]
+fn cutover_dos_have_at_most_four_ddl() {
+    at_most_four_ddl(&CUTOVER);
+}
+
 fn at_most_four_ddl(files: &[DoFile]) {
     // Main's statement bound is 1 s for the whole DO and the measured
-    // production p90 is 152 ms per DDL command, so each S8-4 and S8-5 DO
-    // stays at four DDL commands at most, constraints inline (8l PLAN-r4
-    // and 8p PLAN-r3, §4.2).
+    // production p90 is 152 ms per DDL command, so each S8-4, S8-5 and S8-6
+    // DO stays at four DDL commands at most, constraints inline (8l PLAN-r4,
+    // 8p PLAN-r3 and 8m PLAN-r4, §4.2). The only other command is S8-6's
+    // added foreign key.
     for &(version, file, delimiter, _, inventory) in files {
         let statements = do_body_statements(file, delimiter);
         assert!(statements.len() <= 4, "{version} has {} DDL commands", statements.len());
@@ -682,15 +729,21 @@ fn at_most_four_ddl(files: &[DoFile]) {
             .iter()
             .map(|statement| {
                 let words: Vec<&str> = statement.split_whitespace().collect();
-                let len = if words.get(1) == Some(&"UNIQUE") {
-                    4
-                } else {
-                    3
+                let len = match (words.first(), words.get(1)) {
+                    (Some(&"ALTER"), _) => 6,
+                    (_, Some(&"UNIQUE")) => 4,
+                    _ => 3,
                 };
                 words[..len.min(words.len())].join(" ")
             })
             .collect();
         assert_eq!(ddl, inventory.to_vec(), "{version} is not its PLAN's §4.2 DDL inventory");
-        assert!(statements.iter().all(|statement| statement.starts_with("CREATE ")));
+        assert!(statements.iter().all(|statement| {
+            let words: Vec<&str> = statement.split_whitespace().collect();
+            words[0] == "CREATE"
+                || (words[..2] == ["ALTER", "TABLE"]
+                    && words.get(3..5) == Some(&["ADD", "CONSTRAINT"][..])
+                    && words.get(6..8) == Some(&["FOREIGN", "KEY"][..]))
+        }));
     }
 }

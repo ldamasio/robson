@@ -814,7 +814,7 @@ fn nothing_outside_the_spot_module_names_it() {
         "robsond/src/balance_reconciliation/mod.rs",
         "robsond/src/balance_reconciliation/snapshot.rs",
         "robsond/src/balance_reconciliation/classify.rs",
-        // 8l-1 and 8p-1: the bounded routes of migrations 46 to 54;
+        // 8l-1, 8p-1 and 8m-1: the bounded routes of migrations 46 to 56;
         "robson-db/src/bounded_migration.rs",
         // 8l-2: the settlement barrier and the gate's pending slot;
         "robsond/src/venue_ledger_store/settlement.rs",

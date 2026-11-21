@@ -3,8 +3,9 @@
 //! migration 40's fault inventory, the official runner, the rollback boundary
 //! for older images and, in `migration46_constraints.rs`, the schema's rules.
 //! The same per-version suite covers M51-M54, the S8-5 boundary snapshot
-//! schema (step 8p-1), whose own controls are in `migration51.rs`. A local
-//! test database is created for each case.
+//! schema (step 8p-1), whose own controls are in `migration51.rs`, and
+//! M55-M56, the S8-6 cutover schema (step 8m-1), whose own controls are in
+//! `migration55.rs`. A local test database is created for each case.
 use std::time::Instant;
 
 use anyhow::{ensure, Context, Result};
@@ -23,12 +24,17 @@ mod constraints;
 #[path = "migration51.rs"]
 mod boundary;
 
+#[path = "migration55.rs"]
+mod cutover;
+
 const VERSIONS: [i64; 5] = [VERSION46, VERSION47, VERSION48, VERSION49, VERSION50];
 /// Every bounded Spot schema version: S8-4 (46-50), then S8-5 (51-54).
 const SPOT_SCHEMA: [i64; 9] = [
     VERSION46, VERSION47, VERSION48, VERSION49, VERSION50, VERSION51, VERSION52, VERSION53,
     VERSION54,
 ];
+/// S8-6 (55-56), after every S8-4 and S8-5 version.
+const CUTOVER_SCHEMA: [i64; 2] = [VERSION55, VERSION56];
 const ELAPSED: &str = "UPDATE _sqlx_migrations";
 const RESTORE: &str = "SELECT set_config('lock_timeout',$1,false)";
 const SETTINGS: &str = "SELECT pg_backend_pid(),current_setting('lock_timeout'),current_setting('statement_timeout'),current_setting('idle_in_transaction_session_timeout')";
@@ -46,6 +52,7 @@ const CATALOG: &str = "SELECT md5(string_agg(x, '|' ORDER BY x)) FROM (
 const PRESENT: &str = "SELECT count(*) FILTER (WHERE CASE k
         WHEN 'relation' THEN to_regclass(n) IS NOT NULL
         WHEN 'function' THEN to_regprocedure(n) IS NOT NULL
+        WHEN 'constraint' THEN EXISTS(SELECT 1 FROM pg_constraint WHERE conname=n AND connamespace='public'::regnamespace)
         ELSE EXISTS(SELECT 1 FROM pg_trigger WHERE tgname=n AND NOT tgisinternal) END)
     FROM unnest($1::text[],$2::text[]) AS o(k,n)";
 type MigrationRow = (i64, String, String, bool, Vec<u8>, i64);
@@ -62,9 +69,11 @@ fn contract(version: i64) -> &'static Migration {
         VERSION52 => contract52(),
         VERSION53 => contract53(),
         VERSION54 => contract54(),
+        VERSION55 => contract55(),
+        VERSION56 => contract56(),
         _ => None,
     }
-    .expect("exact embedded S8-4 or S8-5 migration")
+    .expect("exact embedded S8-4, S8-5 or S8-6 migration")
 }
 
 /// The DO statement's leading text, for the proxy's ACK-loss selectors.
@@ -79,6 +88,8 @@ fn do_head(version: i64) -> &'static str {
         VERSION52 => "DO $migration52$",
         VERSION53 => "DO $migration53$",
         VERSION54 => "DO $migration54$",
+        VERSION55 => "DO $migration55$",
+        VERSION56 => "DO $migration56$",
         unexpected => panic!("unexpected Spot schema version {unexpected}"),
     }
 }
@@ -135,6 +146,18 @@ fn objects(version: i64) -> &'static [(&'static str, &'static str)] {
             ("trigger", "activation_bases_move_forward"),
             ("relation", "public.idx_activation_bases_certified"),
         ],
+        VERSION55 => &[
+            ("function", "public.venue_cutover_moves_forward()"),
+            ("relation", "public.venue_cutovers"),
+            ("trigger", "venue_cutovers_move_forward"),
+            ("relation", "public.idx_venue_cutovers_complete"),
+        ],
+        VERSION56 => &[
+            ("relation", "public.idx_venue_cutovers_pending"),
+            ("constraint", "venue_accounts_venue_cutover"),
+            ("constraint", "cash_anchors_venue_cutover"),
+            ("constraint", "activation_bases_venue_cutover"),
+        ],
         unexpected => panic!("unexpected Spot schema version {unexpected}"),
     }
 }
@@ -146,7 +169,10 @@ fn objects(version: i64) -> &'static [(&'static str, &'static str)] {
 /// wait then ends at the 200 ms lock timeout, inside the 1 s statement bound).
 /// S8-5's: 51's first table references accounting_state, 52's first command
 /// is the trigger on boundary_reopenings, 53's first table references
-/// balance_legs and 54's references cash_anchors.
+/// balance_legs and 54's references cash_anchors. S8-6's: 55's first table
+/// references accounting_state; 56's is venue_accounts, the one table it
+/// alters that is already in production (its first command, an index on the
+/// new empty venue_cutovers, takes milliseconds of the statement bound).
 fn parent(version: i64) -> &'static str {
     match version {
         VERSION46 => "clock_samples",
@@ -158,6 +184,8 @@ fn parent(version: i64) -> &'static str {
         VERSION52 => "boundary_reopenings",
         VERSION53 => "balance_legs",
         VERSION54 => "cash_anchors",
+        VERSION55 => "accounting_state",
+        VERSION56 => "venue_accounts",
         unexpected => panic!("unexpected Spot schema version {unexpected}"),
     }
 }
@@ -267,7 +295,8 @@ impl Fixture {
         adapter.lock().await?;
         let mut observer = options.connect().await?;
         let key = acquired_key(&mut observer, pid, &birth).await?;
-        for later in SPOT_SCHEMA.into_iter().filter(|later| *later >= version) {
+        for later in SPOT_SCHEMA.into_iter().chain(CUTOVER_SCHEMA).filter(|later| *later >= version)
+        {
             ensure!(!landed(&mut observer, later).await?, "M{} already present", later % 100);
         }
         let history: Vec<MigrationRow> = sqlx::query_as(HISTORY).fetch_all(&mut observer).await?;
@@ -678,6 +707,7 @@ macro_rules! bounded_suite {
 bounded_suite!(
     m46 => VERSION46, m47 => VERSION47, m48 => VERSION48, m49 => VERSION49, m50 => VERSION50,
     m51 => VERSION51, m52 => VERSION52, m53 => VERSION53, m54 => VERSION54,
+    m55 => VERSION55, m56 => VERSION56,
 );
 
 #[sqlx::test(migrations = false)]
