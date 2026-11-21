@@ -248,6 +248,10 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// Some.
     #[cfg(feature = "postgres")]
     event_log_tenant_id: Option<Uuid>,
+    /// A balance-account daemon's accounting context (ADR-0056 step 8l-4),
+    /// passed by the startup stream repair.
+    #[cfg(feature = "postgres")]
+    balance_accounting: Option<crate::balance_accounting::BalanceAccounting>,
 }
 
 /// Persisted monthly risk state from `monthly_state` table.
@@ -1106,6 +1110,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             event_log_pool: None,
             #[cfg(feature = "postgres")]
             event_log_tenant_id: None,
+            #[cfg(feature = "postgres")]
+            balance_accounting: None,
         }
     }
 
@@ -1307,6 +1313,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 &self.event_streams,
                 &stream_key,
                 &entry,
+                self.balance_accounting.as_ref(),
             )
             .await
             {
@@ -1337,6 +1344,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     pub fn with_event_log(mut self, pool: PgPool, tenant_id: Uuid) -> Self {
         self.event_log_pool = Some(pool);
         self.event_log_tenant_id = Some(tenant_id);
+        self
+    }
+
+    /// Run this manager's suspension clears as a balance-account daemon's
+    /// (ADR-0056 step 8l-4). `None` changes nothing.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn with_balance_accounting(
+        mut self,
+        accounting: Option<crate::balance_accounting::BalanceAccounting>,
+    ) -> Self {
+        self.balance_accounting = accounting;
         self
     }
 

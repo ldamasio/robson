@@ -362,6 +362,7 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
         ready_wait: JOURNAL_READY_WAIT,
         balance_account: false,
         order_set_projection: Some(g.clone()),
+        accounting_generation: Default::default(),
     };
     proxy.enable_exact_query_trace(12);
     proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE public.spot_order_set_generation g"));
@@ -550,6 +551,7 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
         ready_wait: JOURNAL_READY_WAIT,
         balance_account: false,
         order_set_projection: Some(successor.clone()),
+        accounting_generation: Default::default(),
     };
     let j = sell();
     insist(current.commit(&j).await)?;
