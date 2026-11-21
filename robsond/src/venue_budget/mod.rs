@@ -10,6 +10,8 @@ mod completion;
 #[cfg(test)]
 pub(crate) mod fixture;
 mod heads;
+#[allow(dead_code, reason = "dormant N5 storage awaits the reviewed receipt producer")]
+pub(crate) mod n5_claim;
 mod pause_value;
 pub(crate) mod restore;
 mod snapshot;

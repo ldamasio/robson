@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = []
-postgres = ["robson-store/postgres", "sqlx"]
+postgres = ["robson-store/postgres", "robson-exec/n5-native", "sqlx", "dep:sha2"]
 # Test harness only (ADR-0056 step 7): never in a production build.
 crash-points = ["robson-exec/crash-points", "robson-connectors/crash-points"]
 # Test harness only (PLAN r4 §6 C1): the session-bounds calibration, run on
@@ -28,6 +28,7 @@ robson-eventlog = { path = "../robson-eventlog" }
 robson-projector = { path = "../robson-projector" }
 robson-db = { path = "../robson-db" }
 sqlx = { workspace = true, optional = true }
+sha2 = { version = "=0.10.9", optional = true }
 tokio = { workspace = true }
 tokio-util = { version = "0.7" }
 axum = { workspace = true }

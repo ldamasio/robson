@@ -1,19 +1,24 @@
+use chrono::{DateTime, Utc};
+use serde_json::Value;
 use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
 const PAGE_SIZE: usize = 2;
+// Migration 37 guarantees at most one Spot attempt per venue/account/client ID.
 const PAGE: &str = r#"
-SELECT i.intent_id, i.kind,
-       i.not_sent AND i.venue_outcome IS NULL AND n.intent_id IS NULL AS no_send,
-       (i.not_sent AND (i.venue_outcome IS NOT NULL OR n.intent_id IS NOT NULL))
-         OR (n.intent_id IS NOT NULL AND NOT COALESCE(
-              n.tenant_id=$1 AND n.venue_id=$2 AND n.account_scope=$3 AND n.symbol=$5
-               AND n.position_id=$4 AND n.owner='leg' AND n.client_order_id=i.client_order_id
-               AND n.kind=CASE i.kind WHEN 'entry' THEN 'entry'
-                                      WHEN 'protection' THEN 'stop' WHEN 'exit' THEN 'sell' END,
-              false)) AS named_conflict,
+SELECT i.intent_id, i.kind, i.client_order_id, i.not_sent, i.venue_outcome, i.venue_evidence,
+        a.attempt_id, a.state AS attempt_state, a.rejected_at AS attempt_rejected_at,
+        i.not_sent AND i.venue_outcome IS NULL AND i.venue_evidence IS NULL
+          AND n.intent_id IS NULL AS no_send,
+        (i.not_sent AND (i.venue_outcome IS NOT NULL OR i.venue_evidence IS NOT NULL
+                       OR n.intent_id IS NOT NULL))
+         OR (n.intent_id IS NOT NULL AND NOT identity_match.named_identity_matches)
+         AS named_conflict,
        i.disposition_kind IS NOT NULL AS has_disposition,
+        identity_match.named_identity_matches,
         n.exchange_order_id AS named_id, n.phase AS named_phase, n.status AS named_status,
+        n.kind AS named_kind, n.side AS named_side, n.terminal AS named_terminal,
+        i.cancels_order_id,
        CASE WHEN ledger_canonical_id(i.cancels_order_id)
             THEN i.cancels_order_id END AS original_target,
         t.exchange_order_id AS target_id, t.phase AS target_phase, t.status AS target_status,
@@ -28,6 +33,15 @@ SELECT i.intent_id, i.kind,
          AS target_conflict
 FROM order_intents i
 LEFT JOIN venue_orders n ON n.intent_id=i.intent_id
+LEFT JOIN submit_attempts a ON a.venue_id='binance:spot' AND a.venue_id=i.venue_id
+  AND a.account_scope=i.account_scope AND a.client_order_id=i.client_order_id
+CROSS JOIN LATERAL (
+    SELECT COALESCE(n.tenant_id=$1 AND n.venue_id=$2 AND n.account_scope=$3 AND n.symbol=$5
+             AND n.position_id=$4 AND n.owner='leg' AND n.client_order_id=i.client_order_id
+             AND n.kind=CASE i.kind WHEN 'entry' THEN 'entry'
+                                    WHEN 'protection' THEN 'stop' WHEN 'exit' THEN 'sell' END,
+           false) AS named_identity_matches
+) identity_match
  LEFT JOIN venue_orders t ON i.kind='cancel'
    AND t.venue_id=$2 AND t.account_scope=$3 AND t.symbol=$5
    AND t.exchange_order_id=i.cancels_order_id
@@ -44,19 +58,33 @@ const VENUE_PAGE: &str = r#"
  SELECT o.exchange_order_id, o.tenant_id, o.venue_id, o.account_scope, o.symbol,
         o.client_order_id, o.owner, o.position_id, o.intent_id, o.kind,
         o.side, o.phase, o.status, o.terminal,
-        j.intent_id AS journal_intent_id,
+        j.intent_id AS journal_intent_id, j.not_sent AS journal_not_sent,
         COALESCE(o.owner='leg' AND j.tenant_id=o.tenant_id AND j.venue_id=o.venue_id
           AND j.account_scope=o.account_scope AND j.position_id=o.position_id
-          AND j.client_order_id=o.client_order_id AND NOT j.not_sent
+          AND j.client_order_id=o.client_order_id
           AND o.kind=CASE j.kind WHEN 'entry' THEN 'entry'
                                 WHEN 'protection' THEN 'stop' WHEN 'exit' THEN 'sell' END,
-          false) AS journal_matches
+          false) AS journal_identity_matches
  FROM venue_orders o
  LEFT JOIN order_intents j ON j.intent_id=o.intent_id
  WHERE o.tenant_id=$1 AND o.venue_id=$2 AND o.account_scope=$3 AND o.symbol=$5
    AND (o.position_id=$4 OR o.position_id IS NULL)
    AND ($6::text IS NULL OR o.exchange_order_id COLLATE "C">$6)
  ORDER BY o.exchange_order_id COLLATE "C" LIMIT 2
+ "#;
+
+// No position or symbol is inferred for an unbound cancel.
+const UNBOUND_CANCEL_PAGE: &str = r#"
+ SELECT i.intent_id, i.client_order_id, i.cancels_order_id,
+        i.not_sent, i.venue_outcome, i.venue_evidence, n.exchange_order_id AS named_id,
+        i.not_sent AND i.venue_outcome IS NULL AND i.venue_evidence IS NULL
+          AND n.intent_id IS NULL AS no_send
+ FROM order_intents i
+ LEFT JOIN venue_orders n ON n.intent_id=i.intent_id
+ WHERE i.tenant_id=$1 AND i.venue_id=$2 AND i.account_scope=$3
+   AND i.position_id IS NULL AND i.kind='cancel'
+   AND ($4::uuid IS NULL OR i.intent_id>$4)
+ ORDER BY i.intent_id LIMIT 2
  "#;
 
 #[derive(Clone, Copy)]
@@ -72,17 +100,43 @@ pub(super) struct Scope {
 pub(super) struct Row {
     pub(super) intent_id: Uuid,
     pub(super) kind: String,
+    pub(super) client_order_id: String,
+    pub(super) not_sent: bool,
+    pub(super) venue_outcome: Option<String>,
+    pub(super) venue_evidence: Option<Value>,
+    pub(super) attempt_id: Option<Uuid>,
+    pub(super) attempt_state: Option<String>,
+    pub(super) attempt_rejected_at: Option<DateTime<Utc>>,
     pub(super) no_send: bool,
     pub(super) named_conflict: bool,
     pub(super) has_disposition: bool,
+    pub(super) named_identity_matches: bool,
     pub(super) named_id: Option<String>,
     pub(super) named_phase: Option<String>,
     pub(super) named_status: Option<String>,
+    pub(super) named_kind: Option<String>,
+    pub(super) named_side: Option<String>,
+    pub(super) named_terminal: Option<bool>,
+    pub(super) cancels_order_id: Option<String>,
     pub(super) original_target: Option<String>,
     pub(super) target_id: Option<String>,
     pub(super) target_phase: Option<String>,
     pub(super) target_status: Option<String>,
     pub(super) target_conflict: bool,
+}
+
+impl Row {
+    /// Matches the durable rejection record for one Spot protection or exit.
+    pub(super) fn has_durable_rejection(&self) -> bool {
+        matches!(self.kind.as_str(), "protection" | "exit")
+            && self.venue_outcome.as_deref() == Some("rejected")
+            && self.attempt_id.is_some()
+            && self.attempt_state.as_deref() == Some("rejected")
+            && self.attempt_rejected_at.is_some()
+            && !self.not_sent
+            && self.venue_evidence.is_none()
+            && self.named_id.is_none()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -110,18 +164,32 @@ pub(super) struct VenueRow {
     pub(super) status: String,
     pub(super) terminal: bool,
     journal_intent_id: Option<Uuid>,
-    journal_matches: bool,
+    journal_not_sent: Option<bool>,
+    pub(super) journal_identity_matches: bool,
 }
 
 impl VenueRow {
     pub(super) fn linkage(&self) -> VenueLinkage {
-        match (self.position_id, self.journal_intent_id, self.journal_matches) {
+        let journal_matches = self.journal_identity_matches && self.journal_not_sent == Some(false);
+        match (self.position_id, self.journal_intent_id, journal_matches) {
             (None, _, _) => VenueLinkage::RouteUnowned,
             (Some(_), None, _) => VenueLinkage::MissingJournal,
             (Some(_), Some(_), false) => VenueLinkage::JournalConflict,
             (Some(_), Some(_), true) => VenueLinkage::Linked,
         }
     }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub(super) struct UnboundCancelRow {
+    pub(super) intent_id: Uuid,
+    pub(super) client_order_id: String,
+    pub(super) cancels_order_id: Option<String>,
+    pub(super) not_sent: bool,
+    pub(super) venue_outcome: Option<String>,
+    pub(super) venue_evidence: Option<Value>,
+    pub(super) named_id: Option<String>,
+    pub(super) no_send: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -146,6 +214,8 @@ pub(super) struct Report {
     pub(super) rows: Vec<Row>,
     pub(super) page_lengths: Vec<usize>,
     pub(super) ambiguous_unbound: bool,
+    /// Includes positive no-send rows across the exact account scope.
+    pub(super) unbound_cancels: Vec<UnboundCancelRow>,
     pub(super) venue_complement: Vec<VenueRow>,
     pub(super) venue_page_lengths: Vec<usize>,
 }
@@ -245,6 +315,7 @@ impl Snapshot {
             rows: Vec::new(),
             page_lengths: Vec::new(),
             ambiguous_unbound: false,
+            unbound_cancels: Vec::new(),
             venue_complement: Vec::new(),
             venue_page_lengths: Vec::new(),
         };
@@ -302,23 +373,37 @@ impl Snapshot {
         }
     }
 
+    async fn collect_unbound_cancels(&mut self) -> Result<(), Refusal> {
+        let mut after: Option<Uuid> = None;
+        loop {
+            let rows: Vec<UnboundCancelRow> = sqlx::query_as(UNBOUND_CANCEL_PAGE)
+                .bind(self.scope.tenant)
+                .bind(self.scope.venue)
+                .bind(self.scope.account)
+                .bind(after)
+                .fetch_all(&mut self.conn)
+                .await?;
+            for row in &rows {
+                if after.is_some_and(|id| id >= row.intent_id) {
+                    return Err(Refusal::Cursor);
+                }
+                after = Some(row.intent_id);
+            }
+            let length = rows.len();
+            self.report.ambiguous_unbound |= rows.iter().any(|row| !row.no_send);
+            self.report.unbound_cancels.extend(rows);
+            if length < PAGE_SIZE {
+                return Ok(());
+            }
+        }
+    }
+
     pub(super) async fn finish(mut self) -> Result<Report, Refusal> {
         while !self.exhausted() {
             self.step().await?;
         }
         self.collect_venue_complement().await?;
-        self.report.ambiguous_unbound = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM order_intents i
-             WHERE i.tenant_id=$1 AND i.venue_id=$2 AND i.account_scope=$3
-               AND i.position_id IS NULL AND i.kind='cancel'
-               AND (NOT i.not_sent OR i.venue_outcome IS NOT NULL
-                    OR EXISTS(SELECT 1 FROM venue_orders o WHERE o.intent_id=i.intent_id)))",
-        )
-        .bind(self.scope.tenant)
-        .bind(self.scope.venue)
-        .bind(self.scope.account)
-        .fetch_one(&mut self.conn)
-        .await?;
+        self.collect_unbound_cancels().await?;
         sqlx::query("COMMIT").execute(&mut self.conn).await?;
         Ok(self.report)
     }

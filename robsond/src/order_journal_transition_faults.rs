@@ -1,4 +1,4 @@
-use std::{cell::RefCell, time::Duration};
+use std::{cell::RefCell, future::Future, time::Duration};
 
 use anyhow::Result;
 use robson_exec::order_journal::{JournalBackend, JournalBatch, OutcomeRow, VenueOutcome};
@@ -38,16 +38,34 @@ fn pause() -> (RefCell<Option<Pause>>, oneshot::Receiver<()>, oneshot::Sender<()
     (RefCell::new(Some(Pause { reached, release })), wait, resume)
 }
 
-struct Wire {
-    proxy: DbProxy,
-    store: PgJournalBackend,
+pub(super) async fn blackhole_commit<T>(
+    apply: impl Future<Output = T>,
+    proxy: &DbProxy,
+) -> Result<T> {
+    let (slot, reached, release) = pause();
+    let apply = PAUSE.scope(slot, apply);
+    let intercept = async {
+        timeout(Duration::from_millis(400), reached).await??;
+        proxy.set_mode(ProxyMode::Blackhole);
+        release.send(()).map_err(|_| anyhow::anyhow!("commit paused writer retired"))?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (outcome, interception) = tokio::join!(apply, intercept);
+    interception?;
+    proxy.set_mode(ProxyMode::Sever);
+    Ok(outcome)
+}
+
+pub(super) struct Wire {
+    pub(super) proxy: DbProxy,
+    pub(super) store: PgJournalBackend,
     pid: i32,
     birth: String,
     baseline: u64,
 }
 
 impl Wire {
-    async fn new(pool: &PgPool, tenant: Uuid) -> Result<Self> {
+    pub(super) async fn new(pool: &PgPool, tenant: Uuid) -> Result<Self> {
         let options = pool.connect_options();
         let upstream = tokio::net::lookup_host((options.get_host(), options.get_port()))
             .await?
@@ -110,7 +128,7 @@ impl Wire {
         }
     }
 
-    async fn retires(&self, observer: &PgPool) -> Result<()> {
+    pub(super) async fn retires(&self, observer: &PgPool) -> Result<()> {
         timeout(Duration::from_secs(2), async {
             loop {
                 let present: bool = sqlx::query_scalar("SELECT EXISTS(
@@ -127,7 +145,7 @@ impl Wire {
     }
 }
 
-async fn durable(pool: &PgPool, tenant: Uuid) -> Result<Value> {
+pub(super) async fn durable(pool: &PgPool, tenant: Uuid) -> Result<Value> {
     Ok(sqlx::query_scalar(
         "SELECT jsonb_build_object('version',(SELECT version FROM accounting_state
           WHERE tenant_id=$1 AND venue_id=$2),
