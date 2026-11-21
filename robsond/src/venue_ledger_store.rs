@@ -18,6 +18,14 @@ use crate::{ledger_connection::LedgerConnection, spot_order_set_store::JournalGe
 mod orders;
 mod trades;
 
+#[cfg(all(test, feature = "crash-points"))]
+#[path = "balance_owner/pending_execution.rs"]
+mod pending_execution;
+
+#[cfg(all(test, feature = "crash-points"))]
+#[path = "balance_owner/restart_execution.rs"]
+mod restart_execution;
+
 #[cfg(test)]
 #[path = "../tests/venue_ledger_trades/projected.rs"]
 mod projected_trades;

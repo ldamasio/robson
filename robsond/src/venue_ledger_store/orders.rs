@@ -17,6 +17,7 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 use super::{backend, commit_error, LedgerConnection, PgVenueLedger};
+use crate::spot_order_set_store::JournalGeneration;
 
 /// One statement from four bounded sections; see order_source.sql.
 pub(super) const ORDER_PROJECTION: &str = concat!(
@@ -29,6 +30,41 @@ pub(super) const ORDER_PROJECTION: &str = concat!(
 pub(super) struct OrderContext {
     pub(super) order: Option<StoredOrder>,
     pub(super) leg: Option<OrderLeg>,
+}
+
+/// Privately constructed coordinate of one opted, leg-owned, changed order
+/// write whose COMMIT positively succeeded. It is not an observation ACK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct OrderCommit {
+    key: OrderKey,
+    owner: OrderOwner,
+    generation: JournalGeneration,
+    executed_cum: Decimal,
+    accounting_version: i64,
+}
+
+#[cfg(test)]
+impl OrderCommit {
+    pub(super) fn key(&self) -> &OrderKey {
+        &self.key
+    }
+
+    pub(super) fn owner(&self) -> &OrderOwner {
+        &self.owner
+    }
+
+    pub(super) fn generation(&self) -> &JournalGeneration {
+        &self.generation
+    }
+
+    pub(super) fn executed_cum(&self) -> Decimal {
+        self.executed_cum
+    }
+
+    pub(super) fn accounting_version(&self) -> i64 {
+        self.accounting_version
+    }
 }
 
 use crate::venue_clock_store::codec::CaptureBind;
@@ -51,6 +87,30 @@ impl PgVenueLedger {
         link: &OrderLink,
         seen: SeenAt,
     ) -> Result<OrderWriteResult, LedgerError> {
+        self.record_order_core::<false>(record, link, seen)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// Test-only observer: the same write, plus the commit coordinate of an
+    /// opted, leg-owned, changed write whose COMMIT positively succeeded.
+    #[cfg(test)]
+    pub(super) async fn record_order_observed(
+        &self,
+        record: &VenueOrderRecord,
+        link: &OrderLink,
+        seen: SeenAt,
+    ) -> Result<(OrderWriteResult, Option<OrderCommit>), LedgerError> {
+        self.record_order_core::<true>(record, link, seen).await
+    }
+
+    // Ordinary traffic passes CAPTURE=false and never builds a coordinate.
+    async fn record_order_core<const CAPTURE: bool>(
+        &self,
+        record: &VenueOrderRecord,
+        link: &OrderLink,
+        seen: SeenAt,
+    ) -> Result<(OrderWriteResult, Option<OrderCommit>), LedgerError> {
         let committing = AtomicBool::new(false);
         self.bounded(async {
             let key = OrderKey::from_record(record,link)?;
@@ -72,7 +132,7 @@ impl PgVenueLedger {
                 self.statement();
                 tx.rollback().await.map_err(backend)?;
                 held.finished=true;
-                return Ok(OrderWriteResult {changed:false,anomalies:proposed.anomalies});
+                return Ok((OrderWriteResult {changed:false,anomalies:proposed.anomalies},None));
             }
             self.statement();
             // The opted branch only adds RETURNING; legacy keeps its statement.
@@ -92,7 +152,7 @@ impl PgVenueLedger {
                 self.statement();
                 tx.rollback().await.map_err(backend)?;
                 held.finished=true;
-                return Ok(OrderWriteResult {changed:false,anomalies:merged.anomalies});
+                return Ok((OrderWriteResult {changed:false,anomalies:merged.anomalies},None));
             }
             self.write_order(&mut tx,&merged.order,locked.order.is_some()).await?;
             if merged.consumed_delta>Decimal::ZERO || merged.set_cohort {
@@ -132,7 +192,21 @@ impl PgVenueLedger {
             committing.store(true,Ordering::Relaxed);
             tx.commit().await.map_err(commit_error)?;
             held.finished=true;
-            Ok(OrderWriteResult {changed:true,anomalies:merged.anomalies})
+            // Built only after a confirmed COMMIT from values already held:
+            // no statement, and never for an unowned or unprojected write.
+            let commit = match (CAPTURE, &self.order_projection, version, merged.order.owner) {
+                (true, Some(generation), Some(accounting_version), owner @ OrderOwner::Leg { .. }) => {
+                    Some(OrderCommit {
+                        key,
+                        owner,
+                        generation: generation.clone(),
+                        executed_cum: merged.order.executed_cum,
+                        accounting_version,
+                    })
+                },
+                _ => None,
+            };
+            Ok((OrderWriteResult { changed: true, anomalies: merged.anomalies }, commit))
         },&committing).await
     }
 
