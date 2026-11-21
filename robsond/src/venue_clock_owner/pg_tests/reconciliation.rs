@@ -41,13 +41,13 @@ pub(crate) struct ReconciliationRig {
 }
 
 /// What a fixture scan reads; the detector options are read-only, through
-/// the counting proxy.
+/// the counting proxy. The gate's invalidity marks carry its pending
+/// evidence (8k-3a).
 pub(crate) struct ScanInputs<'a> {
     pub(crate) wire: &'a DbProxy,
     pub(crate) options: &'a PgConnectOptions,
     pub(crate) scope: DetectorScope<'a>,
     pub(crate) gate: &'a robson_exec::gate::OperationGate,
-    pub(crate) pending: &'a PendingExecutionOwner,
 }
 
 /// The ACCOUNT receipt of a completed triple, its sample's u2, and the last
@@ -377,9 +377,8 @@ impl ReconciliationRig {
             progress,
             outcome: AttemptOutcome::Unqualified(reason),
         };
-        // C8 step 1: the in-memory marks before pre.
-        let generation_before = inputs.gate.generation();
-        let pending_before = inputs.pending.pending().is_some();
+        // C8 step 1: the in-memory invalidity marks before pre.
+        let before = inputs.gate.invalidity_marks();
         let mut progress = Progress { pre: true, ..Progress::default() };
         let pre = match detector::read_pre(inputs.options, inputs.scope, deadline).await {
             Ok(pre) => pre,
@@ -476,10 +475,8 @@ impl ReconciliationRig {
         let clock = interval.map_or(ClockOutcome::Invalid, ClockOutcome::Valid);
         // C8 step 4: the marks again, after post.
         let marks = QualificationMarks {
-            generation_before,
-            generation_after: inputs.gate.generation(),
-            pending_before,
-            pending_after: inputs.pending.pending().is_some(),
+            before,
+            after: inputs.gate.invalidity_marks(),
             post,
             clock,
         };

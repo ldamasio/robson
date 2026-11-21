@@ -405,7 +405,6 @@ impl Ctx {
             options: &self.options,
             scope: scope(&self.venue, b, uid),
             gate: self.journal.gate(),
-            pending: &self.pending,
         }
     }
 }

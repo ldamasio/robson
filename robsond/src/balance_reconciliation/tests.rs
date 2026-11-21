@@ -1,6 +1,11 @@
 use proptest::prelude::*;
 use robson_connectors::binance::spot::{SpotAccount, SpotAccountBalance};
-use robson_exec::{clock_records::RawClockCapture, venue::VenueId, venue_clock::ClockDomain};
+use robson_exec::{
+    clock_records::RawClockCapture,
+    gate::{InvalidityMarks, PendingEvidence},
+    venue::VenueId,
+    venue_clock::ClockDomain,
+};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use uuid::Uuid;
@@ -640,13 +645,19 @@ fn qualification_reads_every_mark() {
         AttemptOutcome::Qualified(i) => i,
         _ => unreachable!(),
     };
+    let clear = InvalidityMarks {
+        generation: 5,
+        pending: PendingEvidence::Clear,
+    };
     let base = QualificationMarks {
-        generation_before: 5,
-        generation_after: 5,
-        pending_before: false,
-        pending_after: false,
+        before: clear,
+        after: clear,
         post: PostOutcome::Matched,
         clock: ClockOutcome::Valid(interval),
+    };
+    let pending = InvalidityMarks {
+        pending: PendingEvidence::Pending,
+        ..clear
     };
     use UnqualifiedReason as U;
     assert_eq!(qualify(&base), AttemptOutcome::Qualified(interval));
@@ -654,9 +665,15 @@ fn qualification_reads_every_mark() {
         (QualificationMarks { post: PostOutcome::ScopeMoved, ..base }, U::VersionChanged),
         (QualificationMarks { post: PostOutcome::Sql, ..base }, U::Sql),
         (QualificationMarks { post: PostOutcome::Timeout, ..base }, U::Timeout),
-        (QualificationMarks { generation_after: 6, ..base }, U::GenerationChanged),
-        (QualificationMarks { pending_before: true, ..base }, U::PendingEvidence),
-        (QualificationMarks { pending_after: true, ..base }, U::PendingEvidence),
+        (
+            QualificationMarks {
+                after: InvalidityMarks { generation: 6, ..clear },
+                ..base
+            },
+            U::GenerationChanged,
+        ),
+        (QualificationMarks { before: pending, ..base }, U::PendingEvidence),
+        (QualificationMarks { after: pending, ..base }, U::PendingEvidence),
         (QualificationMarks { clock: ClockOutcome::Invalid, ..base }, U::Clock),
     ] {
         assert_eq!(qualify(&marks), AttemptOutcome::Unqualified(reason));
@@ -695,7 +712,7 @@ const PERTURBATIONS: [Perturbation; 8] = [
 #[derive(Default)]
 struct World {
     version: u32,
-    generation: i64,
+    generation: u64,
     evidence: u32,
     acknowledged: u32,
     account_clock_invalid: bool,
@@ -709,10 +726,15 @@ impl World {
         use Perturbation as P;
         match perturbation {
             P::LedgerWrite => self.version += 1,
-            P::PendingRise => self.evidence += 1,
+            // Every retained rise moves the invalidity generation too (8k-3a).
+            P::PendingRise => {
+                self.evidence += 1;
+                self.generation += 1;
+            },
             // Newer evidence, then the older one's ACK: still pending.
             P::OlderAckAfterNewer => {
                 self.evidence += 2;
+                self.generation += 2;
                 self.acknowledged = self.acknowledged.max(self.evidence - 1);
             },
             P::GenerationChange => self.generation += 1,
@@ -725,6 +747,15 @@ impl World {
 
     fn pending(&self) -> bool {
         self.acknowledged < self.evidence
+    }
+
+    /// The gate's invalidity marks as the composition reads them.
+    fn marks(&self) -> InvalidityMarks {
+        let pending = match self.pending() {
+            true => PendingEvidence::Pending,
+            false => PendingEvidence::Clear,
+        };
+        InvalidityMarks { generation: self.generation, pending }
     }
 }
 
@@ -742,7 +773,7 @@ fn simulate(event: Option<(Perturbation, u8)>) -> Attempt {
         outcome: AttemptOutcome::Unqualified(reason),
     };
     at(0, &mut world);
-    let (generation_before, pending_before) = (world.generation, world.pending());
+    let before = world.marks();
     let read = world.version;
     let mut progress = Progress { pre: true, responses: 0, post: false };
     for response in 1..=3u8 {
@@ -777,10 +808,8 @@ fn simulate(event: Option<(Perturbation, u8)>) -> Attempt {
         unreachable!()
     };
     let marks = QualificationMarks {
-        generation_before,
-        generation_after: world.generation,
-        pending_before,
-        pending_after: world.pending(),
+        before,
+        after: world.marks(),
         post,
         // After post the ACCOUNT anchor is revalidated, never retroactively.
         clock: if world.account_clock_invalid {
@@ -965,4 +994,361 @@ proptest! {
         let judged = built.classify(&btc(Decimal::new(1, scale), Decimal::ZERO));
         prop_assert_eq!(judged, Classification::Incomplete(IncompleteReason::Unrepresentable));
     }
+}
+
+// 8k-3a (PLAN-r2 §6.2, §6.7, §8): the invalidity marks, the ACCOUNT reading,
+// the writer's input and the ACCOUNT-only classification.
+
+#[test]
+fn qualification_reads_the_invalidity_marks() {
+    use PendingEvidence::{Clear, Pending, Unbound};
+    let AttemptOutcome::Qualified(interval) = qualified() else {
+        unreachable!()
+    };
+    let marks = |generation, pending| InvalidityMarks { generation, pending };
+    let outcome = |before, after| {
+        qualify(&QualificationMarks {
+            before,
+            after,
+            post: PostOutcome::Matched,
+            clock: ClockOutcome::Valid(interval),
+        })
+    };
+    use UnqualifiedReason as U;
+    // A rise acknowledged in between (or an occurrence) leaves both Clear:
+    // only the generation refuses. The incident generation never sees a rise.
+    assert_eq!(
+        outcome(marks(4, Clear), marks(5, Clear)),
+        AttemptOutcome::Unqualified(U::GenerationChanged)
+    );
+    assert_eq!(
+        outcome(marks(4, Unbound), marks(5, Unbound)),
+        AttemptOutcome::Unqualified(U::GenerationChanged)
+    );
+    for (before, after) in [
+        (marks(4, Pending), marks(4, Pending)),
+        (marks(4, Clear), marks(4, Pending)),
+        (marks(4, Pending), marks(4, Clear)),
+        // An unacknowledged rise moves the generation too: still pending.
+        (marks(4, Clear), marks(5, Pending)),
+    ] {
+        assert_eq!(outcome(before, after), AttemptOutcome::Unqualified(U::PendingEvidence));
+    }
+    // Unbound and Clear pass, alone or once the slot binds in between.
+    for (before, after) in [
+        (marks(4, Unbound), marks(4, Unbound)),
+        (marks(4, Clear), marks(4, Clear)),
+        (marks(4, Unbound), marks(4, Clear)),
+    ] {
+        assert_eq!(outcome(before, after), AttemptOutcome::Qualified(interval));
+    }
+}
+
+const SAMPLE: Uuid = Uuid::from_u128(0x5a);
+/// Odd, so ⌈u2 / 2⌉ and ⌊u2 / 2⌋ differ: u = 101_000_001 ns.
+const U2: i128 = 202_000_001;
+
+fn scan_scope(venue: &VenueId) -> ScanScope<'_> {
+    ScanScope {
+        detector: scope(venue),
+        quote_asset: "USDT",
+    }
+}
+
+/// An ACCOUNT receipt on the scope's epoch: send on a microsecond boundary,
+/// receive inside one.
+fn receipt(balances: &[(&str, Decimal, Decimal)]) -> AccountReceipt {
+    AccountReceipt {
+        sample: Some((SAMPLE, U2)),
+        send: capture(1_794_614_400, 100_000_000, 10, 20),
+        receive: capture(1_794_614_400, 900_000_987, 30, 40),
+        body: account(balances),
+    }
+}
+
+fn cash_body() -> AccountReceipt {
+    receipt(&[
+        ("USDT", dec!(900.5), dec!(99.5)),
+        ("BTC", Decimal::ZERO, Decimal::ZERO),
+    ])
+}
+
+fn read(receipt: &AccountReceipt) -> Result<AccountReading, UnqualifiedReason> {
+    let venue = venue();
+    AccountReading::from_receipt(receipt, &scan_scope(&venue))
+}
+
+fn captured() -> Capture {
+    Capture {
+        marks: InvalidityMarks {
+            generation: 9,
+            pending: PendingEvidence::Clear,
+        },
+        pre: PreSnapshot { version: 7, ..PreSnapshot::default() },
+    }
+}
+
+fn wall_ns(c: &RawClockCapture) -> i128 {
+    i128::from(c.wall_seconds) * 1_000_000_000 + i128::from(c.wall_nanoseconds)
+}
+
+#[test]
+fn stored_observation_equals_the_account_receipt() {
+    use crate::venue_ledger_store::cash::writer::Observed;
+    let receipt = cash_body();
+    let reading = read(&receipt).unwrap();
+    assert_eq!(reading.u_ns, 101_000_001, "u = ⌈u2 / 2⌉");
+    assert_eq!(reading.interval.start_ns, wall_ns(&receipt.send) - 101_000_001);
+    assert_eq!(reading.interval.end_ns, wall_ns(&receipt.receive) + 101_000_001);
+    assert_eq!((reading.sample_id, reading.epoch_id), (SAMPLE, receipt.send.epoch));
+    // The writer recovers send and receive from the interval and u exactly:
+    // send floored and receive ceiled to the microsecond.
+    let observed = Observed::new(reading.interval, reading.u_ns).unwrap();
+    let micros = |us: i128| chrono::DateTime::from_timestamp_micros(us as i64).unwrap();
+    assert_eq!(observed.send_at, micros(wall_ns(&receipt.send) / 1_000));
+    assert_eq!(observed.receive_at, micros(wall_ns(&receipt.receive) / 1_000 + 1));
+    assert_eq!(observed.cut, micros((wall_ns(&receipt.send) - 101_000_001).div_euclid(1_000)));
+}
+
+#[test]
+fn cash_interval_uses_original_account_capture() {
+    let receipt = cash_body();
+    let reading = read(&receipt).unwrap();
+    let capture = captured();
+    let received = std::time::Instant::now();
+    // The composite's last receipt (the lists') is never the interval's end.
+    let lists = capture_at(1_794_614_401, 500_000_000);
+    let composite = ObservationInterval::from_account(&receipt.send, &lists, U2).unwrap();
+    assert!(composite.end_ns > reading.interval.end_ns);
+    let later = BaseVerdict::Clean { interval: composite };
+    assert_eq!(
+        cash_attempt(later, &capture, &reading, received).unwrap_err(),
+        BaseVerdict::Unqualified(UnqualifiedReason::Malformed)
+    );
+    let clean = BaseVerdict::Clean { interval: reading.interval };
+    let attempt = cash_attempt(clean.clone(), &capture, &reading, received).unwrap();
+    assert_eq!(attempt.verdict, clean);
+    assert_eq!(
+        (
+            attempt.version,
+            attempt.marks,
+            attempt.u_ns,
+            attempt.sample_id,
+            attempt.epoch_id
+        ),
+        (7, capture.marks, reading.u_ns, SAMPLE, receipt.send.epoch)
+    );
+    assert_eq!(attempt.received, received);
+    // Every other verdict comes back unchanged.
+    for other in [
+        BaseVerdict::Unqualified(UnqualifiedReason::Clock),
+        BaseVerdict::Incomplete {
+            reason: IncompleteReason::InFlightOrder,
+            interval: reading.interval,
+        },
+        BaseVerdict::Discrepancy {
+            findings: Vec::new(),
+            interval: reading.interval,
+        },
+    ] {
+        assert_eq!(cash_attempt(other.clone(), &capture, &reading, received).unwrap_err(), other);
+    }
+}
+
+fn capture_at(seconds: i64, nanos: u32) -> RawClockCapture {
+    capture(seconds, nanos, 50, 60)
+}
+
+#[test]
+fn quote_total_is_free_plus_locked() {
+    let receipt = cash_body();
+    let reading = read(&receipt).unwrap();
+    assert_eq!(reading.quote_total, Some(dec!(1000.0)));
+    let clean = BaseVerdict::Clean { interval: reading.interval };
+    let attempt = cash_attempt(clean, &captured(), &reading, std::time::Instant::now());
+    assert_eq!(attempt.unwrap().quote_total, dec!(1000.0));
+    let locked = read(&receipt_with(&[("USDT", Decimal::ZERO, dec!(12.5))])).unwrap();
+    assert_eq!(locked.quote_total, Some(dec!(12.5)));
+}
+
+fn receipt_with(balances: &[(&str, Decimal, Decimal)]) -> AccountReceipt {
+    let mut all: Vec<(&str, Decimal, Decimal)> = vec![("BTC", Decimal::ZERO, Decimal::ZERO)];
+    all.extend_from_slice(balances);
+    receipt(&all)
+}
+
+#[test]
+fn a_missing_duplicate_or_negative_quote_row_is_incomplete() {
+    for balances in [
+        vec![],
+        vec![
+            ("USDT", dec!(1), Decimal::ZERO),
+            ("USDT", dec!(2), Decimal::ZERO),
+        ],
+        vec![("USDT", dec!(-1), dec!(5))],
+        vec![("USDT", dec!(5), dec!(-1))],
+    ] {
+        let reading = read(&receipt_with(&balances)).unwrap();
+        assert_eq!(reading.quote_total, None, "{balances:?}: never zero-filled");
+        let clean = BaseVerdict::Clean { interval: reading.interval };
+        assert_eq!(
+            cash_attempt(clean, &captured(), &reading, std::time::Instant::now()).unwrap_err(),
+            BaseVerdict::Incomplete {
+                reason: IncompleteReason::MalformedAccount,
+                interval: reading.interval,
+            },
+            "{balances:?}"
+        );
+    }
+}
+
+#[test]
+fn other_asset_presence_is_not_a_conflict() {
+    let venue = venue();
+    let mut built = Built::new();
+    built.partitioned(dec!(1), dec!(0.001), dec!(0.99), Decimal::ZERO);
+    let busy = receipt(&[
+        ("ETH", dec!(3), dec!(1)),
+        ("USDT", dec!(1805), dec!(17)),
+        ("BNB", dec!(0.5), Decimal::ZERO),
+        ("BTC", dec!(0.995), Decimal::ZERO),
+    ]);
+    assert_eq!(read(&busy).unwrap().quote_total, Some(dec!(1822)));
+    assert_eq!(
+        classify_account(&scan_scope(&venue), &built.pre, &busy.body),
+        Classification::Clean
+    );
+    // An ETHUSDT order and an unrelated list are counted, never judged.
+    built.listing.unrelated_orders = 1;
+    built.listing.unrelated_lists = 1;
+    assert_eq!(built.classify(&busy.body), Classification::Clean);
+}
+
+#[test]
+fn an_account_of_another_uid_never_qualifies() {
+    let mut other = cash_body();
+    other.body.uid = 2;
+    assert_eq!(read(&other), Err(UnqualifiedReason::Scope));
+    assert!(read(&cash_body()).is_ok());
+}
+
+#[test]
+fn a_receipt_without_a_sample_never_qualifies() {
+    let mut unsampled = cash_body();
+    unsampled.sample = None;
+    assert_eq!(read(&unsampled), Err(UnqualifiedReason::Clock));
+}
+
+#[test]
+fn a_receipt_of_another_epoch_never_qualifies() {
+    let other = Uuid::from_u128(0xe2);
+    for (send, receive) in [(true, true), (true, false), (false, true)] {
+        let mut foreign = cash_body();
+        if send {
+            foreign.send.epoch = other;
+        }
+        if receive {
+            foreign.receive.epoch = other;
+        }
+        assert_eq!(read(&foreign), Err(UnqualifiedReason::Clock), "{send} {receive}");
+    }
+    // A malformed interval (receive before send) never qualifies either.
+    let mut reversed = cash_body();
+    std::mem::swap(&mut reversed.send, &mut reversed.receive);
+    assert_eq!(read(&reversed), Err(UnqualifiedReason::Clock));
+}
+
+fn account_only(built: &Built, balances: &[(&str, Decimal, Decimal)]) -> Classification {
+    let venue = venue();
+    classify_account(&scan_scope(&venue), &built.pre, &account(balances))
+}
+
+#[test]
+fn account_only_classification_judges_the_base() {
+    let mut built = Built::new();
+    built.partitioned(dec!(1), dec!(0.001), dec!(0.99), Decimal::ZERO);
+    for held in [dec!(0.99), dec!(0.995), dec!(1)] {
+        assert_eq!(account_only(&built, &[("BTC", held, Decimal::ZERO)]), Classification::Clean);
+    }
+    assert!(matches!(
+        account_only(&built, &[("BTC", dec!(0.5), Decimal::ZERO)]),
+        Classification::Discrepancy(f) if matches!(f[..], [Finding::BaseDeficit { .. }])
+    ));
+    assert_eq!(
+        account_only(&built, &[("BTC", dec!(1.00000001), Decimal::ZERO)]),
+        Classification::Discrepancy(vec![Finding::BaseExcess {
+            holdings: dec!(1.00000001),
+            upper: dec!(1),
+        }])
+    );
+    // Incomplete exactly as the full classification.
+    assert_eq!(
+        account_only(&built, &[]),
+        Classification::Incomplete(IncompleteReason::MalformedAccount)
+    );
+    built.pre.closed_legs = 1;
+    assert_eq!(
+        account_only(&built, &[("BTC", dec!(0.995), Decimal::ZERO)]),
+        Classification::Incomplete(IncompleteReason::ClosedLegWithoutWriteOff)
+    );
+}
+
+#[test]
+fn account_only_classification_checks_the_locked_base() {
+    let mut built = Built::new();
+    let position = built.partitioned(dec!(1), dec!(0.001), dec!(0.99), Decimal::ZERO);
+    // No Robson stop: any locked base is foreign.
+    assert_eq!(
+        account_only(&built, &[("BTC", dec!(0.495), dec!(0.5))]),
+        Classification::Discrepancy(vec![Finding::LockedForeign {
+            locked: dec!(0.5),
+            robson: Decimal::ZERO,
+        }])
+    );
+    // An unlisted live stop: equal locked base is clean (no listing is read,
+    // so no stop is judged missing), short is LockedShort.
+    built.stop(position, 77, dec!(0.5), Decimal::ZERO, false);
+    assert_eq!(account_only(&built, &[("BTC", dec!(0.495), dec!(0.5))]), Classification::Clean);
+    assert_eq!(
+        account_only(&built, &[("BTC", dec!(0.595), dec!(0.4))]),
+        Classification::Discrepancy(vec![Finding::LockedShort {
+            locked: dec!(0.4),
+            robson: dec!(0.5),
+            stops: vec!["77".into()],
+        }])
+    );
+    assert_eq!(
+        account_only(&built, &[("BTC", dec!(0.395), dec!(0.6))]),
+        Classification::Discrepancy(vec![Finding::LockedForeign {
+            locked: dec!(0.6),
+            robson: dec!(0.5),
+        }])
+    );
+    // The full classification still asks for the unlisted stop.
+    assert!(matches!(
+        built.classify(&btc(dec!(0.495), dec!(0.5))),
+        Classification::Discrepancy(f) if f == [Finding::NeedsExactEvidence { exchange_order_id: "77".into() }]
+    ));
+}
+
+#[test]
+fn account_only_clean_requires_no_claims() {
+    let mut built = Built::new();
+    built.claimed(dec!(0.5));
+    assert_eq!(
+        account_only(&built, &[("BTC", dec!(0.25), Decimal::ZERO)]),
+        Classification::Discrepancy(vec![Finding::WithinClaims {
+            holdings: dec!(0.25),
+            lower: Decimal::ZERO,
+            upper: dec!(0.5),
+        }])
+    );
+    assert_eq!(
+        account_only(&built, &[("BTC", Decimal::ZERO, Decimal::ZERO)]),
+        Classification::Discrepancy(vec![Finding::WithinClaims {
+            holdings: Decimal::ZERO,
+            lower: Decimal::ZERO,
+            upper: dec!(0.5)
+        }])
+    );
 }

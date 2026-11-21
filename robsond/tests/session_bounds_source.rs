@@ -646,8 +646,10 @@ fn every_daemon_pool_and_connection_is_built_where_the_bounds_reach_it() {
         // autocommit statement on one fresh connection from the connect
         // options its caller passes, under the caller's deadline, closed
         // before it returns; its caller (8k-1's transport) passes the daemon
-        // pool's, as package 2's and 3's owners take theirs.
-        ("balance_reconciliation/snapshot.rs", "", "read_pre"),
+        // pool's, as package 2's and 3's owners take theirs. Since 8k-3a it
+        // is `fetch`, the one owner of 8k-2's pre statement and of the
+        // non-trading scope's pre and post statement (PLAN-r2 §6.1).
+        ("balance_reconciliation/snapshot.rs", "", "fetch"),
     ]
     .into_iter()
     .collect();
@@ -1008,9 +1010,12 @@ fn package5a_owners_stay_dormant_or_bounded() {
     assert_eq!(outside("read_settlement", "venue_ledger_store/settlement.rs"), none);
     // 8l-3b's context read embeds the barrier (one statement, PLAN-r4 §6.4)
     // and its final qualification reads the marks; the writer is dormant.
+    // 8k-3a's dormant capture reads them before pre and after post.
     let writer_rs = only("venue_ledger_store/cash/writer.rs");
     assert_eq!(outside("SETTLEMENT_BARRIER", "venue_ledger_store/settlement.rs"), writer_rs);
-    assert_eq!(naming("invalidity_marks"), writer_rs);
+    let capture = "balance_reconciliation/capture.rs".to_string();
+    let marks = writer_rs.iter().cloned().chain([capture]).collect::<BTreeSet<_>>();
+    assert_eq!(naming("invalidity_marks"), marks);
     assert_eq!(naming(".pending_evidence("), none);
     // 8l-4a: its writers run on the journal's and the clear's bounded
     // transactions (balance_accounting.rs, a known bound site above); the

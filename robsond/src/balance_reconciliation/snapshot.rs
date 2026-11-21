@@ -1,18 +1,23 @@
 //! The 8k-2 pre statement: one bounded autocommit read of the ledger rows the
 //! base check needs. Rows are decoded one by one into native Decimal; no SQL
-//! aggregate of an amount is decoded.
+//! aggregate of an amount is decoded. 8k-3a adds the non-trading scope's
+//! pre and post statement under the same connection owner, [`fetch`].
 use chrono::{DateTime, Utc};
+use robson_exec::venue::VenueId;
 use rust_decimal::Decimal;
 use sqlx::{
-    postgres::{PgConnectOptions, PgRow},
-    ConnectOptions, Connection, Row,
+    postgres::{PgArguments, PgConnectOptions, PgRow},
+    query::Query,
+    ConnectOptions, Connection, FromRow, Postgres, Row,
 };
 use tokio::time::{timeout_at, Instant};
 use uuid::Uuid;
 
-use super::DetectorScope;
+use super::{DetectorScope, ScanScope};
 
+/// Ends `LIMIT 65` (`PRE_ROW_CAP + 1`): the server returns at most 65 rows.
 const PRE: &str = include_str!("btc_partition.sql");
+const NON_TRADING: &str = include_str!("non_trading.sql");
 
 /// Explicit cap on returned rows, applied before any decode. A fixture bound
 /// for the inert pilot detector, not production policy.
@@ -24,11 +29,13 @@ pub(crate) enum PreRefusal {
     Scope,
     Cap,
     Malformed,
+    /// The non-trading scope's Spot ledger holds a row.
+    LedgerNotEmpty,
     Timeout,
     Sql,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct PreSnapshot {
     pub(crate) version: i64,
     pub(crate) closed_legs: i64,
@@ -101,7 +108,8 @@ pub(crate) struct IntentRow {
 }
 
 /// One statement on a fresh connection under the caller's deadline; the
-/// connection is closed before returning, so nothing is held across HTTP.
+/// connection is closed before returning, so nothing is held across HTTP
+/// ([`fetch`], its owner since 8k-3a).
 pub(crate) async fn read_pre(
     options: &PgConnectOptions,
     scope: DetectorScope<'_>,
@@ -111,32 +119,80 @@ pub(crate) async fn read_pre(
         return Err(PreRefusal::Scope);
     }
     let e = scope.expected;
+    let query = sqlx::query(PRE)
+        .bind(e.tenant_id)
+        .bind(e.venue.as_str())
+        .bind(e.account_scope)
+        .bind(e.generation_id)
+        .bind(e.process_epoch)
+        .bind(e.source_audit_id)
+        .bind(scope.uid)
+        .bind(scope.operated);
+    let rows = fetch(options, query, deadline).await?;
+    if rows.is_empty() {
+        return Err(PreRefusal::Scope);
+    }
+    decode(&rows)
+}
+
+/// The one connection owner of the pre and post statements: one statement
+/// on a fresh connection under the caller's deadline; the connection is
+/// closed before returning, so nothing is held across HTTP. The statements
+/// return at most `PRE_ROW_CAP + 1` rows; more than the cap is refused here,
+/// before any row is decoded.
+async fn fetch(
+    options: &PgConnectOptions,
+    query: Query<'_, Postgres, PgArguments>,
+    deadline: Instant,
+) -> Result<Vec<PgRow>, PreRefusal> {
     let rows = timeout_at(deadline, async {
         let mut connection = options.connect().await?;
-        let rows = sqlx::query(PRE)
-            .bind(e.tenant_id)
-            .bind(e.venue.as_str())
-            .bind(e.account_scope)
-            .bind(e.generation_id)
-            .bind(e.process_epoch)
-            .bind(e.source_audit_id)
-            .bind(scope.uid)
-            .bind(scope.operated)
-            .fetch_all(&mut connection)
-            .await?;
+        let rows = query.fetch_all(&mut connection).await?;
         connection.close().await?;
         Ok::<_, sqlx::Error>(rows)
     })
     .await
     .map_err(|_| PreRefusal::Timeout)?
     .map_err(|_| PreRefusal::Sql)?;
-    if rows.is_empty() {
-        return Err(PreRefusal::Scope);
-    }
     if rows.len() > PRE_ROW_CAP {
         return Err(PreRefusal::Cap);
     }
-    decode(&rows)
+    Ok(rows)
+}
+
+/// The non-trading scope's pre (`expected` None) and post (`Some(v₀)`)
+/// statement (PLAN-r2 §6.1): the version when the scope is bound to its UID,
+/// the epoch is the tenant's live one and the scope's Spot ledger is empty.
+/// A malformed scope is refused before any connection: another venue, a nil
+/// tenant or process epoch, a blank account scope, UID or operated pair
+/// (its generation and source-audit ids are nil by design and not read).
+pub(super) async fn read_non_trading(
+    options: &PgConnectOptions,
+    scope: &ScanScope<'_>,
+    expected: Option<i64>,
+    deadline: Instant,
+) -> Result<i64, PreRefusal> {
+    let (d, e) = (scope.detector, scope.detector.expected);
+    let blank = [e.account_scope.trim(), d.uid, d.operated].contains(&"");
+    let nil = e.tenant_id.is_nil() || e.process_epoch.is_nil();
+    if nil || blank || e.venue.as_str() != VenueId::BINANCE_SPOT {
+        return Err(PreRefusal::Scope);
+    }
+    let query = sqlx::query(NON_TRADING)
+        .bind(e.tenant_id)
+        .bind(e.venue.as_str())
+        .bind(e.account_scope)
+        .bind(e.process_epoch)
+        .bind(d.uid)
+        .bind(expected);
+    let rows = fetch(options, query, deadline).await?;
+    let row = rows.first().ok_or(PreRefusal::Scope)?;
+    // version, uid_bound, epoch_live, ledger_empty.
+    match <(i64, bool, bool, bool)>::from_row(row).map_err(|_| PreRefusal::Malformed)? {
+        (version, true, true, true) => Ok(version),
+        (_, true, true, false) => Err(PreRefusal::LedgerNotEmpty),
+        _ => Err(PreRefusal::Scope),
+    }
 }
 
 pub(super) fn decode(rows: &[PgRow]) -> Result<PreSnapshot, PreRefusal> {
