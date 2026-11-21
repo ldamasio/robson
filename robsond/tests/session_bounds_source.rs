@@ -641,6 +641,13 @@ fn every_daemon_pool_and_connection_is_built_where_the_bounds_reach_it() {
         // and the cold source-audit run (1 s statement and idle at startup,
         // then sql/settings.sql: 300 ms lock).
         ("venue_budget/source_audit/run.rs", "", "begin"),
+        // 8k-2's dormant pre reader (no production caller, checked by
+        // package5a_owners_stay_dormant_or_bounded): one read-only
+        // autocommit statement on one fresh connection from the connect
+        // options its caller passes, under the caller's deadline, closed
+        // before it returns; its caller (8k-1's transport) passes the daemon
+        // pool's, as package 2's and 3's owners take theirs.
+        ("balance_reconciliation/snapshot.rs", "", "read_pre"),
     ]
     .into_iter()
     .collect();
@@ -916,4 +923,59 @@ fn package4_supervised_startup_stays_out_of_production() {
     );
     assert!(!source("venue_budget/source_audit.rs").contains("fn describe_existing_source("));
     assert!(!source("venue_budget/source_audit/run.rs").contains("fn start_existing("));
+}
+
+/// Package 5a's owners on a balance daemon, one line each: what 8k-1 B,
+/// 8k-2, 8l-1, 8l-2 and 8l-4a add to its database paths, and that each
+/// dormant one keeps no production caller. Its one connection owner is
+/// allowed above, with its reason; its one bound site is known above.
+#[test]
+fn package5a_owners_stay_dormant_or_bounded() {
+    let sources = production_sources();
+    let naming = |needle: &str| -> BTreeSet<String> {
+        sources.iter().filter(|s| s.text.contains(needle)).map(|s| s.file.clone()).collect()
+    };
+    let outside = |needle: &str, owner: &str| -> BTreeSet<String> {
+        naming(needle).into_iter().filter(|file| !file.starts_with(owner)).collect()
+    };
+    let none = BTreeSet::<String>::new();
+    let only = |file: &str| BTreeSet::from([file.to_string()]);
+    // 8k-1 B: only 8k-2's dormant detector records the venue_discrepancy
+    // fence; the release endpoint's refusal reads the gate and sends no SQL.
+    assert_eq!(outside("VenueDiscrepancy", "balance_reconciliation/"), none);
+    // 8k-2: the detector is declared and nothing calls it; its pre reader is
+    // the connection owner allowed above.
+    assert_eq!(outside("balance_reconciliation", "balance_reconciliation/"), only("lib.rs"));
+    assert_eq!(source("lib.rs").matches("mod balance_reconciliation;").count(), 1);
+    assert_eq!(outside("read_pre", "balance_reconciliation/"), none);
+    // 8l-1: S8-4's tables are migrations only; the one production text that
+    // names any of them is 8l-2's read-only barrier statement.
+    let tables = [
+        "cash_anchors",
+        "cash_checkpoints",
+        "cash_discrepancies",
+        "cash_sightings",
+        "cash_reanchors",
+        "cash_attested_flows",
+        "dust_ledger",
+        "accounting_invalidations",
+    ];
+    let named: BTreeSet<String> = tables.iter().flat_map(|table| naming(table)).collect();
+    assert_eq!(named, only("venue_ledger_store/settlement.sql"));
+    // 8l-2: the barrier runs on its caller's connection, and neither it nor
+    // the gate's invalidity marks has a production caller yet (8l-3, 8l-7,
+    // 8l-8, 8n).
+    assert_eq!(outside("read_settlement", "venue_ledger_store/settlement.rs"), none);
+    assert_eq!(outside("SETTLEMENT_BARRIER", "venue_ledger_store/settlement.rs"), none);
+    assert_eq!(naming("invalidity_marks"), none);
+    assert_eq!(naming(".pending_evidence("), none);
+    // 8l-4a: its writers run on the journal's and the clear's bounded
+    // transactions (balance_accounting.rs, a known bound site above); the
+    // generation cell is published in production only by the supervised
+    // branch of the daemon's assembly, which needs a SpotReady production
+    // never builds (package4_supervised_startup_stays_out_of_production).
+    assert_eq!(naming("generation.publish("), only("daemon.rs"));
+    let daemon = squeeze(&source("daemon.rs"));
+    assert_eq!(daemon.matches("generation.publish(").count(), 1, "{daemon}");
+    assert!(daemon.contains("Some(ready)=>{generation.publish(ready.generation().clone());"));
 }
