@@ -190,6 +190,7 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     venue: &Arc<E>,
     pool: &Option<Arc<sqlx::PgPool>>,
     config: &Config,
+    generation: &crate::balance_accounting::GenerationCell,
 ) -> Executor<E, S> {
     // The supervised startup owns the Spot backend. Even warm-up of a
     // legacy pool would authenticate with the wrong login during closure.
@@ -199,7 +200,8 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     let (Some(pool), Some(tenant_id)) = (pool, config.projection.tenant_id) else {
         return executor;
     };
-    let backend = crate::order_journal_store::PgJournalBackend::new(pool, tenant_id);
+    let backend = crate::order_journal_store::PgJournalBackend::new(pool, tenant_id)
+        .with_accounting_generation(generation);
     with_order_journal_backend(executor, venue, backend)
 }
 
@@ -480,7 +482,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let store = Arc::new(MemoryStore::new());
         let executor = Executor::new(Arc::clone(&exchange), journal, store.clone());
         let executor = Arc::new(if durable_journal {
-            with_durable_order_journal(executor, &exchange, &pg_pool, &config)
+            with_durable_order_journal(executor, &exchange, &pg_pool, &config, &Default::default())
         } else {
             executor
         });
@@ -704,13 +706,16 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Executor::new(Arc::clone(&venue), journal, store.clone());
+        // ADR-0056 step 8l-4: one order-set generation cell for the journal and
+        // the accounting context.
+        let generation = crate::balance_accounting::GenerationCell::default();
         let executor = Arc::new(match &ready {
             Some(ready) => with_order_journal_backend(
                 executor,
                 &venue,
                 crate::order_journal_store::PgJournalBackend::supervised(ready),
             ),
-            None => with_durable_order_journal(executor, &venue, &pg_pool, &config),
+            None => with_durable_order_journal(executor, &venue, &pg_pool, &config, &generation),
         });
         let order_journal = gated(&venue, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
@@ -764,7 +769,17 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             config.engine.position_monitor_tick_interval_secs,
         ));
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
-            pm = pm.with_event_log((**pool).clone(), tenant_id);
+            // ADR-0056 step 8l-4: on a balance account, the stream repair's
+            // suspension clear bumps the accounting version.
+            let accounting = crate::balance_accounting::BalanceAccounting::for_daemon(
+                venue.capabilities().account_kind,
+                tenant_id,
+                venue.id(),
+                &generation,
+            );
+            pm = pm
+                .with_event_log((**pool).clone(), tenant_id)
+                .with_balance_accounting(accounting);
         }
         let position_manager = Arc::new(RwLock::new(pm));
 
@@ -2769,7 +2784,8 @@ mod tests {
                 Arc::new(IntentJournal::new()),
                 Arc::new(MemoryStore::new()),
             );
-            let executor = with_durable_order_journal(executor, &venue, &pool, &config);
+            let executor =
+                with_durable_order_journal(executor, &venue, &pool, &config, &Default::default());
             let journal = executor.order_journal();
             assert!(!journal.balance_account());
             assert!(!journal.one_attempt_per_client_id());

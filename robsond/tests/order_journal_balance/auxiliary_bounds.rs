@@ -11,6 +11,10 @@ use robson_exec::{
 use super::*;
 
 const BOUNDS: &str = "SELECT set_config('lock_timeout', $1, true)";
+/// The accounting bump right after them (ADR-0056 step 8l-4). With no
+/// generation installed there is no CAS, and with no accounting row it moves
+/// nothing.
+const BUMP: &str = "WITH locked AS (";
 
 fn incident() -> Incident {
     Incident {
@@ -93,11 +97,13 @@ async fn balance_auxiliary_transactions_send_their_bounds_first(pool: PgPool) {
     for (table, legacy_statements) in WRITES {
         let (result, trace) = traced(&proxy, &balance, table).await;
         result.unwrap_or_else(|error| panic!("{table}: {error}"));
-        assert_eq!(trace.len(), legacy_statements + 1, "{table}: {trace:?}");
+        assert_eq!(trace.len(), legacy_statements + 2, "{table}: {trace:?}");
         assert_eq!(trace[0], "BEGIN", "{table}: {trace:?}");
         assert!(trace[1].starts_with(BOUNDS), "{table}: bounds not first: {trace:?}");
+        assert!(trace[2].starts_with(BUMP), "{table}: no bump after the bounds: {trace:?}");
         assert_eq!(trace.last().map(String::as_str), Some("COMMIT"), "{table}: {trace:?}");
-        // The legacy journal's transaction is the same minus the bounds.
+        // The legacy journal's transaction is the same minus the bounds and
+        // the bump.
         let (result, trace) = traced(&proxy, &legacy, table).await;
         result.unwrap_or_else(|error| panic!("legacy {table}: {error}"));
         assert_eq!(trace.len(), legacy_statements, "legacy {table}: {trace:?}");
@@ -154,11 +160,12 @@ async fn balance_auxiliary_lock_waits_end_at_the_server_bound_and_retire_raw(poo
             proxy.query_trace().iter().map(|sql| sql.trim().to_owned()).collect();
         // The statement that waited never executed: the table lock stops it in
         // its Parse, and the proxy counts executed statements only. Nothing
-        // follows the bounds, not even a ROLLBACK, since the connection is
-        // dropped raw.
-        assert_eq!(trace.len(), 2, "{table}: {trace:?}");
+        // follows the bounds and the accounting bump, not even a ROLLBACK,
+        // since the connection is dropped raw.
+        assert_eq!(trace.len(), 3, "{table}: {trace:?}");
         assert_eq!(trace[0], "BEGIN", "{table}: {trace:?}");
         assert!(trace[1].starts_with(BOUNDS), "{table}: {trace:?}");
+        assert!(trace[2].starts_with(BUMP), "{table}: {trace:?}");
     }
     // Each raw retirement gave back its pool permit.
     backend.check_ready().await.unwrap();

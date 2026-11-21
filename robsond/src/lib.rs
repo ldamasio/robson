@@ -92,6 +92,8 @@ pub mod stop;
 pub mod venue;
 
 #[cfg(feature = "postgres")]
+mod balance_accounting;
+#[cfg(feature = "postgres")]
 pub mod budget_basis_alarm;
 #[cfg(feature = "postgres")]
 pub mod db_session;

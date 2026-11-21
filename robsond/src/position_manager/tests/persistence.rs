@@ -1404,6 +1404,7 @@ async fn an_interrupted_repair_resumes_past_its_checkpoint(pool: sqlx::PgPool) {
         &next.event_streams,
         &stream_key,
         &suspended,
+        None,
     )
     .await;
     assert_eq!(outcome, crate::event_streams::RepairOutcome::Cleared { applied: 200 });

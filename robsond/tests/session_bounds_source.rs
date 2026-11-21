@@ -685,6 +685,9 @@ fn every_mention_of_a_session_bound_is_a_known_one() {
         ("order_journal_balance.rs", each("set_config local")),
         ("order_journal_readiness.rs", each("set_config local")),
         ("venue_ledger_store.rs", each("set_config local")),
+        // ADR-0056 step 8l-4: the ledger's bounds, first in the balance
+        // suspension clear's transaction.
+        ("balance_accounting.rs", each("set_config local")),
         // The alarm's own session statement bound.
         ("budget_basis_alarm.rs", vec!["SET statement_timeout".to_string()]),
         // Package 2's clock store: its three Startup options, and the
