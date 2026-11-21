@@ -382,13 +382,13 @@ async fn an_on_demand_sample_is_charged(pool: PgPool) -> Result<()> {
     let held: Vec<_> = (0..19)
         .map(|_| {
             rig.budget
-                .try_reserve_read(crate::venue_budget::state::SpotRead::Account, now, until)
+                .try_reserve_read(crate::venue_budget::state::ReadKind::Account, now, until)
         })
         .collect::<Result<_, _>>()
         .map_err(|e| anyhow!("{e:?}"))?;
     let over =
         rig.budget
-            .try_reserve_read(crate::venue_budget::state::SpotRead::Account, now, until);
+            .try_reserve_read(crate::venue_budget::state::ReadKind::Account, now, until);
     ensure!(matches!(over, Err(BudgetError::Deferred)), "the TIME weight was not charged");
     drop(held);
     Ok(())

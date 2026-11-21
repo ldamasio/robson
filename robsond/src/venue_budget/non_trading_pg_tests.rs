@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::{
     bootstrap, restore,
-    state::{NonTradingBudget, SpotRead},
+    state::{NonTradingBudget, ReadKind},
     BudgetError, Trace,
 };
 use crate::process_epoch::{self, EpochStart};
@@ -84,7 +84,7 @@ fn refused(budget: &NonTradingBudget, now: TickCapture) -> Result<bool> {
     let deadline = at(now, 10 * SECOND)?;
     Ok(matches!(budget.try_reserve_time(now, deadline), Err(BudgetError::Deferred))
         && matches!(
-            budget.try_reserve_read(SpotRead::Account, now, deadline),
+            budget.try_reserve_read(ReadKind::Account, now, deadline),
             Err(BudgetError::Deferred)
         ))
 }
@@ -96,9 +96,9 @@ fn granted(budget: &NonTradingBudget, now: TickCapture) -> Result<()> {
         .try_reserve_time(now, deadline)
         .map_err(|e| anyhow!("TIME at {now:?}: {e:?}"))?;
     let read = budget
-        .try_reserve_read(SpotRead::Account, now, deadline)
+        .try_reserve_read(ReadKind::Account, now, deadline)
         .map_err(|e| anyhow!("ACCOUNT at {now:?}: {e:?}"))?;
-    ensure!(read.read() == SpotRead::Account);
+    ensure!(read.read() == ReadKind::Account);
     Ok(())
 }
 

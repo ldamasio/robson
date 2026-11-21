@@ -77,12 +77,12 @@ fn the_non_trading_budget_has_no_order_path() {
     assert!(!production.contains("for NonTradingBudget"), "{production}");
     // The closed reads' weights are fixed (PLAN §6.7).
     for (read, weight) in [
-        (SpotRead::Account, 20),
-        (SpotRead::OperatedOpenOrders, 6),
-        (SpotRead::OpenOrderLists, 6),
-        (SpotRead::ExchangeInfo, 20),
-        (SpotRead::Kline, 2),
-        (SpotRead::Commission, 20),
+        (ReadKind::Account, 20),
+        (ReadKind::OperatedOpenOrders, 6),
+        (ReadKind::OpenOrderLists, 6),
+        (ReadKind::ExchangeInfo, 20),
+        (ReadKind::Kline, 2),
+        (ReadKind::Commission, 20),
     ] {
         assert_eq!(read.weight(), weight, "{read:?}");
     }
@@ -94,7 +94,7 @@ fn the_non_trading_budget_has_no_order_path() {
 fn closed_reads_are_steady_and_capped_after_the_window() {
     let budget = SharedBudget::non_trading(tick(0, 0), None, false).unwrap();
     assert!(matches!(
-        budget.try_reserve_read(SpotRead::Kline, tick(59, 999_999_999), tick(70, 0)),
+        budget.try_reserve_read(ReadKind::Kline, tick(59, 999_999_999), tick(70, 0)),
         Err(BudgetError::Deferred)
     ));
     assert!(matches!(
@@ -102,13 +102,13 @@ fn closed_reads_are_steady_and_capped_after_the_window() {
         Err(BudgetError::Deferred)
     ));
     let held: Vec<PendingRead> = (0..20)
-        .map(|_| budget.try_reserve_read(SpotRead::Account, tick(61, 0), tick(71, 0)).unwrap())
+        .map(|_| budget.try_reserve_read(ReadKind::Account, tick(61, 0), tick(71, 0)).unwrap())
         .collect();
     assert!(held
         .iter()
-        .all(|pending| pending.read() == SpotRead::Account && pending.0.charge.is_some()));
+        .all(|pending| pending.read() == ReadKind::Account && pending.0.charge.is_some()));
     assert!(matches!(
-        budget.try_reserve_read(SpotRead::Kline, tick(61, 0), tick(71, 0)),
+        budget.try_reserve_read(ReadKind::Kline, tick(61, 0), tick(71, 0)),
         Err(BudgetError::Deferred)
     ));
     assert!(matches!(
@@ -116,8 +116,8 @@ fn closed_reads_are_steady_and_capped_after_the_window() {
         Err(BudgetError::Deferred)
     ));
     drop(held);
-    let kline = budget.try_reserve_read(SpotRead::Kline, tick(61, 0), tick(71, 0)).unwrap();
-    assert_eq!(kline.read(), SpotRead::Kline);
+    let kline = budget.try_reserve_read(ReadKind::Kline, tick(61, 0), tick(71, 0)).unwrap();
+    assert_eq!(kline.read(), ReadKind::Kline);
     assert!(budget.try_reserve_time(tick(61, 0), tick(71, 0)).is_ok());
     assert_eq!(budget.start().unwrap(), tick(0, 0));
 }

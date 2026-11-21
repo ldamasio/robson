@@ -73,7 +73,7 @@ impl Drop for PendingTime {
 /// The closed set of a non-trading Spot process's reads, each with its fixed
 /// request weight (PLAN §6.7); no caller chooses a weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SpotRead {
+pub(crate) enum ReadKind {
     Account,
     OperatedOpenOrders,
     OpenOrderLists,
@@ -82,7 +82,7 @@ pub(crate) enum SpotRead {
     Commission,
 }
 
-impl SpotRead {
+impl ReadKind {
     pub(crate) const fn weight(self) -> u32 {
         match self {
             Self::Account | Self::ExchangeInfo | Self::Commission => 20,
@@ -93,10 +93,10 @@ impl SpotRead {
 }
 
 /// One closed read's reservation, bound to the read whose weight it charged.
-pub(crate) struct PendingRead(PendingTime, SpotRead);
+pub(crate) struct PendingRead(PendingTime, ReadKind);
 
 impl PendingRead {
-    pub(crate) fn read(&self) -> SpotRead {
+    pub(crate) fn read(&self) -> ReadKind {
         self.1
     }
 }
@@ -130,7 +130,7 @@ impl NonTradingBudget {
     /// Non-blocking: a busy budget is `Deferred`, nothing reserved.
     pub(crate) fn try_reserve_read(
         &self,
-        read: SpotRead,
+        read: ReadKind,
         now: TickCapture,
         deadline: TickCapture,
     ) -> Result<PendingRead, BudgetError> {
