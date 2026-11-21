@@ -573,8 +573,32 @@ fn n5_reference_lines(path: &Path) -> &'static [&'static str] {
     }
 }
 
+/// 8k-2's BTCUSDT base detector (robsond's `balance_reconciliation`, inert:
+/// no production caller) classifies the ACCOUNT record this module parses.
+/// Its classifier takes the record type, never a reader, transport or
+/// endpoint; its unit tests build that record. Exactly these lines, in
+/// exactly these files.
+fn detector_reference_lines(path: &Path) -> &'static [&'static str] {
+    match path.to_str() {
+        Some("robsond/src/balance_reconciliation/classify.rs") => &[
+            "use robson_connectors::binance::spot::SpotAccount;",
+            "account: &SpotAccount,",
+            "account: &SpotAccount,",
+        ],
+        Some("robsond/src/balance_reconciliation/tests.rs") => &[
+            "use robson_connectors::binance::spot::{SpotAccount, SpotAccountBalance};",
+            "fn account(balances: &[(&str, Decimal, Decimal)]) -> SpotAccount {",
+            "SpotAccount {",
+            ".map(|(asset, free, locked)| SpotAccountBalance {",
+            "fn btc(free: Decimal, locked: Decimal) -> SpotAccount {",
+            "fn classify(&self, account: &SpotAccount) -> Classification {",
+        ],
+        _ => &[],
+    }
+}
+
 fn strip_n5_references(path: &Path, text: &str) -> String {
-    let mut allowed = n5_reference_lines(path).to_vec();
+    let mut allowed = [n5_reference_lines(path), detector_reference_lines(path)].concat();
     text.lines()
         .filter(|line| {
             if let Some(i) = allowed.iter().position(|expected| *expected == line.trim()) {
@@ -712,6 +736,37 @@ fn commission_allowance_admits_only_its_named_owner_and_test_gates() {
     assert!(!check(gate, "", only));
     assert!(!check(gate.split_once('\n').unwrap().1, cfg, only));
     assert!(!check(gate, cfg, &[owner.clone(), other.to_owned()]));
+}
+
+/// The 8k-2 detector's allowance admits exactly its lines in its two files:
+/// the same lines elsewhere, twice, or with any other Spot path or name are
+/// still found.
+#[test]
+fn detector_allowance_admits_only_its_named_lines() {
+    let names = spot_type_names();
+    let workspace = crate_dir().parent().unwrap();
+    let other = Path::new("robsond/src/venue.rs");
+    for owner in [
+        "robsond/src/balance_reconciliation/classify.rs",
+        "robsond/src/balance_reconciliation/tests.rs",
+    ]
+    .map(Path::new)
+    {
+        let text = fs::read_to_string(workspace.join(owner)).unwrap();
+        assert!(outside_spot_violations(owner, &text, &names).is_empty(), "{}", owner.display());
+        let exact = detector_reference_lines(owner).join("\n");
+        assert!(outside_spot_violations(owner, &exact, &names).is_empty());
+        assert!(!outside_spot_violations(other, &exact, &names).is_empty());
+        assert!(!outside_spot_violations(owner, &format!("{exact}\n{exact}"), &names).is_empty());
+        for extra in [
+            "use robson_connectors::binance::spot::SpotRestReader;",
+            "let account: SpotAccount = read().await;",
+            "binance::spot::build_venue();",
+        ] {
+            let widened = format!("{text}\n{extra}");
+            assert!(!outside_spot_violations(owner, &widened, &names).is_empty(), "{extra}");
+        }
+    }
 }
 
 #[test]
