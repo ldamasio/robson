@@ -79,15 +79,19 @@ async fn the_ledger_schema_installs_fresh(pool: PgPool) {
         20240101000047,
         20240101000048,
         20240101000049,
-        20240101000050
+        20240101000050,
+        20240101000051,
+        20240101000052,
+        20240101000053,
+        20240101000054
     ]);
-    // The embedded chain has no gap: every version from 0 to 50, in order.
+    // The embedded chain has no gap: every version from 0 to 54, in order.
     let chain: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await
             .unwrap();
-    let expected: Vec<i64> = (0..=50).map(|n| 20240101000000 + n).collect();
+    let expected: Vec<i64> = (0..=54).map(|n| 20240101000000 + n).collect();
     assert_eq!(chain, expected);
     // Migrations 41 to 45 create the order-set projection tables empty.
     for suffix in [
@@ -110,7 +114,8 @@ async fn the_ledger_schema_installs_fresh(pool: PgPool) {
                 .unwrap();
         assert_eq!(count, 0, "spot_order_set_{suffix}: migrations are inert");
     }
-    // Migrations 46 to 50 create the S8-4 Spot accounting tables empty.
+    // Migrations 46 to 50 create the S8-4 Spot accounting tables empty, and
+    // 51 to 54 the S8-5 boundary snapshot tables.
     for table in [
         "cash_anchors",
         "cash_checkpoints",
@@ -120,6 +125,12 @@ async fn the_ledger_schema_installs_fresh(pool: PgPool) {
         "cash_attested_flows",
         "dust_ledger",
         "accounting_invalidations",
+        // Migrations 51 to 54: the S8-5 boundary snapshot tables.
+        "boundary_snapshots",
+        "boundary_reopenings",
+        "boundary_snapshot_revisions",
+        "boundary_carried_legs",
+        "activation_bases",
     ] {
         let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(&pool)
