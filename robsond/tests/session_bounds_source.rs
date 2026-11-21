@@ -891,13 +891,20 @@ fn package4_supervised_startup_stays_out_of_production() {
     ] {
         assert!(!startup.contains(test_only), "{test_only} is production code");
     }
-    // The definition is the only production `SpotReady {`: nothing builds one.
+    // Besides its definition and its accessors' impl, no production
+    // `SpotReady {` exists: nothing builds one.
     let built: Vec<(&str, usize)> = sources
         .iter()
-        .map(|s| (s.file.as_str(), s.text.matches("SpotReady {").count()))
+        .map(|s| {
+            let named = s.text.matches("SpotReady {").count();
+            let declared = s.text.matches("struct SpotReady {").count()
+                + s.text.matches("impl SpotReady {").count();
+            (s.file.as_str(), named - declared)
+        })
         .filter(|(_, count)| *count > 0)
         .collect();
-    assert_eq!(built, [("spot_order_set_store/spot_startup.rs", 1)]);
+    assert!(built.is_empty(), "a production SpotReady is built: {built:?}");
+    assert_eq!(startup.matches("impl SpotReady {").count(), 1, "{startup}");
     assert!(!source("daemon.rs").contains("fn with_supervised_spot("));
     let main = source("main.rs");
     assert!(

@@ -2640,6 +2640,28 @@ mod tests {
         })
     }
 
+    /// `venue`'s executor with a plain backend attached as the daemon attaches
+    /// one: whether its journal serves a balance account, then
+    /// [`release_under_lock`] on it.
+    #[cfg(feature = "postgres")]
+    async fn attached_release<E: Venue + 'static>(
+        pool: &sqlx::PgPool,
+        venue: Arc<E>,
+    ) -> (bool, Option<Result<(), String>>, std::time::Duration) {
+        let executor = Executor::new(
+            Arc::clone(&venue),
+            Arc::new(IntentJournal::new()),
+            Arc::new(MemoryStore::new()),
+        );
+        let backend = crate::order_journal_store::PgJournalBackend::new(pool, uuid::Uuid::now_v7());
+        // No readiness check: the release runs on the daemon pool, which is
+        // already connected, and readiness is not what is measured here.
+        let journal = with_order_journal_backend(executor, &venue, backend).order_journal();
+        let started = std::time::Instant::now();
+        let released = release_under_lock(pool, &journal).await;
+        (journal.balance_account(), released, started.elapsed())
+    }
+
     /// D5 finding 2 through package 4's journal attachment: the daemon bounds
     /// the auxiliary transactions of whatever backend it attaches to a
     /// balance venue, from the venue's account kind, and leaves a position
@@ -2651,42 +2673,21 @@ mod tests {
     async fn the_attached_backend_takes_the_balance_bounds_from_the_venue(pool: sqlx::PgPool) {
         use robson_exec::venue::AccountKind;
 
-        use crate::capability::test_exchange::RestrictedExchange;
-        for balance in [true, false] {
-            let mut capabilities = robson_testkit::balance_stub::spot_capabilities();
-            if !balance {
-                capabilities.account_kind = AccountKind::PositionAccount;
-            }
-            let venue = Arc::new(RestrictedExchange::new().with_capabilities(capabilities));
-            let executor = Executor::new(
-                Arc::clone(&venue),
-                Arc::new(IntentJournal::new()),
-                Arc::new(MemoryStore::new()),
-            );
-            let backend =
-                crate::order_journal_store::PgJournalBackend::new(&pool, uuid::Uuid::now_v7());
-            let executor = with_order_journal_backend(executor, &venue, backend);
-            let journal = executor.order_journal();
-            assert_eq!(journal.balance_account(), balance);
-            journal.check_ready().await.unwrap();
-            let started = std::time::Instant::now();
-            let released = release_under_lock(&pool, &journal).await;
-            if balance {
-                let error = released
-                    .expect("the server bound must end the lock wait")
-                    .expect_err("a lock wait past the bound must fail");
-                assert!(
-                    error.contains("lock timeout") || error.contains("statement timeout"),
-                    "{error}"
-                );
-                assert!(started.elapsed() < Duration::from_secs(2));
-            } else {
-                assert!(
-                    released.is_none(),
-                    "a position account's release is bounded: {released:?}"
-                );
-            }
-        }
+        use crate::capability::worker_venue::WorkerVenue;
+        let venue = |kind| Arc::new(WorkerVenue::new(kind, false));
+        let (balance, released, elapsed) =
+            attached_release(&pool, venue(AccountKind::BalanceAccount)).await;
+        assert!(balance);
+        let error = released
+            .expect("the server bound must end the lock wait")
+            .expect_err("a lock wait past the bound must fail");
+        assert!(error.contains("lock timeout") || error.contains("statement timeout"), "{error}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+
+        let (balance, released, _) =
+            attached_release(&pool, venue(AccountKind::PositionAccount)).await;
+        assert!(!balance);
+        assert!(released.is_none(), "a position account's release is bounded: {released:?}");
     }
 
     /// The supervised Spot backend is a bounded balance backend by itself
