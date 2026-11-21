@@ -952,8 +952,10 @@ fn package5a_owners_stay_dormant_or_bounded() {
     assert_eq!(outside("balance_reconciliation", "balance_reconciliation/"), only("lib.rs"));
     assert_eq!(source("lib.rs").matches("mod balance_reconciliation;").count(), 1);
     assert_eq!(outside("read_pre", "balance_reconciliation/"), none);
-    // 8l-1: S8-4's tables are migrations only; the one production text that
-    // names any of them is 8l-2's read-only barrier statement.
+    // 8l-1: S8-4's tables are migrations only; the production texts that
+    // name any of them are 8l-2's read-only barrier statement, 8l-3a's
+    // read-only cash statements, and record_trades' one write, the
+    // unattributed-fill invalidation (PLAN-r4 §6.10).
     let tables = [
         "cash_anchors",
         "cash_checkpoints",
@@ -965,7 +967,27 @@ fn package5a_owners_stay_dormant_or_bounded() {
         "accounting_invalidations",
     ];
     let named: BTreeSet<String> = tables.iter().flat_map(|table| naming(table)).collect();
-    assert_eq!(named, only("venue_ledger_store/settlement.sql"));
+    let cash_sql = [
+        "venue_ledger_store/cash/expected.sql",
+        "venue_ledger_store/cash/discrepancy.sql",
+        "venue_ledger_store/cash/state.sql",
+    ];
+    let (barrier, trades) = ("venue_ledger_store/settlement.sql", "venue_ledger_store/trades.rs");
+    let expected: BTreeSet<String> = cash_sql
+        .iter()
+        .chain([&barrier, &trades])
+        .map(|file| file.to_string())
+        .collect();
+    assert_eq!(named, expected);
+    for file in cash_sql.iter().chain([&barrier]) {
+        let text = source(file);
+        assert!(["INSERT", "UPDATE", "DELETE"].iter().all(|w| !text.contains(w)), "{file}");
+    }
+    assert_eq!(naming("INSERT INTO accounting_invalidations"), only(trades));
+    // 8l-3a: E(t) and the cash predicates run on their caller's connection
+    // and have no production caller yet (8l-3b, 8l-8, 8p, 8n).
+    assert_eq!(outside("read_cash_state", "venue_ledger_store/cash"), none);
+    assert_eq!(outside("CASH_STATE", "venue_ledger_store/cash"), none);
     // 8l-2: the barrier runs on its caller's connection, and neither it nor
     // the gate's invalidity marks has a production caller yet (8l-3, 8l-7,
     // 8l-8, 8n).

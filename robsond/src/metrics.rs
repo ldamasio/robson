@@ -60,6 +60,8 @@
 //!   because a sweep's close held their symbol and side (PR O)
 //! - `robsond_leg_settlement_pending` — balance-account legs the latest
 //!   settlement barrier read found unsettled (ADR-0056 step 8l-2)
+//! - `robsond_cash_impaired` — 1 while the latest cash read found `E(now)`
+//!   impaired by late evidence (ADR-0056 step 8l-3a)
 
 use std::sync::LazyLock;
 
@@ -277,6 +279,18 @@ pub static LEG_SETTLEMENT_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
 
 pub fn observe_leg_settlement_pending(legs: u64) {
     LEG_SETTLEMENT_PENDING.set(i64::try_from(legs).unwrap_or(i64::MAX));
+}
+
+/// 1 while the latest cash read found `E(now)` impaired by late evidence
+/// (ADR-0056 step 8l-3a, PLAN-r4 §6.10): the current month is invalid. Set by
+/// every read; absent until the first, and no production path reads yet.
+pub static CASH_IMPAIRED: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!("robsond_cash_impaired", "1 while E(now) is impaired by late evidence")
+        .expect("failed to register robsond_cash_impaired")
+});
+
+pub fn observe_cash_impaired(impaired: bool) {
+    CASH_IMPAIRED.set(i64::from(impaired));
 }
 
 /// Publish how many streams of each kind are suspended; both kinds export,

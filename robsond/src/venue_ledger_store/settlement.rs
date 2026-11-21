@@ -136,8 +136,15 @@ fn assets<'a>(query: &SettlementQuery<'a>) -> Result<[Vec<&'a str>; 3], LedgerEr
     if query.month.day() != 1 {
         return Err(LedgerError::InvalidEvidence("a month is named by its first day".into()));
     }
+    asset_columns(query.assets)
+}
+
+/// The same arrays for 8l-3's cash statements, which embed this one.
+pub(super) fn asset_columns<'a>(
+    expected: &[CommissionAssets<'a>],
+) -> Result<[Vec<&'a str>; 3], LedgerError> {
     let mut columns: [Vec<&str>; 3] = Default::default();
-    for assets in query.assets {
+    for assets in expected {
         let fields = [assets.symbol, assets.base, assets.quote];
         if fields.iter().any(|text| text.trim().is_empty()) || columns[0].contains(&assets.symbol) {
             return Err(LedgerError::InvalidEvidence(
