@@ -1,27 +1,34 @@
 //! Test-only real Journal/Spot audit composition driven by a disposable PG16
 //! controller.
-use std::io::{self, BufRead, Read, Write};
+use std::{io, os::fd::AsFd, sync::Arc};
 
 use robson_domain::OrderSide;
 use robson_exec::{
+    order_journal::{IntentSpec, OrderJournal, ReleaseRefusal},
     venue::{OrderPhase, VenueOrderRecord},
     venue_ledger::{OrderLink, OrderOwner, SeenAt},
 };
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
-use tokio::time::Instant;
+use sha2::{Digest, Sha256};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::unix::pipe::{Receiver, Sender},
+    time::{timeout_at, Instant},
+};
 
 use super::*;
 use crate::{
     spot_order_set_store::{
-        cold_install::{install, ClosedWriterFence, FencePhase, FenceReceipt, FixtureFenceError},
-        cold_owner::{capture, OwnerRequest, RestoreIdentity},
+        cold_install::{ClosedWriterFence, FencePhase, FenceReceipt, FixtureFenceError},
+        cold_owner::RestoreIdentity,
         observe_generation,
         physical_fixture::{
             audit_cold_sources, AttemptSource, ColdAuditRefusal, ColdAuditScope, ColdSourceSink,
             Family, IntentSource, OrderSource, PageBudget, RouteClass, RouteSource, SinkFull,
             SourceKey,
         },
+        spot_startup::{record_epoch, Admission, RestoredTarget, SpotSupervisor},
         ExpectedGeneration,
     },
     venue_budget::{fixture as budget_fixture, physical_recovery as budget_recovery},
@@ -38,7 +45,15 @@ const BUDGET: PageBudget = PageBudget {
     routes: 2,
 };
 
+const PIPE_BOUND: Duration = Duration::from_secs(3);
+
 struct Channel {
+    input: BufReader<Receiver>,
+    output: Sender,
+    restored: Option<RestoredTarget>,
+    writer_options: Option<sqlx::postgres::PgConnectOptions>,
+    successor_login: String,
+    substitute_installer: Option<PgPool>,
     operation: Uuid,
     owner: String,
     fixture: String,
@@ -47,10 +62,19 @@ struct Channel {
 }
 
 impl Channel {
-    fn open() -> Result<(Self, Value)> {
-        let greeting = Self::read()?;
+    async fn open() -> Result<(Self, Value)> {
+        let mut input =
+            BufReader::new(Receiver::from_owned_fd(io::stdin().as_fd().try_clone_to_owned()?)?);
+        let output = Sender::from_owned_fd(io::stdout().as_fd().try_clone_to_owned()?)?;
+        let greeting = Self::read(&mut input, Instant::now() + PIPE_BOUND).await?;
         ensure!(greeting["schema"] == 1);
         let revision = Self {
+            input,
+            output,
+            restored: None,
+            writer_options: None,
+            successor_login: Self::string(&greeting, "new_user")?.to_owned(),
+            substitute_installer: None,
             operation: Self::string(&greeting, "operation")?.parse()?,
             owner: Self::string(&greeting, "owner")?.to_owned(),
             fixture: Self::string(&greeting, "fixture")?.to_owned(),
@@ -68,18 +92,27 @@ impl Channel {
         value[key].as_str().with_context(|| format!("missing controller field {key}"))
     }
 
-    fn read() -> Result<Value> {
-        let mut bytes = String::new();
-        let n = io::stdin().lock().take(16_385).read_line(&mut bytes)?;
+    async fn read(input: &mut BufReader<Receiver>, deadline: Instant) -> Result<Value> {
+        let mut bytes = Vec::new();
+        let n = timeout_at(deadline, input.take(16_385).read_until(b'\n', &mut bytes)).await??;
         ensure!(
-            n > 0 && n <= 16_384 && bytes.ends_with('\n'),
+            n > 0 && n <= 16_384 && bytes.ends_with(b"\n"),
             "invalid private controller frame size"
         );
-        serde_json::from_str(&bytes)
+        serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("malformed private controller frame"))
     }
 
-    fn phase(&mut self, phase: &str, facts: Value) -> Result<Value> {
+    async fn phase(&mut self, phase: &str, facts: Value) -> Result<Value> {
+        let bound = if phase == "retired" {
+            Duration::from_secs(8)
+        } else {
+            PIPE_BOUND
+        };
+        self.phase_at(phase, facts, Instant::now() + bound).await
+    }
+
+    async fn phase_at(&mut self, phase: &str, facts: Value, deadline: Instant) -> Result<Value> {
         self.seq += 1;
         let previous = if phase == "retired"
             && std::env::var("ROBSON_PHYSICAL_FAULT").as_deref() == Ok("bad-frame")
@@ -91,12 +124,12 @@ impl Channel {
         let frame = json!({"operation": self.operation, "owner": self.owner,
             "fixture": self.fixture, "seq": self.seq, "phase": phase,
             "previous": previous, "facts": facts});
-        {
-            let mut stdout = io::stdout().lock();
-            writeln!(stdout, "\nROBSON_PHASE {frame}")?;
-            stdout.flush()?;
-        }
-        let received = Self::read()?;
+        let payload = frame.to_string();
+        let expected_ack = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        let bytes = format!("\nROBSON_PHASE {payload}\n");
+        ensure!(bytes.len() <= 16_384, "oversized private controller frame");
+        timeout_at(deadline, self.output.write_all(bytes.as_bytes())).await??;
+        let received = Self::read(&mut self.input, deadline).await?;
         ensure!(
             received["schema"] == 1
                 && received["ok"] == true
@@ -109,9 +142,7 @@ impl Channel {
         );
         let previous = Self::string(&received, "previous")?;
         ensure!(
-            previous != self.previous
-                && previous.len() == 64
-                && previous.bytes().all(|b| b.is_ascii_hexdigit()),
+            previous == expected_ack && previous != self.previous,
             "invalid controller receipt chain"
         );
         self.previous = previous.to_owned();
@@ -272,18 +303,85 @@ impl ClosedWriterFence for Channel {
             return Err(FixtureFenceError);
         }
         let name = match phase {
+            FencePhase::BeforeEpoch => "fence_before_epoch",
+            FencePhase::BeforeCapture => "fence_before_capture",
             FencePhase::BeforeRead => "fence_before_install",
             FencePhase::BeforePublish => "fence_before_publish",
             FencePhase::AfterReadback => "fence_after_readback",
+            FencePhase::BeforeSourceAudit | FencePhase::AfterSourceAudit => {
+                return Err(FixtureFenceError);
+            },
         };
         let approved = self
-            .phase(name, json!({"target_id": restore.target}))
+            .phase_at(
+                name,
+                json!({"target_id": restore.target}),
+                deadline.min(Instant::now() + PIPE_BOUND),
+            )
+            .await
             .map_err(|_| FixtureFenceError)?;
         if approved["target_id"] != restore.target.to_string() || Instant::now() >= deadline {
             return Err(FixtureFenceError);
         }
         let owner = self.owner.parse().map_err(|_| FixtureFenceError)?;
         Ok(FenceReceipt { restore, owner })
+    }
+}
+
+impl SpotSupervisor for Channel {
+    fn target(&self) -> &RestoredTarget {
+        self.restored.as_ref().expect("restore receipt configured")
+    }
+
+    fn successor_login(&self) -> &str {
+        &self.successor_login
+    }
+
+    async fn admit(
+        &mut self,
+        admission: &Admission<'_>,
+        deadline: Instant,
+    ) -> std::result::Result<PgPool, FixtureFenceError> {
+        let g = admission.generation;
+        let permit = self.phase_at(
+            "admit",
+            json!({"epoch":g.process_epoch,"audit":g.source_audit_id,"generation":g.generation_id}),
+            deadline.min(Instant::now() + PIPE_BOUND),
+        ).await.map_err(|_| FixtureFenceError)?;
+        if permit["new_user"].as_str() != Some(admission.login) {
+            return Err(FixtureFenceError);
+        }
+        if let Some(installer) = self.substitute_installer.take() {
+            return Ok(installer);
+        }
+        let (login, password_key) = if std::env::var("ROBSON_PHYSICAL_FAULT").as_deref()
+            == Ok("startup-wrong-restricted-login")
+        {
+            (
+                Self::string(&permit, "probe_user").map_err(|_| FixtureFenceError)?,
+                "probe_password",
+            )
+        } else {
+            (admission.login, "new_password")
+        };
+        let password = Self::string(&permit, password_key).map_err(|_| FixtureFenceError)?;
+        let options = self
+            .writer_options
+            .take()
+            .ok_or(FixtureFenceError)?
+            .username(login)
+            .password(password)
+            .ssl_mode(PgSslMode::Disable);
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .test_before_acquire(false)
+            .connect_with(options)
+            .await
+            .map_err(|_| FixtureFenceError)?;
+        if std::env::var("ROBSON_PHYSICAL_FAULT").as_deref() == Ok("post-admit-eof") {
+            std::process::exit(68);
+        }
+        Ok(pool)
     }
 }
 
@@ -298,10 +396,78 @@ fn binding<'a>(g: &'a JournalGeneration, venue: &'a VenueId) -> ExpectedGenerati
     }
 }
 
+async fn witness_daemon_start(
+    restore: PgPool,
+    ready: crate::spot_order_set_store::spot_startup::SpotReady,
+    tenant: Uuid,
+    epoch: Uuid,
+) -> Result<Arc<OrderJournal>> {
+    use robson_connectors::{binance::spot::BinanceSpotAdapter, binance_rest::BinanceRestClient};
+    use robson_exec::{StubOhlcv, StubTradeFeed};
+
+    #[cfg(feature = "crash-points")]
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    #[cfg(feature = "crash-points")]
+    let base = format!("http://{}", listener.local_addr()?);
+    let venue = || -> Result<_> {
+        #[cfg(feature = "crash-points")]
+        let client = BinanceRestClient::with_harness_base_url(
+            base.clone(),
+            "fixture-key".into(),
+            "fixture-secret".into(),
+        );
+        #[cfg(not(feature = "crash-points"))]
+        let client = BinanceRestClient::new("fixture-key".into(), "fixture-secret".into());
+        Ok(Arc::new(BinanceSpotAdapter::new(Arc::new(client))?))
+    };
+    let mut config = crate::Config::test();
+    config.projection.tenant_id = Some(tenant);
+    let unqualified = crate::Daemon::with_venue_and_recovery(
+        config.clone(),
+        venue()?,
+        Arc::new(StubTradeFeed::default()),
+        Arc::new(StubOhlcv::default()),
+        None,
+        Some(Arc::new(restore.clone())),
+    );
+    let refused = Box::pin(unqualified.run_until(crate::stop::StopRequest::default())).await;
+    ensure!(matches!(refused, Err(crate::DaemonError::Config(reason))
+        if reason == "Spot startup requires a supervised journal"));
+    let daemon = crate::Daemon::with_supervised_spot(
+        config,
+        venue()?,
+        Arc::new(StubTradeFeed::default()),
+        Arc::new(StubOhlcv::default()),
+        ready,
+    )?;
+    let journal = daemon.journal_for_startup_witness();
+    let refused = Box::pin(daemon.run_until(crate::stop::StopRequest::default())).await;
+    ensure!(
+        matches!(refused, Err(crate::DaemonError::Config(reason))
+        if reason == "Spot TIME prerequisites unavailable: PrerequisiteRefusal"),
+        "supervised startup did not reach the existing C2 gate"
+    );
+    let epochs: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT epoch_id FROM public.process_epochs WHERE tenant_id=$1 ORDER BY epoch_seq DESC LIMIT 3",
+    ).bind(tenant).fetch_all(&restore).await?;
+    ensure!(
+        epochs.len() == 2 && epochs[0] == epoch,
+        "daemon recorded an extra process epoch"
+    );
+    #[cfg(feature = "crash-points")]
+    ensure!(
+        tokio::time::timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err(),
+        "Spot attempted wire I/O before C2",
+    );
+    Ok(journal)
+}
+
 #[sqlx::test(migrations = false)]
 #[ignore = "requires dedicated physical controller and isolated PG16 over loopback"]
 async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Result<()> {
-    let (mut channel, greeting) = Channel::open()?;
+    let (mut channel, greeting) = Channel::open().await?;
     let old_role = Channel::string(&greeting, "old_user")?;
     let new_role = Channel::string(&greeting, "new_user")?;
     let upstream = pool.connect_options();
@@ -322,7 +488,7 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     )
     .await
     .map_err(|e| anyhow::anyhow!("initialize disposable budget: {e:?}"))?;
-    let g = seed_generation(&pool).await?;
+    let g = seed_generation_for(&pool, robson_exec::order_journal::DEFAULT_ACCOUNT_SCOPE).await?;
     seed_native_sources(&pool, &g).await?;
     validate_writer_roles(&pool, old_role, new_role).await?;
     let before = fields(&pool, &g).await?;
@@ -345,11 +511,13 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
         "SELECT pid,backend_start::text,current_user::text FROM pg_stat_activity WHERE pid=pg_backend_pid()",
     ).fetch_one(&old_pool).await?;
     ensure!(user == old_role);
-    channel.phase(
-        "old_connected",
-        json!({"database":db,"pid":pid,"backend_start":birth,
+    channel
+        .phase(
+            "old_connected",
+            json!({"database":db,"pid":pid,"backend_start":birth,
         "current_user":user,"tenant":g.tenant_id}),
-    )?;
+        )
+        .await?;
     if std::env::var("ROBSON_PHYSICAL_FAULT").as_deref() == Ok("eof") {
         std::process::exit(67);
     }
@@ -365,7 +533,8 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     };
     proxy.enable_exact_query_trace(12);
     proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE public.spot_order_set_generation g"));
-    let original = sell();
+    let mut original = sell();
+    original.intent.account_scope = g.account_scope.clone();
     let result = writer.commit(&original).await;
     ensure!(
         matches!(result, Err(CommitFailure::Uncertain(_))),
@@ -388,23 +557,34 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     pool.close().await;
     let proof = channel.phase("retired",json!({"pid":pid,"backend_start":birth,"intent":original.intent.intent_id,
         "epoch":g.process_epoch,"generation":g.generation_id,"audit":g.source_audit_id,"version":committed.0,
-        "native_statements":6,"lost_commit_acks":1}))?;
-    let target = Channel::string(&proof, "target")?;
+        "native_statements":6,"lost_commit_acks":1})).await?;
     let restore_identity = RestoreIdentity {
         operation: channel.operation,
         target: Channel::string(&proof, "target_id")?.parse()?,
     };
-    ensure!(!restore_identity.target.is_nil());
+    channel.restored = Some(RestoredTarget {
+        restore: restore_identity,
+        database: db.to_owned(),
+        system_identifier: Channel::string(&proof, "system_id")?.to_owned(),
+        data_directory: Channel::string(&proof, "target")?.to_owned(),
+        postmaster_started: Channel::string(&proof, "postmaster_started")?.to_owned(),
+    });
+    let restored_wire = DbProxy::start(server).await?;
+    let restore_options = upstream
+        .as_ref()
+        .clone()
+        .host("127.0.0.1")
+        .port(restored_wire.addr().port())
+        .ssl_mode(PgSslMode::Disable);
+    channel.writer_options = Some(restore_options.clone());
     let restore = PgPoolOptions::new()
         .max_connections(4)
-        .connect_with(upstream.as_ref().clone())
+        .test_before_acquire(false)
+        .connect_with(restore_options)
         .await?;
-    let exact_cluster: (String, String) = sqlx::query_as(
-        "SELECT system_identifier::text,current_setting('data_directory') FROM pg_control_system()",
-    )
-    .fetch_one(&restore)
-    .await?;
-    ensure!(exact_cluster.0 == Channel::string(&proof, "system_id")? && exact_cluster.1 == target);
+    if std::env::var("ROBSON_PHYSICAL_FAULT").as_deref() == Ok("startup-wrong-live-role") {
+        channel.substitute_installer = Some(restore.clone());
+    }
     let venue = VenueId::new(VenueId::BINANCE_SPOT);
     let mut reader = restore.connect_options().connect().await?;
     let predecessor = observe_generation(&mut reader, binding(&g, &venue))
@@ -413,8 +593,24 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     ensure!(
         predecessor.accounting_version == committed.0 && fields(&restore, &g).await? == committed
     );
-    let new =
-        crate::process_epoch::start_epoch(&restore, g.tenant_id, "physical-writer-fixture").await?;
+    let handshake_start = Instant::now();
+    restored_wire.enable_exact_query_trace(256);
+    let deadline = handshake_start + Duration::from_secs(20);
+    let mut epoched = record_epoch(
+        restore.clone(),
+        channel,
+        g.tenant_id,
+        &g.account_scope,
+        "physical-writer-fixture",
+        deadline,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("supervised Spot epoch: {e:?}"))?;
+    let first = restored_wire.query_trace();
+    let installer_checks =
+        first.iter().filter(|q| q.contains("FROM pg_control_system() c")).count();
+    ensure!(installer_checks == 1, "installer identity query bound");
+    let new = epoched.epoch().clone();
     let stamp = new.unclean_generation.context("missing native original recovery stamp")?;
     let actual: Option<i64> = sqlx::query_scalar(
         "SELECT uncertain_generation FROM public.order_intents WHERE intent_id=$1",
@@ -429,10 +625,13 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
             && observe_generation(&mut reader, binding(&g, &venue)).await?.is_none()
             && fields(&restore, &g).await? == committed
     );
-    channel.phase(
-        "epoch",
-        json!({"predecessor":g.process_epoch,"epoch":new.epoch.epoch_id,"stamp":stamp}),
-    )?;
+    epoched
+        .supervisor()
+        .phase(
+            "epoch",
+            json!({"predecessor":g.process_epoch,"epoch":new.epoch.epoch_id,"stamp":stamp}),
+        )
+        .await?;
     let deadline = Instant::now() + Duration::from_secs(5);
     let scope = ColdAuditScope {
         tenant_id: g.tenant_id,
@@ -449,16 +648,11 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     ensure!(
         matches!(stopped,Err(ColdAuditRefusal::PageBudget {family:Family::Routes,last_key:Some(SourceKey::Route(key))}) if key==Uuid::from_u128(8))
     );
-    let request = OwnerRequest {
-        scope,
-        expected_uid: "physical-recovery-fixture",
-        epoch: new.epoch.epoch_id,
-        accounting_version: committed.0,
-        restore: restore_identity,
-    };
-    let cut = capture(&restore, &request, deadline)
+    let mut captured = epoched
+        .capture("physical-recovery-fixture", committed.0)
         .await
-        .map_err(|e| anyhow::anyhow!("real anchored Spot cold audit: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("supervised Spot capture: {e:?}"))?;
+    let cut = captured.cut();
     let mut keys = NativeKeys::default();
     keys.intents(cut.intents())
         .map_err(|_| anyhow::anyhow!("original J fixture oracle"))?;
@@ -487,15 +681,19 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
     let families=receipt.families.iter().zip(["intents","attempts","orders","routes"])
         .map(|(f,name)| json!({"family":name,"rows":f.rows,"pages":f.pages,"last_key":key_value(f.last_key.as_ref())}))
         .collect::<Vec<_>>();
-    channel.phase(
-        "cold",
-        json!({"tenant":g.tenant_id,"scope":g.account_scope,"epoch":new.epoch.epoch_id,
-        "version":committed.0,"families":families,"statements":receipt.statements}),
-    )?;
+    let statements = receipt.statements;
+    captured
+        .supervisor()
+        .phase(
+            "cold",
+            json!({"tenant":g.tenant_id,"scope":g.account_scope,"epoch":new.epoch.epoch_id,
+        "version":committed.0,"families":families,"statements":statements}),
+        )
+        .await?;
     let deadline = Instant::now() + Duration::from_secs(5);
     let audit = budget_recovery::audit_empty_budget(&restore, &copied_budget, deadline).await?;
-    channel.phase("budget",json!({"audit":audit.audit,"quiescence_generation":audit.generation,
-        "source":0,"clocks":0,"charges":0,"statements":audit.start_commands+audit.pass_commands+audit.terminal_commands}))?;
+    captured.supervisor().phase("budget",json!({"audit":audit.audit,"quiescence_generation":audit.generation,
+        "source":0,"clocks":0,"charges":0,"statements":audit.start_commands+audit.pass_commands+audit.terminal_commands})).await?;
     let bootstrap = budget_recovery::bootstrap_empty_budget(
         &restore,
         g.tenant_id,
@@ -506,62 +704,74 @@ async fn physical_spot_writer_survives_exact_native_restore(pool: PgPool) -> Res
         deadline,
     )
     .await?;
-    channel.phase("bootstrap",json!({"audit":bootstrap.audit,"quiescence_generation":bootstrap.generation,
-        "epoch":bootstrap.process_epoch,"statements":bootstrap.bootstrap_commands,"stale_statements":bootstrap.stale_commands}))?;
-    let installed = install(&restore, &cut, &mut channel, Instant::now() + Duration::from_secs(5))
+    captured.supervisor().phase("bootstrap",json!({"audit":bootstrap.audit,"quiescence_generation":bootstrap.generation,
+        "epoch":bootstrap.process_epoch,"statements":bootstrap.bootstrap_commands,"stale_statements":bootstrap.stale_commands})).await?;
+    let mut installed = captured
+        .install()
         .await
-        .map_err(|e| anyhow::anyhow!("exact fenced cold installation: {e:?}"))?;
-    ensure!(installed.restore == restore_identity && installed.accounting_version == committed.0);
-    let successor = installed.generation;
+        .map_err(|e| anyhow::anyhow!("supervised Spot installation: {e:?}"))?;
+    let successor = installed.generation().clone();
     ensure!(observe_generation(&mut reader, binding(&successor, &venue)).await?.is_some());
     ensure!(observe_generation(&mut reader, binding(&g, &venue)).await?.is_none());
-    channel.phase("installed",json!({"tenant":g.tenant_id,"scope":g.account_scope,"epoch":successor.process_epoch,
-        "version":committed.0,"audit":successor.source_audit_id,"generation":successor.generation_id}))?;
-    let permit = channel.phase(
-        "admit",
-        json!({"epoch":successor.process_epoch,"audit":successor.source_audit_id,
-        "generation":successor.generation_id}),
-    )?;
-    ensure!(Channel::string(&permit, "new_user")? == new_role);
-    let candidate = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            upstream
-                .as_ref()
-                .clone()
-                .username(new_role)
-                .password(Channel::string(&permit, "new_password")?)
-                .ssl_mode(PgSslMode::Disable),
-        )
+    installed.supervisor().phase("installed",json!({"tenant":g.tenant_id,"scope":g.account_scope,"epoch":successor.process_epoch,
+        "version":committed.0,"audit":successor.source_audit_id,"generation":successor.generation_id})).await?;
+    let before_admit = restored_wire.query_trace().len();
+    let (ready, mut channel) = installed
+        .admit()
         .await
-        .map_err(|_| anyhow::anyhow!("admitted candidate failed to connect"))?;
-    let as_role: String =
-        sqlx::query_scalar("SELECT current_user::text").fetch_one(&candidate).await?;
-    ensure!(as_role == new_role);
-    if std::env::var("ROBSON_PHYSICAL_FAULT").as_deref() == Ok("post-admit-eof") {
-        // The supervisor already verified the new role and will close the
-        // HBA before destroying the exact restored fixture.
-        std::process::exit(68);
-    }
-    let current = PgJournalBackend {
-        pool: candidate.clone(),
-        daemon_pool: restore.clone(),
-        tenant_id: g.tenant_id,
-        ready_wait: JOURNAL_READY_WAIT,
-        balance_account: false,
-        order_set_projection: Some(successor.clone()),
+        .map_err(|e| anyhow::anyhow!("admitted Spot writer: {e:?}"))?;
+    let wire = restored_wire.query_trace();
+    let admitted_checks = &wire[before_admit..];
+    ensure!(restored_wire.query_trace_dropped() == 0 && admitted_checks.len() == 2);
+    ensure!(
+        admitted_checks[0].contains("inet_server_port")
+            && admitted_checks[1].contains("g.position_hints_complete")
+    );
+    let handshake_ms = u64::try_from(handshake_start.elapsed().as_millis())?;
+    let candidate = ready.writer().clone();
+    let journal =
+        witness_daemon_start(restore.clone(), ready, g.tenant_id, successor.process_epoch).await?;
+    // This restricted role deliberately cannot update incidents. The same
+    // release using the installer's pool would be able to commit.
+    let release = robson_exec::order_journal::ReleaseRecord {
+        decision_id: Uuid::now_v7(),
+        generation: stamp,
+        actor: "disposable-fixture".into(),
+        auth_kind: "verified",
+        note: "restricted successor credential control".into(),
+        treatment: "unbooked_accepted",
+        decided_at: Utc::now(),
     };
-    let j = sell();
-    insist(current.commit(&j).await)?;
+    ensure!(journal.gate().generation() == stamp);
+    let refused = journal.release(release).await;
+    ensure!(
+        matches!(refused, Err(ReleaseRefusal::Backend(reason))
+        if reason.contains("permission denied") && reason.contains("recovery_incidents")),
+        "supervised release did not use the restricted writer"
+    );
+    // Feed a simulated completion to the journal attached to this daemon.
+    // It adds no attempt, clock, request or ticket.
+    let j = journal.open_intent(IntentSpec {
+        position_id: Some(Uuid::now_v7()),
+        kind: IntentKind::Exit,
+        client_order_id: format!("fixture-{}", Uuid::now_v7().simple()),
+        cancels_order_id: None,
+        params: json!({}),
+    });
+    journal.finish_success(&j, Some(json!({"fixture": true}))).await;
+    ensure!(journal.retry_set_depth() == 0);
     ensure!(fields(&restore, &successor).await? == (committed.0 + 1, committed.1 + 1, 2, 0, 2, 0));
     ensure!(
-        j_present(&restore, j.intent.intent_id).await?
+        j_present(&restore, j.intent_id()).await?
             && j_present(&restore, original.intent.intent_id).await?
     );
     candidate.close().await;
-    drop(current);
+    drop(journal);
     drop(reader);
     restore.close().await;
-    channel.phase("successor",json!({"generation":successor.generation_id,"version":committed.0+1,"intent":j.intent.intent_id}))?;
+    channel.phase("successor",json!({"generation":successor.generation_id,"version":committed.0+1,"intent":j.intent_id(),
+        "startup_identity_queries":installer_checks,"successor_verification_queries":admitted_checks.len(),
+        "handshake_ms":handshake_ms,"daemon_gate_verified":true,"release_login_verified":true,
+        "venue_wire_observed":cfg!(feature = "crash-points")})).await?;
     Ok(())
 }

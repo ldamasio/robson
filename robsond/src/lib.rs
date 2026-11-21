@@ -70,6 +70,8 @@ pub mod reconciliation_worker;
     reason = "the order-set owner will consume the observed persisted identity"
 )]
 mod spot_order_set_store;
+#[cfg(all(target_os = "linux", feature = "postgres"))]
+pub mod spot_supervised_preflight;
 mod sse;
 #[cfg(test)]
 mod stack_budget_tests;

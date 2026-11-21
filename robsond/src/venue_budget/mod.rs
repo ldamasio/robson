@@ -52,7 +52,7 @@ mod fixture_tests;
     dead_code,
     reason = "private audit controller awaits the external C2 barrier"
 )]
-mod source_audit;
+pub(crate) mod source_audit;
 // Direct SQL migration38 store-guard behavior controls; TEST-ONLY.
 #[cfg(test)]
 mod store_guard_pg_tests;

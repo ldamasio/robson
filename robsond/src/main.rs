@@ -122,6 +122,12 @@ async fn async_main(stop: StopRequest) -> anyhow::Result<()> {
         }
     }
 
+    // Supervised Spot preflight: no Config, no venue, no environment
+    // credentials. It verifies the isolated target and stops at the gates.
+    if std::env::args().nth(1).as_deref() == Some(SPOT_SUPERVISED_PREFLIGHT) {
+        return spot_supervised_preflight(&stop).await;
+    }
+
     // Default: run daemon
     let config = Config::from_env()?;
 
@@ -192,6 +198,23 @@ async fn async_main(stop: StopRequest) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+const SPOT_SUPERVISED_PREFLIGHT: &str = "spot-supervised-preflight";
+
+#[cfg(all(target_os = "linux", feature = "postgres"))]
+async fn spot_supervised_preflight(stop: &StopRequest) -> anyhow::Result<()> {
+    if std::env::args().len() != 2 {
+        anyhow::bail!("{SPOT_SUPERVISED_PREFLIGHT} refused: unexpected_arguments");
+    }
+    robsond::spot_supervised_preflight::run(stop)
+        .await
+        .map_err(|refusal| anyhow::anyhow!("{SPOT_SUPERVISED_PREFLIGHT} refused: {refusal}"))
+}
+
+#[cfg(not(all(target_os = "linux", feature = "postgres")))]
+async fn spot_supervised_preflight(_stop: &StopRequest) -> anyhow::Result<()> {
+    anyhow::bail!("{SPOT_SUPERVISED_PREFLIGHT} refused: unsupported_build")
 }
 
 /// Connect to PostgreSQL and check the schema is ready. The first connection
