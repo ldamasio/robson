@@ -185,6 +185,47 @@ fn preflight39_refuses_untimed_or_untransacted_shapes() {
     assert!(preflight39(&down).is_err());
 }
 
+#[test]
+fn embedded40_identity_and_canonical_do_shape() {
+    let contract = contract40().expect("embedded40 contract");
+    assert_eq!(
+        contract.sql.as_ref(),
+        include_str!("../../../migrations/20240101000040_balance_transitions.sql")
+    );
+    assert_eq!(contract.version, VERSION40);
+    assert!(matches_embedded(&contract.clone(), contract));
+    assert!(preflight40(contract).is_ok());
+
+    let mut changed = [
+        contract.clone(),
+        contract.clone(),
+        contract.clone(),
+        contract.clone(),
+        contract.clone(),
+        contract.clone(),
+    ];
+    changed[0].version += 1;
+    changed[1].description = "other".into();
+    changed[2].sql = "SELECT 1".into();
+    changed[3].checksum.to_mut()[0] ^= 1;
+    changed[4].migration_type = MigrationType::ReversibleDown;
+    changed[5].no_tx = true;
+    assert!(changed.iter().all(|candidate| !matches_embedded(candidate, contract)));
+    assert!(preflight40(&changed[4]).is_err());
+    assert!(preflight40(&changed[5]).is_err());
+
+    for sql in [
+        "DO $migration40$\nBEGIN NULL; END;\n$migration40$",
+        "-- header\nDO $migration40$\nBEGIN NULL; END;\n$migration40$;",
+        "DO $migration40$\nBEGIN NULL; END;\n$migration40$; SELECT 1;",
+        "DO $migration40$\nBEGIN NULL; END;\n$migration40$; DO $migration40$\nBEGIN NULL; END;\n$migration40$;",
+    ] {
+        let mut invalid = contract.clone();
+        invalid.sql = sql.into();
+        assert!(preflight40(&invalid).is_err(), "accepted {sql}");
+    }
+}
+
 #[tokio::test]
 async fn retired_adapter_cannot_be_reused_by_any_migrate_entry() {
     let failure = Failure {

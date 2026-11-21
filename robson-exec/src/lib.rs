@@ -37,8 +37,14 @@
 #![warn(clippy::all)]
 
 pub mod balance_costs;
+pub mod balance_liability;
 pub mod balance_sizing;
 pub mod cancel;
+pub mod clock_records;
+// Inert C8 arithmetic; a later reviewed producer owns persistence and
+// lifecycle.
+#[allow(dead_code)]
+mod clock_sample_facts;
 mod compat;
 #[cfg(feature = "crash-points")]
 pub mod crash_points;
@@ -49,8 +55,10 @@ pub mod intent;
 pub mod order_journal;
 pub mod ports;
 pub mod quantize;
+pub mod request_budget;
 pub mod stub;
 pub mod venue;
+pub mod venue_clock;
 pub mod venue_ledger;
 
 // Re-exports for convenience

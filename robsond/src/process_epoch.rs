@@ -69,6 +69,8 @@ impl Predecessor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpochStart {
     pub epoch: Epoch,
+    /// Actual predecessor UUID read in the same committed startup transaction.
+    pub predecessor_epoch_id: Option<Uuid>,
     pub predecessor: Predecessor,
     /// The generation this start recorded its `unclean_start` occurrence at,
     /// when it is unclean.
@@ -107,12 +109,13 @@ pub async fn start_epoch(
 async fn insert(pool: &PgPool, tenant_id: Uuid, binary_version: &str) -> DaemonResult<EpochStart> {
     let mut tx = pool.begin().await?;
     let previous = sqlx::query(
-        "SELECT epoch_seq, marker_version FROM process_epochs
+        "SELECT epoch_id, epoch_seq, marker_version FROM process_epochs
          WHERE tenant_id = $1 ORDER BY epoch_seq DESC LIMIT 1",
     )
     .bind(tenant_id)
     .fetch_optional(&mut *tx)
     .await?;
+    let predecessor_epoch_id = previous.as_ref().map(|row| row.get::<Uuid, _>("epoch_id"));
     let predecessor = match previous {
         None => Predecessor::None,
         Some(row) => {
@@ -183,6 +186,7 @@ async fn insert(pool: &PgPool, tenant_id: Uuid, binary_version: &str) -> DaemonR
     tx.commit().await?;
     Ok(EpochStart {
         epoch: Epoch { epoch_id, epoch_seq },
+        predecessor_epoch_id,
         predecessor,
         unclean_generation,
         stamped_intents,
@@ -340,11 +344,13 @@ mod tests {
         let tenant = Uuid::now_v7();
         let first = start_epoch(&pool, tenant, "test").await.unwrap();
         assert_eq!(first.predecessor, Predecessor::None);
+        assert_eq!(first.predecessor_epoch_id, None);
 
         release_all(&pool, tenant).await;
         mark_clean_stop(&pool, first.epoch).await.unwrap();
         assert!(mark_clean_stop(&pool, first.epoch).await.is_err(), "a marker is written once");
         let second = start_epoch(&pool, tenant, "test").await.unwrap();
+        assert_eq!(second.predecessor_epoch_id, Some(first.epoch.epoch_id));
         assert_eq!(second.predecessor, Predecessor::Marked {
             epoch_seq: first.epoch.epoch_seq,
             marker_version: MARKER_VERSION,
@@ -355,11 +361,13 @@ mod tests {
 
         // The second never marked: the third finds an unclean predecessor.
         let third = start_epoch(&pool, tenant, "test").await.unwrap();
+        assert_eq!(third.predecessor_epoch_id, Some(second.epoch.epoch_id));
         assert_eq!(third.predecessor, Predecessor::NoMarker { epoch_seq: second.epoch.epoch_seq });
 
         // Another tenant's epochs are not this one's predecessors.
         let other = start_epoch(&pool, Uuid::now_v7(), "test").await.unwrap();
         assert_eq!(other.predecessor, Predecessor::None);
+        assert_eq!(other.predecessor_epoch_id, None);
 
         assert_eq!(epochs(&pool, tenant).await, [
             (first.epoch.epoch_seq, true, Some(MARKER_VERSION)),

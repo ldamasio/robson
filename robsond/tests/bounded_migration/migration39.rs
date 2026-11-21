@@ -1,13 +1,10 @@
 //! Embedded migration39 through the delegated bounded path: SQLx's own apply
 //! between install and restore on the same owned session. App gates are
 //! application facts only; contention is a real lock holder on the same server.
-use std::{
-    borrow::Cow,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use robson_testkit::db_proxy::{DbProxy, ProxyMode, ProxyStats};
-use sqlx::{migrate::Migrator, postgres::PgSslMode, PgConnection, PgPool};
+use sqlx::{postgres::PgSslMode, PgConnection, PgPool};
 
 use super::{
     super::stages::{self, Edge, Stage},
@@ -46,14 +43,6 @@ fn migration39() -> &'static Migration {
         .iter()
         .find(|m| m.version == VERSION39)
         .expect("embedded original39")
-}
-
-/// The test-only through38 inventory: the binary before migration39 existed.
-fn through38() -> Migrator {
-    let mut through38 = sqlx::migrate!("../migrations");
-    through38.migrations =
-        Cow::Owned(through38.iter().filter(|m| m.version <= VERSION).cloned().collect());
-    through38
 }
 
 /// Bounded 5 ms poll over the native retirement window, as in `finish`, for
@@ -99,7 +88,7 @@ async fn metadata(c: &mut PgConnection) -> Result<Option<(bool, Vec<u8>, i64)>, 
 
 impl Fixture39 {
     async fn new(pool: &PgPool) -> anyhow::Result<Self> {
-        through38().run(pool).await?;
+        through(VERSION).run(pool).await?;
         let options = pool.connect_options();
         let upstream = tokio::net::lookup_host((options.get_host(), options.get_port()))
             .await?
@@ -399,7 +388,7 @@ async fn migration39_lost_commit_ack_is_uncertain_and_durable(pool: PgPool) {
     let mut old = options.connect().await.expect("rollback39 through38 connection");
     let old_pid: i32 =
         sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut old).await.unwrap();
-    let rollback = tokio::time::timeout(ACQUIRE_BOUND, through38().run_direct(&mut old)).await;
+    let rollback = tokio::time::timeout(ACQUIRE_BOUND, through(VERSION).run_direct(&mut old)).await;
     let leaked: bool = sqlx::query_scalar(LOCKED)
         .bind(old_pid)
         .bind(key.0)
@@ -417,7 +406,7 @@ async fn migration39_lost_commit_ack_is_uncertain_and_durable(pool: PgPool) {
         .await
         .unwrap();
     let canonical =
-        tokio::time::timeout(ACQUIRE_BOUND, crate::MIGRATOR.run_direct(&mut current)).await;
+        tokio::time::timeout(ACQUIRE_BOUND, through(VERSION39).run_direct(&mut current)).await;
     let kept: bool = sqlx::query_scalar(LOCKED)
         .bind(current_pid)
         .bind(key.0)

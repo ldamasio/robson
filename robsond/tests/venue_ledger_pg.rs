@@ -22,6 +22,103 @@ use sqlx::{PgPool, Row};
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
+async fn spot_phase_evidence_preserves_the_native_active_order_predicate(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let order_link = f.link(LegOrderKind::Sell);
+    let mut observed = record();
+    observed.status = "PENDING_CANCEL".into();
+    observed.phase = OrderPhase::Terminal;
+    let before = snapshot(&pool).await;
+    let version = f.version(&pool).await;
+    let statements = f.ledger.statements_total();
+    let result = f.ledger.record_order(&observed, &order_link, seen(1)).await;
+    assert_eq!(
+        snapshot(&pool).await,
+        before,
+        "contradictory Spot phase changed durable evidence"
+    );
+    assert!(
+        matches!(
+            result,
+            Err(LedgerError::InvalidEvidence(ref reason))
+                if reason == "incoming Spot phase disagrees with status"
+        ),
+        "{result:?}"
+    );
+    // BEGIN, the server bounds and the pre-read; the refusal retires the
+    // connection raw, without a ROLLBACK.
+    assert_eq!(f.ledger.statements_total() - statements, 3);
+
+    const EVIDENCE: &str = "SELECT status,phase,NOT terminal FROM venue_orders
+        WHERE tenant_id=$1 AND venue_id=$2 AND account_scope=$3 AND symbol=$4 AND exchange_order_id=$5";
+    let read_evidence = || {
+        sqlx::query_as::<_, (String, String, bool)>(EVIDENCE)
+            .bind(f.tenant)
+            .bind(VENUE)
+            .bind(&order_link.account_scope)
+            .bind(&observed.symbol)
+            .bind(&observed.exchange_order_id)
+            .fetch_one(&pool)
+    };
+    observed.phase = OrderPhase::Unknown;
+    assert!(f.ledger.record_order(&observed, &order_link, seen(2)).await.unwrap().changed);
+    assert_eq!(
+        read_evidence().await.unwrap(),
+        ("PENDING_CANCEL".to_owned(), "unknown".to_owned(), true)
+    );
+    assert_eq!(f.version(&pool).await, version + 1);
+
+    observed.phase = OrderPhase::Terminal;
+    observed.status = "EXPIRED_IN_MATCH".into();
+    assert!(f.ledger.record_order(&observed, &order_link, seen(3)).await.unwrap().changed);
+    assert_eq!(
+        read_evidence().await.unwrap(),
+        ("EXPIRED_IN_MATCH".to_owned(), "terminal".to_owned(), false)
+    );
+    assert_eq!(f.version(&pool).await, version + 2);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn spot_writer_refuses_to_reuse_an_existing_contradictory_phase(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let order_link = f.link(LegOrderKind::Sell);
+    let mut observed = record();
+    observed.status = "PENDING_CANCEL".into();
+    observed.phase = OrderPhase::Unknown;
+    f.ledger.record_order(&observed, &order_link, seen(1)).await.unwrap();
+    // Model pre-existing contradictory evidence that the native schema can
+    // represent.
+    let affected = sqlx::query("UPDATE venue_orders SET phase='terminal', terminal_seen_at=NOW()
+        WHERE tenant_id=$1 AND venue_id=$2 AND account_scope=$3 AND symbol=$4 AND exchange_order_id=$5")
+        .bind(f.tenant)
+        .bind(VENUE)
+        .bind(&order_link.account_scope)
+        .bind(&observed.symbol)
+        .bind(&observed.exchange_order_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(affected.rows_affected(), 1);
+    let before = snapshot(&pool).await;
+    let statements = f.ledger.statements_total();
+    let result = f.ledger.record_order(&observed, &order_link, seen(2)).await;
+    assert_eq!(snapshot(&pool).await, before);
+    assert!(
+        matches!(
+            result,
+            Err(LedgerError::InvalidEvidence(ref reason))
+                if reason == "stored Spot phase disagrees with status"
+        ),
+        "{result:?}"
+    );
+    // BEGIN, the server bounds and the pre-read; the refusal retires the
+    // connection raw, without a ROLLBACK.
+    assert_eq!(f.ledger.statements_total() - statements, 3);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
 async fn order_and_contribution_are_atomic_and_replay_is_one_read(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let link = f.link(LegOrderKind::Sell);
@@ -850,9 +947,8 @@ fn order_ledger_has_no_production_callers() {
             }
             if path.extension().is_some_and(|ext| ext == "rs") {
                 let source = std::fs::read_to_string(&path).unwrap();
-                let production = source.split("#[cfg(test)]").next().unwrap();
                 assert!(
-                    !production.contains(".record_order("),
+                    !source.contains(".record_order("),
                     "ledger order writer activated in {}",
                     path.display()
                 );

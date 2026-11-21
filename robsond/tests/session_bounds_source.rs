@@ -122,9 +122,16 @@ fn segments(text: &str) -> Vec<(Kind, &str)> {
     out
 }
 
-fn is_test_attribute(line: &str) -> bool {
-    let line = line.trim_start();
-    line.starts_with("#[cfg(test)]") || line.starts_with("#[cfg(all(test,")
+/// Whether the attribute that starts `rest` gates its item to tests. The
+/// whole attribute is read, whitespace removed, as rustfmt may split it
+/// over lines.
+fn is_test_attribute(rest: &str) -> bool {
+    let rest = rest.trim_start();
+    if !rest.starts_with("#[cfg(") {
+        return false;
+    }
+    let attribute = squeeze(&rest[..rest.find(']').map_or(rest.len(), |end| end + 1)]);
+    attribute.starts_with("#[cfg(test)]") || attribute.starts_with("#[cfg(all(test,")
 }
 
 /// Byte offset just past the item that starts at `start` (its attributes
@@ -175,7 +182,7 @@ fn production(text: &str) -> String {
     for line in code.split_inclusive('\n') {
         let start = offset;
         offset += line.len();
-        if start >= cursor && is_test_attribute(line) {
+        if start >= cursor && is_test_attribute(&code[start..]) {
             out.push_str(&code[cursor..start]);
             cursor = item_end(&code, start);
         }
@@ -262,6 +269,22 @@ fn production_sources() -> Vec<Source> {
                 let included = here.join(&rest[..rest.find('"').unwrap()]);
                 assert!(included.exists(), "{} includes {}", file.display(), included.display());
                 queue.push((included, module_dir.clone()));
+            }
+            // A text that production code embeds with `include_str!` (its SQL)
+            // is one string literal of that code: its bound mentions count.
+            for (at, _) in trimmed.match_indices("include_str!(\"") {
+                let rest = &trimmed[at + "include_str!(\"".len()..];
+                let included = here.join(&rest[..rest.find('"').unwrap()]);
+                assert!(included.exists(), "{} embeds {}", file.display(), included.display());
+                let body = fs::read_to_string(&included)
+                    .unwrap_or_else(|e| panic!("{}: {e}", included.display()));
+                assert!(!body.contains("\"####"), "{} closes the literal", included.display());
+                if seen.insert(included.clone()) {
+                    out.push(Source {
+                        file: included.strip_prefix(&root).unwrap().to_string_lossy().to_string(),
+                        text: format!("r####\"{body}\"####"),
+                    });
+                }
             }
         }
         out.push(Source {
@@ -566,6 +589,8 @@ fn the_guard_reads_production_code_only() {
          mod tests {\n    fn gone() { let s = r#\"}\"#; }\n}\n\
          #[cfg(all(test, feature = \"postgres\"))]\n\
          use gone::Thing;\n\
+         #[cfg(all(\n    test,\n    target_os = \"linux\"\n))]\n\
+         mod gone_too;\n\
          fn also_kept<'a>(x: &'a str) {}\n",
     );
     assert!(text.contains("fn kept()") && text.contains("fn also_kept"), "{text}");
@@ -594,6 +619,17 @@ fn every_daemon_pool_and_connection_is_built_where_the_bounds_reach_it() {
         ("order_journal_store.rs", "PgJournalBackend", "new"),
         ("budget_basis_alarm.rs", "BudgetBasisAlarm", "with_metrics"),
         ("db.rs", "", "run_db_command"),
+        // Package 2's dormant Spot owner opens raw connections from the
+        // daemon pool's connect options, so a balance daemon's bounds are
+        // inherited, and appends its own stricter reviewed limits:
+        // the clock store (300 ms lock, 1 s statement, 1 s idle at startup),
+        ("venue_clock_store.rs", "ClockSampleStore", "initialize"),
+        // the budget bootstrap (1 s statement and idle at startup, 300 ms
+        // lock as its first statement, sql/settings.sql),
+        ("venue_budget/bootstrap.rs", "", "observe_bootstrap"),
+        // and the pause restoration (300 ms lock, 1 s statement, 1 s idle at
+        // startup).
+        ("venue_budget/restore.rs", "", "existing_pause"),
     ]
     .into_iter()
     .collect();
@@ -632,6 +668,29 @@ fn every_mention_of_a_session_bound_is_a_known_one() {
         ("venue_ledger_store.rs", each("set_config local")),
         // The alarm's own session statement bound.
         ("budget_basis_alarm.rs", vec!["SET statement_timeout".to_string()]),
+        // Package 2's clock store: its three Startup options, and the
+        // session statement that confirms them on each new connection.
+        ("venue_clock_store.rs", [each("name"), each("set_config session")].concat()),
+        // Package 2's budget bootstrap: its two Startup options, and the
+        // names it checks in the settings row its first statement returns.
+        ("venue_budget/bootstrap.rs", vec![
+            "name idle_in_transaction_session_timeout".to_string(),
+            "name lock_timeout".to_string(),
+            "name statement_timeout".to_string(),
+            "name statement_timeout".to_string(),
+        ]),
+        // That first statement: transaction-local, like the journal's and
+        // the ledger's; two of its result columns are named after a bound.
+        (
+            "venue_budget/sql/settings.sql",
+            [each("set_config local"), vec![
+                "other lock_timeout".to_string(),
+                "other statement_timeout".to_string(),
+            ]]
+            .concat(),
+        ),
+        // Package 2's pause restoration: its three Startup options.
+        ("venue_budget/restore.rs", each("name")),
     ]
     .into_iter()
     .map(|(file, mentions)| (file.to_string(), mentions))

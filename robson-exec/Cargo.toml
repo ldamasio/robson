@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 default = []
 # Test harness only (ADR-0056 step 7): `compile_error!` under a release build.
-crash-points = ["dep:libc"]
+crash-points = []
 
 [dependencies]
 robson-domain = { path = "../robson-domain" }
@@ -25,7 +25,7 @@ rust_decimal = { workspace = true }
 chrono = { workspace = true }
 num-bigint = "=0.4.8"
 sha2 = "=0.10.9"
-libc = { version = "0.2", optional = true }
+libc = "=0.2.191"
 
 [dev-dependencies]
 anyhow = { workspace = true }

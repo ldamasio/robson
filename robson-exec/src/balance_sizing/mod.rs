@@ -6,7 +6,9 @@ mod geometry;
 mod geometry_tests;
 mod handoff;
 mod inputs;
+mod leg_quantity;
 pub use handoff::{candidate_admission, HandoffError};
+pub(crate) use leg_quantity::{initial_executable, reduced_executable};
 #[cfg(test)]
 mod test_support;
 

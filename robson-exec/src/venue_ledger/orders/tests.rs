@@ -8,6 +8,7 @@ fn at(second: i64) -> SeenAt {
     SeenAt {
         at: DateTime::from_timestamp(1_794_614_400 + second, 0).unwrap(),
         clock: None,
+        capture: None,
     }
 }
 
@@ -73,6 +74,35 @@ fn unowned(record: &VenueOrderRecord) -> StoredOrder {
     merge_order(None, record, &link(OrderOwner::Discovered), &at(1), None)
         .unwrap()
         .order
+}
+
+#[test]
+fn spot_merge_refuses_contradictory_phase_in_new_or_stored_evidence() {
+    let mut incoming = record();
+    incoming.status = "PENDING_CANCEL".into();
+    incoming.phase = OrderPhase::Terminal;
+    let spot = link(OrderOwner::Discovered);
+    assert_eq!(
+        merge_order(None, &incoming, &spot, &at(1), None),
+        Err(LedgerError::InvalidEvidence("incoming Spot phase disagrees with status".into()))
+    );
+
+    let usdm = OrderLink {
+        venue: VenueId::new(VenueId::BINANCE_USDM),
+        ..spot.clone()
+    };
+    assert!(merge_order(None, &incoming, &usdm, &at(1), None).is_ok());
+
+    incoming.phase = OrderPhase::Unknown;
+    let mut stored = merge_order(None, &incoming, &spot, &at(1), None).unwrap().order;
+    assert!(!stored.terminal());
+    assert!(!merge_order(Some(&stored), &incoming, &spot, &at(2), None).unwrap().changed);
+    stored.phase = OrderPhase::Terminal;
+    stored.terminal_seen = Some(at(1));
+    assert_eq!(
+        merge_order(Some(&stored), &incoming, &spot, &at(2), None),
+        Err(LedgerError::InvalidEvidence("stored Spot phase disagrees with status".into()))
+    );
 }
 
 #[test]
@@ -683,4 +713,38 @@ fn a_quote_subtotal_never_becomes_an_unknown_larger_execution_total() {
                 .changed
         );
     }
+}
+
+#[test]
+fn original_exact_capture_and_legacy_absence_never_get_enriched() {
+    use crate::{clock_records::RawClockCapture, venue_clock::ClockDomain};
+    let mut observed = at(1);
+    let raw = RawClockCapture {
+        epoch: Uuid::from_u128(2),
+        wall_seconds: 1,
+        wall_nanoseconds: 7,
+        domain: ClockDomain::new(Uuid::from_u128(3), -2, 4).unwrap(),
+        before_ns: 5,
+        after_ns: 9,
+    };
+    observed.capture = Some(raw);
+    let r = record();
+    let l = link(OrderOwner::Discovered);
+    let first = merge_order(None, &r, &l, &observed, None).unwrap().order;
+    let mut later = at(2);
+    later.capture = Some(RawClockCapture { wall_nanoseconds: 8, ..raw });
+    let replay = merge_order(Some(&first), &r, &l, &later, None).unwrap();
+    assert!(!replay.changed);
+    assert_eq!(replay.order.live_seen.capture, Some(raw));
+    let legacy = merge_order(None, &r, &l, &at(0), None).unwrap().order;
+    let replay = merge_order(Some(&legacy), &r, &l, &later, None).unwrap();
+    assert!(!replay.changed);
+    assert_eq!(replay.order.live_seen.capture, None);
+    let mut terminal = r.clone();
+    terminal.phase = OrderPhase::Terminal;
+    terminal.status = "CANCELED".into();
+    let first_terminal = merge_order(Some(&first), &terminal, &l, &observed, None).unwrap().order;
+    let replay = merge_order(Some(&first_terminal), &terminal, &l, &later, None).unwrap();
+    assert!(!replay.changed);
+    assert_eq!(replay.order.terminal_seen.unwrap().capture, Some(raw));
 }

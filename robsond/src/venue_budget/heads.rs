@@ -1,0 +1,236 @@
+//! Bounded response restrictions. Values never replenish local capacity.
+use std::{sync::LazyLock, time::Duration};
+
+use prometheus::{register_int_gauge, IntGauge};
+static LEVEL: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "robsond_spot_response_restriction_level",
+        "Response restriction severity:0none1steady2protective_only_page3all_blocked"
+    )
+    .expect("register spot response restriction level")
+});
+
+use chrono::{DateTime, FixedOffset};
+use reqwest::header::HeaderMap;
+use robson_exec::{
+    clock_records::{RawClockCapture, TICK_MAX},
+    venue_clock::TickCapture,
+};
+
+use super::BudgetError;
+
+#[derive(Clone, Copy)]
+struct Observation {
+    severity: u8,
+    end: TickCapture,
+}
+impl Observation {
+    fn live(self, now: TickCapture) -> bool {
+        now.elapsed_since(&self.end).is_err()
+    }
+    fn merge(&mut self, other: Self) {
+        self.severity = self.severity.max(other.severity);
+        if other.end.elapsed_since(&self.end).is_ok() {
+            self.end = other.end;
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Heads {
+    minutes: [Option<(i64, Observation)>; 3],
+    fallback: Option<Observation>,
+    orders: Option<Observation>,
+    pause: Option<TickCapture>,
+    unresolved: bool,
+    pending: bool,
+}
+
+fn after(now: TickCapture, seconds: u64) -> Result<TickCapture, BudgetError> {
+    let n = now
+        .nanoseconds()
+        .checked_add(Duration::from_secs(seconds).as_nanos())
+        .ok_or(BudgetError::Invalid)?;
+    if n > u128::try_from(TICK_MAX).map_err(|_| BudgetError::Invalid)? {
+        return Err(BudgetError::Invalid);
+    }
+    TickCapture::new(
+        now.domain(),
+        i64::try_from(n / 1_000_000_000).map_err(|_| BudgetError::Invalid)?,
+        i64::try_from(n % 1_000_000_000).map_err(|_| BudgetError::Invalid)?,
+    )
+    .map_err(|_| BudgetError::Invalid)
+}
+fn date(headers: &HeaderMap, name: &str) -> Option<DateTime<FixedOffset>> {
+    DateTime::parse_from_rfc2822(headers.get(name)?.to_str().ok()?).ok()
+}
+fn severity(headers: &HeaderMap, name: &str, limit: u64) -> u8 {
+    let Some(text) = headers.get(name).and_then(|value| value.to_str().ok()) else {
+        return 0;
+    };
+    let value = match text.parse::<u64>() {
+        Ok(value) => value,
+        // Present malformed/overflowing usage is never evidence of headroom.
+        Err(_) => return 3,
+    };
+    let ratio = u128::from(value) * 100;
+    if ratio >= u128::from(limit) * 95 {
+        3
+    } else if ratio >= u128::from(limit) * 80 {
+        2
+    } else if ratio >= u128::from(limit) * 50 {
+        1
+    } else {
+        0
+    }
+}
+fn coalesce(slot: &mut Option<Observation>, value: Observation) {
+    match slot {
+        Some(current) => current.merge(value),
+        None => *slot = Some(value),
+    }
+}
+
+impl Heads {
+    pub(super) fn observe(
+        &mut self,
+        status: u16,
+        headers: &HeaderMap,
+        head: Option<RawClockCapture>,
+    ) {
+        let observed_level = if matches!(status, 418 | 429) {
+            3
+        } else {
+            severity(headers, "x-mbx-used-weight-1m", 6000)
+                .max(severity(headers, "x-mbx-order-count-10s", 100))
+                .max(severity(headers, "x-mbx-order-count-1d", 200000))
+        };
+        LEVEL.set(LEVEL.get().max(i64::from(observed_level)));
+        if matches!(status, 418 | 429) {
+            self.pending = true;
+        }
+        let Some(head) = head else {
+            if matches!(status, 418 | 429)
+                || severity(headers, "x-mbx-used-weight-1m", 6000) > 0
+                || severity(headers, "x-mbx-order-count-10s", 100) > 0
+                || severity(headers, "x-mbx-order-count-1d", 200000) > 0
+            {
+                self.unresolved = true;
+            }
+            return;
+        };
+        let Ok(now) = head.end_tick() else {
+            self.unresolved = true;
+            return;
+        };
+        self.expire(now);
+        let weight = severity(headers, "x-mbx-used-weight-1m", 6000);
+        if weight > 0 {
+            let Ok(end) = after(now, 120) else {
+                self.unresolved = true;
+                return;
+            };
+            let observation = Observation { severity: weight, end };
+            // I1 supplies no validated C8 conversion to this observer. Even a
+            // retained Date identity therefore receives the full120s, once.
+            let minute = date(headers, "date")
+                .filter(|date| {
+                    head.wall_seconds
+                        .checked_sub(date.timestamp())
+                        .is_some_and(|age| (0..=120).contains(&age))
+                })
+                .map(|date| date.timestamp().div_euclid(60));
+            match minute {
+                Some(minute) => {
+                    if let Some((_, slot)) =
+                        self.minutes.iter_mut().flatten().find(|(id, _)| *id == minute)
+                    {
+                        slot.merge(observation);
+                    } else if let Some(slot) = self.minutes.iter_mut().find(|slot| slot.is_none()) {
+                        *slot = Some((minute, observation));
+                    } else {
+                        coalesce(&mut self.fallback, observation);
+                    }
+                },
+                None => coalesce(&mut self.fallback, observation),
+            }
+        }
+        let orders = severity(headers, "x-mbx-order-count-10s", 100).max(severity(
+            headers,
+            "x-mbx-order-count-1d",
+            200000,
+        ));
+        if orders > 0 {
+            match after(now, 10) {
+                Ok(end) => coalesce(&mut self.orders, Observation { severity: orders, end }),
+                Err(_) => self.unresolved = true,
+            }
+        }
+        if matches!(status, 418 | 429) {
+            let text = headers.get("retry-after").and_then(|value| value.to_str().ok());
+            let seconds = match text {
+                Some(text) if !text.is_empty() && text.bytes().all(|c| c.is_ascii_digit()) => {
+                    text.parse::<u64>().ok()
+                },
+                Some(_) => date(headers, "retry-after")
+                    .zip(date(headers, "date"))
+                    .and_then(|(until, start)| until.timestamp().checked_sub(start.timestamp()))
+                    .and_then(|seconds| u64::try_from(seconds).ok())
+                    .and_then(|seconds| seconds.checked_add(1))
+                    .map(|seconds| seconds.max(60)),
+                None => Some(60),
+            };
+            match seconds.and_then(|seconds| after(now, seconds).ok()) {
+                Some(end) => match self.pause {
+                    Some(old) if end.elapsed_since(&old).is_err() => {},
+                    _ => self.pause = Some(end),
+                },
+                None => self.unresolved = true,
+            }
+        }
+    }
+    fn expire(&mut self, now: TickCapture) {
+        for slot in &mut self.minutes {
+            if slot.is_some_and(|(_, value)| !value.live(now)) {
+                *slot = None;
+            }
+        }
+        for slot in [&mut self.fallback, &mut self.orders] {
+            if slot.is_some_and(|value| !value.live(now)) {
+                *slot = None;
+            }
+        }
+    }
+    pub(super) fn permits_steady(&self, now: TickCapture) -> bool {
+        let level = self
+            .minutes
+            .iter()
+            .flatten()
+            .map(|(_, value)| *value)
+            .chain([self.fallback, self.orders].into_iter().flatten())
+            .filter(|value| value.live(now))
+            .map(|value| value.severity)
+            .max()
+            .unwrap_or(0);
+        LEVEL.set(if self.pending || self.unresolved {
+            3
+        } else {
+            i64::from(level)
+        });
+        !self.unresolved
+            && !self.pending
+            && self.pause.is_none_or(|end| now.elapsed_since(&end).is_ok())
+            && !self
+                .minutes
+                .iter()
+                .flatten()
+                .any(|(_, value)| value.severity > 0 && value.live(now))
+            && ![self.fallback, self.orders]
+                .into_iter()
+                .flatten()
+                .any(|value| value.severity > 0 && value.live(now))
+    }
+    pub(super) fn pending(&self) -> bool {
+        self.pending || self.unresolved
+    }
+}

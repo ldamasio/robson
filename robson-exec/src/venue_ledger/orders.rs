@@ -191,6 +191,12 @@ pub fn merge_order(
         return Err(LedgerError::InvalidEvidence("invalid order quantities or identity".into()));
     }
     let key = OrderKey::from_record(record, link)?;
+    let spot = key.venue.as_str() == VenueId::BINANCE_SPOT;
+    if spot && OrderPhase::from_binance_spot_status(&record.status) != record.phase {
+        return Err(LedgerError::InvalidEvidence(
+            "incoming Spot phase disagrees with status".into(),
+        ));
+    }
     let stop_price = stop_price(record)?;
     let mut anomalies = Vec::with_capacity(2);
     let mut adopting = false;
@@ -202,6 +208,11 @@ pub fn merge_order(
             || old.stop_price != stop_price
         {
             return Err(LedgerError::IdentityConflict);
+        }
+        if spot && OrderPhase::from_binance_spot_status(&old.status) != old.phase {
+            return Err(LedgerError::InvalidEvidence(
+                "stored Spot phase disagrees with status".into(),
+            ));
         }
         let mut order = old.clone();
         match (&old.owner, &link.owner) {
