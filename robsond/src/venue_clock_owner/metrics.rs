@@ -78,6 +78,7 @@ pub(super) fn register() {
     evidence(None);
     LazyLock::force(&BOUND);
     crate::venue_budget::register_restriction_level();
+    crate::venue_budget::pause_store::register();
 }
 
 pub(super) fn cycle(error: Option<super::TimeError>) {

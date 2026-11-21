@@ -11,11 +11,13 @@ pub(crate) struct ClockClosing {
     cancel: CancellationToken,
     pub(super) worker: AsyncMutex<Option<JoinHandle<bool>>>,
     pub(super) watchdog: AsyncMutex<Option<JoinHandle<Result<(), TimeError>>>>,
+    /// PS-2b's pause keeper of a non-trading owner.
+    pub(super) keeper: AsyncMutex<Option<JoinHandle<bool>>>,
     failed: AtomicBool,
 }
 
 impl ClockOwner {
-    pub(crate) fn spawn(self) -> Arc<ClockClosing> {
+    pub(crate) fn spawn(mut self) -> Arc<ClockClosing> {
         let watchdog = tokio::spawn(super::watchdog::run(
             Arc::clone(&self.clock),
             self.epoch,
@@ -25,6 +27,17 @@ impl ClockOwner {
         let budget = self.budget.clone();
         let state = Arc::clone(&self.state);
         let cancel = self.cancel.clone();
+        let keeper = self.keeper.take().map(|(pool, tenant)| {
+            use crate::venue_budget::{pause_store, Trace};
+            let clock = Arc::clone(&self.clock);
+            let write = move |observed| {
+                let (pool, clock) = (pool.clone(), Arc::clone(&clock));
+                async move {
+                    pause_store::persist(&pool, tenant, &observed, &clock, &Trace::default()).await
+                }
+            };
+            tokio::spawn(pause_store::keep(budget.clone(), cancel.clone(), write))
+        });
         let worker = tokio::spawn(self.run());
         // No await or publication occurs before both real handles are owned.
         Arc::new(ClockClosing {
@@ -33,6 +46,7 @@ impl ClockOwner {
             cancel,
             worker: AsyncMutex::new(Some(worker)),
             watchdog: AsyncMutex::new(Some(watchdog)),
+            keeper: AsyncMutex::new(keeper),
             failed: AtomicBool::new(false),
         })
     }
@@ -63,7 +77,8 @@ impl ClockOwner {
                 break;
             }
         }
-        self.retire_jobs().await && !self.budget.pending_pause()
+        // A pending pause is the join's to judge, after the keeper's join.
+        self.retire_jobs().await
     }
 
     async fn retire_jobs(&mut self) -> bool {
@@ -107,14 +122,16 @@ impl ClockClosing {
 
     pub(crate) async fn join(&self, deadline: Instant) -> bool {
         let work = async {
-            let mut worker = self.worker.lock().await;
-            if let Some(task) = worker.as_mut() {
-                if !matches!(task.await, Ok(true)) {
-                    self.failed.store(true, Ordering::Release);
+            // The sampler, then PS-2b's pause keeper.
+            for slot in [&self.worker, &self.keeper] {
+                let mut task = slot.lock().await;
+                if let Some(running) = task.as_mut() {
+                    if !matches!(running.await, Ok(true)) {
+                        self.failed.store(true, Ordering::Release);
+                    }
+                    *task = None;
                 }
-                *worker = None;
             }
-            drop(worker);
             let mut watcher = self.watchdog.lock().await;
             if let Some(task) = watcher.as_mut() {
                 if !matches!(task.await, Ok(Ok(()))) {
@@ -122,6 +139,7 @@ impl ClockClosing {
                 }
                 *watcher = None;
             }
+            drop(watcher);
             !self.failed.load(Ordering::Acquire) && !self.budget.pending_pause()
         };
         // A timeout retains the actual join handles in their slots. It is

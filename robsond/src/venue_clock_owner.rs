@@ -98,6 +98,8 @@ pub(crate) struct ClockOwner {
     /// Delay of the first scheduled cycle from the sampler's spawn.
     first: Duration,
     requests: Arc<on_demand::Requests>,
+    /// The pause keeper's pool and tenant (a non-trading owner's).
+    keeper: Option<(sqlx::PgPool, Uuid)>,
 }
 
 /// What a TIME cycle is for (PLAN §6.6): the minute's scheduled sample, or one
@@ -155,6 +157,7 @@ impl ClockOwner {
             last_on_demand: None,
             first: Duration::ZERO,
             requests: Arc::default(),
+            keeper: None,
         })
     }
 
@@ -183,6 +186,7 @@ impl ClockOwner {
         let unclean = start.predecessor.unclean_reason().is_some();
         let now = owner.clock.capture().map_err(|_| TimeError::Native)?;
         owner.first = first_delay(budget.start().map_err(TimeError::Budget)?, now, unclean)?;
+        owner.keeper = Some((pool.clone(), tenant));
         Ok(owner)
     }
 

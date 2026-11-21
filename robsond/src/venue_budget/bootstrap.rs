@@ -43,7 +43,7 @@ pub(crate) fn production_input() -> Result<BootstrapInput, BudgetError> {
 
 /// B01 and B02: BEGIN, then the transaction-local bounds, checked as the
 /// server returns them.
-async fn begin_bounded(
+pub(super) async fn begin_bounded(
     connection: &mut PgConnection,
     deadline: Instant,
     trace: &Trace,
