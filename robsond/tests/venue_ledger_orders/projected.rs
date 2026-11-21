@@ -296,7 +296,8 @@ async fn projected_native_order_keeps_reference_membership_and_cancel_masks(
     let before = version(&pool, &b).await?;
     let commands = ledger.statements_total();
     ensure!(!ledger.record_order(&live, &linked(&f, 2, exits[1]), later(3)).await?.changed);
-    ensure!(ledger.statements_total() - commands == 1 && version(&pool, &b).await? == before);
+    // BEGIN, the server bounds, one read and ROLLBACK.
+    ensure!(ledger.statements_total() - commands == 4 && version(&pool, &b).await? == before);
 
     sqlx::raw_sql(
         "CREATE TABLE projected_cancel_member_changes (id bigint generated always as identity);

@@ -181,7 +181,8 @@ async fn projected_trade_peer_cases_keep_atomic_versions_and_membership(
     }
     let before = ledger.statements_total();
     ensure!(!ledger.record_trades(&key, &page(47, Decimal::ONE), at()).await?.changed);
-    ensure!(ledger.statements_total() - before == 1);
+    // BEGIN, the server bounds, one read and ROLLBACK.
+    ensure!(ledger.statements_total() - before == 4);
     eprintln!(
         "Projected trade pages: 24 seeded native concurrent schedules and 72 external snapshots"
     );
