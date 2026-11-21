@@ -12,7 +12,7 @@
 //! the local gates run it.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -115,20 +115,24 @@ fn test_pg_runs_exactly_the_isolated_tests_alone() {
     assert!(script.contains("for name in \"${ISOLATED_TESTS[@]}\"; do"));
     assert!(script.contains("-- --ignored \"${name}\" \"${SKIP_CONTROLLER[@]}\" --test-threads=1"));
     // Phase 3 is skipped only on the explicit switch, and only CI's database
-    // step sets it. Both places are pinned verbatim: the script's whole
-    // default dispatch and the whole CI step. Moving another phase under the
-    // switch, or the setting into another step, changes a pinned block and
-    // fails here; a deliberate change updates the block in the same commit.
+    // step sets it. Every place that names the switch is pinned verbatim: the
+    // script's whole default dispatch and its note on the switch, and CI's
+    // whole database step. With those blocks removed, the switch's name may
+    // not occur anywhere under scripts/ or .github/ or in the justfile, as
+    // code, comment or data, so no read, assignment, export or move can slip
+    // past a parser; a deliberate change updates a pinned block in the same
+    // commit.
     let workflow = fs::read_to_string(root.join(".github/workflows/robsond.yml")).unwrap();
-    assert_eq!(script.matches(DEFAULT_DISPATCH).count(), 1, "{script}");
-    assert_eq!(workflow.matches(CI_DATABASE_STEP).count(), 1, "{workflow}");
+    for (text, block) in [
+        (&script, DEFAULT_DISPATCH),
+        (&script, SCRIPT_NOTE),
+        (&workflow, CI_DATABASE_STEP),
+    ] {
+        assert_eq!(text.matches(block).count(), 1, "a pinned block is not found once:\n{block}");
+    }
     assert_eq!(workflow.matches("- name: Run the DATABASE_URL-gated tests").count(), 1);
-    // Outside comments the switch appears only in those pinned blocks: twice
-    // in the script (the test and its warning) and once in the workflow. Any
-    // other read, assignment or export, in the scripts, the justfile or any
-    // workflow, fails here.
     let mut files = vec![root.join("justfile")];
-    let mut dirs = vec![root.join("scripts"), root.join(".github/workflows")];
+    let mut dirs = vec![root.join("scripts"), root.join(".github")];
     while let Some(dir) = dirs.pop() {
         for entry in fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -139,22 +143,25 @@ fn test_pg_runs_exactly_the_isolated_tests_alone() {
             }
         }
     }
-    let mut uses = BTreeMap::new();
+    let mut stray = Vec::new();
     for path in &files {
-        let name = path.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
-        let count = switch_uses(&fs::read(path).unwrap());
-        if count > 0 {
-            uses.insert(name, count);
+        let name = path.strip_prefix(&root).unwrap();
+        let pins: &[&str] = if name == Path::new("scripts/test-pg.sh") {
+            &[DEFAULT_DISPATCH, SCRIPT_NOTE]
+        } else if name == Path::new(".github/workflows/robsond.yml") {
+            &[CI_DATABASE_STEP]
+        } else {
+            &[]
+        };
+        let mut bytes = fs::read(path).unwrap();
+        for pin in pins {
+            bytes = remove_once(&bytes, pin.as_bytes());
+        }
+        if occurrences(&bytes) > 0 {
+            stray.push(name.display().to_string());
         }
     }
-    assert_eq!(
-        uses,
-        BTreeMap::from([
-            (".github/workflows/robsond.yml".to_string(), 1),
-            ("scripts/test-pg.sh".to_string(), 2),
-        ]),
-        "the switch may be read by phase 3 and set only by CI's database step"
-    );
+    assert!(stray.is_empty(), "{SWITCH} is named outside its pinned blocks in {stray:?}");
 }
 
 const SWITCH: &str = "ROBSON_TEST_PG_SKIP_MEASUREMENTS";
@@ -181,6 +188,13 @@ const DEFAULT_DISPATCH: &str = r##"else
 fi
 "##;
 
+/// `scripts/test-pg.sh`'s header note on the switch, verbatim.
+const SCRIPT_NOTE: &str = r##"#   ROBSON_TEST_PG_SKIP_MEASUREMENTS=1 skips phase 3 and says so. CI sets it: a
+#   shared runner's speed varies (the 60 s million-row cold audit reached 920
+#   and then, alone, 848 of its 1000 pages on two runners, and passed on two
+#   others), so the envelope is proven by the local gates, which run phase 3.
+"##;
+
 /// CI's database step in `.github/workflows/robsond.yml`, verbatim.
 const CI_DATABASE_STEP: &str = r##"      - name: Run the DATABASE_URL-gated tests
         env:
@@ -194,49 +208,33 @@ const CI_DATABASE_STEP: &str = r##"      - name: Run the DATABASE_URL-gated test
         run: bash scripts/test-pg.sh
 "##;
 
-/// Lines of a text file that name [`SWITCH`] outside a comment. A file with a
-/// NUL byte, or that is not UTF-8, is binary and cannot set a shell variable.
-/// A shell or YAML comment starts at a `#` outside quotes that begins the line
-/// or follows whitespace.
-fn switch_uses(bytes: &[u8]) -> usize {
-    if bytes.contains(&0) {
-        return 0;
-    }
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return 0;
-    };
-    text.lines().map(code_part).filter(|code| code.contains(SWITCH)).count()
+/// How many times [`SWITCH`] occurs in `bytes`, whatever surrounds it.
+fn occurrences(bytes: &[u8]) -> usize {
+    bytes.windows(SWITCH.len()).filter(|w| *w == SWITCH.as_bytes()).count()
 }
 
-/// The part of a shell or YAML line before its comment.
-fn code_part(line: &str) -> &str {
-    let (mut single, mut double, mut escaped) = (false, false, false);
-    let mut previous = ' ';
-    for (at, c) in line.char_indices() {
-        match c {
-            _ if escaped => escaped = false,
-            '\\' if !single => escaped = true,
-            '\'' if !double => single = !single,
-            '"' if !single => double = !double,
-            '#' if !single && !double && previous.is_whitespace() => return &line[..at],
-            _ => {},
-        }
-        previous = c;
+/// `bytes` without the first occurrence of `block` (unchanged if absent).
+fn remove_once(bytes: &[u8], block: &[u8]) -> Vec<u8> {
+    match bytes.windows(block.len()).position(|w| w == block) {
+        Some(at) => [&bytes[..at], &bytes[at + block.len()..]].concat(),
+        None => bytes.to_vec(),
     }
-    line
 }
 
 #[test]
-fn switch_uses_skip_comments_and_binaries_only() {
-    assert_eq!(switch_uses(b"# ROBSON_TEST_PG_SKIP_MEASUREMENTS=1"), 0);
-    assert_eq!(switch_uses(b"run: x # ROBSON_TEST_PG_SKIP_MEASUREMENTS"), 0);
-    assert_eq!(switch_uses(b"export ROBSON_TEST_PG_SKIP_MEASUREMENTS=1"), 1);
-    assert_eq!(switch_uses(b"echo \" #\"; export ROBSON_TEST_PG_SKIP_MEASUREMENTS=1"), 1);
-    assert_eq!(switch_uses(b"n=${#a[@]} ROBSON_TEST_PG_SKIP_MEASUREMENTS=1"), 1);
-    assert_eq!(switch_uses(b"\0ROBSON_TEST_PG_SKIP_MEASUREMENTS"), 0);
-    assert_eq!(switch_uses(&[0xff, b'R']), 0);
-    assert_eq!(switch_uses(DEFAULT_DISPATCH.as_bytes()), 2);
-    assert_eq!(switch_uses(CI_DATABASE_STEP.as_bytes()), 1);
+fn the_switch_scan_counts_every_mention() {
+    assert_eq!(occurrences(b"# ROBSON_TEST_PG_SKIP_MEASUREMENTS=1"), 1);
+    assert_eq!(occurrences(b"run: x # ROBSON_TEST_PG_SKIP_MEASUREMENTS"), 1);
+    assert_eq!(
+        occurrences(b"echo \"$(echo \" #\")\"; export ROBSON_TEST_PG_SKIP_MEASUREMENTS=1"),
+        1
+    );
+    assert_eq!(occurrences(b"\0ROBSON_TEST_PG_SKIP_MEASUREMENTS\xff"), 1);
+    assert_eq!(occurrences(DEFAULT_DISPATCH.as_bytes()), 2);
+    assert_eq!(occurrences(SCRIPT_NOTE.as_bytes()), 1);
+    assert_eq!(occurrences(CI_DATABASE_STEP.as_bytes()), 1);
+    assert_eq!(remove_once(b"aXYbXY", b"XY"), b"abXY");
+    assert_eq!(remove_once(b"ab", b"XY"), b"ab");
 }
 
 #[test]
