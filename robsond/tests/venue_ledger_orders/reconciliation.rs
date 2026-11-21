@@ -566,7 +566,11 @@ async fn base_cases(pool: &PgPool, tenant: Uuid, rig: &mut ReconciliationRig) ->
             rig,
             &ctx.inputs(b),
             1,
-            &[triple(btc(dec!(0), dec!(0.999)), &[robson.clone()], &[])],
+            &[triple(
+                btc(dec!(0), dec!(0.999)),
+                std::slice::from_ref(&robson),
+                &[],
+            )],
             None,
         )
         .await?;
@@ -597,7 +601,11 @@ async fn base_cases(pool: &PgPool, tenant: Uuid, rig: &mut ReconciliationRig) ->
             rig,
             &ctx.inputs(b),
             1,
-            &[triple(btc(dec!(0.5), dec!(0.999)), &[robson.clone()], &[])],
+            &[triple(
+                btc(dec!(0.5), dec!(0.999)),
+                std::slice::from_ref(&robson),
+                &[],
+            )],
             None,
         )
         .await?;
@@ -611,7 +619,11 @@ async fn base_cases(pool: &PgPool, tenant: Uuid, rig: &mut ReconciliationRig) ->
             rig,
             &ctx.inputs(b),
             1,
-            &[triple(btc(dec!(0), dec!(0.5)), &[robson.clone()], &[])],
+            &[triple(
+                btc(dec!(0), dec!(0.5)),
+                std::slice::from_ref(&robson),
+                &[],
+            )],
             None,
         )
         .await?;
@@ -671,9 +683,11 @@ async fn base_cases(pool: &PgPool, tenant: Uuid, rig: &mut ReconciliationRig) ->
             rig,
             &ctx.inputs(b),
             1,
-            &[triple(btc(dec!(0), dec!(0.999)), &[robson.clone()], &[
-                list(SYMBOL, 9, "operated-oco", 901),
-            ])],
+            &[triple(
+                btc(dec!(0), dec!(0.999)),
+                std::slice::from_ref(&robson),
+                &[list(SYMBOL, 9, "operated-oco", 901)],
+            )],
             None,
         )
         .await?;
