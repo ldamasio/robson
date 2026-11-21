@@ -19,15 +19,21 @@
 #   DATABASE_URL=postgres://... bash scripts/test-pg.sh crash_recovery   # name filter, serial
 #   DATABASE_URL=postgres://... bash scripts/test-pg.sh --crash-harness
 #
-# What runs (no extra args): two phases over the same workspace selection,
+# What runs (no extra args): three phases over the same workspace selection,
 #   1. cargo test --workspace --exclude robson-connectors --features postgres
 #                 --no-fail-fast -- --ignored --skip bounded_migration::public_pg::
+#                 --skip <each ISOLATED_TESTS name>
 #   2. the same selection -- --ignored bounded_migration::public_pg:: --test-threads=1
+#   3. for each ISOLATED_TESTS name, the same selection -- --ignored <name>
+#      --test-threads=1, alone on the server
 #   Phase 2 is the migration38 suite: its server-side 1 s statement and 15 s
-#   apply bounds are measured, so its tests never run beside each other. Phase 1
-#   keeps libtest's default concurrency. Both phases run; the script fails if
-#   either failed. Together they select every ignored test exactly once, except
-#   the controller tests below.
+#   apply bounds are measured, so its tests never run beside each other. Phase 3
+#   holds the measurement runs whose ignore reason starts with "requires isolated
+#   PG": each asserts a wall-clock envelope, which concurrent tests on the same
+#   server would consume (the 60 s million-row cold audit missed its envelope on
+#   a CI runner beside phase 1's load). Phase 1 keeps libtest's default
+#   concurrency. Every phase runs; the script fails if any failed. Together they
+#   select every ignored test exactly once, except the controller tests below.
 # With extra args (a caller subset), one invocation:
 #   cargo test --workspace --exclude robson-connectors --features postgres
 #              --no-fail-fast -- --ignored [extra args] --test-threads=1
@@ -149,6 +155,13 @@ SKIP_CONTROLLER=()
 for name in "${CONTROLLER_TESTS[@]}"; do
     SKIP_CONTROLLER+=(--skip "${name}")
 done
+ISOLATED_TESTS=(
+    measured_million_row_cold_terminal_envelope
+)
+SKIP_ISOLATED=()
+for name in "${ISOLATED_TESTS[@]}"; do
+    SKIP_ISOLATED+=(--skip "${name}")
+done
 
 if [[ $# -gt 0 ]]; then
     args=()
@@ -165,9 +178,13 @@ if [[ $# -gt 0 ]]; then
 else
     status=0
     info "Phase 1: every ignored test outside ${SUITE}"
-    "${CARGO[@]}" -- --ignored --skip "${SUITE}" "${SKIP_CONTROLLER[@]}" || status=1
+    "${CARGO[@]}" -- --ignored --skip "${SUITE}" "${SKIP_CONTROLLER[@]}" "${SKIP_ISOLATED[@]}" || status=1
     info "Phase 2: ${SUITE} one test at a time"
     "${CARGO[@]}" -- --ignored "${SUITE}" "${SKIP_CONTROLLER[@]}" --test-threads=1 || status=1
+    for name in "${ISOLATED_TESTS[@]}"; do
+        info "Phase 3: ${name} alone"
+        "${CARGO[@]}" -- --ignored "${name}" "${SKIP_CONTROLLER[@]}" --test-threads=1 || status=1
+    done
     if [[ ${status} -ne 0 ]]; then
         fail "Postgres integration tests failed."
         exit 1
