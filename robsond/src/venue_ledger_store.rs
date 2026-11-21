@@ -17,6 +17,7 @@ use crate::{ledger_connection::LedgerConnection, spot_order_set_store::JournalGe
 
 mod entry_fee;
 mod orders;
+pub mod settlement;
 mod trades;
 
 #[cfg(all(test, feature = "crash-points"))]
