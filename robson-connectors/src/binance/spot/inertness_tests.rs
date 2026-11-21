@@ -588,6 +588,20 @@ fn strip_n5_references(path: &Path, text: &str) -> String {
         .join("\n")
 }
 
+/// Package 3's order-writer inventory (robsond/tests/venue_ledger_pg.rs,
+/// `order_ledger_has_no_production_callers`) names the physical recovery
+/// fixture once, as data, to prove its declaration test-only: it neither
+/// declares nor includes it, so it is not a second inclusion site. Only that
+/// file, and only so, is not counted as a reference.
+fn names_only_as_data(path: &Path, text: &str, inclusion: &str) -> bool {
+    path.ends_with("robsond/tests/venue_ledger_pg.rs")
+        && text.matches(inclusion).count() == 1
+        && !text.contains(&format!("#[path = {inclusion}]"))
+        && !["include!(", "include_str!(", "include_bytes!("]
+            .iter()
+            .any(|form| text.contains(&format!("{form}{inclusion}")))
+}
+
 fn isolated_test_fixture(
     owner: &str,
     fixture: &str,
@@ -817,7 +831,10 @@ fn nothing_outside_the_spot_module_names_it() {
         let inclusion = format!("\"{name}\"");
         let references: Vec<_> = outside
             .iter()
-            .filter(|path| fs::read_to_string(path).unwrap().contains(&inclusion))
+            .filter(|path| {
+                let text = fs::read_to_string(path).unwrap();
+                text.contains(&inclusion) && !names_only_as_data(path, &text, &inclusion)
+            })
             .cloned()
             .collect();
         assert!(
