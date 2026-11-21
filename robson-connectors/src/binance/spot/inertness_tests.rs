@@ -801,11 +801,26 @@ fn nothing_outside_the_spot_module_names_it() {
     let mut files = Vec::new();
     rust_files(workspace, &mut files);
     let outside: Vec<PathBuf> = files.into_iter().filter(|path| !path.starts_with(&spot)).collect();
-    // The scan sees the factory and the daemon, not only this crate.
+    // The scan sees the factory and the daemon, not only this crate, and
+    // package 5a's owners, one line each:
     for must in [
         "robsond/src/venue.rs",
         "robsond/src/main.rs",
         "robson-connectors/src/lib.rs",
+        // 8k-1 B: the foreign-lock fence and its release refusal;
+        "robson-exec/src/order_journal.rs",
+        "robsond/src/api.rs",
+        // 8k-2: the inert detector (its classifier's exact lines only);
+        "robsond/src/balance_reconciliation/mod.rs",
+        "robsond/src/balance_reconciliation/snapshot.rs",
+        "robsond/src/balance_reconciliation/classify.rs",
+        // 8l-1: the bounded routes of migrations 46 to 50;
+        "robson-db/src/bounded_migration.rs",
+        // 8l-2: the settlement barrier and the gate's pending slot;
+        "robsond/src/venue_ledger_store/settlement.rs",
+        "robson-exec/src/gate/pending_execution.rs",
+        // 8l-4a: the balance accounting context.
+        "robsond/src/balance_accounting.rs",
     ] {
         assert!(outside.iter().any(|path| path.ends_with(must)), "{must} not scanned");
     }
