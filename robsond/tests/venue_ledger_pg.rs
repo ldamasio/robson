@@ -934,28 +934,120 @@ async fn wire_statement_counts_match_the_counter_and_replay_contract(pool: PgPoo
     }
 }
 
+/// The only modules under `src` that may call the ledger order writer outside
+/// `venue_ledger_store`: test-only fixtures that drive it against a
+/// disposable database. Each must be declared only behind `#[cfg(test)]`,
+/// directly or through a test-only parent, so no production build compiles
+/// its call.
+const TEST_ONLY_ORDER_WRITERS: [&str; 2] = [
+    // The prepared first-cancel bridge seeds the initialized fixture's order
+    // through the real writer (declared in order_journal_transition.rs).
+    "order_journal_transition_prepared.rs",
+    // The physical recovery witness seeds its observed BUY order (declared in
+    // the test-only order_journal_projected_pg_tests.rs).
+    "order_journal_physical_recovery_pg_tests.rs",
+];
+
+/// Whether `file` (relative to `src`) is compiled only into tests: every
+/// `#[path]` declaration of it carries a test gate among its attributes, or
+/// sits in a file that is itself test-only. A file declared any other way, or
+/// not at all, is not proven test-only.
+fn declared_test_only(src: &std::path::Path, file: &str) -> bool {
+    fn files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    fn test_only(src: &std::path::Path, all: &[std::path::PathBuf], file: &str, depth: u8) -> bool {
+        let target = src.join(file);
+        let mut declarations = 0;
+        for declarer in all {
+            let text = std::fs::read_to_string(declarer).unwrap();
+            let lines: Vec<&str> = text.lines().map(str::trim).collect();
+            for (at, line) in lines.iter().enumerate() {
+                let Some(path) =
+                    line.strip_prefix("#[path = \"").and_then(|rest| rest.strip_suffix("\"]"))
+                else {
+                    continue;
+                };
+                if declarer.parent().unwrap().join(path) != target {
+                    continue;
+                }
+                declarations += 1;
+                // The item's attributes: the unbroken lines above the path
+                // attribute back to the previous item, and those below it up
+                // to the `mod` line, rustfmt's multi-line forms joined.
+                let above = lines[..at]
+                    .iter()
+                    .rev()
+                    .take_while(|l| !l.is_empty() && !l.ends_with([';', '}', '{']))
+                    .collect::<Vec<_>>();
+                let below = lines[at + 1..]
+                    .iter()
+                    .take_while(|l| !l.ends_with([';', '{']))
+                    .collect::<Vec<_>>();
+                let gate: String = above
+                    .iter()
+                    .rev()
+                    .chain(below.iter())
+                    .flat_map(|l| l.chars())
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                let gated = gate.contains("#[cfg(test)]") || gate.contains("#[cfg(all(test,");
+                let parent = declarer.strip_prefix(src).unwrap().to_str().unwrap();
+                if !gated && (depth == 0 || !test_only(src, all, parent, depth - 1)) {
+                    return false;
+                }
+            }
+        }
+        declarations > 0
+    }
+    let mut all = Vec::new();
+    files(src, &mut all);
+    test_only(src, &all, file, 8)
+}
+
 #[test]
 fn order_ledger_has_no_production_callers() {
-    fn visit(path: &std::path::Path) {
+    fn visit(src: &std::path::Path, path: &std::path::Path, callers: &mut Vec<String>) {
         for entry in std::fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 if path.file_name().unwrap() != "venue_ledger_store" {
-                    visit(&path);
+                    visit(src, &path, callers);
                 }
                 continue;
             }
             if path.extension().is_some_and(|ext| ext == "rs") {
                 let source = std::fs::read_to_string(&path).unwrap();
-                assert!(
-                    !source.contains(".record_order("),
-                    "ledger order writer activated in {}",
-                    path.display()
-                );
+                if source.contains(".record_order(") {
+                    callers.push(path.strip_prefix(src).unwrap().display().to_string());
+                }
             }
         }
     }
-    visit(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut callers = Vec::new();
+    visit(&src, &src, &mut callers);
+    callers.sort();
+    let mut expected = TEST_ONLY_ORDER_WRITERS.map(String::from).to_vec();
+    expected.sort();
+    assert_eq!(
+        callers, expected,
+        "ledger order writer activated outside the test-only inventory"
+    );
+    for file in TEST_ONLY_ORDER_WRITERS {
+        assert!(declared_test_only(&src, file), "{file} is not declared test-only");
+    }
+    // Controls: a production module declared through `#[path]` and a test
+    // module behind its gate are told apart.
+    assert!(!declared_test_only(&src, "order_journal_transition.rs"));
+    assert!(declared_test_only(&src, "order_journal_projected_pg_tests.rs"));
 }
 
 #[sqlx::test(migrations = "../migrations")]
