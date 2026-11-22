@@ -1022,18 +1022,21 @@ fn ps2a_non_trading_budget_stays_dormant() {
     let sources = production_sources();
     // PS-3: the TIME owner's non-trading constructor takes the budget and its
     // TIME handle; nothing else does, and nothing calls the constructor yet.
-    for (needle, owner) in [
-        ("observe_non_trading", None),
-        ("bootstrap::non_trading(", None),
-        ("NonTradingBudget", Some("venue_clock_owner.rs")),
-        (".time_owner()", Some("venue_clock_owner.rs")),
-        ("ClockOwner::non_trading(", None),
+    // PS-5b: the read owner holds the same budget; nothing constructs it yet.
+    let (clock, reads) = ("venue_clock_owner.rs", "venue_clock_owner/reads.rs");
+    for (needle, owners) in [
+        ("observe_non_trading", &[][..]),
+        ("bootstrap::non_trading(", &[]),
+        ("NonTradingBudget", &[clock, reads]),
+        (".time_owner()", &[clock]),
+        ("ClockOwner::non_trading(", &[]),
+        ("SpotReads::new(", &[]),
     ] {
         let outside: BTreeSet<&str> = sources
             .iter()
             .filter(|s| s.text.contains(needle) && !s.file.starts_with("venue_budget/"))
             .map(|s| s.file.as_str())
-            .filter(|file| Some(*file) != owner)
+            .filter(|file| !owners.contains(file))
             .collect();
         assert!(outside.is_empty(), "{needle} reached from {outside:?}");
     }

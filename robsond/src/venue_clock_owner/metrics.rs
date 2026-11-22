@@ -75,6 +75,11 @@ pub(super) fn register() {
     for outcome in outcomes.split(' ').chain(["venue", "storage"]) {
         CYCLES.with_label_values(&[outcome]);
     }
+    for read in READ_LABELS.split(' ') {
+        for outcome in READ_OUTCOMES.split(' ') {
+            READS.with_label_values(&[read, outcome]);
+        }
+    }
     evidence(None);
     LazyLock::force(&BOUND);
     bucket(Some((0, 0)));
@@ -103,9 +108,31 @@ fn set_bucket(gauge: &IntGaugeVec, usage: Option<(u64, u64)>) {
     }
 }
 
+static READS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!("robsond_spot_reads_total", "Budgeted Spot read outcomes", &[
+        "read", "outcome"
+    ])
+    .expect("register spot read outcomes")
+});
+
+/// Every read's label (its `ReadKind`, as `read` writes it) and outcome.
+const READ_LABELS: &str = "Account OperatedOpenOrders OpenOrderLists ExchangeInfo Kline Commission";
+const READ_OUTCOMES: &str = "published deferred budget expired closing transport native resource \
+                             payload venue storage busy dropped";
+
+/// One budgeted read's outcome, by read (PS-5b): a TIME cycle's outcome
+/// labels, `busy` (no slot) or `dropped` (its caller dropped it).
+pub(super) fn read(read: impl std::fmt::Debug, outcome: &str) {
+    READS.with_label_values(&[format!("{read:?}").as_str(), outcome]).inc();
+}
+
 pub(super) fn cycle(error: Option<super::TimeError>) {
+    CYCLES.with_label_values(&[outcome(error.as_ref())]).inc();
+}
+
+pub(super) fn outcome(error: Option<&super::TimeError>) -> &'static str {
     use super::TimeError;
-    let label = match error {
+    match error {
         None => "published",
         Some(TimeError::Budget(crate::venue_budget::BudgetError::Deferred)) => "deferred",
         Some(TimeError::Budget(_)) => "budget",
@@ -117,8 +144,8 @@ pub(super) fn cycle(error: Option<super::TimeError>) {
         Some(TimeError::Payload) => "payload",
         Some(TimeError::Venue) => "venue",
         Some(TimeError::Storage(_)) => "storage",
-    };
-    CYCLES.with_label_values(&[label]).inc();
+        Some(TimeError::Busy) => "busy",
+    }
 }
 
 #[cfg(test)]
@@ -137,5 +164,45 @@ mod tests {
         assert_eq!(used("weight_1m"), 26);
         super::set_bucket(&gauge, Some((u64::MAX, 1)));
         assert_eq!((used("weight_1m"), used("orders_10s")), (i64::MAX, 1));
+    }
+
+    /// PS-5b: every read's series exists from the start: `READ_LABELS` names
+    /// each `ReadKind` as `read` writes it, and `READ_OUTCOMES` holds every
+    /// label `outcome` gives a read (each error, success) and `dropped`.
+    #[test]
+    fn every_read_series_is_registered_at_start() {
+        use super::super::TimeError;
+        use crate::{
+            venue_budget::{state::ReadKind, BudgetError},
+            venue_clock_store::StoreError,
+        };
+        let kinds = [
+            ReadKind::Account,
+            ReadKind::OperatedOpenOrders,
+            ReadKind::OpenOrderLists,
+            ReadKind::ExchangeInfo,
+            ReadKind::Kline,
+            ReadKind::Commission,
+        ];
+        let labels: Vec<_> = kinds.iter().map(|kind| format!("{kind:?}")).collect();
+        assert_eq!(super::READ_LABELS.split(' ').collect::<Vec<_>>(), labels);
+        let errors = [
+            TimeError::Budget(BudgetError::Deferred),
+            TimeError::Budget(BudgetError::Invalid),
+            TimeError::Expired,
+            TimeError::Closing,
+            TimeError::Transport,
+            TimeError::Storage(StoreError::Backend),
+            TimeError::Native,
+            TimeError::Resource,
+            TimeError::Payload,
+            TimeError::Venue,
+            TimeError::Busy,
+        ];
+        let outcomes: Vec<_> = super::READ_OUTCOMES.split(' ').collect();
+        for error in errors.iter().map(Some).chain([None]) {
+            assert!(outcomes.contains(&super::outcome(error)), "{error:?}");
+        }
+        assert!(outcomes.contains(&"dropped"));
     }
 }

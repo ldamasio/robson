@@ -604,10 +604,40 @@ fn detector_reference_lines(path: &Path) -> &'static [&'static str] {
 }
 
 /// PS-4's prepared read transport: outside this module, exactly its signer's
-/// definition in the REST client. No owner calls it yet (PS-5 adds one).
+/// definition in the REST client and the lines of its one owner, PS-5b's
+/// budgeted read owner (no production caller until PS-6).
 fn read_reference_lines(path: &Path) -> &'static [&'static str] {
     match path.to_str() {
         Some("robson-connectors/src/binance_rest.rs") => &["pub(crate) fn bind_spot_read("],
+        // PS-5b: the read owner, its exact lines.
+        Some("robsond/src/venue_clock_owner/reads.rs") => &[
+            "use robson_connectors::binance::spot::{",
+            "PreparedSpotCommission, PreparedSpotRead, SpotCommission, SpotPreparedRead, SpotReadBody,",
+            "SPOT_COMMISSION_BODY_CAP, SPOT_OPERATED_SYMBOL,",
+            "Closed(SpotPreparedRead),",
+            "Closed(SpotReadBody),",
+            "Commission(SpotCommission),",
+            "Read(PreparedSpotRead),",
+            "Commission(PreparedSpotCommission),",
+            "Self::Closed(SpotPreparedRead::Account) => ReadKind::Account,",
+            "Self::Closed(SpotPreparedRead::OperatedOpenOrders) => ReadKind::OperatedOpenOrders,",
+            "Self::Closed(SpotPreparedRead::OpenOrderLists) => ReadKind::OpenOrderLists,",
+            "Self::Closed(SpotPreparedRead::ExchangeInfo) => ReadKind::ExchangeInfo,",
+            "Self::Closed(SpotPreparedRead::Kline { .. }) => ReadKind::Kline,",
+            "Self::Commission => SPOT_COMMISSION_BODY_CAP,",
+            "SpotPreparedRead::Account,",
+            "SpotPreparedRead::OperatedOpenOrders,",
+            "SpotPreparedRead::OpenOrderLists,",
+            "self.one(Read::Closed(SpotPreparedRead::Account), Some(&signed?), deadline)",
+            "self.single(Read::Closed(SpotPreparedRead::ExchangeInfo), deadline).await",
+            "self.single(Read::Closed(SpotPreparedRead::Kline { start_ms }), deadline).await",
+            "Read::Closed(read) => client.prepare_spot_read(read).map(Prepared::Read),",
+            "Read::Commission => robson_domain::Symbol::from_pair(SPOT_OPERATED_SYMBOL)",
+            "client.prepare_spot_commission(&pair).map(Prepared::Commission)",
+            "if status != 200 && !matches!(read, Read::Closed(SpotPreparedRead::Kline { .. })) {",
+            "Read::Commission => serde_json::from_slice::<SpotCommission>(&body)",
+            ".filter(|commission| commission.symbol == SPOT_OPERATED_SYMBOL)",
+        ],
         _ => &[],
     }
 }
@@ -912,6 +942,13 @@ fn nothing_outside_the_spot_module_names_it() {
             "order_journal_projected_pg_tests.rs",
             "mod physical_recovery",
             "#![cfg(all(test, feature = \"postgres\"))]\n",
+        ),
+        (
+            clock_dir.as_path(),
+            "reads_tests.rs",
+            "reads.rs",
+            "mod tests",
+            "#![cfg(all(test, feature = \"crash-points\"))]\n",
         ),
         (
             n5_dir.as_path(),
@@ -1338,6 +1375,12 @@ fn the_read_allowance_admits_only_its_named_owner() {
     let other = Path::new("robsond/src/venue.rs");
     assert!(outside_spot_violations(owner, &exact, &names).is_empty());
     assert!(!outside_spot_violations(other, &exact, &names).is_empty());
+    let reads = Path::new("robsond/src/venue_clock_owner/reads.rs");
+    let owned = fs::read_to_string(workspace.join(reads)).unwrap();
+    assert!(outside_spot_violations(reads, &owned, &names).is_empty());
+    assert!(
+        !outside_spot_violations(other, &read_reference_lines(reads).join("\n"), &names).is_empty()
+    );
     assert!(!outside_spot_violations(owner, &format!("{exact}\n{exact}"), &names).is_empty());
     for extra in [
         "let prepared = client.prepare_spot_read(read)?;",

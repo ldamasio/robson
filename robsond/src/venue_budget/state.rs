@@ -128,13 +128,52 @@ impl NonTradingBudget {
     }
 
     /// One closed read at its fixed weight, `now` and its deadline captured
-    /// by `at` under the budget lock (see [`SharedBudget::reserve_now`]).
+    /// by `at` under the budget lock (as [`SharedBudget::reserve_now`]);
+    /// non-blocking (PLAN §6.7 step 1): a busy budget is `Deferred`, `at`
+    /// not called, nothing reserved.
     pub(crate) fn reserve_read_now(
         &self,
         read: ReadKind,
         at: impl FnOnce() -> Result<(TickCapture, TickCapture), BudgetError>,
     ) -> Result<PendingRead, BudgetError> {
-        self.0.reserve_now(read.weight(), at).map(|pending| PendingRead(pending, read))
+        let mut state = self.0 .0.try_lock().map_err(|_| BudgetError::Deferred)?;
+        let (now, deadline) = at()?;
+        let pending = self.0.reserve_steady(&mut state, now, deadline, read.weight())?;
+        Ok(PendingRead(pending, read))
+    }
+
+    /// A read's first poll, as [`SharedBudget::poll_commission_first`]: the
+    /// caller's clock admission, the budget check, the handoff, the poll and
+    /// its head, under one budget guard; later polls through `poll_send`.
+    pub(crate) fn poll_read_first<M>(
+        &self,
+        pending: &mut PendingRead,
+        clock: &NativeClock,
+        epoch: uuid::Uuid,
+        admit_clock: impl FnOnce() -> Result<(TickCapture, M), BudgetError>,
+        poll: impl FnOnce() -> std::task::Poll<reqwest::Result<reqwest::Response>>,
+    ) -> Result<(TickCapture, M, std::task::Poll<reqwest::Result<reqwest::Response>>), BudgetError>
+    {
+        self.0.poll_reserved_first(&mut pending.0, clock, epoch, admit_clock, poll)
+    }
+
+    /// A read's later poll, as [`SharedBudget::poll_send`] with no charge
+    /// left to hand off; non-blocking: a busy budget is `Deferred`, nothing
+    /// polled (the read polls again).
+    pub(crate) fn poll_send(
+        &self,
+        clock: &NativeClock,
+        epoch: uuid::Uuid,
+        poll: impl FnOnce() -> std::task::Poll<reqwest::Result<reqwest::Response>>,
+    ) -> Result<std::task::Poll<reqwest::Result<reqwest::Response>>, BudgetError> {
+        let mut state = self.0 .0.try_lock().map_err(|_| BudgetError::Deferred)?;
+        let result = poll();
+        SharedBudget::observe_head(&mut state, &result, clock, epoch);
+        Ok(result)
+    }
+
+    pub(crate) fn usage(&self, at: impl FnOnce() -> Option<TickCapture>) -> Option<(u64, u64)> {
+        self.0.usage(at)
     }
 
     /// Non-blocking: a busy budget is `Deferred`, nothing reserved.

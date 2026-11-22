@@ -30,6 +30,9 @@ pub(crate) enum TimeError {
     Resource,
     Payload,
     Venue,
+    /// A fifth read while four are in flight: refused at once, nothing
+    /// reserved, prepared or sent (PS-5).
+    Busy,
 }
 
 impl From<BudgetError> for TimeError {

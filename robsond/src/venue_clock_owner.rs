@@ -42,6 +42,7 @@ mod on_demand;
 pub(crate) use on_demand::ClockHandle;
 #[cfg(all(test, feature = "crash-points"))]
 mod pg_tests;
+pub(crate) mod reads;
 #[cfg(all(test, feature = "crash-points"))]
 pub(crate) use pg_tests::reconciliation::{
     AccountSeen, Hook, Listener, ReconciliationRig, ScanInputs, Scanned,
