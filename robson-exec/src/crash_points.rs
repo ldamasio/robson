@@ -48,6 +48,8 @@ crash_points! {
     CASH_AFTER_CONTEXT = "cash_after_context";
     // The cash writer sent its writes; COMMIT is not sent (8l-3b).
     CASH_BEFORE_COMMIT = "cash_before_commit";
+    // The re-anchor holds O1; O2 is not requested (8l-5a).
+    REANCHOR_AFTER_O1 = "reanchor_after_o1";
 }
 
 /// Crash point to arm.

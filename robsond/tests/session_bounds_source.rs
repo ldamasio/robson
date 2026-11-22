@@ -953,8 +953,15 @@ fn package5a_owners_stay_dormant_or_bounded() {
     // the connection owner allowed above.
     // 8l-3b's dormant cash writer takes 8k-2's qualified verdict and its
     // interval (`BaseVerdict`, `ObservationInterval`) as its input.
-    let detector_users =
-        BTreeSet::from(["lib.rs", "venue_ledger_store/cash/writer.rs"].map(String::from));
+    // 8l-5a's dormant re-anchor runs O1 and O2 through 8k-3a's capture.
+    let detector_users = BTreeSet::from(
+        [
+            "lib.rs",
+            "venue_ledger_store/cash/writer.rs",
+            "venue_ledger_store/cash/reanchor.rs",
+        ]
+        .map(String::from),
+    );
     assert_eq!(outside("balance_reconciliation", "balance_reconciliation/"), detector_users);
     assert_eq!(source("lib.rs").matches("mod balance_reconciliation;").count(), 1);
     assert_eq!(outside("read_pre", "balance_reconciliation/"), none);
@@ -1004,6 +1011,12 @@ fn package5a_owners_stay_dormant_or_bounded() {
     // 8l-3b: the cash writer is declared and nothing calls it (8k-3 will).
     assert_eq!(outside("CashWriter", "venue_ledger_store/cash"), none);
     assert_eq!(naming(".conclude("), none);
+    // 8l-5a: the re-anchor service is built nowhere in production; its
+    // endpoint takes it as a router extension, which the 5a composition adds
+    // with PS-5b's ACCOUNT reads.
+    let reanchor = "venue_ledger_store/cash/reanchor.rs";
+    assert_eq!(outside("CashReanchor", "venue_ledger_store/cash"), only("api/cash_reanchor.rs"));
+    assert_eq!(naming("CashReanchor {"), only(reanchor));
     // 8l-2: the barrier runs on its caller's connection, and neither it nor
     // the gate's invalidity marks has a production caller yet (8l-3, 8l-7,
     // 8l-8, 8n).

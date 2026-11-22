@@ -25,6 +25,9 @@ use super::{
 
 #[cfg(test)]
 mod pg_tests;
+// 8l-5's re-anchor: composed at 5a with PS-5b's ACCOUNT reads.
+#[cfg_attr(not(test), allow(dead_code, reason = "8l-5: composed at 5a"))]
+pub(crate) mod reanchor;
 #[cfg_attr(
     not(test),
     allow(

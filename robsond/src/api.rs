@@ -65,6 +65,9 @@ use crate::{
     sse::{map_daemon_event, resync_required_event},
 };
 
+#[cfg(feature = "postgres")]
+mod cash_reanchor;
+
 // =============================================================================
 // API State
 // =============================================================================
@@ -780,7 +783,8 @@ where
     let authenticated = authenticated
         .route("/recovery/disposition", post(recovery_disposition_handler::<E, S>))
         .route("/recovery/release", post(recovery_release_handler::<E, S>))
-        .route("/recovery/pending", get(recovery_pending_handler::<E, S>));
+        .route("/recovery/pending", get(recovery_pending_handler::<E, S>))
+        .route("/venue/cash-reanchor", post(cash_reanchor::handler));
     let authenticated = authenticated.layer(auth_layer).with_state(state);
 
     read_only.merge(authenticated).layer(build_cors_layer())

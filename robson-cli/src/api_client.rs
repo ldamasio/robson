@@ -148,6 +148,21 @@ impl ApiClient {
         }
     }
 
+    /// `POST /venue/cash-reanchor {reason}`: the status and the JSON body
+    /// (`null` when the body is not JSON).
+    pub async fn cash_reanchor(&self, reason: &str) -> Result<(u16, serde_json::Value)> {
+        let resp = self
+            .client
+            .post(format!("{}/venue/cash-reanchor", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "reason": reason }))
+            .send()
+            .await
+            .context("failed to connect to robsond")?;
+        let status = resp.status().as_u16();
+        Ok((status, resp.json().await.unwrap_or(serde_json::Value::Null)))
+    }
+
     pub async fn acknowledge_income(
         &self,
         exchange_income_id: &str,
