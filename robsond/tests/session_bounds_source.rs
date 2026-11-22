@@ -1001,9 +1001,12 @@ fn package5a_owners_stay_dormant_or_bounded() {
     // and have no production caller yet (8l-3b, 8l-8, 8p, 8n).
     assert_eq!(outside("read_cash_state", "venue_ledger_store/cash"), none);
     assert_eq!(outside("CASH_STATE", "venue_ledger_store/cash"), none);
-    // 8l-3b: the cash writer is declared and nothing calls it (8k-3 will).
-    assert_eq!(outside("CashWriter", "venue_ledger_store/cash"), none);
-    assert_eq!(naming(".conclude("), none);
+    // 8l-3b: the cash writer is declared; 8k-3c's dormant route is its one
+    // caller (8k-3d's task calls the route).
+    let route = only("balance_reconciliation/route.rs");
+    assert_eq!(outside("CashWriter", "venue_ledger_store/cash"), route);
+    assert_eq!(naming(".conclude("), route);
+    assert_eq!(source("balance_reconciliation/route.rs").matches(".conclude(").count(), 1);
     // 8l-2: the barrier runs on its caller's connection, and neither it nor
     // the gate's invalidity marks has a production caller yet (8l-3, 8l-7,
     // 8l-8, 8n).

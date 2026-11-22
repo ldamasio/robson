@@ -834,6 +834,9 @@ fn nothing_outside_the_spot_module_names_it() {
         "robsond/src/balance_reconciliation/pg_tests.rs",
         // 8k-3b: its attempt (the triple's record lines only);
         "robsond/src/balance_reconciliation/attempt.rs",
+        // 8k-3c: its route and the route's tests (no Spot item);
+        "robsond/src/balance_reconciliation/route.rs",
+        "robsond/src/balance_reconciliation/pg_tests/routing.rs",
         // 8l-1: the bounded routes of migrations 46 to 50;
         "robson-db/src/bounded_migration.rs",
         // 8l-2: the settlement barrier and the gate's pending slot;

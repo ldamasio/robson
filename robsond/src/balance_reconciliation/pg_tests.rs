@@ -699,7 +699,20 @@ struct Scripted<'a> {
     receipts: Vec<AccountReceipt>,
     /// What the receipt's revalidation after the post answers.
     valid: bool,
+    /// 8k-3c: the receipts' sample, USDT total, locked BTC, and the triple's
+    /// open orders and lists as the venue's JSON.
+    sample: Uuid,
+    usdt: &'static str,
+    locked: &'static str,
+    orders: serde_json::Value,
+    lists: serde_json::Value,
+    /// 8k-3c: awaited once in the first triple, at its start or (true) its
+    /// end.
+    hook: Option<(bool, Hook<'a>)>,
 }
+
+/// 8k-3c: a future the scripted port awaits once.
+type Hook<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>;
 
 impl<'a> Scripted<'a> {
     fn new(pool: &'a PgPool, f: &'a Fixture, script: Vec<Step>) -> Self {
@@ -715,6 +728,12 @@ impl<'a> Scripted<'a> {
             sessions: Vec::new(),
             receipts: Vec::new(),
             valid: true,
+            sample: Uuid::from_u128(0x5a),
+            usdt: "1000",
+            locked: "0",
+            orders: serde_json::json!([]),
+            lists: serde_json::json!([]),
+            hook: None,
         }
     }
 
@@ -733,12 +752,12 @@ impl<'a> Scripted<'a> {
         let body = serde_json::json!({
             "uid": 4242, "canTrade": true, "accountType": "SPOT", "permissions": ["SPOT"],
             "balances": [
-                {"asset": "USDT", "free": "1000", "locked": "0"},
-                {"asset": "BTC", "free": btc, "locked": "0"},
+                {"asset": "USDT", "free": self.usdt, "locked": "0"},
+                {"asset": "BTC", "free": btc, "locked": self.locked},
             ],
         });
         Ok(AccountReceipt {
-            sample: Some((Uuid::from_u128(0x5a), 2)),
+            sample: Some((self.sample, 2)),
             send: at(1_794_614_400 + 10 * n, i128::from(n) * 100),
             receive: at(1_794_614_401 + 10 * n, i128::from(n) * 100 + 50),
             body: serde_json::from_value(body)?,
@@ -755,6 +774,9 @@ impl InventoryReads for Scripted<'_> {
             .await
             .expect("activity");
         self.sessions.push(sessions);
+        if matches!(self.hook, Some((false, _))) {
+            self.hook.take().expect("a hook").1.await;
+        }
         tokio::time::sleep(self.hold).await;
         let step = self.script.pop_front().expect("a scripted triple");
         let (sent, answer) = match step {
@@ -767,12 +789,15 @@ impl InventoryReads for Scripted<'_> {
                 self.receipts.push(receipt.clone());
                 let triple = Triple {
                     account: receipt,
-                    orders: Vec::new(),
-                    lists: Vec::new(),
+                    orders: serde_json::from_value(self.orders.clone()).expect("orders"),
+                    lists: serde_json::from_value(self.lists.clone()).expect("lists"),
                 };
                 (3, Ok(triple))
             },
         };
+        if let Some((true, _)) = self.hook {
+            self.hook.take().expect("a hook").1.await;
+        }
         self.handed_off += u32::from(sent);
         self.arrived.push(std::time::Instant::now());
         (sent, answer)
@@ -1006,3 +1031,6 @@ async fn the_scan_holds_nothing_across_the_inventory(pool: PgPool) -> Result<()>
     println!("SCAN_8K3B case=holds-nothing sessions_during_triples={:?}", reads.sessions);
     Ok(())
 }
+
+// 8k-3c (PLAN-r2 §6.4, §6.5, §8): the route of every scan's result.
+mod routing;

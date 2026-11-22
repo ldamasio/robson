@@ -13,7 +13,8 @@
 //! 8k-3a: the marks are the gate's invalidity marks, and the non-trading
 //! scope's capture, ACCOUNT reading and ACCOUNT-only classification
 //! ([`Capture`], [`AccountReading`], [`classify_account`]) serve the scan
-//! and 8l-5's O1/O2.
+//! and 8l-5's O1/O2. 8k-3c's `route` takes every scan's result to exactly
+//! one consequence, the cash writer only for a qualified Clean.
 use robson_exec::{
     clock_records::RawClockCapture,
     gate::{IncidentReason, InvalidityMarks, Occurrence, OperationGate},
@@ -28,6 +29,7 @@ mod capture;
 mod classify;
 #[cfg(test)]
 mod pg_tests;
+mod route;
 mod snapshot;
 
 pub(crate) use attempt::{scan_non_trading, InventoryReads, ReadFailure, Scanned, Triple};
