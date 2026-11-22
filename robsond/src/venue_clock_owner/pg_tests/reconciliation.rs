@@ -4,6 +4,8 @@
 //!
 //! One attempt: gate marks, pre, signing time, triple, operated subset, keyed
 //! post, gate marks, `qualify`; only a qualified attempt is classified.
+//! 8k-3b: the rig is also the production non-trading attempt's inventory
+//! port ([`RigReads`]); this installed-scope attempt stays until 8k-3e.
 use std::{future::Future, pin::Pin};
 
 use robson_exec::{
@@ -149,6 +151,93 @@ fn time_refusal(error: &TimeError) -> UnqualifiedReason {
 
 type Attempted = (detector::Attempt, Option<detector::Classification>, Option<AccountSeen>);
 
+/// The rig as the production attempt's inventory port (8k-3b): one loopback
+/// triple through the native owner per call, and the ACCOUNT receipt's
+/// admission mark kept for its revalidation after the post.
+pub(crate) struct RigReads<'a> {
+    rig: &'a mut ReconciliationRig,
+    port: u16,
+    mark: Option<inventory::AccountMark>,
+}
+
+impl RigReads<'_> {
+    /// A budget refusal before any handoff (no capacity, a pause) is
+    /// `Deferred`; everything else maps as this rig's own attempt maps it.
+    fn failure(error: &TimeError, sent: u64) -> detector::ReadFailure {
+        use detector::ReadFailure as F;
+        match error {
+            TimeError::Budget(_) if sent == 0 => F::Deferred,
+            TimeError::Native => F::Clock,
+            TimeError::Expired => F::Timeout,
+            TimeError::Payload => F::Malformed,
+            _ => F::Venue,
+        }
+    }
+}
+
+impl detector::InventoryReads for RigReads<'_> {
+    async fn triple(
+        &mut self,
+        deadline: Instant,
+    ) -> (u8, Result<detector::Triple, detector::ReadFailure>) {
+        let port = self.port;
+        let rig = &mut *self.rig;
+        let before = rig.budget.handoffs().unwrap_or(u64::MAX);
+        let read = async {
+            let owner = rig.owner.as_ref().ok_or(TimeError::Closing)?;
+            let signed = owner.commission_signing_time()?;
+            let claim = rig.clock.capture().map_err(|_| TimeError::Native)?;
+            owner.read_inventory_triple(&signed, claim, &mut rig.slot, port, deadline).await
+        }
+        .await;
+        let sent = rig.budget.handoffs().map_or(u64::MAX, |after| after.saturating_sub(before));
+        let handed = u8::try_from(sent).unwrap_or(u8::MAX);
+        let triple = match read {
+            Ok(triple) => triple,
+            Err(error) => return (handed, Err(Self::failure(&error, sent))),
+        };
+        let [account, orders, lists] = &triple.receipts;
+        let (
+            InventoryBody::Account(body),
+            InventoryBody::OpenOrders(open),
+            InventoryBody::OpenOrderLists(listed),
+        ) = (&account.body, &orders.body, &lists.body)
+        else {
+            return (handed, Err(detector::ReadFailure::Malformed));
+        };
+        let u2 = rig.owner.as_ref().and_then(|owner| {
+            let published = owner.state.lock().ok()?.published.as_ref().map(|p| (p.id, p.u2));
+            published.filter(|(id, _)| *id == account.sample).map(|(_, u2)| u2)
+        });
+        self.mark = Some(inventory::AccountMark {
+            generation: account.generation,
+            sample: account.sample,
+            raw: account.send,
+            handoff: account.handoff,
+        });
+        let receipt = detector::AccountReceipt {
+            sample: u2.map(|u2| (account.sample, u2)),
+            send: account.send,
+            receive: account.receive,
+            body: body.clone(),
+        };
+        let triple = detector::Triple {
+            account: receipt,
+            orders: open.clone(),
+            lists: listed.clone(),
+        };
+        (handed, Ok(triple))
+    }
+
+    fn still_valid(&self, _: &detector::AccountReceipt) -> bool {
+        let owner = self.rig.owner.as_ref();
+        self.mark
+            .as_ref()
+            .zip(owner)
+            .is_some_and(|(mark, owner)| owner.account_receipt(mark).is_ok())
+    }
+}
+
 impl ReconciliationRig {
     /// A fresh epoch and the fixture budget. It must run before any journal
     /// row exists; TIME waits for `ready`.
@@ -278,6 +367,20 @@ impl ReconciliationRig {
 
     pub(crate) fn clock_trip(&self) -> anyhow::Result<ClockTrip> {
         Ok(ClockTrip(Arc::clone(&self.owner.as_ref().context("open owner")?.state)))
+    }
+
+    /// The production non-trading attempt's port over `listener` (8k-3b).
+    pub(crate) fn reads(&mut self, listener: &Listener) -> RigReads<'_> {
+        RigReads {
+            rig: self,
+            port: listener.0.port,
+            mark: None,
+        }
+    }
+
+    /// Requests handed off so far on this rig's budget.
+    pub(crate) fn handoffs(&self) -> anyhow::Result<u64> {
+        self.budget.handoffs().map_err(|e| anyhow!("{e:?}"))
     }
 
     /// A gate on this epoch and its bound pending-execution owner.

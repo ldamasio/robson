@@ -672,3 +672,337 @@ mod pending {
         }
     }
 }
+
+// 8k-3b (PLAN-r2 §6.2, §6.3, §8): the production attempt and scan over a
+// scripted inventory port, on the non-trading statement in PostgreSQL.
+
+/// One scripted triple: a failure after `sent` handoffs, or an answer
+/// holding `btc` free whose ACCOUNT receipt is the `n`-th; `bump` moves the
+/// accounting version while the triple is in flight.
+enum Step {
+    Fail(u8, ReadFailure),
+    Answer { btc: &'static str, bump: bool },
+}
+
+struct Scripted<'a> {
+    pool: &'a PgPool,
+    f: &'a Fixture,
+    script: std::collections::VecDeque<Step>,
+    hold: Duration,
+    calls: u32,
+    handed_off: u32,
+    entered: Vec<std::time::Instant>,
+    arrived: Vec<std::time::Instant>,
+    /// Sessions of the scan's application name seen during each triple:
+    /// (connected, busy or in a transaction).
+    sessions: Vec<(i64, i64)>,
+    receipts: Vec<AccountReceipt>,
+    /// What the receipt's revalidation after the post answers.
+    valid: bool,
+}
+
+impl<'a> Scripted<'a> {
+    fn new(pool: &'a PgPool, f: &'a Fixture, script: Vec<Step>) -> Self {
+        Self {
+            pool,
+            f,
+            script: script.into(),
+            hold: Duration::ZERO,
+            calls: 0,
+            handed_off: 0,
+            entered: Vec::new(),
+            arrived: Vec::new(),
+            sessions: Vec::new(),
+            receipts: Vec::new(),
+            valid: true,
+        }
+    }
+
+    fn receipt(&self, btc: &str) -> Result<AccountReceipt> {
+        let n = i64::from(self.calls);
+        let domain = robson_exec::venue_clock::ClockDomain::new(Uuid::from_u128(0xb0), 0, 0)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let at = |second: i64, tick: i128| robson_exec::clock_records::RawClockCapture {
+            epoch: self.f.epoch,
+            wall_seconds: second,
+            wall_nanoseconds: 0,
+            domain,
+            before_ns: tick,
+            after_ns: tick + 1,
+        };
+        let body = serde_json::json!({
+            "uid": 4242, "canTrade": true, "accountType": "SPOT", "permissions": ["SPOT"],
+            "balances": [
+                {"asset": "USDT", "free": "1000", "locked": "0"},
+                {"asset": "BTC", "free": btc, "locked": "0"},
+            ],
+        });
+        Ok(AccountReceipt {
+            sample: Some((Uuid::from_u128(0x5a), 2)),
+            send: at(1_794_614_400 + 10 * n, i128::from(n) * 100),
+            receive: at(1_794_614_401 + 10 * n, i128::from(n) * 100 + 50),
+            body: serde_json::from_value(body)?,
+        })
+    }
+}
+
+impl InventoryReads for Scripted<'_> {
+    async fn triple(&mut self, _deadline: Instant) -> (u8, Result<Triple, ReadFailure>) {
+        self.calls += 1;
+        self.entered.push(std::time::Instant::now());
+        let sessions = sqlx::query_as("SELECT count(*), count(*) FILTER (WHERE state <> 'idle' OR xact_start IS NOT NULL) FROM pg_stat_activity WHERE application_name = '8k3b-scan'")
+            .fetch_one(self.pool)
+            .await
+            .expect("activity");
+        self.sessions.push(sessions);
+        tokio::time::sleep(self.hold).await;
+        let step = self.script.pop_front().expect("a scripted triple");
+        let (sent, answer) = match step {
+            Step::Fail(sent, failure) => (sent, Err(failure)),
+            Step::Answer { btc, bump } => {
+                if bump {
+                    self.f.bump(self.pool).await.expect("bump");
+                }
+                let receipt = self.receipt(btc).expect("receipt");
+                self.receipts.push(receipt.clone());
+                let triple = Triple {
+                    account: receipt,
+                    orders: Vec::new(),
+                    lists: Vec::new(),
+                };
+                (3, Ok(triple))
+            },
+        };
+        self.handed_off += u32::from(sent);
+        self.arrived.push(std::time::Instant::now());
+        (sent, answer)
+    }
+
+    fn still_valid(&self, _: &AccountReceipt) -> bool {
+        self.valid
+    }
+}
+
+/// The scan's own sessions are recognizable in `pg_stat_activity`.
+fn scan_options(options: &PgConnectOptions) -> PgConnectOptions {
+    options.clone().application_name("8k3b-scan")
+}
+
+/// B3: at most three attempts, whatever the port keeps answering.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_scan_makes_at_most_three_attempts(pool: PgPool) -> Result<()> {
+    let f = Fixture::new(&pool).await?;
+    let gate = gate(&f.venue);
+    let failures = (0..5).map(|_| Step::Fail(1, ReadFailure::Venue)).collect();
+    let mut reads = Scripted::new(&pool, &f, failures);
+    let s = scan_non_trading(&mut reads, &gate, &pool.connect_options(), &f.scope()).await;
+    let s = s.context("one attempt")?;
+    ensure!((s.outcome.attempts, reads.calls) == (3, 3), "{s:?}");
+    ensure!(s.verdict == BaseVerdict::Unqualified(UnqualifiedReason::Venue) && s.cash.is_none());
+    ensure!(
+        s.outcome.cost == ScanCost { sql: 3, http: 3, weight: 60 },
+        "{:?}",
+        s.outcome.cost
+    );
+    Ok(())
+}
+
+/// B2: every attempt's prefix is counted and nothing resets the counters;
+/// SQL and connections by proxy, handoffs by the port, equal the model; every
+/// connection the scan opened is closed when it returns.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn scan_cost_counts_all_three_attempts_and_cleanup(pool: PgPool) -> Result<()> {
+    let f = Fixture::new(&pool).await?;
+    let gate = gate(&f.venue);
+    let (proxy, options) = proxied(&pool).await?;
+    let script = vec![
+        Step::Fail(2, ReadFailure::Venue),
+        Step::Fail(1, ReadFailure::Clock),
+        Step::Answer { btc: "0", bump: false },
+    ];
+    let mut reads = Scripted::new(&pool, &f, script);
+    let s = scan_non_trading(&mut reads, &gate, &options, &f.scope()).await;
+    let s = s.context("one attempt")?;
+    // 1 + 1 + 2 SQL, 2 + 1 + 3 requests, 26 + 20 + 32 weight.
+    ensure!(
+        s.outcome.cost == ScanCost { sql: 4, http: 6, weight: 78 },
+        "{:?}",
+        s.outcome.cost
+    );
+    let stats = proxy.stats();
+    ensure!(
+        (stats.statements, stats.connections, reads.handoffs()) == (4, 4, 6),
+        "{stats:?}"
+    );
+    ensure!(matches!(s.verdict, BaseVerdict::Clean { .. }) && s.cash.is_some(), "{s:?}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while proxy.closed_relays() < 4 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("every scan connection closed")?;
+    println!("SCAN_8K3B case=cost attempts=3 sql=4 http=6 weight=78 connections_closed=4");
+    Ok(())
+}
+
+impl Scripted<'_> {
+    fn handoffs(&self) -> u64 {
+        u64::from(self.handed_off)
+    }
+}
+
+/// B4: a read refused before any send ends the scan: one pre statement, no
+/// request, no weight. The same refusal after a handoff is a venue failure
+/// and retries.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_read_refused_before_any_send_ends_the_scan(pool: PgPool) -> Result<()> {
+    let f = Fixture::new(&pool).await?;
+    let gate = gate(&f.venue);
+    let (proxy, options) = proxied(&pool).await?;
+    let deferred = (0..3).map(|_| Step::Fail(0, ReadFailure::Deferred)).collect();
+    let mut reads = Scripted::new(&pool, &f, deferred);
+    let s = scan_non_trading(&mut reads, &gate, &options, &f.scope()).await;
+    let s = s.context("one attempt")?;
+    ensure!(s.verdict == BaseVerdict::Unqualified(UnqualifiedReason::Deferred), "{s:?}");
+    ensure!(
+        (s.outcome.attempts, reads.calls, proxy.stats().statements) == (1, 1, 1),
+        "{s:?}"
+    );
+    ensure!(
+        s.outcome.cost == ScanCost { sql: 1, http: 0, weight: 0 },
+        "{:?}",
+        s.outcome.cost
+    );
+    let sent = vec![Step::Fail(1, ReadFailure::Deferred), Step::Answer {
+        btc: "0",
+        bump: false,
+    }];
+    let mut reads = Scripted::new(&pool, &f, sent);
+    let s = scan_non_trading(&mut reads, &gate, &options, &f.scope()).await;
+    let s = s.context("one attempt")?;
+    ensure!(
+        s.outcome.attempts == 2 && matches!(s.verdict, BaseVerdict::Clean { .. }),
+        "{s:?}"
+    );
+    Ok(())
+}
+
+/// B1: only the last attempt is classified, on its own bodies; an
+/// unqualified last attempt concludes nothing, whatever came before.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn an_unqualified_last_attempt_concludes_nothing(pool: PgPool) -> Result<()> {
+    let f = Fixture::new(&pool).await?;
+    let gate = gate(&f.venue);
+    let options = pool.connect_options();
+    // Three full triples, each with a ledger write in flight.
+    let moved = (0..3).map(|_| Step::Answer { btc: "0", bump: true }).collect();
+    let mut reads = Scripted::new(&pool, &f, moved);
+    let s = scan_non_trading(&mut reads, &gate, &options, &f.scope()).await;
+    let s = s.context("one attempt")?;
+    ensure!(
+        s.verdict == BaseVerdict::Unqualified(UnqualifiedReason::VersionChanged),
+        "{s:?}"
+    );
+    ensure!(s.cash.is_none() && s.outcome.attempts == 3, "{s:?}");
+    // An excess seen by a discarded attempt never reaches the verdict of the
+    // qualified one, which concludes on its own receipt.
+    let script = vec![Step::Answer { btc: "0.5", bump: true }, Step::Answer {
+        btc: "0",
+        bump: false,
+    }];
+    let mut reads = Scripted::new(&pool, &f, script);
+    let s = scan_non_trading(&mut reads, &gate, &options, &f.scope()).await;
+    let s = s.context("one attempt")?;
+    let last = AccountReading::from_receipt(&reads.receipts[1], &f.scope())
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    ensure!(s.verdict == BaseVerdict::Clean { interval: last.interval }, "{s:?}");
+    let cash = s.cash.context("the writer's input")?;
+    ensure!(
+        (cash.version, &cash.verdict) == (f.version(&pool).await?, &s.verdict),
+        "{cash:?}"
+    );
+    Ok(())
+}
+
+/// The ACCOUNT receipt's revalidation after the post refuses: a receipt
+/// that no longer validates never qualifies, and is retried like any clock
+/// refusal.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_receipt_failing_revalidation_never_qualifies(pool: PgPool) -> Result<()> {
+    let f = Fixture::new(&pool).await?;
+    let gate = gate(&f.venue);
+    let answers = (0..3).map(|_| Step::Answer { btc: "0", bump: false }).collect();
+    let mut reads = Scripted::new(&pool, &f, answers);
+    reads.valid = false;
+    let s = scan_non_trading(&mut reads, &gate, &pool.connect_options(), &f.scope()).await;
+    let s = s.context("one attempt")?;
+    ensure!(s.verdict == BaseVerdict::Unqualified(UnqualifiedReason::Clock), "{s:?}");
+    ensure!(s.cash.is_none() && s.outcome.attempts == 3, "{s:?}");
+    ensure!(
+        s.outcome.cost == ScanCost { sql: 6, http: 9, weight: 96 },
+        "{:?}",
+        s.outcome.cost
+    );
+    Ok(())
+}
+
+/// B5: the freshness floor is taken before the ACCOUNT request, so the
+/// writer's 60 s bound counts from before the request, never from arrival.
+/// The ACCOUNT response is held 300 ms here.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn publication_freshness_counts_from_before_the_account_request(pool: PgPool) -> Result<()> {
+    let f = Fixture::new(&pool).await?;
+    let gate = gate(&f.venue);
+    let mut reads = Scripted::new(&pool, &f, vec![Step::Answer { btc: "0", bump: false }]);
+    reads.hold = Duration::from_millis(300);
+    let s = scan_non_trading(&mut reads, &gate, &pool.connect_options(), &f.scope()).await;
+    let cash = s.context("one attempt")?.cash.context("the writer's input")?;
+    let (entered, arrived) = (reads.entered[0], reads.arrived[0]);
+    ensure!(cash.received <= entered, "the floor precedes the request");
+    ensure!(arrived.duration_since(cash.received) >= Duration::from_millis(300));
+    ensure!(cash.received.elapsed() > arrived.elapsed(), "age counted from the floor");
+    Ok(())
+}
+
+/// Nothing is held across the inventory: while each triple is in flight, no
+/// session of the scan is busy or inside a transaction; once the scan has
+/// returned, none of its sessions remains.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn the_scan_holds_nothing_across_the_inventory(pool: PgPool) -> Result<()> {
+    let f = Fixture::new(&pool).await?;
+    let gate = gate(&f.venue);
+    let options = scan_options(&pool.connect_options());
+    let script = vec![Step::Answer { btc: "0", bump: true }, Step::Answer {
+        btc: "0",
+        bump: false,
+    }];
+    let mut reads = Scripted::new(&pool, &f, script);
+    reads.hold = Duration::from_millis(200);
+    let s = scan_non_trading(&mut reads, &gate, &options, &f.scope()).await;
+    ensure!(s.context("one attempt")?.outcome.attempts == 2);
+    ensure!(reads.sessions.iter().all(|(_, busy)| *busy == 0), "{:?}", reads.sessions);
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let open: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = '8k3b-scan'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            if open == 0 {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    closed.await.context("every scan session closed")??;
+    println!("SCAN_8K3B case=holds-nothing sessions_during_triples={:?}", reads.sessions);
+    Ok(())
+}
