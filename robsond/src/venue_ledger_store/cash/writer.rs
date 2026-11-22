@@ -174,18 +174,25 @@ pub(crate) struct OpenDiscrepancy {
     pub(crate) clean_max: Option<Decimal>,
 }
 
+impl OpenDiscrepancy {
+    /// A clean sighting of its direction survives (PLAN-r4 §6.10); without
+    /// one it is void by late evidence.
+    pub(crate) fn surviving(&self) -> bool {
+        match self.missing {
+            true => self.clean_min.is_some_and(|min| min < -TOLERANCE),
+            false => self.clean_max.is_some_and(|max| max > TOLERANCE),
+        }
+    }
+}
+
 /// Step 5's branch table (PLAN-r4 §6.4): whether the version moves, then at
 /// most two writes. An open discrepancy with no surviving clean sighting of
 /// its direction is void by late evidence and the observation is judged as
 /// with none open. Missing cash never writes a checkpoint, a clean
 /// observation never voids it, and only an insert opens one, with the bump.
 pub(crate) fn plan(open: Option<OpenDiscrepancy>, delta: Decimal) -> (bool, Vec<Write>) {
-    let evidence = |o: &OpenDiscrepancy| match o.missing {
-        true => o.clean_min.is_some_and(|min| min < -TOLERANCE),
-        false => o.clean_max.is_some_and(|max| max > TOLERANCE),
-    };
     let (late, open) = match open {
-        Some(o) if !evidence(&o) => (Some(Write::Void(o.id, "late_evidence")), None),
+        Some(o) if !o.surviving() => (Some(Write::Void(o.id, "late_evidence")), None),
         open => (None, open),
     };
     let clean = delta.abs() <= TOLERANCE;

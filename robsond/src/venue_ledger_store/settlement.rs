@@ -64,7 +64,8 @@ pub struct SettlementBarrier {
     pub unsettled: UnsettledLegs,
     /// An unsettled order's, intent's or leg's widened life meets the month.
     pub life_meets_month: bool,
-    /// `accounting_invalidations` rows of the month.
+    /// `accounting_invalidations` rows of the month, and recovery
+    /// re-anchors whose uncertain span holds it (8l-5b).
     pub invalidations: u64,
     /// The month starts after `now`: nothing proves it yet.
     pub not_begun: bool,

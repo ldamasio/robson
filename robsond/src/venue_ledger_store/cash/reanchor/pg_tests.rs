@@ -72,6 +72,15 @@ impl Fixture {
         Ok(Self { tenant, scope, epoch, sample })
     }
 
+    /// An observed anchor of `quote` at `as_of`, on a clean 10 s hull.
+    async fn anchor(&self, pool: &PgPool, as_of: DateTime<Utc>, quote: Decimal) -> Result<()> {
+        sqlx::query("INSERT INTO cash_anchors (anchor_id,tenant_id,venue_id,kind,quote,as_of,send_at,receive_at,u_ns,sample_id,epoch_id,interval_start,interval_end,depends_start,depends_end)
+            VALUES ($1,$2,'binance:spot','reanchor',$3,$4,$4+interval '150 ms',$4+interval '350 ms',150000000,$5,$6,$4,$4+interval '500 ms',$4-interval '10 s',$4+interval '500 ms')")
+            .bind(Uuid::now_v7()).bind(self.tenant).bind(quote).bind(as_of).bind(self.sample).bind(self.epoch)
+            .execute(pool).await?;
+        Ok(())
+    }
+
     async fn version(&self, pool: &PgPool) -> Result<i64> {
         Ok(sqlx::query_scalar("SELECT version FROM accounting_state WHERE tenant_id=$1")
             .bind(self.tenant)
@@ -308,10 +317,25 @@ async fn o1_and_o2_qualify_on_two_statements(pool: PgPool) -> Result<()> {
         ensure!(o.reading.u_ns == 150_000_000 && o.reading.sample_id == f.sample);
         ensure!(o.reading.epoch_id == f.epoch && o.total == dec!(1000.005));
     }
+    // The whole command (8l-5b): with no observed anchor before O1 the
+    // transaction refuses and writes nothing; with one, two capture
+    // statements and the six of the transaction (no installed generation, so
+    // no CAS) on three connections, nothing else.
     let refused = reanchor.run("operator@example.test", "withdrew 100").await;
-    ensure!(refused == Err(ReanchorRefusal::Uncommitted), "{refused:?}");
+    ensure!(refused == Err(ReanchorRefusal::NoAnchor), "{refused:?}");
     ensure!(f.version(&pool).await? == 3);
+    f.anchor(&pool, at(-60_000), dec!(1000)).await?;
+    let (reanchor, _) = service(&through, &f, agreeing(&f, "1000.005"), vec![]);
+    let start = proxy.stats();
+    let done = reanchor.run("operator@example.test", "no movement").await;
+    let end = proxy.stats();
+    let done = done.map_err(|r| anyhow::anyhow!("{r:?}"))?;
+    ensure!((done.mode, done.version, done.flows) == ("attested", 4, 0), "{done:?}");
+    ensure!(done.delta == Some(dec!(0.005)) && f.version(&pool).await? == 4);
+    let counted = (end.statements - start.statements, end.connections - start.connections);
+    ensure!(counted == (8, 3), "{counted:?}");
     println!("REANCHOR_PRE_READS statements=2 connections=2 trace={}", trace.len());
+    println!("REANCHOR_COMMAND_COUNTS statements={} connections={}", counted.0, counted.1);
     Ok(())
 }
 

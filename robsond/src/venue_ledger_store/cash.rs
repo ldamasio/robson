@@ -127,6 +127,7 @@ pub async fn read_cash_state(
         effective_minimum: row.try_get("effective_minimum").map_err(backend)?,
     };
     crate::metrics::observe_cash_impaired(state.impaired_now);
+    crate::metrics::observe_withdrawal_fence(query.venue.as_str(), state.withdrawal_fence);
     Ok(state)
 }
 

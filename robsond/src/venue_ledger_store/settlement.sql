@@ -16,7 +16,9 @@
 -- leg's own [created_at, closed_at or now]. No life ends before it starts. A life meets the half-open month
 -- [first, next) when it starts before next and ends at or after first, so a month is valid again only once
 -- every such life ends strictly before its first instant. A month is also invalid with an
--- accounting_invalidations row for it. A venue without its accounting row has no answer.
+-- accounting_invalidations row for it, or inside a recovery re-anchor's span (operator decision Q2 = R, 8l-5b): from
+-- the UTC month of the anchor it rests on (the latest clean-hull one) through the month of its own anchor. A venue
+-- without its accounting row has no answer.
 WITH legs AS MATERIALIZED (
     SELECT l.position_id, l.created_at, l.closed_at,
            l.recovery_state IS NOT DISTINCT FROM 'entry_unknown' AS entry_unknown,
@@ -91,6 +93,12 @@ SELECT count(*) FILTER (WHERE unknown_order OR unrowed_intent OR incomplete_fill
                  AND greatest(coalesce(lives.ended, $4), lives.born) + interval '2 seconds'
                      >= $3::date::timestamp AT TIME ZONE 'UTC') AS life_meets_month,
        (SELECT count(*) FROM public.accounting_invalidations x
-        WHERE (x.tenant_id, x.venue_id, x.month) = ($1, $2, $3::date)) AS invalidations,
+        WHERE (x.tenant_id, x.venue_id, x.month) = ($1, $2, $3::date))
+       + (SELECT count(*) FROM public.cash_reanchors r
+          JOIN public.cash_anchors o ON o.anchor_id = r.old_anchor_id
+          JOIN public.cash_anchors n ON n.anchor_id = r.new_anchor_id
+          WHERE (r.tenant_id, r.venue_id, r.mode) = ($1, $2, 'recovery')
+            AND $3::date BETWEEN date_trunc('month', o.as_of AT TIME ZONE 'UTC')::date
+                             AND date_trunc('month', n.as_of AT TIME ZONE 'UTC')::date) AS invalidations,
        EXISTS (SELECT 1 FROM public.accounting_state s WHERE (s.tenant_id, s.venue_id) = ($1, $2)) AS venue_known
 FROM verdict

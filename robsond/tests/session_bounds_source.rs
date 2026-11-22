@@ -981,7 +981,15 @@ fn package5a_owners_stay_dormant_or_bounded() {
         "dust_ledger",
         "accounting_invalidations",
     ];
-    let named: BTreeSet<String> = tables.iter().flat_map(|table| naming(table)).collect();
+    // 8l-5b's metric robsond_cash_reanchors_total names a table only inside
+    // its own name: metrics.rs holds no statement.
+    let metrics = source("metrics.rs").replace("robsond_cash_reanchors_total", "");
+    assert!(tables.iter().all(|table| !metrics.contains(table)));
+    let named: BTreeSet<String> = tables
+        .iter()
+        .flat_map(|table| naming(table))
+        .filter(|file| file != "metrics.rs")
+        .collect();
     let cash_sql = [
         "venue_ledger_store/cash/expected.sql",
         "venue_ledger_store/cash/discrepancy.sql",
@@ -992,14 +1000,22 @@ fn package5a_owners_stay_dormant_or_bounded() {
         "venue_ledger_store/cash/context.sql",
         "venue_ledger_store/cash/writer.rs",
     ];
+    // 8l-5b's re-anchor: its context read and its one write statement (the
+    // anchor, the re-anchor row, its flows, the checkpoint and the
+    // discrepancy's closure; PLAN-r4 §6.12), which has no production caller.
+    let reanchor_sql = [
+        "venue_ledger_store/cash/reanchor/context.sql",
+        "venue_ledger_store/cash/reanchor/write.sql",
+    ];
     let expected: BTreeSet<String> = cash_sql
         .iter()
         .chain([&barrier, &trades])
         .chain(&writer)
+        .chain(&reanchor_sql)
         .map(|file| file.to_string())
         .collect();
     assert_eq!(named, expected);
-    for file in cash_sql.iter().chain([&barrier, &writer[0]]) {
+    for file in cash_sql.iter().chain([&barrier, &writer[0], &reanchor_sql[0]]) {
         let text = source(file);
         assert!(["INSERT", "UPDATE", "DELETE"].iter().all(|w| !text.contains(w)), "{file}");
     }
@@ -1015,8 +1031,10 @@ fn package5a_owners_stay_dormant_or_bounded() {
     // endpoint takes it as a router extension, which the 5a composition adds
     // with PS-5b's ACCOUNT reads.
     let reanchor = "venue_ledger_store/cash/reanchor.rs";
+    let commit = "venue_ledger_store/cash/reanchor/commit.rs";
     assert_eq!(outside("CashReanchor", "venue_ledger_store/cash"), only("api/cash_reanchor.rs"));
-    assert_eq!(naming("CashReanchor {"), only(reanchor));
+    let service: BTreeSet<String> = [reanchor, commit].map(String::from).into();
+    assert_eq!(naming("CashReanchor {"), service);
     // 8l-2: the barrier runs on its caller's connection, and neither it nor
     // the gate's invalidity marks has a production caller yet (8l-3, 8l-7,
     // 8l-8, 8n).
@@ -1024,10 +1042,14 @@ fn package5a_owners_stay_dormant_or_bounded() {
     // 8l-3b's context read embeds the barrier (one statement, PLAN-r4 §6.4)
     // and its final qualification reads the marks; the writer is dormant.
     // 8k-3a's dormant capture reads them before pre and after post.
+    // 8l-5b's re-anchor transaction embeds it too and reads the marks again
+    // under the row (PLAN-r4 §6.12).
     let writer_rs = only("venue_ledger_store/cash/writer.rs");
-    assert_eq!(outside("SETTLEMENT_BARRIER", "venue_ledger_store/settlement.rs"), writer_rs);
+    let barrier_users: BTreeSet<String> =
+        writer_rs.iter().cloned().chain([commit.to_string()]).collect();
+    assert_eq!(outside("SETTLEMENT_BARRIER", "venue_ledger_store/settlement.rs"), barrier_users);
     let capture = "balance_reconciliation/capture.rs".to_string();
-    let marks = writer_rs.iter().cloned().chain([capture]).collect::<BTreeSet<_>>();
+    let marks = barrier_users.iter().cloned().chain([capture]).collect::<BTreeSet<_>>();
     assert_eq!(naming("invalidity_marks"), marks);
     assert_eq!(naming(".pending_evidence("), none);
     // 8l-4a: its writers run on the journal's and the clear's bounded

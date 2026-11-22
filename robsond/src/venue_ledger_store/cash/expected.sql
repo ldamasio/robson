@@ -15,7 +15,7 @@
 -- (R) a re-anchor R has O.as_of < T <= A_R.as_of, O the anchor it replaced and A_R its own, and its dating copy, its
 --     anchor's hull or a sighting it used (its resolved discrepancy's, less excluded_sighting_seqs) is dirty.
 -- Both spans are right-closed, as E selects: the anchor at as_of = T is not yet used, and R's flows (dated at or
--- after O.as_of) still count at A_R.as_of.
+-- after O.as_of) still count at A_R.as_of. anchor_dirty is (A) alone: A's own hull is dirty (8l-5b's recovery).
 WITH anchor AS (
     SELECT a.anchor_id, a.as_of, a.quote,
            EXISTS (SELECT 1 FROM public.order_fills f
@@ -64,6 +64,7 @@ WITH anchor AS (
     ) x
 )
 SELECT a.anchor_id, a.as_of AS anchor_as_of, coalesce(a.impaired, false) OR r.impaired AS impaired,
+       coalesce(a.impaired, false) AS anchor_dirty,
        CASE WHEN NOT (coalesce(a.impaired, false) OR r.impaired) AND f.odd = 0
                  AND ledger_amount_fits(a.quote + f.total)
             THEN a.quote + f.total END AS expected

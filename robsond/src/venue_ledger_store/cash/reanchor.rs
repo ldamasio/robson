@@ -6,10 +6,12 @@
 //! one transaction holding the accounting rows (8l-5b).
 //!
 //! 8l-5a: the identity, the single flight, the at-rest and timing refusals
-//! before the transaction, and O1/O2. Inert: no production composition. The
-//! venue side is a seam ([`ReanchorVenue`]) that PS-5b's ACCOUNT and TIME
-//! read path fills, and the daemon adds the service to the router at the 5a
-//! composition; without it the endpoint answers 503.
+//! before the transaction, and O1/O2; 8l-5b ([`commit`]): the transaction,
+//! its flows and continuity, and the recovery of an impaired anchor (operator
+//! decision Q2 = R). Inert: no production composition. The venue side is a
+//! seam ([`ReanchorVenue`]) that PS-5b's ACCOUNT and TIME read path fills,
+//! and the daemon adds the service to the router at the 5a composition;
+//! without it the endpoint answers 503.
 use std::{sync::Arc, time::Duration};
 
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
@@ -81,8 +83,34 @@ pub(crate) enum ReanchorRefusal {
     Disagree,
     /// A UTC month boundary lies within 1 h of [O1's cut, O2's end].
     NearBoundary,
-    /// The observations qualified; the transaction is 8l-5b's.
-    Uncommitted,
+    /// The transaction's bump did not land on `v₀ + 1`.
+    VersionMoved,
+    /// The installed order-set generation refused its CAS (PLAN-r4 §6.5).
+    StaleGeneration,
+    /// An unsettled leg, an open transition, an unknown or live non-stop
+    /// order, or an uncertain intent.
+    NotAtRest,
+    /// The observations are not of the tenant's live epoch or this process.
+    Epoch,
+    /// A booked fill lies in [O1's cut, O2's end].
+    DirtyHull,
+    /// No observed anchor precedes O1 (the cutover's is 8m's).
+    NoAnchor,
+    /// An anchor lies between O1's and O2's cuts.
+    AnchorOverlap,
+    /// `E_old` is impaired but not by its own anchor's dirty hull.
+    ImpairedChain,
+    /// `E_old` has no value (an unexpected commission asset or a sum that
+    /// does not fit), or an amount is not exactly representable.
+    Undefined,
+    /// The invalidity generation moved, or evidence is pending.
+    Marks,
+    /// Publication more than 60 s after O1's capture began.
+    Stale,
+    /// COMMIT was sent and no answer came: a retry re-reads.
+    Uncertain,
+    /// The database refused or failed; nothing committed.
+    Unavailable,
 }
 
 /// One of O1 and O2: its reading, the stored microsecond times and the
@@ -147,14 +175,21 @@ impl CashReanchor {
         subject: &str,
         reason: &str,
     ) -> Result<Reanchored, ReanchorRefusal> {
-        // The guard is held for the whole arm. 8l-5b's transaction takes the
-        // evidence.
+        // The guard is held for the whole arm.
         let result = match self.flight.try_lock() {
             Err(_) => Err(ReanchorRefusal::Busy),
             Ok(_flight) if self.read_only => Err(ReanchorRefusal::ReadOnly),
-            Ok(_flight) => self.observe().await.and(Err(ReanchorRefusal::Uncommitted)),
+            Ok(_flight) => match self.observe().await {
+                Ok(evidence) => self.commit(subject, reason, &evidence).await,
+                Err(refusal) => Err(refusal),
+            },
         };
         if let Err(refusal) = &result {
+            let outcome = match refusal {
+                ReanchorRefusal::Uncertain => "uncertain",
+                _ => "refused",
+            };
+            crate::metrics::observe_cash_reanchor(outcome);
             tracing::warn!(?refusal, subject, reason, "cash re-anchor refused");
         }
         result
@@ -251,5 +286,6 @@ pub(crate) fn near_boundary(cut: DateTime<Utc>, end: DateTime<Utc>) -> bool {
     before.zip(after).is_none_or(|(before, after)| month(before) != month(after))
 }
 
+mod commit;
 #[cfg(test)]
 mod pg_tests;
