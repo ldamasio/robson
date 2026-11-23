@@ -25,7 +25,7 @@ BEGIN
         CONSTRAINT activation_bases_ids CHECK (
             tenant_id <> '00000000-0000-0000-0000-000000000000'::UUID
             AND cutover_id <> '00000000-0000-0000-0000-000000000000'::UUID),
-        CONSTRAINT activation_bases_month CHECK (EXTRACT(DAY FROM month) = 1),
+        CONSTRAINT activation_bases_month CHECK ((EXTRACT(DAY FROM month) = 1) IS TRUE),
         CONSTRAINT activation_bases_amounts CHECK (
             ledger_amount_fits(previous_basis) AND ledger_amount_fits(quote_total) AND ledger_amount_fits(basis)
             AND previous_basis >= 0 AND quote_total >= 0),

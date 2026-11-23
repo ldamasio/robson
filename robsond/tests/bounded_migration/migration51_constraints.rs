@@ -1523,6 +1523,10 @@ async fn activation_basis_moves_forward_once(pool: PgPool) -> Result<()> {
         (with(&row, "cutover_id", json!(NIL)), "23514", "activation_bases_ids"),
         (with(&row, "tenant_id", json!(NIL)), "23514", "activation_bases_ids"),
         (with(&row, "month", json!("2026-11-02")), "23514", "activation_bases_month"),
+        // An infinite month has no day (EXTRACT is NULL): refused, not passed
+        // as unknown, even pending with no as_of to bound it.
+        (with(&row, "month", json!("infinity")), "23514", "activation_bases_month"),
+        (with(&row, "month", json!("-infinity")), "23514", "activation_bases_month"),
         (
             set(&row, &[("previous_basis", json!("-1")), ("basis", json!("-1"))]),
             "23514",
