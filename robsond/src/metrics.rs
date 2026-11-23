@@ -73,6 +73,16 @@
 //!   `withdrawal` or `contribution` (ADR-0056 step 8l-5)
 //! - `robsond_withdrawal_fence{venue}` — 1 while the latest cash read found an
 //!   attested withdrawal in the current UTC month (ADR-0056 step 8l-5)
+//! - the balance scan's route (ADR-0056 step 8k-3c; registered with the route's
+//!   `SCAN_METRICS`, every finite series at 0):
+//!   `robsond_balance_scans_total{outcome}`,
+//!   `robsond_balance_scan_refusals_total{stage, reason}`,
+//!   `robsond_balance_scan_attempts_total`,
+//!   `robsond_balance_scan_weight_total`,
+//!   `robsond_balance_scan_last_concluded_timestamp_seconds`,
+//!   `robsond_cash_observation_retries_total`, `robsond_spot_btc_conflict`,
+//!   `robsond_spot_btc_conflicts_total{finding}` and
+//!   `robsond_balance_recovery_withheld_total{kind}`
 
 use std::sync::LazyLock;
 

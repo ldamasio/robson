@@ -1501,3 +1501,192 @@ async fn foreign_lock_restart(pool: &PgPool, tenant: Uuid, rig: &ReconciliationR
     println!("RECON_8K1B case=restart fenced_before_scan=true restored_count=2 release=AwaitsBalanceRelease");
     Ok(())
 }
+
+/// 8k-3b (PLAN-r2 §8): the production non-trading attempt and scan over the
+/// rig's port (the loopback listener through the native owner): Clean with
+/// the writer's input drawn from that very ACCOUNT receipt, each
+/// fence-and-page finding an empty ledger can show, an unlinked BTCUSDT
+/// order, an unrelated list counted only, and the scope's refusals at pre.
+/// Every scan's SQL, handoffs and physical connections equal the cost model.
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn non_trading_scan_over_the_rig(pool: PgPool) -> Result<()> {
+    setup_tables(&pool).await?;
+    let tenant = Uuid::now_v7();
+    sqlx::query("INSERT INTO accounting_state (tenant_id,venue_id,budget_model) VALUES ($1,'binance:spot','net_from_start_non_expanding_v1')")
+        .bind(tenant).execute(&pool).await?;
+    let mut rig = ReconciliationRig::open(&pool, tenant).await?;
+    let cases = Box::pin(non_trading_cases(&pool, tenant, &mut rig)).await;
+    let closed = rig.close().await;
+    cases?;
+    closed?;
+    Ok(())
+}
+
+/// One production non-trading scan over `answers`, and what the proxy, the
+/// budget and the listener measured: SQL, handoffs, connections.
+async fn nt_scan(
+    rig: &mut ReconciliationRig,
+    ctx: &Ctx,
+    scope: &crate::balance_reconciliation::ScanScope<'_>,
+    attempts: usize,
+    answers: &[[String; 3]],
+) -> Result<(crate::balance_reconciliation::Scanned, [u64; 3])> {
+    rig.settle(attempts).await?;
+    let listener = Listener::triples(Instant::now() + Duration::from_secs(60), answers).await?;
+    let (sql, handoffs, connections) =
+        (ctx.proxy.stats().statements, rig.handoffs()?, listener.connections());
+    let gate = ctx.journal.gate();
+    let scanned = Box::pin(crate::balance_reconciliation::scan_non_trading(
+        &mut rig.reads(&listener),
+        gate,
+        &ctx.options,
+        scope,
+    ))
+    .await;
+    let measured = [
+        ctx.proxy.stats().statements - sql,
+        rig.handoffs()? - handoffs,
+        u64::try_from(listener.connections() - connections)?,
+    ];
+    listener.finish(Instant::now() + Duration::from_secs(5)).await?;
+    Ok((scanned.context("one attempt")?, measured))
+}
+
+fn nt_findings(
+    case: &str,
+    s: &crate::balance_reconciliation::Scanned,
+    expected: &[Finding],
+) -> Result<()> {
+    ensure!(
+        matches!(&s.verdict, BaseVerdict::Discrepancy { findings, .. } if findings == expected)
+            && s.cash.is_none(),
+        "{case}: {:?}",
+        s.verdict
+    );
+    Ok(())
+}
+
+fn nt_costs(
+    case: &str,
+    s: &crate::balance_reconciliation::Scanned,
+    measured: [u64; 3],
+    model: (u8, u32, u32, u32),
+) -> Result<()> {
+    let (attempts, sql, http, weight) = model;
+    ensure!(
+        s.outcome.attempts == attempts
+            && s.outcome.cost == ScanCost { sql, http, weight }
+            && measured == [u64::from(sql), u64::from(http), u64::from(http)],
+        "{case}: attempts {} cost {:?} measured {measured:?}",
+        s.outcome.attempts,
+        s.outcome.cost
+    );
+    println!("SCAN_8K3B case={case} attempts={attempts} sql={sql} http={http} weight={weight}");
+    Ok(())
+}
+
+async fn non_trading_cases(pool: &PgPool, tenant: Uuid, rig: &mut ReconciliationRig) -> Result<()> {
+    use crate::balance_reconciliation::ScanScope;
+    const NT: &str = "non-trading";
+    sqlx::query("INSERT INTO venue_accounts (venue_id,account_scope,tenant_id,uid,bound_at,cutover_id) VALUES ('binance:spot',$1,$2,$3,now(),$4)")
+        .bind(NT).bind(tenant).bind(LOOPBACK_UID.to_string()).bind(Uuid::now_v7())
+        .execute(pool).await?;
+    rig.ready().await?;
+    let ctx = Ctx::new(pool, rig).await?;
+    let epoch = rig.start.epoch.epoch_id;
+    let expected = ExpectedGeneration {
+        tenant_id: tenant,
+        venue: &ctx.venue,
+        account_scope: NT,
+        generation_id: Uuid::nil(),
+        process_epoch: epoch,
+        source_audit_id: Uuid::nil(),
+    };
+    let bound = DetectorScope {
+        expected,
+        uid: &ctx.uid,
+        operated: SYMBOL,
+        base_asset: "BTC",
+    };
+    let scope = ScanScope { detector: bound, quote_asset: "USDT" };
+    let stranger = ScanScope {
+        detector: DetectorScope { uid: "4242", ..bound },
+        quote_asset: "USDT",
+    };
+    let version: i64 =
+        sqlx::query_scalar("SELECT version FROM accounting_state WHERE tenant_id=$1")
+            .bind(tenant)
+            .fetch_one(pool)
+            .await?;
+    let wallet = |free: Decimal, locked: Decimal| {
+        account(&[
+            ("USDT", dec!(1000), dec!(0)),
+            ("ETH", dec!(2), dec!(1)),
+            ("BTC", free, locked),
+        ])
+    };
+    let zero = Decimal::ZERO;
+
+    // Clean: the writer's input from this very ACCOUNT receipt.
+    let (s, m) = nt_scan(rig, &ctx, &scope, 1, &[triple(wallet(zero, zero), &[], &[])]).await?;
+    nt_costs("nt-clean", &s, m, (1, 2, 3, 32))?;
+    let cash = s.cash.as_ref().context("nt-clean: the writer's input")?;
+    ensure!(
+        matches!(s.verdict, BaseVerdict::Clean { .. }) && cash.verdict == s.verdict,
+        "{s:?}"
+    );
+    ensure!(
+        (cash.version, cash.quote_total, cash.epoch_id) == (version, dec!(1000), epoch)
+            && cash.marks == ctx.journal.gate().invalidity_marks(),
+        "nt-clean: {cash:?}"
+    );
+
+    // Each fence-and-page finding a non-trading (empty) ledger can show.
+    let excess = triple(wallet(dec!(0.5), zero), &[], &[]);
+    let (s, m) = nt_scan(rig, &ctx, &scope, 1, &[excess]).await?;
+    nt_costs("nt-excess", &s, m, (1, 2, 3, 32))?;
+    nt_findings("nt-excess", &s, &[Finding::BaseExcess { holdings: dec!(0.5), upper: zero }])?;
+    let foreign = triple(wallet(zero, dec!(0.5)), &[], &[]);
+    let (s, m) = nt_scan(rig, &ctx, &scope, 1, &[foreign]).await?;
+    nt_costs("nt-foreign-lock", &s, m, (1, 2, 3, 32))?;
+    nt_findings("nt-foreign-lock", &s, &[
+        Finding::BaseExcess { holdings: dec!(0.5), upper: zero },
+        Finding::LockedForeign { locked: dec!(0.5), robson: zero },
+    ])?;
+    let lists = [
+        list(SYMBOL, 77, "web-list", 701),
+        list("ETHUSDT", 78, "eth-list", 702),
+    ];
+    let (s, m) = nt_scan(rig, &ctx, &scope, 1, &[triple(wallet(zero, zero), &[], &lists)]).await?;
+    nt_costs("nt-operated-list", &s, m, (1, 2, 3, 32))?;
+    nt_findings("nt-operated-list", &s, &[Finding::OperatedOrderList { order_list_id: 77 }])?;
+    ensure!(s.cash.is_none(), "a finding never reaches the writer");
+
+    // An unlinked BTCUSDT order (a BUY: no BTC locked): strict recovery.
+    let web = [order(SYMBOL, 901, -1, "web-901", "LIMIT", "BUY", zero)];
+    let (s, m) = nt_scan(rig, &ctx, &scope, 1, &[triple(wallet(zero, zero), &web, &[])]).await?;
+    nt_costs("nt-unlinked", &s, m, (1, 2, 3, 32))?;
+    nt_findings("nt-unlinked", &s, &[Finding::UnlinkedOperatedOrder { order_id: 901 }])?;
+
+    // Another pair's list is only counted.
+    let other = [list("ETHUSDT", 79, "eth-only", 703)];
+    let (s, m) = nt_scan(rig, &ctx, &scope, 1, &[triple(wallet(zero, zero), &[], &other)]).await?;
+    nt_costs("nt-unrelated", &s, m, (1, 2, 3, 32))?;
+    ensure!(matches!(s.verdict, BaseVerdict::Clean { .. }) && s.cash.is_some(), "{s:?}");
+
+    // The scope's refusals end the scan at pre: another UID, a ledger row.
+    let (s, m) = nt_scan(rig, &ctx, &stranger, 1, &[]).await?;
+    nt_costs("nt-uid", &s, m, (1, 1, 0, 0))?;
+    ensure!(s.verdict == BaseVerdict::Unqualified(UnqualifiedReason::Scope), "{s:?}");
+    sqlx::query("INSERT INTO order_intents (intent_id,tenant_id,venue_id,account_scope,client_order_id,kind,params,created_at) VALUES ($1,$2,'binance:spot',$3,'nt-row','entry','{}',now())")
+        .bind(Uuid::now_v7()).bind(tenant).bind(NT).execute(pool).await?;
+    let (s, m) = nt_scan(rig, &ctx, &scope, 1, &[]).await?;
+    nt_costs("nt-ledger", &s, m, (1, 1, 0, 0))?;
+    ensure!(
+        s.verdict == BaseVerdict::Unqualified(UnqualifiedReason::LedgerNotEmpty),
+        "{s:?}"
+    );
+    ctx.proxied.close().await;
+    Ok(())
+}

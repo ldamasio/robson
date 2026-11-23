@@ -578,7 +578,9 @@ fn n5_reference_lines(path: &Path) -> &'static [&'static str] {
 /// Its classifier takes the record type, never a reader, transport or
 /// endpoint; its unit tests build that record. 8k-3a's ACCOUNT-only
 /// classification takes it the same way, and its capture holds it as the
-/// receipt's body. Exactly these lines, in exactly these files.
+/// receipt's body; 8k-3b's attempt holds the triple's order and list
+/// records as its port returns them. Exactly these lines, in exactly these
+/// files.
 fn detector_reference_lines(path: &Path) -> &'static [&'static str] {
     match path.to_str() {
         Some("robsond/src/balance_reconciliation/classify.rs") => &[
@@ -590,6 +592,11 @@ fn detector_reference_lines(path: &Path) -> &'static [&'static str] {
         Some("robsond/src/balance_reconciliation/capture.rs") => &[
             "use robson_connectors::binance::spot::SpotAccount;",
             "pub(crate) body: SpotAccount,",
+        ],
+        Some("robsond/src/balance_reconciliation/attempt.rs") => &[
+            "use robson_connectors::binance::spot::{SpotOpenOrderList, SpotOrderRecord};",
+            "pub(crate) orders: Vec<SpotOrderRecord>,",
+            "pub(crate) lists: Vec<SpotOpenOrderList>,",
         ],
         Some("robsond/src/balance_reconciliation/tests.rs") => &[
             "use robson_connectors::binance::spot::{SpotAccount, SpotAccountBalance};",
@@ -756,6 +763,7 @@ fn detector_allowance_admits_only_its_named_lines() {
         "robsond/src/balance_reconciliation/classify.rs",
         "robsond/src/balance_reconciliation/tests.rs",
         "robsond/src/balance_reconciliation/capture.rs",
+        "robsond/src/balance_reconciliation/attempt.rs",
     ]
     .map(Path::new)
     {
@@ -824,6 +832,11 @@ fn nothing_outside_the_spot_module_names_it() {
         // 8k-3a: its capture (the receipt body's exact lines only);
         "robsond/src/balance_reconciliation/capture.rs",
         "robsond/src/balance_reconciliation/pg_tests.rs",
+        // 8k-3b: its attempt (the triple's record lines only);
+        "robsond/src/balance_reconciliation/attempt.rs",
+        // 8k-3c: its route and the route's tests (no Spot item);
+        "robsond/src/balance_reconciliation/route.rs",
+        "robsond/src/balance_reconciliation/pg_tests/routing.rs",
         // 8l-1: the bounded routes of migrations 46 to 50;
         "robson-db/src/bounded_migration.rs",
         // 8l-2: the settlement barrier and the gate's pending slot;

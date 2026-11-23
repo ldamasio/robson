@@ -13,7 +13,8 @@
 //! 8k-3a: the marks are the gate's invalidity marks, and the non-trading
 //! scope's capture, ACCOUNT reading and ACCOUNT-only classification
 //! ([`Capture`], [`AccountReading`], [`classify_account`]) serve the scan
-//! and 8l-5's O1/O2.
+//! and 8l-5's O1/O2. 8k-3c's `route` takes every scan's result to exactly
+//! one consequence, the cash writer only for a qualified Clean.
 use robson_exec::{
     clock_records::RawClockCapture,
     gate::{IncidentReason, InvalidityMarks, Occurrence, OperationGate},
@@ -23,12 +24,15 @@ use uuid::Uuid;
 
 use crate::spot_order_set_store::ExpectedGeneration;
 
+mod attempt;
 mod capture;
 mod classify;
 #[cfg(test)]
 mod pg_tests;
+mod route;
 mod snapshot;
 
+pub(crate) use attempt::{scan_non_trading, InventoryReads, ReadFailure, Scanned, Triple};
 pub(crate) use capture::{cash_attempt, AccountReading, AccountReceipt, Capture};
 pub(crate) use classify::{classify, classify_account, consequence, Classification};
 pub(crate) use snapshot::{
@@ -178,12 +182,19 @@ pub(crate) enum UnqualifiedReason {
     Malformed,
     /// The non-trading scope's Spot ledger holds a row (8k-3a).
     LedgerNotEmpty,
+    /// A read refused before any request was handed off (8k-3b): nothing
+    /// sent or charged; retrying inside a pause or a full slot only spends
+    /// statements, so it ends the scan.
+    Deferred,
 }
 
 impl UnqualifiedReason {
     /// A refusal no retry can change within one scan.
     fn permanent(self) -> bool {
-        matches!(self, Self::Scope | Self::Cap | Self::Malformed | Self::LedgerNotEmpty)
+        matches!(
+            self,
+            Self::Scope | Self::Cap | Self::Malformed | Self::LedgerNotEmpty | Self::Deferred
+        )
     }
 }
 
