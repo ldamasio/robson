@@ -1289,9 +1289,9 @@ fn every_projector_caller_on_a_balance_daemon_passes_its_context() {
              robson_projector::apply_event_to_projections_with(pool, envelope, step)",
         ],
         &[
-            "let envelope = fetch.fetch_one(held.connection()).await?; failed_seq = \
-             Some(envelope.seq); apply_month_boundary_reset_on(held.connection(), &envelope, \
-             accounting).await?; held.finished = true;",
+            "let envelope = fetch.fetch_one(held.connection()).instrument(io(1)).await?; \
+             failed_seq = Some(envelope.seq); apply_month_boundary_reset_on(held.connection(), \
+             &envelope, accounting).await?; held.finished = true;",
         ],
     ];
     let apply_calls = |source: &str| {

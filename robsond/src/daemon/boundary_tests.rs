@@ -5,7 +5,8 @@
 //! in one write, the pre-certificate zero reset once, no version moved
 //! without a row, a position account's legacy boundary, the command id
 //! pinned, each transaction's statements by proxy trace, and a lost apply
-//! `COMMIT` answer retiring its connection raw.
+//! `COMMIT` answer retiring its connection raw. 8p-O: each of those
+//! statements counted under its operation's root.
 //!
 //! The balance daemon runs on the stub venue's identity (`stub`) with no
 //! generation installed; the proxy test installs one on Binance Spot's.
@@ -19,6 +20,7 @@ use robson_exec::{
 };
 use robson_testkit::db_proxy::{DbProxy, ProxyMode};
 use sqlx::{postgres::PgPoolOptions, PgPool};
+use tracing::instrument::WithSubscriber as _;
 use uuid::Uuid;
 
 use super::*;
@@ -28,6 +30,7 @@ use crate::{
     capability::worker_venue::WorkerVenue,
     circuit_breaker::HaltState,
     event_streams::EventStreams,
+    operation_observation::{job, probe::Probe, Job, JOB_METRICS},
     spot_order_set_store::JournalGeneration,
 };
 
@@ -929,4 +932,238 @@ async fn a_superseded_owner_applies_no_reset(pool: PgPool) {
     );
     assert_eq!(version(&pool, tenant, SPOT).await, 1, "one apply, the successor's");
     assert!(!zero_reset(&pool, &successor, &streams, &journal, january).await.unwrap());
+}
+
+/// What a probe saw of one job root (8p-O): its label, its attempts by kind
+/// (statement, `BEGIN`, `COMMIT`, `ROLLBACK`), its score (those plus one per
+/// nested job operation), whether it crossed 15, whether it is incomplete,
+/// and its outcome (1 success, 2 error).
+type Observed = crate::operation_observation::probe::JobObservation;
+
+/// `work` relayed through `proxy` and observed by `probe`: its result, each
+/// job root it ran, and the statements the proxy relayed, once each relayed
+/// statement, in order, is asserted to be one first-entered attempt of its
+/// intended root, of its kind: `owners` gives each root's label and how
+/// many consecutive relayed statements are its.
+async fn observed<T>(
+    proxy: &DbProxy,
+    probe: &Probe,
+    owners: &[(&'static str, usize)],
+    work: impl Future<Output = T>,
+) -> (T, Vec<Observed>, Vec<&'static str>) {
+    let (result, shape) = traced(proxy, work.with_subscriber(probe.dispatch())).await;
+    let mut labels = owners.iter().flat_map(|&(label, n)| std::iter::repeat_n(label, n));
+    let expected: Vec<(&'static str, u64)> = shape
+        .iter()
+        .map(|relayed| (labels.next().expect("an owner"), io_kind(relayed)))
+        .collect();
+    assert_eq!(labels.next(), None, "{shape:?}");
+    assert_eq!(probe.take_events(), expected, "{shape:?}");
+    (result, probe.take_jobs(), shape)
+}
+
+/// The `io_kind` of a relayed statement: 2 `BEGIN`, 3 `COMMIT`, 4
+/// `ROLLBACK`, 1 any other.
+fn io_kind(relayed: &str) -> u64 {
+    match relayed {
+        "begin" => 2,
+        "commit" => 3,
+        "rollback" => 4,
+        _ => 1,
+    }
+}
+
+/// The attempts by kind (statement, `BEGIN`, `COMMIT`, `ROLLBACK`) that a
+/// proxy trace relayed.
+fn kinds(shape: &[&str]) -> [u64; 4] {
+    let count = |kind| shape.iter().filter(|relayed| **relayed == kind).count() as u64;
+    let [begin, commit, rollback] = ["begin", "commit", "rollback"].map(count);
+    [
+        shape.len() as u64 - begin - commit - rollback,
+        begin,
+        commit,
+        rollback,
+    ]
+}
+
+/// 8p-O: each statement of every boundary transaction, as the proxy relays
+/// it, counts once under its operation's root, in order and by kind: the tick's
+/// pending rows committed (six) and rolled back (six) and its view (one), the
+/// zero reset's append (eight) and apply (seven), each its own root, and the
+/// refused append (four). None crosses 15.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn each_boundary_statement_counts_under_its_operation(pool: PgPool) {
+    let _serial = JOB_METRICS.lock().await;
+    sqlx::query("SELECT create_event_log_partitions(3)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (proxy, proxied) = through_proxy(&pool).await;
+    let probe = Probe::new();
+    let january = at(2027, 1, 1, 0, 0, 30);
+    let certified = installed_spot(&pool).await;
+    activation(&pool, certified.tenant_id, SPOT, "2026-12-01", Some("2026-12-15 12:00:00+00"))
+        .await;
+
+    for rows in [1, 0] {
+        let pending = job(Job::BoundaryTick, write_pending(&proxied, &certified, january));
+        let (written, jobs, shape) =
+            observed(&proxy, &probe, &[("boundary_tick", 6)], pending).await;
+        assert_eq!(written.unwrap(), rows);
+        assert_eq!(shape.len(), 6, "{shape:?}");
+        assert_eq!(jobs, [("boundary_tick", kinds(&shape), 6, false, false, 1)], "{shape:?}");
+    }
+    let view = job(Job::BoundaryTick, read_month(&proxied, &certified, january));
+    let (view, jobs, shape) = observed(&proxy, &probe, &[("boundary_tick", 1)], view).await;
+    assert_eq!(view.unwrap(), (false, false, true));
+    assert_eq!(shape, ["view"]);
+    assert_eq!(jobs, [("boundary_tick", [1, 0, 0, 0], 1, false, false, 1)]);
+
+    let uncertified = installed_spot(&pool).await;
+    let streams = EventStreams::default();
+    let journal = OrderJournal::unpersisted();
+    let reset = zero_reset(&proxied, &uncertified, &streams, &journal, january);
+    let owners = [("boundary_zero_reset", 8), ("boundary_apply", 7)];
+    let (applied, jobs, shape) = observed(&proxy, &probe, &owners, reset).await;
+    assert!(applied.unwrap());
+    assert_eq!(shape.len(), 15, "{shape:?}");
+    assert_eq!(jobs, [
+        ("boundary_zero_reset", kinds(&shape[..8]), 8, false, false, 1),
+        ("boundary_apply", kinds(&shape[8..]), 7, false, false, 1),
+    ]);
+    let reset = zero_reset(&proxied, &uncertified, &streams, &journal, january);
+    let owners = [("boundary_zero_reset", 4)];
+    let (applied, jobs, shape) = observed(&proxy, &probe, &owners, reset).await;
+    assert!(!applied.unwrap());
+    assert_eq!(shape, ["begin", "bounds", "view", "rollback"]);
+    assert_eq!(jobs, [("boundary_zero_reset", [2, 1, 0, 1], 4, false, false, 1)]);
+    probe.release();
+}
+
+/// 8p-O: a balance account's poll counts each statement the proxy relays
+/// once: the tick's partitions, pending rows (five without a generation) and
+/// view (eight at a new month, scored ten with its two nested operations),
+/// then the zero reset's append (eight) and apply (six) under their own
+/// roots; the next poll's tick six.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_balance_poll_counts_each_statement_under_its_operation(pool: PgPool) {
+    let _serial = JOB_METRICS.lock().await;
+    let (proxy, proxied) = through_proxy(&pool).await;
+    let probe = Probe::new();
+    let tenant = Uuid::now_v7();
+    account(&pool, tenant, STUB).await;
+    let (daemon, _, _) = balance_daemon(&proxied, tenant, false);
+    let january = at(2027, 1, 1, 0, 0, 30);
+
+    let owners = [
+        ("boundary_tick", 8),
+        ("boundary_zero_reset", 8),
+        ("boundary_apply", 6),
+    ];
+    let poll = daemon.poll_month_boundary(january);
+    let (polled, jobs, shape) = observed(&proxy, &probe, &owners, poll).await;
+    assert!(polled.unwrap());
+    assert_eq!(shape.len(), 22, "{shape:?}");
+    assert_eq!(&shape[..2], ["event_partitions", "snapshot_partitions"]);
+    assert_eq!(jobs, [
+        ("boundary_tick", kinds(&shape[..8]), 10, false, false, 1),
+        ("boundary_zero_reset", kinds(&shape[8..16]), 8, false, false, 1),
+        ("boundary_apply", kinds(&shape[16..]), 6, false, false, 1),
+    ]);
+    let later = january + chrono::Duration::seconds(60);
+    let poll = daemon.poll_month_boundary(later);
+    let (polled, jobs, shape) = observed(&proxy, &probe, &[("boundary_tick", 6)], poll).await;
+    assert!(!polled.unwrap());
+    assert_eq!(shape.len(), 6, "{shape:?}");
+    assert_eq!(jobs, [("boundary_tick", kinds(&shape), 6, false, false, 1)]);
+    probe.release();
+}
+
+/// 8p-O: the startup's pending rows count as a tick: the five statements a
+/// pending write without a generation relays (begin, bounds, bump, the
+/// insert and commit), held at the stream repair that follows.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn the_startup_pending_rows_count_as_a_tick(pool: PgPool) {
+    let _serial = JOB_METRICS.lock().await;
+    let probe = Probe::new();
+    let tenant = Uuid::now_v7();
+    account(&pool, tenant, STUB).await;
+    activation(&pool, tenant, STUB, "2026-10-01", Some("2026-10-15 12:00:00+00")).await;
+    let (daemon, _, _) = balance_daemon(&pool, tenant, true);
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE stream_suspensions IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let mut startup = Box::pin(daemon.start_up(&shutdown).with_subscriber(probe.dispatch()));
+    tokio::select! {
+        started = &mut startup => panic!("the startup passed its held stream repair: {started:?}"),
+        waited = tokio::time::timeout(Duration::from_secs(20), waited_on(&pool, "stream_suspensions")) => {
+            waited.expect("the startup reaches its stream repair");
+        },
+    }
+    assert_eq!(probe.take_jobs(), [("boundary_tick", [3, 1, 1, 0], 5, false, false, 1)]);
+    let tick = |kind: u64| ("boundary_tick", kind);
+    assert_eq!(probe.take_events(), [tick(2), tick(1), tick(1), tick(1), tick(3)], "in order");
+    held.rollback().await.unwrap();
+    drop(startup);
+    probe.release();
+}
+
+/// 8p-O: a stalled apply's failure is counted where it happens (the apply's
+/// fetch, an error), and the tick it ran in is incomplete: the stream
+/// suspension it records is written by the journal's retry loop, uncounted.
+/// The append found the stored event (seven, rolled back).
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_stalled_apply_leaves_its_tick_incomplete(pool: PgPool) {
+    let _serial = JOB_METRICS.lock().await;
+    sqlx::query("SELECT create_event_log_partitions(3)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let probe = Probe::new();
+    let tenant = Uuid::now_v7();
+    let (daemon, _, _) = balance_daemon(&pool, tenant, false);
+    let accounting = daemon.position_manager.read().await.balance_accounting().unwrap();
+    let january = at(2027, 1, 1, 0, 0, 30);
+    reset_appended_alone(&pool, tenant, january).await;
+    let (streams, journal) = (EventStreams::default(), OrderJournal::unpersisted());
+
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE event_log IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let stalled =
+        job(Job::BoundaryTick, zero_reset(&pool, &accounting, &streams, &journal, january));
+    let stalled =
+        tokio::time::timeout(Duration::from_secs(10), stalled.with_subscriber(probe.dispatch()));
+    let stalled = stalled.await.expect("the client deadline ends the stalled apply");
+    held.rollback().await.unwrap();
+    assert!(stalled.is_err(), "{stalled:?}");
+    assert!(streams.is_suspended(JANUARY_STREAM));
+    assert_eq!(probe.take_jobs(), [
+        ("boundary_tick", [0, 0, 0, 0], 2, false, true, 2),
+        ("boundary_zero_reset", [5, 1, 0, 1], 7, false, false, 1),
+        ("boundary_apply", [1, 0, 0, 0], 1, false, false, 2),
+    ]);
+    let append = |kind: u64| ("boundary_zero_reset", kind);
+    assert_eq!(probe.take_events(), [
+        append(2),
+        append(1),
+        append(1),
+        append(1),
+        append(1),
+        append(1),
+        append(4),
+        ("boundary_apply", 1),
+        ("boundary_tick", 7),
+    ]);
+    probe.release();
 }
