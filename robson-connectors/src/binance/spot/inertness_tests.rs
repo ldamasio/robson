@@ -650,6 +650,9 @@ fn read_reference_lines(path: &Path) -> &'static [&'static str] {
             "if status != 200 && !matches!(read, Read::Closed(SpotPreparedRead::Kline { .. })) {",
             "Read::Commission => serde_json::from_slice::<SpotCommission>(&body)",
             ".filter(|commission| commission.symbol == SPOT_OPERATED_SYMBOL)",
+            // 5a: the binding of 8p-4's mark venue, its kline read and body.
+            "let read = Read::Closed(SpotPreparedRead::Kline { start_ms });",
+            "ReadBody::Closed(SpotReadBody::Kline(rows)) => Ok((receipt.status, rows)),",
         ],
         _ => &[],
     }

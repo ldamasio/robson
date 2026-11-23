@@ -1150,7 +1150,14 @@ fn package5a_owners_stay_dormant_or_bounded() {
     // poll is routed before the legacy reset (R1), and its startup writes the
     // pending rows first. No production daemon is a balance account yet: the
     // factory refuses Spot and a Spot start needs a supervised handoff.
-    assert_eq!(outside("boundary::", "boundary.rs"), only("daemon.rs"));
+    // 5a: PS-5b's read owner implements 8p-4's mark venue (its boundary::
+    // names are the seam's trait and failure type); nothing calls the mark
+    // until 8p-5, and no other production text names the seam.
+    let users: BTreeSet<String> =
+        ["daemon.rs", "venue_clock_owner/reads.rs"].map(String::from).into();
+    assert_eq!(outside("boundary::", "boundary.rs"), users);
+    assert_eq!(outside("MarkVenue", "boundary/"), only("venue_clock_owner/reads.rs"));
+    assert_eq!(naming("mark::kline_at"), none);
     assert!(daemon.contains(
         "==robson_exec::venue::AccountKind::BalanceAccount{returnself.boundary_tick(now).await;}"
     ));

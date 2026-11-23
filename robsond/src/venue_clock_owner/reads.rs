@@ -225,13 +225,32 @@ impl SpotReads {
         signed: Option<&CommissionSigningTime>,
         deadline: Instant,
     ) -> Result<ReadReceipt, TimeError> {
-        let (handle, bound) = (&self.handle, deadline.min(Instant::now() + REQUEST_BOUND));
-        let mut metered = Metered(self, read.budget(), Some("dropped"));
-        let reserved = self.budget.reserve_read_now(read.budget(), || {
-            let now = handle.clock.capture().map_err(|_| BudgetError::Invalid)?;
+        let bound = deadline.min(Instant::now() + REQUEST_BOUND);
+        let reserved = self.reserve(read.budget(), bound);
+        self.reserved(read, signed, bound, reserved).await
+    }
+
+    /// `read`'s reservation at its fixed weight, `now` and the deadline
+    /// `bound` captured under the budget lock (non-blocking).
+    fn reserve(&self, read: ReadKind, bound: Instant) -> Result<PendingRead, BudgetError> {
+        let clock = &self.handle.clock;
+        self.budget.reserve_read_now(read, || {
+            let now = clock.capture().map_err(|_| BudgetError::Invalid)?;
             let left = bound.checked_duration_since(Instant::now()).ok_or(BudgetError::Expired)?;
             Ok((now, after(now, left).map_err(|_| BudgetError::Invalid)?))
-        });
+        })
+    }
+
+    /// [`Self::one`]'s request on a reservation already taken (or refused).
+    async fn reserved(
+        &self,
+        read: Read,
+        signed: Option<&CommissionSigningTime>,
+        bound: Instant,
+        reserved: Result<PendingRead, BudgetError>,
+    ) -> Result<ReadReceipt, TimeError> {
+        let handle = &self.handle;
+        let mut metered = Metered(self, read.budget(), Some("dropped"));
         let work = async {
             let mut pending = reserved.map_err(TimeError::Budget)?;
             // A fresh transport on a blocking permit, which the job keeps until
@@ -427,6 +446,61 @@ impl SpotReads {
             (false, false) => Ok((now, None)),
             (false, true) => Err(TimeError::Native),
         }
+    }
+}
+
+/// 8p-4's boundary mark on this owner (5a): the closed kline's reservation,
+/// taken first under the budget lock with the 10 s bound, for the single read
+/// path to send on. Dropped unsent, its charge is refunded.
+pub(crate) struct KlineReservation {
+    pending: PendingRead,
+    bound: Instant,
+}
+
+impl SpotReads {
+    /// One unsigned kline read at `start_ms` on `reserved` (no second
+    /// reservation), on a slot, within the reservation's bound: its HTTP
+    /// status and body text.
+    async fn kline_on(
+        &self,
+        reserved: KlineReservation,
+        start_ms: u64,
+    ) -> Result<(u16, String), crate::boundary::Failure> {
+        let read = Read::Closed(SpotPreparedRead::Kline { start_ms });
+        let slot = self.refused(ReadKind::Kline, self.slot(reserved.bound, 10));
+        let (_slot, bound) = slot.map_err(|e| format!("{e:?}"))?;
+        let receipt = self.reserved(read, None, bound, Ok(reserved.pending)).await;
+        let receipt = receipt.map_err(|e| format!("{e:?}"))?;
+        match receipt.body {
+            ReadBody::Closed(SpotReadBody::Kline(rows)) => Ok((receipt.status, rows)),
+            _ => Err("the kline read answered another body".into()),
+        }
+    }
+}
+
+/// The binding of `boundary::mark::MarkVenue` (8p-4's seam, 5a): no
+/// production caller until 8p-5's completion calls `mark::kline_at`.
+impl crate::boundary::mark::MarkVenue for SpotReads {
+    type Reserved = KlineReservation;
+
+    /// Only the kline's weight (2); a busy or paused budget refuses at once,
+    /// nothing charged.
+    fn try_reserve(&self, weight: u32) -> Result<KlineReservation, crate::boundary::Failure> {
+        if weight != ReadKind::Kline.weight() {
+            return Err(format!("the mark reserves the kline's weight, not {weight}").into());
+        }
+        let bound = Instant::now() + REQUEST_BOUND;
+        let pending = self.reserve(ReadKind::Kline, bound).map_err(TimeError::Budget);
+        let pending = self.refused(ReadKind::Kline, pending).map_err(|e| format!("{e:?}"))?;
+        Ok(KlineReservation { pending, bound })
+    }
+
+    fn read_kline(
+        &self,
+        reserved: KlineReservation,
+        start_ms: u64,
+    ) -> impl Future<Output = Result<(u16, String), crate::boundary::Failure>> + Send {
+        self.kline_on(reserved, start_ms)
     }
 }
 

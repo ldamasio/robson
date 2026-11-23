@@ -766,3 +766,79 @@ proptest! {
         runtime.block_on(interleave(callers, throttled, usage, rotate, closing))?;
     }
 }
+
+/// 8p-4's mark of November 2026's boundary, asked on a valid clock long
+/// after B + 60 s, and the kline open time it asks for (B − 60 s).
+fn mark_month() -> (chrono::NaiveDate, robson_exec::boundary_carry::RobsonTime, u64) {
+    let month = chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+    let b = month.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let verdict = Some(robson_exec::venue_ledger::ClockVerdict::Valid);
+    let now = robson_exec::boundary_carry::RobsonTime { at: chrono::Utc::now(), verdict };
+    (month, now, u64::try_from(b.timestamp_millis() - 60_000).unwrap())
+}
+
+/// 5a: the read owner as 8p-4's `MarkVenue` reserves only the kline's
+/// weight (2), before anything is prepared; a dropped reservation is
+/// refunded, and nothing is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mark_venue_reserves_only_the_klines_weight() {
+    use crate::boundary::mark::{MarkVenue as _, KLINE_WEIGHT};
+    let venue = venue().await;
+    let owner = rig(venue.url());
+    for weight in [0, 1, 3, 6, 20] {
+        assert!(owner.reads.try_reserve(weight).is_err(), "weight {weight}");
+    }
+    assert_eq!(owner.used(), (0, 0));
+    let reserved = owner.reads.try_reserve(KLINE_WEIGHT).unwrap();
+    assert_eq!(owner.used(), (2, 0), "reserved, not handed off");
+    drop(reserved);
+    assert_eq!(owner.used(), (0, 0), "refunded unsent");
+    assert_eq!(venue.requests_total(), 0);
+    venue.shutdown().await.unwrap();
+}
+
+/// 5a: one boundary mark is one charge of the kline's weight, then one
+/// unsigned send on that reservation through the single read path (no second
+/// reservation); the venue's status and body reach `kline_at` as they came.
+/// This venue answers every kline 400, so the mark refuses with that status.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_mark_kline_is_one_charge_and_one_unsigned_send() {
+    use crate::boundary::mark::{kline_at, MarkVenue as _, KLINE_WEIGHT};
+    let venue = venue().await;
+    let owner = rig(venue.url());
+    let reserved = owner.reads.try_reserve(KLINE_WEIGHT).unwrap();
+    let (status, body) = owner.reads.read_kline(reserved, 1_800_000_000_000).await.unwrap();
+    assert_eq!((status, body.as_str()), (400, r#"{"code":-1100,"msg":"unserved"}"#));
+    assert_eq!(owner.used(), (2, 1));
+    let (month, now, open) = mark_month();
+    let refused = kline_at(&owner.reads, month, now).await.err().unwrap();
+    assert!(refused.to_string().contains("HTTP 400"), "{refused}");
+    assert_eq!(owner.used(), (4, 2));
+    let requests = venue.requests();
+    assert_eq!(requests.len(), 2);
+    for (seen, start) in requests.iter().zip([1_800_000_000_000, open]) {
+        assert_eq!((seen.path.as_str(), seen.signature), ("/api/v3/klines", None));
+        assert!(seen.query.contains(&format!("&startTime={start}&")), "{}", seen.query);
+    }
+    venue.shutdown().await.unwrap();
+}
+
+/// 5a: a paused budget defers the mark's reservation at once: `kline_at`
+/// fails with nothing charged and nothing sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deferred_budget_sends_no_mark_kline() {
+    use crate::boundary::mark::{kline_at, MarkVenue as _, KLINE_WEIGHT};
+    let venue = venue().await;
+    let owner = rig(venue.url());
+    owner.publish(1);
+    venue.script_next("/api/v3/account", 429, "{}");
+    assert_eq!(owner.reads.inventory(soon(15_000)).await.err(), Some(TimeError::Venue));
+    assert!(owner.budget.pending_pause());
+    let deferred = owner.reads.try_reserve(KLINE_WEIGHT).err().unwrap();
+    assert!(deferred.to_string().contains("Deferred"), "{deferred}");
+    let (month, now, _) = mark_month();
+    assert!(kline_at(&owner.reads, month, now).await.is_err());
+    assert_eq!(owner.used(), (20, 1));
+    assert_eq!(venue.requests().len(), 1);
+    venue.shutdown().await.unwrap();
+}
