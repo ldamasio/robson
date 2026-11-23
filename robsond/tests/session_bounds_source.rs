@@ -928,9 +928,10 @@ fn package4_supervised_startup_stays_out_of_production() {
 }
 
 /// Package 5a's owners on a balance daemon, one line each: what 8k-1 B,
-/// 8k-2, 8l-1, 8l-2, 8l-4a and 8l-4b add to its database paths, and that each
-/// dormant one keeps no production caller. Its one connection owner is
-/// allowed above, with its reason; its one bound site is known above.
+/// 8k-2, 8l-1, 8l-2, 8l-4a, 8l-4b, 8p-1, 8p-2 and 8p-4 add to its database
+/// paths, and that each dormant one keeps no production caller. Its one
+/// connection owner is allowed above, with its reason; its one bound site is
+/// known above.
 #[test]
 fn package5a_owners_stay_dormant_or_bounded() {
     let sources = production_sources();
@@ -968,9 +969,10 @@ fn package5a_owners_stay_dormant_or_bounded() {
     // 8l-1: S8-4's tables are migrations only; the production texts that
     // name any of them are 8l-2's read-only barrier statement, 8l-3a's
     // read-only cash statements, record_trades' one write, the
-    // unattributed-fill invalidation (PLAN-r4 §6.10), and 8l-3b's cash
-    // writer (its context read and its checkpoint, discrepancy and sighting
-    // writes; PLAN-r4 §6.4), which has no production caller.
+    // unattributed-fill invalidation (PLAN-r4 §6.10), 8l-3b's cash writer
+    // (its context read and its checkpoint, discrepancy and sighting writes;
+    // PLAN-r4 §6.4), which has no production caller, and 8p-4's read-only
+    // leg-facts statement, which names dust_ledger only.
     let tables = [
         "cash_anchors",
         "cash_checkpoints",
@@ -1007,18 +1009,25 @@ fn package5a_owners_stay_dormant_or_bounded() {
         "venue_ledger_store/cash/reanchor/context.sql",
         "venue_ledger_store/cash/reanchor/write.sql",
     ];
+    // 8p-4's leg-facts statement, which has no production caller (below).
+    let leg_facts_sql = "venue_ledger_store/leg_facts.sql";
     let expected: BTreeSet<String> = cash_sql
         .iter()
-        .chain([&barrier, &trades])
+        .chain([&barrier, &trades, &leg_facts_sql])
         .chain(&writer)
         .chain(&reanchor_sql)
         .map(|file| file.to_string())
         .collect();
     assert_eq!(named, expected);
-    for file in cash_sql.iter().chain([&barrier, &writer[0], &reanchor_sql[0]]) {
+    for file in cash_sql.iter().chain([&barrier, &writer[0], &reanchor_sql[0], &leg_facts_sql]) {
         let text = source(file);
         assert!(["INSERT", "UPDATE", "DELETE"].iter().all(|w| !text.contains(w)), "{file}");
     }
+    let leg_facts: Vec<&str> = tables
+        .into_iter()
+        .filter(|table| naming(table).contains(leg_facts_sql))
+        .collect();
+    assert_eq!(leg_facts, ["dust_ledger"]);
     assert_eq!(naming("INSERT INTO accounting_invalidations"), only(trades));
     // 8l-3a: E(t) and the cash predicates run on their caller's connection
     // and have no production caller yet (8l-3b, 8l-8, 8p, 8n).
@@ -1038,6 +1047,21 @@ fn package5a_owners_stay_dormant_or_bounded() {
     assert_eq!(outside("CashReanchor", "venue_ledger_store/cash"), only("api/cash_reanchor.rs"));
     let service: BTreeSet<String> = [reanchor, commit].map(String::from).into();
     assert_eq!(naming("CashReanchor {"), service);
+    // 8p-1: S8-5's tables are migrations; 8p-2's boundary owner is the one
+    // production text naming any of them. It inserts the pending snapshot
+    // rows and reads the activation basis 8m will write, on the bounds of
+    // balance_accounting.rs; the other three wait for 8p-5..9.
+    assert_eq!(naming("boundary_snapshots"), only("boundary.rs"));
+    assert_eq!(naming("activation_bases"), only("boundary.rs"));
+    let later = [
+        "boundary_reopenings",
+        "boundary_snapshot_revisions",
+        "boundary_carried_legs",
+    ];
+    assert_eq!(later.iter().flat_map(|table| naming(table)).collect::<BTreeSet<_>>(), none);
+    let boundary = squeeze(&source("boundary.rs"));
+    assert!(boundary.contains("sqlx::query(BOUNDS)"), "{boundary}");
+    assert!(!boundary.contains("set_config"), "only the ledger's bounds: {boundary}");
     // 8l-2: the barrier runs on its caller's connection, and neither it nor
     // the gate's invalidity marks has a production caller yet (8l-3, 8l-7,
     // 8l-8, 8n).
@@ -1079,4 +1103,40 @@ fn package5a_owners_stay_dormant_or_bounded() {
     assert!(
         daemon.contains("letaccounting=self.position_manager.read().await.balance_accounting();")
     );
+    // 8p-2's zero reset runs the same step through the projector's
+    // owned-connection entry, on a connection it holds as a LedgerConnection,
+    // so a late or failed apply retires it raw.
+    assert_eq!(naming("apply_month_boundary_reset_on("), only("boundary.rs"));
+    let zero_reset = squeeze(&function(&source("boundary.rs"), "async fn zero_reset("));
+    assert!(
+        zero_reset.contains(
+            "letmutheld=LedgerConnection::new(pool.acquire().await?);letfetch=sqlx::query_as::<_,\
+             EventEnvelope>(ENVELOPE).bind(event_id);letenvelope=fetch.fetch_one(held.connection())\
+             .await?;failed_seq=Some(envelope.seq);apply_month_boundary_reset_on(held.connection(),\
+             &envelope,accounting).await?;held.finished=true;"
+        ),
+        "{zero_reset}"
+    );
+    // 8p-2: the owner's two callers are the daemon's. Its balance-account
+    // poll is routed before the legacy reset (R1), and its startup writes the
+    // pending rows first. No production daemon is a balance account yet: the
+    // factory refuses Spot and a Spot start needs a supervised handoff.
+    assert_eq!(outside("boundary::", "boundary.rs"), only("daemon.rs"));
+    assert!(daemon.contains(
+        "==robson_exec::venue::AccountKind::BalanceAccount{returnself.boundary_tick(now).await;}"
+    ));
+    let start_up = squeeze(&function(&source("daemon.rs"), "async fn start_up("));
+    assert!(
+        start_up.contains(
+            "->DaemonResult<()>{#[cfg(feature=\"postgres\")]ifletSome((pool,accounting))=self.\
+             boundary_owner().await{crate::boundary::write_pending(&pool,&accounting,Utc::now())"
+        ),
+        "{start_up}"
+    );
+    // 8p-4: the leg-facts reader runs its one statement (above) on the
+    // connection its caller passes, so it opens none and sets no bound; nothing
+    // outside it calls it or names its statement until 8p-5.
+    let reader = "venue_ledger_store/leg_facts.rs";
+    assert_eq!(outside("read_leg_facts", reader), none);
+    assert_eq!(outside("LEG_FACTS", reader), none);
 }

@@ -93,6 +93,9 @@ pub mod venue;
 
 #[cfg(feature = "postgres")]
 mod balance_accounting;
+// ADR-0056 step 8p-2: a balance-account daemon's month boundaries.
+#[cfg(feature = "postgres")]
+mod boundary;
 #[cfg(feature = "postgres")]
 pub mod budget_basis_alarm;
 #[cfg(feature = "postgres")]

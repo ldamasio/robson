@@ -2,7 +2,9 @@
 //! 8l-1): each exact embedded file through the delegated bounded path with
 //! migration 40's fault inventory, the official runner, the rollback boundary
 //! for older images and, in `migration46_constraints.rs`, the schema's rules.
-//! A local test database is created for each case.
+//! The same per-version suite covers M51-M54, the S8-5 boundary snapshot
+//! schema (step 8p-1), whose own controls are in `migration51.rs`. A local
+//! test database is created for each case.
 use std::time::Instant;
 
 use anyhow::{ensure, Context, Result};
@@ -18,7 +20,15 @@ use super::{
 #[path = "migration46_constraints.rs"]
 mod constraints;
 
+#[path = "migration51.rs"]
+mod boundary;
+
 const VERSIONS: [i64; 5] = [VERSION46, VERSION47, VERSION48, VERSION49, VERSION50];
+/// Every bounded Spot schema version: S8-4 (46-50), then S8-5 (51-54).
+const SPOT_SCHEMA: [i64; 9] = [
+    VERSION46, VERSION47, VERSION48, VERSION49, VERSION50, VERSION51, VERSION52, VERSION53,
+    VERSION54,
+];
 const ELAPSED: &str = "UPDATE _sqlx_migrations";
 const RESTORE: &str = "SELECT set_config('lock_timeout',$1,false)";
 const SETTINGS: &str = "SELECT pg_backend_pid(),current_setting('lock_timeout'),current_setting('statement_timeout'),current_setting('idle_in_transaction_session_timeout')";
@@ -48,9 +58,13 @@ fn contract(version: i64) -> &'static Migration {
         VERSION48 => contract48(),
         VERSION49 => contract49(),
         VERSION50 => contract50(),
+        VERSION51 => contract51(),
+        VERSION52 => contract52(),
+        VERSION53 => contract53(),
+        VERSION54 => contract54(),
         _ => None,
     }
-    .expect("exact embedded S8-4 migration")
+    .expect("exact embedded S8-4 or S8-5 migration")
 }
 
 /// The DO statement's leading text, for the proxy's ACK-loss selectors.
@@ -61,7 +75,11 @@ fn do_head(version: i64) -> &'static str {
         VERSION48 => "DO $migration48$",
         VERSION49 => "DO $migration49$",
         VERSION50 => "DO $migration50$",
-        unexpected => panic!("unexpected S8-4 version {unexpected}"),
+        VERSION51 => "DO $migration51$",
+        VERSION52 => "DO $migration52$",
+        VERSION53 => "DO $migration53$",
+        VERSION54 => "DO $migration54$",
+        unexpected => panic!("unexpected Spot schema version {unexpected}"),
     }
 }
 
@@ -96,7 +114,28 @@ fn objects(version: i64) -> &'static [(&'static str, &'static str)] {
             ("relation", "public.accounting_invalidations"),
             ("trigger", "accounting_invalidations_are_immutable"),
         ],
-        unexpected => panic!("unexpected S8-4 version {unexpected}"),
+        VERSION51 => &[
+            ("function", "public.boundary_snapshot_moves_forward()"),
+            ("relation", "public.boundary_snapshots"),
+            ("trigger", "boundary_snapshots_move_forward"),
+            ("relation", "public.boundary_reopenings"),
+        ],
+        VERSION52 => &[
+            ("trigger", "boundary_reopenings_are_immutable"),
+            ("relation", "public.boundary_snapshot_revisions"),
+            ("trigger", "boundary_snapshot_revisions_are_immutable"),
+        ],
+        VERSION53 => &[
+            ("relation", "public.boundary_carried_legs"),
+            ("trigger", "boundary_carried_legs_are_immutable"),
+            ("function", "public.activation_basis_moves_forward()"),
+        ],
+        VERSION54 => &[
+            ("relation", "public.activation_bases"),
+            ("trigger", "activation_bases_move_forward"),
+            ("relation", "public.idx_activation_bases_certified"),
+        ],
+        unexpected => panic!("unexpected Spot schema version {unexpected}"),
     }
 }
 
@@ -105,6 +144,9 @@ fn objects(version: i64) -> &'static [(&'static str, &'static str)] {
 /// table, so the lock wait starts before the DO spends its statement bound
 /// (49's dust_ledger locks balance_legs only after a whole table; the lock
 /// wait then ends at the 200 ms lock timeout, inside the 1 s statement bound).
+/// S8-5's: 51's first table references accounting_state, 52's first command
+/// is the trigger on boundary_reopenings, 53's first table references
+/// balance_legs and 54's references cash_anchors.
 fn parent(version: i64) -> &'static str {
     match version {
         VERSION46 => "clock_samples",
@@ -112,7 +154,11 @@ fn parent(version: i64) -> &'static str {
         VERSION48 => "cash_discrepancies",
         VERSION49 => "cash_reanchors",
         VERSION50 => "accounting_state",
-        unexpected => panic!("unexpected S8-4 version {unexpected}"),
+        VERSION51 => "accounting_state",
+        VERSION52 => "boundary_reopenings",
+        VERSION53 => "balance_legs",
+        VERSION54 => "cash_anchors",
+        unexpected => panic!("unexpected Spot schema version {unexpected}"),
     }
 }
 
@@ -221,7 +267,7 @@ impl Fixture {
         adapter.lock().await?;
         let mut observer = options.connect().await?;
         let key = acquired_key(&mut observer, pid, &birth).await?;
-        for later in VERSIONS.into_iter().filter(|later| *later >= version) {
+        for later in SPOT_SCHEMA.into_iter().filter(|later| *later >= version) {
             ensure!(!landed(&mut observer, later).await?, "M{} already present", later % 100);
         }
         let history: Vec<MigrationRow> = sqlx::query_as(HISTORY).fetch_all(&mut observer).await?;
@@ -629,7 +675,10 @@ macro_rules! bounded_suite {
     )*};
 }
 
-bounded_suite!(m46 => VERSION46, m47 => VERSION47, m48 => VERSION48, m49 => VERSION49, m50 => VERSION50);
+bounded_suite!(
+    m46 => VERSION46, m47 => VERSION47, m48 => VERSION48, m49 => VERSION49, m50 => VERSION50,
+    m51 => VERSION51, m52 => VERSION52, m53 => VERSION53, m54 => VERSION54,
+);
 
 #[sqlx::test(migrations = false)]
 #[ignore = "requires isolated PostgreSQL DATABASE_URL"]
@@ -689,12 +738,14 @@ async fn migration46_to_50_refuse_a_non_identical_source_before_sql(pool: PgPool
 #[ignore = "requires isolated PostgreSQL DATABASE_URL"]
 async fn migrations46_to_50_official_runner_applies_each_once_in_order(pool: PgPool) -> Result<()> {
     let mut f = Fixture::new(&pool, VERSION46).await?;
-    // run_direct takes the same advisory lock itself.
+    // run_direct takes the same advisory lock itself. The image is frozen at
+    // 50, the one that carries S8-4; S8-5's runner witness is migration51.rs's.
+    let image = through(VERSION50);
     f.adapter.unlock().await?;
     f.proxy.enable_exact_query_trace(64);
     let before = f.proxy.stats().statements;
     let started = Instant::now();
-    crate::MIGRATOR.run_direct(&mut f.adapter).await?;
+    image.run_direct(&mut f.adapter).await?;
     let duration = started.elapsed();
     let trace: Vec<String> =
         f.proxy.query_trace().iter().map(|sql| sql.trim().to_owned()).collect();
@@ -745,7 +796,7 @@ async fn migrations46_to_50_official_runner_applies_each_once_in_order(pool: PgP
     eprintln!("M46-M50 official runner physical_sql={statements} duration={duration:?}");
     // A second official run skips every applied version.
     let again = f.proxy.stats().statements;
-    crate::MIGRATOR.run_direct(&mut f.adapter).await?;
+    image.run_direct(&mut f.adapter).await?;
     ensure!(f.proxy.stats().statements - again == 7, "a repeated run applied something");
     ensure!(
         sqlx::query_as::<_, MigrationRow>(HISTORY).fetch_all(&mut f.observer).await? == history
@@ -800,9 +851,10 @@ async fn migrations46_to_50_older_images_refuse_with_version_missing(pool: PgPoo
     }
     ensure!(sqlx::query_as::<_, MigrationRow>(HISTORY).fetch_all(&mut observer).await? == history);
     ensure!(sqlx::query_scalar::<_, String>(CATALOG).fetch_one(&mut observer).await? == catalog);
-    // The canonical image skips every applied version and unlocks.
+    // The canonical image of S8-4 (frozen at 50; later files are their own
+    // witnesses') skips every applied version and unlocks.
     let mut canonical = BoundedMigration::connect(options.as_ref()).await?;
-    timeout(ACQUIRE_BOUND, crate::MIGRATOR.run_direct(&mut canonical))
+    timeout(ACQUIRE_BOUND, image_through(VERSION50).run_direct(&mut canonical))
         .await
         .context("canonical image did not answer")??;
     ensure!(sqlx::query_as::<_, MigrationRow>(HISTORY).fetch_all(&mut observer).await? == history);

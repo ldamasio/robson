@@ -52,6 +52,9 @@ crash_points! {
     REANCHOR_AFTER_O1 = "reanchor_after_o1";
     // The re-anchor sent its write; COMMIT is not sent (8l-5b).
     REANCHOR_BEFORE_COMMIT = "reanchor_before_commit";
+    // A balance account's pending boundary snapshot rows are committed;
+    // nothing after them has run (ADR-0056 step 8p-2).
+    BOUNDARY_AFTER_PENDING = "boundary_after_pending";
 }
 
 /// Crash point to arm.

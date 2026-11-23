@@ -1256,20 +1256,23 @@ async fn recalibration_apply_bumps_once_for_the_cutover(pool: PgPool) {
 }
 
 /// Source guard (PLAN-r4 §6.7): every caller of the projector in robsond's
-/// production code (the append path, the projection worker and the stream
-/// repair) passes the balance context, and the daemon builds it for both
-/// the manager and the worker.
+/// production code (the append path, the projection worker, the stream
+/// repair and 8p-2's zero reset, on its own connection) passes the balance
+/// context, and the daemon builds it for both the manager and the worker.
 #[test]
 fn every_projector_caller_on_a_balance_daemon_passes_its_context() {
     let callers = [
         ("position_manager.rs", include_str!("position_manager.rs")),
         ("projection_worker.rs", include_str!("projection_worker.rs")),
         ("event_streams.rs", include_str!("event_streams.rs")),
+        ("boundary.rs", include_str!("boundary.rs")),
     ];
     // Each caller's own context reaches its one apply: the manager's, the
-    // repair's (from the manager, checked in 8l-4a's wiring test) and the
-    // worker's (from the manager, checked below).
-    let flows: [&[&str]; 3] = [
+    // repair's (from the manager, checked in 8l-4a's wiring test), the
+    // worker's (from the manager, checked below) and the zero reset's, which
+    // is only ever a balance daemon's (it has no other) and reaches the
+    // projector's owned-connection entry, whose step is not optional.
+    let flows: [&[&str]; 4] = [
         &[
             "let accounting = self.balance_accounting.as_ref(); \
              match Self::append_and_apply(pool, tenant_id, &stream_key, event, accounting)",
@@ -1285,12 +1288,21 @@ fn every_projector_caller_on_a_balance_daemon_passes_its_context() {
             "let step = projector_step(accounting); if let Err(error) = \
              robson_projector::apply_event_to_projections_with(pool, envelope, step)",
         ],
+        &[
+            "let envelope = fetch.fetch_one(held.connection()).await?; failed_seq = \
+             Some(envelope.seq); apply_month_boundary_reset_on(held.connection(), &envelope, \
+             accounting).await?; held.finished = true;",
+        ],
     ];
+    let apply_calls = |source: &str| {
+        source.matches("apply_event_to_projections_with(").count()
+            + source.matches("apply_month_boundary_reset_on(").count()
+    };
     let squeezed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     for ((file, source), flow) in callers.iter().zip(flows) {
         let source = squeezed(production(source));
         assert!(!source.contains("apply_event_to_projections("), "{file}");
-        assert_eq!(source.matches("apply_event_to_projections_with(").count(), 1, "{file}");
+        assert_eq!(apply_calls(&source), 1, "{file}");
         for step in flow {
             assert!(source.contains(&squeezed(step)), "{file}: {step}");
         }
@@ -1308,7 +1320,9 @@ fn every_projector_caller_on_a_balance_daemon_passes_its_context() {
             } else if name.ends_with(".rs") && !name.contains("test") {
                 let known = callers.iter().any(|(caller, _)| *caller == name);
                 let source = std::fs::read_to_string(&path).unwrap();
-                let applies = production(&source).contains("apply_event_to_projections");
+                let source = production(&source);
+                let applies = source.contains("apply_event_to_projections")
+                    || source.contains("apply_month_boundary_reset_on");
                 assert!(known || !applies, "{} applies projections", path.display());
             }
         }

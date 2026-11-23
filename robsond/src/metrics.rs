@@ -25,6 +25,9 @@
 //!   that alarm read the persisted basis
 //! - `robsond_month_boundary_pending` — the current month's reset has not
 //!   landed (0 or 1)
+//! - `robsond_boundary_snapshot_pending` — a balance account's current month
+//!   owes a boundary snapshot that is not complete, by venue (ADR-0056 step
+//!   8p-2)
 //! - `robsond_budget_model_shadow_slots_delta` — dormant ADR-0051 NFS slots
 //!   minus HWM slots
 //! - `robsond_market_data_ws_failures_total` — failed WS attempts by endpoint
@@ -767,6 +770,19 @@ pub static MONTH_BOUNDARY_PENDING: LazyLock<Gauge> = LazyLock::new(|| {
         "Whether the current month's MonthBoundaryReset has not landed yet (0 or 1)"
     )
     .expect("failed to register robsond_month_boundary_pending")
+});
+
+/// A balance account's current month owes a boundary snapshot (its certified
+/// activation basis is of an earlier month) that is not complete (ADR-0056
+/// step 8p-2). Set by each boundary poll that reads the month; absent until
+/// the first.
+pub static BOUNDARY_SNAPSHOT_PENDING: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
+        "robsond_boundary_snapshot_pending",
+        "Whether the current month's boundary snapshot is owed and not complete (0 or 1)",
+        &["venue"]
+    )
+    .expect("failed to register robsond_boundary_snapshot_pending")
 });
 
 /// Dormant ADR-0051 shadow comparison: net-from-start slots minus HWM slots.

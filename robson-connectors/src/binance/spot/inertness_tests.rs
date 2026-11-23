@@ -837,7 +837,7 @@ fn nothing_outside_the_spot_module_names_it() {
         // 8k-3c: its route and the route's tests (no Spot item);
         "robsond/src/balance_reconciliation/route.rs",
         "robsond/src/balance_reconciliation/pg_tests/routing.rs",
-        // 8l-1: the bounded routes of migrations 46 to 50;
+        // 8l-1 and 8p-1: the bounded routes of migrations 46 to 54;
         "robson-db/src/bounded_migration.rs",
         // 8l-2: the settlement barrier and the gate's pending slot;
         "robsond/src/venue_ledger_store/settlement.rs",

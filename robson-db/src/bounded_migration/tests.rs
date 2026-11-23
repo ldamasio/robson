@@ -349,10 +349,12 @@ async fn retired_adapter_cannot_be_reused_by_any_migrate_entry() {
 }
 
 type Preflight = fn(&Migration) -> Result<(), MigrateError>;
+/// Version, exact bytes, DO delimiter, preflight and the DDL commands, in
+/// order.
+type DoFile = (i64, &'static str, &'static str, Preflight, &'static [&'static str]);
 
-/// The S8-4 files (PLAN-r4 §4.2): version, exact bytes, DO delimiter,
-/// preflight and the DDL commands of each, in order.
-const SPOT_ACCOUNTING: [(i64, &str, &str, Preflight, &[&str]); 5] = [
+/// The S8-4 files (8l PLAN-r4 §4.2).
+const SPOT_ACCOUNTING: [DoFile; 5] = [
     (
         VERSION46,
         include_str!("../../../migrations/20240101000046_spot_cash_anchors.sql"),
@@ -413,6 +415,55 @@ const SPOT_ACCOUNTING: [(i64, &str, &str, Preflight, &[&str]); 5] = [
     ),
 ];
 
+/// The S8-5 files (8p PLAN-r3 §4.2).
+const BOUNDARY_CARRY: [DoFile; 4] = [
+    (
+        VERSION51,
+        include_str!("../../../migrations/20240101000051_boundary_snapshots.sql"),
+        "$migration51$",
+        preflight51,
+        &[
+            "CREATE FUNCTION public.boundary_snapshot_moves_forward()",
+            "CREATE TABLE public.boundary_snapshots",
+            "CREATE TRIGGER boundary_snapshots_move_forward",
+            "CREATE TABLE public.boundary_reopenings",
+        ],
+    ),
+    (
+        VERSION52,
+        include_str!("../../../migrations/20240101000052_boundary_revisions.sql"),
+        "$migration52$",
+        preflight52,
+        &[
+            "CREATE TRIGGER boundary_reopenings_are_immutable",
+            "CREATE TABLE public.boundary_snapshot_revisions",
+            "CREATE TRIGGER boundary_snapshot_revisions_are_immutable",
+        ],
+    ),
+    (
+        VERSION53,
+        include_str!("../../../migrations/20240101000053_boundary_carried_legs.sql"),
+        "$migration53$",
+        preflight53,
+        &[
+            "CREATE TABLE public.boundary_carried_legs",
+            "CREATE TRIGGER boundary_carried_legs_are_immutable",
+            "CREATE FUNCTION public.activation_basis_moves_forward()",
+        ],
+    ),
+    (
+        VERSION54,
+        include_str!("../../../migrations/20240101000054_activation_bases.sql"),
+        "$migration54$",
+        preflight54,
+        &[
+            "CREATE TABLE public.activation_bases",
+            "CREATE TRIGGER activation_bases_move_forward",
+            "CREATE UNIQUE INDEX idx_activation_bases_certified",
+        ],
+    ),
+];
+
 fn spot_accounting_contract(version: i64) -> &'static Migration {
     match version {
         VERSION46 => contract46(),
@@ -420,14 +471,30 @@ fn spot_accounting_contract(version: i64) -> &'static Migration {
         VERSION48 => contract48(),
         VERSION49 => contract49(),
         VERSION50 => contract50(),
+        VERSION51 => contract51(),
+        VERSION52 => contract52(),
+        VERSION53 => contract53(),
+        VERSION54 => contract54(),
         _ => None,
     }
-    .expect("embedded S8-4 contract")
+    .expect("embedded S8-4 or S8-5 contract")
 }
 
 #[test]
 fn embedded46_to_50_identity_and_canonical_do_shape() {
-    for (version, file, delimiter, preflight, _) in SPOT_ACCOUNTING {
+    identity_and_canonical_do_shape(&SPOT_ACCOUNTING, "$migration45$");
+}
+
+#[test]
+fn embedded51_to_54_identity_and_canonical_do_shape() {
+    identity_and_canonical_do_shape(&BOUNDARY_CARRY, "$migration50$");
+}
+
+/// Each file is its exact embedded contract and its preflight accepts only
+/// its own canonical DO: not a header, a trailing statement, a second DO, the
+/// version before the set (`before`) or another file of the set.
+fn identity_and_canonical_do_shape(files: &[DoFile], before: &str) {
+    for &(version, file, delimiter, preflight, _) in files {
         let contract = spot_accounting_contract(version);
         assert_eq!(contract.version, version);
         assert_eq!(contract.sql.as_ref(), file);
@@ -453,13 +520,13 @@ fn embedded46_to_50_identity_and_canonical_do_shape() {
             format!(
                 "DO {delimiter}\nBEGIN NULL; END;\n{delimiter}; DO {delimiter}\nBEGIN NULL; END;\n{delimiter};"
             ),
-            "DO $migration45$\nBEGIN NULL; END;\n$migration45$;".to_owned(),
+            format!("DO {before}\nBEGIN NULL; END;\n{before};"),
         ] {
             let mut invalid = contract.clone();
             invalid.sql = sql.clone().into();
             assert!(preflight(&invalid).is_err(), "accepted {sql}");
         }
-        for (other, ..) in SPOT_ACCOUNTING {
+        for &(other, ..) in files {
             if other != version {
                 let foreign = spot_accounting_contract(other);
                 let mut renumbered = foreign.clone();
@@ -473,6 +540,15 @@ fn embedded46_to_50_identity_and_canonical_do_shape() {
 
 #[tokio::test]
 async fn non_identical_46_to_50_are_refused_before_any_connection_use() {
+    refused_before_any_connection_use(&SPOT_ACCOUNTING).await;
+}
+
+#[tokio::test]
+async fn non_identical_51_to_54_are_refused_before_any_connection_use() {
+    refused_before_any_connection_use(&BOUNDARY_CARRY).await;
+}
+
+async fn refused_before_any_connection_use(files: &[DoFile]) {
     // No connection at all: a refusal must come from the contract check, an
     // identical source reaches the owned apply and finds the connection gone.
     let mut adapter = BoundedMigration {
@@ -481,7 +557,7 @@ async fn non_identical_46_to_50_are_refused_before_any_connection_use() {
         contract: None,
         gate: Default::default(),
     };
-    for (version, ..) in SPOT_ACCOUNTING {
+    for &(version, ..) in files {
         let contract = spot_accounting_contract(version);
         let expected = format!("migration{} contract mismatch", version % 100);
         let mut checksum = contract.clone();
@@ -580,10 +656,26 @@ fn do_body_statements(sql: &str, delimiter: &str) -> Vec<String> {
 
 #[test]
 fn spot_accounting_dos_have_at_most_four_ddl() {
+    at_most_four_ddl(&SPOT_ACCOUNTING);
+    // The reader itself: a nested body's semicolons, quoted ones and
+    // comments are not commands.
+    let witness = "DO $m$\nBEGIN\n    -- a; b;\n    CREATE TABLE t (c TEXT CHECK (c <> ';'));\n    \
+                   CREATE FUNCTION f() RETURNS INT LANGUAGE plpgsql AS $f$ BEGIN RETURN 1; END; $f$;\n    \
+                   /* x; */ CREATE INDEX i ON t (c);\nEND;\n$m$;";
+    assert_eq!(do_body_statements(witness, "$m$").len(), 3);
+}
+
+#[test]
+fn boundary_carry_dos_have_at_most_four_ddl() {
+    at_most_four_ddl(&BOUNDARY_CARRY);
+}
+
+fn at_most_four_ddl(files: &[DoFile]) {
     // Main's statement bound is 1 s for the whole DO and the measured
-    // production p90 is 152 ms per DDL command, so each S8-4 DO stays at
-    // four DDL commands at most, constraints inline (PLAN-r4 §4.2).
-    for (version, file, delimiter, _, inventory) in SPOT_ACCOUNTING {
+    // production p90 is 152 ms per DDL command, so each S8-4 and S8-5 DO
+    // stays at four DDL commands at most, constraints inline (8l PLAN-r4
+    // and 8p PLAN-r3, §4.2).
+    for &(version, file, delimiter, _, inventory) in files {
         let statements = do_body_statements(file, delimiter);
         assert!(statements.len() <= 4, "{version} has {} DDL commands", statements.len());
         let ddl: Vec<String> = statements
@@ -598,13 +690,7 @@ fn spot_accounting_dos_have_at_most_four_ddl() {
                 words[..len.min(words.len())].join(" ")
             })
             .collect();
-        assert_eq!(ddl, inventory.to_vec(), "{version} is not its PLAN-r4 §4.2 DDL inventory");
+        assert_eq!(ddl, inventory.to_vec(), "{version} is not its PLAN's §4.2 DDL inventory");
         assert!(statements.iter().all(|statement| statement.starts_with("CREATE ")));
     }
-    // The reader itself: a nested body's semicolons, quoted ones and
-    // comments are not commands.
-    let witness = "DO $m$\nBEGIN\n    -- a; b;\n    CREATE TABLE t (c TEXT CHECK (c <> ';'));\n    \
-                   CREATE FUNCTION f() RETURNS INT LANGUAGE plpgsql AS $f$ BEGIN RETURN 1; END; $f$;\n    \
-                   /* x; */ CREATE INDEX i ON t (c);\nEND;\n$m$;";
-    assert_eq!(do_body_statements(witness, "$m$").len(), 3);
 }

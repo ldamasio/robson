@@ -1,14 +1,15 @@
 //! Every CHECK, FOREIGN KEY, UNIQUE and trigger rule of S8-4 (PLAN-r4 §4.3,
 //! with the re-anchor `mode` of operator decision Q2 = R), on the installed
 //! schema. Rows are built as JSON and inserted with
-//! `jsonb_populate_record`, so each refusal case changes one field.
+//! `jsonb_populate_record`, so each refusal case changes one field. The
+//! fixture helpers are shared with S8-5's rules (`migration51_constraints.rs`).
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::*;
 
-const VENUE: &str = "binance:spot";
-const NIL: &str = "00000000-0000-0000-0000-000000000000";
+pub(super) const VENUE: &str = "binance:spot";
+pub(super) const NIL: &str = "00000000-0000-0000-0000-000000000000";
 
 /// The production route: through 45 in order, then 46 to 50 through the
 /// bounded adapter and the official runner; then all five S8-4 schemas exist.
@@ -23,13 +24,13 @@ async fn install(pool: &PgPool) -> Result<()> {
 
 /// A venue scope: its version row, a process epoch and a clock sample.
 #[derive(Clone, Copy)]
-struct Scope {
-    tenant: Uuid,
-    sample: Uuid,
-    epoch: Uuid,
+pub(super) struct Scope {
+    pub(super) tenant: Uuid,
+    pub(super) sample: Uuid,
+    pub(super) epoch: Uuid,
 }
 
-async fn scope(pool: &PgPool) -> Result<Scope> {
+pub(super) async fn scope(pool: &PgPool) -> Result<Scope> {
     let tenant = Uuid::now_v7();
     let epoch = Uuid::now_v7();
     let sample = Uuid::now_v7();
@@ -52,7 +53,7 @@ async fn scope(pool: &PgPool) -> Result<Scope> {
 }
 
 /// A tenant with a process epoch and a clock sample but no version row.
-async fn orphan(pool: &PgPool) -> Result<Scope> {
+pub(super) async fn orphan(pool: &PgPool) -> Result<Scope> {
     let s = scope(pool).await?;
     let orphan = Uuid::now_v7();
     sqlx::query("INSERT INTO process_epochs (epoch_id,tenant_id,binary_version) VALUES ($1,$2,'s84-orphan')")
@@ -73,7 +74,7 @@ async fn orphan(pool: &PgPool) -> Result<Scope> {
 }
 
 /// Milliseconds after 2026-11-10 12:00:00 UTC.
-fn ts(ms: i64) -> String {
+pub(super) fn ts(ms: i64) -> String {
     let t = 12 * 3_600_000 + ms;
     format!(
         "2026-11-10 {:02}:{:02}:{:02}.{:03}+00",
@@ -101,7 +102,13 @@ fn observe(row: &mut Value, prefix: &str, s: Scope, cut: i64) {
     }
 }
 
-fn anchor_row(s: Scope, id: Uuid, kind: &str, cutover: Option<Uuid>, cut: Option<i64>) -> Value {
+pub(super) fn anchor_row(
+    s: Scope,
+    id: Uuid,
+    kind: &str,
+    cutover: Option<Uuid>,
+    cut: Option<i64>,
+) -> Value {
     let mut row = json!({
         "anchor_id": id, "tenant_id": s.tenant, "venue_id": VENUE, "kind": kind,
         "cutover_id": cutover, "quote": "1000",
@@ -193,7 +200,7 @@ fn flow_row(
 }
 
 /// `table` is always one of this file's fixed S8-4 table names.
-async fn insert<'e>(
+pub(super) async fn insert<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     table: &str,
     row: &Value,
@@ -207,7 +214,7 @@ async fn insert<'e>(
     .map(|_| ())
 }
 
-fn set(row: &Value, pairs: &[(&str, Value)]) -> Value {
+pub(super) fn set(row: &Value, pairs: &[(&str, Value)]) -> Value {
     let mut row = row.clone();
     for (key, value) in pairs {
         row[*key] = value.clone();
@@ -215,19 +222,19 @@ fn set(row: &Value, pairs: &[(&str, Value)]) -> Value {
     row
 }
 
-fn with(row: &Value, key: &str, value: Value) -> Value {
+pub(super) fn with(row: &Value, key: &str, value: Value) -> Value {
     let mut row = row.clone();
     row[key] = value;
     row
 }
 
-async fn exec(pool: &PgPool, sql: &str, id: Uuid) -> Result<u64, sqlx::Error> {
+pub(super) async fn exec(pool: &PgPool, sql: &str, id: Uuid) -> Result<u64, sqlx::Error> {
     sqlx::query(sql).bind(id).execute(pool).await.map(|done| done.rows_affected())
 }
 
 /// Refused natively with `code`, naming `needle` as the constraint or in
 /// the message (a trigger's).
-fn refused<T: std::fmt::Debug>(
+pub(super) fn refused<T: std::fmt::Debug>(
     result: Result<T, sqlx::Error>,
     code: &str,
     needle: &str,
@@ -247,7 +254,7 @@ fn refused<T: std::fmt::Debug>(
     Ok(())
 }
 
-const IMMUTABLE: &str = "rows are never updated or deleted";
+pub(super) const IMMUTABLE: &str = "rows are never updated or deleted";
 
 /// A cutover anchor at `base` and a re-anchor's anchor 70 s later.
 async fn anchors(pool: &PgPool, s: Scope, base: i64) -> Result<(Uuid, Uuid)> {
@@ -1264,7 +1271,7 @@ async fn cash_attested_flows_follow_their_rules(pool: PgPool) -> Result<()> {
 }
 
 /// One admitted leg, as migration 40's constraint fixture admits it.
-async fn admit(pool: &PgPool, tenant: Uuid) -> Result<Uuid> {
+pub(super) async fn admit(pool: &PgPool, tenant: Uuid) -> Result<Uuid> {
     let position = Uuid::now_v7();
     let entry = Uuid::now_v7();
     let mut tx = pool.begin().await?;
