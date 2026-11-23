@@ -194,6 +194,7 @@ fn balance_daemon(
         None,
         Some(Arc::new(pool.clone())),
         None,
+        None,
     );
     let pending = prometheus::Gauge::new("test_month_boundary_pending", "test").unwrap();
     daemon.month_boundary_pending = pending.clone();
