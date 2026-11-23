@@ -1460,9 +1460,12 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             || crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION"));
         let start = match &self.spot_start {
             SpotStart::Supervised(start) => start.clone(),
-            // The epoch-start seam of a non-trading start (PS-1): 5a composes
-            // 8l-3b's `process_epoch::start_balance_epoch` (same arguments).
-            SpotStart::NonTrading { .. } => ordinary().await?,
+            // A non-trading start is a balance account's: its epoch takes the
+            // tenant's accounting rows first (8l-3b; PS-1's seam, 5a).
+            SpotStart::NonTrading { .. } => {
+                let version = env!("CARGO_PKG_VERSION");
+                crate::process_epoch::start_balance_epoch(pool, tenant_id, version).await?
+            },
             SpotStart::None if !spot => ordinary().await?,
             SpotStart::None => return Err(DaemonError::Config(UNSUPERVISED_SPOT.into())),
         };

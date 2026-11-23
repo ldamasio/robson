@@ -110,10 +110,6 @@ pub async fn start_epoch(
 ///
 /// # Errors
 /// As [`start_epoch`], and a lock wait past the pool's bound.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the supervised Spot start (PS-1) calls it")
-)]
 pub(crate) async fn start_balance_epoch(
     pool: &PgPool,
     tenant_id: Uuid,

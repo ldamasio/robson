@@ -174,3 +174,82 @@ async fn a_non_trading_start_inserts_an_ordinary_epoch_then_stops(pool: PgPool) 
         "a non-trading start sent nothing"
     );
 }
+
+/// 5a: a non-trading start's epoch is a balance account's (8l-3b's
+/// `start_balance_epoch` behind PS-1's seam). Its transaction takes the
+/// tenant's accounting rows first, so while another transaction holds them
+/// the start waits on exactly that statement and inserts no epoch; once they
+/// are released it inserts its epoch and stops as before.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_non_trading_start_takes_the_accounting_rows_before_its_epoch(pool: PgPool) {
+    use std::time::{Duration, Instant};
+    async fn epochs(pool: &PgPool, tenant: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM process_epochs WHERE tenant_id=$1")
+            .bind(tenant)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+    let tenant = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO accounting_state (tenant_id, venue_id, budget_model) \
+         VALUES ($1, 'binance:spot', 'net_from_start_non_expanding_v1')",
+    )
+    .bind(tenant)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut held = pool.begin().await.unwrap();
+    let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *held)
+        .await
+        .unwrap();
+    let rows = crate::balance_accounting::ACCOUNTING_ROWS;
+    sqlx::query(rows).bind(tenant).fetch_all(&mut *held).await.unwrap();
+    #[cfg(feature = "crash-points")]
+    let closed = Arc::new(BinanceRestClient::with_harness_base_url(
+        "http://127.0.0.1:9".into(),
+        "fixture-key".into(),
+        "fixture-secret".into(),
+    ));
+    #[cfg(not(feature = "crash-points"))]
+    let closed = client();
+    let venue = Arc::new(BinanceSpotAdapter::non_trading(Arc::clone(&closed)).unwrap());
+    let daemon = spot(Some(tenant), Arc::new(pool.clone()), closed, venue).unwrap();
+    let mut start = Box::pin(daemon.run_until(crate::stop::StopRequest::default()));
+    // The start's backend waits behind the holder on the accounting rows'
+    // statement: an ordinary epoch never runs it, and nothing else on this
+    // start's path does.
+    let waits = async {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let waiters: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE $1 = ANY(pg_blocking_pids(pid)) AND query = $2",
+            )
+            .bind(holder)
+            .bind(rows)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiters == 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the start never waited on the accounting rows");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        started = &mut start => panic!("the start ended while the rows were held: {started:?}"),
+        () = waits => {},
+    }
+    assert_eq!(epochs(&pool, tenant).await, 0, "no epoch while the rows are held");
+    held.rollback().await.unwrap();
+    let started = start.await;
+    assert!(
+        matches!(&started, Err(DaemonError::Config(reason)) if reason == NOT_WIRED),
+        "{started:?}"
+    );
+    assert_eq!(epochs(&pool, tenant).await, 1, "its epoch once the rows are free");
+}
