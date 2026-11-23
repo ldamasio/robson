@@ -303,9 +303,11 @@ impl TransactionWatch {
     }
 
     /// One statement ran. Transaction control moves the boundary; anything
-    /// else counts only inside a transaction.
+    /// else counts only inside a transaction. Leading comments are not part
+    /// of the command (`venue_budget/sql/begin.sql` sends one before `BEGIN`).
     fn executed_statement(&mut self, text: String) {
-        let control = text.trim().trim_end_matches(';').trim().to_ascii_uppercase();
+        let command = without_leading_comments(&text);
+        let control = command.trim().trim_end_matches(';').trim().to_ascii_uppercase();
         if control == "BEGIN" || control.starts_with("BEGIN ") {
             self.in_transaction = true;
             self.executed.clear();
@@ -941,6 +943,40 @@ fn is_simple_query_commit(tag: u8, body: &[u8]) -> bool {
     simple_query_text(body).eq_ignore_ascii_case("COMMIT")
 }
 
+/// `sql` from its first token: leading whitespace, `--` line comments and
+/// (nested) `/* */` block comments skipped. An unclosed comment leaves nothing.
+fn without_leading_comments(sql: &str) -> &str {
+    let mut rest = sql.trim_start();
+    loop {
+        if let Some(line) = rest.strip_prefix("--") {
+            rest = line.find('\n').map_or("", |end| &line[end + 1..]);
+        } else if rest.starts_with("/*") {
+            let (mut depth, mut at) = (0_usize, 0);
+            loop {
+                let Some(next) = rest.get(at..) else {
+                    return "";
+                };
+                if next.starts_with("/*") {
+                    (depth, at) = (depth + 1, at + 2);
+                } else if next.starts_with("*/") {
+                    (depth, at) = (depth - 1, at + 2);
+                    if depth == 0 {
+                        break;
+                    }
+                } else if let Some(c) = next.chars().next() {
+                    at += c.len_utf8();
+                } else {
+                    return "";
+                }
+            }
+            rest = &rest[at..];
+        } else {
+            return rest;
+        }
+        rest = rest.trim_start();
+    }
+}
+
 fn simple_query_text(body: &[u8]) -> String {
     let end = body.iter().position(|byte| *byte == 0).unwrap_or(body.len());
     let statement = String::from_utf8_lossy(&body[..end]);
@@ -1059,6 +1095,29 @@ mod tests {
         assert!(watch.executed("other"));
     }
 
+    /// Leading comments are skipped before a statement is classified: a
+    /// commented `BEGIN` opens the transaction, a commented `COMMIT` closes
+    /// it, and a comment that only names `BEGIN` opens nothing.
+    #[test]
+    fn leading_comments_do_not_hide_transaction_control() {
+        assert_eq!(without_leading_comments(" -- a\n--b\n BEGIN"), "BEGIN");
+        assert_eq!(without_leading_comments("/* a /* b */ c */\nbegin"), "begin");
+        assert_eq!(without_leading_comments("-- BEGIN\nSELECT 1"), "SELECT 1");
+        assert_eq!(without_leading_comments("/* open /* BEGIN */"), "");
+        assert_eq!(without_leading_comments("-- only a comment"), "");
+        assert_eq!(without_leading_comments("SELECT 1 -- BEGIN"), "SELECT 1 -- BEGIN");
+
+        let mut watch = TransactionWatch::default();
+        watch.observe(b'Q', b"-- B01: no binds\nBEGIN ISOLATION LEVEL READ COMMITTED;\0");
+        watch.observe(b'Q', b"UPDATE budget_venue_state SET n = 1\0");
+        assert!(watch.executed("budget_venue_state"), "the commented BEGIN opened it");
+        watch.observe(b'Q', b"/* end */ COMMIT\0");
+        assert!(!watch.executed("budget_venue_state"), "the commented COMMIT closed it");
+        watch.observe(b'Q', b"-- BEGIN\nSELECT 1\0");
+        watch.observe(b'Q', b"UPDATE budget_venue_state SET n = 2\0");
+        assert!(!watch.executed("budget_venue_state"), "a comment opens nothing");
+    }
+
     #[test]
     fn only_a_simple_query_commit_is_a_commit() {
         assert!(is_simple_query_commit(b'Q', b"COMMIT\0"));
@@ -1150,6 +1209,31 @@ mod tests {
                 commit_acks_dropped: 1,
                 statements: 2,
             });
+            assert_eq!(proxy.mode(), ProxyMode::Pass);
+        })
+        .await;
+    }
+
+    /// `DropCommitAckOf` arms on a transaction whose `BEGIN` text starts
+    /// with a comment, as `venue_budget/sql/begin.sql`'s does; the counter
+    /// shows the drop (a test of this mode asserts it, never only the error).
+    #[tokio::test]
+    async fn a_commented_begin_arms_the_commit_ack_drop_of_its_work() {
+        bounded(async {
+            let (upstream, _received) = scripted_server().await;
+            let proxy = DbProxy::start(upstream).await.unwrap();
+            let mut client = connected(&proxy).await;
+            proxy.set_mode(ProxyMode::DropCommitAckOf("budget_venue_state"));
+            for sql in [
+                &b"-- B01: no binds\nBEGIN ISOLATION LEVEL READ COMMITTED;\0"[..],
+                b"UPDATE budget_venue_state SET n = 1\0",
+            ] {
+                client.write_all(&message(b'Q', sql)).await.unwrap();
+                assert_eq!(read_reply(&mut client).await.unwrap(), (b'C', b'Z'));
+            }
+            client.write_all(&message(b'Q', b"COMMIT\0")).await.unwrap();
+            assert!(read_reply(&mut client).await.is_err());
+            assert_eq!(proxy.stats().commit_acks_dropped, 1);
             assert_eq!(proxy.mode(), ProxyMode::Pass);
         })
         .await;
