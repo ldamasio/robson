@@ -13,7 +13,7 @@ use robson_exec::{
     venue_clock::{NativeClock, TickCapture},
 };
 
-use super::{pause_value::PauseValue, BootstrapRows, BudgetError};
+use super::{heads::PauseObservation, pause_value::PauseValue, BootstrapRows, BudgetError};
 
 fn transition(error: TransitionError) -> BudgetError {
     match error {
@@ -517,6 +517,18 @@ impl SharedBudget {
     pub(crate) fn pending_pause(&self) -> bool {
         self.0.lock().map_or(true, |state| state.heads.pending())
     }
+
+    pub(crate) fn pending_observation(&self) -> Option<PauseObservation> {
+        self.0.lock().ok()?.heads.pending_observation()
+    }
+
+    pub(crate) fn acknowledge_pause(&self, id: uuid::Uuid) {
+        let _ = self.0.lock().map(|mut state| state.heads.acknowledge(id));
+    }
+
+    pub(crate) fn pause_wake(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(Arc::clone(&self.0.lock().ok()?.heads.wake))
+    }
 }
 
 #[cfg(test)]
@@ -530,3 +542,7 @@ mod non_trading_tests;
 #[cfg(test)]
 #[path = "now_ordering_tests.rs"]
 mod now_ordering_tests;
+
+#[cfg(test)]
+#[path = "pause_tests.rs"]
+mod pause_tests;

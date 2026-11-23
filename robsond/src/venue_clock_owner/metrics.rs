@@ -84,6 +84,7 @@ pub(super) fn register() {
     LazyLock::force(&BOUND);
     bucket(Some((0, 0)));
     crate::venue_budget::register_restriction_level();
+    crate::venue_budget::pause_store::register();
 }
 
 static BUCKET: LazyLock<IntGaugeVec> = LazyLock::new(|| {

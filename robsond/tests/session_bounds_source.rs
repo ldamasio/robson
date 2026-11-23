@@ -636,6 +636,12 @@ fn every_daemon_pool_and_connection_is_built_where_the_bounds_reach_it() {
         // startup, then sql/settings.sql checked; 5 s overall with the
         // restoration.
         ("venue_budget/bootstrap.rs", "", "observe_non_trading"),
+        // PS-2b's pause keeper write (spawned only by PS-3's non-trading
+        // TIME owner, itself without a production caller until PS-6): one
+        // raw connection at a time from the pool's options with 300 ms lock,
+        // 1 s statement and 1 s idle at startup, sql/settings.sql checked,
+        // 2 s per write; its lost-ACK confirmation opens one fresh one alike.
+        ("venue_budget/pause_store.rs", "", "persist"),
         // Package 3's dormant Spot owners (no production caller) do the
         // same, so the bounds of the pool they are given are inherited:
         // the N5 claim store (1 s statement and idle at startup, then
@@ -737,6 +743,8 @@ fn every_mention_of_a_session_bound_is_a_known_one() {
         ),
         // Package 2's pause restoration: its three Startup options.
         ("venue_budget/restore.rs", each("name")),
+        // PS-2b's pause keeper write: its three Startup options.
+        ("venue_budget/pause_store.rs", each("name")),
         // Package 3's cold snapshot: transaction-local limits (20 ms lock,
         // 40 ms statement, 1 s idle) set after BEGIN on a connection of the
         // pool it is given, so the inherited bounds cover BEGIN itself.

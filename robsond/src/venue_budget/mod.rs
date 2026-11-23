@@ -15,6 +15,7 @@ mod heads;
     reason = "dormant N5 storage awaits the reviewed receipt producer"
 )]
 pub(crate) mod n5_claim;
+pub(crate) mod pause_store;
 mod pause_value;
 pub(crate) mod restore;
 mod snapshot;
