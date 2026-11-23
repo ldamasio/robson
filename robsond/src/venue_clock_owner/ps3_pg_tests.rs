@@ -500,7 +500,13 @@ async fn an_expired_queued_sample_request_is_refused_unsent(pool: PgPool) -> Res
     let owner = rig.owner(&pool)?;
     let handle = owner.handle();
     let closing = owner.spawn();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The first cycle prepares its transport on a blocking permit before it
+    // connects, which a loaded module run can delay past any fixed sleep:
+    // wait (bounded) for its connection; the server then holds it 600 ms.
+    let connected = in_ms(5_000);
+    while rig.server.connections() == 0 && Instant::now() < connected {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     ensure!(rig.server.connections() == 1, "the scheduled cycle is in flight");
     let queued = handle.request_sample(in_ms(100)).await;
     ensure!(queued == Err(TimeError::Expired), "{queued:?}");
