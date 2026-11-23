@@ -951,10 +951,13 @@ fn package4_supervised_startup_stays_out_of_production() {
 }
 
 /// Package 5a's owners on a balance daemon, one line each: what 8k-1 B,
-/// 8k-2, 8l-1, 8l-2, 8l-4a, 8l-4b, 8p-1, 8p-2, 8p-4, 8m-1 and 8m-3 add to
-/// its database paths, and that each dormant one keeps no production caller.
-/// Its one connection owner is allowed above, with its reason; its one bound
-/// site is known above.
+/// 8k-2, 8k-3a..3c, 8l-1, 8l-2, 8l-3a/3b, 8l-4a, 8l-4b, 8l-5a/5b, 8p-1,
+/// 8p-2, 8p-4, 8p-O, 8m-1 and 8m-3 (and the composition's binding of 8p-4's
+/// mark venue) add to its database paths, and that each dormant one keeps no
+/// production caller. Its one connection owner is allowed above, with its
+/// reason; its one bound site is known above. Each set is the union of the
+/// lanes' own on the composed tree (the PS lanes' owners have their own test
+/// below).
 #[test]
 fn package5a_owners_stay_dormant_or_bounded() {
     let sources = production_sources();
