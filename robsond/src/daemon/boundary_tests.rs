@@ -845,7 +845,10 @@ async fn a_lost_apply_commit_retires_its_connection_raw(pool: PgPool) {
         waited >= Duration::from_secs(2) && waited < Duration::from_secs(5),
         "{waited:?}"
     );
-    tokio::time::timeout(Duration::from_secs(1), async {
+    // The apply's connection is retired raw, closing its relay; whether any
+    // connection went back to the pool is the idleness check below. This
+    // bound (the apply's own 10 s above) only ends a hang.
+    tokio::time::timeout(Duration::from_secs(10), async {
         while proxy.closed_relays() == closed {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

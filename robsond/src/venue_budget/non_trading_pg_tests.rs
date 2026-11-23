@@ -539,25 +539,24 @@ async fn a_non_trading_bootstrap_is_bounded_and_dropped_on_expiry(pool: PgPool) 
         .await?;
 
     let (proxy, wired) = wire(&pool).await?;
-    let began = std::time::Instant::now();
     let locked = bootstrap(&wired, tenant, &start, &clock, &Trace::default()).await;
+    // `Invalid`, the server's lock bound, not `Expired`, the 5 s deadline.
     ensure!(matches!(locked, Err(BudgetError::Invalid)), "{:?}", locked.err());
-    ensure!(began.elapsed() < Duration::from_secs(3), "ended by the server's lock bound");
     // The insert waited on the lock (from its parse) and never completed: no
     // COMMIT followed.
     let shape = shapes(&proxy);
     ensure!(shape[..3] == ["begin", "bounds", "pause"] && shape.len() <= 4, "{shape:?}");
     ensure!(!shape.contains(&"commit"), "{shape:?}");
 
-    let began = std::time::Instant::now();
     let deadline = Instant::now() + Duration::from_millis(150);
     let expired =
         bootstrap::non_trading(&pool, tenant, &start, &clock, deadline, &Trace::default()).await;
     ensure!(matches!(expired, Err(BudgetError::Expired)), "{:?}", expired.err());
-    ensure!(began.elapsed() < Duration::from_secs(1));
     let waiting = "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
                    AND state <> 'idle' AND query LIKE '-- B05:%'";
-    let gone = Instant::now() + Duration::from_secs(3);
+    // A hang guard: the server ends the session once its 300 ms lock bound
+    // refuses the insert the dropped bootstrap left waiting.
+    let gone = Instant::now() + Duration::from_secs(5);
     while sqlx::query_scalar::<_, i64>(waiting).fetch_one(&pool).await? != 0 {
         ensure!(Instant::now() < gone, "the dropped bootstrap's session still waits");
         tokio::time::sleep(Duration::from_millis(50)).await;

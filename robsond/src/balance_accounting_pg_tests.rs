@@ -1118,9 +1118,11 @@ async fn a_usdm_projector_issues_its_pre_8l_statements(pool: PgPool) {
 }
 
 /// The projector takes the accounting rows before `monthly_state`: the bump
-/// precedes the write in its trace, and while another transaction holds the
-/// tenant's accounting row the waiting apply holds no `monthly_state` lock.
-/// It then lands whole or, past its 300 ms lock bound, not at all.
+/// precedes the write in its trace; and an apply that finds the tenant's
+/// accounting row held waits on it, is refused at its 300 ms lock bound
+/// (`BOUNDS`) while the row stays held, and never reached `monthly_state`:
+/// its whole trace has the bump and no `monthly_state` statement, and
+/// nothing changed.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn projector_takes_the_accounting_row_before_monthly_state(pool: PgPool) {
@@ -1140,49 +1142,19 @@ async fn projector_takes_the_accounting_row_before_monthly_state(pool: PgPool) {
         .fetch_all(&mut *holder)
         .await
         .unwrap();
-    let waiting = {
-        let (pool, installed) = (pool.clone(), installed.clone());
-        tokio::spawn(async move {
-            let event = recalibration(april(), "9000");
-            apply_event_to_projections_with(&pool, &event, projector_step(Some(&installed))).await
-        })
-    };
-    let pid: i32 = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let found = sqlx::query_scalar(
-                "SELECT pid FROM pg_stat_activity WHERE datname = current_database() \
-                 AND wait_event_type = 'Lock' AND query LIKE 'WITH locked AS (%'",
-            )
-            .fetch_optional(&pool)
-            .await
-            .unwrap();
-            if let Some(pid) = found {
-                break pid;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("the apply must wait on the accounting row");
-    let monthly_locks: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_locks WHERE pid = $1 AND relation = 'monthly_state'::regclass",
-    )
-    .bind(pid)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let event = recalibration(april(), "9000");
+    let step = projector_step(Some(&installed));
+    let refused = apply_event_to_projections_with(&proxied, &event, step);
+    let (refused, shape) = traced(&proxy, refused).await;
     holder.rollback().await.unwrap();
-    let applied = waiting.await.unwrap();
-    assert_eq!(monthly_locks, 0, "monthly_state locked before the accounting row");
+    assert!(refused.is_err(), "the apply landed past a held row: {shape:?}");
+    assert!(shape.contains(&"bump"), "{shape:?}");
+    assert!(
+        !shape.iter().any(|s| ["monthly", "lock"].contains(s)),
+        "monthly_state before the accounting row: {shape:?}"
+    );
     let (base, _, _) = month(&pool, april()).await;
-    match applied {
-        Ok(()) => {
-            assert_eq!((versions(&pool, &installed).await, base), ((2, Some(2)), 9000.into()))
-        },
-        Err(_) => {
-            assert_eq!((versions(&pool, &installed).await, base), ((1, Some(1)), 10000.into()))
-        },
-    }
+    assert_eq!((versions(&pool, &installed).await, base), ((1, Some(1)), 10000.into()));
 }
 
 /// Healthy progress: repeated applies on a balance daemon each advance the

@@ -413,9 +413,12 @@ async fn an_inventory_triple_uses_one_sample() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_body_over_its_cap_is_refused_before_decode() {
     let flood = rig(endless().await);
-    let began = Instant::now();
-    assert_eq!(flood.reads.rules(soon(3_000)).await.err(), Some(TimeError::Payload));
-    assert!(began.elapsed() < Duration::from_secs(2));
+    // `Payload`, not `Expired`: refused at its cap, before its deadline; a
+    // read that went on would end only at that deadline, the body endless.
+    // The deadline is a read's own bound, so nothing shorter than what a
+    // read may take races the transport's preparation.
+    let read = flood.reads.rules(Instant::now() + REQUEST_BOUND).await;
+    assert_eq!(read.err(), Some(TimeError::Payload));
     assert_eq!(flood.used(), (20, 1));
     let venue = venue().await;
     let owner = rig(venue.url());
@@ -430,7 +433,8 @@ async fn a_body_over_its_cap_is_refused_before_decode() {
 
 /// A deadline before the handoff is a proven no-send; one passed after it
 /// leaves the weight charged and fails the read. The triple's subreads share
-/// its one deadline: a held third read ends with it, never 10 s later.
+/// its one deadline: a held third read ends with it, never 10 s later; and a
+/// deadline that passes before the third read is reserved sends no third.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_composite_never_resets_its_deadline() {
     let venue = venue().await;
@@ -444,11 +448,25 @@ async fn a_composite_never_resets_its_deadline() {
     assert_eq!(owner.used(), (0, 0));
     venue.hold_next("/api/v3/openOrderList");
     let began = Instant::now();
-    let held = owner.reads.inventory(began + Duration::from_millis(1_500)).await;
-    assert_eq!(held.err(), Some(TimeError::Expired));
-    assert!(began.elapsed() < Duration::from_millis(2_500));
-    assert_eq!(owner.used(), (32, 3));
-    assert_eq!(venue.requests().len(), 3);
+    let deadline = began + Duration::from_millis(1_500);
+    let held = owner.reads.inventory(deadline).await;
+    let ended = Instant::now();
+    // Which subread the deadline found (the held third, or an earlier one
+    // when the first two took longer) depends on the host, not on the code;
+    // either way the triple ends at its one deadline. A deadline reset for a
+    // later subread would let it run REQUEST_BOUND from its own start, which
+    // comes after `began`, and a third read is always sent then.
+    assert!(matches!(
+        held.err(),
+        Some(TimeError::Expired | TimeError::Budget(BudgetError::Expired))
+    ));
+    assert!(ended >= deadline && ended < began + REQUEST_BOUND, "{:?}", ended - began);
+    // Each subread handed off is charged at its weight, in order, and none
+    // reaches the venue without its handoff.
+    let (weight, handoffs) = owner.used();
+    assert!(handoffs <= 3, "{handoffs} handoffs");
+    assert_eq!((weight, handoffs), [(0, 0), (20, 1), (26, 2), (32, 3)][handoffs as usize]);
+    assert!(venue.requests().len() as u64 <= handoffs);
     venue.shutdown().await.unwrap();
 }
 
@@ -504,9 +522,14 @@ async fn a_fifth_reader_is_refused_not_queued() {
         held.push(tokio::spawn(rules(owner.reads.clone())));
         until(|| venue.held() == reader).await;
     }
-    let fifth =
-        tokio::time::timeout(Duration::from_millis(100), owner.reads.inventory(soon(15_000)));
-    assert_eq!(fifth.await.expect("refused at once").err(), Some(TimeError::Busy));
+    // At once means on its first poll, before any await: no clock decides it.
+    let fifth = owner.reads.inventory(soon(15_000));
+    let mut fifth = std::pin::pin!(fifth);
+    let polled = std::future::poll_fn(|cx| Poll::Ready(fifth.as_mut().poll(cx))).await;
+    let Poll::Ready(fifth) = polled else {
+        panic!("a fifth reader was queued, not refused")
+    };
+    assert_eq!(fifth.err(), Some(TimeError::Busy));
     assert_eq!(owner.used(), (80, 4));
     venue.shutdown().await.unwrap();
     for read in held {

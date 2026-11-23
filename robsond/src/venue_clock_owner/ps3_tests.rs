@@ -214,7 +214,7 @@ proptest! {
         }
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
-            let mut owner = offline_owner();
+            let (mut owner, _) = offline_owner();
             let handoffs = owner.budget.handoffs();
             for (_, _, past_ms) in &offsets {
                 let deadline = Instant::now() - Duration::from_millis(*past_ms);
@@ -381,8 +381,9 @@ fn a_waiting_sampler_wakes_for_a_request() {
 }
 
 /// A non-trading TIME owner whose budget is inside its grant window (no
-/// reservation can succeed), with a lazy pool and a client never reached.
-fn offline_owner() -> ClockOwner {
+/// reservation can succeed), with a lazy pool and a client never reached,
+/// and its budget's start capture.
+fn offline_owner() -> (ClockOwner, TickCapture) {
     let clock = Arc::new(NativeClock::initialize().unwrap());
     let budget = SharedBudget::non_trading(clock.capture().unwrap(), None, false).unwrap();
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -400,7 +401,9 @@ fn offline_owner() -> ClockOwner {
         open_incidents: Vec::new(),
     };
     let client = Arc::new(BinanceRestClient::new(String::new(), String::new()));
-    ClockOwner::non_trading(clock, client, &pool, Uuid::from_u128(4), &start, &budget).unwrap()
+    let owner =
+        ClockOwner::non_trading(clock, client, &pool, Uuid::from_u128(4), &start, &budget).unwrap();
+    (owner, budget.start().unwrap())
 }
 
 /// The spawned owner's reader handle, offline: no evidence before a sample,
@@ -408,8 +411,17 @@ fn offline_owner() -> ClockOwner {
 /// joins the sampler and the watchdog (first cycle 121 s away: unclean).
 #[tokio::test]
 async fn an_offline_owner_answers_its_readers_and_closes() {
-    let owner = offline_owner();
-    assert!(owner.first > Duration::from_secs(120) && owner.first <= Duration::from_secs(121));
+    let (owner, budget_start) = offline_owner();
+    // The owner took its own capture after the budget's start, with the
+    // client, the lazy pool and the metrics registration in between: time
+    // no fixed window bounds. A capture taken now bounds it from above.
+    let since_start = owner.clock.capture().unwrap().elapsed_since(&budget_start).unwrap();
+    let unclean = Duration::from_secs(121);
+    assert!(
+        owner.first <= unclean && owner.first >= unclean.saturating_sub(since_start),
+        "first cycle in {:?}, {since_start:?} after the budget's start",
+        owner.first
+    );
     let handle = owner.handle();
     let closing = owner.spawn();
     assert!(handle.clock_evidence().is_err(), "evidence before any sample");

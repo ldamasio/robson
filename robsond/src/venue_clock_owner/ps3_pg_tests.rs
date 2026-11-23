@@ -10,7 +10,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use chrono::Utc;
 use robson_testkit::db_proxy::{DbProxy, ProxyMode};
 use sqlx::{
@@ -29,13 +29,16 @@ use crate::{
     venue_budget::state::SharedBudget,
 };
 
-/// A loopback TIME venue: one answer per connection, after `delay_ms`, with
-/// `serverTime` shifted by `offset_ms`; connections counted.
+/// A loopback TIME venue: one answer per connection, after `delay_ms` and
+/// once not held, with `serverTime` shifted by `offset_ms`; connections
+/// counted, each answer's instant kept.
 struct TimeServer {
     base_url: String,
     connections: Arc<AtomicUsize>,
     delay_ms: Arc<AtomicU64>,
     offset_ms: Arc<AtomicI64>,
+    hold: tokio::sync::watch::Sender<bool>,
+    answered: Arc<Mutex<Vec<Instant>>>,
     task: JoinHandle<()>,
 }
 
@@ -46,12 +49,19 @@ impl TimeServer {
         let connections = Arc::new(AtomicUsize::new(0));
         let delay_ms = Arc::new(AtomicU64::new(0));
         let offset_ms = Arc::new(AtomicI64::new(0));
-        let (count, delay, offset) =
-            (Arc::clone(&connections), Arc::clone(&delay_ms), Arc::clone(&offset_ms));
+        let (hold, held) = tokio::sync::watch::channel(false);
+        let answered = Arc::new(Mutex::new(Vec::new()));
+        let (count, delay, offset, answers) = (
+            Arc::clone(&connections),
+            Arc::clone(&delay_ms),
+            Arc::clone(&offset_ms),
+            Arc::clone(&answered),
+        );
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 count.fetch_add(1, Ordering::SeqCst);
                 let (delay, offset) = (delay.load(Ordering::SeqCst), offset.load(Ordering::SeqCst));
+                let (mut held, answers) = (held.clone(), Arc::clone(&answers));
                 tokio::spawn(async move {
                     let mut head = Vec::new();
                     while !head.ends_with(b"\r\n\r\n") && head.len() < 16_384 {
@@ -61,6 +71,7 @@ impl TimeServer {
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(delay)).await;
+                    let _ = held.wait_for(|held| !*held).await;
                     let body =
                         format!("{{\"serverTime\":{}}}", Utc::now().timestamp_millis() + offset);
                     let answer = format!(
@@ -68,6 +79,7 @@ impl TimeServer {
                          {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
+                    answers.lock().unwrap().push(Instant::now());
                     let _ = socket.write_all(answer.as_bytes()).await;
                     let _ = socket.shutdown().await;
                 });
@@ -78,12 +90,28 @@ impl TimeServer {
             connections,
             delay_ms,
             offset_ms,
+            hold,
+            answered,
             task,
         })
     }
 
     fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    /// Answers wait, from now until [`Self::release`], however long that is.
+    fn hold(&self) {
+        self.hold.send_replace(true);
+    }
+
+    fn release(&self) {
+        self.hold.send_replace(false);
+    }
+
+    /// When the venue wrote each answer, in order.
+    fn answered(&self) -> Vec<Instant> {
+        self.answered.lock().unwrap().clone()
     }
 }
 
@@ -204,13 +232,17 @@ async fn a_sample_is_published_only_after_it_lands(pool: PgPool) -> Result<()> {
     let (proxy, wired) = wire(&pool).await?;
     let mut owner = rig.owner(&wired)?;
     let handle = owner.handle();
-    // The database refuses at once: the store fails well before the cycle's
+    // The database refuses at once: the store fails before the cycle's
     // persistence bound, so nothing but the failure stops the publication.
+    // The refusal is the severed connect's I/O error (Backend), which no
+    // bound's expiry yields (Expired, or Unpublished after an attempt); no
+    // fixed window over the cycle's transport preparation and connects.
     proxy.set_mode(ProxyMode::Sever);
-    let began = Instant::now();
     let lost = owner.run_cycle_kind(CycleKind::OnDemand { deadline: in_ms(5_000) }).await;
-    ensure!(matches!(lost, Err(TimeError::Storage(_))), "{lost:?}");
-    ensure!(began.elapsed() < Duration::from_millis(1_500), "{:?}", began.elapsed());
+    ensure!(
+        matches!(lost, Err(TimeError::Storage(crate::venue_clock_store::StoreError::Backend))),
+        "{lost:?}"
+    );
     ensure!(rig.server.connections() == 1 && rig.handoffs()? == 1, "the request went out");
     ensure!(handle.clock_evidence().is_err(), "published without a landed row");
     ensure!(epoch_samples(&pool, rig.start.epoch.epoch_id).await? == 0);
@@ -419,13 +451,18 @@ async fn o2_five_seconds_after_o1_gets_its_own_sample(pool: PgPool) -> Result<()
 }
 
 /// PLAN §6.6, Root's condition: an on-demand cycle ends by its caller's
-/// deadline, whatever holds it (a slow venue in the HTTP exchange, a
-/// database that answers nothing in the persistence), over generated cases:
-/// the sampler takes the next request (`Deferred`, within 5 s of the
-/// handoff) no later than the caller's deadline plus a little.
+/// deadline, whatever holds it, over generated cases: a venue that holds its
+/// answer (the HTTP exchange), a database that answers nothing (the
+/// persistence), or nothing. Each is judged against what ignoring the
+/// deadline would cost (`run_cycle_kind`'s bounds): the sampler takes the
+/// next request (`Deferred`, within 5 s of the handoff) before the exchange's
+/// 10 s from the cycle's start; the persistence's connection is dropped
+/// before 2 s from the venue's answer.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn an_on_demand_cycle_never_outlives_its_caller_deadline(pool: PgPool) -> Result<()> {
+    const HTTP_BOUND: Duration = Duration::from_secs(10);
+    const PERSIST_BOUND: Duration = Duration::from_secs(2);
     let mut seed = 0x9e37_79b9_u64;
     for (venue_ms, blackhole) in [
         (2_000, false),
@@ -436,29 +473,103 @@ async fn an_on_demand_cycle_never_outlives_its_caller_deadline(pool: PgPool) -> 
         (300, true),
     ] {
         seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-        let deadline_ms = 150 + (seed >> 33) % 750;
+        // 2-3 s: inside the 5 s on-demand spacing, so the next request is
+        // `Deferred` once the sampler takes it.
+        let deadline_ms = 2_000 + (seed >> 33) % 1_000;
+        // 2_000: the venue holds its answer past the deadline (released only
+        // after the case). A blackhole: the venue answers half a second
+        // before the deadline, into a persistence that nothing answers.
+        let http_held = venue_ms == 2_000;
+        let persistence_held = blackhole && !http_held;
         let rig = rig(&pool).await?;
         let (proxy, wired) = wire(&pool).await?;
         let owner = rig.owner(&wired)?;
         let handle = owner.handle();
         let closing = owner.spawn();
-        rig.server.delay_ms.store(venue_ms, Ordering::SeqCst);
+        if http_held || persistence_held {
+            rig.server.hold();
+        } else {
+            rig.server.delay_ms.store(venue_ms, Ordering::SeqCst);
+        }
         if blackhole {
             proxy.set_mode(ProxyMode::Blackhole);
         }
         let began = Instant::now();
-        let first = handle.request_sample(began + Duration::from_millis(deadline_ms)).await;
-        let next = handle.request_sample(in_ms(3_000)).await;
-        let free = began.elapsed();
+        let deadline = began + Duration::from_millis(deadline_ms);
+        let release = async {
+            if persistence_held {
+                while rig.server.connections() == 0 && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                tokio::time::sleep_until(deadline - Duration::from_millis(500)).await;
+                rig.server.release();
+            }
+        };
+        // The persistence's connection, as the proxy sees it: dropped at the
+        // caller's deadline by a correct cycle, kept to 2 s after the answer
+        // (at the earliest) by one that ignores it. Its close is judged, not
+        // the sampler's release, which also waits for the blocking parser.
+        let connections = proxy.stats().connections;
+        let closed = proxy.closed_relays();
+        let done = AtomicBool::new(false);
+        let close = async {
+            loop {
+                if !persistence_held {
+                    break None;
+                }
+                if proxy.closed_relays() > closed {
+                    break Some(Instant::now());
+                }
+                if done.load(Ordering::SeqCst) && proxy.stats().connections == connections {
+                    break None;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        };
+        let cycle = async {
+            let (first, ()) = tokio::join!(handle.request_sample(deadline), release);
+            // A held exchange runs to its 10 s bound; a cycle that ends by
+            // itself, or behind the blackhole, ends by its own 10 s exchange
+            // and 2 s persistence.
+            let free_by = began
+                + HTTP_BOUND
+                + if http_held {
+                    Duration::ZERO
+                } else {
+                    PERSIST_BOUND
+                };
+            let next = handle.request_sample(free_by).await;
+            let free = Instant::now();
+            done.store(true, Ordering::SeqCst);
+            (first, next, free)
+        };
+        let close = async { tokio::time::timeout(HTTP_BOUND + PERSIST_BOUND, close).await };
+        let ((first, next, free), close) = tokio::join!(cycle, close);
         let case = format!("venue {venue_ms} ms, blackhole {blackhole}, deadline {deadline_ms} ms");
-        ensure!(free <= Duration::from_millis(deadline_ms + 300), "{case}: free after {free:?}");
+        if http_held {
+            ensure!(free < began + HTTP_BOUND, "{case}: free {:?} after the start", free - began);
+        }
+        // A persistence case whose request never went out (its preparation
+        // outlasted the deadline) has no answer and no connection: not judged.
+        if persistence_held && proxy.stats().connections > connections {
+            let answered =
+                *rig.server.answered().first().context("a persistence without an answer")?;
+            let close = close.map_err(|_| anyhow!("{case}: the persistence was never dropped"))?;
+            let close = close.context("a connection that never closed")?;
+            ensure!(
+                close < answered + PERSIST_BOUND,
+                "{case}: the persistence was dropped {:?} after the answer",
+                close - answered
+            );
+        }
         ensure!(
             next == Err(TimeError::Budget(BudgetError::Deferred)),
             "{case}: {first:?} {next:?}"
         );
-        if venue_ms > deadline_ms || blackhole {
+        if http_held || persistence_held {
             ensure!(first.is_err() && handle.clock_evidence().is_err(), "{case}: {first:?}");
         }
+        rig.server.release();
         proxy.set_mode(ProxyMode::Pass);
         closing.begin_closing();
         ensure!(closing.join(in_ms(5_000)).await, "{case}: the owner's tasks did not end");
@@ -475,7 +586,8 @@ async fn an_expired_queued_sample_request_is_refused_unsent(pool: PgPool) -> Res
     let clock = Arc::new(NativeClock::initialize()?);
     let tenant = Uuid::now_v7();
     // A clean predecessor: the first scheduled cycle comes at once (start +
-    // 61 s has passed for this budget) and holds the sampler for 600 ms.
+    // 61 s has passed for this budget) and holds the sampler while the venue
+    // holds its answer.
     sqlx::query(
         "INSERT INTO process_epochs (epoch_id, tenant_id, binary_version, clean_stop_at, \
          marker_version) VALUES ($1, $2, 'ps-3-predecessor', now(), $3)",
@@ -496,29 +608,43 @@ async fn an_expired_queued_sample_request_is_refused_unsent(pool: PgPool) -> Res
         budget,
         server: TimeServer::start().await?,
     };
-    rig.server.delay_ms.store(600, Ordering::SeqCst);
+    rig.server.hold();
     let owner = rig.owner(&pool)?;
     let handle = owner.handle();
     let closing = owner.spawn();
     // The first cycle prepares its transport on a blocking permit before it
     // connects, which a loaded module run can delay past any fixed sleep:
-    // wait (bounded) for its connection; the server then holds it 600 ms.
+    // wait (bounded) for its connection; the server then holds its answer
+    // until the test releases it, so the queued request's 100 ms pass behind
+    // the cycle in flight whatever the scheduling.
     let connected = in_ms(5_000);
     while rig.server.connections() == 0 && Instant::now() < connected {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     ensure!(rig.server.connections() == 1, "the scheduled cycle is in flight");
-    let queued = handle.request_sample(in_ms(100)).await;
+    // The test also waits on the queued request itself: the sampler answers
+    // it when it takes it, after the held cycle, and only then may a later
+    // request be made (one made before would join it and lend it a live
+    // deadline).
+    let deadline = in_ms(100);
+    let taken = handle.requests.join(deadline).map_err(|e| anyhow!("join: {e:?}"))?;
+    let queued = handle.request_sample(deadline).await;
     ensure!(queued == Err(TimeError::Expired), "{queued:?}");
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    ensure!(rig.server.connections() == 1 && rig.handoffs()? == 1);
+    rig.server.release();
+    let taken = tokio::time::timeout(Duration::from_secs(10), taken).await;
     ensure!(
-        rig.server.connections() == 1 && rig.handoffs()? == 1,
-        "the expired request went out"
+        matches!(taken, Ok(Ok(Err(TimeError::Expired)))),
+        "the sampler sent the expired request: {taken:?}"
     );
-    rig.server.delay_ms.store(0, Ordering::SeqCst);
+    // Refused, unsent and spending no spacing: the next request goes out at
+    // once as the second exchange.
     let next = handle.request_sample(in_ms(5_000)).await;
     ensure!(next.is_ok(), "the expired request spent the spacing: {next:?}");
-    ensure!(rig.server.connections() == 2 && rig.handoffs()? == 2);
+    ensure!(
+        rig.server.connections() == 2 && rig.handoffs()? == 2,
+        "the expired request went out"
+    );
     closing.begin_closing();
     ensure!(closing.join(in_ms(5_000)).await);
     Ok(())

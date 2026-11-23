@@ -605,7 +605,10 @@ async fn a_writer_refusal_ends_the_scan(pool: PgPool) -> Result<()> {
         let scope = desk.f.scope();
         let metrics = ScanMetrics::new(None);
         let mut reads = desk.reads(&pool, "1000", vec![Step::Answer { btc: "0", bump: false }]);
-        reads.hold = Duration::from_millis(500);
+        // The stale case's margin on each side of the 60 s freshness is half
+        // this hold: at least a second of scheduling between its measurement
+        // and its checks.
+        reads.hold = Duration::from_millis(2_000);
         if case == "dirty" {
             // Booked in another scope, inside the first receipt's interval.
             desk.fill(&pool, wall(10, 500)).await?;
@@ -620,12 +623,19 @@ async fn a_writer_refusal_ends_the_scan(pool: PgPool) -> Result<()> {
                 let _ = gate.record(IncidentReason::StreamSuspended);
             },
             "stale" => {
-                let shift = Duration::from_millis(59_500);
+                // Measured now, the shift puts the arrival half the venue's
+                // hold inside the writer's 60 s freshness and the floor (before
+                // the request) at least half the hold past it, whatever the
+                // scan took after the arrival.
+                let fresh = Duration::from_secs(60);
+                let shift = fresh
+                    .checked_sub(reads.arrived[0].elapsed() + reads.hold / 2)
+                    .context("an arrival inside the window")?;
                 let cash = scanned.cash.as_mut().context("the writer's input")?;
                 cash.received = cash.received.checked_sub(shift).context("monotonic")?;
                 let arrived = reads.arrived[0].checked_sub(shift).context("monotonic")?;
-                ensure!(arrived.elapsed() < Duration::from_secs(60), "fresh from arrival");
-                ensure!(cash.received.elapsed() > Duration::from_secs(60), "stale from the floor");
+                ensure!(arrived.elapsed() < fresh, "fresh from arrival");
+                ensure!(cash.received.elapsed() > fresh, "stale from the floor");
             },
             _ => {},
         }
@@ -913,9 +923,13 @@ async fn generated_interleavings_conclude_only_after_every_invalidator(pool: PgP
                                 .await?;
                         },
                     }
+                    // Released once the writer waits on the rows, inside its
+                    // 300 ms lock bound, as `stalled` releases its locks.
+                    let pool = &pool;
                     let release = async move {
-                        tokio::time::sleep(Duration::from_millis(60)).await;
-                        tx.commit().await
+                        waiting(pool, 1).await?;
+                        tx.commit().await?;
+                        anyhow::Ok(())
                     };
                     let (routed, committed) = tokio::join!(routing, release);
                     committed?;

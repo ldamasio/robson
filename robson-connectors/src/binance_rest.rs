@@ -1908,18 +1908,32 @@ mod tests {
 
     use super::*;
 
+    /// The request targets a [`by_path`] server saw, in order.
+    struct Served {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Served {
+        /// Stops the server once the client's call has returned: every
+        /// request the call made was answered, so it is already recorded.
+        fn stop(self) -> Vec<String> {
+            self.task.abort();
+            std::mem::take(&mut *self.seen.lock().unwrap())
+        }
+    }
+
     /// Answer each request by its path from `answers` (status, body) until
-    /// the client stops asking; return the request targets seen.
+    /// the test stops the server, recording each target before its answer.
     async fn by_path(
         answers: &'static [(&'static str, u16, &'static str)],
-    ) -> (BinanceRestClient, tokio::task::JoinHandle<Vec<String>>) {
+    ) -> (BinanceRestClient, Served) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            let mut seen = Vec::new();
-            while let Ok(Ok((mut stream, _))) =
-                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
-            {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
                 let mut head = Vec::new();
                 let mut buf = [0_u8; 1024];
                 while !head.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -1940,12 +1954,11 @@ mod tests {
                      Connection: close\r\n\r\n{body}",
                     body.len()
                 );
+                record.lock().unwrap().push(target);
                 let _ = stream.write_all(response.as_bytes()).await;
-                seen.push(target);
             }
-            seen
         });
-        (BinanceRestClient::with_local_base_url(origin), server)
+        (BinanceRestClient::with_local_base_url(origin), Served { seen, task })
     }
 
     /// ADR-0056 step 8m-3, C6: the three account-wide reads, each signed and
@@ -1971,7 +1984,7 @@ mod tests {
         ];
         let (client, server) = by_path(&OPEN).await;
         assert_eq!(client.open_book_counts().await.unwrap(), [1, 2, 1]);
-        let seen = server.await.unwrap();
+        let seen = server.stop();
         let paths: Vec<&str> = seen.iter().map(|t| t.split('?').next().unwrap()).collect();
         assert_eq!(paths, [
             "/fapi/v2/positionRisk",
@@ -1998,7 +2011,7 @@ mod tests {
             matches!(refused, BinanceRestError::ApiError { code: -2015, http_status: 401, .. }),
             "{refused:?}"
         );
-        assert_eq!(server.await.unwrap().len(), 3);
+        assert_eq!(server.stop().len(), 3);
         // Without Binance's JSON body, the status stays in the text the
         // cutover report classifies (robsond's `usdm_refusal`).
         static BARE: [(&str, u16, &str); 1] = [("/fapi/v2/positionRisk", 403, "<html></html>")];
@@ -2008,7 +2021,7 @@ mod tests {
             matches!(&refused, BinanceRestError::RequestFailed(text) if text.starts_with("HTTP 403")),
             "{refused:?}"
         );
-        assert_eq!(server.await.unwrap().len(), 1);
+        assert_eq!(server.stop().len(), 1);
     }
 
     #[tokio::test]

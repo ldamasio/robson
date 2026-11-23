@@ -282,8 +282,10 @@ async fn a_database_that_is_down_lands_nothing(pool: PgPool) -> Result<()> {
     let down =
         persist(&wired, tenant, &observed(domain, 1_000 * SECOND, 30), &clock, &Trace::default())
             .await;
+    // Only the write's deadline can end a write nothing answers: `Expired`,
+    // after waiting it out.
     ensure!(down == Err(BudgetError::Expired), "{down:?}");
-    ensure!(began.elapsed() < Duration::from_millis(2_500));
+    ensure!(began.elapsed() >= WRITE_BOUND, "{:?}", began.elapsed());
     ensure!(stored_row(&pool, tenant).await?.is_none());
     Ok(())
 }

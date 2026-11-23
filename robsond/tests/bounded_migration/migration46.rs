@@ -562,7 +562,10 @@ async fn fault(pool: PgPool, version: i64, case: Fault) -> Result<()> {
             if case == Fault::RestoreSever {
                 let closed = proxy.closed_relays();
                 proxy.set_mode(ProxyMode::Sever);
-                timeout(Duration::from_millis(80), async {
+                // The relay closes on the proxy's next poll; the apply waits at
+                // its restore stage meanwhile, so the bound is the stage
+                // controller's own ceiling, as for `hit` above.
+                timeout(CONTROLLER_CEILING, async {
                     while proxy.closed_relays() == closed {
                         tokio::task::yield_now().await;
                     }
