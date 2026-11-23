@@ -1031,9 +1031,17 @@ async fn repeated_reanchors_keep_e_continuous(pool: PgPool) -> Result<()> {
 async fn rehearsal_withdrawal_is_fenced_until_the_next_boundary(pool: PgPool) -> Result<()> {
     let rig = Rig::bare(&pool, false).await?;
     let t0 = utc("2026-11-10T12:00:00Z");
+    // The anchor's cutover run (M56's foreign key).
+    let cutover = Uuid::now_v7();
+    sqlx::query(include_str!("../../../../../tests/fixtures/cutover_run.sql"))
+        .bind("binance:spot")
+        .bind(rig.book.tenant)
+        .bind(cutover)
+        .execute(&pool)
+        .await?;
     sqlx::query("INSERT INTO cash_anchors (anchor_id,tenant_id,venue_id,kind,cutover_id,quote,as_of,send_at,receive_at,u_ns,sample_id,epoch_id,interval_start,interval_end,depends_start,depends_end)
         VALUES ($1,$2,'binance:spot','cutover',$3,2000,$4,$4+interval '150 ms',$4+interval '350 ms',150000000,$5,$6,$4,$4+interval '500 ms',$4-interval '10 s',$4+interval '500 ms')")
-        .bind(Uuid::now_v7()).bind(rig.book.tenant).bind(Uuid::now_v7()).bind(t0).bind(rig.book.sample).bind(rig.book.epoch)
+        .bind(Uuid::now_v7()).bind(rig.book.tenant).bind(cutover).bind(t0).bind(rig.book.sample).bind(rig.book.epoch)
         .execute(&pool).await?;
     rig.scan(&pool, t0 + TimeDelta::minutes(1), dec!(2000)).await?;
     rig.scan(&pool, t0 + TimeDelta::minutes(5), dec!(1900)).await?;

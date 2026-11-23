@@ -71,8 +71,14 @@ impl Fixture {
     ) -> Result<Self> {
         sqlx::query("INSERT INTO accounting_state (tenant_id,venue_id,budget_model) VALUES ($1,$2,'net_from_start_non_expanding_v1')")
             .bind(tenant).bind(venue).execute(pool).await?;
-        sqlx::query("INSERT INTO venue_accounts (venue_id,account_scope,tenant_id,uid,bound_at,cutover_id) VALUES ($1,$2,$3,$4,now(),$5)")
-            .bind(venue).bind(scope).bind(tenant).bind(UID).bind(Uuid::now_v7()).execute(pool).await?;
+        // Bound to a cutover run of the tenant (M56's foreign key).
+        sqlx::query(include_str!("../../tests/fixtures/bound_venue_account.sql"))
+            .bind(venue)
+            .bind(scope)
+            .bind(tenant)
+            .bind(UID)
+            .execute(pool)
+            .await?;
         Self::epoch_of(pool, tenant, epoch).await?;
         Ok(Self {
             tenant,

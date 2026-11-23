@@ -131,9 +131,16 @@ impl Book {
 
     /// A cutover anchor before completion: no `as_of` and no observation.
     pub(super) async fn pending(&self, pool: &PgPool, quote: Decimal) -> Result<Uuid> {
-        let id = Uuid::now_v7();
+        let (id, cutover) = (Uuid::now_v7(), Uuid::now_v7());
+        // Its cutover run (M56's foreign key).
+        sqlx::query(include_str!("../../../tests/fixtures/cutover_run.sql"))
+            .bind("binance:spot")
+            .bind(self.tenant)
+            .bind(cutover)
+            .execute(pool)
+            .await?;
         sqlx::query("INSERT INTO cash_anchors (anchor_id,tenant_id,venue_id,kind,cutover_id,quote) VALUES ($1,$2,'binance:spot','cutover',$3,$4)")
-            .bind(id).bind(self.tenant).bind(Uuid::now_v7()).bind(quote).execute(pool).await?;
+            .bind(id).bind(self.tenant).bind(cutover).bind(quote).execute(pool).await?;
         Ok(id)
     }
 

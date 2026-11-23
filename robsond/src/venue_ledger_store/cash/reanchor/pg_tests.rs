@@ -62,8 +62,14 @@ impl Fixture {
         let scope = format!("ra-{tenant}");
         sqlx::query("INSERT INTO accounting_state (tenant_id,venue_id,budget_model) VALUES ($1,'binance:spot','net_from_start_non_expanding_v1')")
             .bind(tenant).execute(pool).await?;
-        sqlx::query("INSERT INTO venue_accounts (venue_id,account_scope,tenant_id,uid,bound_at,cutover_id) VALUES ('binance:spot',$1,$2,$3,now(),$4)")
-            .bind(&scope).bind(tenant).bind(UID).bind(Uuid::now_v7()).execute(pool).await?;
+        // Bound to a cutover run of the tenant (M56's foreign key).
+        sqlx::query(include_str!("../../../../tests/fixtures/bound_venue_account.sql"))
+            .bind("binance:spot")
+            .bind(&scope)
+            .bind(tenant)
+            .bind(UID)
+            .execute(pool)
+            .await?;
         sqlx::query("INSERT INTO process_epochs (epoch_id,tenant_id,binary_version) VALUES ($1,$2,'8l-5-fixture')")
             .bind(epoch).bind(tenant).execute(pool).await?;
         sqlx::query("INSERT INTO clock_samples (sample_id,tenant_id,venue_id,process_epoch,clock_domain,send_wall_seconds,send_wall_nanoseconds,send_tick_before,send_tick_after,receive_wall_seconds,receive_wall_nanoseconds,receive_tick_before,receive_tick_after,server_ms,theta2_ns,r_low_ns,r_high_ns,u2_ns,numeric_verdict,numeric_failures,algorithm_version,recorded_at) VALUES ($1,$2,'binance:spot',$3,ROW('boottime',$4::uuid,0,0)::budget_clock_domain_v38,1794614400,0,0,0,1794614400,0,0,0,0,-3589228800000000000,0,0,3589228800200000000,'invalid',1,1,now())")

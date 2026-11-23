@@ -63,6 +63,14 @@ async fn account(pool: &PgPool, tenant: Uuid, venue: &str) {
 /// certified at `as_of` when one is given.
 async fn activation(pool: &PgPool, tenant: Uuid, venue: &str, month: &str, as_of: Option<&str>) {
     let cutover = Uuid::now_v7();
+    // Their cutover run (M56's foreign keys).
+    sqlx::query(include_str!("../../tests/fixtures/cutover_run.sql"))
+        .bind(venue)
+        .bind(tenant)
+        .bind(cutover)
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO cash_anchors (anchor_id, tenant_id, venue_id, kind, cutover_id, quote) \
          VALUES ($1, $2, $3, 'cutover', $4, 1805)",

@@ -1594,9 +1594,14 @@ fn nt_costs(
 async fn non_trading_cases(pool: &PgPool, tenant: Uuid, rig: &mut ReconciliationRig) -> Result<()> {
     use crate::balance_reconciliation::ScanScope;
     const NT: &str = "non-trading";
-    sqlx::query("INSERT INTO venue_accounts (venue_id,account_scope,tenant_id,uid,bound_at,cutover_id) VALUES ('binance:spot',$1,$2,$3,now(),$4)")
-        .bind(NT).bind(tenant).bind(LOOPBACK_UID.to_string()).bind(Uuid::now_v7())
-        .execute(pool).await?;
+    // Bound to the tenant's cutover run (M56's foreign key).
+    sqlx::query(include_str!("../fixtures/bound_venue_account.sql"))
+        .bind("binance:spot")
+        .bind(NT)
+        .bind(tenant)
+        .bind(LOOPBACK_UID.to_string())
+        .execute(pool)
+        .await?;
     rig.ready().await?;
     let ctx = Ctx::new(pool, rig).await?;
     let epoch = rig.start.epoch.epoch_id;
