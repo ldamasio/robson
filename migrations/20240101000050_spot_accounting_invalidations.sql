@@ -23,7 +23,7 @@ BEGIN
         CONSTRAINT accounting_invalidations_ids CHECK (
             invalidation_id <> '00000000-0000-0000-0000-000000000000'::UUID
             AND tenant_id <> '00000000-0000-0000-0000-000000000000'::UUID),
-        CONSTRAINT accounting_invalidations_month CHECK (EXTRACT(DAY FROM month) = 1),
+        CONSTRAINT accounting_invalidations_month CHECK ((EXTRACT(DAY FROM month) = 1) IS TRUE),
         CONSTRAINT accounting_invalidations_reason CHECK (reason IN ('unattributed_fill')),
         CONSTRAINT accounting_invalidations_evidence_key CHECK (btrim(evidence_key) <> ''),
         CONSTRAINT accounting_invalidations_fill CHECK (

@@ -32,7 +32,8 @@ BEGIN
             date_rule IN ('checkpoint_cut', 'o1_receipt_plus_u')
             AND (direction = 'withdrawal') = (date_rule = 'checkpoint_cut')),
         CONSTRAINT cash_attested_flows_month CHECK (
-            attributed_month = date_trunc('month', economic_date AT TIME ZONE 'UTC')::DATE)
+            isfinite(economic_date)
+            AND attributed_month = date_trunc('month', economic_date AT TIME ZONE 'UTC')::DATE)
     );
 
     CREATE TRIGGER cash_attested_flows_are_immutable BEFORE UPDATE OR DELETE ON public.cash_attested_flows

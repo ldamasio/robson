@@ -482,6 +482,18 @@ async fn boundary_snapshots_refuse_incoherent_rows(pool: PgPool) -> Result<()> {
             "23514",
             "boundary_snapshots_month",
         ),
+        // An infinite month has no day (EXTRACT is NULL), and its as_of is the
+        // same infinity: refused by the month CHECK, not passed as unknown.
+        (
+            set(&row, &[("month", json!("infinity")), ("as_of", json!("infinity"))]),
+            "23514",
+            "boundary_snapshots_month",
+        ),
+        (
+            set(&row, &[("month", json!("-infinity")), ("as_of", json!("-infinity"))]),
+            "23514",
+            "boundary_snapshots_month",
+        ),
         (
             with(&row, "as_of", json!("2026-12-01 00:00:00-03")),
             "23514",
@@ -1137,6 +1149,18 @@ async fn boundary_carried_legs_refuse_incoherent_rows(pool: PgPool) -> Result<()
         ),
         (
             with(&trade, "cohort_month", json!("2026-11-02")),
+            "23514",
+            "boundary_carried_legs_months",
+        ),
+        // An infinite cohort month has no day: -infinity is also before the
+        // month, so without IS TRUE the CHECK would be NULL AND TRUE and pass.
+        (
+            with(&trade, "cohort_month", json!("-infinity")),
+            "23514",
+            "boundary_carried_legs_months",
+        ),
+        (
+            with(&trade, "cohort_month", json!("infinity")),
             "23514",
             "boundary_carried_legs_months",
         ),

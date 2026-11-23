@@ -1200,6 +1200,24 @@ async fn cash_attested_flows_follow_their_rules(pool: PgPool) -> Result<()> {
             "23514",
             "cash_attested_flows_month",
         ),
+        // An infinite economic date has no UTC month: its date_trunc is the
+        // same infinity, which the equality alone would accept.
+        (
+            set(&withdrawal, &[
+                ("economic_date", json!("infinity")),
+                ("attributed_month", json!("infinity")),
+            ]),
+            "23514",
+            "cash_attested_flows_month",
+        ),
+        (
+            set(&withdrawal, &[
+                ("economic_date", json!("-infinity")),
+                ("attributed_month", json!("-infinity")),
+            ]),
+            "23514",
+            "cash_attested_flows_month",
+        ),
         (
             with(&withdrawal, "date_rule", json!("o1_receipt_plus_u")),
             "23514",
@@ -1430,6 +1448,25 @@ async fn accounting_invalidations_are_idempotent_and_immutable(pool: PgPool) -> 
             "accounting_invalidations_fill",
         ),
         (with(&row, "trade_id", Value::Null), "23514", "accounting_invalidations_fill"),
+        (with(&row, "trade_time", Value::Null), "23514", "accounting_invalidations_fill"),
+        // An infinite month has no day (EXTRACT is NULL) and equals the month
+        // of the same infinite trade time: refused by the month CHECK.
+        (
+            set(&row, &[
+                ("month", json!("infinity")),
+                ("trade_time", json!("infinity")),
+            ]),
+            "23514",
+            "accounting_invalidations_month",
+        ),
+        (
+            set(&row, &[
+                ("month", json!("-infinity")),
+                ("trade_time", json!("-infinity")),
+            ]),
+            "23514",
+            "accounting_invalidations_month",
+        ),
         (
             with(&row, "reason", json!("late_evidence")),
             "23514",

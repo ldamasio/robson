@@ -95,7 +95,7 @@ BEGIN
         CONSTRAINT boundary_snapshots_version_row FOREIGN KEY (tenant_id, venue_id)
             REFERENCES public.accounting_state (tenant_id, venue_id),
         CONSTRAINT boundary_snapshots_ids CHECK (tenant_id <> '00000000-0000-0000-0000-000000000000'::UUID),
-        CONSTRAINT boundary_snapshots_month CHECK (EXTRACT(DAY FROM month) = 1),
+        CONSTRAINT boundary_snapshots_month CHECK ((EXTRACT(DAY FROM month) = 1) IS TRUE),
         CONSTRAINT boundary_snapshots_as_of CHECK (as_of = (month::TIMESTAMP AT TIME ZONE 'UTC')),
         CONSTRAINT boundary_snapshots_state CHECK (state IN ('pending', 'complete', 'reopened')),
         CONSTRAINT boundary_snapshots_revision CHECK (

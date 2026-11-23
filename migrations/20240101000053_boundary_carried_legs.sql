@@ -59,7 +59,8 @@ BEGIN
                  OR lookup_clock_sample_id <> '00000000-0000-0000-0000-000000000000'::UUID)
             AND (cancel_intent_id IS NULL OR cancel_intent_id <> '00000000-0000-0000-0000-000000000000'::UUID)
             AND ledger_canonical_id(stop_order_id) AND ledger_canonical_id(stop_trade_id)),
-        CONSTRAINT boundary_carried_legs_months CHECK (EXTRACT(DAY FROM cohort_month) = 1 AND cohort_month < month),
+        CONSTRAINT boundary_carried_legs_months CHECK (
+            (EXTRACT(DAY FROM cohort_month) = 1 AND cohort_month < month) IS TRUE),
         CONSTRAINT boundary_carried_legs_kind CHECK (kind IN ('inventory', 'entry_in_flight')),
         CONSTRAINT boundary_carried_legs_amounts CHECK (
             ledger_amount_fits(g_b) AND ledger_amount_fits(vwap) AND ledger_amount_fits(trigger_b)
