@@ -221,6 +221,36 @@ fn c6_fails_on_an_open_usdm_algo_order() {
     only(&report(&db, &venue, CLEAN), "c6", "usdm_permission_missing");
 }
 
+/// C6's seam: 8m-6 fills `VenueFacts::usdm` with what a [`UsdmReadObserver`]
+/// answers (in production the Spot daemon key's client, through
+/// `open_book_counts`), as is: a clean book passes, an open one or a refused
+/// read fails C6 alone, by its reason.
+#[tokio::test]
+async fn c6_takes_a_usdm_observers_answer_as_its_evidence() {
+    struct Answer(Result<[usize; 3], String>);
+    #[async_trait]
+    impl UsdmReadObserver for Answer {
+        async fn open(&self) -> Result<[usize; 3], String> {
+            self.0.clone()
+        }
+    }
+    let denied = BinanceRestError::RequestFailed("HTTP 401 Unauthorized: ".into());
+    for (answer, failed) in [
+        (Ok([0; 3]), None),
+        (Ok([0, 0, 1]), Some("USD-M")),
+        (Err(usdm_refusal(denied)), Some("usdm_permission_missing")),
+    ] {
+        let observer: &dyn UsdmReadObserver = &Answer(answer);
+        let (db, mut venue) = green();
+        venue.usdm = observer.open().await;
+        let report = report(&db, &venue, CLEAN);
+        match failed {
+            None => assert!(report.passed(), "{report:#?}"),
+            Some(reason) => only(&report, "c6", reason),
+        }
+    }
+}
+
 /// Q1: each sign of a key without the read permission, alone, is named so:
 /// the codes, a JSON error at 401 or 403, and a 401 or 403 without Binance's
 /// JSON body (`RestAnswer::into_body`'s text, pinned in robson-connectors).
