@@ -15,8 +15,8 @@ use robson_eventlog::{ActorType, EventEnvelope};
 use robson_exec::{
     gate::{Incident, IncidentReason},
     order_journal::{
-        JournalBackend, OrderJournal, PendingEntry, ReleaseRecord, ReleaseRefusal,
-        StreamSuspensionRow, DEFAULT_ACCOUNT_SCOPE,
+        CommitFailure, JournalBackend, JournalBatch, OrderJournal, PendingEntry, ReleaseCounts,
+        ReleaseRecord, ReleaseRefusal, StreamSuspensionRow, DEFAULT_ACCOUNT_SCOPE,
     },
     venue::{AccountKind, VenueId},
 };
@@ -481,18 +481,59 @@ async fn a_lost_commit_ack_on_a_balance_clear_keeps_the_stream_suspended(pool: P
     assert!(open.iter().all(|(stream_key, _)| *stream_key != key), "{open:?}");
 }
 
-/// Log lines, as a `fmt` subscriber writes them.
-#[derive(Clone, Default)]
-struct Logs(Arc<Mutex<Vec<u8>>>);
+/// The journal's backend with every failure of a durable incident or
+/// suspension write recorded, for this test only: the very `failure` the
+/// journal's retry pass logs in its warn lines (`order_journal.rs`, "Incident
+/// not recorded yet" and "Stream suspension not recorded yet") before it keeps
+/// the entry pending. A per-test record, unlike a tracing subscriber, whose
+/// callsite interest is process-global and races with concurrent tests.
+struct Refusals<B> {
+    backend: B,
+    seen: Mutex<Vec<String>>,
+}
 
-impl std::io::Write for Logs {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
+impl<B> Refusals<B> {
+    fn note<T>(&self, result: Result<T, CommitFailure>) -> Result<T, CommitFailure> {
+        if let Err(failure) = &result {
+            self.seen.lock().unwrap().push(format!("{failure:?}"));
+        }
+        result
+    }
+}
+
+#[async_trait::async_trait]
+impl<B: JournalBackend> JournalBackend for Refusals<B> {
+    async fn commit(&self, batch: &JournalBatch) -> Result<(), CommitFailure> {
+        self.backend.commit(batch).await
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+    async fn attempt_states(
+        &self,
+        venue: &str,
+        scope: &str,
+        id: &str,
+    ) -> Result<Vec<bool>, String> {
+        self.backend.attempt_states(venue, scope, id).await
+    }
+
+    async fn check_ready(&self) -> Result<(), String> {
+        self.backend.check_ready().await
+    }
+
+    async fn check_balance_schema(&self, venue: &str, index: bool) -> Result<(), String> {
+        self.backend.check_balance_schema(venue, index).await
+    }
+
+    async fn record_suspension(&self, row: &StreamSuspensionRow) -> Result<(), CommitFailure> {
+        self.note(self.backend.record_suspension(row).await)
+    }
+
+    async fn upsert_incident(&self, incident: &Incident) -> Result<(), CommitFailure> {
+        self.note(self.backend.upsert_incident(incident).await)
+    }
+
+    async fn release(&self, release: &ReleaseRecord) -> Result<ReleaseCounts, String> {
+        self.backend.release(release).await
     }
 }
 
@@ -514,9 +555,10 @@ async fn landed(pool: &PgPool, tenant: Uuid, stream_key: &str) -> (i64, i64) {
 /// and nothing opens or is lost (Root's condition (iv) on design choice 4):
 /// (1) the latch and the fence stay closed, so admissions stay refused
 /// (`check_admissions_open` reads exactly these) and a release is refused;
-/// (2) the refusal is in the journal's warn lines, with the backend's error,
-/// and in the retry-set depth the `robsond_journal_retry_set_depth` gauge
-/// exports; every retry pass tries both again; (3) the order-set owner's
+/// (2) every retry pass tries both writes again and receives the backend's
+/// refusal, the `failure` its warn lines print (recorded per test, see
+/// `Refusals`), and the retry-set depth the `robsond_journal_retry_set_depth`
+/// gauge exports stays at both; (3) the order-set owner's
 /// rebuild rotates the generation's identity as `cold_install`'s
 /// `publish.sql` does, the journal's pass still refuses on the identity it
 /// read, and once the owner publishes the new one into the shared cell the
@@ -526,11 +568,14 @@ async fn landed(pool: &PgPool, tenant: Uuid, stream_key: &str) -> (i64, i64) {
 async fn a_stale_generation_keeps_durable_incident_and_suspension_writes_pending(pool: PgPool) {
     let installed = seed(&pool, true).await;
     let tenant = installed.tenant_id;
-    let backend = PgJournalBackend::new(&pool, tenant)
-        .with_balance_account(true)
-        .with_accounting_generation(&installed.generation);
+    let backend = Arc::new(Refusals {
+        backend: PgJournalBackend::new(&pool, tenant)
+            .with_balance_account(true)
+            .with_accounting_generation(&installed.generation),
+        seen: Mutex::default(),
+    });
     let journal = Arc::new(
-        OrderJournal::new(Arc::new(backend), &VenueId::new(SPOT)).with_balance_account(true),
+        OrderJournal::new(backend.clone(), &VenueId::new(SPOT)).with_balance_account(true),
     );
     stale(&pool, &installed).await;
     let suspension = suspension_row();
@@ -538,27 +583,18 @@ async fn a_stale_generation_keeps_durable_incident_and_suspension_writes_pending
     journal.record_suspension(suspension);
     assert!(journal.latch_set() && journal.gate().fenced());
 
-    let logs = Logs::default();
-    let writer = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
-    {
-        let _logging = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
-        for _ in 0..3 {
-            assert_eq!(journal.flush_pending().await, 0);
-            assert_eq!(journal.retry_set_depth(), 2);
-        }
-    }
-    let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-    for line in [
-        "Incident not recorded yet; it will be retried",
-        "Stream suspension not recorded yet; it will be retried",
-        "stale order-set generation",
-    ] {
-        assert!(logged.contains(line), "{line}: {logged}");
+    // Every pass tries both writes, receives the backend's refusal (what its
+    // warn lines print) and keeps both pending: the depth the
+    // `robsond_journal_retry_set_depth` gauge exports.
+    for pass in 1..=3 {
+        assert_eq!(journal.flush_pending().await, 0);
+        assert_eq!(journal.retry_set_depth(), 2);
+        let seen = backend.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2 * pass, "{seen:?}");
+        assert!(
+            seen.iter().all(|failure| failure.contains("stale order-set generation")),
+            "{seen:?}"
+        );
     }
     let pending = journal.pending_entries();
     assert!(pending.contains(&PendingEntry::Incident(IncidentReason::StreamSuspended)));

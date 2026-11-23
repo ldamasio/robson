@@ -576,14 +576,20 @@ fn n5_reference_lines(path: &Path) -> &'static [&'static str] {
 /// 8k-2's BTCUSDT base detector (robsond's `balance_reconciliation`, inert:
 /// no production caller) classifies the ACCOUNT record this module parses.
 /// Its classifier takes the record type, never a reader, transport or
-/// endpoint; its unit tests build that record. Exactly these lines, in
-/// exactly these files.
+/// endpoint; its unit tests build that record. 8k-3a's ACCOUNT-only
+/// classification takes it the same way, and its capture holds it as the
+/// receipt's body. Exactly these lines, in exactly these files.
 fn detector_reference_lines(path: &Path) -> &'static [&'static str] {
     match path.to_str() {
         Some("robsond/src/balance_reconciliation/classify.rs") => &[
             "use robson_connectors::binance::spot::SpotAccount;",
             "account: &SpotAccount,",
             "account: &SpotAccount,",
+            "account: &SpotAccount,",
+        ],
+        Some("robsond/src/balance_reconciliation/capture.rs") => &[
+            "use robson_connectors::binance::spot::SpotAccount;",
+            "pub(crate) body: SpotAccount,",
         ],
         Some("robsond/src/balance_reconciliation/tests.rs") => &[
             "use robson_connectors::binance::spot::{SpotAccount, SpotAccountBalance};",
@@ -749,6 +755,7 @@ fn detector_allowance_admits_only_its_named_lines() {
     for owner in [
         "robsond/src/balance_reconciliation/classify.rs",
         "robsond/src/balance_reconciliation/tests.rs",
+        "robsond/src/balance_reconciliation/capture.rs",
     ]
     .map(Path::new)
     {
@@ -814,6 +821,9 @@ fn nothing_outside_the_spot_module_names_it() {
         "robsond/src/balance_reconciliation/mod.rs",
         "robsond/src/balance_reconciliation/snapshot.rs",
         "robsond/src/balance_reconciliation/classify.rs",
+        // 8k-3a: its capture (the receipt body's exact lines only);
+        "robsond/src/balance_reconciliation/capture.rs",
+        "robsond/src/balance_reconciliation/pg_tests.rs",
         // 8l-1: the bounded routes of migrations 46 to 50;
         "robson-db/src/bounded_migration.rs",
         // 8l-2: the settlement barrier and the gate's pending slot;

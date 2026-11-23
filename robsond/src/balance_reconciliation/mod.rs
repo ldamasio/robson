@@ -10,19 +10,27 @@
 //! triple, the operated subset and the keyed attribution post statement,
 //! gate marks again, then [`qualify`]. Only a qualified attempt is
 //! classified; [`Scan`] keeps at most three attempts and their actual cost.
+//! 8k-3a: the marks are the gate's invalidity marks, and the non-trading
+//! scope's capture, ACCOUNT reading and ACCOUNT-only classification
+//! ([`Capture`], [`AccountReading`], [`classify_account`]) serve the scan
+//! and 8l-5's O1/O2.
 use robson_exec::{
     clock_records::RawClockCapture,
-    gate::{IncidentReason, Occurrence, OperationGate},
+    gate::{IncidentReason, InvalidityMarks, Occurrence, OperationGate},
 };
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::spot_order_set_store::ExpectedGeneration;
 
+mod capture;
 mod classify;
+#[cfg(test)]
+mod pg_tests;
 mod snapshot;
 
-pub(crate) use classify::{classify, consequence, Classification};
+pub(crate) use capture::{cash_attempt, AccountReading, AccountReceipt, Capture};
+pub(crate) use classify::{classify, classify_account, consequence, Classification};
 pub(crate) use snapshot::{
     read_pre, IntentRow, LegRow, LinkedOrder, OrderRow, PreRefusal, PreSnapshot,
 };
@@ -35,6 +43,20 @@ pub(crate) struct DetectorScope<'a> {
     pub(crate) operated: &'a str,
     /// From the route's rules; the ledger does not store it.
     pub(crate) base_asset: &'a str,
+}
+
+/// One process's balance-scan scope, fixed by its start kind (PLAN-r2 §6.1):
+/// here the non-trading scope of a process with no order-set generation,
+/// read by `non_trading.sql`: its detector scope's tenant, venue, account
+/// scope, process epoch and UID, never its generation or source-audit ids
+/// (nil, as none is installed), and the scope's Spot ledger must be empty.
+/// A malformed scope is refused as `Scope` before any statement. The
+/// installed scope is 8k-3e's.
+#[derive(Clone, Copy)]
+pub(crate) struct ScanScope<'a> {
+    pub(crate) detector: DetectorScope<'a>,
+    /// The route's quote asset: no other asset is read (SD7).
+    pub(crate) quote_asset: &'a str,
 }
 
 /// How the keyed attribution judged one operated open order.
@@ -94,7 +116,7 @@ impl ObservationInterval {
                 .checked_mul(1_000_000_000)?
                 .checked_add(i128::from(capture.wall_nanoseconds))
         };
-        let u = u2.checked_add(1)? / 2;
+        let u = account_u(u2)?;
         let start = wall(send)?.checked_sub(u)?;
         let end = wall(receive)?.checked_add(u)?;
         (start <= end).then_some(Self {
@@ -103,6 +125,12 @@ impl ObservationInterval {
             cut_ns: start,
         })
     }
+}
+
+/// `u = ⌈u2 / 2⌉`: the one rounding of the interval and of the `u` stored
+/// with it, so the writer recovers send and receive exactly.
+pub(crate) fn account_u(u2: i128) -> Option<i128> {
+    Some(u2.checked_add(1)? / 2)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,19 +149,20 @@ pub(crate) enum ClockOutcome {
     Invalid,
 }
 
-/// What one attempt that reached its post statement observed. Generation and
-/// pending are read in memory before pre and after post.
+/// What one attempt that reached its post statement observed. The gate's
+/// invalidity marks (generation and pending evidence, read together under its
+/// mutex) are read before pre and after post (8k-3a, F4): the invalidity
+/// generation moves on every occurrence and every pending rise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QualificationMarks {
-    pub(crate) generation_before: i64,
-    pub(crate) generation_after: i64,
-    pub(crate) pending_before: bool,
-    pub(crate) pending_after: bool,
+    pub(crate) before: InvalidityMarks,
+    pub(crate) after: InvalidityMarks,
     pub(crate) post: PostOutcome,
     pub(crate) clock: ClockOutcome,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum UnqualifiedReason {
     VersionChanged,
     GenerationChanged,
@@ -147,12 +176,14 @@ pub(crate) enum UnqualifiedReason {
     /// Pre returned more rows than the fixture cap; nothing was decoded.
     Cap,
     Malformed,
+    /// The non-trading scope's Spot ledger holds a row (8k-3a).
+    LedgerNotEmpty,
 }
 
 impl UnqualifiedReason {
     /// A refusal no retry can change within one scan.
     fn permanent(self) -> bool {
-        matches!(self, Self::Scope | Self::Cap | Self::Malformed)
+        matches!(self, Self::Scope | Self::Cap | Self::Malformed | Self::LedgerNotEmpty)
     }
 }
 
@@ -162,6 +193,7 @@ impl From<PreRefusal> for UnqualifiedReason {
             PreRefusal::Scope => Self::Scope,
             PreRefusal::Cap => Self::Cap,
             PreRefusal::Malformed => Self::Malformed,
+            PreRefusal::LedgerNotEmpty => Self::LedgerNotEmpty,
             PreRefusal::Timeout => Self::Timeout,
             PreRefusal::Sql => Self::Sql,
         }
@@ -176,16 +208,20 @@ pub(crate) enum AttemptOutcome {
 
 /// C8 steps 1, 3 and 4 for an attempt whose triple completed. Any change
 /// between before pre and after post, or any pending evidence, discards it.
+/// Unbound and Clear pass. A rise moves the generation too; while it is
+/// pending its reason is `PendingEvidence`, as before 8k-3a.
 pub(crate) fn qualify(marks: &QualificationMarks) -> AttemptOutcome {
     use UnqualifiedReason as U;
+    let (before, after) = (marks.before, marks.after);
     let reason = match marks.post {
         PostOutcome::Sql => Some(U::Sql),
         PostOutcome::Timeout => Some(U::Timeout),
         PostOutcome::ScopeMoved => Some(U::VersionChanged),
         PostOutcome::Matched => None,
     }
-    .or((marks.generation_before != marks.generation_after).then_some(U::GenerationChanged))
-    .or((marks.pending_before || marks.pending_after).then_some(U::PendingEvidence));
+    .or((before.pending.blocks_publication() || after.pending.blocks_publication())
+        .then_some(U::PendingEvidence))
+    .or((before.generation != after.generation).then_some(U::GenerationChanged));
     match (reason, marks.clock) {
         (Some(reason), _) => AttemptOutcome::Unqualified(reason),
         (None, ClockOutcome::Invalid) => AttemptOutcome::Unqualified(U::Clock),

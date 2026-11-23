@@ -11,7 +11,7 @@ use rust_decimal::Decimal;
 
 use super::{
     Attribution, Consequence, DetectorScope, Finding, IncompleteReason, IntentRow, LegRow,
-    LinkedOrder, Listing, PreSnapshot,
+    LinkedOrder, Listing, PreSnapshot, ScanScope,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,18 +207,37 @@ pub(crate) fn classify(
     account: &SpotAccount,
     listing: &Listing,
 ) -> Classification {
-    match judge(scope, pre, account, listing) {
+    verdict(judge(scope, pre, account, Some(listing)))
+}
+
+/// The ACCOUNT-only classification of O1/O2 (8k-3a, PLAN-r2 §6.7): the base
+/// and locked-base checks alone, Incomplete exactly as [`classify`]. Clean
+/// only with no open claim and the locked base equal to Robson's live stop
+/// remainders. Orders and lists are not visible to an ACCOUNT read and are
+/// not claimed to be checked.
+pub(crate) fn classify_account(
+    scope: &ScanScope<'_>,
+    pre: &PreSnapshot,
+    account: &SpotAccount,
+) -> Classification {
+    verdict(judge(scope.detector, pre, account, None))
+}
+
+fn verdict(judged: Step<Vec<Finding>>) -> Classification {
+    match judged {
         Ok(findings) if findings.is_empty() => Classification::Clean,
         Ok(findings) => Classification::Discrepancy(findings),
         Err(reason) => Classification::Incomplete(reason),
     }
 }
 
+/// `listing` is `None` for an ACCOUNT-only classification: no order is
+/// listed and no stop is judged missing from a listing.
 fn judge(
     scope: DetectorScope<'_>,
     pre: &PreSnapshot,
     account: &SpotAccount,
-    listing: &Listing,
+    listing: Option<&Listing>,
 ) -> Step<Vec<Finding>> {
     let mut balances = account.balances.iter().filter(|b| b.asset == scope.base_asset);
     let (Some(balance), None) = (balances.next(), balances.next()) else {
@@ -261,7 +280,7 @@ fn judge(
 
     let mut findings = Vec::new();
     let mut listed = HashSet::new();
-    for order in &listing.orders {
+    for order in listing.iter().flat_map(|listing| &listing.orders) {
         match order.attribution {
             Attribution::Ledger { .. } => {},
             Attribution::Absent | Attribution::Discovered | Attribution::Unauthored => {
@@ -271,12 +290,12 @@ fn judge(
         }
         listed.insert(order.order_id.to_string());
     }
-    for stop in &live_stops {
+    for stop in live_stops.iter().filter(|_| listing.is_some()) {
         if !listed.contains(*stop) {
             findings.push(Finding::NeedsExactEvidence { exchange_order_id: (*stop).to_owned() });
         }
     }
-    for list in &listing.lists {
+    for list in listing.iter().flat_map(|listing| &listing.lists) {
         findings.push(Finding::OperatedOrderList { order_list_id: list.order_list_id });
     }
 

@@ -250,7 +250,7 @@ pub(crate) async fn record_epoch<S: SpotSupervisor>(
     let start = bounded(
         StartupStage::Epoch,
         deadline,
-        crate::process_epoch::start_epoch(&pool, tenant_id, binary_version),
+        crate::process_epoch::start_balance_epoch(&pool, tenant_id, binary_version),
     )
     .await?
     .map_err(StartupRefusal::Epoch)?;

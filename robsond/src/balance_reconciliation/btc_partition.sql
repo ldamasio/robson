@@ -132,3 +132,7 @@ FROM g
 CROSS JOIN intents j
 LEFT JOIN public.venue_orders o ON o.intent_id=j.intent_id
 ORDER BY 1, 5, 16, 21
+-- PRE_ROW_CAP + 1 (8k-3a): at most 65 rows are returned; the header ranks
+-- first, so the limit never drops it, and a 65th row is refused as Cap
+-- before any row is decoded.
+LIMIT 65

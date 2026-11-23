@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::{ledger_connection::LedgerConnection, spot_order_set_store::JournalGeneration};
 
+pub mod cash;
 mod entry_fee;
 mod orders;
 pub mod settlement;

@@ -60,6 +60,19 @@
 //!   because a sweep's close held their symbol and side (PR O)
 //! - `robsond_leg_settlement_pending` — balance-account legs the latest
 //!   settlement barrier read found unsettled (ADR-0056 step 8l-2)
+//! - `robsond_cash_impaired` — 1 while the latest cash read found `E(now)`
+//!   impaired by late evidence (ADR-0056 step 8l-3a)
+//! - `robsond_cash_conclusions_total{outcome}` — cash writer attempts by
+//!   outcome: `clean`, `missing`, `extra`, `refused` or `uncertain` (ADR-0056
+//!   step 8l-3b)
+//! - `robsond_cash_reanchors_total{direction}` — re-anchors: committed ones by
+//!   the flows they wrote (`none`, `withdrawal`, `contribution`, `both`) or
+//!   `recovery`; `refused`, or `uncertain` without a COMMIT answer (ADR-0056
+//!   step 8l-5)
+//! - `robsond_spot_external_flows_total{kind}` — attested flows written, by
+//!   `withdrawal` or `contribution` (ADR-0056 step 8l-5)
+//! - `robsond_withdrawal_fence{venue}` — 1 while the latest cash read found an
+//!   attested withdrawal in the current UTC month (ADR-0056 step 8l-5)
 
 use std::sync::LazyLock;
 
@@ -277,6 +290,70 @@ pub static LEG_SETTLEMENT_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
 
 pub fn observe_leg_settlement_pending(legs: u64) {
     LEG_SETTLEMENT_PENDING.set(i64::try_from(legs).unwrap_or(i64::MAX));
+}
+
+/// 1 while the latest cash read found `E(now)` impaired by late evidence
+/// (ADR-0056 step 8l-3a, PLAN-r4 §6.10): the current month is invalid. Set by
+/// every read; absent until the first, and no production path reads yet.
+pub static CASH_IMPAIRED: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!("robsond_cash_impaired", "1 while E(now) is impaired by late evidence")
+        .expect("failed to register robsond_cash_impaired")
+});
+
+pub fn observe_cash_impaired(impaired: bool) {
+    CASH_IMPAIRED.set(i64::from(impaired));
+}
+
+/// Cash writer attempts by outcome (ADR-0056 step 8l-3b): a published
+/// conclusion is `clean`, `missing` or `extra` by its Δ; one that wrote
+/// nothing is `refused`; a COMMIT without an answer is `uncertain`. No
+/// production writer yet.
+pub static CASH_CONCLUSIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!("robsond_cash_conclusions_total", "Cash writer attempts by outcome", &[
+        "outcome"
+    ])
+    .expect("failed to register robsond_cash_conclusions_total")
+});
+
+pub fn observe_cash_conclusion(outcome: &str) {
+    CASH_CONCLUSIONS.with_label_values(&[outcome]).inc();
+}
+
+/// Re-anchors by direction (ADR-0056 step 8l-5); no production composition
+/// yet.
+pub static CASH_REANCHORS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!("robsond_cash_reanchors_total", "Cash re-anchors by direction", &[
+        "direction"
+    ])
+    .expect("failed to register robsond_cash_reanchors_total")
+});
+
+pub fn observe_cash_reanchor(direction: &str) {
+    CASH_REANCHORS.with_label_values(&[direction]).inc();
+}
+
+/// Attested external flows a re-anchor wrote, by kind (ADR-0056 step 8l-5).
+pub static SPOT_EXTERNAL_FLOWS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!("robsond_spot_external_flows_total", "Attested flows by kind", &["kind"])
+        .expect("failed to register robsond_spot_external_flows_total")
+});
+
+pub fn observe_external_flow(kind: &str) {
+    SPOT_EXTERNAL_FLOWS.with_label_values(&[kind]).inc();
+}
+
+/// 1 while the latest cash read found an attested withdrawal attributed to
+/// the current UTC month (ADR-0056 step 8l-5): admissions wait for the next
+/// boundary. Set by every read; no production path reads yet.
+pub static WITHDRAWAL_FENCE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!("robsond_withdrawal_fence", "1 while a withdrawal fences the month", &[
+        "venue"
+    ])
+    .expect("failed to register robsond_withdrawal_fence")
+});
+
+pub fn observe_withdrawal_fence(venue: &str, fenced: bool) {
+    WITHDRAWAL_FENCE.with_label_values(&[venue]).set(i64::from(fenced));
 }
 
 /// Publish how many streams of each kind are suspended; both kinds export,
