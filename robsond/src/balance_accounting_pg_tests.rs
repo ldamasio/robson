@@ -149,15 +149,15 @@ async fn qualifies(pool: &PgPool, accounting: &BalanceAccounting) -> bool {
     use crate::balance_reconciliation::{read_pre, DetectorScope};
     const UID: &str = "5a-scan";
     let installed = accounting.generation.current().unwrap();
-    sqlx::query(
-        "INSERT INTO venue_accounts (venue_id, account_scope, tenant_id, uid, bound_at, \
-         cutover_id) VALUES ($1, $2, $3, $4, now(), $5) ON CONFLICT DO NOTHING",
-    )
+    // Bound to a cutover run of the tenant (M56's foreign key).
+    sqlx::query(concat!(
+        include_str!("../tests/fixtures/bound_venue_account.sql"),
+        " ON CONFLICT DO NOTHING"
+    ))
     .bind(SPOT)
     .bind(&installed.account_scope)
     .bind(installed.tenant_id)
     .bind(UID)
-    .bind(Uuid::now_v7())
     .execute(pool)
     .await
     .unwrap();

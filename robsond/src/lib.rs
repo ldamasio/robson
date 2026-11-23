@@ -96,8 +96,12 @@ mod balance_accounting;
 // ADR-0056 step 8p-2: a balance-account daemon's month boundaries.
 #[cfg(feature = "postgres")]
 mod boundary;
+// ADR-0056 step 8m-3: the cutover report, read only; 8m-4 and 8m-6 call it.
 #[cfg(feature = "postgres")]
 pub mod budget_basis_alarm;
+#[cfg(feature = "postgres")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod cutover_report;
 #[cfg(feature = "postgres")]
 pub mod db_session;
 #[cfg(feature = "postgres")]

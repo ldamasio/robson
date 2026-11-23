@@ -108,11 +108,12 @@ impl Fixture {
 
     pub(super) async fn all_rows(&self, pool: &PgPool) -> Result<(), sqlx::Error> {
         self.order(pool).await;
-        sqlx::query("INSERT INTO venue_accounts VALUES ($1,'scope',$2,'fixture-uid',$3,$4)")
+        // Bound to a cutover run of the tenant (M56's foreign key).
+        sqlx::query(include_str!("../fixtures/bound_venue_account.sql"))
             .bind(VENUE)
+            .bind("scope")
             .bind(self.tenant)
-            .bind(self.at)
-            .bind(Uuid::now_v7())
+            .bind("fixture-uid")
             .execute(pool)
             .await
             .unwrap();

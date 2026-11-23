@@ -928,10 +928,10 @@ fn package4_supervised_startup_stays_out_of_production() {
 }
 
 /// Package 5a's owners on a balance daemon, one line each: what 8k-1 B,
-/// 8k-2, 8l-1, 8l-2, 8l-4a, 8l-4b, 8p-1, 8p-2 and 8p-4 add to its database
-/// paths, and that each dormant one keeps no production caller. Its one
-/// connection owner is allowed above, with its reason; its one bound site is
-/// known above.
+/// 8k-2, 8l-1, 8l-2, 8l-4a, 8l-4b, 8p-1, 8p-2, 8p-4, 8m-1 and 8m-3 add to
+/// its database paths, and that each dormant one keeps no production caller.
+/// Its one connection owner is allowed above, with its reason; its one bound
+/// site is known above.
 #[test]
 fn package5a_owners_stay_dormant_or_bounded() {
     let sources = production_sources();
@@ -1062,6 +1062,11 @@ fn package5a_owners_stay_dormant_or_bounded() {
     let boundary = squeeze(&source("boundary.rs"));
     assert!(boundary.contains("sqlx::query(BOUNDS)"), "{boundary}");
     assert!(!boundary.contains("set_config"), "only the ledger's bounds: {boundary}");
+    // 8m-1 and 8m-3: S8-6's runs are read only by the cutover report's
+    // statement (no writer yet, 8m-4 and 8m-5), and the report is dormant:
+    // only its module declaration names it (8m-4 and 8m-6 call it).
+    assert_eq!(naming("venue_cutover"), only("cutover_report.sql"));
+    assert_eq!(outside("cutover_report", "cutover_report"), only("lib.rs"));
     // 8l-2: the barrier runs on its caller's connection, and neither it nor
     // the gate's invalidity marks has a production caller yet (8l-3, 8l-7,
     // 8l-8, 8n).
