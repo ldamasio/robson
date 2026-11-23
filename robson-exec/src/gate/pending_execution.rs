@@ -1,17 +1,60 @@
-//! One cumulative-order slot for the controlled 8j composition.
+//! One cumulative-order slot for the controlled 8j composition. The slot's
+//! state and its read compile in every build (ADR-0056 step 8l-2); the
+//! receiver that binds and fills it stays the composition's (`crash-points`)
+//! until 8j-2 binds it.
+#[cfg(feature = "crash-points")]
 use std::sync::Arc;
 
+#[cfg(feature = "crash-points")]
 use rust_decimal::Decimal;
+#[cfg(feature = "crash-points")]
 use uuid::Uuid;
 
+use super::GateState;
+#[cfg(feature = "crash-points")]
 use super::OperationGate;
+#[cfg(feature = "crash-points")]
 use crate::{clock_records::RawClockCapture, venue::VenueOrderRecord};
 
+/// Venue evidence with an accounting effect, received and not yet committed
+/// (v16 §3.7.3 R5-1), as the gate holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingEvidence {
+    /// No receiver is bound, so none can be registered: only
+    /// `bind_pending_execution` creates the slot. Publication reads it as
+    /// none pending; a spot entry is still refused while unbound (8l-7).
+    Unbound,
+    /// Bound, and the latest registered evidence was acknowledged.
+    Clear,
+    /// Registered and unacknowledged: its write may not have committed. A
+    /// dropped or superseded ticket and an exhausted sequence leave it here.
+    Pending,
+}
+
+impl PendingEvidence {
+    /// Whether a cash conclusion or a snapshot must refuse to publish.
+    pub fn blocks_publication(self) -> bool {
+        self == Self::Pending
+    }
+}
+
+impl GateState {
+    pub(super) fn pending_evidence(&self) -> PendingEvidence {
+        match &self.pending_execution {
+            None => PendingEvidence::Unbound,
+            Some(slot) if slot.pending => PendingEvidence::Pending,
+            Some(_) => PendingEvidence::Clear,
+        }
+    }
+}
+
 /// Tickets alive at once. A test interleaving cap, never a runtime risk cap.
+#[cfg(feature = "crash-points")]
 const OUTSTANDING_TICKETS: u8 = 2;
 
 /// The exact marks carried by one bounded observation. A raw capture alone
 /// does not authenticate a sample or authorize a venue request.
+#[cfg(feature = "crash-points")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingExecutionEvidence {
     pub sample: Uuid,
@@ -21,18 +64,31 @@ pub struct PendingExecutionEvidence {
 }
 
 /// Bound once and never reset: the latest sequence stays after a clear, so a
-/// sequence is never issued twice.
+/// sequence is never issued twice. `pending` only ever falls by an exact
+/// acknowledgement of the latest sequence.
 #[derive(Debug, Default)]
+#[cfg_attr(
+    not(feature = "crash-points"),
+    allow(
+        dead_code,
+        reason = "only the receiver creates it, crash-points until 8j-2"
+    )
+)]
 pub(super) struct PendingExecutionSlot {
+    #[cfg(feature = "crash-points")]
     latest: Option<(u64, PendingExecutionEvidence, Arc<VenueOrderRecord>)>,
     pending: bool,
+    #[cfg(feature = "crash-points")]
     outstanding: u8,
+    #[cfg(feature = "crash-points")]
     exhausted: bool,
+    #[cfg(feature = "crash-points")]
     unissued: bool,
 }
 
 /// Created once on the actual OperationGate. The daemon's private receiver
 /// binds this slot to one immutable native order and journal identity.
+#[cfg(feature = "crash-points")]
 pub struct PendingExecutionOwner {
     gate: Arc<OperationGate>,
     epoch: Uuid,
@@ -40,17 +96,20 @@ pub struct PendingExecutionOwner {
 }
 
 /// Move-only. Dropped unacknowledged, it leaves the slot pending.
+#[cfg(feature = "crash-points")]
 pub struct PendingExecutionTicket {
     gate: Arc<OperationGate>,
     sequence: u64,
 }
 
+#[cfg(feature = "crash-points")]
 pub enum PendingExecutionRegistration {
     Issued(PendingExecutionTicket),
     Retained,
     Refused,
 }
 
+#[cfg(feature = "crash-points")]
 impl Drop for PendingExecutionTicket {
     fn drop(&mut self) {
         let mut state = self.gate.lock();
@@ -60,6 +119,7 @@ impl Drop for PendingExecutionTicket {
     }
 }
 
+#[cfg(feature = "crash-points")]
 impl OperationGate {
     /// Isolated composition only. This reserves no venue or trading permit.
     pub fn bind_pending_execution(self: &Arc<Self>, epoch: Uuid) -> Option<PendingExecutionOwner> {
@@ -73,8 +133,11 @@ impl OperationGate {
     }
 }
 
+#[cfg(feature = "crash-points")]
 impl PendingExecutionOwner {
     /// Synchronously retain the exact newer observation before persistence.
+    /// A retained rise moves the invalidity generation in the same critical
+    /// section (v16 §3.7.3 R5-1); a refusal retains and moves nothing.
     pub fn register(
         &self,
         evidence: PendingExecutionEvidence,
@@ -116,10 +179,12 @@ impl PendingExecutionOwner {
         slot.pending = true;
         slot.exhausted = sequence.is_none();
         slot.unissued = true;
-        match self.issue(slot) {
+        let registration = match self.issue(slot) {
             Some(ticket) => Issued(ticket),
             None => Retained,
-        }
+        };
+        state.invalidate();
+        registration
     }
 
     fn issue(&self, slot: &mut PendingExecutionSlot) -> Option<PendingExecutionTicket> {
@@ -150,6 +215,7 @@ impl PendingExecutionOwner {
 
     /// Only the issuing gate's current ticket can retire its slot.
     /// The owner calls this after matching the private native commit receipt.
+    /// The fall never moves the invalidity generation.
     pub fn acknowledge(&self, ticket: PendingExecutionTicket) -> bool {
         // The lock ends before the ticket drops: its Drop takes the same mutex.
         let acknowledged = Arc::ptr_eq(&self.gate, &ticket.gate) && {
@@ -180,7 +246,7 @@ impl PendingExecutionOwner {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "crash-points"))]
 mod tests {
     use std::sync::atomic::AtomicBool;
 
@@ -295,5 +361,67 @@ mod tests {
         assert!(!owner.acknowledge(first));
         assert!(!owner.acknowledge(second));
         assert_eq!(owner.pending(), Some(latest));
+    }
+
+    fn bound() -> (Arc<OperationGate>, PendingExecutionOwner, Uuid, ClockDomain) {
+        let gate = Arc::new(OperationGate::new(Arc::new(AtomicBool::new(false))));
+        gate.begin_epoch(EpochView { epoch_seq: 7, unclean_reason: None }, None, Vec::new());
+        let epoch = Uuid::from_u128(0xe9);
+        let domain = ClockDomain::new(Uuid::from_u128(0xb0), 0, 0).unwrap();
+        let owner = gate.bind_pending_execution(epoch).unwrap();
+        (gate, owner, epoch, domain)
+    }
+
+    /// Each retained rise, issued or not, moves the invalidity generation
+    /// under the mutex; the fall and a refusal never move it, and a rise is
+    /// not an occurrence: fence and incident generation stay as they were.
+    #[test]
+    fn pending_rise_moves_the_invalidity_generation() {
+        use crate::gate::{InvalidityMarks, PendingEvidence::*};
+        let (gate, owner, epoch, domain) = bound();
+        let marks = |generation, pending| InvalidityMarks { generation, pending };
+        assert_eq!(gate.invalidity_marks(), marks(0, Clear));
+        let incident_generation = gate.generation();
+
+        let first = register(&owner, evidence(epoch, domain, 100, dec!(0.25))).unwrap();
+        assert_eq!(gate.invalidity_marks(), marks(1, Pending));
+        assert!(!gate.fenced() && gate.generation() == incident_generation);
+        assert!(owner.acknowledge(first));
+        assert_eq!(gate.invalidity_marks(), marks(1, Clear), "the fall never moves it");
+
+        assert!(register(&owner, evidence(epoch, domain, 102, dec!(0.1))).is_none());
+        assert_eq!(gate.invalidity_marks(), marks(1, Clear), "a refusal retains nothing");
+
+        let _second = register(&owner, evidence(epoch, domain, 104, dec!(0.5))).unwrap();
+        let _third = register(&owner, evidence(epoch, domain, 106, dec!(0.5))).unwrap();
+        assert!(register(&owner, evidence(epoch, domain, 108, dec!(0.5))).is_none());
+        assert_eq!(gate.invalidity_marks(), marks(4, Pending), "a retained rise moves it too");
+    }
+
+    /// The read reports evidence pending whenever its commit is unproven: a
+    /// dropped ticket, a superseded one, an exhausted sequence.
+    #[test]
+    fn pending_evidence_read_fails_closed() {
+        let (gate, owner, epoch, domain) = bound();
+        drop(register(&owner, evidence(epoch, domain, 100, dec!(0.25))).unwrap());
+        assert_eq!(gate.pending_evidence(), PendingEvidence::Pending, "dropped ticket");
+
+        let (gate, owner, epoch, domain) = bound();
+        let old = register(&owner, evidence(epoch, domain, 100, dec!(0.25))).unwrap();
+        drop(register(&owner, evidence(epoch, domain, 102, dec!(0.5))).unwrap());
+        assert!(!owner.acknowledge(old));
+        assert_eq!(gate.pending_evidence(), PendingEvidence::Pending, "superseded ticket");
+
+        let (gate, owner, epoch, domain) = bound();
+        let last = register(&owner, evidence(epoch, domain, 100, dec!(0.25))).unwrap();
+        if let Some((sequence, _, _)) =
+            gate.lock().pending_execution.as_mut().and_then(|slot| slot.latest.as_mut())
+        {
+            *sequence = u64::MAX;
+        }
+        assert!(register(&owner, evidence(epoch, domain, 102, dec!(0.5))).is_none());
+        assert!(!owner.acknowledge(last));
+        assert!(owner.take_unissued().is_none());
+        assert_eq!(gate.pending_evidence(), PendingEvidence::Pending, "exhausted sequence");
     }
 }

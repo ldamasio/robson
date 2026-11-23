@@ -190,6 +190,7 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     venue: &Arc<E>,
     pool: &Option<Arc<sqlx::PgPool>>,
     config: &Config,
+    generation: &crate::balance_accounting::GenerationCell,
 ) -> Executor<E, S> {
     // The supervised startup owns the Spot backend. Even warm-up of a
     // legacy pool would authenticate with the wrong login during closure.
@@ -199,7 +200,8 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     let (Some(pool), Some(tenant_id)) = (pool, config.projection.tenant_id) else {
         return executor;
     };
-    let backend = crate::order_journal_store::PgJournalBackend::new(pool, tenant_id);
+    let backend = crate::order_journal_store::PgJournalBackend::new(pool, tenant_id)
+        .with_accounting_generation(generation);
     with_order_journal_backend(executor, venue, backend)
 }
 
@@ -480,7 +482,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let store = Arc::new(MemoryStore::new());
         let executor = Executor::new(Arc::clone(&exchange), journal, store.clone());
         let executor = Arc::new(if durable_journal {
-            with_durable_order_journal(executor, &exchange, &pg_pool, &config)
+            with_durable_order_journal(executor, &exchange, &pg_pool, &config, &Default::default())
         } else {
             executor
         });
@@ -704,13 +706,21 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Executor::new(Arc::clone(&venue), journal, store.clone());
+        // ADR-0056 step 8l-4: one order-set generation cell for the journal and
+        // the accounting context. A supervised start publishes the generation
+        // it installed and admitted into it before the journal is built, so
+        // the journal and the manager's context read that generation (5a).
+        let generation = crate::balance_accounting::GenerationCell::default();
         let executor = Arc::new(match &ready {
-            Some(ready) => with_order_journal_backend(
-                executor,
-                &venue,
-                crate::order_journal_store::PgJournalBackend::supervised(ready),
-            ),
-            None => with_durable_order_journal(executor, &venue, &pg_pool, &config),
+            Some(ready) => {
+                generation.publish(ready.generation().clone());
+                with_order_journal_backend(
+                    executor,
+                    &venue,
+                    crate::order_journal_store::PgJournalBackend::supervised(ready, &generation),
+                )
+            },
+            None => with_durable_order_journal(executor, &venue, &pg_pool, &config, &generation),
         });
         let order_journal = gated(&venue, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
@@ -764,7 +774,17 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             config.engine.position_monitor_tick_interval_secs,
         ));
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
-            pm = pm.with_event_log((**pool).clone(), tenant_id);
+            // ADR-0056 step 8l-4: on a balance account, the append path and
+            // the stream repair bump the accounting version.
+            let accounting = crate::balance_accounting::BalanceAccounting::for_daemon(
+                venue.capabilities().account_kind,
+                tenant_id,
+                venue.id(),
+                &generation,
+            );
+            pm = pm
+                .with_event_log((**pool).clone(), tenant_id)
+                .with_balance_accounting(accounting);
         }
         let position_manager = Arc::new(RwLock::new(pm));
 
@@ -1217,8 +1237,13 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 "Starting projection worker with shared pool"
             );
 
+            // ADR-0056 step 8l-4: a balance account's projector bumps its
+            // accounting version in every `monthly_state` write, on the
+            // manager's context and so on the journal's generation cell.
+            let accounting = self.position_manager.read().await.balance_accounting();
             let worker =
-                ProjectionWorker::new((**pool).clone(), self.config.projection.clone(), tenant_id);
+                ProjectionWorker::new((**pool).clone(), self.config.projection.clone(), tenant_id)
+                    .with_balance_accounting(accounting);
 
             let worker_shutdown = shutdown.clone();
             workers.push(tokio::spawn(async move {
@@ -2715,7 +2740,10 @@ mod tests {
             source_audit_id: uuid::Uuid::now_v7(),
         };
         let ready = SpotReady::unsupervised_fixture(start, generation, pool.clone());
-        let backend = crate::order_journal_store::PgJournalBackend::supervised(&ready);
+        let backend = crate::order_journal_store::PgJournalBackend::supervised(
+            &ready,
+            &crate::balance_accounting::GenerationCell::default(),
+        );
         let incident = Incident {
             reason: IncidentReason::UncertainOutcome,
             first_at: Utc::now(),
@@ -2739,6 +2767,230 @@ mod tests {
         let error = format!("{failure:?}");
         assert!(error.contains("lock timeout") || error.contains("statement timeout"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// 5a composition of 8l-4's generation cell with package 4's supervised
+    /// start (ROOT-decision-8l4a-generation-handoff, option A). A supervised
+    /// start publishes the generation it installed and admitted into the
+    /// daemon's one cell before its journal is built, and the manager's
+    /// accounting context, which `Daemon::run` hands to the projection worker
+    /// (8l-4b), reads that same cell. The supervised journal's durable
+    /// incident and suspension writes and the worker's projector apply then
+    /// bump the accounting version and CAS against the installed generation,
+    /// which stays current. A restart's successor (the 8j rebuild: a rotated
+    /// generation in a new epoch, as `cold_install`'s `publish.sql` writes
+    /// it) reaches its own daemon the same way: its writes advance the
+    /// rotated generation, and the predecessor's journal, still on the old
+    /// identity, is refused and keeps its writes pending.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_supervised_start_publishes_its_generation_to_the_journal_and_the_manager(
+        pool: sqlx::PgPool,
+    ) {
+        use robson_exec::{
+            order_journal::{StreamSuspensionRow, DEFAULT_ACCOUNT_SCOPE},
+            venue::AccountKind,
+            StubOhlcv, StubTradeFeed,
+        };
+
+        use crate::{
+            capability::worker_venue::WorkerVenue,
+            spot_order_set_store::{
+                observe_generation, spot_startup::SpotReady, ExpectedGeneration, JournalGeneration,
+            },
+        };
+        let tenant = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO accounting_state (tenant_id, venue_id, budget_model) \
+             VALUES ($1, 'binance:spot', 'net_from_start_non_expanding_v1')",
+        )
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let start =
+            crate::process_epoch::start_epoch(&pool, tenant, "5a-supervised").await.unwrap();
+        let installed = JournalGeneration {
+            tenant_id: tenant,
+            account_scope: DEFAULT_ACCOUNT_SCOPE.to_string(),
+            generation_id: uuid::Uuid::now_v7(),
+            process_epoch: start.epoch.epoch_id,
+            source_audit_id: uuid::Uuid::now_v7(),
+        };
+        sqlx::query(
+            "INSERT INTO spot_order_set_generation (tenant_id, venue_id, account_scope, \
+             generation_id, process_epoch, source_audit_id, accounting_version) \
+             VALUES ($1, 'binance:spot', $2, $3, $4, $5, 0)",
+        )
+        .bind(tenant)
+        .bind(&installed.account_scope)
+        .bind(installed.generation_id)
+        .bind(installed.process_epoch)
+        .bind(installed.source_audit_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let versions = || {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (i64, i64)>(
+                    "SELECT a.version, g.accounting_version FROM accounting_state a \
+                     JOIN spot_order_set_generation g USING (tenant_id, venue_id) \
+                     WHERE (a.tenant_id, a.venue_id) = ($1, 'binance:spot')",
+                )
+                .bind(tenant)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let current = |generation: JournalGeneration| {
+            let pool = pool.clone();
+            async move {
+                let venue =
+                    robson_exec::venue::VenueId::new(robson_exec::venue::VenueId::BINANCE_SPOT);
+                let mut connection = pool.acquire().await.unwrap();
+                let expected = ExpectedGeneration {
+                    tenant_id: generation.tenant_id,
+                    venue: &venue,
+                    account_scope: &generation.account_scope,
+                    generation_id: generation.generation_id,
+                    process_epoch: generation.process_epoch,
+                    source_audit_id: generation.source_audit_id,
+                };
+                observe_generation(&mut connection, expected).await.unwrap().is_some()
+            }
+        };
+        let suspension = || StreamSuspensionRow {
+            suspension_id: uuid::Uuid::now_v7(),
+            stream_key: format!("position:{}", uuid::Uuid::now_v7()),
+            stream_kind: "position",
+            failed_seq: None,
+            month: None,
+            error: "5a supervised start".to_string(),
+            epoch_id: None,
+            suspended_at: Utc::now(),
+        };
+        let supervised = |ready: SpotReady| {
+            let mut config = Config::test();
+            config.projection.tenant_id = Some(tenant);
+            Daemon::assemble_with_recovery(
+                config,
+                Arc::new(WorkerVenue::new(AccountKind::BalanceAccount, false)),
+                Arc::new(StubTradeFeed::default()),
+                Arc::new(StubOhlcv::default()),
+                None,
+                Some(Arc::new(ready.writer().clone())),
+                Some(ready),
+            )
+        };
+
+        let first =
+            supervised(SpotReady::unsupervised_fixture(start, installed.clone(), pool.clone()));
+        // The worker's context, as Daemon::run takes it from the manager, on
+        // this test venue's own identity (a balance account, not Spot).
+        let context = first.position_manager.read().await.balance_accounting().unwrap();
+        assert_eq!(context.generation.current(), Some(installed.clone()), "the manager's cell");
+        let journal = first.journal_for_startup_witness();
+        assert!(journal.balance_account());
+        journal.record_suspension(suspension());
+        assert_eq!(journal.flush_pending().await, 2, "the incident and the suspension land");
+        assert_eq!(journal.retry_set_depth(), 0);
+        assert_eq!(versions().await, (2, 2), "two bumps, each with the CAS");
+        assert!(current(installed.clone()).await);
+        let at = Utc.with_ymd_and_hms(2027, 4, 1, 0, 0, 10).unwrap();
+        let reset = robson_eventlog::EventEnvelope {
+            event_id: uuid::Uuid::now_v7(),
+            tenant_id: tenant,
+            stream_key: "test:5a".to_string(),
+            seq: 1,
+            event_type: "month_boundary_reset".to_string(),
+            payload: serde_json::json!({
+                "capital_base": "10000", "carried_positions_risk": "0",
+                "month": 4, "year": 2027, "timestamp": at,
+            }),
+            payload_schema_version: 1,
+            occurred_at: at,
+            ingested_at: at,
+            idempotency_key: uuid::Uuid::now_v7().to_string(),
+            trace_id: None,
+            causation_id: None,
+            command_id: None,
+            workflow_id: None,
+            actor_type: Some(ActorType::Daemon),
+            actor_id: None,
+            prev_hash: None,
+            hash: None,
+        };
+        // This balance test venue is not Binance Spot, so the worker's context
+        // refuses the published generation before any write (an empty cell
+        // would have bumped unopted): the worker read the published cell.
+        let step = crate::balance_accounting::projector_step(Some(&context));
+        let refused = robson_projector::apply_event_to_projections_with(&pool, &reset, step).await;
+        assert!(
+            matches!(&refused, Err(robson_projector::ProjectionError::Accounting(e))
+                if e.contains("not this context's")),
+            "{refused:?}"
+        );
+        assert_eq!(versions().await, (2, 2));
+        // The same cell under the identity a Spot daemon's context carries:
+        // the worker's apply bumps once, with the CAS.
+        let spot = crate::balance_accounting::BalanceAccounting {
+            venue: robson_exec::venue::VenueId::new(robson_exec::venue::VenueId::BINANCE_SPOT),
+            ..context.clone()
+        };
+        let step = crate::balance_accounting::projector_step(Some(&spot));
+        robson_projector::apply_event_to_projections_with(&pool, &reset, step)
+            .await
+            .unwrap();
+        assert_eq!(versions().await, (3, 3), "the worker's apply bumps once, with the CAS");
+        assert!(current(installed.clone()).await);
+
+        // The successor installs a rotated generation in its own epoch.
+        let successor =
+            crate::process_epoch::start_epoch(&pool, tenant, "5a-successor").await.unwrap();
+        let rotated = JournalGeneration {
+            generation_id: uuid::Uuid::now_v7(),
+            process_epoch: successor.epoch.epoch_id,
+            source_audit_id: uuid::Uuid::now_v7(),
+            ..installed.clone()
+        };
+        sqlx::query(
+            "UPDATE public.spot_order_set_generation g SET generation_id = $3, \
+             process_epoch = $4, source_audit_id = $5, accounting_version = a.version, \
+             position_hints_complete = true FROM public.accounting_state a \
+             WHERE (a.tenant_id, a.venue_id) = (g.tenant_id, g.venue_id) \
+             AND (g.tenant_id, g.venue_id, g.account_scope) = ($1, 'binance:spot', $2) \
+             AND g.generation_id = $6",
+        )
+        .bind(tenant)
+        .bind(&rotated.account_scope)
+        .bind(rotated.generation_id)
+        .bind(rotated.process_epoch)
+        .bind(rotated.source_audit_id)
+        .bind(installed.generation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(current(rotated.clone()).await && !current(installed.clone()).await);
+        let second =
+            supervised(SpotReady::unsupervised_fixture(successor, rotated.clone(), pool.clone()));
+        let context = second.position_manager.read().await.balance_accounting().unwrap();
+        assert_eq!(context.generation.current(), Some(rotated.clone()));
+        let renewed = second.journal_for_startup_witness();
+        renewed.record_suspension(suspension());
+        assert_eq!(renewed.flush_pending().await, 2);
+        assert_eq!(versions().await, (5, 5), "the successor's writes advance its generation");
+        assert!(current(rotated.clone()).await);
+
+        // The predecessor's journal still reads the old identity: refused, and
+        // its writes stay pending with nothing moved.
+        journal.record_suspension(suspension());
+        assert_eq!(journal.flush_pending().await, 0);
+        assert_eq!(journal.retry_set_depth(), 2);
+        assert_eq!(versions().await, (5, 5));
+        assert!(current(rotated).await);
     }
 
     #[cfg(feature = "postgres")]
@@ -2769,7 +3021,8 @@ mod tests {
                 Arc::new(IntentJournal::new()),
                 Arc::new(MemoryStore::new()),
             );
-            let executor = with_durable_order_journal(executor, &venue, &pool, &config);
+            let executor =
+                with_durable_order_journal(executor, &venue, &pool, &config, &Default::default());
             let journal = executor.order_journal();
             assert!(!journal.balance_account());
             assert!(!journal.one_attempt_per_client_id());

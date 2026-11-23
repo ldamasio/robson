@@ -6,7 +6,11 @@ use sqlx::{pool::PoolConnection, Connection, PgConnection, Postgres, Transaction
 use tracing::Instrument as _;
 
 use super::{PgJournalBackend, RetiringConnection, RollbackObservation};
-use crate::{ledger_connection::LedgerConnection, spot_order_set_store::JournalGeneration};
+use crate::{
+    balance_accounting::{BalanceAccounting, GenerationCell},
+    ledger_connection::LedgerConnection,
+    spot_order_set_store::JournalGeneration,
+};
 
 /// Transaction-local server bounds, the first statement of every balance
 /// journal transaction: lock and statement timeouts from one statement budget.
@@ -94,6 +98,31 @@ impl PgJournalBackend {
             .await
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    /// Share the order-set owner's cell (ADR-0056 step 8l-4): the generation
+    /// the owner publishes is the one these auxiliary writes advance.
+    pub(crate) fn with_accounting_generation(mut self, generation: &GenerationCell) -> Self {
+        self.accounting_generation = generation.clone();
+        self
+    }
+
+    /// Right after its bounds, a balance account's incident, suspension and
+    /// release transaction bumps the accounting version and advances the
+    /// generation in the owner's cell (ADR-0056 step 8l-4): two statements,
+    /// one when none is installed. The legacy journal sends nothing here.
+    pub(super) async fn advance_auxiliary(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), String> {
+        if !self.balance_account {
+            return Ok(());
+        }
+        BalanceAccounting::for_journal(self.tenant_id, &self.accounting_generation)
+            .advance(tx)
+            .await
+            .map(drop)
+            .map_err(|error| error.to_string())
     }
 
     pub(super) async fn commit_balance(

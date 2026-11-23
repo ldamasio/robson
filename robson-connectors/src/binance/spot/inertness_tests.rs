@@ -573,8 +573,32 @@ fn n5_reference_lines(path: &Path) -> &'static [&'static str] {
     }
 }
 
+/// 8k-2's BTCUSDT base detector (robsond's `balance_reconciliation`, inert:
+/// no production caller) classifies the ACCOUNT record this module parses.
+/// Its classifier takes the record type, never a reader, transport or
+/// endpoint; its unit tests build that record. Exactly these lines, in
+/// exactly these files.
+fn detector_reference_lines(path: &Path) -> &'static [&'static str] {
+    match path.to_str() {
+        Some("robsond/src/balance_reconciliation/classify.rs") => &[
+            "use robson_connectors::binance::spot::SpotAccount;",
+            "account: &SpotAccount,",
+            "account: &SpotAccount,",
+        ],
+        Some("robsond/src/balance_reconciliation/tests.rs") => &[
+            "use robson_connectors::binance::spot::{SpotAccount, SpotAccountBalance};",
+            "fn account(balances: &[(&str, Decimal, Decimal)]) -> SpotAccount {",
+            "SpotAccount {",
+            ".map(|(asset, free, locked)| SpotAccountBalance {",
+            "fn btc(free: Decimal, locked: Decimal) -> SpotAccount {",
+            "fn classify(&self, account: &SpotAccount) -> Classification {",
+        ],
+        _ => &[],
+    }
+}
+
 fn strip_n5_references(path: &Path, text: &str) -> String {
-    let mut allowed = n5_reference_lines(path).to_vec();
+    let mut allowed = [n5_reference_lines(path), detector_reference_lines(path)].concat();
     text.lines()
         .filter(|line| {
             if let Some(i) = allowed.iter().position(|expected| *expected == line.trim()) {
@@ -714,6 +738,37 @@ fn commission_allowance_admits_only_its_named_owner_and_test_gates() {
     assert!(!check(gate, cfg, &[owner.clone(), other.to_owned()]));
 }
 
+/// The 8k-2 detector's allowance admits exactly its lines in its two files:
+/// the same lines elsewhere, twice, or with any other Spot path or name are
+/// still found.
+#[test]
+fn detector_allowance_admits_only_its_named_lines() {
+    let names = spot_type_names();
+    let workspace = crate_dir().parent().unwrap();
+    let other = Path::new("robsond/src/venue.rs");
+    for owner in [
+        "robsond/src/balance_reconciliation/classify.rs",
+        "robsond/src/balance_reconciliation/tests.rs",
+    ]
+    .map(Path::new)
+    {
+        let text = fs::read_to_string(workspace.join(owner)).unwrap();
+        assert!(outside_spot_violations(owner, &text, &names).is_empty(), "{}", owner.display());
+        let exact = detector_reference_lines(owner).join("\n");
+        assert!(outside_spot_violations(owner, &exact, &names).is_empty());
+        assert!(!outside_spot_violations(other, &exact, &names).is_empty());
+        assert!(!outside_spot_violations(owner, &format!("{exact}\n{exact}"), &names).is_empty());
+        for extra in [
+            "use robson_connectors::binance::spot::SpotRestReader;",
+            "let account: SpotAccount = read().await;",
+            "binance::spot::build_venue();",
+        ] {
+            let widened = format!("{text}\n{extra}");
+            assert!(!outside_spot_violations(owner, &widened, &names).is_empty(), "{extra}");
+        }
+    }
+}
+
 #[test]
 fn the_clock_allowance_keeps_other_spot_paths_and_time_callers_closed() {
     let names = spot_type_names();
@@ -746,11 +801,29 @@ fn nothing_outside_the_spot_module_names_it() {
     let mut files = Vec::new();
     rust_files(workspace, &mut files);
     let outside: Vec<PathBuf> = files.into_iter().filter(|path| !path.starts_with(&spot)).collect();
-    // The scan sees the factory and the daemon, not only this crate.
+    // The scan sees the factory and the daemon, not only this crate, and
+    // package 5a's owners, one line each:
     for must in [
         "robsond/src/venue.rs",
         "robsond/src/main.rs",
         "robson-connectors/src/lib.rs",
+        // 8k-1 B: the foreign-lock fence and its release refusal;
+        "robson-exec/src/order_journal.rs",
+        "robsond/src/api.rs",
+        // 8k-2: the inert detector (its classifier's exact lines only);
+        "robsond/src/balance_reconciliation/mod.rs",
+        "robsond/src/balance_reconciliation/snapshot.rs",
+        "robsond/src/balance_reconciliation/classify.rs",
+        // 8l-1: the bounded routes of migrations 46 to 50;
+        "robson-db/src/bounded_migration.rs",
+        // 8l-2: the settlement barrier and the gate's pending slot;
+        "robsond/src/venue_ledger_store/settlement.rs",
+        "robson-exec/src/gate/pending_execution.rs",
+        // 8l-4a: the balance accounting context;
+        "robsond/src/balance_accounting.rs",
+        // 8l-4b: the projector's accounting step and the worker passing it.
+        "robson-projector/src/accounting.rs",
+        "robsond/src/projection_worker.rs",
     ] {
         assert!(outside.iter().any(|path| path.ends_with(must)), "{must} not scanned");
     }

@@ -35,6 +35,12 @@ use robson_exec::order_journal::StreamSuspensionRow;
 use tokio::sync::OwnedMutexGuard;
 use uuid::Uuid;
 
+#[cfg(feature = "postgres")]
+use crate::{
+    balance_accounting::{projector_step, AccountingRefusal, BalanceAccounting, BOUNDS},
+    ledger_connection::LedgerConnection,
+};
+
 /// Prefix of a position's stream.
 pub(crate) const POSITION_STREAM_PREFIX: &str = "position:";
 /// Prefix of a month's system stream.
@@ -318,6 +324,9 @@ pub(crate) enum RepairOutcome {
 /// counters `EntryFilled` and `PositionClosed` add to are not idempotent: an
 /// event re-applied whose position part was already applied adds again. They
 /// drive neither the budget nor the API.
+///
+/// On a balance-account daemon, `accounting` goes to every apply and the
+/// clear is one transaction with the accounting bump (ADR-0056 step 8l-4).
 #[cfg(feature = "postgres")]
 pub(crate) async fn repair_position_stream(
     pool: &sqlx::PgPool,
@@ -325,21 +334,17 @@ pub(crate) async fn repair_position_stream(
     streams: &EventStreams,
     stream_key: &str,
     suspended: &Suspended,
+    accounting: Option<&BalanceAccounting>,
 ) -> RepairOutcome {
     let _stream = streams.lock(stream_key).await;
-    let outcome = match repair_under_lock(pool, tenant_id, streams, stream_key, suspended).await {
+    let repaired = repair_under_lock(pool, tenant_id, streams, stream_key, suspended, accounting);
+    let outcome = match repaired.await {
         Ok(outcome) => outcome,
         Err(error) => RepairOutcome::Failed { error: error.to_string() },
     };
     let recorded = match &outcome {
         RepairOutcome::Cleared { .. } => {
-            sqlx::query(
-                "UPDATE stream_suspensions SET cleared_at = NOW(), repair_error = NULL \
-                 WHERE suspension_id = $1",
-            )
-            .bind(suspended.suspension_id)
-            .execute(pool)
-            .await
+            clear_suspension(pool, suspended.suspension_id, accounting).await
         },
         RepairOutcome::Refused { seq, event_type } => {
             record_repair_error(
@@ -358,8 +363,10 @@ pub(crate) async fn repair_position_stream(
             streams.clear(stream_key);
             RepairOutcome::Cleared { applied }
         },
-        // Applied, but not cleared on record: it stays suspended, and the next
-        // start validates and applies a suffix that is a no-op by then.
+        // Applied, but its clear failed, or its COMMIT went unanswered and may
+        // have landed: it stays suspended in this process. If the clear did
+        // not land, the next start validates and applies a suffix that is a
+        // no-op by then; if it did, there is nothing left to repair.
         (RepairOutcome::Cleared { .. }, Err(error)) => RepairOutcome::Failed {
             error: format!("clearing the suspension: {error}"),
         },
@@ -367,17 +374,51 @@ pub(crate) async fn repair_position_stream(
     }
 }
 
+/// The clear: one autocommit statement, or on a balance-account daemon one
+/// transaction of six (ADR-0056 step 8l-4): `BEGIN`, the bounds, the
+/// accounting bump, the generation CAS, the clear and `COMMIT`, dropped raw
+/// on any failure. A failure before `COMMIT` leaves nothing of it; an
+/// unanswered `COMMIT` may have landed all of it (PLAN-r4 §7.1).
+#[cfg(feature = "postgres")]
+async fn clear_suspension(
+    pool: &sqlx::PgPool,
+    suspension_id: Uuid,
+    accounting: Option<&BalanceAccounting>,
+) -> Result<(), String> {
+    use sqlx::Connection as _;
+
+    const CLEAR: &str = "UPDATE stream_suspensions SET cleared_at = NOW(), repair_error = NULL \
+                         WHERE suspension_id = $1";
+    let Some(accounting) = accounting else {
+        let cleared = sqlx::query(CLEAR).bind(suspension_id).execute(pool).await;
+        return cleared.map(drop).map_err(|error| error.to_string());
+    };
+    let clear = async {
+        let mut held = LedgerConnection::new(pool.acquire().await?);
+        let mut tx = held.connection().begin().await?;
+        sqlx::query(BOUNDS).execute(&mut *tx).await?;
+        accounting.advance(&mut tx).await?;
+        sqlx::query(CLEAR).bind(suspension_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        held.finished = true;
+        Ok::<_, AccountingRefusal>(())
+    };
+    clear.await.map_err(|error| error.to_string())
+}
+
 #[cfg(feature = "postgres")]
 async fn record_repair_error(
     pool: &sqlx::PgPool,
     suspension_id: Uuid,
     error: &str,
-) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+) -> Result<(), String> {
     sqlx::query("UPDATE stream_suspensions SET repair_error = $2 WHERE suspension_id = $1")
         .bind(suspension_id)
         .bind(error)
         .execute(pool)
         .await
+        .map(drop)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "postgres")]
@@ -387,6 +428,7 @@ async fn repair_under_lock(
     streams: &EventStreams,
     stream_key: &str,
     suspended: &Suspended,
+    accounting: Option<&BalanceAccounting>,
 ) -> Result<RepairOutcome, sqlx::Error> {
     let ManagedStream::Position(position_id) = suspended.stream else {
         return Ok(RepairOutcome::Refused {
@@ -452,7 +494,10 @@ async fn repair_under_lock(
             break;
         };
         for envelope in &page {
-            if let Err(error) = robson_projector::apply_event_to_projections(pool, envelope).await {
+            let step = projector_step(accounting);
+            if let Err(error) =
+                robson_projector::apply_event_to_projections_with(pool, envelope, step).await
+            {
                 return Ok(RepairOutcome::Failed {
                     error: format!("seq {}: {}: {error}", envelope.seq, envelope.event_type),
                 });

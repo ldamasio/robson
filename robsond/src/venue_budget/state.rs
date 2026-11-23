@@ -229,7 +229,7 @@ impl SharedBudget {
     }
 
     /// Test-only C8 inventory reservation: the closed read's fixed weight
-    /// (20/80/6), never a caller-chosen one, same Steady checks.
+    /// (20/6/6), never a caller-chosen one, same Steady checks.
     #[cfg(all(test, feature = "crash-points"))]
     pub(crate) fn try_reserve_inventory(
         &self,

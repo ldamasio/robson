@@ -58,6 +58,8 @@
 //!   the next scan because a live entry held their symbol and side (PR O)
 //! - `robsond_entry_refused_ownership_total` — entries refused at their send
 //!   because a sweep's close held their symbol and side (PR O)
+//! - `robsond_leg_settlement_pending` — balance-account legs the latest
+//!   settlement barrier read found unsettled (ADR-0056 step 8l-2)
 
 use std::sync::LazyLock;
 
@@ -261,6 +263,21 @@ pub static STREAMS_SUSPENDED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     )
     .expect("failed to register robsond_streams_suspended")
 });
+
+/// Balance-account legs the latest settlement barrier read found unsettled
+/// (ADR-0056 step 8l-2, v16 §3.7.3). Set by every read; absent until the
+/// first, and no production path reads the barrier yet.
+pub static LEG_SETTLEMENT_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "robsond_leg_settlement_pending",
+        "Balance-account legs the latest settlement barrier read found unsettled"
+    )
+    .expect("failed to register robsond_leg_settlement_pending")
+});
+
+pub fn observe_leg_settlement_pending(legs: u64) {
+    LEG_SETTLEMENT_PENDING.set(i64::try_from(legs).unwrap_or(i64::MAX));
+}
 
 /// Publish how many streams of each kind are suspended; both kinds export,
 /// at 0 from startup.

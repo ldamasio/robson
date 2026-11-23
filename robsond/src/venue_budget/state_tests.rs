@@ -269,7 +269,7 @@ proptest! {
                 || Ok((now, ())), || std::task::Poll::Pending).unwrap();
         }
         drop(reservation);
-        let remaining = 400 - u32::from(handed_off) * [20, 80, 6][endpoint];
+        let remaining = 400 - u32::from(handed_off) * [20, 6, 6][endpoint];
         let mut probes = Vec::new();
         for _ in 0..remaining / 20 {
             probes.push(budget.try_reserve_account(now, due).unwrap());

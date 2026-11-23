@@ -6,6 +6,7 @@ use robson_eventlog::{EventEnvelope, QUERY_STATE_CHANGED_EVENT_TYPE};
 use sqlx::PgPool;
 
 use crate::{
+    accounting::AccountingStep,
     error::{ProjectionError, Result},
     handlers,
 };
@@ -212,6 +213,17 @@ pub fn is_repairable_position_event(event_type: &str) -> bool {
 /// This is idempotent and safe for replay - handlers use UPSERT
 /// and check sequence numbers to prevent double-application.
 pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
+    apply_event_to_projections_with(pool, envelope, None).await
+}
+
+/// [`apply_event_to_projections`] on a balance-account daemon (ADR-0056 step
+/// 8l-4): each `monthly_state` write is one transaction that runs `accounting`
+/// before it. `None` is exactly [`apply_event_to_projections`].
+pub async fn apply_event_to_projections_with(
+    pool: &PgPool,
+    envelope: &EventEnvelope,
+    accounting: Option<&dyn AccountingStep>,
+) -> Result<()> {
     match projection_route(envelope.event_type.as_str()) {
         Some(ProjectionRoute::OrderSubmitted) => {
             handlers::orders::handle_order_submitted(pool, envelope).await?
@@ -251,7 +263,8 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         },
         Some(ProjectionRoute::EntryFilled) => {
             handlers::positions::handle_entry_filled(pool, envelope).await?;
-            handlers::monthly_state::handle_entry_filled_monthly(pool, envelope).await?;
+            handlers::monthly_state::handle_entry_filled_monthly(pool, envelope, accounting)
+                .await?;
         },
         Some(ProjectionRoute::TechnicalStopAnalyzed) => {
             // Audit-only event. The full analysis payload is recoverable from
@@ -261,10 +274,11 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
             handlers::positions::handle_entry_signal_received(pool, envelope).await?
         },
         Some(ProjectionRoute::MonthBoundaryReset) => {
-            handlers::monthly_state::handle_month_boundary_reset(pool, envelope).await?
+            handlers::monthly_state::handle_month_boundary_reset(pool, envelope, accounting).await?
         },
         Some(ProjectionRoute::CapitalBaseRecalibrated) => {
-            handlers::monthly_state::handle_capital_base_recalibrated(pool, envelope).await?
+            handlers::monthly_state::handle_capital_base_recalibrated(pool, envelope, accounting)
+                .await?
         },
         Some(ProjectionRoute::TrailingStopUpdated) => {
             handlers::positions::handle_trailing_stop_updated(pool, envelope).await?
@@ -338,7 +352,8 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         },
         Some(ProjectionRoute::PositionClosedDomain) => {
             handlers::positions::handle_position_closed_domain(pool, envelope).await?;
-            handlers::monthly_state::handle_position_closed_monthly(pool, envelope).await?;
+            handlers::monthly_state::handle_position_closed_monthly(pool, envelope, accounting)
+                .await?;
         },
         None => {
             // Unknown event types are a configuration error - they indicate the projector
