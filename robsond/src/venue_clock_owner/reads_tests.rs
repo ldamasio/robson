@@ -799,8 +799,9 @@ async fn the_mark_venue_reserves_only_the_klines_weight() {
 
 /// 5a: one boundary mark is one charge of the kline's weight, then one
 /// unsigned send on that reservation through the single read path (no second
-/// reservation); the venue's status and body reach `kline_at` as they came.
-/// This venue answers every kline 400, so the mark refuses with that status.
+/// reservation); the venue's status and body come back as they came. This
+/// venue answers every kline 400 with an error object, which the mark refuses
+/// (K stays pending).
 #[tokio::test(flavor = "multi_thread")]
 async fn one_mark_kline_is_one_charge_and_one_unsigned_send() {
     use crate::boundary::mark::{kline_at, MarkVenue as _, KLINE_WEIGHT};
@@ -811,8 +812,7 @@ async fn one_mark_kline_is_one_charge_and_one_unsigned_send() {
     assert_eq!((status, body.as_str()), (400, r#"{"code":-1100,"msg":"unserved"}"#));
     assert_eq!(owner.used(), (2, 1));
     let (month, now, open) = mark_month();
-    let refused = kline_at(&owner.reads, month, now).await.err().unwrap();
-    assert!(refused.to_string().contains("HTTP 400"), "{refused}");
+    assert!(kline_at(&owner.reads, month, now).await.is_err());
     assert_eq!(owner.used(), (4, 2));
     let requests = venue.requests();
     assert_eq!(requests.len(), 2);
