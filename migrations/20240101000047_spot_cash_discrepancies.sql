@@ -67,14 +67,16 @@ BEGIN
         CONSTRAINT cash_discrepancies_direction CHECK (direction IN ('missing', 'extra')),
         CONSTRAINT cash_discrepancies_state CHECK (state IN ('open', 'void', 'resolved')),
         CONSTRAINT cash_discrepancies_first_observation CHECK (
-            first_u_ns >= 0 AND first_interval_start <= first_send_at AND first_send_at <= first_receive_at
+            first_u_ns >= 0 AND isfinite(first_interval_start) AND isfinite(first_interval_end)
+            AND first_interval_start <= first_send_at AND first_send_at <= first_receive_at
             AND first_receive_at <= first_interval_end),
         -- the sign matches the direction and the first sighting is beyond the 0.01 tolerance
         CONSTRAINT cash_discrepancies_first_delta CHECK (
             ledger_amount_fits(first_delta)
             AND ((direction = 'missing' AND first_delta < -0.01) OR (direction = 'extra' AND first_delta > 0.01))),
         CONSTRAINT cash_discrepancies_checkpoint CHECK (
-            checkpoint_interval_start <= checkpoint_cut AND checkpoint_cut <= checkpoint_interval_end
+            isfinite(checkpoint_interval_start) AND isfinite(checkpoint_interval_end)
+            AND checkpoint_interval_start <= checkpoint_cut AND checkpoint_cut <= checkpoint_interval_end
             AND checkpoint_cut <= first_interval_start),
         CONSTRAINT cash_discrepancies_opened_version CHECK (opened_version >= 0),
         CONSTRAINT cash_discrepancies_min_delta CHECK (ledger_amount_fits(min_delta) AND min_delta <= first_delta),

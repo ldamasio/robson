@@ -405,6 +405,21 @@ async fn cash_anchors_refuse_incoherent_rows(pool: PgPool) -> Result<()> {
             "23514",
             "cash_anchors_hull",
         ),
+        // An observation's instants are finite: an infinite end (with the hull
+        // following it) or start would satisfy every ordering.
+        (
+            set(&fresh(&good), &[
+                ("interval_end", json!("infinity")),
+                ("depends_end", json!("infinity")),
+            ]),
+            "23514",
+            "cash_anchors_observation",
+        ),
+        (
+            with(&fresh(&good), "depends_start", json!("-infinity")),
+            "23514",
+            "cash_anchors_hull",
+        ),
         (with(&fresh(&good), "quote", json!("-0.01")), "23514", "cash_anchors_quote"),
         (with(&fresh(&good), "quote", json!("NaN")), "23514", "cash_anchors_quote"),
         (with(&good, "anchor_id", json!(NIL)), "23514", "cash_anchors_ids"),
@@ -508,6 +523,20 @@ async fn cash_checkpoints_follow_their_anchor(pool: PgPool) -> Result<()> {
         ),
         (
             with(&checkpoint_row(s, 1_000, "scan", None), "cut", json!(ts(999))),
+            "23514",
+            "cash_checkpoints_observation",
+        ),
+        // Finite instants: an infinite end or start satisfies every ordering.
+        (
+            with(&checkpoint_row(s, 1_000, "scan", None), "interval_end", json!("infinity")),
+            "23514",
+            "cash_checkpoints_observation",
+        ),
+        (
+            set(&checkpoint_row(s, 1_000, "scan", None), &[
+                ("cut", json!("-infinity")),
+                ("interval_start", json!("-infinity")),
+            ]),
             "23514",
             "cash_checkpoints_observation",
         ),
@@ -784,6 +813,22 @@ async fn cash_discrepancies_refuse_incoherent_first_sightings(pool: PgPool) -> R
             "23514",
             "cash_discrepancies_checkpoint",
         ),
+        // Finite instants: an infinite bound satisfies every ordering.
+        (
+            with(&good, "checkpoint_interval_start", json!("-infinity")),
+            "23514",
+            "cash_discrepancies_checkpoint",
+        ),
+        (
+            with(&good, "checkpoint_interval_end", json!("infinity")),
+            "23514",
+            "cash_discrepancies_checkpoint",
+        ),
+        (
+            with(&good, "first_interval_end", json!("infinity")),
+            "23514",
+            "cash_discrepancies_first_observation",
+        ),
         (with(&good, "min_delta", json!("-99")), "23514", "cash_discrepancies_min_delta"),
         (with(&good, "min_delta", json!("NaN")), "23514", "cash_discrepancies_min_delta"),
         (
@@ -856,6 +901,16 @@ async fn cash_sightings_are_immutable(pool: PgPool) -> Result<()> {
         (sighting_row(s, id, 3, "Infinity", 30_000), "23514", "cash_sightings_delta"),
         (
             with(&sighting_row(s, id, 3, "1", 30_000), "interval_end", json!(ts(30_349))),
+            "23514",
+            "cash_sightings_observation",
+        ),
+        (
+            with(&sighting_row(s, id, 3, "1", 30_000), "interval_end", json!("infinity")),
+            "23514",
+            "cash_sightings_observation",
+        ),
+        (
+            with(&sighting_row(s, id, 3, "1", 30_000), "interval_start", json!("-infinity")),
             "23514",
             "cash_sightings_observation",
         ),
@@ -973,6 +1028,19 @@ async fn cash_reanchors_refuse_incoherent_rows(pool: PgPool) -> Result<()> {
         (set(&[("o2_total", json!("995.02"))]), "23514", "cash_reanchors_observations"),
         (set(&[("o1_send_at", json!(ts(60_400)))]), "23514", "cash_reanchors_o1"),
         (set(&[("o2_total", json!("-1"))]), "23514", "cash_reanchors_o2"),
+        // Finite instants: an infinite bound satisfies every ordering.
+        (set(&[("o1_interval_start", json!("-infinity"))]), "23514", "cash_reanchors_o1"),
+        (set(&[("o2_interval_end", json!("infinity"))]), "23514", "cash_reanchors_o2"),
+        (
+            set(&[("dating_interval_start", json!("-infinity"))]),
+            "23514",
+            "cash_reanchors_dating",
+        ),
+        (
+            set(&[("dating_interval_end", json!("infinity"))]),
+            "23514",
+            "cash_reanchors_dating",
+        ),
         (
             set(&[
                 ("dating_cut", json!(ts(70_000))),

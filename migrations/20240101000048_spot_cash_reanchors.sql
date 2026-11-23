@@ -34,7 +34,8 @@ BEGIN
         CONSTRAINT cash_sightings_seq CHECK (seq >= 1),
         CONSTRAINT cash_sightings_delta CHECK (ledger_amount_fits(delta)),
         CONSTRAINT cash_sightings_observation CHECK (
-            u_ns >= 0 AND interval_start <= send_at AND send_at <= receive_at AND receive_at <= interval_end)
+            u_ns >= 0 AND isfinite(interval_start) AND isfinite(interval_end)
+            AND interval_start <= send_at AND send_at <= receive_at AND receive_at <= interval_end)
     );
 
     CREATE TRIGGER cash_sightings_are_immutable BEFORE UPDATE OR DELETE ON public.cash_sightings
@@ -103,10 +104,12 @@ BEGIN
             AND o2_epoch_id <> '00000000-0000-0000-0000-000000000000'::UUID),
         CONSTRAINT cash_reanchors_identity CHECK (btrim(operator_subject) <> '' AND btrim(reason) <> ''),
         CONSTRAINT cash_reanchors_o1 CHECK (
-            o1_u_ns >= 0 AND o1_interval_start <= o1_send_at AND o1_send_at <= o1_receive_at
+            o1_u_ns >= 0 AND isfinite(o1_interval_start) AND isfinite(o1_interval_end)
+            AND o1_interval_start <= o1_send_at AND o1_send_at <= o1_receive_at
             AND o1_receive_at <= o1_interval_end AND ledger_amount_fits(o1_total) AND o1_total >= 0),
         CONSTRAINT cash_reanchors_o2 CHECK (
-            o2_u_ns >= 0 AND o2_interval_start <= o2_send_at AND o2_send_at <= o2_receive_at
+            o2_u_ns >= 0 AND isfinite(o2_interval_start) AND isfinite(o2_interval_end)
+            AND o2_interval_start <= o2_send_at AND o2_send_at <= o2_receive_at
             AND o2_receive_at <= o2_interval_end AND ledger_amount_fits(o2_total) AND o2_total >= 0),
         -- O1 ends before O2's cut, so the contribution dated at O1's receipt plus u precedes the new anchor;
         -- the two totals agree within 0.01
@@ -121,7 +124,8 @@ BEGIN
         CONSTRAINT cash_reanchors_anchors CHECK (old_anchor_id <> new_anchor_id),
         -- the effective dating copy; the withdrawal it dates precedes the new anchor
         CONSTRAINT cash_reanchors_dating CHECK (
-            dating_interval_start <= dating_cut AND dating_cut <= dating_interval_end
+            isfinite(dating_interval_start) AND isfinite(dating_interval_end)
+            AND dating_interval_start <= dating_cut AND dating_cut <= dating_interval_end
             AND dating_cut < o2_interval_start),
         -- min_delta = min(effective minimum, delta at O1, delta at O2, 0), delta being O2's; W = -min_delta
         CONSTRAINT cash_reanchors_amounts CHECK (

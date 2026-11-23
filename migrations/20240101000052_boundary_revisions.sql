@@ -55,7 +55,7 @@ BEGIN
             AND anchor_id <> '00000000-0000-0000-0000-000000000000'::UUID
             AND computed_clock_sample_id <> '00000000-0000-0000-0000-000000000000'::UUID),
         CONSTRAINT boundary_snapshot_revisions_as_of CHECK (
-            as_of = (month::TIMESTAMP AT TIME ZONE 'UTC') AND anchor_as_of < as_of),
+            as_of = (month::TIMESTAMP AT TIME ZONE 'UTC') AND isfinite(anchor_as_of) AND anchor_as_of < as_of),
         CONSTRAINT boundary_snapshot_revisions_mark CHECK (
             mark_price > 0 AND mark_kline_open_time = as_of - INTERVAL '60 seconds'
             AND mark_kline_close_time = as_of - INTERVAL '1 millisecond'),
@@ -72,7 +72,7 @@ BEGIN
             reason IN ('initial', 'reopened') AND (revision = 1) = (reason = 'initial')
             AND (reason = 'reopened') = (reopen_seq IS NOT NULL)),
         CONSTRAINT boundary_snapshot_revisions_computed CHECK (
-            computed_clock_verdict = 'valid' AND computed_at >= as_of + INTERVAL '60 seconds')
+            computed_clock_verdict = 'valid' AND isfinite(computed_at) AND computed_at >= as_of + INTERVAL '60 seconds')
     );
 
     CREATE TRIGGER boundary_snapshot_revisions_are_immutable BEFORE UPDATE OR DELETE

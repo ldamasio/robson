@@ -85,13 +85,13 @@ BEGIN
             open_after_b IN ('new_at_completion', 'trade_after_b', 'robson_cancel_after_b')),
         CONSTRAINT boundary_carried_legs_acknowledged CHECK (
             num_nonnulls(stop_live_seen_at, stop_live_clock_verdict) = CASE WHEN protected_at_b THEN 2 ELSE 0 END
-            AND (NOT protected_at_b OR (stop_live_clock_verdict = 'valid'
+            AND (NOT protected_at_b OR (stop_live_clock_verdict = 'valid' AND isfinite(stop_live_seen_at)
                  AND stop_live_seen_at <= (month::TIMESTAMP AT TIME ZONE 'UTC') - INTERVAL '2 seconds'))),
         CONSTRAINT boundary_carried_legs_lookup CHECK (
             num_nonnulls(lookup_sent_at, lookup_clock_sample_id, lookup_clock_verdict, lookup_status)
             = CASE WHEN open_after_b = 'new_at_completion' THEN 4 ELSE 0 END
             AND (open_after_b IS DISTINCT FROM 'new_at_completion' OR (lookup_clock_verdict = 'valid'
-                 AND lookup_status = 'NEW'
+                 AND lookup_status = 'NEW' AND isfinite(lookup_sent_at)
                  AND lookup_sent_at >= (month::TIMESTAMP AT TIME ZONE 'UTC') + INTERVAL '2 seconds'))),
         CONSTRAINT boundary_carried_legs_trade CHECK (
             (stop_trade_id IS NOT NULL) = (open_after_b IS NOT DISTINCT FROM 'trade_after_b')),
@@ -99,6 +99,7 @@ BEGIN
             num_nonnulls(cancel_intent_id, cancel_attempt_at, cancel_attempt_clock_verdict)
             = CASE WHEN open_after_b = 'robson_cancel_after_b' THEN 3 ELSE 0 END
             AND (open_after_b IS DISTINCT FROM 'robson_cancel_after_b' OR (cancel_attempt_clock_verdict = 'valid'
+                 AND isfinite(cancel_attempt_at)
                  AND cancel_attempt_at >= (month::TIMESTAMP AT TIME ZONE 'UTC') + INTERVAL '2 seconds'))),
         CONSTRAINT boundary_carried_legs_exclusions CHECK (
             CASE WHEN jsonb_typeof(exclusions) = 'array' THEN jsonb_array_length(exclusions) <= 64 ELSE FALSE END)

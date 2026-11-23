@@ -806,6 +806,12 @@ async fn boundary_snapshot_revisions_refuse_incoherent_rows(pool: PgPool) -> Res
             "23514",
             "boundary_snapshot_revisions_as_of",
         ),
+        // Finite instants: -infinity precedes every B.
+        (
+            with(&good, "anchor_as_of", json!("-infinity")),
+            "23514",
+            "boundary_snapshot_revisions_as_of",
+        ),
         (
             with(&good, "mark_price", json!("0")),
             "23514",
@@ -926,6 +932,11 @@ async fn boundary_snapshot_revisions_refuse_incoherent_rows(pool: PgPool) -> Res
         ),
         (
             with(&good, "computed_at", json!(at(59_999))),
+            "23514",
+            "boundary_snapshot_revisions_computed",
+        ),
+        (
+            with(&good, "computed_at", json!("infinity")),
             "23514",
             "boundary_snapshot_revisions_computed",
         ),
@@ -1316,6 +1327,23 @@ async fn boundary_carried_legs_refuse_incoherent_rows(pool: PgPool) -> Result<()
             with(&trade, "stop_live_seen_at", json!(at(-1_999))),
             "23514",
             "boundary_carried_legs_acknowledged",
+        ),
+        // Finite instants: -infinity precedes B - 2 s and infinity follows
+        // B + 2 s, so each would satisfy its ordering.
+        (
+            with(&trade, "stop_live_seen_at", json!("-infinity")),
+            "23514",
+            "boundary_carried_legs_acknowledged",
+        ),
+        (
+            with(&lookup, "lookup_sent_at", json!("infinity")),
+            "23514",
+            "boundary_carried_legs_lookup",
+        ),
+        (
+            with(&cancel, "cancel_attempt_at", json!("infinity")),
+            "23514",
+            "boundary_carried_legs_cancel",
         ),
         (
             with(&trade, "stop_live_clock_verdict", json!("invalid")),

@@ -70,9 +70,10 @@ BEGIN
             num_nulls(as_of, send_at, receive_at, u_ns, sample_id, epoch_id, interval_start, interval_end,
                       depends_start, depends_end) IN (0, 10)),
         CONSTRAINT cash_anchors_observation CHECK (
-            as_of = interval_start AND u_ns >= 0
+            as_of = interval_start AND u_ns >= 0 AND isfinite(interval_start) AND isfinite(interval_end)
             AND interval_start <= send_at AND send_at <= receive_at AND receive_at <= interval_end),
-        CONSTRAINT cash_anchors_hull CHECK (depends_start <= interval_start AND depends_end = interval_end)
+        CONSTRAINT cash_anchors_hull CHECK (
+            isfinite(depends_start) AND depends_start <= interval_start AND depends_end = interval_end)
     );
 
     CREATE TRIGGER cash_anchors_move_forward BEFORE UPDATE OR DELETE ON public.cash_anchors
@@ -108,7 +109,7 @@ BEGIN
         CONSTRAINT cash_checkpoints_source CHECK (source IN ('scan', 'cutover', 'reanchor')),
         CONSTRAINT cash_checkpoints_anchor_pair CHECK ((source = 'scan') = (anchor_id IS NULL)),
         CONSTRAINT cash_checkpoints_observation CHECK (
-            cut = interval_start AND u_ns >= 0
+            cut = interval_start AND u_ns >= 0 AND isfinite(interval_start) AND isfinite(interval_end)
             AND interval_start <= send_at AND send_at <= receive_at AND receive_at <= interval_end)
     );
 END;
