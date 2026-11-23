@@ -275,7 +275,7 @@ impl ReconciliationRig {
         let mut rows = bootstrap::observe_bootstrap(pool, tenant, &start, &input, deadline, &trace)
             .await
             .map_err(|e| anyhow!("budget bootstrap: {e:?}"))?;
-        restore::existing_pause(pool, tenant, &mut rows, &clock, deadline, &trace)
+        restore::existing_pause(pool, tenant, rows.pause.as_mut(), &clock, deadline, &trace)
             .await
             .map_err(|e| anyhow!("budget pause: {e:?}"))?;
         let budget = SharedBudget::from_rows(rows, start.predecessor.unclean_reason().is_some())

@@ -86,7 +86,8 @@ SELECT s.venue_id,s.initialization_state,s.initialization_id,s.audit_id,
        budget_integer_fits(p.restoration_anchor,0,9223372036854775807999999999) AS pause_anchor_fits,
        p.deadline_tick::text AS pause_deadline_text,
        budget_integer_fits(p.deadline_tick,0,9223372036854775807999999999) AS pause_deadline_fits,
-       p.until_at::text AS pause_until_audit,p.recorded_at::text AS pause_recorded_audit
+       p.until_at::text AS pause_until_audit,p.recorded_at::text AS pause_recorded_audit,
+       (extract(epoch FROM p.recorded_at)*1000000)::bigint AS pause_recorded_at_us
 FROM budget_venue_state s
 LEFT JOIN budget_source_audits a ON a.audit_id=s.audit_id
 LEFT JOIN venue_pauses p ON p.tenant_id=$2::uuid AND p.venue_id=s.venue_id

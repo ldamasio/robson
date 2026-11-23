@@ -7,12 +7,15 @@ use super::{
     BudgetError,
 };
 
-pub(super) struct PauseValue {
+pub(crate) struct PauseValue {
     pub(super) observation: Uuid,
     pub(super) duration: Option<i128>,
     pub(super) original: Option<(ClockDomain, i128)>,
     pub(super) restored: Option<(ClockDomain, i128, i128)>,
     pub(super) bounded: bool,
+    /// The stored `recorded_at` in microseconds: a restoration never moves
+    /// it backward.
+    pub(super) recorded_us: i64,
     pub(super) _observed: (i16, Option<i32>, Option<String>, String),
 }
 
@@ -60,6 +63,7 @@ impl PauseValue {
         let deadline = optional(row, "pause_deadline_text", "pause_deadline_fits")?;
         let until: Option<String> = get(row, "pause_until_audit")?;
         let recorded: Option<String> = get(row, "pause_recorded_audit")?;
+        let recorded_us: Option<i64> = get(row, "pause_recorded_at_us")?;
         if !present {
             if status.is_none()
                 && code.is_none()
@@ -73,6 +77,7 @@ impl PauseValue {
                 && deadline.is_none()
                 && until.is_none()
                 && recorded.is_none()
+                && recorded_us.is_none()
             {
                 return Ok(None);
             }
@@ -108,6 +113,7 @@ impl PauseValue {
             original,
             restored,
             bounded,
+            recorded_us: recorded_us.ok_or(BudgetError::Invalid)?,
             _observed: (status, code, until, recorded.ok_or(BudgetError::Invalid)?),
         }))
     }

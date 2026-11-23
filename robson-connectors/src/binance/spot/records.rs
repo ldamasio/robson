@@ -373,14 +373,12 @@ pub fn decode_open_order_lists(
     Ok(lists)
 }
 
-#[cfg(any(test, feature = "crash-points"))]
 #[derive(Deserialize)]
 #[serde(transparent)]
 struct OpenOrderEntries(#[serde(deserialize_with = "object_entries")] Vec<SpotOrderRecord>);
 
 /// Why a strict inventory body was refused. No variant carries input text
 /// beyond a validated ID.
-#[cfg(any(test, feature = "crash-points"))]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SpotInventoryError {
     #[error("inventory: {len} bytes exceed the {limit}-byte envelope")]
@@ -396,11 +394,14 @@ pub enum SpotInventoryError {
     /// The same `(symbol, orderId)` or `(symbol, clientOrderId)` twice.
     #[error("inventory: order {0} repeats or conflicts")]
     DuplicateOrder(u64),
+    /// A scoped answer with a row outside its own request: an open order of
+    /// another pair than the one asked for.
+    #[error("inventory: a row outside the read's scope")]
+    OutsideScope,
     #[error("inventory: allocation refused")]
     Allocation,
 }
 
-#[cfg(any(test, feature = "crash-points"))]
 fn malformed(e: serde_json::Error) -> SpotInventoryError {
     // Category and position only: a serde message may quote the input.
     SpotInventoryError::Malformed(format!(
@@ -413,7 +414,6 @@ fn malformed(e: serde_json::Error) -> SpotInventoryError {
 
 /// Decode a completed `GET /api/v3/account` body within `max_bytes`: one
 /// map only (never a positional array), every asset once. Synchronous, no I/O.
-#[cfg(any(test, feature = "crash-points"))]
 pub fn decode_account(body: &str, max_bytes: usize) -> Result<SpotAccount, SpotInventoryError> {
     if body.len() > max_bytes {
         return Err(SpotInventoryError::Oversize { len: body.len(), limit: max_bytes });
@@ -451,7 +451,6 @@ pub fn decode_account(body: &str, max_bytes: usize) -> Result<SpotAccount, SpotI
 /// array of maps, every row and raw symbol kept, all or nothing. Identity is
 /// unique by `(symbol, orderId)` and by `(symbol, clientOrderId)`; list
 /// references are not resolved here.
-#[cfg(any(test, feature = "crash-points"))]
 pub fn decode_open_orders(
     body: &str,
     max_bytes: usize,

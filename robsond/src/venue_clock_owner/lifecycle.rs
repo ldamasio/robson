@@ -38,16 +38,22 @@ impl ClockOwner {
     }
 
     async fn run(mut self) -> bool {
-        let mut ticks = tokio::time::interval(Duration::from_secs(60));
+        let first = Instant::now() + self.first;
+        let mut ticks = tokio::time::interval_at(first, Duration::from_secs(60));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                biased;
-                _ = self.cancel.cancelled() => break,
-                _ = ticks.tick() => {},
-            }
-            let result = self.run_cycle().await;
+        let requests = Arc::clone(&self.requests);
+        while let Some(request) = next_cycle(&requests, &mut ticks, &self.cancel).await {
+            let result = match &request {
+                Some(request) => {
+                    self.run_cycle_kind(CycleKind::OnDemand { deadline: request.deadline }).await
+                },
+                None => self.run_cycle().await,
+            };
             metrics::cycle(result.as_ref().err().copied());
+            metrics::bucket(self.budget.usage(|| self.clock.capture().ok()));
+            if let Some(request) = request {
+                request.answer(result);
+            }
             // No subsequent cycle may overwrite a still-owned blocking job.
             // Cancellation cannot detach preparation or parser work.
             let retired = self.retire_jobs().await;
@@ -68,6 +74,22 @@ impl ClockOwner {
             tracing::warn!(outcome = "resource", "TIME blocking-job retirement failed");
         }
         preparation && parser
+    }
+}
+
+/// The sampler's next cycle, one at a time (PLAN §6.6): `None` once cancelled;
+/// the minute's tick first, so requests never starve it; then a reader's
+/// request, taken from its slot, which the caller answers after its cycle.
+pub(super) async fn next_cycle(
+    requests: &super::on_demand::Requests,
+    ticks: &mut tokio::time::Interval,
+    cancel: &CancellationToken,
+) -> Option<Option<super::on_demand::Request>> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        _ = ticks.tick() => Some(None),
+        request = requests.next() => Some(Some(request)),
     }
 }
 

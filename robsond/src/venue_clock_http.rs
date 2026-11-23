@@ -30,6 +30,15 @@ pub(crate) enum TimeError {
     Resource,
     Payload,
     Venue,
+    /// A fifth read while four are in flight: refused at once, nothing
+    /// reserved, prepared or sent (PS-5).
+    Busy,
+}
+
+impl From<BudgetError> for TimeError {
+    fn from(error: BudgetError) -> Self {
+        Self::Budget(error)
+    }
 }
 
 /// A TIME answer is tens of bytes. A body over this size is refused before it
