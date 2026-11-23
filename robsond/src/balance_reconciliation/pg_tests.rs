@@ -329,16 +329,27 @@ async fn a_malformed_scope_is_refused_before_any_statement(pool: PgPool) -> Resu
     let malformed = [
         Fixture::bound(&pool, Uuid::now_v7(), VenueId::BINANCE_USDM, "nt-usdm", Uuid::now_v7())
             .await?,
-        Fixture::bound(&pool, Uuid::nil(), spot, "nt-nil-tenant", Uuid::now_v7()).await?,
         Fixture::bound(&pool, Uuid::now_v7(), spot, "nt-nil-epoch", Uuid::nil()).await?,
         Fixture::bound(&pool, Uuid::now_v7(), spot, " ", Uuid::now_v7()).await?,
     ];
+    // A nil tenant has no backing rows on the composed schema: its venue
+    // account must name a cutover run (M56) and a run refuses a nil tenant
+    // (venue_cutovers_ids). The capture refuses it before any statement all
+    // the same.
+    let nil_tenant = Fixture {
+        tenant: Uuid::nil(),
+        scope: "nt-nil-tenant".into(),
+        epoch: Uuid::now_v7(),
+        venue: VenueId::new(spot),
+    };
     let gate = gate(&VenueId::new(spot));
     for f in &malformed {
         // The backing rows match: the statement alone would qualify it.
         let row = non_trading(NON_TRADING, f, &f.scope).fetch_one(&pool).await?;
         let flags: (i64, bool, bool, bool) = sqlx::FromRow::from_row(&row)?;
         ensure!(flags == (0, true, true, true), "{}: {flags:?}", f.scope);
+    }
+    for f in malformed.iter().chain([&nil_tenant]) {
         let before = proxy.stats().connections;
         let refused = Capture::before(&gate, &options, &f.scope(), deadline()).await;
         ensure!(matches!(refused, Err(UnqualifiedReason::Scope)), "{}: {refused:?}", f.scope);
