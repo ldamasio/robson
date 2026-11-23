@@ -335,7 +335,8 @@ async fn auxiliary(backend: &PgJournalBackend, write: &str) -> Result<(), String
 /// and the CAS right after main's bounds (6, 6, 8), move the version once and
 /// keep the generation current; with none installed only the bump is added
 /// (5, 5, 7); the legacy (USD-M) journal sends exactly its statements (3, 3,
-/// 5) and moves nothing.
+/// 5) and moves nothing. A non-trading journal's are the plain balance
+/// journal's (PS-1).
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn balance_journal_writers_add_the_bump_and_the_cas(pool: PgPool) {
@@ -347,10 +348,17 @@ async fn balance_journal_writers_add_the_bump_and_the_cas(pool: PgPool) {
         .with_accounting_generation(&installed.generation);
     let plain = PgJournalBackend::new(&proxied, unopted.tenant_id).with_balance_account(true);
     let legacy = PgJournalBackend::new(&proxied, unopted.tenant_id);
-    let journals: [(&PgJournalBackend, &BalanceAccounting, &[&str]); 3] = [
+    // PS-1: a non-trading Spot journal as the daemon wires it (balance, the
+    // daemon's empty cell) refuses every batch, and F's writes run as before.
+    let non_trading = PgJournalBackend::new(&proxied, unopted.tenant_id)
+        .with_accounting_generation(&GenerationCell::default())
+        .with_balance_account(true)
+        .non_trading();
+    let journals: [(&PgJournalBackend, &BalanceAccounting, &[&str]); 4] = [
         (&opted, &installed, &["bounds", "bump", "cas"]),
         (&plain, &unopted, &["bounds", "bump"]),
         (&legacy, &unopted, &[]),
+        (&non_trading, &unopted, &["bounds", "bump"]),
     ];
     for (backend, accounting, added) in journals {
         backend.check_ready().await.unwrap();

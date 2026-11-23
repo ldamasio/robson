@@ -130,10 +130,9 @@ pub struct Daemon<E: Venue + 'static, S: Store + 'static> {
     /// (ADR-0056 step 7). Held here so nothing reaches it through the manager
     /// lock.
     order_journal: Arc<OrderJournal>,
-    /// The epoch a supervised Spot startup already recorded, taken once by
-    /// the start instead of inserting another. `None` on every other daemon.
+    /// How a `binance:spot` daemon starts; `None` on every other daemon.
     #[cfg(feature = "postgres")]
-    supervised_epoch: Option<crate::process_epoch::EpochStart>,
+    spot_start: SpotStart,
     /// Bounds of the two-phase stop.
     stop_timings: StopTimings,
 }
@@ -202,16 +201,18 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     };
     let backend = crate::order_journal_store::PgJournalBackend::new(pool, tenant_id)
         .with_accounting_generation(generation);
-    with_order_journal_backend(executor, venue, backend)
+    with_order_journal_backend(executor, venue, backend, false)
 }
 
 /// The executor's journal on `backend`, attached to the venue before it is
-/// shared.
+/// shared. A `non_trading` journal's gate refuses every mutation from before
+/// it is attached or shared, and before any epoch (PS-1).
 #[cfg(feature = "postgres")]
 fn with_order_journal_backend<E: Venue + 'static, S: Store + 'static>(
     executor: Executor<E, S>,
     venue: &Arc<E>,
     backend: crate::order_journal_store::PgJournalBackend,
+    non_trading: bool,
 ) -> Executor<E, S> {
     // ADR-0056 step 8: the capability is fixed before the journal is shared,
     // and its backend bounds the same account's transactions.
@@ -224,6 +225,10 @@ fn with_order_journal_backend<E: Venue + 'static, S: Store + 'static>(
             .with_one_attempt_per_client_id(one_attempt)
             .with_balance_account(balance),
     );
+    if non_trading {
+        // A fresh gate always takes it; the constructor checks that it did.
+        let _ = journal.gate().refuse_mutations(robson_exec::gate::ReadOnlyReason::NonTrading);
+    }
     venue.attach_order_journal(Arc::clone(&journal));
     executor.with_order_journal(journal)
 }
@@ -239,6 +244,24 @@ async fn unless_stopped<T>(
         done = work => Ok(done),
         stopped = stopping => Err(stopped),
     }
+}
+
+#[cfg(feature = "postgres")]
+const UNSUPERVISED_SPOT: &str = "Spot startup requires a supervised journal";
+
+/// How a `binance:spot` daemon starts, fixed at construction (PS-1).
+#[cfg(feature = "postgres")]
+enum SpotStart {
+    /// Refused: a Spot daemon needs a start kind.
+    None,
+    /// The epoch package 4's supervised startup already recorded (test-only).
+    Supervised(crate::process_epoch::EpochStart),
+    /// An ordinary epoch with every venue mutation refused; the closed client
+    /// the TIME owner and the budgeted reads will use (PS-6).
+    NonTrading {
+        #[allow(dead_code, reason = "PS-6 builds the TIME owner and reads on it")]
+        client: Arc<robson_connectors::BinanceRestClient>,
+    },
 }
 
 struct PreparedStart {
@@ -363,7 +386,7 @@ impl Daemon<StubExchange, MemoryStore> {
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             #[cfg(feature = "postgres")]
-            supervised_epoch: None,
+            spot_start: SpotStart::None,
             stop_timings: StopTimings::default(),
         }
     }
@@ -444,7 +467,7 @@ impl Daemon<StubExchange, MemoryStore> {
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             #[cfg(feature = "postgres")]
-            supervised_epoch: None,
+            spot_start: SpotStart::None,
             stop_timings: StopTimings::default(),
         })
     }
@@ -550,7 +573,7 @@ impl Daemon<StubExchange, MemoryStore> {
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             #[cfg(feature = "postgres")]
-            supervised_epoch: None,
+            spot_start: SpotStart::None,
             stop_timings: StopTimings::default(),
         }
     }
@@ -630,7 +653,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             #[cfg(feature = "postgres")]
-            supervised_epoch: None,
+            spot_start: SpotStart::None,
             stop_timings: StopTimings::default(),
         }
     }
@@ -653,7 +676,48 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             projection_recovery,
             pg_pool,
             None,
+            None,
         )
+    }
+
+    /// A Spot daemon that can never trade (PS, production non-trading start):
+    /// refused unless `venue` is `binance:spot` on a balance account, a tenant
+    /// is set and `client` (the venue's own, from the Spot adapter's
+    /// non-trading constructor) is closed to unbudgeted requests.
+    /// Its journal refuses every batch and its gate every mutation, from
+    /// before the journal is shared; its start inserts an ordinary epoch.
+    #[cfg(feature = "postgres")]
+    pub fn non_trading_spot(
+        config: Config,
+        venue: Arc<E>,
+        market_data: Arc<dyn TradeFeedPort>,
+        ohlcv_port: Arc<dyn OhlcvPort>,
+        projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
+        pg_pool: Arc<sqlx::PgPool>,
+        client: Arc<robson_connectors::BinanceRestClient>,
+    ) -> DaemonResult<Self> {
+        if venue.id().as_str() != robson_exec::venue::VenueId::BINANCE_SPOT
+            || venue.capabilities().account_kind != robson_exec::venue::AccountKind::BalanceAccount
+            || config.projection.tenant_id.is_none()
+            || !client.is_closed()
+        {
+            let needs = "binance:spot, a balance account, a tenant and a closed client";
+            return Err(DaemonError::Config(format!("A non-trading start needs {needs}")));
+        }
+        let daemon = Self::assemble_with_recovery(
+            config,
+            venue,
+            market_data,
+            ohlcv_port,
+            projection_recovery,
+            Some(pg_pool),
+            None,
+            Some(client),
+        );
+        match daemon.order_journal.gate().read_only() {
+            Some(robson_exec::gate::ReadOnlyReason::NonTrading) => Ok(daemon),
+            _ => Err(DaemonError::Config("Non-trading refusal not set".into())),
+        }
     }
 
     /// Build the Spot daemon only from the supervised startup handoff. The
@@ -688,6 +752,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             None,
             pool,
             Some(ready),
+            None,
         ))
     }
 
@@ -700,6 +765,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
         projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
         pg_pool: Option<Arc<sqlx::PgPool>>,
         ready: Option<crate::spot_order_set_store::spot_startup::SpotReady>,
+        non_trading: Option<Arc<robson_connectors::BinanceRestClient>>,
     ) -> Self {
         use robson_domain::RiskConfig;
 
@@ -718,9 +784,20 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
                     executor,
                     &venue,
                     crate::order_journal_store::PgJournalBackend::supervised(ready, &generation),
+                    false,
                 )
             },
-            None => with_durable_order_journal(executor, &venue, &pg_pool, &config, &generation),
+            None => match (&non_trading, &pg_pool, config.projection.tenant_id) {
+                (Some(_), Some(pool), Some(tenant_id)) => with_order_journal_backend(
+                    executor,
+                    &venue,
+                    crate::order_journal_store::PgJournalBackend::new(pool, tenant_id)
+                        .with_accounting_generation(&generation)
+                        .non_trading(),
+                    true,
+                ),
+                _ => with_durable_order_journal(executor, &venue, &pg_pool, &config, &generation),
+            },
         });
         let order_journal = gated(&venue, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
@@ -802,7 +879,11 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             #[cfg(feature = "postgres")]
-            supervised_epoch: ready.map(|ready| ready.epoch().clone()),
+            spot_start: match (ready, non_trading) {
+                (Some(ready), _) => SpotStart::Supervised(ready.epoch().clone()),
+                (None, Some(client)) => SpotStart::NonTrading { client },
+                (None, None) => SpotStart::None,
+            },
             stop_timings: StopTimings::default(),
         }
     }
@@ -1057,9 +1138,9 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     async fn prepare_start(&self, journal: &OrderJournal) -> DaemonResult<PreparedStart> {
         #[cfg(feature = "postgres")]
         if self.exchange.id().as_str() == robson_exec::venue::VenueId::BINANCE_SPOT
-            && self.supervised_epoch.is_none()
+            && matches!(self.spot_start, SpotStart::None)
         {
-            return Err(DaemonError::Config("Spot startup requires a supervised journal".into()));
+            return Err(DaemonError::Config(UNSUPERVISED_SPOT.into()));
         }
         journal
             .check_ready()
@@ -1374,12 +1455,16 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             refuse_an_epochless_venue(self.exchange.id())?;
             return Ok(PreparedStart { marker: None, clock: None });
         };
-        let start = if self.exchange.id().as_str() == robson_exec::venue::VenueId::BINANCE_SPOT {
-            self.supervised_epoch.clone().ok_or_else(|| {
-                DaemonError::Config("Spot startup requires a supervised journal".into())
-            })?
-        } else {
-            crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION")).await?
+        let spot = self.exchange.id().as_str() == robson_exec::venue::VenueId::BINANCE_SPOT;
+        let ordinary =
+            || crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION"));
+        let start = match &self.spot_start {
+            SpotStart::Supervised(start) => start.clone(),
+            // The epoch-start seam of a non-trading start (PS-1): 5a composes
+            // 8l-3b's `process_epoch::start_balance_epoch` (same arguments).
+            SpotStart::NonTrading { .. } => ordinary().await?,
+            SpotStart::None if !spot => ordinary().await?,
+            SpotStart::None => return Err(DaemonError::Config(UNSUPERVISED_SPOT.into())),
         };
         crate::process_epoch::record_start(&start);
         let view = robson_exec::gate::EpochView {
@@ -1397,6 +1482,12 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             .await
             .event_streams()
             .set_epoch(start.epoch.epoch_id);
+        // A non-trading start stops here until PS-6 wires its TIME owner, its
+        // budget and its reads: no wire I/O, its epoch left unmarked.
+        if matches!(self.spot_start, SpotStart::NonTrading { .. }) {
+            crate::metrics::REFUSED_MUTATIONS.with_label_values(&["non_trading"]);
+            return Err(DaemonError::Config("Spot TIME owner not wired".into()));
+        }
         // I1's real component is exercised only from an isolated controlled
         // source. Production C2/2b/final audit is still unavailable: refuse
         // BEFORE constructing a TIME client/task or sending any request.
@@ -2778,7 +2869,7 @@ mod tests {
         let backend = crate::order_journal_store::PgJournalBackend::new(pool, uuid::Uuid::now_v7());
         // No readiness check: the release runs on the daemon pool, which is
         // already connected, and readiness is not what is measured here.
-        let journal = with_order_journal_backend(executor, &venue, backend).order_journal();
+        let journal = with_order_journal_backend(executor, &venue, backend, false).order_journal();
         let started = std::time::Instant::now();
         let released = release_under_lock(pool, &journal).await;
         (journal.balance_account(), released, started.elapsed())
@@ -2980,6 +3071,7 @@ mod tests {
                 None,
                 Some(Arc::new(ready.writer().clone())),
                 Some(ready),
+                None,
             )
         };
 
@@ -5637,3 +5729,7 @@ mod account_worker_tests;
 
 #[cfg(all(test, feature = "postgres"))]
 mod boundary_tests;
+
+#[cfg(all(test, feature = "postgres"))]
+#[path = "daemon_non_trading_pg_tests.rs"]
+mod non_trading_pg_tests;

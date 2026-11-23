@@ -2566,6 +2566,54 @@ mod tests {
         "0f254014d2dfb05879b1da44d6fd026a92ec6fd32b1e6a2fface66097b4094ef";
     const INTO_BODY: &str = "f1cadf8028c136cfaa20dbd6ef1e6331c54faba2ce28eabc28ebe8fd0e47b4a0";
 
+    /// PS-1: on a read-only gate every mutation entry is refused before
+    /// anything is built or sent, whether the client is closed or not: the
+    /// one-shot POST and DELETE answers, the legacy POST and DELETE, a permit
+    /// holder's and an orphan sweep's cancel. No request, latch or incident.
+    #[tokio::test]
+    async fn a_read_only_gate_refuses_every_mutation_entry() {
+        use robson_exec::gate::{orphan_sweep_cancel, OrphanSweepCancel, ReadOnlyReason};
+        let (url, requests) = slow_venue(Duration::ZERO, Duration::ZERO).await;
+        let client = BinanceRestClient::with_local_base_url(url);
+        let journal = Arc::new(OrderJournal::unpersisted());
+        journal.gate().refuse_mutations(ReadOnlyReason::NonTrading).unwrap();
+        client.attach_gate(Arc::clone(journal.gate()));
+        let refused = |result: Result<(), BinanceRestError>| match result {
+            Err(BinanceRestError::Refused(detail)) => {
+                assert_eq!(detail, "venue mutation refused: read-only process (non_trading)")
+            },
+            other => panic!("{other:?}"),
+        };
+        let entries = async {
+            refused(client.post_signed_answer("/api/v3/order", vec![]).await.map(drop));
+            refused(client.delete_signed_answer("/api/v3/order", vec![]).await.map(drop));
+            refused(client.set_leverage("BTCUSDT", 1).await);
+            refused(client.cancel_order("BTCUSDT", 1).await.map(drop));
+        };
+        entries.await;
+        let permit = journal.acquire(OperationKind::Panic).unwrap();
+        permit.scope(entries_again(&client, refused)).await;
+        permit.complete();
+        let sweep = Arc::new(OrphanSweepCancel::default());
+        let swept = client.delete_signed_answer("/api/v3/order", vec![]);
+        refused(orphan_sweep_cancel(Arc::clone(&sweep), swept).await.map(drop));
+        assert!(sweep.withheld() && !sweep.passed());
+
+        assert_eq!(requests.load(Ordering::SeqCst), 0, "nothing sent");
+        let gate = journal.gate().snapshot();
+        assert_eq!((gate.unpermitted, gate.open_incidents, gate.fenced), (0, 0, false));
+        assert!(!journal.latch_set());
+    }
+
+    async fn entries_again(
+        client: &BinanceRestClient,
+        refused: impl Fn(Result<(), BinanceRestError>),
+    ) {
+        refused(client.post_signed_answer("/api/v3/order", vec![]).await.map(drop));
+        refused(client.delete_signed_answer("/api/v3/order", vec![]).await.map(drop));
+        refused(client.set_leverage("BTCUSDT", 1).await);
+    }
+
     /// With a permit a mutation goes out in every phase, uncounted.
     #[tokio::test]
     async fn a_mutation_under_a_permit_goes_out_in_every_phase() {

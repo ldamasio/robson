@@ -682,6 +682,7 @@ async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
         balance_account: false,
         order_set_projection: Some(g.clone()),
         accounting_generation: Default::default(),
+        non_trading: false,
     };
     proxy.enable_exact_query_trace(12);
     proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE public.spot_order_set_generation g"));

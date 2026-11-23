@@ -1945,6 +1945,12 @@ impl OrderJournal {
         intent: &JournaledIntent,
         class: WriteClass,
     ) -> Result<(), BeforeSendRefusal> {
+        // A read-only process authorizes no send of either class, before any
+        // row, commit or occurrence: its journal is barrier 2 (PS-1).
+        if let Some(reason) = self.gate.read_only() {
+            let refused = crate::gate::MutationRefused::ReadOnly(reason);
+            return Err(SendRefusal::NotSent(refused.to_string()).into());
+        }
         let one_attempt = self.one_attempt_per_client_id;
         let (batch, attempt_id, first) = {
             let mut state = self.lock();
