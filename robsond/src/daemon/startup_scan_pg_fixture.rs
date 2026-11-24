@@ -192,10 +192,11 @@ async fn close_survives_failure(pool: sqlx::PgPool, append_fails: bool) {
             1 + u64::from((at.year(), at.month()) != (since.year(), since.month()))
         })
         .unwrap_or(0);
+    // 8m-2a: the append's try-lock, one statement.
     let expected_scan = if append_fails {
-        (9 + h, 0)
+        (10 + h, 0)
     } else {
-        (12 + h, 1)
+        (13 + h, 1)
     };
     let primary_ok = first_scan.as_ref().is_ok_and(|count| *count == 1)
         && (after_scan.statements - before.statements, after_scan.commits - before.commits)
@@ -257,7 +258,7 @@ async fn close_survives_failure(pool: sqlx::PgPool, append_fails: bool) {
         && (
             after_flush.statements - before_flush.statements,
             after_flush.commits - before_flush.commits,
-        ) == (6, 2)
+        ) == (8, 2)
     {
         Some(worker.scan_and_reconcile().with_subscriber(production.dispatch()).await)
     } else {
@@ -349,7 +350,8 @@ async fn close_survives_failure(pool: sqlx::PgPool, append_fails: bool) {
         "SCAN_FLUSH_PARSE actual={} unit=frontend_Parse first_flush_cache_unspecified",
         parses_after_flush - parses_before_flush
     );
-    assert_wire_delta("incident+suspension flush separately", before_flush, after_flush, 6, 2);
+    // Each with the certificate's key (8m-2a): BEGIN, key, write, COMMIT.
+    assert_wire_delta("incident+suspension flush separately", before_flush, after_flush, 8, 2);
     assert_eq!(flushed, Some(2));
     let (failure, failed_seq) = suspension.unwrap();
     let expected_constraint = if append_fails {

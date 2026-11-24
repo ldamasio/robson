@@ -77,11 +77,11 @@ fn exact_capture_error(_: crate::venue_clock_store::codec::CodecError) -> Ledger
 
 impl PgVenueLedger {
     /// Persist an actual venue order record, never an absence/unknown response
-    /// or a placement's un-timed FULL fills. At most eight statements,
-    /// including the pre-read, which already runs under the server bounds. A
-    /// replay without new evidence is BEGIN, the bounds, one read and
-    /// ROLLBACK, with no bump. An opted changed write adds one exact
-    /// membership statement.
+    /// or a placement's un-timed FULL fills. At most nine statements,
+    /// including the pre-read, which already runs under the server bounds and
+    /// the certificate's key. A replay without new evidence is BEGIN, the
+    /// bounds, the key, one read and ROLLBACK, with no bump. An opted changed
+    /// write adds one exact membership statement.
     pub async fn record_order(
         &self,
         record: &VenueOrderRecord,
@@ -127,6 +127,10 @@ impl PgVenueLedger {
             self.statement();
             let mut tx = held.connection().begin().await.map_err(backend)?;
             self.timeouts(&mut tx).await?;
+            // The certificate's shared key right after the bounds, before any read
+            // or row lock (8m PLAN-r4 §6.7).
+            self.statement();
+            let _key = robson_eventlog::certificate::participate(&mut tx).await.map_err(backend)?;
             let before = self.read_order_context(&mut tx,&key,position,false).await?;
             let proposed = merge_order(before.order.as_ref(),record,link,&seen,before.leg.as_ref())?;
             if !proposed.changed {

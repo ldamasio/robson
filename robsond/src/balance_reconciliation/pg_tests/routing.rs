@@ -649,7 +649,9 @@ async fn a_writer_refusal_ends_the_scan(pool: PgPool) -> Result<()> {
         };
         ensure!(refused, "{case}: {routed:?}");
         ensure!((reads.calls, scan) == (1, 2), "{case}: one attempt");
-        ensure!((1..=4).contains(&published) && scan + published <= 16, "{case}: {published}");
+        // A refusal stops at its check: BEGIN, the bounds, the certificate's
+        // key, the row lock and, past the version, the context read.
+        ensure!((1..=5).contains(&published) && scan + published <= 16, "{case}: {published}");
         let retried = u64::from(case != "dirty");
         ensure!(metrics.retries.get() == retried, "{case}: {}", metrics.retries.get());
         let dirty = metrics.refusals.with_label_values(&["publish", "dirty_observation"]);

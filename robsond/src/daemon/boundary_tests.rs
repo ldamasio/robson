@@ -570,6 +570,7 @@ async fn traced<T>(proxy: &DbProxy, work: impl Future<Output = T>) -> (T, Vec<&'
             "COMMIT" => "commit",
             "ROLLBACK" => "rollback",
             sql if sql.starts_with("SELECT set_config('lock_timeout'") => "bounds",
+            sql if sql == robson_eventlog::certificate::PARTICIPATE => "key",
             sql if sql.starts_with("WITH locked AS (") => "bump",
             sql if sql.contains("UPDATE public.spot_order_set_generation") => "cas",
             "SELECT create_event_log_partitions(3)" => "event_partitions",
@@ -628,11 +629,12 @@ async fn installed_spot(pool: &PgPool) -> BalanceAccounting {
     accounting
 }
 
-/// The planned statements (8p PLAN-r3 §7.2) on Binance Spot's identity with a
-/// generation installed: the pending rows six, committed with a row and
-/// rolled back without; the month's view one; the zero reset eight and its
-/// apply seven (its guard is the month's view), then four when the month is
-/// already reset. Each write bumps once with the CAS.
+/// The planned statements (8p PLAN-r3 §7.2, each transaction with 8m-2a's
+/// certificate key) on Binance Spot's identity with a generation installed:
+/// the pending rows seven, committed with a row and rolled back without; the
+/// month's view one; the zero reset nine and its apply eight (its guard is
+/// the month's view), then five when the month is already reset. Each write
+/// bumps once with the CAS.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn each_boundary_transaction_sends_its_planned_statements(pool: PgPool) {
@@ -648,10 +650,10 @@ async fn each_boundary_transaction_sends_its_planned_statements(pool: PgPool) {
 
     let (written, shape) = traced(&proxy, write_pending(&proxied, &certified, january)).await;
     assert_eq!(written.unwrap(), 1);
-    assert_eq!(shape, ["begin", "bounds", "bump", "cas", "pending", "commit"]);
+    assert_eq!(shape, ["begin", "bounds", "key", "bump", "cas", "pending", "commit"]);
     let (written, shape) = traced(&proxy, write_pending(&proxied, &certified, january)).await;
     assert_eq!(written.unwrap(), 0);
-    assert_eq!(shape, ["begin", "bounds", "bump", "cas", "pending", "rollback"]);
+    assert_eq!(shape, ["begin", "bounds", "key", "bump", "cas", "pending", "rollback"]);
     let (view, shape) = traced(&proxy, read_month(&proxied, &certified, january)).await;
     assert_eq!(view.unwrap(), (false, false, true), "not due, not landed, owed");
     assert_eq!(shape, ["view"]);
@@ -666,6 +668,7 @@ async fn each_boundary_transaction_sends_its_planned_statements(pool: PgPool) {
     assert_eq!(shape, [
         "begin",
         "bounds",
+        "key",
         "view",
         "seq",
         "idempotency",
@@ -675,6 +678,7 @@ async fn each_boundary_transaction_sends_its_planned_statements(pool: PgPool) {
         "fetch",
         "begin",
         "bounds",
+        "key",
         "bump",
         "cas",
         "monthly",
@@ -683,12 +687,12 @@ async fn each_boundary_transaction_sends_its_planned_statements(pool: PgPool) {
     let reset = zero_reset(&proxied, &uncertified, &streams, &journal, january);
     let (applied, shape) = traced(&proxy, reset).await;
     assert!(!applied.unwrap());
-    assert_eq!(shape, ["begin", "bounds", "view", "rollback"]);
+    assert_eq!(shape, ["begin", "bounds", "key", "view", "rollback"]);
     assert_eq!(version(&pool, uncertified.tenant_id, SPOT).await, 1);
 }
 
 /// A balance account's poll through the proxy: the partitions once per new
-/// month, then each poll's pending transaction (five without a generation)
+/// month, then each poll's pending transaction (six without a generation)
 /// and view; the zero reset only while its month is due.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
@@ -698,13 +702,16 @@ async fn a_balance_poll_creates_the_partitions_once_per_month(pool: PgPool) {
     account(&pool, tenant, STUB).await;
     let (daemon, _, _) = balance_daemon(&proxied, tenant, false);
     let january = at(2027, 1, 1, 0, 0, 30);
-    let pending = ["begin", "bounds", "bump", "pending", "rollback", "view"];
+    let pending = [
+        "begin", "bounds", "key", "bump", "pending", "rollback", "view",
+    ];
 
     let (polled, shape) = traced(&proxy, daemon.poll_month_boundary(january)).await;
     assert!(polled.unwrap());
     let reset = [
         "begin",
         "bounds",
+        "key",
         "view",
         "seq",
         "idempotency",
@@ -712,7 +719,9 @@ async fn a_balance_poll_creates_the_partitions_once_per_month(pool: PgPool) {
         "stream",
         "commit",
     ];
-    let apply = ["fetch", "begin", "bounds", "bump", "monthly", "commit"];
+    let apply = [
+        "fetch", "begin", "bounds", "key", "bump", "monthly", "commit",
+    ];
     let partitions = ["event_partitions", "snapshot_partitions"];
     assert_eq!(shape, [&partitions[..], &pending[..], &reset[..], &apply[..]].concat());
     let later = january + chrono::Duration::seconds(60);
@@ -722,6 +731,40 @@ async fn a_balance_poll_creates_the_partitions_once_per_month(pool: PgPool) {
 }
 
 const JANUARY_STREAM: &str = "system:month_boundary:2027-01";
+
+/// 8m-2a: the boundary's transactions take the cutover certificate's key right
+/// after their bounds. While completion holds it, the pending rows and the
+/// zero reset's append each refuse at their lock bound with nothing written
+/// and nothing suspended; after completion both land.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn boundary_transactions_wait_for_completion(pool: PgPool) {
+    use crate::balance_accounting::certificate_tests::Completion;
+    sqlx::query("SELECT create_event_log_partitions(3)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let january = at(2027, 1, 1, 0, 0, 30);
+    let certified = installed_spot(&pool).await;
+    activation(&pool, certified.tenant_id, SPOT, "2026-12-01", Some("2026-12-15 12:00:00+00"))
+        .await;
+    let uncertified = installed_spot(&pool).await;
+    let (streams, journal) = (EventStreams::default(), OrderJournal::unpersisted());
+
+    let completion = Completion::hold(&pool).await.unwrap();
+    assert!(write_pending(&pool, &certified, january).await.is_err());
+    assert!(zero_reset(&pool, &uncertified, &streams, &journal, january).await.is_err());
+    assert!(!streams.is_suspended(JANUARY_STREAM));
+    assert_eq!(version(&pool, certified.tenant_id, SPOT).await, 0);
+    assert_eq!(version(&pool, uncertified.tenant_id, SPOT).await, 0);
+    assert!(resets(&pool, uncertified.tenant_id, 2027, 1).await.is_empty());
+    completion.release().await.unwrap();
+
+    assert_eq!(write_pending(&pool, &certified, january).await.unwrap(), 1);
+    assert!(zero_reset(&pool, &uncertified, &streams, &journal, january).await.unwrap());
+    assert_eq!(version(&pool, certified.tenant_id, SPOT).await, 1);
+    assert_eq!(resets(&pool, uncertified.tenant_id, 2027, 1).await.len(), 1);
+}
 
 /// The zero reset of January 2027 as 8p stores it for `tenant` on the stub
 /// venue, appended alone: a crash after the append and before the apply.
@@ -1000,9 +1043,10 @@ fn kinds(shape: &[&str]) -> [u64; 4] {
 
 /// 8p-O: each statement of every boundary transaction, as the proxy relays
 /// it, counts once under its operation's root, in order and by kind: the tick's
-/// pending rows committed (six) and rolled back (six) and its view (one), the
-/// zero reset's append (eight) and apply (seven), each its own root, and the
-/// refused append (four). None crosses 15.
+/// pending rows committed (seven) and rolled back (seven) and its view (one),
+/// the zero reset's append (nine) and apply (eight), each its own root, and the
+/// refused append (five), each with the certificate's key (8m-2a). None crosses
+/// 15.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn each_boundary_statement_counts_under_its_operation(pool: PgPool) {
@@ -1021,10 +1065,10 @@ async fn each_boundary_statement_counts_under_its_operation(pool: PgPool) {
     for rows in [1, 0] {
         let pending = job(Job::BoundaryTick, write_pending(&proxied, &certified, january));
         let (written, jobs, shape) =
-            observed(&proxy, &probe, &[("boundary_tick", 6)], pending).await;
+            observed(&proxy, &probe, &[("boundary_tick", 7)], pending).await;
         assert_eq!(written.unwrap(), rows);
-        assert_eq!(shape.len(), 6, "{shape:?}");
-        assert_eq!(jobs, [("boundary_tick", kinds(&shape), 6, false, false, 1)], "{shape:?}");
+        assert_eq!(shape.len(), 7, "{shape:?}");
+        assert_eq!(jobs, [("boundary_tick", kinds(&shape), 7, false, false, 1)], "{shape:?}");
     }
     let view = job(Job::BoundaryTick, read_month(&proxied, &certified, january));
     let (view, jobs, shape) = observed(&proxy, &probe, &[("boundary_tick", 1)], view).await;
@@ -1036,28 +1080,28 @@ async fn each_boundary_statement_counts_under_its_operation(pool: PgPool) {
     let streams = EventStreams::default();
     let journal = OrderJournal::unpersisted();
     let reset = zero_reset(&proxied, &uncertified, &streams, &journal, january);
-    let owners = [("boundary_zero_reset", 8), ("boundary_apply", 7)];
+    let owners = [("boundary_zero_reset", 9), ("boundary_apply", 8)];
     let (applied, jobs, shape) = observed(&proxy, &probe, &owners, reset).await;
     assert!(applied.unwrap());
-    assert_eq!(shape.len(), 15, "{shape:?}");
+    assert_eq!(shape.len(), 17, "{shape:?}");
     assert_eq!(jobs, [
-        ("boundary_zero_reset", kinds(&shape[..8]), 8, false, false, 1),
-        ("boundary_apply", kinds(&shape[8..]), 7, false, false, 1),
+        ("boundary_zero_reset", kinds(&shape[..9]), 9, false, false, 1),
+        ("boundary_apply", kinds(&shape[9..]), 8, false, false, 1),
     ]);
     let reset = zero_reset(&proxied, &uncertified, &streams, &journal, january);
-    let owners = [("boundary_zero_reset", 4)];
+    let owners = [("boundary_zero_reset", 5)];
     let (applied, jobs, shape) = observed(&proxy, &probe, &owners, reset).await;
     assert!(!applied.unwrap());
-    assert_eq!(shape, ["begin", "bounds", "view", "rollback"]);
-    assert_eq!(jobs, [("boundary_zero_reset", [2, 1, 0, 1], 4, false, false, 1)]);
+    assert_eq!(shape, ["begin", "bounds", "key", "view", "rollback"]);
+    assert_eq!(jobs, [("boundary_zero_reset", [3, 1, 0, 1], 5, false, false, 1)]);
     probe.release();
 }
 
 /// 8p-O: a balance account's poll counts each statement the proxy relays
-/// once: the tick's partitions, pending rows (five without a generation) and
-/// view (eight at a new month, scored ten with its two nested operations),
-/// then the zero reset's append (eight) and apply (six) under their own
-/// roots; the next poll's tick six.
+/// once: the tick's partitions, pending rows (six without a generation) and
+/// view (nine at a new month, scored eleven with its two nested operations),
+/// then the zero reset's append (nine) and apply (seven) under their own
+/// roots; the next poll's tick seven.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn a_balance_poll_counts_each_statement_under_its_operation(pool: PgPool) {
@@ -1070,32 +1114,33 @@ async fn a_balance_poll_counts_each_statement_under_its_operation(pool: PgPool) 
     let january = at(2027, 1, 1, 0, 0, 30);
 
     let owners = [
-        ("boundary_tick", 8),
-        ("boundary_zero_reset", 8),
-        ("boundary_apply", 6),
+        ("boundary_tick", 9),
+        ("boundary_zero_reset", 9),
+        ("boundary_apply", 7),
     ];
     let poll = daemon.poll_month_boundary(january);
     let (polled, jobs, shape) = observed(&proxy, &probe, &owners, poll).await;
     assert!(polled.unwrap());
-    assert_eq!(shape.len(), 22, "{shape:?}");
+    assert_eq!(shape.len(), 25, "{shape:?}");
     assert_eq!(&shape[..2], ["event_partitions", "snapshot_partitions"]);
     assert_eq!(jobs, [
-        ("boundary_tick", kinds(&shape[..8]), 10, false, false, 1),
-        ("boundary_zero_reset", kinds(&shape[8..16]), 8, false, false, 1),
-        ("boundary_apply", kinds(&shape[16..]), 6, false, false, 1),
+        ("boundary_tick", kinds(&shape[..9]), 11, false, false, 1),
+        ("boundary_zero_reset", kinds(&shape[9..18]), 9, false, false, 1),
+        ("boundary_apply", kinds(&shape[18..]), 7, false, false, 1),
     ]);
     let later = january + chrono::Duration::seconds(60);
     let poll = daemon.poll_month_boundary(later);
-    let (polled, jobs, shape) = observed(&proxy, &probe, &[("boundary_tick", 6)], poll).await;
+    let (polled, jobs, shape) = observed(&proxy, &probe, &[("boundary_tick", 7)], poll).await;
     assert!(!polled.unwrap());
-    assert_eq!(shape.len(), 6, "{shape:?}");
-    assert_eq!(jobs, [("boundary_tick", kinds(&shape), 6, false, false, 1)]);
+    assert_eq!(shape.len(), 7, "{shape:?}");
+    assert_eq!(jobs, [("boundary_tick", kinds(&shape), 7, false, false, 1)]);
     probe.release();
 }
 
-/// 8p-O: the startup's pending rows count as a tick: the five statements a
-/// pending write without a generation relays (begin, bounds, bump, the
-/// insert and commit), held at the stream repair that follows.
+/// 8p-O: the startup's pending rows count as a tick: the six statements a
+/// pending write without a generation relays (begin, bounds, the
+/// certificate's key, bump, the insert and commit), held at the stream repair
+/// that follows.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn the_startup_pending_rows_count_as_a_tick(pool: PgPool) {
@@ -1119,9 +1164,10 @@ async fn the_startup_pending_rows_count_as_a_tick(pool: PgPool) {
             waited.expect("the startup reaches its stream repair");
         },
     }
-    assert_eq!(probe.take_jobs(), [("boundary_tick", [3, 1, 1, 0], 5, false, false, 1)]);
+    assert_eq!(probe.take_jobs(), [("boundary_tick", [4, 1, 1, 0], 6, false, false, 1)]);
     let tick = |kind: u64| ("boundary_tick", kind);
-    assert_eq!(probe.take_events(), [tick(2), tick(1), tick(1), tick(1), tick(3)], "in order");
+    let in_order = [tick(2), tick(1), tick(1), tick(1), tick(1), tick(3)];
+    assert_eq!(probe.take_events(), in_order, "in order");
     held.rollback().await.unwrap();
     drop(startup);
     probe.release();
@@ -1130,7 +1176,7 @@ async fn the_startup_pending_rows_count_as_a_tick(pool: PgPool) {
 /// 8p-O: a stalled apply's failure is counted where it happens (the apply's
 /// fetch, an error), and the tick it ran in is incomplete: the stream
 /// suspension it records is written by the journal's retry loop, uncounted.
-/// The append found the stored event (seven, rolled back).
+/// The append found the stored event (eight, rolled back).
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn a_stalled_apply_leaves_its_tick_incomplete(pool: PgPool) {
@@ -1162,12 +1208,13 @@ async fn a_stalled_apply_leaves_its_tick_incomplete(pool: PgPool) {
     assert!(streams.is_suspended(JANUARY_STREAM));
     assert_eq!(probe.take_jobs(), [
         ("boundary_tick", [0, 0, 0, 0], 2, false, true, 2),
-        ("boundary_zero_reset", [5, 1, 0, 1], 7, false, false, 1),
+        ("boundary_zero_reset", [6, 1, 0, 1], 8, false, false, 1),
         ("boundary_apply", [1, 0, 0, 0], 1, false, false, 2),
     ]);
     let append = |kind: u64| ("boundary_zero_reset", kind);
     assert_eq!(probe.take_events(), [
         append(2),
+        append(1),
         append(1),
         append(1),
         append(1),

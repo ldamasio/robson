@@ -3232,7 +3232,7 @@ mod tests {
                 journal.finish_success(&intent, None).await;
             })
             .await;
-            assert_eq!(journal.statements_total(), 9);
+            assert_eq!(journal.statements_total(), 11);
         }
         let pool = pool.as_ref().unwrap();
         assert_eq!(

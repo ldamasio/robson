@@ -1411,6 +1411,72 @@ async fn an_interrupted_repair_resumes_past_its_checkpoint(pool: sqlx::PgPool) {
     assert_eq!(repair_state(&pool, id).await, (701, Some(dec!(1200)), Some(701), false, true));
 }
 
+/// 8m-2a: the repair's bookkeeping on a position account takes the cutover
+/// certificate's key. While completion holds it, an applied page's checkpoint
+/// (and then the clear) and a refused repair's error each wait and land after
+/// it; the page's projection itself is 8m-2b's.
+#[cfg(feature = "postgres")]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn repair_bookkeeping_waits_for_completion(pool: sqlx::PgPool) {
+    use crate::{
+        balance_accounting::certificate_tests::{until_key_waiters, Completion},
+        event_streams::{repair_position_stream, RepairOutcome},
+    };
+
+    // An applied page: its checkpoint waits, then the clear.
+    let tenant_id = Uuid::now_v7();
+    let id = suspended_leg(&pool, tenant_id).await;
+    append_unapplied(&pool, tenant_id, id, trailing_updates(id, 1000..1001)).await;
+    let process = process_of(&pool, tenant_id);
+    process.load_stream_suspensions().await.unwrap();
+    let (stream_key, suspended) = process.event_streams.suspended_positions().remove(0);
+    let completion = Completion::hold(&pool).await.unwrap();
+    let repair = repair_position_stream(
+        &pool,
+        tenant_id,
+        &process.event_streams,
+        &stream_key,
+        &suspended,
+        None,
+    );
+    let (outcome, ()) = tokio::join!(repair, async {
+        until_key_waiters(&pool, 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (_, _, through, errored, cleared) = repair_state(&pool, id).await;
+        assert_eq!((through, errored, cleared), (None, false, false), "landed inside");
+        completion.release().await.unwrap();
+    });
+    assert_eq!(outcome, RepairOutcome::Cleared { applied: 1 });
+    assert_eq!(repair_state(&pool, id).await, (2, Some(dec!(1001)), Some(2), false, true));
+
+    // A refused repair: its error waits.
+    let tenant_id = Uuid::now_v7();
+    let id = suspended_leg(&pool, tenant_id).await;
+    let probe = ("month_boundary_reset".to_string(), serde_json::json!({ "probe": true }));
+    append_unapplied(&pool, tenant_id, id, vec![probe]).await;
+    let process = process_of(&pool, tenant_id);
+    process.load_stream_suspensions().await.unwrap();
+    let (stream_key, suspended) = process.event_streams.suspended_positions().remove(0);
+    let completion = Completion::hold(&pool).await.unwrap();
+    let repair = repair_position_stream(
+        &pool,
+        tenant_id,
+        &process.event_streams,
+        &stream_key,
+        &suspended,
+        None,
+    );
+    let (outcome, ()) = tokio::join!(repair, async {
+        until_key_waiters(&pool, 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!repair_state(&pool, id).await.3, "the error landed inside");
+        completion.release().await.unwrap();
+    });
+    assert!(matches!(outcome, RepairOutcome::Refused { .. }), "{outcome:?}");
+    assert!(repair_state(&pool, id).await.3);
+}
+
 /// A type with no guarded position handler anywhere in the suffix means no
 /// repair at all: not even the valid events ahead of it apply.
 #[cfg(feature = "postgres")]

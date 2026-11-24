@@ -268,8 +268,31 @@ async fn proxied(pool: &PgPool) -> Result<(DbProxy, PgPool)> {
     Ok((proxy, PgPoolOptions::new().max_connections(1).connect_lazy(&url)?))
 }
 
-/// A withdrawal of 100 seen by O1 and O2: one transaction of seven
-/// statements (six without an installed generation: no CAS) on one
+/// 8m-2a: the re-anchor's transaction takes the cutover certificate's key
+/// (through `advance`) right after its bounds. While completion holds it, the
+/// commit refuses at its lock bound with nothing written; after completion the
+/// same re-anchor commits and bumps once.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_reanchor_waits_for_completion(pool: PgPool) -> Result<()> {
+    use crate::balance_accounting::certificate_tests::Completion;
+    let rig = Rig::new(&pool, true).await?;
+    let version = rig.version(&pool).await?;
+    let completion = Completion::hold(&pool).await?;
+    let evidence = rig.evidence(&pool, at(60_000), [dec!(900), dec!(900)]).await?;
+    let refused = rig.commit(&evidence).await;
+    ensure!(matches!(refused, Err(ReanchorRefusal::Unavailable)), "{refused:?}");
+    ensure!(rig.version(&pool).await? == version);
+    completion.release().await?;
+    let evidence = rig.evidence(&pool, at(60_000), [dec!(900), dec!(900)]).await?;
+    let done = rig.commit(&evidence).await.map_err(|r| anyhow::anyhow!("{r:?}"))?;
+    ensure!(done.version == version + 1, "{done:?}");
+    Ok(())
+}
+
+/// A withdrawal of 100 seen by O1 and O2: one transaction of eight
+/// statements with the certificate's key (seven without an installed
+/// generation: no CAS) on one
 /// connection; W = 100 dated at the old anchor (no checkpoint: the clean-hull
 /// anchor's copy), C = 0 and no contribution row; the new anchor and
 /// checkpoint at O2's cut; `E` continuous at O2's cut and equal to the
@@ -277,7 +300,8 @@ async fn proxied(pool: &PgPool) -> Result<(DbProxy, PgPool)> {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn reanchor_books_a_withdrawal_and_keeps_e_continuous(pool: PgPool) -> Result<()> {
-    for (opted, statements) in [(true, 7), (false, 6)] {
+    // 8m-2a: `advance` takes the certificate's key first, one statement.
+    for (opted, statements) in [(true, 8), (false, 7)] {
         let mut rig = Rig::new(&pool, opted).await?;
         let (proxy, through) = proxied(&pool).await?;
         rig.reanchor.pool = through;

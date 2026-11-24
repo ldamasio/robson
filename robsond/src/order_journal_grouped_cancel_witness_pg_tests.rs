@@ -252,7 +252,7 @@ async fn projected_grouped_cancel_clocked_result_has_no_clock_and_respects_physi
         .map_err(|err| anyhow::anyhow!("clocked ordinary observation: {err:?}"))?;
     ensure!(acknowledgement.is_empty());
     let trace = wire.proxy.query_trace();
-    ensure!(trace.len() == 7 && trace.last().is_some_and(|sql| sql == "COMMIT"), "{trace:?}");
+    ensure!(trace.len() == 8 && trace.last().is_some_and(|sql| sql == "COMMIT"), "{trace:?}");
     ensure!(!trace
         .iter()
         .any(|sql| sql.contains("budget_insert_clocks")

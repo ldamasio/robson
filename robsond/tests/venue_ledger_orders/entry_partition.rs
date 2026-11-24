@@ -162,7 +162,7 @@ async fn entry_partition_first_set_writes_once_with_measured_statements(
                         measured(&ledger, &proxy, &live, &link, later(1)).await?;
                     // The live write runs the leg UPDATE only to set a NULL cohort.
                     ensure!(
-                        changed && count == 7 + u64::from(!handed_off) + projection,
+                        changed && count == 8 + u64::from(!handed_off) + projection,
                         "{case}: live {count}"
                     );
                     ensure!(f.version(&pool).await == version + 1);
@@ -190,7 +190,8 @@ async fn entry_partition_first_set_writes_once_with_measured_statements(
                 let version = f.version(&pool).await;
                 let (changed, count) =
                     measured(&ledger, &proxy, &terminal, &link, later(2)).await?;
-                ensure!(changed && count == 8 + projection, "{case}: first set {count}");
+                // With the certificate's key before the bump (8m-2a).
+                ensure!(changed && count == 9 + projection, "{case}: first set {count}");
                 ensure!(f.version(&pool).await == version + 1, "{case}: version");
                 ensure!(
                     leg_row(&pool, &f).await? == (Some(set), true, Decimal::ZERO),
@@ -202,11 +203,11 @@ async fn entry_partition_first_set_writes_once_with_measured_statements(
                     exact_reference(&pool, b).await?;
                 }
                 // (c) The identical terminal replay writes nothing: BEGIN, the
-                // server bounds, one read and ROLLBACK (main's d8e002e1).
+                // server bounds, the key, one read and ROLLBACK (main's d8e002e1).
                 let before = snapshot(&pool).await;
                 let (changed, count) =
                     measured(&ledger, &proxy, &terminal, &link, later(3)).await?;
-                ensure!(!changed && count == 4, "{case}: replay {count}");
+                ensure!(!changed && count == 5, "{case}: replay {count}");
                 ensure!(snapshot(&pool).await == before, "{case}: replay changed rows");
                 counts.push(count);
                 proxied.close().await;
@@ -466,7 +467,7 @@ async fn a_later_sell_consumes_against_the_recorded_partition(pool: PgPool) -> R
             .await?
             .changed
     );
-    ensure!(ledger.statements_total() - count == 8);
+    ensure!(ledger.statements_total() - count == 9);
     let (partition, _, consumed) = leg_row(&pool, &f).await?;
     ensure!(partition == Some(set) && consumed == dec!(0.1));
     // The R1/R3 evaluator's own calculation over the actual row.

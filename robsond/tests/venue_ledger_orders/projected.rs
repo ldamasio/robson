@@ -223,7 +223,8 @@ async fn write(
     let before = version(pool, b).await?;
     let commands = ledger.statements_total();
     ensure!(ledger.record_order(order, link, seen).await?.changed);
-    ensure!(ledger.statements_total() - commands <= 9);
+    // With the certificate's key before the bump (8m-2a).
+    ensure!(ledger.statements_total() - commands <= 10);
     ensure!(version(pool, b).await? == before + 1);
     exact_reference(pool, b).await
 }
@@ -305,8 +306,8 @@ async fn projected_native_order_keeps_reference_membership_and_cancel_masks(
     let before = version(&pool, &b).await?;
     let commands = ledger.statements_total();
     ensure!(!ledger.record_order(&live, &linked(&f, 2, exits[1]), later(3)).await?.changed);
-    // BEGIN, the server bounds, one read and ROLLBACK.
-    ensure!(ledger.statements_total() - commands == 4 && version(&pool, &b).await? == before);
+    // BEGIN, the server bounds, the certificate's key, one read and ROLLBACK.
+    ensure!(ledger.statements_total() - commands == 5 && version(&pool, &b).await? == before);
 
     sqlx::raw_sql(
         "CREATE TABLE projected_cancel_member_changes (id bigint generated always as identity);
@@ -448,7 +449,7 @@ async fn projected_native_order_commit_loss_has_one_atomic_publication(pool: PgP
     ));
     let trace = proxy.query_trace();
     ensure!(proxy.stats().commit_acks_dropped == 1);
-    ensure!(trace.len() == 8 && trace.last().is_some_and(|cmd| cmd == "COMMIT"), "{trace:?}");
+    ensure!(trace.len() == 9 && trace.last().is_some_and(|cmd| cmd == "COMMIT"), "{trace:?}");
     ensure!(trace.iter().filter(|cmd| cmd.contains("spot_order_set_generation")).count() == 1);
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -496,8 +497,11 @@ async fn projected_native_order_commit_coordinate_only_follows_confirmed_commit(
     let (result, commit) = ledger.record_order_observed(&first, &first_link, later(1)).await?;
     let trace = proxy.query_trace();
     ensure!(result.changed && result.anomalies.is_empty());
-    ensure!(ledger.statements_total() - commands == 9);
-    ensure!(trace.len() == 9 && trace.last().is_some_and(|cmd| cmd == "COMMIT"), "{trace:?}");
+    ensure!(ledger.statements_total() - commands == 10);
+    ensure!(
+        trace.len() == 10 && trace.last().is_some_and(|cmd| cmd == "COMMIT"),
+        "{trace:?}"
+    );
     ensure!(trace.iter().filter(|cmd| cmd.contains("spot_order_set_generation")).count() == 1);
     ensure!(version(&pool, &b).await? == v + 1);
     let commit = commit.context("confirmed projected leg write has a coordinate")?;
@@ -516,7 +520,7 @@ async fn projected_native_order_commit_coordinate_only_follows_confirmed_commit(
     let (result, commit) = ledger.record_order_observed(&first, &first_link, later(1)).await?;
     let trace = proxy.query_trace();
     ensure!(!result.changed && commit.is_none());
-    ensure!(ledger.statements_total() - commands == 4 && trace.len() == 4, "{trace:?}");
+    ensure!(ledger.statements_total() - commands == 5 && trace.len() == 5, "{trace:?}");
     ensure!(trace.first().is_some_and(|cmd| cmd == "BEGIN"), "{trace:?}");
     ensure!(trace.last().is_some_and(|cmd| cmd == "ROLLBACK"), "{trace:?}");
     ensure!(version(&pool, &b).await? == v + 1);
@@ -537,8 +541,8 @@ async fn projected_native_order_commit_coordinate_only_follows_confirmed_commit(
     ));
     let trace = proxy.query_trace();
     ensure!(proxy.stats().commit_acks_dropped == 1);
-    ensure!(ledger.statements_total() - commands == 8);
-    ensure!(trace.len() == 8 && trace.last().is_some_and(|cmd| cmd == "COMMIT"), "{trace:?}");
+    ensure!(ledger.statements_total() - commands == 9);
+    ensure!(trace.len() == 9 && trace.last().is_some_and(|cmd| cmd == "COMMIT"), "{trace:?}");
     ensure!(trace.iter().filter(|cmd| cmd.contains("spot_order_set_generation")).count() == 1);
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -566,7 +570,7 @@ async fn projected_native_order_commit_coordinate_only_follows_confirmed_commit(
     .await?;
     ensure!(landed == (1, Some(exits[1])));
     exact_reference(&pool, &b).await?;
-    eprintln!("C8_COMMIT_COORDINATE confirmed=1 observed_execution=0.25 changed_sql=9 replay_sql=1 lost_ack_sql=8 lost_ack_coordinate=0");
+    eprintln!("C8_COMMIT_COORDINATE confirmed=1 observed_execution=0.25 changed_sql=10 replay_sql=1 lost_ack_sql=9 lost_ack_coordinate=0");
     Ok(())
 }
 
@@ -641,7 +645,7 @@ async fn projected_native_order_pending_ack_preserves_newer_execution(pool: PgPo
     let complete_old = async {
         let before = ledger.statements_total();
         let ack = work.persist().await?.context("first changed commit receipt")?;
-        ensure!(ledger.statements_total() - before == 9);
+        ensure!(ledger.statements_total() - before == 10);
         ensure!(ack.accounting_version == initial_version + 1);
         ack_ready.send(()).map_err(|_| anyhow::anyhow!("ACK controller missing"))?;
         resume_ack.await?;
@@ -670,7 +674,7 @@ async fn projected_native_order_pending_ack_preserves_newer_execution(pool: PgPo
 
     let before = ledger.statements_total();
     let ack = work.persist().await?.context("newer changed commit receipt")?;
-    ensure!(ledger.statements_total() - before == 9);
+    ensure!(ledger.statements_total() - before == 10);
     ensure!(ack.accounting_version == initial_version + 2);
     ensure!(readback().await? == (second.executed, intent));
     ensure!(receiver.pending() == Some(second), "only applying the exact ACK retires it");
@@ -707,7 +711,7 @@ async fn projected_native_order_pending_ack_preserves_newer_execution(pool: PgPo
     let before = ledger.statements_total();
     let ack = retained_work.persist().await?.context("retained exact PG commit")?;
     ensure!(
-        ledger.statements_total() - before == 9 && ack.accounting_version == initial_version + 3
+        ledger.statements_total() - before == 10 && ack.accounting_version == initial_version + 3
     );
     let durable: (Decimal, Decimal, i64) = sqlx::query_as(
         "SELECT executed_cum,cumulative_quote,venue_update_time_ms FROM venue_orders
@@ -728,8 +732,9 @@ async fn projected_native_order_pending_ack_preserves_newer_execution(pool: PgPo
     let replay = receiver
         .register(f.record(1, same.executed, OrderPhase::Live), same)?
         .context("same ticket")?;
-    // No write: BEGIN, the server bounds, one read and ROLLBACK (d8e002e1).
-    ensure!(replay.persist().await?.is_none() && ledger.statements_total() - before == 4);
+    // No write: BEGIN, the server bounds, the certificate's key, one read and
+    // ROLLBACK (d8e002e1).
+    ensure!(replay.persist().await?.is_none() && ledger.statements_total() - before == 5);
     ensure!(
         receiver.pending() == Some(same),
         "no-op returned no proof and preserves pending"
@@ -743,7 +748,7 @@ async fn projected_native_order_pending_ack_preserves_newer_execution(pool: PgPo
     proxy.enable_exact_query_trace(16);
     proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE venue_orders"));
     ensure!(matches!(unknown.persist().await, Err(LedgerError::Uncertain(_))));
-    ensure!(ledger.statements_total() - before == 9 && proxy.stats().commit_acks_dropped == 1);
+    ensure!(ledger.statements_total() - before == 10 && proxy.stats().commit_acks_dropped == 1);
     ensure!(receiver.pending() == Some(last), "lost native reply cannot clear pending");
     ensure!(readback().await? == (last.executed, intent));
     ensure!(version(&pool, &binding).await? == initial_version + 4);

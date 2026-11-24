@@ -39,8 +39,9 @@ impl CardinalitySample {
         })
     }
     fn expected_statements(&self) -> u64 {
-        // Per close: append/apply9 + halt2. Per orphan: before/result4+5.
-        11 * u64::from(self.n) + 9 * u64::from(self.n) + self.predicted_months() + 2
+        // Per close: append/apply10 + halt2. Per orphan: before/result5+6.
+        // 8m-2a: the append's try-lock and each journal commit's key.
+        12 * u64::from(self.n) + 11 * u64::from(self.n) + self.predicted_months() + 2
     }
     fn primary_matches(&self) -> bool {
         matches!(&self.result, Ok(value) if *value == usize::from(self.n))
@@ -56,7 +57,7 @@ impl CardinalitySample {
             "multi-leg close + orphan journal + tail",
             self.before,
             self.after,
-            20 * u64::from(self.n) + h + 2,
+            23 * u64::from(self.n) + h + 2,
             3 * u64::from(self.n),
         );
         assert_production_io(
@@ -191,7 +192,7 @@ async fn cardinality_sample(
     let h = window.map_or(0, |(at, since, _)| {
         1 + u64::from((at.year(), at.month()) != (since.year(), since.month()))
     });
-    let expected = 20 * u64::from(n) + h + 2;
+    let expected = 23 * u64::from(n) + h + 2;
     let next = if matches!(&result,Ok(value) if *value==usize::from(n))
         && after.statements - before.statements == expected
         && production[0] == expected

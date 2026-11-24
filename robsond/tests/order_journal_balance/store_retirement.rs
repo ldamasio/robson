@@ -65,8 +65,9 @@ async fn a_failed_ledger_commit_counts_through_completed_retirement(pool: PgPool
         Err(LedgerError::Backend(_))
     ));
     retired(&pool, pid).await;
-    assert_eq!(ledger.statements_total(), 5);
-    assert_eq!(proxy.stats().statements - before, 5, "{:?}", proxy.query_trace());
+    // With the certificate's key after the bounds (8m-2a).
+    assert_eq!(ledger.statements_total(), 6);
+    assert_eq!(proxy.stats().statements - before, 6, "{:?}", proxy.query_trace());
     assert!(!proxy.query_trace().iter().any(|sql| sql == "ROLLBACK"));
     assert_eq!(single.size(), 0);
     assert_eq!(
@@ -87,8 +88,9 @@ async fn a_failed_ledger_commit_counts_through_completed_retirement(pool: PgPool
     ledger.ensure_accounting_row(&venue, MonthlyBudgetModel::HwmV1).await.unwrap();
     idle(&single).await;
     assert_eq!(backend_pid(&pool, &application).await, replacement);
-    assert_eq!(ledger.statements_total(), 15);
-    assert_eq!(proxy.stats().statements - before, 15);
+    // Three preparations of six, each with the certificate's key (8m-2a).
+    assert_eq!(ledger.statements_total(), 18);
+    assert_eq!(proxy.stats().statements - before, 18);
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -104,7 +106,7 @@ async fn a_failed_balance_journal_commit_counts_through_completed_retirement(poo
     proxy.enable_query_trace(32);
     let before = proxy.stats().statements;
     let batch = balance_batch("rejected-commit", IntentKind::Exit);
-    assert_eq!(batch.statements(), 7);
+    assert_eq!(batch.statements(), 8);
     // J keeps its established conservative COMMIT classification.
     let (pid, result) = captured_commit(&pool, &backend, &batch).await;
     assert!(matches!(result, Err(CommitFailure::Uncertain(_))));
@@ -192,8 +194,8 @@ async fn ledger_error_cancellation_and_lost_ack_have_no_hidden_cleanup_sql(pool:
         Err(LedgerError::Invariant(_))
     ));
     retired(&pool, pid).await;
-    wire(&proxy, before, 3);
-    assert_eq!(ledger.statements_total(), 3);
+    wire(&proxy, before, 4);
+    assert_eq!(ledger.statements_total(), 4);
     sqlx::query("DROP TRIGGER reject_before_insert ON accounting_state")
         .execute(&pool)
         .await
@@ -218,8 +220,8 @@ async fn ledger_error_cancellation_and_lost_ack_have_no_hidden_cleanup_sql(pool:
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     retired(&pool, pid).await;
-    wire(&proxy, before, 3);
-    assert_eq!(ledger.statements_total() - counted, 3);
+    wire(&proxy, before, 4);
+    assert_eq!(ledger.statements_total() - counted, 4);
     held.rollback().await.unwrap();
     recover(&ledger, &single, &venue).await;
     let pid = backend_pid(&pool, &application).await;
@@ -234,8 +236,8 @@ async fn ledger_error_cancellation_and_lost_ack_have_no_hidden_cleanup_sql(pool:
         Err(LedgerError::Uncertain(_))
     ));
     retired(&pool, pid).await;
-    wire(&proxy, before, 5);
-    assert_eq!(ledger.statements_total() - counted, 5);
+    wire(&proxy, before, 6);
+    assert_eq!(ledger.statements_total() - counted, 6);
     assert_eq!(version(&pool, tenant, other.as_str()).await, 0);
     recover(&ledger, &single, &other).await;
 }
@@ -338,7 +340,7 @@ async fn balance_journal_known_error_and_cancellation_count_through_retirement(p
     let (pid, result) = captured_commit(&pool, &backend, &batch).await;
     assert!(matches!(result, Err(CommitFailure::Known(_))));
     retired(&pool, pid).await;
-    wire(&proxy, before, 3);
+    wire(&proxy, before, 4);
     seed_account(&pool, tenant, SPOT).await;
     backend.check_ready().await.unwrap();
     let mut held = pool.begin().await.unwrap();
@@ -356,7 +358,7 @@ async fn balance_journal_known_error_and_cancellation_count_through_retirement(p
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     retired(&pool, pid).await;
-    wire(&proxy, before, 3);
+    wire(&proxy, before, 4);
     assert_eq!(version(&pool, tenant, SPOT).await, 0);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM order_intents")
@@ -368,7 +370,7 @@ async fn balance_journal_known_error_and_cancellation_count_through_retirement(p
     held.rollback().await.unwrap();
     backend.commit(&batch).await.unwrap();
     assert_eq!(version(&pool, tenant, SPOT).await, 1);
-    wire(&proxy, before, 10);
+    wire(&proxy, before, 12);
 }
 
 // The journal owns a separate max_connections=2 pool. Capture the actual
@@ -441,7 +443,7 @@ async fn journal_retirement_tracks_the_active_backend_with_an_idle_sibling(pool:
     assert!(matches!(result, Err(CommitFailure::Known(_))));
     assert!(pids.contains(&pid));
     retired(&pool, pid).await;
-    wire(&proxy, before, 3);
+    wire(&proxy, before, 4);
     let sibling = *pids.iter().find(|other| **other != pid).unwrap();
     assert!(
         sqlx::query_scalar::<_, bool>(

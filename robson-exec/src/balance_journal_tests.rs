@@ -73,7 +73,7 @@ async fn a_journal_off_the_balance_flag_carries_no_balance_rows() {
     .await;
     assert_eq!(backend.commits().len(), 2);
     assert!(backend.commits().iter().all(|batch| batch.balance.is_none()));
-    assert_eq!(journal.statements_total(), 9);
+    assert_eq!(journal.statements_total(), 11);
 }
 
 #[tokio::test]
@@ -133,8 +133,9 @@ proptest! {
         let mut batch = journal.lock().intents[&intent.client_order_id].batch();
         batch.attempts = (0..attempts).map(|_| AttemptRow { attempt_id: Uuid::now_v7(), created_at: Utc::now(), rejected_at: None }).collect();
         batch.outcome = outcome.then(OutcomeRow::default);
-        // BEGIN, intent INSERT, COMMIT; optional attempt INSERT and outcome UPDATE.
-        let mut expected = 3;
+        // BEGIN, the certificate's key, intent INSERT, COMMIT; optional attempt
+        // INSERT and outcome UPDATE.
+        let mut expected = 4;
         if attempts > 0 { expected += 1; }
         if outcome { expected += 1; }
         if balance {

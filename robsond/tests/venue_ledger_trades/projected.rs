@@ -181,8 +181,8 @@ async fn projected_trade_peer_cases_keep_atomic_versions_and_membership(
     }
     let before = ledger.statements_total();
     ensure!(!ledger.record_trades(&key, &page(47, Decimal::ONE), at()).await?.changed);
-    // BEGIN, the server bounds, one read and ROLLBACK.
-    ensure!(ledger.statements_total() - before == 4);
+    // BEGIN, the server bounds, the certificate's key, one read and ROLLBACK.
+    ensure!(ledger.statements_total() - before == 5);
     eprintln!(
         "Projected trade pages: 24 seeded native concurrent schedules and 72 external snapshots"
     );
@@ -300,7 +300,7 @@ async fn projected_trade_refused_generation_rolls_back_fills_and_ledger(
                     result,
                     Err(LedgerError::Invariant(reason)) if reason.contains("generation refused")
                 ));
-                ensure!(statements == 10, "fixture never reached the exact CAS");
+                ensure!(statements == 11, "fixture never reached the exact CAS");
             }
             inspect().await?;
         }
@@ -359,7 +359,8 @@ async fn projected_trade_duplicate_replans_after_real_accounting_lock(pool: PgPo
         ensure!(right?.changed);
         [b.statements_total(), a.statements_total()]
     };
-    ensure!(counts == [11, 7], "{counts:?}");
+    // Each with the certificate's key before its bump (8m-2a).
+    ensure!(counts == [12, 8], "{counts:?}");
     ensure!(observe(&pool, &f, &key).await? == (version + 1, 1, Decimal::ONE));
     ensure!(membership(&pool).await? == original_members);
     Ok(())
@@ -391,7 +392,7 @@ async fn projected_trade_lost_commit_requires_retirement_then_observes_accepted_
     let trace = proxy.query_trace();
     ensure!(proxy.stats().commit_acks_dropped == 1);
     ensure!(
-        trace.len() == 11 && trace[9].contains("UPDATE public.spot_order_set_generation"),
+        trace.len() == 12 && trace[10].contains("UPDATE public.spot_order_set_generation"),
         "{trace:?}"
     );
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -442,9 +443,10 @@ async fn unattributed_fill_invalidates_its_month(pool: PgPool) -> Result<()> {
     let key = f.key(7);
     let before = ledger.statements_total();
     ensure!(ledger.record_trades(&key, &across, at()).await?.changed);
-    // BEGIN, the bounds, three reads, the bump, the fills, the invalidation,
-    // the order, COMMIT: one more than the same page without it.
-    ensure!(ledger.statements_total() - before == 10);
+    // BEGIN, the bounds, three reads, the certificate's key, the bump, the
+    // fills, the invalidation, the order, COMMIT: one more than the same page
+    // without it.
+    ensure!(ledger.statements_total() - before == 11);
     let invalid = |month: &str| {
         let month = chrono::NaiveDate::parse_from_str(month, "%Y-%m-%d").expect("month");
         let (pool, tenant) = (pool.clone(), f.tenant);
@@ -487,7 +489,7 @@ async fn unattributed_fill_invalidates_its_month(pool: PgPool) -> Result<()> {
     let leg = f.seed_order(&pool, 8, Decimal::ZERO, OrderPhase::Live).await;
     let before = ledger.statements_total();
     ensure!(ledger.record_trades(&leg, &page(81, Decimal::ONE), at()).await?.changed);
-    ensure!(ledger.statements_total() - before == 10, "a leg page keeps its ten");
+    ensure!(ledger.statements_total() - before == 11, "a leg page keeps its eleven");
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM accounting_invalidations")
         .fetch_one(&pool)
         .await?;
@@ -498,7 +500,7 @@ async fn unattributed_fill_invalidates_its_month(pool: PgPool) -> Result<()> {
     let projected = g.ledger(&pool).with_trade_order_set_projection(binding);
     let before = projected.statements_total();
     ensure!(projected.record_trades(&g.key(2), &page(91, Decimal::ONE), at()).await?.changed);
-    ensure!(projected.statements_total() - before == 11);
+    ensure!(projected.statements_total() - before == 12);
     let (current, advanced): (i64, i64) = sqlx::query_as(
         "SELECT a.version, s.accounting_version FROM accounting_state a JOIN spot_order_set_generation s USING (tenant_id, venue_id) WHERE a.tenant_id=$1",
     )

@@ -283,13 +283,13 @@ async fn persisted_order_set_journal_lost_commit_proves_original_atomic_state(
     native_retired(&pool, pid, &birth).await?;
     let trace = proxy.query_trace();
     ensure!(
-        trace.len() == 6 && proxy.query_trace_dropped() == 0,
-        "two extra accounting executions, one projection and no queued rollback: {trace:?}"
+        trace.len() == 7 && proxy.query_trace_dropped() == 0,
+        "the bounds, the key and the bump, one projection and no queued rollback: {trace:?}"
     );
-    ensure!(trace[4].contains("UPDATE public.spot_order_set_generation g") && trace[5] == "COMMIT");
+    ensure!(trace[5].contains("UPDATE public.spot_order_set_generation g") && trace[6] == "COMMIT");
     let committed = fields(&pool, &g).await?;
     ensure!(committed == (before.0 + 1, before.1 + 1, 1, 0, 1, 0));
-    eprintln!("Persisted journal native lost COMMIT ACK: 6 wire commands, original retired");
+    eprintln!("Persisted journal native lost COMMIT ACK: 7 wire commands, original retired");
 
     let venue = VenueId::new(VenueId::BINANCE_SPOT);
     let binding = ExpectedGeneration {
@@ -460,13 +460,13 @@ async fn persisted_order_set_journal_caller_cancel_at_native_lock_retires_and_ro
             witnessed=observe => witnessed.context("exact native projection row lock")??,
         }
         let trace = proxy.query_trace();
-        ensure!(trace.len()==5 && trace[4].contains("UPDATE public.spot_order_set_generation g"),
+        ensure!(trace.len()==6 && trace[5].contains("UPDATE public.spot_order_set_generation g"),
             "before the caller cut the original journal and projection attempt must reach PostgreSQL: {trace:?}");
         drop(write);
     }
     hold.rollback().await?;
     native_retired(&pool, pid, &birth).await?;
-    ensure!(proxy.stats().commits == 0 && proxy.query_trace().len() == 5);
+    ensure!(proxy.stats().commits == 0 && proxy.query_trace().len() == 6);
     ensure!(fields(&pool, &g).await? == before && !j_present(&pool, j.intent.intent_id).await?);
     eprintln!("Persisted journal native caller cancellation: actual aggregate row lock, 5 wire commands and retired rollback");
     Ok(())

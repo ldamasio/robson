@@ -284,11 +284,12 @@ pub(crate) struct CashWriter<'a> {
 
 impl CashWriter<'_> {
     /// One conclusion from one attempt, or a refusal with nothing written.
-    /// At most nine statements: BEGIN, the bounds, the row lock, the context
-    /// read, the bump and the generation CAS when the branch bumps, at most
-    /// two writes, COMMIT. A refusal returns unfinished, so the guard retires
-    /// the connection and the server rolls everything back; a lost COMMIT
-    /// answer is `Uncertain`, and the next scan re-reads.
+    /// At most ten statements: BEGIN, the bounds, the certificate's shared
+    /// key, the row lock, the context read, the bump and the generation CAS
+    /// when the branch bumps, at most two writes, COMMIT. A refusal returns
+    /// unfinished, so the guard retires the connection and the server rolls
+    /// everything back; a lost COMMIT answer is `Uncertain`, and the next
+    /// scan re-reads.
     pub(crate) async fn conclude(&self, attempt: &CashAttempt) -> Result<Concluded, CashRefusal> {
         let committing = AtomicBool::new(false);
         let result = tokio::time::timeout(CLIENT_BOUND, self.publish(attempt, &committing))
@@ -328,7 +329,8 @@ impl CashWriter<'_> {
         let mut held = LedgerConnection::new(self.pool.acquire().await.map_err(backend)?);
         let mut tx = held.connection().begin().await.map_err(backend)?;
         sqlx::query(BOUNDS).execute(&mut *tx).await.map_err(backend)?;
-        // 8m-2a: `participate()` goes here, before the row lock (8m PLAN-r4 §6.7).
+        // The certificate's shared key before the row lock (8m PLAN-r4 §6.7).
+        let key = robson_eventlog::certificate::participate(&mut tx).await.map_err(backend)?;
         let locked: Vec<(String, i64)> = sqlx::query_as(ACCOUNTING_ROWS)
             .bind(accounting.tenant_id)
             .fetch_all(&mut *tx)
@@ -377,7 +379,12 @@ impl CashWriter<'_> {
             attempt.quote_total.checked_sub(expected).ok_or(LedgerError::Unrepresentable)?;
         let (bump, writes) = plan(open, delta);
         let bumped = match bump {
-            true => Some(accounting.advance(&mut tx).await?.ok_or(LedgerError::NoAccountingRow)?),
+            true => Some(
+                accounting
+                    .advance_participating(&mut tx, &key)
+                    .await?
+                    .ok_or(LedgerError::NoAccountingRow)?,
+            ),
             false => None,
         };
         for write in &writes {

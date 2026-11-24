@@ -62,6 +62,29 @@ async fn fee_measured(
     Ok((plan, count))
 }
 
+/// 8m-2a: the finalization takes the cutover certificate's key right after its
+/// bounds. While completion holds it the finalization refuses at its lock
+/// bound with nothing written; after completion it finalizes and bumps once.
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn entry_fee_finalization_waits_for_completion(pool: PgPool) -> Result<()> {
+    use crate::balance_accounting::certificate_tests::Completion;
+    setup_tables(&pool).await?;
+    let f = Fixture::new(&pool).await;
+    let ledger = f.ledger(&pool);
+    complete_entry(&ledger, &f, dec!(0.0002), dec!(0.0002)).await?;
+    let (version, rows) = (f.version(&pool).await, snapshot(&pool).await);
+    let completion = Completion::hold(&pool).await?;
+    let refused = ledger.finalize_entry_fee(f.position, BASE).await;
+    ensure!(matches!(refused, Err(LedgerError::Backend(_))), "{refused:?}");
+    ensure!(f.version(&pool).await == version && snapshot(&pool).await == rows);
+    completion.release().await?;
+    let plan = ledger.finalize_entry_fee(f.position, BASE).await?;
+    ensure!(matches!(plan, EntryFeePlan::Finalize { .. }), "{plan:?}");
+    ensure!(f.version(&pool).await == version + 1);
+    Ok(())
+}
+
 #[sqlx::test(migrations = false)]
 #[ignore = "requires isolated PostgreSQL DATABASE_URL"]
 async fn entry_fee_finalizes_once_with_measured_statements(pool: PgPool) -> Result<()> {
@@ -100,7 +123,8 @@ async fn entry_fee_finalizes_once_with_measured_statements(pool: PgPool) -> Resu
         let (plan, count) = fee_measured(&ledger, &proxy, &f).await?;
         // floor_step(1.0001) = 1 would raise X: X never rises, so it stays.
         ensure!(plan == finalize(dec!(0.0004), dec!(0.999), false, false), "a: {plan:?}");
-        ensure!(count == 7 + u64::from(projected), "a: {count} statements");
+        // With the certificate's key before the bump (8m-2a).
+        ensure!(count == 8 + u64::from(projected), "a: {count} statements");
         ensure!(f.version(&pool).await == before + 1);
         let done = LegPartition {
             base_fee: dec!(0.0004),
@@ -116,9 +140,9 @@ async fn entry_fee_finalizes_once_with_measured_statements(pool: PgPool) -> Resu
         }
         let rows = snapshot(&pool).await;
         let (replay, replayed) = fee_measured(&ledger, &proxy, &f).await?;
-        // BEGIN, the server bounds, one read and ROLLBACK.
+        // BEGIN, the server bounds, the certificate's key, one read and ROLLBACK.
         ensure!(
-            replay == EntryFeePlan::Unchanged && replayed == 4,
+            replay == EntryFeePlan::Unchanged && replayed == 5,
             "replay {replay:?} {replayed}"
         );
         ensure!(snapshot(&pool).await == rows, "replay changed rows");
@@ -192,7 +216,7 @@ async fn entry_fee_waits_or_holds_without_writing(pool: PgPool) -> Result<()> {
     let before = snapshot(&pool).await;
     let (plan, count) = fee_measured(&ledger, &proxy, &f).await?;
     ensure!(
-        plan == EntryFeePlan::NotReady(EntryFeePending::FillsIncomplete) && count == 4,
+        plan == EntryFeePlan::NotReady(EntryFeePending::FillsIncomplete) && count == 5,
         "d: {plan:?} {count}"
     );
     ensure!(snapshot(&pool).await == before, "d changed rows");
@@ -200,7 +224,7 @@ async fn entry_fee_waits_or_holds_without_writing(pool: PgPool) -> Result<()> {
     ensure!(ledger.record_trades(&f.key(ENTRY), &second, at()).await?.changed);
     let (plan, count) = fee_measured(&ledger, &proxy, &f).await?;
     ensure!(
-        plan == finalize(dec!(0.001), dec!(0.999), false, false) && count == 7,
+        plan == finalize(dec!(0.001), dec!(0.999), false, false) && count == 8,
         "d: {plan:?}"
     );
     proxied.close().await;
@@ -241,7 +265,7 @@ async fn entry_fee_waits_or_holds_without_writing(pool: PgPool) -> Result<()> {
         };
         let before = snapshot(&pool).await;
         let (plan, count) = fee_measured(&ledger, &proxy, &f).await?;
-        ensure!(plan == held && count == 4, "{case}: {plan:?} {count}");
+        ensure!(plan == held && count == 5, "{case}: {plan:?} {count}");
         ensure!(snapshot(&pool).await == before, "{case} changed rows");
         proxied.close().await;
     }
@@ -270,9 +294,10 @@ async fn entry_fee_waits_or_holds_without_writing(pool: PgPool) -> Result<()> {
         let (count, wire) = (ledger.statements_total(), proxy.stats().statements);
         let refused = ledger.finalize_entry_fee(f.position, BASE).await;
         ensure!(matches!(refused, Err(LedgerError::Unrepresentable)), "l {case}: {refused:?}");
-        // BEGIN, the server bounds and the refused read; the connection is
-        // retired raw, so no ROLLBACK follows on the wire.
-        ensure!(ledger.statements_total() - count == 3 && proxy.stats().statements - wire == 3);
+        // BEGIN, the server bounds, the certificate's key and the refused
+        // read; the connection is retired raw, so no ROLLBACK follows on the
+        // wire.
+        ensure!(ledger.statements_total() - count == 4 && proxy.stats().statements - wire == 4);
         ensure!(snapshot(&pool).await == before, "l {case} changed rows");
         proxied.close().await;
     }
@@ -431,7 +456,8 @@ async fn competing_entry_fee_finalizers_serialize(pool: PgPool) -> Result<()> {
     let won = plans.iter().position(|plan| matches!(plan, EntryFeePlan::Finalize { .. }));
     let won = won.context("no finalization")?;
     ensure!(plans[1 - won] == EntryFeePlan::Unchanged, "{plans:?}");
-    ensure!(counts[won] == 7 && counts[1 - won] == 6, "{counts:?}");
+    // Both reach the bump, each after the certificate's key (8m-2a).
+    ensure!(counts[won] == 8 && counts[1 - won] == 7, "{counts:?}");
     ensure!(f.version(&pool).await == version + 1, "one changed commit");
     ensure!(leg_row(&pool, &f).await?.0.is_some_and(|p| p.base_fee_final));
     writers.close().await;

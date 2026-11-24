@@ -622,7 +622,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
             .map(|q| q.estimated_usdt)
             .unwrap_or(Decimal::ZERO);
 
-        sqlx::query(
+        // A saga's state is a certification input: under the certificate's
+        // shared key (ADR-0056 step 8m-2a, 8m PLAN-r4 §6.7).
+        let upsert = sqlx::query(
             r#"
             INSERT INTO funding_sagas (
                 tenant_id, saga_id, state, quote, estimated_usdt, created_at, updated_at
@@ -638,9 +640,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
         .bind(saga_id)
         .bind(state.as_str())
         .bind(quote)
-        .bind(estimated_usdt)
-        .execute(&*self.pool)
-        .await?;
+        .bind(estimated_usdt);
+        robson_eventlog::certificate::execute_participating(&self.pool, upsert).await?;
 
         Ok(())
     }

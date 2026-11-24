@@ -400,6 +400,12 @@ fn governed_rearm_backoff(attempt: u32) -> std::time::Duration {
 
 type DetectorMap = RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>;
 
+/// How long an append refused by the cutover certificate's completion is
+/// retried (8m PLAN-r4 §6.7): past completion's own bounds (a 2 s wait for the
+/// key, a 30 s client deadline), after which the refusal is a failure.
+#[cfg(feature = "postgres")]
+const CERTIFICATE_RETRY_BOUND: std::time::Duration = std::time::Duration::from_secs(35);
+
 /// How far an admission flow got, which decides what an error leaves behind
 /// (ADR-0051 Recovery).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -948,7 +954,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         #[cfg(feature = "postgres")]
         if let Some(pool) = &self.event_log_pool {
-            sqlx::query(
+            // The month's row is a certification input: under the cutover
+            // certificate's shared key (ADR-0056 step 8m-2a).
+            let upsert = sqlx::query(
                 r#"
                 INSERT INTO monthly_state (
                     year, month, capital_base, month_peak_net,
@@ -973,12 +981,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .bind(now.year())
             .bind(now.month() as i16)
             .bind(monthly.capital_base)
-            .bind(equity_net)
-            .execute(pool)
-            .instrument(
-                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
-            )
-            .await?;
+            .bind(equity_net);
+            robson_eventlog::certificate::execute_participating(pool, upsert).await?;
         }
 
         let mut cache = self.month_peak_net_cache.lock().await;
@@ -1382,6 +1386,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// suspension is recorded through the journal's retry set and sets the
     /// latch. A caller that already has a venue result keeps it either way.
     ///
+    /// One refusal is not a failure: while the cutover certificate's
+    /// completion holds its key the append's try-lock refuses with nothing
+    /// written (ADR-0056 step 8m-2a, 8m PLAN-r4 §6.7). The append is retried,
+    /// the stream's lock keeping the event first on its stream, and lands
+    /// after completion; only a refusal past [`CERTIFICATE_RETRY_BOUND`],
+    /// longer than completion's own bounds, counts as a failure.
+    ///
     /// Rationale: the synchronous apply on the write path is the only active
     /// projection update mechanism for `positions_current`. Silencing failures
     /// here would leave the projection stale without the caller's
@@ -1465,7 +1476,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let eventlog_event = EventlogEvent::new(tenant_id, stream_key, &event_type, payload)
             .with_actor(EventlogActorType::Daemon, Some("robsond".to_string()));
 
-        let event_id = match append_event(pool, stream_key, None, eventlog_event).await {
+        // While the cutover certificate's completion holds its key the append is
+        // refused with nothing written (8m PLAN-r4 §6.7): retried with backoff,
+        // the stream's lock held, until completion releases it.
+        let mut appended = append_event(pool, stream_key, None, eventlog_event.clone()).await;
+        let (refused_at, mut pause) =
+            (tokio::time::Instant::now(), std::time::Duration::from_millis(50));
+        while matches!(appended, Err(robson_eventlog::EventLogError::CertificateInProgress))
+            && refused_at.elapsed() < CERTIFICATE_RETRY_BOUND
+        {
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(std::time::Duration::from_secs(1));
+            appended = append_event(pool, stream_key, None, eventlog_event.clone()).await;
+        }
+        let event_id = match appended {
             Ok(id) => id,
             Err(robson_eventlog::EventLogError::IdempotentDuplicate(id)) => {
                 // Duplicate means the append already happened, but projection apply may
@@ -13408,7 +13432,7 @@ mod tests {
             let gate = mutation.gate.unwrap();
             assert_eq!((gate.permits, gate.ordinary, gate.unpermitted), (1, 1, 0), "{mutation:?}");
         }
-        assert_eq!(journal.operation_statements_max(), 18, "entry and stop, one operation");
+        assert_eq!(journal.operation_statements_max(), 22, "entry and stop, one operation");
         assert_eq!(journal.gate().snapshot().permits, 0);
     }
 
@@ -16027,5 +16051,7 @@ mod tests {
         assert_eq!(ctx.open_positions[0].symbol, "BTCUSDT");
     }
 
+    #[cfg(feature = "postgres")]
+    mod certificate;
     mod persistence;
 }

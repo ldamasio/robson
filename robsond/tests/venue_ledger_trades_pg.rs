@@ -217,11 +217,11 @@ async fn a_failed_trades_commit_rolls_back_the_cursor(pool: PgPool) {
     wait_for_backend_exit(&pool, pid).await;
     assert_eq!(
         proxy.stats().statements - wire,
-        10,
+        11,
         "failed COMMIT must not flush a hidden ROLLBACK: {:?}",
         proxy.query_trace()
     );
-    assert_eq!(ledger.statements_total(), 10);
+    assert_eq!(ledger.statements_total(), 11);
     assert_eq!(snapshot(&pool).await, before);
 }
 
@@ -249,11 +249,11 @@ async fn a_cancelled_record_trades_between_its_aggregate_statements_lands_nothin
     wait_for_backend_exit(&pool, pid).await;
     assert_eq!(
         proxy.stats().statements - wire,
-        9,
+        10,
         "cancelled transaction must not flush hidden SQL: {:?}",
         proxy.query_trace()
     );
-    assert_eq!(ledger.statements_total(), 9);
+    assert_eq!(ledger.statements_total(), 10);
     tokio::time::timeout(Duration::from_secs(3),async {
         loop {
             let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND query LIKE '%UPDATE balance_legs SET consumed_cum%' AND state='active')").fetch_one(&pool).await.unwrap();
@@ -286,9 +286,9 @@ async fn a_duplicate_page_without_cursor_advance_writes_nothing(pool: PgPool) {
             .unwrap()
             .changed
     );
-    // BEGIN, the server bounds, one read and ROLLBACK.
-    assert_eq!(proxy.stats().statements - wire, 4);
-    assert_eq!(ledger.statements_total() - count, 4);
+    // BEGIN, the server bounds, the certificate's key, one read and ROLLBACK.
+    assert_eq!(proxy.stats().statements - wire, 5);
+    assert_eq!(ledger.statements_total() - count, 5);
     assert_eq!(snapshot(&pool).await, before);
     let recorded: chrono::DateTime<chrono::Utc> =
         sqlx::query_scalar("SELECT recorded_at FROM order_fills")
@@ -329,6 +329,35 @@ async fn touch_checked_changes_rotation_only(pool: PgPool) {
     assert_eq!(f.version(&pool).await, v);
 }
 
+/// 8m-2a: a trade page takes the cutover certificate's key right after its
+/// bounds. While completion holds it the page refuses at its lock bound with
+/// nothing written; after completion it lands and bumps once.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_trade_page_waits_for_completion(pool: PgPool) {
+    use sqlx::Connection as _;
+    let f = Fixture::new(&pool).await;
+    let key = f.seed_order(&pool, 1, Decimal::ZERO, OrderPhase::Live).await;
+    let ledger = f.ledger(&pool);
+    let page = robson_exec::venue::TradePage {
+        trades: vec![fill(10_001, dec!(0.001))],
+        next_from_id: None,
+    };
+    let version = f.version(&pool).await;
+    let mut completion = sqlx::PgConnection::connect_with(&pool.connect_options()).await.unwrap();
+    sqlx::query("BEGIN").execute(&mut completion).await.unwrap();
+    sqlx::query(robson_eventlog::certificate::EXCLUSIVE)
+        .execute(&mut completion)
+        .await
+        .unwrap();
+    let refused = ledger.record_trades(&key, &page, at()).await;
+    assert!(matches!(refused, Err(LedgerError::Backend(_))), "{refused:?}");
+    assert_eq!(f.version(&pool).await, version);
+    sqlx::query("COMMIT").execute(&mut completion).await.unwrap();
+    assert!(ledger.record_trades(&key, &page, at()).await.unwrap().changed);
+    assert_eq!(f.version(&pool).await, version + 1);
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn record_trades_issues_its_reviewed_statements(pool: PgPool) {
@@ -343,8 +372,9 @@ async fn record_trades_issues_its_reviewed_statements(pool: PgPool) {
         };
         let before = proxy.stats().statements;
         assert!(ledger.record_trades(&key, &page, at()).await.unwrap().changed);
-        assert_eq!(proxy.stats().statements - before, 10);
-        assert_eq!(ledger.statements_total(), 10);
+        // With the certificate's key before the bump (8m-2a).
+        assert_eq!(proxy.stats().statements - before, 11);
+        assert_eq!(ledger.statements_total(), 11);
     }
 }
 
