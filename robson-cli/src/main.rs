@@ -15,6 +15,8 @@ enum Cli {
     Auth(commands::auth::AuthArgs),
     ReconcileClose(commands::reconcile_close::ReconcileCloseArgs),
     Income(commands::income::IncomeArgs),
+    /// The Spot cash ledger (ADR-0056 step 8l-5).
+    Cash(commands::cash::CashArgs),
 }
 
 #[tokio::main]
@@ -24,6 +26,7 @@ async fn main() {
         Cli::Auth(args) => commands::auth::run(args).await,
         Cli::ReconcileClose(args) => commands::reconcile_close::run(args).await,
         Cli::Income(args) => commands::income::run(args).await,
+        Cli::Cash(args) => commands::cash::run(args).await,
     };
     std::process::exit(code);
 }

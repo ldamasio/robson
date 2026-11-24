@@ -347,3 +347,403 @@ async fn retired_adapter_cannot_be_reused_by_any_migrate_entry() {
     assert!(adapter.revert(&ordinary).await.is_err());
     assert_eq!(adapter.status(), status);
 }
+
+type Preflight = fn(&Migration) -> Result<(), MigrateError>;
+/// Version, exact bytes, DO delimiter, preflight and the DDL commands, in
+/// order.
+type DoFile = (i64, &'static str, &'static str, Preflight, &'static [&'static str]);
+
+/// The S8-4 files (8l PLAN-r4 §4.2).
+const SPOT_ACCOUNTING: [DoFile; 5] = [
+    (
+        VERSION46,
+        include_str!("../../../migrations/20240101000046_spot_cash_anchors.sql"),
+        "$migration46$",
+        preflight46,
+        &[
+            "CREATE FUNCTION public.cash_anchor_moves_forward()",
+            "CREATE TABLE public.cash_anchors",
+            "CREATE TRIGGER cash_anchors_move_forward",
+            "CREATE TABLE public.cash_checkpoints",
+        ],
+    ),
+    (
+        VERSION47,
+        include_str!("../../../migrations/20240101000047_spot_cash_discrepancies.sql"),
+        "$migration47$",
+        preflight47,
+        &[
+            "CREATE FUNCTION public.cash_discrepancy_moves_forward()",
+            "CREATE TABLE public.cash_discrepancies",
+            "CREATE TRIGGER cash_discrepancies_move_forward",
+            "CREATE UNIQUE INDEX idx_cash_discrepancies_open",
+        ],
+    ),
+    (
+        VERSION48,
+        include_str!("../../../migrations/20240101000048_spot_cash_reanchors.sql"),
+        "$migration48$",
+        preflight48,
+        &[
+            "CREATE TABLE public.cash_sightings",
+            "CREATE TRIGGER cash_sightings_are_immutable",
+            "CREATE TABLE public.cash_reanchors",
+            "CREATE TRIGGER cash_reanchors_are_immutable",
+        ],
+    ),
+    (
+        VERSION49,
+        include_str!("../../../migrations/20240101000049_spot_cash_flows_dust.sql"),
+        "$migration49$",
+        preflight49,
+        &[
+            "CREATE TABLE public.cash_attested_flows",
+            "CREATE TRIGGER cash_attested_flows_are_immutable",
+            "CREATE TABLE public.dust_ledger",
+            "CREATE TRIGGER dust_ledger_is_immutable",
+        ],
+    ),
+    (
+        VERSION50,
+        include_str!("../../../migrations/20240101000050_spot_accounting_invalidations.sql"),
+        "$migration50$",
+        preflight50,
+        &[
+            "CREATE TABLE public.accounting_invalidations",
+            "CREATE TRIGGER accounting_invalidations_are_immutable",
+        ],
+    ),
+];
+
+/// The S8-5 files (8p PLAN-r3 §4.2).
+const BOUNDARY_CARRY: [DoFile; 4] = [
+    (
+        VERSION51,
+        include_str!("../../../migrations/20240101000051_boundary_snapshots.sql"),
+        "$migration51$",
+        preflight51,
+        &[
+            "CREATE FUNCTION public.boundary_snapshot_moves_forward()",
+            "CREATE TABLE public.boundary_snapshots",
+            "CREATE TRIGGER boundary_snapshots_move_forward",
+            "CREATE TABLE public.boundary_reopenings",
+        ],
+    ),
+    (
+        VERSION52,
+        include_str!("../../../migrations/20240101000052_boundary_revisions.sql"),
+        "$migration52$",
+        preflight52,
+        &[
+            "CREATE TRIGGER boundary_reopenings_are_immutable",
+            "CREATE TABLE public.boundary_snapshot_revisions",
+            "CREATE TRIGGER boundary_snapshot_revisions_are_immutable",
+        ],
+    ),
+    (
+        VERSION53,
+        include_str!("../../../migrations/20240101000053_boundary_carried_legs.sql"),
+        "$migration53$",
+        preflight53,
+        &[
+            "CREATE TABLE public.boundary_carried_legs",
+            "CREATE TRIGGER boundary_carried_legs_are_immutable",
+            "CREATE FUNCTION public.activation_basis_moves_forward()",
+        ],
+    ),
+    (
+        VERSION54,
+        include_str!("../../../migrations/20240101000054_activation_bases.sql"),
+        "$migration54$",
+        preflight54,
+        &[
+            "CREATE TABLE public.activation_bases",
+            "CREATE TRIGGER activation_bases_move_forward",
+            "CREATE UNIQUE INDEX idx_activation_bases_certified",
+        ],
+    ),
+];
+
+/// The S8-6 files (8m PLAN-r4 §4.2): 56 adds its foreign keys to existing
+/// tables, each inventoried by its table and constraint name.
+const CUTOVER: [DoFile; 2] = [
+    (
+        VERSION55,
+        include_str!("../../../migrations/20240101000055_venue_cutovers.sql"),
+        "$migration55$",
+        preflight55,
+        &[
+            "CREATE FUNCTION public.venue_cutover_moves_forward()",
+            "CREATE TABLE public.venue_cutovers",
+            "CREATE TRIGGER venue_cutovers_move_forward",
+            "CREATE UNIQUE INDEX idx_venue_cutovers_complete",
+        ],
+    ),
+    (
+        VERSION56,
+        include_str!("../../../migrations/20240101000056_venue_cutover_links.sql"),
+        "$migration56$",
+        preflight56,
+        &[
+            "CREATE UNIQUE INDEX idx_venue_cutovers_pending",
+            "ALTER TABLE public.venue_accounts ADD CONSTRAINT venue_accounts_venue_cutover",
+            "ALTER TABLE public.cash_anchors ADD CONSTRAINT cash_anchors_venue_cutover",
+            "ALTER TABLE public.activation_bases ADD CONSTRAINT activation_bases_venue_cutover",
+        ],
+    ),
+];
+
+fn spot_accounting_contract(version: i64) -> &'static Migration {
+    match version {
+        VERSION46 => contract46(),
+        VERSION47 => contract47(),
+        VERSION48 => contract48(),
+        VERSION49 => contract49(),
+        VERSION50 => contract50(),
+        VERSION51 => contract51(),
+        VERSION52 => contract52(),
+        VERSION53 => contract53(),
+        VERSION54 => contract54(),
+        VERSION55 => contract55(),
+        VERSION56 => contract56(),
+        _ => None,
+    }
+    .expect("embedded S8-4, S8-5 or S8-6 contract")
+}
+
+#[test]
+fn embedded46_to_50_identity_and_canonical_do_shape() {
+    identity_and_canonical_do_shape(&SPOT_ACCOUNTING, "$migration45$");
+}
+
+#[test]
+fn embedded51_to_54_identity_and_canonical_do_shape() {
+    identity_and_canonical_do_shape(&BOUNDARY_CARRY, "$migration50$");
+}
+
+#[test]
+fn embedded55_to_56_identity_and_canonical_do_shape() {
+    identity_and_canonical_do_shape(&CUTOVER, "$migration54$");
+}
+
+/// Each file is its exact embedded contract and its preflight accepts only
+/// its own canonical DO: not a header, a trailing statement, a second DO, the
+/// version before the set (`before`) or another file of the set.
+fn identity_and_canonical_do_shape(files: &[DoFile], before: &str) {
+    for &(version, file, delimiter, preflight, _) in files {
+        let contract = spot_accounting_contract(version);
+        assert_eq!(contract.version, version);
+        assert_eq!(contract.sql.as_ref(), file);
+        assert!(!contract.no_tx && contract.migration_type == MigrationType::Simple);
+        assert!(matches_embedded(&contract.clone(), contract));
+        assert!(preflight(contract).is_ok());
+
+        let mut changed = vec![contract.clone(); 6];
+        changed[0].version += 1;
+        changed[1].description = "other".into();
+        changed[2].sql = "SELECT 1".into();
+        changed[3].checksum.to_mut()[0] ^= 1;
+        changed[4].migration_type = MigrationType::ReversibleUp;
+        changed[5].no_tx = true;
+        assert!(changed.iter().all(|candidate| !matches_embedded(candidate, contract)));
+        assert!(preflight(&changed[4]).is_err());
+        assert!(preflight(&changed[5]).is_err());
+
+        for sql in [
+            format!("DO {delimiter}\nBEGIN NULL; END;\n{delimiter}"),
+            format!("-- header\nDO {delimiter}\nBEGIN NULL; END;\n{delimiter};"),
+            format!("DO {delimiter}\nBEGIN NULL; END;\n{delimiter}; SELECT 1;"),
+            format!(
+                "DO {delimiter}\nBEGIN NULL; END;\n{delimiter}; DO {delimiter}\nBEGIN NULL; END;\n{delimiter};"
+            ),
+            format!("DO {before}\nBEGIN NULL; END;\n{before};"),
+        ] {
+            let mut invalid = contract.clone();
+            invalid.sql = sql.clone().into();
+            assert!(preflight(&invalid).is_err(), "accepted {sql}");
+        }
+        for &(other, ..) in files {
+            if other != version {
+                let foreign = spot_accounting_contract(other);
+                let mut renumbered = foreign.clone();
+                renumbered.version = version;
+                assert!(!matches_embedded(&renumbered, contract), "{other} as {version}");
+                assert!(preflight(foreign).is_err(), "{version} accepted {other}'s DO");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_identical_46_to_50_are_refused_before_any_connection_use() {
+    refused_before_any_connection_use(&SPOT_ACCOUNTING).await;
+}
+
+#[tokio::test]
+async fn non_identical_51_to_54_are_refused_before_any_connection_use() {
+    refused_before_any_connection_use(&BOUNDARY_CARRY).await;
+}
+
+#[tokio::test]
+async fn non_identical_55_to_56_are_refused_before_any_connection_use() {
+    refused_before_any_connection_use(&CUTOVER).await;
+}
+
+async fn refused_before_any_connection_use(files: &[DoFile]) {
+    // No connection at all: a refusal must come from the contract check, an
+    // identical source reaches the owned apply and finds the connection gone.
+    let mut adapter = BoundedMigration {
+        connection: None,
+        status: Status { phase: Phase::Preflight, failure: None },
+        contract: None,
+        gate: Default::default(),
+    };
+    for &(version, ..) in files {
+        let contract = spot_accounting_contract(version);
+        let expected = format!("migration{} contract mismatch", version % 100);
+        let mut checksum = contract.clone();
+        checksum.checksum.to_mut()[0] ^= 1;
+        let mut sql = contract.clone();
+        sql.sql = "SELECT 1".into();
+        let mut no_tx = contract.clone();
+        no_tx.no_tx = true;
+        let mut description = contract.clone();
+        description.description = "other".into();
+        for wrong in [checksum, sql, no_tx, description] {
+            let error = adapter.apply(&wrong).await.expect_err("non-identical source applied");
+            assert!(
+                matches!(&error, MigrateError::Source(source) if source.to_string() == expected),
+                "{version}: {error}"
+            );
+        }
+        let identical = adapter.apply(contract).await.expect_err("no connection");
+        assert!(matches!(
+            &identical,
+            MigrateError::Source(source) if source.to_string() == "migration connection is retired"
+        ));
+        assert_eq!(adapter.status(), Status { phase: Phase::Preflight, failure: None });
+    }
+}
+
+/// Top-level statements of a canonical DO body between its `BEGIN` and final
+/// `END;`, read past comments, string literals and nested dollar quotes.
+fn do_body_statements(sql: &str, delimiter: &str) -> Vec<String> {
+    let body = sql
+        .trim_end()
+        .strip_prefix(&format!("DO {delimiter}\n"))
+        .and_then(|sql| sql.strip_suffix(&format!("\n{delimiter};")))
+        .expect("canonical DO wrapper");
+    let body = body
+        .trim()
+        .strip_prefix("BEGIN")
+        .and_then(|body| body.strip_suffix("END;"))
+        .expect("one BEGIN ... END; block");
+    let chars: Vec<char> = body.chars().collect();
+    let (mut statements, mut current, mut i) = (Vec::new(), String::new(), 0);
+    while i < chars.len() {
+        match chars[i] {
+            '-' if chars.get(i + 1) == Some(&'-') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            },
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                let rest: String = chars[i..].iter().collect();
+                let end = rest.find("*/").expect("closed block comment");
+                i += rest[..end + 2].chars().count();
+            },
+            '\'' => {
+                let mut j = i + 1;
+                loop {
+                    assert!(j < chars.len(), "unclosed string literal");
+                    if chars[j] == '\'' && chars.get(j + 1) == Some(&'\'') {
+                        j += 2;
+                    } else if chars[j] == '\'' {
+                        break;
+                    } else {
+                        j += 1;
+                    }
+                }
+                current.extend(&chars[i..=j]);
+                i = j + 1;
+            },
+            '$' if !chars.get(i + 1).is_some_and(char::is_ascii_digit) => {
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                assert_eq!(chars.get(j), Some(&'$'), "dollar sign outside a quote tag");
+                let tag: String = chars[i..=j].iter().collect();
+                let after: String = chars[j + 1..].iter().collect();
+                let end = after.find(&tag).expect("closed dollar quote");
+                let quoted = tag.chars().count() * 2 + after[..end].chars().count();
+                current.extend(&chars[i..i + quoted]);
+                i += quoted;
+            },
+            ';' => {
+                statements.push(current.split_whitespace().collect::<Vec<_>>().join(" "));
+                current.clear();
+                i += 1;
+            },
+            c => {
+                current.push(c);
+                i += 1;
+            },
+        }
+    }
+    assert!(current.trim().is_empty(), "text after the last statement: {current:?}");
+    statements
+}
+
+#[test]
+fn spot_accounting_dos_have_at_most_four_ddl() {
+    at_most_four_ddl(&SPOT_ACCOUNTING);
+    // The reader itself: a nested body's semicolons, quoted ones and
+    // comments are not commands.
+    let witness = "DO $m$\nBEGIN\n    -- a; b;\n    CREATE TABLE t (c TEXT CHECK (c <> ';'));\n    \
+                   CREATE FUNCTION f() RETURNS INT LANGUAGE plpgsql AS $f$ BEGIN RETURN 1; END; $f$;\n    \
+                   /* x; */ CREATE INDEX i ON t (c);\nEND;\n$m$;";
+    assert_eq!(do_body_statements(witness, "$m$").len(), 3);
+}
+
+#[test]
+fn boundary_carry_dos_have_at_most_four_ddl() {
+    at_most_four_ddl(&BOUNDARY_CARRY);
+}
+
+#[test]
+fn cutover_dos_have_at_most_four_ddl() {
+    at_most_four_ddl(&CUTOVER);
+}
+
+fn at_most_four_ddl(files: &[DoFile]) {
+    // Main's statement bound is 1 s for the whole DO and the measured
+    // production p90 is 152 ms per DDL command, so each S8-4, S8-5 and S8-6
+    // DO stays at four DDL commands at most, constraints inline (8l PLAN-r4,
+    // 8p PLAN-r3 and 8m PLAN-r4, §4.2). The only other command is S8-6's
+    // added foreign key.
+    for &(version, file, delimiter, _, inventory) in files {
+        let statements = do_body_statements(file, delimiter);
+        assert!(statements.len() <= 4, "{version} has {} DDL commands", statements.len());
+        let ddl: Vec<String> = statements
+            .iter()
+            .map(|statement| {
+                let words: Vec<&str> = statement.split_whitespace().collect();
+                let len = match (words.first(), words.get(1)) {
+                    (Some(&"ALTER"), _) => 6,
+                    (_, Some(&"UNIQUE")) => 4,
+                    _ => 3,
+                };
+                words[..len.min(words.len())].join(" ")
+            })
+            .collect();
+        assert_eq!(ddl, inventory.to_vec(), "{version} is not its PLAN's §4.2 DDL inventory");
+        assert!(statements.iter().all(|statement| {
+            let words: Vec<&str> = statement.split_whitespace().collect();
+            words[0] == "CREATE"
+                || (words[..2] == ["ALTER", "TABLE"]
+                    && words.get(3..5) == Some(&["ADD", "CONSTRAINT"][..])
+                    && words.get(6..8) == Some(&["FOREIGN", "KEY"][..]))
+        }));
+    }
+}

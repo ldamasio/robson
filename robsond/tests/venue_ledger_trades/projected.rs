@@ -412,3 +412,105 @@ async fn projected_trade_lost_commit_requires_retirement_then_observes_accepted_
     eprintln!("Projected trade page: 11 physical commands, original backend retired after lost COMMIT acknowledgement");
     Ok(())
 }
+
+/// ADR-0056 step 8l-3a (PLAN-r4 §6.10): new fills of an order with no
+/// governed leg invalidate the UTC month of each fill's venue time, through
+/// one idempotent statement on the page's transaction; leg fills add none.
+#[sqlx::test(migrations = false)]
+#[ignore = "requires isolated PostgreSQL DATABASE_URL"]
+async fn unattributed_fill_invalidates_its_month(pool: PgPool) -> Result<()> {
+    use crate::venue_ledger_store::settlement::{
+        read_settlement, CommissionAssets, SettlementQuery,
+    };
+    migrate(&pool).await?;
+    let f = Fixture::new(&pool).await;
+    let ledger = f.ledger(&pool);
+    let last_october: chrono::DateTime<chrono::Utc> = "2026-10-31T23:59:59.999Z".parse()?;
+    let fill = |id: u64, time| robson_exec::ports::TradeFill {
+        time: Some(time),
+        ..support::fill(id, Decimal::ONE)
+    };
+    let across = robson_exec::venue::TradePage {
+        trades: vec![
+            fill(71, last_october),
+            fill(72, last_october + chrono::TimeDelta::milliseconds(1)),
+        ],
+        next_from_id: None,
+    };
+    let record = f.record(7, Decimal::ZERO, OrderPhase::Live);
+    ledger.record_order(&record, &f.link(7, OrderOwner::Discovered), seen()).await?;
+    let key = f.key(7);
+    let before = ledger.statements_total();
+    ensure!(ledger.record_trades(&key, &across, at()).await?.changed);
+    // BEGIN, the bounds, three reads, the bump, the fills, the invalidation,
+    // the order, COMMIT: one more than the same page without it.
+    ensure!(ledger.statements_total() - before == 10);
+    let invalid = |month: &str| {
+        let month = chrono::NaiveDate::parse_from_str(month, "%Y-%m-%d").expect("month");
+        let (pool, tenant) = (pool.clone(), f.tenant);
+        async move {
+            let venue = support::venue();
+            let assets = [CommissionAssets {
+                symbol: SYMBOL,
+                base: "BTC",
+                quote: "USDT",
+            }];
+            let query = SettlementQuery {
+                tenant_id: tenant,
+                venue: &venue,
+                month,
+                now: at(),
+                assets: &assets,
+            };
+            Ok::<_, anyhow::Error>(
+                read_settlement(&mut *pool.acquire().await?, &query).await?.invalidations,
+            )
+        }
+    };
+    ensure!(invalid("2026-10-01").await? == 1 && invalid("2026-11-01").await? == 1);
+    ensure!(invalid("2026-09-01").await? == 0 && invalid("2026-12-01").await? == 0);
+    let evidence: Vec<String> = sqlx::query_scalar(
+        "SELECT evidence_key FROM accounting_invalidations WHERE tenant_id=$1 ORDER BY month",
+    )
+    .bind(f.tenant)
+    .fetch_all(&pool)
+    .await?;
+    ensure!(
+        evidence
+            == [
+                format!("{}/{SYMBOL}/71", f.scope),
+                format!("{}/{SYMBOL}/72", f.scope)
+            ]
+    );
+    // A replay lands nothing; a leg's page adds no invalidation.
+    ensure!(!ledger.record_trades(&key, &across, at()).await?.changed);
+    let leg = f.seed_order(&pool, 8, Decimal::ZERO, OrderPhase::Live).await;
+    let before = ledger.statements_total();
+    ensure!(ledger.record_trades(&leg, &page(81, Decimal::ONE), at()).await?.changed);
+    ensure!(ledger.statements_total() - before == 10, "a leg page keeps its ten");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM accounting_invalidations")
+        .fetch_one(&pool)
+        .await?;
+    ensure!(rows == 2);
+    // Opted: the generation CAS too, and the generation stays current.
+    let g = Fixture::new(&pool).await;
+    let (binding, version) = generation(&pool, &g).await?;
+    let projected = g.ledger(&pool).with_trade_order_set_projection(binding);
+    let before = projected.statements_total();
+    ensure!(projected.record_trades(&g.key(2), &page(91, Decimal::ONE), at()).await?.changed);
+    ensure!(projected.statements_total() - before == 11);
+    let (current, advanced): (i64, i64) = sqlx::query_as(
+        "SELECT a.version, s.accounting_version FROM accounting_state a JOIN spot_order_set_generation s USING (tenant_id, venue_id) WHERE a.tenant_id=$1",
+    )
+    .bind(g.tenant)
+    .fetch_one(&pool)
+    .await?;
+    ensure!(current == version + 1 && advanced == current);
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM accounting_invalidations WHERE tenant_id=$1")
+            .bind(g.tenant)
+            .fetch_one(&pool)
+            .await?;
+    ensure!(rows == 1);
+    Ok(())
+}

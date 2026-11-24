@@ -25,6 +25,9 @@
 //!   that alarm read the persisted basis
 //! - `robsond_month_boundary_pending` — the current month's reset has not
 //!   landed (0 or 1)
+//! - `robsond_boundary_snapshot_pending` — a balance account's current month
+//!   owes a boundary snapshot that is not complete, by venue (ADR-0056 step
+//!   8p-2)
 //! - `robsond_budget_model_shadow_slots_delta` — dormant ADR-0051 NFS slots
 //!   minus HWM slots
 //! - `robsond_market_data_ws_failures_total` — failed WS attempts by endpoint
@@ -58,6 +61,31 @@
 //!   the next scan because a live entry held their symbol and side (PR O)
 //! - `robsond_entry_refused_ownership_total` — entries refused at their send
 //!   because a sweep's close held their symbol and side (PR O)
+//! - `robsond_leg_settlement_pending` — balance-account legs the latest
+//!   settlement barrier read found unsettled (ADR-0056 step 8l-2)
+//! - `robsond_cash_impaired` — 1 while the latest cash read found `E(now)`
+//!   impaired by late evidence (ADR-0056 step 8l-3a)
+//! - `robsond_cash_conclusions_total{outcome}` — cash writer attempts by
+//!   outcome: `clean`, `missing`, `extra`, `refused` or `uncertain` (ADR-0056
+//!   step 8l-3b)
+//! - `robsond_cash_reanchors_total{direction}` — re-anchors: committed ones by
+//!   the flows they wrote (`none`, `withdrawal`, `contribution`, `both`) or
+//!   `recovery`; `refused`, or `uncertain` without a COMMIT answer (ADR-0056
+//!   step 8l-5)
+//! - `robsond_spot_external_flows_total{kind}` — attested flows written, by
+//!   `withdrawal` or `contribution` (ADR-0056 step 8l-5)
+//! - `robsond_withdrawal_fence{venue}` — 1 while the latest cash read found an
+//!   attested withdrawal in the current UTC month (ADR-0056 step 8l-5)
+//! - the balance scan's route (ADR-0056 step 8k-3c; registered with the route's
+//!   `SCAN_METRICS`, every finite series at 0):
+//!   `robsond_balance_scans_total{outcome}`,
+//!   `robsond_balance_scan_refusals_total{stage, reason}`,
+//!   `robsond_balance_scan_attempts_total`,
+//!   `robsond_balance_scan_weight_total`,
+//!   `robsond_balance_scan_last_concluded_timestamp_seconds`,
+//!   `robsond_cash_observation_retries_total`, `robsond_spot_btc_conflict`,
+//!   `robsond_spot_btc_conflicts_total{finding}` and
+//!   `robsond_balance_recovery_withheld_total{kind}`
 
 use std::sync::LazyLock;
 
@@ -200,6 +228,17 @@ pub static UNPERMITTED_MUTATIONS: LazyLock<Counter> = LazyLock::new(|| {
     .expect("failed to register robsond_unpermitted_mutations_total")
 });
 
+/// Venue mutations a read-only process refused at the choke point, by
+/// reason (PS-1): nothing sent, no latch, no incident; each pages.
+pub static REFUSED_MUTATIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        "robsond_venue_mutation_refused_total",
+        "Venue mutations refused by a read-only process",
+        &["reason"]
+    )
+    .expect("failed to register robsond_venue_mutation_refused_total")
+});
+
 /// Operations whose permit was dropped before they completed: cancelled or
 /// panicked mid-flight. Each sets the journal latch.
 pub static ABORTED_OPERATIONS: LazyLock<Counter> = LazyLock::new(|| {
@@ -261,6 +300,85 @@ pub static STREAMS_SUSPENDED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     )
     .expect("failed to register robsond_streams_suspended")
 });
+
+/// Balance-account legs the latest settlement barrier read found unsettled
+/// (ADR-0056 step 8l-2, v16 §3.7.3). Set by every read; absent until the
+/// first, and no production path reads the barrier yet.
+pub static LEG_SETTLEMENT_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "robsond_leg_settlement_pending",
+        "Balance-account legs the latest settlement barrier read found unsettled"
+    )
+    .expect("failed to register robsond_leg_settlement_pending")
+});
+
+pub fn observe_leg_settlement_pending(legs: u64) {
+    LEG_SETTLEMENT_PENDING.set(i64::try_from(legs).unwrap_or(i64::MAX));
+}
+
+/// 1 while the latest cash read found `E(now)` impaired by late evidence
+/// (ADR-0056 step 8l-3a, PLAN-r4 §6.10): the current month is invalid. Set by
+/// every read; absent until the first, and no production path reads yet.
+pub static CASH_IMPAIRED: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!("robsond_cash_impaired", "1 while E(now) is impaired by late evidence")
+        .expect("failed to register robsond_cash_impaired")
+});
+
+pub fn observe_cash_impaired(impaired: bool) {
+    CASH_IMPAIRED.set(i64::from(impaired));
+}
+
+/// Cash writer attempts by outcome (ADR-0056 step 8l-3b): a published
+/// conclusion is `clean`, `missing` or `extra` by its Δ; one that wrote
+/// nothing is `refused`; a COMMIT without an answer is `uncertain`. No
+/// production writer yet.
+pub static CASH_CONCLUSIONS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!("robsond_cash_conclusions_total", "Cash writer attempts by outcome", &[
+        "outcome"
+    ])
+    .expect("failed to register robsond_cash_conclusions_total")
+});
+
+pub fn observe_cash_conclusion(outcome: &str) {
+    CASH_CONCLUSIONS.with_label_values(&[outcome]).inc();
+}
+
+/// Re-anchors by direction (ADR-0056 step 8l-5); no production composition
+/// yet.
+pub static CASH_REANCHORS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!("robsond_cash_reanchors_total", "Cash re-anchors by direction", &[
+        "direction"
+    ])
+    .expect("failed to register robsond_cash_reanchors_total")
+});
+
+pub fn observe_cash_reanchor(direction: &str) {
+    CASH_REANCHORS.with_label_values(&[direction]).inc();
+}
+
+/// Attested external flows a re-anchor wrote, by kind (ADR-0056 step 8l-5).
+pub static SPOT_EXTERNAL_FLOWS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!("robsond_spot_external_flows_total", "Attested flows by kind", &["kind"])
+        .expect("failed to register robsond_spot_external_flows_total")
+});
+
+pub fn observe_external_flow(kind: &str) {
+    SPOT_EXTERNAL_FLOWS.with_label_values(&[kind]).inc();
+}
+
+/// 1 while the latest cash read found an attested withdrawal attributed to
+/// the current UTC month (ADR-0056 step 8l-5): admissions wait for the next
+/// boundary. Set by every read; no production path reads yet.
+pub static WITHDRAWAL_FENCE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!("robsond_withdrawal_fence", "1 while a withdrawal fences the month", &[
+        "venue"
+    ])
+    .expect("failed to register robsond_withdrawal_fence")
+});
+
+pub fn observe_withdrawal_fence(venue: &str, fenced: bool) {
+    WITHDRAWAL_FENCE.with_label_values(&[venue]).set(i64::from(fenced));
+}
 
 /// Publish how many streams of each kind are suspended; both kinds export,
 /// at 0 from startup.
@@ -395,6 +513,10 @@ impl robson_exec::gate::GateObserver for GateMetrics {
 
     fn entry_refused_ownership(&self) {
         ENTRY_REFUSED_OWNERSHIP.inc();
+    }
+
+    fn mutation_refused(&self, reason: robson_exec::gate::ReadOnlyReason) {
+        REFUSED_MUTATIONS.with_label_values(&[reason.as_str()]).inc();
     }
 }
 
@@ -663,6 +785,19 @@ pub static MONTH_BOUNDARY_PENDING: LazyLock<Gauge> = LazyLock::new(|| {
         "Whether the current month's MonthBoundaryReset has not landed yet (0 or 1)"
     )
     .expect("failed to register robsond_month_boundary_pending")
+});
+
+/// A balance account's current month owes a boundary snapshot (its certified
+/// activation basis is of an earlier month) that is not complete (ADR-0056
+/// step 8p-2). Set by each boundary poll that reads the month; absent until
+/// the first.
+pub static BOUNDARY_SNAPSHOT_PENDING: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
+        "robsond_boundary_snapshot_pending",
+        "Whether the current month's boundary snapshot is owed and not complete (0 or 1)",
+        &["venue"]
+    )
+    .expect("failed to register robsond_boundary_snapshot_pending")
 });
 
 /// Dormant ADR-0051 shadow comparison: net-from-start slots minus HWM slots.

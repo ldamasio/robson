@@ -744,7 +744,7 @@ async fn signed_writer(pool: PgPool, base_url: &str) -> anyhow::Result<WriteRepo
     restore::existing_pause(
         &pool,
         tenant,
-        &mut rows,
+        rows.pause.as_mut(),
         &clock,
         Instant::now() + Duration::from_secs(2),
         &Trace::default(),

@@ -372,6 +372,8 @@ async fn proxied_journal(
         ready_wait: JOURNAL_READY_WAIT,
         balance_account: false,
         order_set_projection: Some(g.clone()),
+        accounting_generation: Default::default(),
+        non_trading: false,
     };
     Ok((stored, proxy, pid, birth))
 }

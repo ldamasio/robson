@@ -74,8 +74,27 @@ async fn the_ledger_schema_installs_fresh(pool: PgPool) {
         20240101000042,
         20240101000043,
         20240101000044,
-        20240101000045
+        20240101000045,
+        20240101000046,
+        20240101000047,
+        20240101000048,
+        20240101000049,
+        20240101000050,
+        20240101000051,
+        20240101000052,
+        20240101000053,
+        20240101000054,
+        20240101000055,
+        20240101000056
     ]);
+    // The embedded chain has no gap: every version from 0 to 56, in order.
+    let chain: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let expected: Vec<i64> = (0..=56).map(|n| 20240101000000 + n).collect();
+    assert_eq!(chain, expected);
     // Migrations 41 to 45 create the order-set projection tables empty.
     for suffix in [
         "generation",
@@ -96,6 +115,32 @@ async fn the_ledger_schema_installs_fresh(pool: PgPool) {
                 .await
                 .unwrap();
         assert_eq!(count, 0, "spot_order_set_{suffix}: migrations are inert");
+    }
+    // Migrations 46 to 50 create the S8-4 Spot accounting tables empty, 51 to
+    // 54 the S8-5 boundary snapshot tables and 55 to 56 the S8-6 cutover runs.
+    for table in [
+        "cash_anchors",
+        "cash_checkpoints",
+        "cash_discrepancies",
+        "cash_sightings",
+        "cash_reanchors",
+        "cash_attested_flows",
+        "dust_ledger",
+        "accounting_invalidations",
+        // Migrations 51 to 54: the S8-5 boundary snapshot tables.
+        "boundary_snapshots",
+        "boundary_reopenings",
+        "boundary_snapshot_revisions",
+        "boundary_carried_legs",
+        "activation_bases",
+        // Migrations 55 to 56: the S8-6 cutover runs.
+        "venue_cutovers",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{table}: migrations are inert");
     }
     let f = Fixture::new_for_all_rows(&pool).await.unwrap();
     f.all_rows(&pool).await.unwrap();
@@ -126,6 +171,8 @@ async fn the_ledger_schema_has_only_reviewed_external_foreign_keys(pool: PgPool)
         ("spot_intent_clock_attempt_fk", "spot_intent_clock", "submit_attempts", 0),
         ("spot_intent_clock_intent_fk", "spot_intent_clock", "order_intents", 0),
         ("spot_intent_clock_sample_fk", "spot_intent_clock", "clock_samples", 0),
+        // M56: a venue account names its cutover run (validated, immediate).
+        ("venue_accounts_venue_cutover", "venue_accounts", "venue_cutovers", 1),
         ("venue_orders_live_sample_fk", "venue_orders", "clock_samples", 0),
         ("venue_orders_terminal_sample_fk", "venue_orders", "clock_samples", 0),
     ]);

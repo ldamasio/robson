@@ -271,10 +271,14 @@ async fn seed_native_sources(
     rehearsal: bool,
 ) -> Result<Option<Uuid>> {
     let venue = VenueId::new(VenueId::BINANCE_SPOT);
-    sqlx::query(
-        "INSERT INTO public.venue_accounts(venue_id,account_scope,tenant_id,uid,bound_at,cutover_id)
-         VALUES('binance:spot',$1,$2,$3,now(),$4)",
-    ).bind(&g.account_scope).bind(g.tenant_id).bind(uid).bind(Uuid::now_v7()).execute(pool).await?;
+    // Bound to a cutover run of the tenant (M56's foreign key).
+    sqlx::query(include_str!("../tests/fixtures/bound_venue_account.sql"))
+        .bind("binance:spot")
+        .bind(&g.account_scope)
+        .bind(g.tenant_id)
+        .bind(uid)
+        .execute(pool)
+        .await?;
     sqlx::query("CREATE INDEX idx_leg_routes_spot_scope_position ON public.leg_routes(account_scope,position_id) WHERE venue_id='binance:spot'")
         .execute(pool).await?;
     let ledger = PgVenueLedger::new(pool, g.tenant_id);
@@ -677,6 +681,8 @@ async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
         ready_wait: JOURNAL_READY_WAIT,
         balance_account: false,
         order_set_projection: Some(g.clone()),
+        accounting_generation: Default::default(),
+        non_trading: false,
     };
     proxy.enable_exact_query_trace(12);
     proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE public.spot_order_set_generation g"));
@@ -939,12 +945,18 @@ async fn physical_spot_restore(pool: PgPool, rehearsal: bool) -> Result<()> {
         );
         drop(reader);
         restore.close().await;
+        // TIME 1 + the scoped triple 20 + 6 + 6, then the weight-4 exact lookup.
+        let (weight, lookup_weight, cumulative_weight) = (33, 4, 37);
+        ensure!(
+            cumulative_weight == weight + lookup_weight && cumulative_weight == 37,
+            "cumulative evidence weight is the triple's plus the lookup's"
+        );
         installed.supervisor().phase("rehearsal_complete", json!({
             "epoch": successor.process_epoch, "generation": successor.generation_id,
-            "sample": witness.sample, "handoffs": 4, "weight": 107, "inventory_sql": 0,
+            "sample": witness.sample, "handoffs": 4, "weight": weight, "inventory_sql": 0,
             "uid": uid.parse::<u64>()?, "owned_intent": owned,
-            "lookup_handoffs": witness.lookup_handoffs, "lookup_weight": 4, "lookup_sql": witness.lookup_sql,
-            "cumulative_handoffs": witness.cumulative_handoffs, "cumulative_weight": 111,
+            "lookup_handoffs": witness.lookup_handoffs, "lookup_weight": lookup_weight, "lookup_sql": witness.lookup_sql,
+            "cumulative_handoffs": witness.cumulative_handoffs, "cumulative_weight": cumulative_weight,
             "lookup_sample": witness.lookup_sample, "durable_executed": witness.durable_executed.normalize().to_string(),
             "lookup_executed": witness.lookup_executed.normalize().to_string(), "pending_execution_observed": true,
         })).await?;

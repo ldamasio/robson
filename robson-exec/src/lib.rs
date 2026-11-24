@@ -39,6 +39,7 @@
 pub mod balance_costs;
 pub mod balance_liability;
 pub mod balance_sizing;
+pub mod boundary_carry;
 pub mod cancel;
 pub mod clock_records;
 // Inert C8 arithmetic; a later reviewed producer owns persistence and

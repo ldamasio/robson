@@ -18,6 +18,9 @@ mod clocked;
 #[path = "order_journal_clocked_pg_tests.rs"]
 mod clocked_pg_tests;
 #[cfg(test)]
+#[path = "order_journal_non_trading_tests.rs"]
+mod non_trading_tests;
+#[cfg(test)]
 #[path = "order_journal_projected_pg_tests.rs"]
 mod projected_pg_tests;
 #[path = "order_journal_readiness.rs"]
@@ -87,6 +90,11 @@ pub struct PgJournalBackend {
     balance_account: bool,
     /// Private opt-in journal maintenance; `None` keeps the legacy statements.
     order_set_projection: Option<JournalGeneration>,
+    /// The order-set owner's cell a balance account's incident, suspension
+    /// and release read (ADR-0056 step 8l-4); empty, they run no CAS.
+    accounting_generation: crate::balance_accounting::GenerationCell,
+    /// A non-trading Spot process's journal (PS-1): every batch refused.
+    non_trading: bool,
 }
 
 impl PgJournalBackend {
@@ -106,7 +114,18 @@ impl PgJournalBackend {
             ready_wait: JOURNAL_READY_WAIT,
             balance_account: false,
             order_set_projection: None,
+            accounting_generation: Default::default(),
+            non_trading: false,
         }
+    }
+
+    /// The journal of a non-trading Spot process (PS-1): every batch (an
+    /// intent, an outcome, a disposition replay, an admission) is refused as
+    /// `Known` before any SQL, so no strict attempt is ever authorized;
+    /// incidents, suspensions and releases (F's) run as before.
+    pub(crate) fn non_trading(mut self) -> Self {
+        self.non_trading = true;
+        self
     }
 
     /// Run this backend's incident, suspension and release transactions as a
@@ -126,9 +145,14 @@ impl PgJournalBackend {
 
     /// The supervised Spot backend: orders and a release both on the admitted
     /// writer, bound to its installed generation. The installer's pool never
-    /// reaches it.
+    /// reaches it. Its incidents, suspensions and releases read `generation`,
+    /// the daemon's one cell, into which the supervised start publishes
+    /// (ADR-0056 step 8l-4, 5a).
     #[allow(dead_code, reason = "no production supervisor yet")]
-    pub(crate) fn supervised(ready: &SpotReady) -> Self {
+    pub(crate) fn supervised(
+        ready: &SpotReady,
+        generation: &crate::balance_accounting::GenerationCell,
+    ) -> Self {
         Self {
             pool: ready.writer().clone(),
             daemon_pool: ready.writer().clone(),
@@ -138,6 +162,8 @@ impl PgJournalBackend {
             // suspensions and releases run under the server bounds.
             balance_account: true,
             order_set_projection: Some(ready.generation().clone()),
+            accounting_generation: generation.clone(),
+            non_trading: false,
         }
     }
 
@@ -558,6 +584,10 @@ impl PgJournalBackend {
 #[async_trait]
 impl JournalBackend for PgJournalBackend {
     async fn commit(&self, batch: &JournalBatch) -> Result<(), CommitFailure> {
+        if self.non_trading {
+            let refused = "non-trading Spot process: journal mutations refused";
+            return Err(CommitFailure::Known(refused.to_owned()));
+        }
         let started = Instant::now();
         let projection = self.projection_for(batch)?;
         if let Some(balance) = &batch.balance {
@@ -614,6 +644,7 @@ impl JournalBackend for PgJournalBackend {
         self.bound_auxiliary(&mut tx, COMMIT_BOUND, started)
             .await
             .map_err(CommitFailure::Known)?;
+        self.advance_auxiliary(&mut tx).await.map_err(CommitFailure::Known)?;
         // An open suspension of the stream, or this one replayed, stands.
         sqlx::query(
             r#"
@@ -667,6 +698,7 @@ impl JournalBackend for PgJournalBackend {
         self.bound_auxiliary(&mut tx, COMMIT_BOUND, started)
             .await
             .map_err(CommitFailure::Known)?;
+        self.advance_auxiliary(&mut tx).await.map_err(CommitFailure::Known)?;
         // Every value only grows, so a replay or a reordering converges. A
         // released row does not conflict: this opens a new one.
         sqlx::query(
@@ -713,7 +745,8 @@ impl JournalBackend for PgJournalBackend {
     /// One transaction of five statements, `BEGIN` and `COMMIT` included
     /// (design §2.8): tombstone, release, decision. The decision comes last,
     /// with what the two before it did; the incidents' reference to it is
-    /// checked at the commit. A balance account's has six: its bounds first.
+    /// checked at the commit. A balance account's has eight: its bounds, then
+    /// its accounting bump and generation CAS (seven with none installed).
     async fn release(&self, release: &ReleaseRecord) -> Result<ReleaseCounts, String> {
         let started = Instant::now();
         let error = |e: sqlx::Error| e.to_string();
@@ -733,6 +766,7 @@ impl JournalBackend for PgJournalBackend {
             .map_err(error)?;
         let mut rollback_observation = self.rollback_observation();
         self.bound_auxiliary(&mut tx, RELEASE_BOUND, started).await?;
+        self.advance_auxiliary(&mut tx).await?;
         // A row with no `uncertain_at` is never tombstoned, nor one with an
         // outcome, proven unsent, or already disposed of.
         let tombstoned = sqlx::query(

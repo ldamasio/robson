@@ -20,6 +20,10 @@ pub enum ProjectionError {
         stream_key: String,
     },
 
+    /// A balance-account daemon's accounting step refused (ADR-0056 step 8l-4).
+    #[error("Balance accounting refused: {0}")]
+    Accounting(String),
+
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 

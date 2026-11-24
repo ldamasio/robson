@@ -66,8 +66,8 @@ use tracing::{error, warn};
 
 use crate::order_journal::{self, OPERATIONS_CAPACITY};
 
-#[cfg(feature = "crash-points")]
 mod pending_execution;
+pub use pending_execution::PendingEvidence;
 #[cfg(feature = "crash-points")]
 pub use pending_execution::{
     PendingExecutionEvidence, PendingExecutionOwner, PendingExecutionRegistration,
@@ -247,10 +247,13 @@ pub enum IncidentReason {
     OperationAborted,
     /// The generation counter of this epoch ran out.
     GenerationExhausted,
+    /// A qualified balance scan found a conflict to fence and page (8k-1 B):
+    /// held until the typed balance release (8k-4), never the F release.
+    VenueDiscrepancy,
 }
 
 impl IncidentReason {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::UncleanStart,
         Self::UncertainOutcome,
         Self::UnlandedSend,
@@ -259,6 +262,7 @@ impl IncidentReason {
         Self::StreamSuspended,
         Self::OperationAborted,
         Self::GenerationExhausted,
+        Self::VenueDiscrepancy,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -271,6 +275,7 @@ impl IncidentReason {
             Self::StreamSuspended => "stream_suspended",
             Self::OperationAborted => "operation_aborted",
             Self::GenerationExhausted => "generation_exhausted",
+            Self::VenueDiscrepancy => "venue_discrepancy",
         }
     }
 
@@ -279,9 +284,17 @@ impl IncidentReason {
     }
 
     /// A latch-class reason sets the journal latch, which only a restart
-    /// clears, so its release waits for the next process.
+    /// clears, so its release waits for the next process. `venue_discrepancy`,
+    /// of migration 38's reason set, is nonlatching (8h2a plan): its release
+    /// is refused in every process instead.
     pub fn latches(self) -> bool {
-        !matches!(self, Self::UncleanStart | Self::UncertainOutcome)
+        !matches!(self, Self::UncleanStart | Self::UncertainOutcome | Self::VenueDiscrepancy)
+    }
+
+    /// Whether only the typed balance release (8k-4) may release it: the F
+    /// release refuses while one is open, in every process (8k-1 B, R2).
+    pub fn awaits_balance_release(self) -> bool {
+        matches!(self, Self::VenueDiscrepancy)
     }
 }
 
@@ -372,7 +385,31 @@ pub enum MutationRefused {
     Stopping(Phase),
     /// An orphan sweep's cancel while the veto holds (design §2.9).
     OrphanCancelWithheld,
+    /// A read-only process: every mutation, permit or not (PS-1).
+    ReadOnly(ReadOnlyReason),
 }
+
+/// Why a process refuses every venue mutation (PS, production non-trading
+/// Spot start). Fixed before the epoch; only its reason can change after it
+/// (8m-6's mode labels), and nothing in 5a lifts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOnlyReason {
+    NonTrading,
+    Cutover,
+    PreActivation,
+    UidMismatch,
+}
+
+impl ReadOnlyReason {
+    /// The label, in declaration order (one per variant).
+    pub fn as_str(self) -> &'static str {
+        ["non_trading", "cutover", "pre_activation", "uid_mismatch"][self as usize]
+    }
+}
+
+/// The refusal was asked for after the epoch began: it stays as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochAlreadyBegun;
 
 impl fmt::Display for MutationRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -384,6 +421,9 @@ impl fmt::Display for MutationRefused {
                 f,
                 "orphan-sweep cancel withheld: an incident is open, the fence closed or the latch set"
             ),
+            Self::ReadOnly(reason) => {
+                write!(f, "venue mutation refused: read-only process ({})", reason.as_str())
+            },
         }
     }
 }
@@ -429,6 +469,8 @@ pub trait GateObserver: Send + Sync {
     /// An entry refused at its send because a sweep's close held its key
     /// (ADR-0056 step 7, PR O).
     fn entry_refused_ownership(&self) {}
+    /// A mutation refused by a read-only process (PS-1).
+    fn mutation_refused(&self, _reason: ReadOnlyReason) {}
 }
 
 /// The gate's counters at one instant.
@@ -469,6 +511,8 @@ pub(crate) struct GateState {
     /// The high half of the generation, from the process epoch.
     epoch_seq: i64,
     epoch: Option<EpochView>,
+    /// Set before the epoch on a read-only process and never cleared (PS-1).
+    read_only: Option<ReadOnlyReason>,
     /// The low half, `n`, bumped by every occurrence.
     counter: u32,
     incidents: BTreeMap<IncidentReason, OpenIncident>,
@@ -484,9 +528,23 @@ pub(crate) struct GateState {
     orphan_cancels_passed: u64,
     orphan_cancels_withheld: u64,
     entries_refused_ownership: u64,
-    /// The controlled composition's slot; never part of the snapshot.
-    #[cfg(feature = "crash-points")]
+    /// The invalidity generation (ADR-0056 step 8l-2, v16 §3.7.3 R5-1): moved
+    /// by every occurrence and every pending-evidence rise, never by a fall or
+    /// a release. The incident generation is not reused: a rise must not close
+    /// the fence. Per process, from 0: a capture never outlives its epoch.
+    invalidity: u64,
+    /// The pending-evidence slot, `None` until a receiver binds it; never
+    /// part of the snapshot.
     pending_execution: Option<pending_execution::PendingExecutionSlot>,
+}
+
+/// The marks a cash observation, a snapshot or an entry authorization
+/// captures and checks again (ADR-0056 step 8l-2): read together, under the
+/// gate mutex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidityMarks {
+    pub generation: u64,
+    pub pending: PendingEvidence,
 }
 
 impl GateState {
@@ -497,6 +555,7 @@ impl GateState {
             latch,
             epoch_seq: 0,
             epoch: None,
+            read_only: None,
             counter: 0,
             incidents: BTreeMap::new(),
             permits: 0,
@@ -511,9 +570,16 @@ impl GateState {
             orphan_cancels_passed: 0,
             orphan_cancels_withheld: 0,
             entries_refused_ownership: 0,
-            #[cfg(feature = "crash-points")]
+            invalidity: 0,
             pending_execution: None,
         }
+    }
+
+    /// Move the invalidity generation; the caller holds the gate mutex. 2^64
+    /// moves cannot happen in one process, so wrapping never returns a value
+    /// a capture still holds.
+    fn invalidate(&mut self) {
+        self.invalidity = self.invalidity.wrapping_add(1);
     }
 
     /// Whether an entry may start its send now. Anything else may in every
@@ -553,6 +619,7 @@ impl GateState {
             self.latch.store(true, Ordering::SeqCst);
         }
         self.fenced = true;
+        self.invalidate();
         let exhausted = self.counter < GENERATION_COUNTER_LIMIT && {
             self.counter += 1;
             self.counter == GENERATION_COUNTER_LIMIT
@@ -645,6 +712,11 @@ impl GateState {
         }
     }
 
+    /// Whether an open incident waits for the typed balance release.
+    pub(crate) fn awaits_balance_release(&self) -> bool {
+        self.incidents.keys().any(|reason| reason.awaits_balance_release())
+    }
+
     /// Whether the orphan sweep may not cancel an `ins-` order now (design
     /// §2.9): an incident is open, the fence is closed or the latch is set.
     pub(crate) fn vetoes_orphan_cancel(&self) -> bool {
@@ -724,6 +796,23 @@ impl OperationGate {
         self.lock().generation()
     }
 
+    /// The invalidity generation and the pending evidence, read together
+    /// under the mutex (ADR-0056 step 8l-2). No production caller yet: the
+    /// cash writer (8l-3), the snapshot (8l-8) and the entry authorization
+    /// (8l-7) capture them and check them again.
+    pub fn invalidity_marks(&self) -> InvalidityMarks {
+        let state = self.lock();
+        InvalidityMarks {
+            generation: state.invalidity,
+            pending: state.pending_evidence(),
+        }
+    }
+
+    /// The pending evidence alone; see [`PendingEvidence`].
+    pub fn pending_evidence(&self) -> PendingEvidence {
+        self.lock().pending_evidence()
+    }
+
     /// The open incidents as this process knows them: those loaded at start
     /// and every occurrence since, until a release covers them.
     pub fn open_incidents(&self) -> Vec<Incident> {
@@ -733,6 +822,29 @@ impl OperationGate {
     /// The epoch this start recorded, if it recorded one.
     pub fn epoch(&self) -> Option<EpochView> {
         self.lock().epoch
+    }
+
+    /// Refuse every venue mutation from now on, permit or not (PS-1): only
+    /// before the epoch begins, so no mutation of this process can precede
+    /// it. Nothing clears it.
+    pub fn refuse_mutations(&self, reason: ReadOnlyReason) -> Result<(), EpochAlreadyBegun> {
+        let mut state = self.lock();
+        if state.epoch.is_some() {
+            return Err(EpochAlreadyBegun);
+        }
+        state.read_only = Some(reason);
+        Ok(())
+    }
+
+    /// Replace the reason of a refusal already set (8m-6's mode labels);
+    /// whether one was set. It never sets or clears a refusal.
+    pub fn label_read_only(&self, reason: ReadOnlyReason) -> bool {
+        self.lock().read_only.as_mut().map(|current| *current = reason).is_some()
+    }
+
+    /// The read-only refusal, when this process has one.
+    pub fn read_only(&self) -> Option<ReadOnlyReason> {
+        self.lock().read_only
     }
 
     /// Record an occurrence of `reason` (design §2.7), for a caller holding no
@@ -902,6 +1014,18 @@ impl OperationGate {
     /// # Errors
     /// Without a permit of this gate, once the daemon is stopping.
     pub fn mutation(&self, what: &str) -> Result<(), MutationRefused> {
+        // A read-only process refuses first, before the veto and the permit:
+        // nothing sent, no latch, no incident; a sweep's cancel is withheld.
+        // The observer is told with no gate lock held.
+        let read_only = self.lock().read_only;
+        if let Some(reason) = read_only {
+            ORPHAN_SWEEP_CANCEL.try_with(|c| c.withheld.store(true, Ordering::SeqCst)).ok();
+            warn!(what, reason = reason.as_str(), "Venue mutation refused: read-only process");
+            if let Some(observer) = self.observer.get() {
+                observer.mutation_refused(reason);
+            }
+            return Err(MutationRefused::ReadOnly(reason));
+        }
         // The orphan-cancel veto's binding check (design §2.9), under the mutex
         // every occurrence takes: one that closes the fence after this lets
         // this cancel go as in flight, one before it refuses it.
@@ -1104,5 +1228,269 @@ mod tests {
         let started = Instant::now();
         assert!(!gate.wait_no_permits(started + std::time::Duration::from_secs(10)).await);
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(10));
+    }
+
+    /// Every occurrence moves the invalidity generation once, under the
+    /// mutex; the release that opens the fence again moves nothing.
+    #[test]
+    fn occurrence_moves_the_invalidity_generation() {
+        let gate = gate();
+        let mut expected = 0;
+        assert_eq!(gate.invalidity_marks().generation, expected);
+        for reason in IncidentReason::ALL {
+            gate.record(reason);
+            expected += 1;
+            assert_eq!(gate.invalidity_marks().generation, expected, "{reason:?}");
+        }
+        assert_eq!(gate.mutation("POST /order"), Ok(()), "unpermitted: an occurrence");
+        gate.abort(OperationKind::Arm);
+        assert_eq!(gate.invalidity_marks().generation, expected + 2);
+
+        let fresh = self::gate();
+        fresh.record(IncidentReason::UncertainOutcome);
+        assert!(fresh.release_through(fresh.generation()), "a non-latching release opens");
+        assert_eq!(fresh.invalidity_marks().generation, 1, "a release never moves it");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+
+        /// Concurrent invalidators of every reason and a reader: each read is
+        /// ordered wholly before or after each move, so reads never go back
+        /// and the final value counts every move.
+        #[test]
+        fn invalidity_generation_counts_every_concurrent_move(
+            plan in proptest::collection::vec((0..IncidentReason::ALL.len(), 1_u64..120), 1..6)
+        ) {
+            let gate = gate();
+            let total: u64 = plan.iter().map(|(_, moves)| moves).sum();
+            std::thread::scope(|scope| {
+                for &(reason, moves) in &plan {
+                    let gate = &gate;
+                    scope.spawn(move || {
+                        for _ in 0..moves {
+                            gate.record(IncidentReason::ALL[reason]);
+                        }
+                    });
+                }
+                scope.spawn(|| {
+                    let mut last = 0;
+                    while last < total {
+                        let read = gate.invalidity_marks().generation;
+                        assert!(read >= last, "{read} after {last}");
+                        last = read;
+                    }
+                });
+            });
+            proptest::prop_assert_eq!(gate.invalidity_marks().generation, total);
+        }
+    }
+
+    /// No receiver can be bound in a production build, so no evidence can be
+    /// registered: unbound reads as none pending for publication, and stays
+    /// distinguishable for the entry path (8l-7).
+    #[test]
+    fn unbound_slot_reads_no_pending() {
+        let gate = gate();
+        assert_eq!(gate.pending_evidence(), PendingEvidence::Unbound);
+        assert!(!gate.pending_evidence().blocks_publication());
+        assert!(PendingEvidence::Pending.blocks_publication());
+        assert!(!PendingEvidence::Clear.blocks_publication());
+        gate.record(IncidentReason::StreamSuspended);
+        assert_eq!(gate.invalidity_marks(), InvalidityMarks {
+            generation: 1,
+            pending: PendingEvidence::Unbound
+        });
+    }
+
+    /// PS-1's refusal: counts what a read-only gate reports.
+    #[derive(Default)]
+    struct Refusals(std::sync::Mutex<Vec<ReadOnlyReason>>);
+
+    impl GateObserver for Refusals {
+        fn unpermitted_mutation(&self) {}
+        fn operation_aborted(&self, _: OperationKind) {}
+        fn mutation_refused(&self, reason: ReadOnlyReason) {
+            self.0.lock().unwrap().push(reason);
+        }
+    }
+
+    const EPOCH: EpochView = EpochView { epoch_seq: 7, unclean_reason: None };
+
+    /// PS-1: the refusal is set only before the epoch, and after it only its
+    /// reason can change; nothing clears it. An unrefused gate keeps today's
+    /// behaviour, and once its epoch began it can no longer be refused.
+    #[test]
+    fn the_refusal_is_fixed_before_the_epoch() {
+        let gate = gate();
+        assert!(!gate.label_read_only(ReadOnlyReason::Cutover), "nothing to label");
+        assert_eq!(gate.read_only(), None);
+        assert_eq!(gate.refuse_mutations(ReadOnlyReason::NonTrading), Ok(()));
+        gate.begin_epoch(EPOCH, None, Vec::new());
+        assert_eq!(gate.refuse_mutations(ReadOnlyReason::PreActivation), Err(EpochAlreadyBegun));
+        assert_eq!(gate.read_only(), Some(ReadOnlyReason::NonTrading));
+        for reason in [ReadOnlyReason::Cutover, ReadOnlyReason::UidMismatch] {
+            assert!(gate.label_read_only(reason));
+            assert_eq!(gate.read_only(), Some(reason));
+            assert_eq!(gate.mutation("POST /api/v3/order"), Err(MutationRefused::ReadOnly(reason)));
+        }
+        assert_eq!(
+            MutationRefused::ReadOnly(ReadOnlyReason::NonTrading).to_string(),
+            "venue mutation refused: read-only process (non_trading)"
+        );
+        let reasons = [
+            ReadOnlyReason::NonTrading,
+            ReadOnlyReason::Cutover,
+            ReadOnlyReason::PreActivation,
+            ReadOnlyReason::UidMismatch,
+        ];
+        assert_eq!(reasons.map(ReadOnlyReason::as_str), [
+            "non_trading",
+            "cutover",
+            "pre_activation",
+            "uid_mismatch"
+        ]);
+
+        let late = self::gate();
+        late.begin_epoch(EPOCH, None, Vec::new());
+        assert_eq!(late.refuse_mutations(ReadOnlyReason::NonTrading), Err(EpochAlreadyBegun));
+        assert!(!late.label_read_only(ReadOnlyReason::NonTrading));
+        assert_eq!(late.read_only(), None);
+        assert_eq!(late.mutation("POST /order"), Ok(()), "today's unpermitted pass");
+        assert_eq!(late.snapshot().unpermitted, 1);
+    }
+
+    /// PS-1: the refusal comes before the permit pass. Permits are still
+    /// given (reads and F's release need them), and a holder's mutation is
+    /// refused all the same; an ordinary gate lets the same holder through.
+    #[tokio::test]
+    async fn a_permit_holder_cannot_mutate_on_a_non_trading_gate() {
+        for read_only in [true, false] {
+            let journal = Arc::new(crate::order_journal::OrderJournal::unpersisted());
+            if read_only {
+                journal.gate().refuse_mutations(ReadOnlyReason::NonTrading).unwrap();
+            }
+            let permit = journal.acquire(OperationKind::Panic).unwrap();
+            let sent =
+                permit.scope(async { journal.gate().mutation("DELETE /api/v3/order") }).await;
+            permit.complete();
+            let expected = if read_only {
+                Err(MutationRefused::ReadOnly(ReadOnlyReason::NonTrading))
+            } else {
+                Ok(())
+            };
+            assert_eq!(sent, expected, "read-only {read_only}");
+            assert_eq!(journal.gate().snapshot().unpermitted, 0);
+        }
+    }
+
+    /// PS-1: a refused mutation sends nothing to fence: no incident, latch,
+    /// count, fence or generation move; an orphan sweep's cancel is withheld,
+    /// never passed; the observer counts each refusal by reason.
+    #[tokio::test]
+    async fn a_refused_mutation_opens_no_incident() {
+        let journal = Arc::new(crate::order_journal::OrderJournal::unpersisted());
+        let gate = journal.gate();
+        let refusals = Arc::new(Refusals::default());
+        gate.set_observer(Arc::clone(&refusals) as Arc<dyn GateObserver>);
+        gate.refuse_mutations(ReadOnlyReason::NonTrading).unwrap();
+        gate.begin_epoch(EPOCH, None, Vec::new());
+        let before = (gate.snapshot(), gate.invalidity_marks());
+        let refused = Err(MutationRefused::ReadOnly(ReadOnlyReason::NonTrading));
+        assert_eq!(gate.mutation("POST /api/v3/order"), refused);
+        let sweep = Arc::new(OrphanSweepCancel::default());
+        let swept = orphan_sweep_cancel(Arc::clone(&sweep), async {
+            gate.mutation("DELETE /api/v3/order")
+        });
+        assert_eq!(swept.await, refused);
+        assert!(sweep.withheld() && !sweep.passed());
+        assert_eq!((gate.snapshot(), gate.invalidity_marks()), before);
+        assert!(gate.open_incidents().is_empty() && !gate.fenced() && !journal.latch_set());
+        assert_eq!(*refusals.0.lock().unwrap(), [ReadOnlyReason::NonTrading; 2]);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Step {
+        Refuse(ReadOnlyReason),
+        Label(ReadOnlyReason),
+        BeginEpoch,
+        Mutation,
+    }
+
+    fn step() -> impl proptest::strategy::Strategy<Value = Step> {
+        use proptest::prelude::*;
+        let reason = proptest::sample::select(vec![
+            ReadOnlyReason::NonTrading,
+            ReadOnlyReason::Cutover,
+            ReadOnlyReason::PreActivation,
+            ReadOnlyReason::UidMismatch,
+        ]);
+        prop_oneof![
+            reason.clone().prop_map(Step::Refuse),
+            reason.prop_map(Step::Label),
+            Just(Step::BeginEpoch),
+            Just(Step::Mutation),
+            Just(Step::Mutation),
+        ]
+    }
+
+    /// One step as a thread ran it: tickets of a shared counter taken just
+    /// before and just after, so "a ended before b began" is `a.1 < b.0`.
+    type Ran = (u64, u64, Step, bool);
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// PS-1: from several threads, random refusals, labels, epochs and
+        /// mutations. Every mutation begun after a refusal succeeded is
+        /// refused, every refusal begun after an epoch began fails, a label
+        /// never creates a refusal, and the refusal is never cleared.
+        #[test]
+        fn property_no_mutation_passes_a_non_trading_gate(
+            plan in proptest::collection::vec(proptest::collection::vec(step(), 1..8), 2..5)
+        ) {
+            use std::sync::atomic::AtomicU64;
+            let gate = gate();
+            let tickets = AtomicU64::new(0);
+            let ran: Vec<Ran> = std::thread::scope(|scope| {
+                let threads: Vec<_> = plan
+                    .iter()
+                    .map(|steps| {
+                        let (gate, tickets) = (&gate, &tickets);
+                        scope.spawn(move || {
+                            steps.iter().map(|&step| {
+                                let begun = tickets.fetch_add(1, Ordering::SeqCst);
+                                let ok = match step {
+                                    Step::Refuse(reason) => gate.refuse_mutations(reason).is_ok(),
+                                    Step::Label(reason) => gate.label_read_only(reason),
+                                    Step::BeginEpoch => {
+                                        gate.begin_epoch(EPOCH, None, Vec::new());
+                                        true
+                                    },
+                                    Step::Mutation => gate.mutation("POST /api/v3/order").is_ok(),
+                                };
+                                (begun, tickets.fetch_add(1, Ordering::SeqCst), step, ok)
+                            })
+                            .collect::<Vec<Ran>>()
+                        })
+                    })
+                    .collect();
+                threads.into_iter().flat_map(|thread| thread.join().unwrap()).collect()
+            });
+            let refused = ran.iter().filter(|r| matches!(r.2, Step::Refuse(_)) && r.3).map(|r| r.1).min();
+            let epoch = ran.iter().filter(|r| matches!(r.2, Step::BeginEpoch)).map(|r| r.1).min();
+            for &(begun, _, step, ok) in &ran {
+                match step {
+                    Step::Mutation if refused.is_some_and(|at| at < begun) => {
+                        proptest::prop_assert!(!ok, "a mutation passed after the refusal");
+                    },
+                    Step::Refuse(_) if epoch.is_some_and(|at| at < begun) => {
+                        proptest::prop_assert!(!ok, "a refusal landed after the epoch");
+                    },
+                    _ => {},
+                }
+            }
+            proptest::prop_assert_eq!(gate.read_only().is_some(), refused.is_some());
+        }
     }
 }

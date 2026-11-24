@@ -28,6 +28,12 @@
 //!   helper (8c-3, round 2);
 //! - they read no configuration and name no testnet host.
 //!
+//! PS-4 (production non-trading Spot start) adds the closed set of budgeted
+//! reads (`reads.rs`, checked as every other spot file) and its one-shot
+//! transport (`read_send.rs`, pinned byte for byte as the commission
+//! transport is). Outside this module only the transport's signer, defined
+//! in `binance_rest.rs`, may name it; PS-5 names its owner here.
+//!
 //! `robsond`'s venue tests check the other half: the factory still refuses
 //! `binance_spot`, builds no spot venue, and builds no feed on the spot stream
 //! base. The bounded clock owner and receiver have a separate, exact
@@ -573,8 +579,92 @@ fn n5_reference_lines(path: &Path) -> &'static [&'static str] {
     }
 }
 
+/// 8k-2's BTCUSDT base detector (robsond's `balance_reconciliation`, inert:
+/// no production caller) classifies the ACCOUNT record this module parses.
+/// Its classifier takes the record type, never a reader, transport or
+/// endpoint; its unit tests build that record. 8k-3a's ACCOUNT-only
+/// classification takes it the same way, and its capture holds it as the
+/// receipt's body; 8k-3b's attempt holds the triple's order and list
+/// records as its port returns them. Exactly these lines, in exactly these
+/// files.
+fn detector_reference_lines(path: &Path) -> &'static [&'static str] {
+    match path.to_str() {
+        Some("robsond/src/balance_reconciliation/classify.rs") => &[
+            "use robson_connectors::binance::spot::SpotAccount;",
+            "account: &SpotAccount,",
+            "account: &SpotAccount,",
+            "account: &SpotAccount,",
+        ],
+        Some("robsond/src/balance_reconciliation/capture.rs") => &[
+            "use robson_connectors::binance::spot::SpotAccount;",
+            "pub(crate) body: SpotAccount,",
+        ],
+        Some("robsond/src/balance_reconciliation/attempt.rs") => &[
+            "use robson_connectors::binance::spot::{SpotOpenOrderList, SpotOrderRecord};",
+            "pub(crate) orders: Vec<SpotOrderRecord>,",
+            "pub(crate) lists: Vec<SpotOpenOrderList>,",
+        ],
+        Some("robsond/src/balance_reconciliation/tests.rs") => &[
+            "use robson_connectors::binance::spot::{SpotAccount, SpotAccountBalance};",
+            "fn account(balances: &[(&str, Decimal, Decimal)]) -> SpotAccount {",
+            "SpotAccount {",
+            ".map(|(asset, free, locked)| SpotAccountBalance {",
+            "fn btc(free: Decimal, locked: Decimal) -> SpotAccount {",
+            "fn classify(&self, account: &SpotAccount) -> Classification {",
+        ],
+        _ => &[],
+    }
+}
+
+/// PS-4's prepared read transport: outside this module, exactly its signer's
+/// definition in the REST client and the lines of its one owner, PS-5b's
+/// budgeted read owner (no production caller until PS-6).
+fn read_reference_lines(path: &Path) -> &'static [&'static str] {
+    match path.to_str() {
+        Some("robson-connectors/src/binance_rest.rs") => &["pub(crate) fn bind_spot_read("],
+        // PS-5b: the read owner, its exact lines.
+        Some("robsond/src/venue_clock_owner/reads.rs") => &[
+            "use robson_connectors::binance::spot::{",
+            "PreparedSpotCommission, PreparedSpotRead, SpotCommission, SpotPreparedRead, SpotReadBody,",
+            "SPOT_COMMISSION_BODY_CAP, SPOT_OPERATED_SYMBOL,",
+            "Closed(SpotPreparedRead),",
+            "Closed(SpotReadBody),",
+            "Commission(SpotCommission),",
+            "Read(PreparedSpotRead),",
+            "Commission(PreparedSpotCommission),",
+            "Self::Closed(SpotPreparedRead::Account) => ReadKind::Account,",
+            "Self::Closed(SpotPreparedRead::OperatedOpenOrders) => ReadKind::OperatedOpenOrders,",
+            "Self::Closed(SpotPreparedRead::OpenOrderLists) => ReadKind::OpenOrderLists,",
+            "Self::Closed(SpotPreparedRead::ExchangeInfo) => ReadKind::ExchangeInfo,",
+            "Self::Closed(SpotPreparedRead::Kline { .. }) => ReadKind::Kline,",
+            "Self::Commission => SPOT_COMMISSION_BODY_CAP,",
+            "SpotPreparedRead::Account,",
+            "SpotPreparedRead::OperatedOpenOrders,",
+            "SpotPreparedRead::OpenOrderLists,",
+            "self.one(Read::Closed(SpotPreparedRead::Account), Some(&signed?), deadline)",
+            "self.single(Read::Closed(SpotPreparedRead::ExchangeInfo), deadline).await",
+            "self.single(Read::Closed(SpotPreparedRead::Kline { start_ms }), deadline).await",
+            "Read::Closed(read) => client.prepare_spot_read(read).map(Prepared::Read),",
+            "Read::Commission => robson_domain::Symbol::from_pair(SPOT_OPERATED_SYMBOL)",
+            "client.prepare_spot_commission(&pair).map(Prepared::Commission)",
+            "if status != 200 && !matches!(read, Read::Closed(SpotPreparedRead::Kline { .. })) {",
+            "Read::Commission => serde_json::from_slice::<SpotCommission>(&body)",
+            ".filter(|commission| commission.symbol == SPOT_OPERATED_SYMBOL)",
+            // 5a: the binding of 8p-4's mark venue, its kline read and body.
+            "let read = Read::Closed(SpotPreparedRead::Kline { start_ms });",
+            "ReadBody::Closed(SpotReadBody::Kline(rows)) => Ok((receipt.status, rows)),",
+        ],
+        _ => &[],
+    }
+}
+
 fn strip_n5_references(path: &Path, text: &str) -> String {
-    let mut allowed = n5_reference_lines(path).to_vec();
+    let mut allowed = [
+        n5_reference_lines(path),
+        detector_reference_lines(path),
+        read_reference_lines(path),
+    ]
+    .concat();
     text.lines()
         .filter(|line| {
             if let Some(i) = allowed.iter().position(|expected| *expected == line.trim()) {
@@ -668,6 +758,17 @@ fn outside_spot_violations(path: &Path, text: &str, names: &[String]) -> Vec<Str
     {
         found.push("names a Spot commission path outside its approved source lines".into());
     }
+    if [
+        "PreparedSpotRead",
+        "SpotReadRequest",
+        "prepare_spot_read",
+        "bind_spot_read",
+    ]
+    .iter()
+    .any(|name| has_word(text, name))
+    {
+        found.push("names the prepared Spot read transport outside its approved lines".into());
+    }
     if names_spot_endpoint(text) {
         found.push("names a spot endpoint".into());
     }
@@ -714,6 +815,39 @@ fn commission_allowance_admits_only_its_named_owner_and_test_gates() {
     assert!(!check(gate, cfg, &[owner.clone(), other.to_owned()]));
 }
 
+/// The 8k-2 detector's allowance admits exactly its lines in its two files:
+/// the same lines elsewhere, twice, or with any other Spot path or name are
+/// still found.
+#[test]
+fn detector_allowance_admits_only_its_named_lines() {
+    let names = spot_type_names();
+    let workspace = crate_dir().parent().unwrap();
+    let other = Path::new("robsond/src/venue.rs");
+    for owner in [
+        "robsond/src/balance_reconciliation/classify.rs",
+        "robsond/src/balance_reconciliation/tests.rs",
+        "robsond/src/balance_reconciliation/capture.rs",
+        "robsond/src/balance_reconciliation/attempt.rs",
+    ]
+    .map(Path::new)
+    {
+        let text = fs::read_to_string(workspace.join(owner)).unwrap();
+        assert!(outside_spot_violations(owner, &text, &names).is_empty(), "{}", owner.display());
+        let exact = detector_reference_lines(owner).join("\n");
+        assert!(outside_spot_violations(owner, &exact, &names).is_empty());
+        assert!(!outside_spot_violations(other, &exact, &names).is_empty());
+        assert!(!outside_spot_violations(owner, &format!("{exact}\n{exact}"), &names).is_empty());
+        for extra in [
+            "use robson_connectors::binance::spot::SpotRestReader;",
+            "let account: SpotAccount = read().await;",
+            "binance::spot::build_venue();",
+        ] {
+            let widened = format!("{text}\n{extra}");
+            assert!(!outside_spot_violations(owner, &widened, &names).is_empty(), "{extra}");
+        }
+    }
+}
+
 #[test]
 fn the_clock_allowance_keeps_other_spot_paths_and_time_callers_closed() {
     let names = spot_type_names();
@@ -746,11 +880,37 @@ fn nothing_outside_the_spot_module_names_it() {
     let mut files = Vec::new();
     rust_files(workspace, &mut files);
     let outside: Vec<PathBuf> = files.into_iter().filter(|path| !path.starts_with(&spot)).collect();
-    // The scan sees the factory and the daemon, not only this crate.
+    // The scan sees the factory and the daemon, not only this crate, and
+    // package 5a's owners, one line each:
     for must in [
         "robsond/src/venue.rs",
         "robsond/src/main.rs",
         "robson-connectors/src/lib.rs",
+        // 8k-1 B: the foreign-lock fence and its release refusal;
+        "robson-exec/src/order_journal.rs",
+        "robsond/src/api.rs",
+        // 8k-2: the inert detector (its classifier's exact lines only);
+        "robsond/src/balance_reconciliation/mod.rs",
+        "robsond/src/balance_reconciliation/snapshot.rs",
+        "robsond/src/balance_reconciliation/classify.rs",
+        // 8k-3a: its capture (the receipt body's exact lines only);
+        "robsond/src/balance_reconciliation/capture.rs",
+        "robsond/src/balance_reconciliation/pg_tests.rs",
+        // 8k-3b: its attempt (the triple's record lines only);
+        "robsond/src/balance_reconciliation/attempt.rs",
+        // 8k-3c: its route and the route's tests (no Spot item);
+        "robsond/src/balance_reconciliation/route.rs",
+        "robsond/src/balance_reconciliation/pg_tests/routing.rs",
+        // 8l-1, 8p-1 and 8m-1: the bounded routes of migrations 46 to 56;
+        "robson-db/src/bounded_migration.rs",
+        // 8l-2: the settlement barrier and the gate's pending slot;
+        "robsond/src/venue_ledger_store/settlement.rs",
+        "robson-exec/src/gate/pending_execution.rs",
+        // 8l-4a: the balance accounting context;
+        "robsond/src/balance_accounting.rs",
+        // 8l-4b: the projector's accounting step and the worker passing it.
+        "robson-projector/src/accounting.rs",
+        "robsond/src/projection_worker.rs",
     ] {
         assert!(outside.iter().any(|path| path.ends_with(must)), "{must} not scanned");
     }
@@ -808,6 +968,21 @@ fn nothing_outside_the_spot_module_names_it() {
             "order_journal_projected_pg_tests.rs",
             "mod physical_recovery",
             "#![cfg(all(test, feature = \"postgres\"))]\n",
+        ),
+        // PS-1: the non-trading start's daemon tests build the Spot venue.
+        (
+            daemon_dir.as_path(),
+            "daemon_non_trading_pg_tests.rs",
+            "daemon.rs",
+            "mod non_trading_pg_tests",
+            "#![cfg(all(test, feature = \"postgres\"))]\n",
+        ),
+        (
+            clock_dir.as_path(),
+            "reads_tests.rs",
+            "reads.rs",
+            "mod tests",
+            "#![cfg(all(test, feature = \"crash-points\"))]\n",
         ),
         (
             n5_dir.as_path(),
@@ -1182,6 +1357,78 @@ fn prepared_commission_mutation_violations(text: &str) -> Vec<String> {
     }
 }
 
+fn prepared_read_mutation_violations(text: &str) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    // PS-4's closed read transport, reviewed whole; its signer
+    // `bind_spot_read` sits beside the commission binder in binance_rest.rs.
+    const EXACT_READ_TRANSPORT: &str =
+        "27d156f00c3d9e80cb11dd4292fc19ee2a25b5ad0de15cb57b43c44990632aa4";
+    if hex::encode(Sha256::digest(text.as_bytes())) == EXACT_READ_TRANSPORT {
+        Vec::new()
+    } else {
+        vec!["changes the closed Spot read transport".into()]
+    }
+}
+
+/// PS-4: the read transport is admitted byte for byte; another client, a
+/// mutation verb, a resend or another signer is not.
+#[test]
+fn the_read_transport_allowance_rejects_changed_send_or_client() {
+    let original = include_str!("read_send.rs");
+    assert!(prepared_read_mutation_violations(original).is_empty());
+    assert!(
+        !mutation_violations("read_send.rs", original).is_empty(),
+        "it holds a transport"
+    );
+    for (before, after) in [
+        ("single_shot()?", "reqwest::Client::new()"),
+        ("transport.get(url)", "transport.post(url)"),
+        ("signer.bind_spot_read(", "signer.bind_spot_commission("),
+        (
+            "self.transport.execute(self.request)",
+            "self.transport.clone().execute(self.request)",
+        ),
+    ] {
+        assert!(original.contains(before), "negative control must change the source: {before}");
+        let changed = original.replacen(before, after, 1);
+        assert!(!prepared_read_mutation_violations(&changed).is_empty(), "{after}");
+    }
+}
+
+/// PS-4: outside this module only the signer's definition may name the read
+/// transport. The same line elsewhere or twice, or a preparation, type or
+/// call by any other line, is found.
+#[test]
+fn the_read_allowance_admits_only_its_named_owner() {
+    let names = spot_type_names();
+    let workspace = crate_dir().parent().unwrap();
+    let owner = Path::new("robson-connectors/src/binance_rest.rs");
+    let text = fs::read_to_string(workspace.join(owner)).unwrap();
+    assert!(outside_spot_violations(owner, &text, &names).is_empty());
+    let exact = read_reference_lines(owner).join("\n");
+    let other = Path::new("robsond/src/venue.rs");
+    assert!(outside_spot_violations(owner, &exact, &names).is_empty());
+    assert!(!outside_spot_violations(other, &exact, &names).is_empty());
+    let reads = Path::new("robsond/src/venue_clock_owner/reads.rs");
+    let owned = fs::read_to_string(workspace.join(reads)).unwrap();
+    assert!(outside_spot_violations(reads, &owned, &names).is_empty());
+    assert!(
+        !outside_spot_violations(other, &read_reference_lines(reads).join("\n"), &names).is_empty()
+    );
+    assert!(!outside_spot_violations(owner, &format!("{exact}\n{exact}"), &names).is_empty());
+    for extra in [
+        "let prepared = client.prepare_spot_read(read)?;",
+        "fn f(_: PreparedSpotRead) {}",
+        "fn f(_: SpotReadRequest) {}",
+        "let read = SpotPreparedRead::Account;",
+        "self.bind_spot_read(transport, path, None, stamp)",
+    ] {
+        assert!(!outside_spot_violations(other, extra, &names).is_empty(), "{extra}");
+        let widened = format!("{text}\n{extra}");
+        assert!(!outside_spot_violations(owner, &widened, &names).is_empty(), "{extra}");
+    }
+}
+
 #[test]
 fn the_commission_transport_allowance_rejects_changed_send_or_client() {
     let original = include_str!("commission_send.rs");
@@ -1367,6 +1614,7 @@ fn the_spot_module_sends_orders_only_through_the_ledger_and_reads_no_configurati
     let sources = spot_production_sources();
     let time = spot_dir().join("time.rs");
     let commission = spot_dir().join("commission_send.rs");
+    let read_transport = spot_dir().join("read_send.rs");
     let root = spot_dir().join("mod.rs");
     assert!(sources.len() >= 7, "{} production sources", sources.len());
     for (path, text) in &sources {
@@ -1375,6 +1623,8 @@ fn the_spot_module_sends_orders_only_through_the_ledger_and_reads_no_configurati
             prepared_time_mutation_violations(text)
         } else if path == &commission {
             prepared_commission_mutation_violations(text)
+        } else if path == &read_transport {
+            prepared_read_mutation_violations(text)
         } else {
             let permitted: &[&str] = if path == &root {
                 &["pub use time::PreparedSpotTime;"]
@@ -1389,6 +1639,10 @@ fn the_spot_module_sends_orders_only_through_the_ledger_and_reads_no_configurati
             mutation_violations(&file, text)
         };
         assert!(violations.is_empty(), "{}: {violations:?}", path.display());
+        if path != &read_transport {
+            let signs = has_word(text, "bind_spot_read");
+            assert!(!signs, "{} signs a closed read outside its transport", path.display());
+        }
         for configuration in ["env::var", "std::env", "ROBSON_", "dotenv"] {
             assert!(!text.contains(configuration), "{} reads {configuration}", path.display());
         }

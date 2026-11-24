@@ -1,5 +1,6 @@
-//! Concrete controlled TIME owner. Production construction still requires the
-//! unavailable C2/final-source context; no public Ready constructor exists.
+//! Concrete TIME owner. Its one production construction is a non-trading
+//! Spot start's (PLAN §6.6, PS-3), on that start's non-trading budget; the
+//! trading C2/final-source context stays unavailable.
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -20,7 +21,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    venue_budget::{state::SharedBudget, BudgetError},
+    process_epoch::EpochStart,
+    venue_budget::{
+        state::{NonTradingBudget, SharedBudget},
+        BudgetError,
+    },
     venue_clock_http::{self, TimeError},
     venue_clock_store::ClockSampleStore,
 };
@@ -33,8 +38,15 @@ mod inventory;
 mod jobs;
 mod lifecycle;
 mod metrics;
+mod on_demand;
+pub(crate) use on_demand::ClockHandle;
 #[cfg(all(test, feature = "crash-points"))]
 mod pg_tests;
+pub(crate) mod reads;
+#[cfg(all(test, feature = "crash-points"))]
+pub(crate) use pg_tests::reconciliation::{
+    AccountSeen, Hook, Listener, ReconciliationRig, ScanInputs, Scanned,
+};
 #[cfg(all(test, feature = "crash-points"))]
 pub(crate) use pg_tests::restart_lookup::{GovernedRestartRead, RestartLookup};
 #[cfg(all(test, feature = "crash-points"))]
@@ -82,6 +94,21 @@ pub(crate) struct ClockOwner {
     workers: Arc<Semaphore>,
     cycle: u64,
     last_opportunity: Option<TickCapture>,
+    /// The latest on-demand cycle's handoff bound: at most its response.
+    last_on_demand: Option<Instant>,
+    /// Delay of the first scheduled cycle from the sampler's spawn.
+    first: Duration,
+    requests: Arc<on_demand::Requests>,
+    /// The pause keeper's pool and tenant (a non-trading owner's).
+    keeper: Option<(sqlx::PgPool, Uuid)>,
+}
+
+/// What a TIME cycle is for (PLAN §6.6): the minute's scheduled sample, or one
+/// a reader asked for, bounded by its caller's absolute deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CycleKind {
+    Scheduled,
+    OnDemand { deadline: Instant },
 }
 
 fn after(tick: TickCapture, duration: Duration) -> Result<TickCapture, TimeError> {
@@ -128,10 +155,58 @@ impl ClockOwner {
             workers: Arc::new(Semaphore::new(1)),
             cycle: 0,
             last_opportunity: None,
+            last_on_demand: None,
+            first: Duration::ZERO,
+            requests: Arc::default(),
+            keeper: None,
         })
     }
 
+    /// The production owner of a non-trading Spot start (PLAN §6.6), built
+    /// after its budget bootstrap: the store bound to the committed epoch, the
+    /// budget's TIME handle, and the first scheduled cycle at start + 61 s
+    /// (+ 121 s after an unclean start), the first venue request.
+    pub(crate) fn non_trading(
+        clock: Arc<NativeClock>,
+        client: Arc<BinanceRestClient>,
+        pool: &sqlx::PgPool,
+        tenant: Uuid,
+        start: &EpochStart,
+        budget: &NonTradingBudget,
+    ) -> Result<Self, TimeError> {
+        metrics::register();
+        let store = ClockSampleStore::from_committed_epoch(pool, tenant, start);
+        let mut owner = Self::controlled(
+            clock,
+            client,
+            store,
+            budget.time_owner(),
+            tenant,
+            start.epoch.epoch_id,
+        )?;
+        let unclean = start.predecessor.unclean_reason().is_some();
+        let now = owner.clock.capture().map_err(|_| TimeError::Native)?;
+        owner.first = first_delay(budget.start().map_err(TimeError::Budget)?, now, unclean)?;
+        owner.keeper = Some((pool.clone(), tenant));
+        Ok(owner)
+    }
+
+    /// A clonable handle for readers: on-demand samples and clock evidence.
+    pub(crate) fn handle(&self) -> ClockHandle {
+        ClockHandle {
+            clock: Arc::clone(&self.clock),
+            epoch: self.epoch,
+            state: Arc::clone(&self.state),
+            cancel: self.cancel.clone(),
+            requests: Arc::clone(&self.requests),
+        }
+    }
+
     pub(crate) async fn run_cycle(&mut self) -> Result<Uuid, TimeError> {
+        self.run_cycle_kind(CycleKind::Scheduled).await
+    }
+
+    pub(crate) async fn run_cycle_kind(&mut self, kind: CycleKind) -> Result<Uuid, TimeError> {
         if self.preparation.is_some() || self.parser.is_some() {
             return Err(TimeError::Resource);
         }
@@ -146,19 +221,51 @@ impl ClockOwner {
             let capture = state.capture_native(&self.clock, self.epoch)?;
             (capture.end_tick().map_err(|_| TimeError::Native)?, state.generation)
         };
-        if self.last_opportunity.is_some_and(|last| {
-            admitted.elapsed_since(&last).map_or(true, |age| age < Duration::from_secs(60))
-        }) {
+        if matches!(kind, CycleKind::Scheduled)
+            && self.last_opportunity.is_some_and(|last| {
+                admitted.elapsed_since(&last).map_or(true, |age| age < Duration::from_secs(60))
+            })
+        {
             return Err(TimeError::Budget(BudgetError::Deferred));
         }
+        // Only a scheduled cycle keeps the 60 s opportunity spacing; an
+        // on-demand one is refused, before any reservation, once its caller's
+        // deadline has passed or within 5 s of the previous on-demand handoff
+        // (`last_on_demand`: monotonic, never earlier than that handoff).
+        let limit = match kind {
+            CycleKind::Scheduled => None,
+            CycleKind::OnDemand { deadline } if Instant::now() >= deadline => {
+                return Err(TimeError::Expired);
+            },
+            CycleKind::OnDemand { .. }
+                if self
+                    .last_on_demand
+                    .is_some_and(|last| last.elapsed() < Duration::from_secs(5)) =>
+            {
+                return Err(TimeError::Budget(BudgetError::Deferred));
+            },
+            CycleKind::OnDemand { deadline } => Some(deadline),
+        };
         // A paused/refused opportunity is skipped, never retried in the same
         // minute. The run loop also skips missed ticks rather than replaying.
-        self.last_opportunity = Some(admitted);
-        let http_deadline = Instant::now() + Duration::from_secs(10);
+        if limit.is_none() {
+            self.last_opportunity = Some(admitted);
+        }
+        let http_deadline = bounded(limit, Instant::now() + Duration::from_secs(10));
+        // `now` under the budget lock (PS-5): readers reserve beside this
+        // cycle. `admitted` stays for the spacing rule and the persistence
+        // bound (the cycle's remaining 60 s), not for the reservation.
+        let clock = &self.clock;
         let pending = self
             .budget
-            .try_reserve_time(admitted, after(admitted, Duration::from_secs(10))?)
+            .reserve_now(1, || {
+                let now = clock.capture().map_err(|_| BudgetError::Invalid)?;
+                Ok((now, after(now, Duration::from_secs(10)).map_err(|_| BudgetError::Invalid)?))
+            })
             .map_err(TimeError::Budget)?;
+        if limit.is_some() {
+            self.last_on_demand = Some(Instant::now());
+        }
         self.cycle = self.cycle.checked_add(1).ok_or(TimeError::Resource)?;
         // The immutable send mark includes synchronous preparation time.
         // Capture after reservation and BEFORE spawning preparation.
@@ -197,7 +304,12 @@ impl ClockOwner {
             http_deadline,
             &self.cancel,
         )
-        .await?;
+        .await;
+        if limit.is_some() {
+            // Whatever the answer, a handoff it had is no later than now.
+            self.last_on_demand = Some(Instant::now());
+        }
+        let body = body?;
         {
             let mut state = self.state.lock().map_err(|_| TimeError::Native)?;
             state.capture_native(&self.clock, self.epoch)?;
@@ -243,8 +355,8 @@ impl ClockOwner {
             .ok_or(TimeError::Expired)?;
         let remaining_age =
             Duration::from_nanos(u64::try_from(remaining_age).map_err(|_| TimeError::Expired)?);
-        let deadline =
-            Instant::now() + Duration::from_secs(2).min(remaining_age).min(remaining_cycle);
+        let persist_for = Duration::from_secs(2).min(remaining_age).min(remaining_cycle);
+        let deadline = bounded(limit, Instant::now() + persist_for);
         // Every poll/resumption observes actual native state. Cancellation
         // drops this one owned persistence future, never creates a revisit.
         let mut persist = Box::pin(self.store.persist(self.cycle, raw, Some(deadline)));
@@ -289,23 +401,29 @@ impl ClockOwner {
         }
         // Fresh capture is taken AFTER acquiring the decision lock.
         let capture = state.capture_native(&self.clock, self.epoch)?;
-        if state.closing
-            || state.generation != generation
-            || !original_valid
+        if !original_valid
             || Instant::now() >= deadline
             || !arithmetic.fits_capture(&capture).map_err(|_| TimeError::Native)?
         {
             return Err(TimeError::Expired);
         }
-        state.last_valid = Some(receive.end_tick().map_err(|_| TimeError::Native)?);
-        state.faults = 0;
-        state.active_faults = 0;
-        metrics::faults(0, 0);
-        let published = Published { id, arithmetic, u2: numbers.u2 };
-        let published_id = published.id;
-        state.published = Some(published);
-        Ok(published_id)
+        let received = receive.end_tick().map_err(|_| TimeError::Native)?;
+        state.publish(generation, Published { id, arithmetic, u2: numbers.u2 }, received)
     }
+}
+
+/// A cycle's bound `at`, or its on-demand caller's deadline when earlier:
+/// both the HTTP request and the persistence end by the caller's deadline.
+fn bounded(limit: Option<Instant>, at: Instant) -> Instant {
+    limit.map_or(at, |deadline| at.min(deadline))
+}
+
+/// How long after spawn the first scheduled cycle comes: start + 61 s, or
+/// start + 121 s after an unclean start (PLAN §6.6), never before the
+/// budget's grant window (60 s) or unclean barrier (120 s) ends.
+fn first_delay(start: TickCapture, now: TickCapture, unclean: bool) -> Result<Duration, TimeError> {
+    let grant = Duration::from_secs(if unclean { 121 } else { 61 });
+    Ok(grant.saturating_sub(now.elapsed_since(&start).map_err(|_| TimeError::Native)?))
 }
 
 #[cfg(all(
@@ -316,3 +434,10 @@ impl ClockOwner {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod state_tests;
+
+// PS-3: the request slot, publication CAS and caller deadline (no I/O), and
+// the owner on PG16 with a loopback TIME venue (crash-points harness URL).
+#[cfg(all(test, feature = "crash-points"))]
+mod ps3_pg_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod ps3_tests;

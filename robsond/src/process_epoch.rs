@@ -11,7 +11,7 @@
 //! incident no release covered. The daemon seeds the fence from that before
 //! any venue request (design §3).
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use chrono::{DateTime, Utc};
 use robson_exec::gate::{Incident, IncidentReason};
@@ -97,7 +97,31 @@ pub async fn start_epoch(
     tenant_id: Uuid,
     binary_version: &str,
 ) -> DaemonResult<EpochStart> {
-    match tokio::time::timeout(EPOCH_INSERT_BOUND, insert(pool, tenant_id, binary_version)).await {
+    bounded(insert(pool, tenant_id, binary_version, false)).await
+}
+
+/// [`start_epoch`] for a balance-account daemon (ADR-0056 step 8l-3b): its
+/// transaction first takes the tenant's accounting rows in (tenant, venue)
+/// order, as the cash writer does, so a cash conclusion holding them commits
+/// or rolls back before this epoch exists, and one that takes them after it
+/// reads this epoch and refuses its predecessor's attempt. One statement more
+/// than [`start_epoch`]; the wait is the balance pool's lock bound, past
+/// which the start is refused with no epoch.
+///
+/// # Errors
+/// As [`start_epoch`], and a lock wait past the pool's bound.
+pub(crate) async fn start_balance_epoch(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    binary_version: &str,
+) -> DaemonResult<EpochStart> {
+    bounded(insert(pool, tenant_id, binary_version, true)).await
+}
+
+async fn bounded(
+    insert: impl Future<Output = DaemonResult<EpochStart>>,
+) -> DaemonResult<EpochStart> {
+    match tokio::time::timeout(EPOCH_INSERT_BOUND, insert).await {
         Ok(started) => started,
         Err(_) => Err(DaemonError::Config(format!(
             "process epoch not recorded within {} s; refusing to start",
@@ -106,8 +130,19 @@ pub async fn start_epoch(
     }
 }
 
-async fn insert(pool: &PgPool, tenant_id: Uuid, binary_version: &str) -> DaemonResult<EpochStart> {
+async fn insert(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    binary_version: &str,
+    balance: bool,
+) -> DaemonResult<EpochStart> {
     let mut tx = pool.begin().await?;
+    if balance {
+        sqlx::query(crate::balance_accounting::ACCOUNTING_ROWS)
+            .bind(tenant_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    }
     let previous = sqlx::query(
         "SELECT epoch_id, epoch_seq, marker_version FROM process_epochs
          WHERE tenant_id = $1 ORDER BY epoch_seq DESC LIMIT 1",

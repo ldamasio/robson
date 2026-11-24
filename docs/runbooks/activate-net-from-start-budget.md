@@ -208,6 +208,25 @@ Run from a shell with the production kubeconfig.
    Expected: `UPDATE 1` with the current `year, month`. `UPDATE 0` means the
    row is already switched or does not exist; investigate before retrying.
 
+   **On a balance-account venue (Spot; ADR-0056 step 8l-4)** the switch is
+   instead one transaction that first bumps every `accounting_state` row of
+   the tenant, in (tenant, venue) order, setting the model, and then updates
+   the month, so no snapshot read before it can still validate. `TENANT_ID` is
+   the daemon's `PROJECTION_TENANT_ID`. One `-c` string is one implicit
+   transaction: any error rolls all of it back.
+
+   <!-- 8l-4 balance model switch -->
+   ```bash
+   TENANT_ID=00000000-0000-0000-0000-000000000000 TARGET_YEAR=2026 TARGET_MONTH=11
+   robson_psql "SELECT set_config('lock_timeout', '300ms', true), set_config('statement_timeout', '1s', true), set_config('idle_in_transaction_session_timeout', '1s', true); WITH locked AS (SELECT tenant_id, venue_id FROM accounting_state WHERE tenant_id = '${TENANT_ID}' ORDER BY tenant_id, venue_id FOR UPDATE) UPDATE accounting_state a SET version = a.version + 1, budget_model = 'net_from_start_non_expanding_v1' FROM locked WHERE (a.tenant_id, a.venue_id) = (locked.tenant_id, locked.venue_id) RETURNING a.venue_id, a.version, a.budget_model; UPDATE monthly_state SET monthly_budget_model = 'net_from_start_non_expanding_v1' WHERE year = ${TARGET_YEAR} AND month = ${TARGET_MONTH} AND monthly_budget_model = 'hwm_v1' RETURNING year, month, capital_base, monthly_budget_model;"
+   ```
+
+   Expected: one `accounting_state` row per venue of the tenant with its new
+   version and the net-from-start model, then `UPDATE 1` as above. The switch
+   does not advance an installed order-set generation: it leaves it stale, and
+   every write that bumps the version refuses until the order-set owner
+   re-installs it (PLAN-r4 §6.5), so run it at rest.
+
    Later months inherit the model: every `monthly_state` insert path
    (`MonthBoundaryReset` projector, `CapitalBaseRecalibrated`, the daemon's peak
    upsert) copies the most recent earlier row's `monthly_budget_model`, and no
@@ -345,7 +364,12 @@ Two operational notes from the run:
 
 ## Rollback
 
-Inverse statement, same guard, no restart:
+On a balance-account venue (Spot) there is no rollback: Spot runs only under
+net-from-start (SD14), so the inverse switch is refused. Forced by direct SQL,
+every Spot budget snapshot reads the mismatch and is invalid (the balance
+snapshot's model check, ADR-0056 step 8l-8).
+
+Elsewhere, the inverse statement, same guard, no restart:
 
 ```bash
 robson_psql "UPDATE monthly_state SET monthly_budget_model = 'hwm_v1' WHERE year = EXTRACT(YEAR FROM now() AT TIME ZONE 'UTC')::smallint AND month = EXTRACT(MONTH FROM now() AT TIME ZONE 'UTC')::smallint AND monthly_budget_model = 'net_from_start_non_expanding_v1' RETURNING year, month, monthly_budget_model;"

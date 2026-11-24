@@ -130,10 +130,9 @@ pub struct Daemon<E: Venue + 'static, S: Store + 'static> {
     /// (ADR-0056 step 7). Held here so nothing reaches it through the manager
     /// lock.
     order_journal: Arc<OrderJournal>,
-    /// The epoch a supervised Spot startup already recorded, taken once by
-    /// the start instead of inserting another. `None` on every other daemon.
+    /// How a `binance:spot` daemon starts; `None` on every other daemon.
     #[cfg(feature = "postgres")]
-    supervised_epoch: Option<crate::process_epoch::EpochStart>,
+    spot_start: SpotStart,
     /// Bounds of the two-phase stop.
     stop_timings: StopTimings,
 }
@@ -190,6 +189,7 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     venue: &Arc<E>,
     pool: &Option<Arc<sqlx::PgPool>>,
     config: &Config,
+    generation: &crate::balance_accounting::GenerationCell,
 ) -> Executor<E, S> {
     // The supervised startup owns the Spot backend. Even warm-up of a
     // legacy pool would authenticate with the wrong login during closure.
@@ -199,17 +199,20 @@ fn with_durable_order_journal<E: Venue + 'static, S: Store + 'static>(
     let (Some(pool), Some(tenant_id)) = (pool, config.projection.tenant_id) else {
         return executor;
     };
-    let backend = crate::order_journal_store::PgJournalBackend::new(pool, tenant_id);
-    with_order_journal_backend(executor, venue, backend)
+    let backend = crate::order_journal_store::PgJournalBackend::new(pool, tenant_id)
+        .with_accounting_generation(generation);
+    with_order_journal_backend(executor, venue, backend, false)
 }
 
 /// The executor's journal on `backend`, attached to the venue before it is
-/// shared.
+/// shared. A `non_trading` journal's gate refuses every mutation from before
+/// it is attached or shared, and before any epoch (PS-1).
 #[cfg(feature = "postgres")]
 fn with_order_journal_backend<E: Venue + 'static, S: Store + 'static>(
     executor: Executor<E, S>,
     venue: &Arc<E>,
     backend: crate::order_journal_store::PgJournalBackend,
+    non_trading: bool,
 ) -> Executor<E, S> {
     // ADR-0056 step 8: the capability is fixed before the journal is shared,
     // and its backend bounds the same account's transactions.
@@ -222,6 +225,10 @@ fn with_order_journal_backend<E: Venue + 'static, S: Store + 'static>(
             .with_one_attempt_per_client_id(one_attempt)
             .with_balance_account(balance),
     );
+    if non_trading {
+        // A fresh gate always takes it; the constructor checks that it did.
+        let _ = journal.gate().refuse_mutations(robson_exec::gate::ReadOnlyReason::NonTrading);
+    }
     venue.attach_order_journal(Arc::clone(&journal));
     executor.with_order_journal(journal)
 }
@@ -237,6 +244,24 @@ async fn unless_stopped<T>(
         done = work => Ok(done),
         stopped = stopping => Err(stopped),
     }
+}
+
+#[cfg(feature = "postgres")]
+const UNSUPERVISED_SPOT: &str = "Spot startup requires a supervised journal";
+
+/// How a `binance:spot` daemon starts, fixed at construction (PS-1).
+#[cfg(feature = "postgres")]
+enum SpotStart {
+    /// Refused: a Spot daemon needs a start kind.
+    None,
+    /// The epoch package 4's supervised startup already recorded (test-only).
+    Supervised(crate::process_epoch::EpochStart),
+    /// An ordinary epoch with every venue mutation refused; the closed client
+    /// the TIME owner and the budgeted reads will use (PS-6).
+    NonTrading {
+        #[allow(dead_code, reason = "PS-6 builds the TIME owner and reads on it")]
+        client: Arc<robson_connectors::BinanceRestClient>,
+    },
 }
 
 struct PreparedStart {
@@ -361,7 +386,7 @@ impl Daemon<StubExchange, MemoryStore> {
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             #[cfg(feature = "postgres")]
-            supervised_epoch: None,
+            spot_start: SpotStart::None,
             stop_timings: StopTimings::default(),
         }
     }
@@ -442,7 +467,7 @@ impl Daemon<StubExchange, MemoryStore> {
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             #[cfg(feature = "postgres")]
-            supervised_epoch: None,
+            spot_start: SpotStart::None,
             stop_timings: StopTimings::default(),
         })
     }
@@ -480,7 +505,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let store = Arc::new(MemoryStore::new());
         let executor = Executor::new(Arc::clone(&exchange), journal, store.clone());
         let executor = Arc::new(if durable_journal {
-            with_durable_order_journal(executor, &exchange, &pg_pool, &config)
+            with_durable_order_journal(executor, &exchange, &pg_pool, &config, &Default::default())
         } else {
             executor
         });
@@ -548,7 +573,7 @@ impl Daemon<StubExchange, MemoryStore> {
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             #[cfg(feature = "postgres")]
-            supervised_epoch: None,
+            spot_start: SpotStart::None,
             stop_timings: StopTimings::default(),
         }
     }
@@ -628,7 +653,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             #[cfg(feature = "postgres")]
-            supervised_epoch: None,
+            spot_start: SpotStart::None,
             stop_timings: StopTimings::default(),
         }
     }
@@ -651,7 +676,48 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             projection_recovery,
             pg_pool,
             None,
+            None,
         )
+    }
+
+    /// A Spot daemon that can never trade (PS, production non-trading start):
+    /// refused unless `venue` is `binance:spot` on a balance account, a tenant
+    /// is set and `client` (the venue's own, from the Spot adapter's
+    /// non-trading constructor) is closed to unbudgeted requests.
+    /// Its journal refuses every batch and its gate every mutation, from
+    /// before the journal is shared; its start inserts an ordinary epoch.
+    #[cfg(feature = "postgres")]
+    pub fn non_trading_spot(
+        config: Config,
+        venue: Arc<E>,
+        market_data: Arc<dyn TradeFeedPort>,
+        ohlcv_port: Arc<dyn OhlcvPort>,
+        projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
+        pg_pool: Arc<sqlx::PgPool>,
+        client: Arc<robson_connectors::BinanceRestClient>,
+    ) -> DaemonResult<Self> {
+        if venue.id().as_str() != robson_exec::venue::VenueId::BINANCE_SPOT
+            || venue.capabilities().account_kind != robson_exec::venue::AccountKind::BalanceAccount
+            || config.projection.tenant_id.is_none()
+            || !client.is_closed()
+        {
+            let needs = "binance:spot, a balance account, a tenant and a closed client";
+            return Err(DaemonError::Config(format!("A non-trading start needs {needs}")));
+        }
+        let daemon = Self::assemble_with_recovery(
+            config,
+            venue,
+            market_data,
+            ohlcv_port,
+            projection_recovery,
+            Some(pg_pool),
+            None,
+            Some(client),
+        );
+        match daemon.order_journal.gate().read_only() {
+            Some(robson_exec::gate::ReadOnlyReason::NonTrading) => Ok(daemon),
+            _ => Err(DaemonError::Config("Non-trading refusal not set".into())),
+        }
     }
 
     /// Build the Spot daemon only from the supervised startup handoff. The
@@ -686,6 +752,7 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             None,
             pool,
             Some(ready),
+            None,
         ))
     }
 
@@ -698,19 +765,39 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
         projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
         pg_pool: Option<Arc<sqlx::PgPool>>,
         ready: Option<crate::spot_order_set_store::spot_startup::SpotReady>,
+        non_trading: Option<Arc<robson_connectors::BinanceRestClient>>,
     ) -> Self {
         use robson_domain::RiskConfig;
 
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Executor::new(Arc::clone(&venue), journal, store.clone());
+        // ADR-0056 step 8l-4: one order-set generation cell for the journal and
+        // the accounting context. A supervised start publishes the generation
+        // it installed and admitted into it before the journal is built, so
+        // the journal and the manager's context read that generation (5a).
+        let generation = crate::balance_accounting::GenerationCell::default();
         let executor = Arc::new(match &ready {
-            Some(ready) => with_order_journal_backend(
-                executor,
-                &venue,
-                crate::order_journal_store::PgJournalBackend::supervised(ready),
-            ),
-            None => with_durable_order_journal(executor, &venue, &pg_pool, &config),
+            Some(ready) => {
+                generation.publish(ready.generation().clone());
+                with_order_journal_backend(
+                    executor,
+                    &venue,
+                    crate::order_journal_store::PgJournalBackend::supervised(ready, &generation),
+                    false,
+                )
+            },
+            None => match (&non_trading, &pg_pool, config.projection.tenant_id) {
+                (Some(_), Some(pool), Some(tenant_id)) => with_order_journal_backend(
+                    executor,
+                    &venue,
+                    crate::order_journal_store::PgJournalBackend::new(pool, tenant_id)
+                        .with_accounting_generation(&generation)
+                        .non_trading(),
+                    true,
+                ),
+                _ => with_durable_order_journal(executor, &venue, &pg_pool, &config, &generation),
+            },
         });
         let order_journal = gated(&venue, &executor);
         let event_bus = Arc::new(EventBus::new(1000));
@@ -764,7 +851,17 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             config.engine.position_monitor_tick_interval_secs,
         ));
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
-            pm = pm.with_event_log((**pool).clone(), tenant_id);
+            // ADR-0056 step 8l-4: on a balance account, the append path and
+            // the stream repair bump the accounting version.
+            let accounting = crate::balance_accounting::BalanceAccounting::for_daemon(
+                venue.capabilities().account_kind,
+                tenant_id,
+                venue.id(),
+                &generation,
+            );
+            pm = pm
+                .with_event_log((**pool).clone(), tenant_id)
+                .with_balance_accounting(accounting);
         }
         let position_manager = Arc::new(RwLock::new(pm));
 
@@ -782,7 +879,11 @@ impl<E: Venue + 'static> Daemon<E, MemoryStore> {
             month_boundary_pending: crate::metrics::MONTH_BOUNDARY_PENDING.clone(),
             order_journal,
             #[cfg(feature = "postgres")]
-            supervised_epoch: ready.map(|ready| ready.epoch().clone()),
+            spot_start: match (ready, non_trading) {
+                (Some(ready), _) => SpotStart::Supervised(ready.epoch().clone()),
+                (None, Some(client)) => SpotStart::NonTrading { client },
+                (None, None) => SpotStart::None,
+            },
             stop_timings: StopTimings::default(),
         }
     }
@@ -1037,9 +1138,9 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     async fn prepare_start(&self, journal: &OrderJournal) -> DaemonResult<PreparedStart> {
         #[cfg(feature = "postgres")]
         if self.exchange.id().as_str() == robson_exec::venue::VenueId::BINANCE_SPOT
-            && self.supervised_epoch.is_none()
+            && matches!(self.spot_start, SpotStart::None)
         {
-            return Err(DaemonError::Config("Spot startup requires a supervised journal".into()));
+            return Err(DaemonError::Config(UNSUPERVISED_SPOT.into()));
         }
         journal
             .check_ready()
@@ -1051,6 +1152,21 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     /// The startup phase, under the startup permit: capital, recovery from the
     /// event log, the stale-active gate, the startup scan and startup recovery.
     async fn start_up(&self, shutdown: &tokio_util::sync::CancellationToken) -> DaemonResult<()> {
+        // ADR-0056 step 8p-2: a balance account first writes the pending rows
+        // of every boundary it crossed, before capital, stream repair, the
+        // store and any recovery (8p PLAN-r3 §6.2). Without them it does not
+        // start.
+        #[cfg(feature = "postgres")]
+        if let Some((pool, accounting)) = self.boundary_owner().await {
+            let pending = crate::boundary::write_pending(&pool, &accounting, Utc::now());
+            crate::operation_observation::job(
+                crate::operation_observation::Job::BoundaryTick,
+                pending,
+            )
+            .await
+            .map_err(|error| DaemonError::MonthBoundaryDeferred { reason: error.to_string() })?;
+        }
+
         // 0. Initialize capital from exchange (best-effort)
         self.initialize_capital().await;
 
@@ -1217,8 +1333,13 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                 "Starting projection worker with shared pool"
             );
 
+            // ADR-0056 step 8l-4: a balance account's projector bumps its
+            // accounting version in every `monthly_state` write, on the
+            // manager's context and so on the journal's generation cell.
+            let accounting = self.position_manager.read().await.balance_accounting();
             let worker =
-                ProjectionWorker::new((**pool).clone(), self.config.projection.clone(), tenant_id);
+                ProjectionWorker::new((**pool).clone(), self.config.projection.clone(), tenant_id)
+                    .with_balance_accounting(accounting);
 
             let worker_shutdown = shutdown.clone();
             workers.push(tokio::spawn(async move {
@@ -1334,12 +1455,19 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             refuse_an_epochless_venue(self.exchange.id())?;
             return Ok(PreparedStart { marker: None, clock: None });
         };
-        let start = if self.exchange.id().as_str() == robson_exec::venue::VenueId::BINANCE_SPOT {
-            self.supervised_epoch.clone().ok_or_else(|| {
-                DaemonError::Config("Spot startup requires a supervised journal".into())
-            })?
-        } else {
-            crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION")).await?
+        let spot = self.exchange.id().as_str() == robson_exec::venue::VenueId::BINANCE_SPOT;
+        let ordinary =
+            || crate::process_epoch::start_epoch(pool, tenant_id, env!("CARGO_PKG_VERSION"));
+        let start = match &self.spot_start {
+            SpotStart::Supervised(start) => start.clone(),
+            // A non-trading start is a balance account's: its epoch takes the
+            // tenant's accounting rows first (8l-3b; PS-1's seam, 5a).
+            SpotStart::NonTrading { .. } => {
+                let version = env!("CARGO_PKG_VERSION");
+                crate::process_epoch::start_balance_epoch(pool, tenant_id, version).await?
+            },
+            SpotStart::None if !spot => ordinary().await?,
+            SpotStart::None => return Err(DaemonError::Config(UNSUPERVISED_SPOT.into())),
         };
         crate::process_epoch::record_start(&start);
         let view = robson_exec::gate::EpochView {
@@ -1357,6 +1485,12 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             .await
             .event_streams()
             .set_epoch(start.epoch.epoch_id);
+        // A non-trading start stops here until PS-6 wires its TIME owner, its
+        // budget and its reads: no wire I/O, its epoch left unmarked.
+        if matches!(self.spot_start, SpotStart::NonTrading { .. }) {
+            crate::metrics::REFUSED_MUTATIONS.with_label_values(&["non_trading"]);
+            return Err(DaemonError::Config("Spot TIME owner not wired".into()));
+        }
         // I1's real component is exercised only from an isolated controlled
         // source. Production C2/2b/final audit is still unavailable: refuse
         // BEFORE constructing a TIME client/task or sending any request.
@@ -1381,7 +1515,89 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         Ok(PreparedStart { marker: None })
     }
 
+    /// The pool and accounting context a balance account's boundary is owned
+    /// on: `None` on a position account, which has no context, or without a
+    /// database.
+    #[cfg(feature = "postgres")]
+    async fn boundary_owner(
+        &self,
+    ) -> Option<(Arc<sqlx::PgPool>, crate::balance_accounting::BalanceAccounting)> {
+        let accounting = self.position_manager.read().await.balance_accounting()?;
+        Some((Arc::clone(self.pg_pool.as_ref()?), accounting))
+    }
+
+    /// ADR-0056 step 8p-2: a balance account's boundary poll (8p PLAN-r3
+    /// §6.2). The partitions once per new month, the pending rows, and before
+    /// any certificate 8p's zero reset of a month nobody reset, which resets
+    /// the breaker and is broadcast as the legacy reset is; then both pending
+    /// gauges. A failure at a new month leaves `robsond_month_boundary_pending`
+    /// at 1, as the legacy poll does; the next poll retries.
+    #[cfg(feature = "postgres")]
+    async fn boundary_tick(&self, now: DateTime<Utc>) -> DaemonResult<bool> {
+        let Some((pool, accounting)) = self.boundary_owner().await else {
+            return Ok(false);
+        };
+        use tracing::Instrument as _;
+
+        use crate::{boundary::io, operation_observation::Job};
+        let current_month = (now.year(), now.month());
+        let new_month = *self.last_month_check.read().await != current_month;
+        // 8p-O: every statement of the tick but the zero reset's (its own
+        // operations) counts under the tick's root.
+        let ticked = crate::operation_observation::job(Job::BoundaryTick, async {
+            if new_month {
+                let events = sqlx::query("SELECT create_event_log_partitions(3)").execute(&*pool);
+                events.instrument(io(1)).await?;
+                let snapshots = sqlx::query("SELECT create_snapshot_partitions(3)").execute(&*pool);
+                snapshots.instrument(io(1)).await?;
+            }
+            crate::boundary::write_pending(&pool, &accounting, now).await?;
+            let (zero_due, mut landed, owed) =
+                crate::boundary::read_month(&*pool, &accounting, now).await?;
+            if zero_due {
+                let manager = self.position_manager.read().await;
+                let (streams, journal) = (manager.event_streams(), &self.order_journal);
+                if crate::boundary::zero_reset(&pool, &accounting, streams, journal, now).await? {
+                    let _ = manager.circuit_breaker().reset().await;
+                    info!(year = now.year(), month = now.month(), "Month boundary reset at 0");
+                    self.event_bus.send(DaemonEvent::MonthBoundaryProcessed {
+                        year: now.year(),
+                        month: now.month(),
+                        capital_base: Decimal::ZERO,
+                    });
+                    landed = true;
+                }
+            }
+            Ok::<_, crate::boundary::Failure>((landed, owed))
+        });
+        let (landed, owed) = ticked.await.map_err(|error| {
+            if new_month {
+                self.month_boundary_pending.set(1.0);
+            }
+            DaemonError::MonthBoundaryDeferred { reason: error.to_string() }
+        })?;
+        self.month_boundary_pending.set(if landed { 0.0 } else { 1.0 });
+        crate::metrics::BOUNDARY_SNAPSHOT_PENDING
+            .with_label_values(&[accounting.venue.as_str()])
+            .set(if owed { 1.0 } else { 0.0 });
+        *self.last_month_check.write().await = current_month;
+        Ok(new_month)
+    }
+
+    /// Without PostgreSQL a balance account has no boundary to own.
+    #[cfg(not(feature = "postgres"))]
+    async fn boundary_tick(&self, _now: DateTime<Utc>) -> DaemonResult<bool> {
+        Ok(false)
+    }
+
     async fn poll_month_boundary(&self, now: DateTime<Utc>) -> DaemonResult<bool> {
+        // ADR-0056 step 8p-2, R1: a balance account's boundary is 8p's, and
+        // the futures-wallet reset below never runs on one.
+        if self.exchange.capabilities().account_kind
+            == robson_exec::venue::AccountKind::BalanceAccount
+        {
+            return self.boundary_tick(now).await;
+        }
         let current_month = (now.year(), now.month());
         let previous_month = { *self.last_month_check.read().await };
 
@@ -2656,7 +2872,7 @@ mod tests {
         let backend = crate::order_journal_store::PgJournalBackend::new(pool, uuid::Uuid::now_v7());
         // No readiness check: the release runs on the daemon pool, which is
         // already connected, and readiness is not what is measured here.
-        let journal = with_order_journal_backend(executor, &venue, backend).order_journal();
+        let journal = with_order_journal_backend(executor, &venue, backend, false).order_journal();
         let started = std::time::Instant::now();
         let released = release_under_lock(pool, &journal).await;
         (journal.balance_account(), released, started.elapsed())
@@ -2715,7 +2931,10 @@ mod tests {
             source_audit_id: uuid::Uuid::now_v7(),
         };
         let ready = SpotReady::unsupervised_fixture(start, generation, pool.clone());
-        let backend = crate::order_journal_store::PgJournalBackend::supervised(&ready);
+        let backend = crate::order_journal_store::PgJournalBackend::supervised(
+            &ready,
+            &crate::balance_accounting::GenerationCell::default(),
+        );
         let incident = Incident {
             reason: IncidentReason::UncertainOutcome,
             first_at: Utc::now(),
@@ -2739,6 +2958,231 @@ mod tests {
         let error = format!("{failure:?}");
         assert!(error.contains("lock timeout") || error.contains("statement timeout"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// 5a composition of 8l-4's generation cell with package 4's supervised
+    /// start (ROOT-decision-8l4a-generation-handoff, option A). A supervised
+    /// start publishes the generation it installed and admitted into the
+    /// daemon's one cell before its journal is built, and the manager's
+    /// accounting context, which `Daemon::run` hands to the projection worker
+    /// (8l-4b), reads that same cell. The supervised journal's durable
+    /// incident and suspension writes and the worker's projector apply then
+    /// bump the accounting version and CAS against the installed generation,
+    /// which stays current. A restart's successor (the 8j rebuild: a rotated
+    /// generation in a new epoch, as `cold_install`'s `publish.sql` writes
+    /// it) reaches its own daemon the same way: its writes advance the
+    /// rotated generation, and the predecessor's journal, still on the old
+    /// identity, is refused and keeps its writes pending.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_supervised_start_publishes_its_generation_to_the_journal_and_the_manager(
+        pool: sqlx::PgPool,
+    ) {
+        use robson_exec::{
+            order_journal::{StreamSuspensionRow, DEFAULT_ACCOUNT_SCOPE},
+            venue::AccountKind,
+            StubOhlcv, StubTradeFeed,
+        };
+
+        use crate::{
+            capability::worker_venue::WorkerVenue,
+            spot_order_set_store::{
+                observe_generation, spot_startup::SpotReady, ExpectedGeneration, JournalGeneration,
+            },
+        };
+        let tenant = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO accounting_state (tenant_id, venue_id, budget_model) \
+             VALUES ($1, 'binance:spot', 'net_from_start_non_expanding_v1')",
+        )
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let start =
+            crate::process_epoch::start_epoch(&pool, tenant, "5a-supervised").await.unwrap();
+        let installed = JournalGeneration {
+            tenant_id: tenant,
+            account_scope: DEFAULT_ACCOUNT_SCOPE.to_string(),
+            generation_id: uuid::Uuid::now_v7(),
+            process_epoch: start.epoch.epoch_id,
+            source_audit_id: uuid::Uuid::now_v7(),
+        };
+        sqlx::query(
+            "INSERT INTO spot_order_set_generation (tenant_id, venue_id, account_scope, \
+             generation_id, process_epoch, source_audit_id, accounting_version) \
+             VALUES ($1, 'binance:spot', $2, $3, $4, $5, 0)",
+        )
+        .bind(tenant)
+        .bind(&installed.account_scope)
+        .bind(installed.generation_id)
+        .bind(installed.process_epoch)
+        .bind(installed.source_audit_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let versions = || {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (i64, i64)>(
+                    "SELECT a.version, g.accounting_version FROM accounting_state a \
+                     JOIN spot_order_set_generation g USING (tenant_id, venue_id) \
+                     WHERE (a.tenant_id, a.venue_id) = ($1, 'binance:spot')",
+                )
+                .bind(tenant)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let current = |generation: JournalGeneration| {
+            let pool = pool.clone();
+            async move {
+                let venue =
+                    robson_exec::venue::VenueId::new(robson_exec::venue::VenueId::BINANCE_SPOT);
+                let mut connection = pool.acquire().await.unwrap();
+                let expected = ExpectedGeneration {
+                    tenant_id: generation.tenant_id,
+                    venue: &venue,
+                    account_scope: &generation.account_scope,
+                    generation_id: generation.generation_id,
+                    process_epoch: generation.process_epoch,
+                    source_audit_id: generation.source_audit_id,
+                };
+                observe_generation(&mut connection, expected).await.unwrap().is_some()
+            }
+        };
+        let suspension = || StreamSuspensionRow {
+            suspension_id: uuid::Uuid::now_v7(),
+            stream_key: format!("position:{}", uuid::Uuid::now_v7()),
+            stream_kind: "position",
+            failed_seq: None,
+            month: None,
+            error: "5a supervised start".to_string(),
+            epoch_id: None,
+            suspended_at: Utc::now(),
+        };
+        let supervised = |ready: SpotReady| {
+            let mut config = Config::test();
+            config.projection.tenant_id = Some(tenant);
+            Daemon::assemble_with_recovery(
+                config,
+                Arc::new(WorkerVenue::new(AccountKind::BalanceAccount, false)),
+                Arc::new(StubTradeFeed::default()),
+                Arc::new(StubOhlcv::default()),
+                None,
+                Some(Arc::new(ready.writer().clone())),
+                Some(ready),
+                None,
+            )
+        };
+
+        let first =
+            supervised(SpotReady::unsupervised_fixture(start, installed.clone(), pool.clone()));
+        // The worker's context, as Daemon::run takes it from the manager, on
+        // this test venue's own identity (a balance account, not Spot).
+        let context = first.position_manager.read().await.balance_accounting().unwrap();
+        assert_eq!(context.generation.current(), Some(installed.clone()), "the manager's cell");
+        let journal = first.journal_for_startup_witness();
+        assert!(journal.balance_account());
+        journal.record_suspension(suspension());
+        assert_eq!(journal.flush_pending().await, 2, "the incident and the suspension land");
+        assert_eq!(journal.retry_set_depth(), 0);
+        assert_eq!(versions().await, (2, 2), "two bumps, each with the CAS");
+        assert!(current(installed.clone()).await);
+        let at = Utc.with_ymd_and_hms(2027, 4, 1, 0, 0, 10).unwrap();
+        let reset = robson_eventlog::EventEnvelope {
+            event_id: uuid::Uuid::now_v7(),
+            tenant_id: tenant,
+            stream_key: "test:5a".to_string(),
+            seq: 1,
+            event_type: "month_boundary_reset".to_string(),
+            payload: serde_json::json!({
+                "capital_base": "10000", "carried_positions_risk": "0",
+                "month": 4, "year": 2027, "timestamp": at,
+            }),
+            payload_schema_version: 1,
+            occurred_at: at,
+            ingested_at: at,
+            idempotency_key: uuid::Uuid::now_v7().to_string(),
+            trace_id: None,
+            causation_id: None,
+            command_id: None,
+            workflow_id: None,
+            actor_type: Some(ActorType::Daemon),
+            actor_id: None,
+            prev_hash: None,
+            hash: None,
+        };
+        // This balance test venue is not Binance Spot, so the worker's context
+        // refuses the published generation before any write (an empty cell
+        // would have bumped unopted): the worker read the published cell.
+        let step = crate::balance_accounting::projector_step(Some(&context));
+        let refused = robson_projector::apply_event_to_projections_with(&pool, &reset, step).await;
+        assert!(
+            matches!(&refused, Err(robson_projector::ProjectionError::Accounting(e))
+                if e.contains("not this context's")),
+            "{refused:?}"
+        );
+        assert_eq!(versions().await, (2, 2));
+        // The same cell under the identity a Spot daemon's context carries:
+        // the worker's apply bumps once, with the CAS.
+        let spot = crate::balance_accounting::BalanceAccounting {
+            venue: robson_exec::venue::VenueId::new(robson_exec::venue::VenueId::BINANCE_SPOT),
+            ..context.clone()
+        };
+        let step = crate::balance_accounting::projector_step(Some(&spot));
+        robson_projector::apply_event_to_projections_with(&pool, &reset, step)
+            .await
+            .unwrap();
+        assert_eq!(versions().await, (3, 3), "the worker's apply bumps once, with the CAS");
+        assert!(current(installed.clone()).await);
+
+        // The successor installs a rotated generation in its own epoch.
+        let successor =
+            crate::process_epoch::start_epoch(&pool, tenant, "5a-successor").await.unwrap();
+        let rotated = JournalGeneration {
+            generation_id: uuid::Uuid::now_v7(),
+            process_epoch: successor.epoch.epoch_id,
+            source_audit_id: uuid::Uuid::now_v7(),
+            ..installed.clone()
+        };
+        sqlx::query(
+            "UPDATE public.spot_order_set_generation g SET generation_id = $3, \
+             process_epoch = $4, source_audit_id = $5, accounting_version = a.version, \
+             position_hints_complete = true FROM public.accounting_state a \
+             WHERE (a.tenant_id, a.venue_id) = (g.tenant_id, g.venue_id) \
+             AND (g.tenant_id, g.venue_id, g.account_scope) = ($1, 'binance:spot', $2) \
+             AND g.generation_id = $6",
+        )
+        .bind(tenant)
+        .bind(&rotated.account_scope)
+        .bind(rotated.generation_id)
+        .bind(rotated.process_epoch)
+        .bind(rotated.source_audit_id)
+        .bind(installed.generation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(current(rotated.clone()).await && !current(installed.clone()).await);
+        let second =
+            supervised(SpotReady::unsupervised_fixture(successor, rotated.clone(), pool.clone()));
+        let context = second.position_manager.read().await.balance_accounting().unwrap();
+        assert_eq!(context.generation.current(), Some(rotated.clone()));
+        let renewed = second.journal_for_startup_witness();
+        renewed.record_suspension(suspension());
+        assert_eq!(renewed.flush_pending().await, 2);
+        assert_eq!(versions().await, (5, 5), "the successor's writes advance its generation");
+        assert!(current(rotated.clone()).await);
+
+        // The predecessor's journal still reads the old identity: refused, and
+        // its writes stay pending with nothing moved.
+        journal.record_suspension(suspension());
+        assert_eq!(journal.flush_pending().await, 0);
+        assert_eq!(journal.retry_set_depth(), 2);
+        assert_eq!(versions().await, (5, 5));
+        assert!(current(rotated).await);
     }
 
     #[cfg(feature = "postgres")]
@@ -2769,7 +3213,8 @@ mod tests {
                 Arc::new(IntentJournal::new()),
                 Arc::new(MemoryStore::new()),
             );
-            let executor = with_durable_order_journal(executor, &venue, &pool, &config);
+            let executor =
+                with_durable_order_journal(executor, &venue, &pool, &config, &Default::default());
             let journal = executor.order_journal();
             assert!(!journal.balance_account());
             assert!(!journal.one_attempt_per_client_id());
@@ -5284,3 +5729,10 @@ mod tests {
 
 #[cfg(test)]
 mod account_worker_tests;
+
+#[cfg(all(test, feature = "postgres"))]
+mod boundary_tests;
+
+#[cfg(all(test, feature = "postgres"))]
+#[path = "daemon_non_trading_pg_tests.rs"]
+mod non_trading_pg_tests;

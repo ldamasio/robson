@@ -630,6 +630,18 @@ fn every_daemon_pool_and_connection_is_built_where_the_bounds_reach_it() {
         // and the pause restoration (300 ms lock, 1 s statement, 1 s idle at
         // startup).
         ("venue_budget/restore.rs", "", "existing_pause"),
+        // PS-2a's non-trading budget bootstrap (no production caller until
+        // PS-6 composes the non-trading start): one raw connection from the
+        // pool's options with 300 ms lock, 1 s statement and 1 s idle at
+        // startup, then sql/settings.sql checked; 5 s overall with the
+        // restoration.
+        ("venue_budget/bootstrap.rs", "", "observe_non_trading"),
+        // PS-2b's pause keeper write (spawned only by PS-3's non-trading
+        // TIME owner, itself without a production caller until PS-6): one
+        // raw connection at a time from the pool's options with 300 ms lock,
+        // 1 s statement and 1 s idle at startup, sql/settings.sql checked,
+        // 2 s per write; its lost-ACK confirmation opens one fresh one alike.
+        ("venue_budget/pause_store.rs", "", "persist"),
         // Package 3's dormant Spot owners (no production caller) do the
         // same, so the bounds of the pool they are given are inherited:
         // the N5 claim store (1 s statement and idle at startup, then
@@ -641,6 +653,15 @@ fn every_daemon_pool_and_connection_is_built_where_the_bounds_reach_it() {
         // and the cold source-audit run (1 s statement and idle at startup,
         // then sql/settings.sql: 300 ms lock).
         ("venue_budget/source_audit/run.rs", "", "begin"),
+        // 8k-2's dormant pre reader (no production caller, checked by
+        // package5a_owners_stay_dormant_or_bounded): one read-only
+        // autocommit statement on one fresh connection from the connect
+        // options its caller passes, under the caller's deadline, closed
+        // before it returns; its caller (8k-1's transport) passes the daemon
+        // pool's, as package 2's and 3's owners take theirs. Since 8k-3a it
+        // is `fetch`, the one owner of 8k-2's pre statement and of the
+        // non-trading scope's pre and post statement (PLAN-r2 §6.1).
+        ("balance_reconciliation/snapshot.rs", "", "fetch"),
     ]
     .into_iter()
     .collect();
@@ -685,19 +706,31 @@ fn every_mention_of_a_session_bound_is_a_known_one() {
         ("order_journal_balance.rs", each("set_config local")),
         ("order_journal_readiness.rs", each("set_config local")),
         ("venue_ledger_store.rs", each("set_config local")),
+        // ADR-0056 step 8l-4: the ledger's bounds, first in the balance
+        // suspension clear's transaction.
+        ("balance_accounting.rs", each("set_config local")),
         // The alarm's own session statement bound.
         ("budget_basis_alarm.rs", vec!["SET statement_timeout".to_string()]),
         // Package 2's clock store: its three Startup options, and the
         // session statement that confirms them on each new connection.
         ("venue_clock_store.rs", [each("name"), each("set_config session")].concat()),
         // Package 2's budget bootstrap: its two Startup options, and the
-        // names it checks in the settings row its first statement returns.
-        ("venue_budget/bootstrap.rs", vec![
-            "name idle_in_transaction_session_timeout".to_string(),
-            "name lock_timeout".to_string(),
-            "name statement_timeout".to_string(),
-            "name statement_timeout".to_string(),
-        ]),
+        // names it checks in the settings row its first statement returns;
+        // PS-2a's non-trading bootstrap: its three Startup options (it
+        // checks the same settings row).
+        (
+            "venue_budget/bootstrap.rs",
+            [
+                vec![
+                    "name idle_in_transaction_session_timeout".to_string(),
+                    "name lock_timeout".to_string(),
+                    "name statement_timeout".to_string(),
+                    "name statement_timeout".to_string(),
+                ],
+                each("name"),
+            ]
+            .concat(),
+        ),
         // That first statement: transaction-local, like the journal's and
         // the ledger's; two of its result columns are named after a bound.
         (
@@ -710,6 +743,8 @@ fn every_mention_of_a_session_bound_is_a_known_one() {
         ),
         // Package 2's pause restoration: its three Startup options.
         ("venue_budget/restore.rs", each("name")),
+        // PS-2b's pause keeper write: its three Startup options.
+        ("venue_budget/pause_store.rs", each("name")),
         // Package 3's cold snapshot: transaction-local limits (20 ms lock,
         // 40 ms statement, 1 s idle) set after BEGIN on a connection of the
         // pool it is given, so the inherited bounds cover BEGIN itself.
@@ -913,4 +948,279 @@ fn package4_supervised_startup_stays_out_of_production() {
     );
     assert!(!source("venue_budget/source_audit.rs").contains("fn describe_existing_source("));
     assert!(!source("venue_budget/source_audit/run.rs").contains("fn start_existing("));
+}
+
+/// Package 5a's owners on a balance daemon, one line each: what 8k-1 B,
+/// 8k-2, 8k-3a..3c, 8l-1, 8l-2, 8l-3a/3b, 8l-4a, 8l-4b, 8l-5a/5b, 8p-1,
+/// 8p-2, 8p-4, 8p-O, 8m-1 and 8m-3 (and the composition's binding of 8p-4's
+/// mark venue) add to its database paths, and that each dormant one keeps no
+/// production caller. Its one connection owner is allowed above, with its
+/// reason; its one bound site is known above. Each set is the union of the
+/// lanes' own on the composed tree (the PS lanes' owners have their own test
+/// below).
+#[test]
+fn package5a_owners_stay_dormant_or_bounded() {
+    let sources = production_sources();
+    let naming = |needle: &str| -> BTreeSet<String> {
+        sources
+            .iter()
+            .filter(|s| s.text.contains(needle))
+            .map(|s| s.file.clone())
+            .collect()
+    };
+    let outside = |needle: &str, owner: &str| -> BTreeSet<String> {
+        naming(needle).into_iter().filter(|file| !file.starts_with(owner)).collect()
+    };
+    let none = BTreeSet::<String>::new();
+    let only = |file: &str| BTreeSet::from([file.to_string()]);
+    // 8k-1 B: only 8k-2's dormant detector records the venue_discrepancy
+    // fence; the release endpoint's refusal reads the gate and sends no SQL.
+    assert_eq!(outside("VenueDiscrepancy", "balance_reconciliation/"), none);
+    // 8k-2: the detector is declared and nothing calls it; its pre reader is
+    // the connection owner allowed above.
+    // 8l-3b's dormant cash writer takes 8k-2's qualified verdict and its
+    // interval (`BaseVerdict`, `ObservationInterval`) as its input.
+    // 8l-5a's dormant re-anchor runs O1 and O2 through 8k-3a's capture.
+    let detector_users = BTreeSet::from(
+        [
+            "lib.rs",
+            "venue_ledger_store/cash/writer.rs",
+            "venue_ledger_store/cash/reanchor.rs",
+        ]
+        .map(String::from),
+    );
+    assert_eq!(outside("balance_reconciliation", "balance_reconciliation/"), detector_users);
+    assert_eq!(source("lib.rs").matches("mod balance_reconciliation;").count(), 1);
+    assert_eq!(outside("read_pre", "balance_reconciliation/"), none);
+    // 8l-1: S8-4's tables are migrations only; the production texts that
+    // name any of them are 8l-2's read-only barrier statement, 8l-3a's
+    // read-only cash statements, record_trades' one write, the
+    // unattributed-fill invalidation (PLAN-r4 §6.10), 8l-3b's cash writer
+    // (its context read and its checkpoint, discrepancy and sighting writes;
+    // PLAN-r4 §6.4), which has no production caller, and 8p-4's read-only
+    // leg-facts statement, which names dust_ledger only.
+    let tables = [
+        "cash_anchors",
+        "cash_checkpoints",
+        "cash_discrepancies",
+        "cash_sightings",
+        "cash_reanchors",
+        "cash_attested_flows",
+        "dust_ledger",
+        "accounting_invalidations",
+    ];
+    // 8l-5b's metric robsond_cash_reanchors_total names a table only inside
+    // its own name: metrics.rs holds no statement.
+    let metrics = source("metrics.rs").replace("robsond_cash_reanchors_total", "");
+    assert!(tables.iter().all(|table| !metrics.contains(table)));
+    let named: BTreeSet<String> = tables
+        .iter()
+        .flat_map(|table| naming(table))
+        .filter(|file| file != "metrics.rs")
+        .collect();
+    let cash_sql = [
+        "venue_ledger_store/cash/expected.sql",
+        "venue_ledger_store/cash/discrepancy.sql",
+        "venue_ledger_store/cash/state.sql",
+    ];
+    let (barrier, trades) = ("venue_ledger_store/settlement.sql", "venue_ledger_store/trades.rs");
+    let writer = [
+        "venue_ledger_store/cash/context.sql",
+        "venue_ledger_store/cash/writer.rs",
+    ];
+    // 8l-5b's re-anchor: its context read and its one write statement (the
+    // anchor, the re-anchor row, its flows, the checkpoint and the
+    // discrepancy's closure; PLAN-r4 §6.12), which has no production caller.
+    let reanchor_sql = [
+        "venue_ledger_store/cash/reanchor/context.sql",
+        "venue_ledger_store/cash/reanchor/write.sql",
+    ];
+    // 8p-4's leg-facts statement, which has no production caller (below).
+    let leg_facts_sql = "venue_ledger_store/leg_facts.sql";
+    let expected: BTreeSet<String> = cash_sql
+        .iter()
+        .chain([&barrier, &trades, &leg_facts_sql])
+        .chain(&writer)
+        .chain(&reanchor_sql)
+        .map(|file| file.to_string())
+        .collect();
+    assert_eq!(named, expected);
+    for file in cash_sql.iter().chain([&barrier, &writer[0], &reanchor_sql[0], &leg_facts_sql]) {
+        let text = source(file);
+        assert!(["INSERT", "UPDATE", "DELETE"].iter().all(|w| !text.contains(w)), "{file}");
+    }
+    let leg_facts: Vec<&str> = tables
+        .into_iter()
+        .filter(|table| naming(table).contains(leg_facts_sql))
+        .collect();
+    assert_eq!(leg_facts, ["dust_ledger"]);
+    assert_eq!(naming("INSERT INTO accounting_invalidations"), only(trades));
+    // 8l-3a: E(t) and the cash predicates run on their caller's connection
+    // and have no production caller yet (8l-3b, 8l-8, 8p, 8n).
+    assert_eq!(outside("read_cash_state", "venue_ledger_store/cash"), none);
+    assert_eq!(outside("CASH_STATE", "venue_ledger_store/cash"), none);
+    // 8l-3b: the cash writer is declared; 8k-3c's dormant route is its one
+    // caller (8k-3d's task calls the route).
+    let route = only("balance_reconciliation/route.rs");
+    assert_eq!(outside("CashWriter", "venue_ledger_store/cash"), route);
+    assert_eq!(naming(".conclude("), route);
+    assert_eq!(source("balance_reconciliation/route.rs").matches(".conclude(").count(), 1);
+    // 8l-5a: the re-anchor service is built nowhere in production; its
+    // endpoint takes it as a router extension, which the 5a composition adds
+    // with PS-5b's ACCOUNT reads.
+    let reanchor = "venue_ledger_store/cash/reanchor.rs";
+    let commit = "venue_ledger_store/cash/reanchor/commit.rs";
+    assert_eq!(outside("CashReanchor", "venue_ledger_store/cash"), only("api/cash_reanchor.rs"));
+    let service: BTreeSet<String> = [reanchor, commit].map(String::from).into();
+    assert_eq!(naming("CashReanchor {"), service);
+    // 8p-1: S8-5's tables are migrations; 8p-2's boundary owner is the one
+    // production text naming any of them. It inserts the pending snapshot
+    // rows and reads the activation basis 8m will write, on the bounds of
+    // balance_accounting.rs; the other three wait for 8p-5..9.
+    assert_eq!(naming("boundary_snapshots"), only("boundary.rs"));
+    assert_eq!(naming("activation_bases"), only("boundary.rs"));
+    let later = [
+        "boundary_reopenings",
+        "boundary_snapshot_revisions",
+        "boundary_carried_legs",
+    ];
+    assert_eq!(later.iter().flat_map(|table| naming(table)).collect::<BTreeSet<_>>(), none);
+    let boundary = squeeze(&source("boundary.rs"));
+    assert!(boundary.contains("sqlx::query(BOUNDS)"), "{boundary}");
+    assert!(!boundary.contains("set_config"), "only the ledger's bounds: {boundary}");
+    // 8m-1 and 8m-3: S8-6's runs are read only by the cutover report's
+    // statement (no writer yet, 8m-4 and 8m-5), and the report is dormant:
+    // only its module declaration names it (8m-4 and 8m-6 call it).
+    assert_eq!(naming("venue_cutover"), only("cutover_report.sql"));
+    assert_eq!(outside("cutover_report", "cutover_report"), only("lib.rs"));
+    // 8l-2: the barrier runs on its caller's connection, and neither it nor
+    // the gate's invalidity marks has a production caller yet (8l-3, 8l-7,
+    // 8l-8, 8n).
+    assert_eq!(outside("read_settlement", "venue_ledger_store/settlement.rs"), none);
+    // 8l-3b's context read embeds the barrier (one statement, PLAN-r4 §6.4)
+    // and its final qualification reads the marks; the writer is dormant.
+    // 8k-3a's dormant capture reads them before pre and after post.
+    // 8l-5b's re-anchor transaction embeds it too and reads the marks again
+    // under the row (PLAN-r4 §6.12).
+    let writer_rs = only("venue_ledger_store/cash/writer.rs");
+    let barrier_users: BTreeSet<String> =
+        writer_rs.iter().cloned().chain([commit.to_string()]).collect();
+    assert_eq!(outside("SETTLEMENT_BARRIER", "venue_ledger_store/settlement.rs"), barrier_users);
+    let capture = "balance_reconciliation/capture.rs".to_string();
+    let marks = barrier_users.iter().cloned().chain([capture]).collect::<BTreeSet<_>>();
+    assert_eq!(naming("invalidity_marks"), marks);
+    assert_eq!(naming(".pending_evidence("), none);
+    // 8l-4a: its writers run on the journal's and the clear's bounded
+    // transactions (balance_accounting.rs, a known bound site above); the
+    // generation cell is published in production only by the supervised
+    // branch of the daemon's assembly, which needs a SpotReady production
+    // never builds (package4_supervised_startup_stays_out_of_production).
+    assert_eq!(naming("generation.publish("), only("daemon.rs"));
+    let daemon = squeeze(&source("daemon.rs"));
+    assert_eq!(daemon.matches("generation.publish(").count(), 1, "{daemon}");
+    assert!(daemon.contains("Some(ready)=>{generation.publish(ready.generation().clone());"));
+    // 8l-4b: every production projector apply passes the context's step (its
+    // bounds first, on the projector's pool): the append path, the stream
+    // repair and the projection worker, which takes the manager's context.
+    assert_eq!(naming("apply_event_to_projections("), none);
+    let steps: BTreeSet<String> = [
+        "event_streams.rs",
+        "position_manager.rs",
+        "projection_worker.rs",
+    ]
+    .map(String::from)
+    .into();
+    assert_eq!(outside("projector_step(", "balance_accounting.rs"), steps);
+    assert!(
+        daemon.contains("letaccounting=self.position_manager.read().await.balance_accounting();")
+    );
+    // 8p-2's zero reset runs the same step through the projector's
+    // owned-connection entry, on a connection it holds as a LedgerConnection,
+    // so a late or failed apply retires it raw.
+    assert_eq!(naming("apply_month_boundary_reset_on("), only("boundary.rs"));
+    let zero_reset = squeeze(&function(&source("boundary.rs"), "async fn zero_reset("));
+    assert!(
+        zero_reset.contains(
+            "letmutheld=LedgerConnection::new(pool.acquire().await?);letfetch=sqlx::query_as::<_,\
+             EventEnvelope>(ENVELOPE).bind(event_id);letenvelope=fetch.fetch_one(held.connection())\
+             .instrument(io(1)).await?;failed_seq=Some(envelope.seq);\
+             apply_month_boundary_reset_on(held.connection(),&envelope,accounting).await?;\
+             held.finished=true;"
+        ),
+        "{zero_reset}"
+    );
+    // 8p-2: the owner's two callers are the daemon's. Its balance-account
+    // poll is routed before the legacy reset (R1), and its startup writes the
+    // pending rows first. No production daemon is a balance account yet: the
+    // factory refuses Spot and a Spot start needs a supervised handoff.
+    // 5a: PS-5b's read owner implements 8p-4's mark venue (its boundary::
+    // names are the seam's trait and failure type); nothing calls the mark
+    // until 8p-5, and no other production text names the seam.
+    let users: BTreeSet<String> =
+        ["daemon.rs", "venue_clock_owner/reads.rs"].map(String::from).into();
+    assert_eq!(outside("boundary::", "boundary.rs"), users);
+    assert_eq!(outside("MarkVenue", "boundary/"), only("venue_clock_owner/reads.rs"));
+    assert_eq!(naming("mark::kline_at"), none);
+    assert!(daemon.contains(
+        "==robson_exec::venue::AccountKind::BalanceAccount{returnself.boundary_tick(now).await;}"
+    ));
+    let start_up = squeeze(&function(&source("daemon.rs"), "async fn start_up("));
+    assert!(
+        start_up.contains(
+            "->DaemonResult<()>{#[cfg(feature=\"postgres\")]ifletSome((pool,accounting))=self.\
+             boundary_owner().await{letpending=crate::boundary::write_pending(&pool,&accounting,\
+             Utc::now());crate::operation_observation::job(crate::operation_observation::Job::\
+             BoundaryTick,pending,)"
+        ),
+        "{start_up}"
+    );
+    // 8p-4: the leg-facts reader runs its one statement (above) on the
+    // connection its caller passes, so it opens none and sets no bound; nothing
+    // outside it calls it or names its statement until 8p-5.
+    let reader = "venue_ledger_store/leg_facts.rs";
+    assert_eq!(outside("read_leg_facts", reader), none);
+    assert_eq!(outside("LEG_FACTS", reader), none);
+}
+
+/// PS-2a's non-trading budget bootstrap (its connection owner is allowed
+/// above), the budget it builds and PS-3's TIME owner on it have no
+/// production caller until PS-6 composes the non-trading start.
+#[test]
+fn ps2a_non_trading_budget_stays_dormant() {
+    let sources = production_sources();
+    // PS-3: the TIME owner's non-trading constructor takes the budget and its
+    // TIME handle; nothing else does, and nothing calls the constructor yet.
+    // PS-5b: the read owner holds the same budget; nothing constructs it yet.
+    let (clock, reads) = ("venue_clock_owner.rs", "venue_clock_owner/reads.rs");
+    for (needle, owners) in [
+        ("observe_non_trading", &[][..]),
+        ("bootstrap::non_trading(", &[]),
+        ("NonTradingBudget", &[clock, reads]),
+        (".time_owner()", &[clock]),
+        ("ClockOwner::non_trading(", &[]),
+        ("SpotReads::new(", &[]),
+    ] {
+        let outside: BTreeSet<&str> = sources
+            .iter()
+            .filter(|s| s.text.contains(needle) && !s.file.starts_with("venue_budget/"))
+            .map(|s| s.file.as_str())
+            .filter(|file| !owners.contains(file))
+            .collect();
+        assert!(outside.is_empty(), "{needle} reached from {outside:?}");
+    }
+    let owner = source("venue_clock_owner.rs");
+    assert_eq!(owner.matches(".time_owner()").count(), 1, "{owner}");
+    // Its one connection inherits the pool's bounds and tightens them at
+    // startup, before its first statement.
+    let observe = squeeze(&function(
+        &source("venue_budget/bootstrap.rs"),
+        "pub(crate) async fn observe_non_trading(",
+    ));
+    assert!(
+        observe.contains(
+            r#"letoptions=(*pool.connect_options()).clone().options([("lock_timeout","300ms"),("statement_timeout","1s"),("idle_in_transaction_session_timeout","1s"),]);"#
+        ),
+        "{observe}"
+    );
+    assert!(observe.contains("letmutconnection=options.connect().await"), "{observe}");
 }

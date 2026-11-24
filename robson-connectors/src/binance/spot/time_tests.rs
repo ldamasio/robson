@@ -20,10 +20,12 @@ async fn headers(stream: &mut TcpStream) -> String {
 
 #[tokio::test]
 async fn prepared_time_is_unsigned_and_returns_before_body_collection() {
+    // Building the client loads TLS roots and can be slow on a loaded test
+    // host; only the exchange itself is bounded (as the redirect test).
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let prepared = BinanceRestClient::with_local_base_url(url).prepare_spot_time().unwrap();
     timeout(Duration::from_secs(2), async {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let prepared = BinanceRestClient::with_local_base_url(url).prepare_spot_time().unwrap();
         // Preparation itself owns no network future or request attempt.
         assert!(timeout(Duration::from_millis(20), listener.accept()).await.is_err());
         let (proceed, wait) = oneshot::channel();

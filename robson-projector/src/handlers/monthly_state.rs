@@ -16,10 +16,15 @@ use std::convert::TryFrom;
 use chrono::{DateTime, Datelike, Utc};
 use robson_eventlog::EventEnvelope;
 use rust_decimal::Decimal;
-use sqlx::PgPool;
+use sqlx::{
+    postgres::{PgArguments, PgQueryResult},
+    query::Query,
+    Acquire, PgExecutor, PgPool, Postgres,
+};
 use tracing::Instrument as _;
 
 use crate::{
+    accounting::AccountingStep,
     error::{ProjectionError, Result},
     types::{CapitalBaseRecalibrated, EntryFilled, MonthBoundaryReset, PositionClosedDomain},
 };
@@ -33,9 +38,51 @@ const INHERIT_BUDGET_MODEL: &str = r#"COALESCE(
     'hwm_v1'
 )"#;
 
-pub(crate) async fn handle_month_boundary_reset(
-    pool: &PgPool,
+/// One `monthly_state` statement: autocommit, as it always was, or on a
+/// balance-account daemon (ADR-0056 step 8l-4) `BEGIN`, the daemon's
+/// accounting step, the statement and `COMMIT`, so the accounting rows are
+/// taken before `monthly_state` and a refused step writes nothing. `on` is
+/// the pool, or (8p-2) a connection its caller owns and retires.
+async fn write<'c>(
+    on: impl Acquire<'c, Database = Postgres> + PgExecutor<'c>,
+    accounting: Option<&dyn AccountingStep>,
+    statement: Query<'_, Postgres, PgArguments>,
+) -> Result<PgQueryResult> {
+    let Some(step) = accounting else {
+        return Ok(statement
+            .execute(on)
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+            )
+            .await?);
+    };
+    let mut tx = on
+        .begin()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 2_u64),
+        )
+        .await?;
+    let mut rollback_observation = RollbackObservation::new();
+    step.run(&mut tx).await.map_err(ProjectionError::Accounting)?;
+    let written = statement
+        .execute(&mut *tx)
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
+        )
+        .await?;
+    tx.commit()
+        .instrument(
+            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 3_u64),
+        )
+        .await?;
+    rollback_observation.disarm();
+    Ok(written)
+}
+
+pub(crate) async fn handle_month_boundary_reset<'c>(
+    on: impl Acquire<'c, Database = Postgres> + PgExecutor<'c>,
     envelope: &EventEnvelope,
+    accounting: Option<&dyn AccountingStep>,
 ) -> Result<()> {
     let payload: MonthBoundaryReset =
         serde_json::from_value(envelope.payload.clone()).map_err(|e| {
@@ -74,17 +121,17 @@ pub(crate) async fn handle_month_boundary_reset(
             boundary_reset_at = EXCLUDED.boundary_reset_at
         "#,
     );
-    sqlx::query(&statement)
-        .bind(year)
-        .bind(month)
-        .bind(payload.capital_base)
-        .bind(payload.carried_positions_risk)
-        .bind(payload.timestamp)
-        .execute(pool)
-        .instrument(
-            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
-        )
-        .await?;
+    write(
+        on,
+        accounting,
+        sqlx::query(&statement)
+            .bind(year)
+            .bind(month)
+            .bind(payload.capital_base)
+            .bind(payload.carried_positions_risk)
+            .bind(payload.timestamp),
+    )
+    .await?;
 
     Ok(())
 }
@@ -92,6 +139,7 @@ pub(crate) async fn handle_month_boundary_reset(
 pub(crate) async fn handle_capital_base_recalibrated(
     pool: &PgPool,
     envelope: &EventEnvelope,
+    accounting: Option<&dyn AccountingStep>,
 ) -> Result<()> {
     let payload: CapitalBaseRecalibrated = serde_json::from_value(envelope.payload.clone())
         .map_err(|e| ProjectionError::InvalidPayload {
@@ -124,17 +172,17 @@ pub(crate) async fn handle_capital_base_recalibrated(
             carried_risk = EXCLUDED.carried_risk
         "#,
     );
-    sqlx::query(&statement)
-        .bind(year)
-        .bind(month)
-        .bind(payload.new_capital_base)
-        .bind(payload.carried_risk)
-        .bind(payload.timestamp)
-        .execute(pool)
-        .instrument(
-            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
-        )
-        .await?;
+    write(
+        pool,
+        accounting,
+        sqlx::query(&statement)
+            .bind(year)
+            .bind(month)
+            .bind(payload.new_capital_base)
+            .bind(payload.carried_risk)
+            .bind(payload.timestamp),
+    )
+    .await?;
 
     Ok(())
 }
@@ -149,9 +197,11 @@ pub(crate) async fn handle_capital_base_recalibrated(
 /// A writer may be inserting the row right now, where the first UPDATE cannot
 /// see it. Wait for it and look again, so the counter is not lost to a row that
 /// commits a moment later. Only events before the month's first row take this
-/// path.
+/// path. On a balance-account daemon each of the two transactions takes the
+/// accounting step first (ADR-0056 step 8l-4).
 async fn add_to_month_counters(
     pool: &PgPool,
+    accounting: Option<&dyn AccountingStep>,
     occurred_at: DateTime<Utc>,
     trades_opened: i32,
     realized_loss: Decimal,
@@ -162,16 +212,12 @@ async fn add_to_month_counters(
     let year = occurred_at.year() as i16;
     let month = occurred_at.month() as i16;
 
-    let updated = sqlx::query(ADD)
-        .bind(year)
-        .bind(month)
-        .bind(trades_opened)
-        .bind(realized_loss)
-        .execute(pool)
-        .instrument(
-            tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
-        )
-        .await?;
+    let updated = write(
+        pool,
+        accounting,
+        sqlx::query(ADD).bind(year).bind(month).bind(trades_opened).bind(realized_loss),
+    )
+    .await?;
     if updated.rows_affected() > 0 {
         return Ok(());
     }
@@ -183,6 +229,9 @@ async fn add_to_month_counters(
         )
         .await?;
     let mut rollback_observation = RollbackObservation::new();
+    if let Some(step) = accounting {
+        step.run(&mut tx).await.map_err(ProjectionError::Accounting)?;
+    }
     sqlx::query("LOCK TABLE monthly_state IN SHARE ROW EXCLUSIVE MODE")
         .execute(&mut *tx)
         .instrument(
@@ -215,6 +264,7 @@ async fn add_to_month_counters(
 pub(crate) async fn handle_entry_filled_monthly(
     pool: &PgPool,
     envelope: &EventEnvelope,
+    accounting: Option<&dyn AccountingStep>,
 ) -> Result<()> {
     let _payload: EntryFilled = serde_json::from_value(envelope.payload.clone()).map_err(|e| {
         ProjectionError::InvalidPayload {
@@ -223,7 +273,7 @@ pub(crate) async fn handle_entry_filled_monthly(
         }
     })?;
 
-    add_to_month_counters(pool, envelope.occurred_at, 1, Decimal::ZERO).await
+    add_to_month_counters(pool, accounting, envelope.occurred_at, 1, Decimal::ZERO).await
 }
 
 /// Add realized loss from a closed position to `monthly_state`.
@@ -233,6 +283,7 @@ pub(crate) async fn handle_entry_filled_monthly(
 pub(crate) async fn handle_position_closed_monthly(
     pool: &PgPool,
     envelope: &EventEnvelope,
+    accounting: Option<&dyn AccountingStep>,
 ) -> Result<()> {
     let payload: PositionClosedDomain =
         serde_json::from_value(envelope.payload.clone()).map_err(|e| {
@@ -248,7 +299,7 @@ pub(crate) async fn handle_position_closed_monthly(
         return Ok(());
     }
 
-    add_to_month_counters(pool, envelope.occurred_at, 0, net.abs()).await
+    add_to_month_counters(pool, accounting, envelope.occurred_at, 0, net.abs()).await
 }
 
 // The public SQLx Transaction Drop queues rollback while open. This only counts

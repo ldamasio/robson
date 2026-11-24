@@ -6,6 +6,7 @@ use std::{fmt, str::FromStr};
 use chrono::{DateTime, Utc};
 use robson_domain::PositionId;
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -27,7 +28,8 @@ pub use entry_fee::{
 };
 
 /// The orders whose execution can belong to a governed leg.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LegOrderKind {
     Entry,
     Stop,
@@ -72,7 +74,8 @@ pub struct OrderLink {
     pub client_order_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ClockVerdict {
     Valid,
     Invalid,
@@ -96,7 +99,8 @@ pub struct SeenAt {
 }
 
 /// An unsigned venue integer id, printed without signs or leading zeroes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(try_from = "String")]
 pub struct VenueIntId(u64);
 
 impl FromStr for VenueIntId {
@@ -110,6 +114,17 @@ impl FromStr for VenueIntId {
             .parse::<u64>()
             .map(Self)
             .map_err(|_| LedgerError::InvalidEvidence("venue integer id exceeds u64".to_string()))
+    }
+}
+
+impl TryFrom<String> for VenueIntId {
+    type Error = LedgerError;
+
+    /// The canonical text only (`FromStr` also takes leading zeroes).
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let id: Self = value.parse()?;
+        let canonical = id.to_string() == value;
+        canonical.then_some(id).ok_or(LedgerError::InvalidEvidence(value))
     }
 }
 

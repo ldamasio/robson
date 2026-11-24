@@ -413,6 +413,9 @@ pub struct ReleaseCounts {
 pub enum ReleaseRefusal {
     /// The latch is set: only a restart clears it.
     Latched,
+    /// An open `venue_discrepancy` waits for the typed balance release
+    /// (8k-4); this release never covers it (8k-1 B, R2).
+    AwaitsBalanceRelease,
     /// The quoted generation is not the current one.
     Stale { current: i64 },
     /// Something in `persistence_pending` has not landed.
@@ -426,6 +429,11 @@ impl fmt::Display for ReleaseRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Latched => write!(f, "latched: the journal latch is set until a restart"),
+            Self::AwaitsBalanceRelease => write!(
+                f,
+                "balance release required: an open venue_discrepancy waits for the typed balance \
+                 release"
+            ),
             Self::Stale { current } => write!(f, "stale: the current generation is {current}"),
             Self::Persisting { pending } => {
                 write!(f, "persisting: {pending} entries have not landed")
@@ -1937,6 +1945,12 @@ impl OrderJournal {
         intent: &JournaledIntent,
         class: WriteClass,
     ) -> Result<(), BeforeSendRefusal> {
+        // A read-only process authorizes no send of either class, before any
+        // row, commit or occurrence: its journal is barrier 2 (PS-1).
+        if let Some(reason) = self.gate.read_only() {
+            let refused = crate::gate::MutationRefused::ReadOnly(reason);
+            return Err(SendRefusal::NotSent(refused.to_string()).into());
+        }
         let one_attempt = self.one_attempt_per_client_id;
         let (batch, attempt_id, first) = {
             let mut state = self.lock();
@@ -3050,9 +3064,10 @@ impl OrderJournal {
 
     /// The audited release (design §2.7): risk acceptance of everything up to
     /// the generation `request.generation`, never a venue outcome and never a
-    /// booking. Refused, with nothing written, while the latch is set, when
-    /// the quoted generation is not the current one, or while anything waits
-    /// in `persistence_pending`. Then the backend's one transaction tombstones
+    /// booking. Refused, with nothing written, while the latch is set, while
+    /// an open incident waits for the typed balance release, when the quoted
+    /// generation is not the current one, or while anything waits in
+    /// `persistence_pending`. Then the backend's one transaction tombstones
     /// the uncertain intents stamped at or below it and releases the incidents
     /// whose last generation is at or below it, and the fence opens only if
     /// the generation is still the quoted one and the latch clear. A
@@ -3067,6 +3082,9 @@ impl OrderJournal {
             let (gate, state) = self.lock_both();
             if self.latch_set() {
                 return Err(ReleaseRefusal::Latched);
+            }
+            if gate.awaits_balance_release() {
+                return Err(ReleaseRefusal::AwaitsBalanceRelease);
             }
             if gate.generation() != request.generation {
                 return Err(ReleaseRefusal::Stale { current: gate.generation() });
@@ -5024,15 +5042,19 @@ mod tests {
     }
 
     /// Each latch-class source records its own reason with the latch set; the
-    /// two others close the fence with the latch clear.
+    /// three others close the fence with the latch clear.
     #[test]
-    fn the_latch_class_is_every_reason_but_two() {
+    fn the_latch_class_is_every_reason_but_three() {
         for reason in IncidentReason::ALL {
             let (_backend, journal) = journal();
             journal.gate().record(reason);
             assert!(journal.gate().fenced(), "{reason:?}");
-            let latch_class =
-                !matches!(reason, IncidentReason::UncleanStart | IncidentReason::UncertainOutcome);
+            let latch_class = !matches!(
+                reason,
+                IncidentReason::UncleanStart
+                    | IncidentReason::UncertainOutcome
+                    | IncidentReason::VenueDiscrepancy
+            );
             assert_eq!(journal.latch_set(), latch_class, "{reason:?}");
             assert_eq!(IncidentReason::parse(reason.as_str()), Some(reason));
         }
@@ -5180,6 +5202,232 @@ mod tests {
         let open = journal.gate().open_incidents();
         assert_eq!(open.len(), 1);
         assert!(open[0].last_generation > quoted);
+    }
+
+    /// 8k-1 B: `venue_discrepancy` is its own wire value, nonlatching, and
+    /// the only reason that waits for the typed balance release.
+    #[test]
+    fn venue_discrepancy_is_nonlatching_and_awaits_the_balance_release() {
+        let reason = IncidentReason::VenueDiscrepancy;
+        assert_eq!(reason.as_str(), "venue_discrepancy");
+        assert_eq!(IncidentReason::parse("venue_discrepancy"), Some(reason));
+        assert!(!reason.latches());
+        for other in IncidentReason::ALL {
+            assert_eq!(other.awaits_balance_release(), other == reason, "{other:?}");
+        }
+    }
+
+    /// R2: while a `venue_discrepancy` is open the F release is refused before
+    /// the backend is called, and nothing changes.
+    #[tokio::test]
+    async fn a_venue_discrepancy_refuses_the_release_and_changes_nothing() {
+        let (backend, journal) = journal();
+        epoch(&journal, 3);
+        journal.gate().record(IncidentReason::VenueDiscrepancy);
+        journal.flush_pending().await;
+        let before = (journal.gate().fenced(), journal.gate().generation(), reasons(&journal));
+        assert!(before.0 && !journal.latch_set());
+
+        let refused = journal.release(release_of(before.1)).await;
+        assert_eq!(refused, Err(ReleaseRefusal::AwaitsBalanceRelease));
+        assert!(backend.releases().is_empty(), "the backend saw no release");
+        let after = (journal.gate().fenced(), journal.gate().generation(), reasons(&journal));
+        assert_eq!(after, before);
+        let rows = backend.incidents();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].released_by.is_none());
+    }
+
+    /// 5a composition of 8k-1 B and 8l-2 on one `GateState` (PLAN-r4 §9 risk
+    /// 4): a `venue_discrepancy` occurrence moves the invalidity generation
+    /// like every occurrence, and its refused F release moves neither the
+    /// invalidity generation nor the pending evidence.
+    #[tokio::test]
+    async fn a_venue_discrepancy_moves_the_invalidity_marks_and_its_refused_release_does_not() {
+        let (backend, journal) = journal();
+        epoch(&journal, 5);
+        let before = journal.gate().invalidity_marks();
+        journal.gate().record(IncidentReason::VenueDiscrepancy);
+        journal.flush_pending().await;
+        let raised = journal.gate().invalidity_marks();
+        assert_eq!(raised.generation, before.generation + 1);
+        assert_eq!(raised.pending, before.pending);
+
+        let refused = journal.release(release_of(journal.gate().generation())).await;
+        assert_eq!(refused, Err(ReleaseRefusal::AwaitsBalanceRelease));
+        assert!(backend.releases().is_empty());
+        assert_eq!(journal.gate().invalidity_marks(), raised, "a refused release moves nothing");
+        journal.gate().record(IncidentReason::VenueDiscrepancy);
+        assert_eq!(journal.gate().invalidity_marks().generation, raised.generation + 1);
+    }
+
+    /// The same release with only `unclean_start` open still releases it and
+    /// opens the fence: no other reason waits for the balance release.
+    #[tokio::test]
+    async fn an_unclean_start_alone_is_still_released() {
+        let (backend, journal) = journal();
+        epoch(&journal, 4);
+        journal.gate().record(IncidentReason::UncleanStart);
+        journal.flush_pending().await;
+        let receipt = journal.release(release_of(journal.gate().generation())).await.unwrap();
+        assert!(receipt.fence_open && !journal.gate().fenced());
+        assert_eq!(backend.releases().len(), 1);
+    }
+
+    /// Holds `release` between its entry and the stub's transaction.
+    struct HeldRelease {
+        real: Arc<StubJournalBackend>,
+        entered: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl JournalBackend for HeldRelease {
+        async fn commit(&self, batch: &JournalBatch) -> Result<(), CommitFailure> {
+            self.real.commit(batch).await
+        }
+
+        async fn record_suspension(
+            &self,
+            suspension: &StreamSuspensionRow,
+        ) -> Result<(), CommitFailure> {
+            self.real.record_suspension(suspension).await
+        }
+
+        async fn upsert_incident(&self, incident: &Incident) -> Result<(), CommitFailure> {
+            self.real.upsert_incident(incident).await
+        }
+
+        async fn release(&self, release: &ReleaseRecord) -> Result<ReleaseCounts, String> {
+            self.entered.notify_one();
+            self.resume.notified().await;
+            self.real.release(release).await
+        }
+
+        async fn attempt_states(&self, v: &str, s: &str, id: &str) -> Result<Vec<bool>, String> {
+            self.real.attempt_states(v, s, id).await
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Recorded {
+        BeforeTheCheck,
+        WhileHeld,
+        AfterTheRelease,
+    }
+
+    /// R2 over every generated schedule of one release, one `venue_discrepancy`
+    /// occurrence and the flushes around it, from a landed `unclean_start`:
+    /// the discrepancy is recorded before the release's check, while its
+    /// backend transaction is held, or after it; flushed at once or not;
+    /// flushed after the release or not; quoted generation current or stale.
+    /// The discrepancy always survives, durable and unreleased, with the fence
+    /// closed; a refused release never reaches the backend.
+    #[tokio::test]
+    async fn release_record_flush_schedules_keep_a_venue_discrepancy_fenced() {
+        let mut schedules = 0;
+        for recorded in [
+            Recorded::BeforeTheCheck,
+            Recorded::WhileHeld,
+            Recorded::AfterTheRelease,
+        ] {
+            for (flush_at_once, flush_after, stale) in
+                (0..8).map(|n| (n & 1 == 1, n & 2 == 2, n & 4 == 4))
+            {
+                schedules += 1;
+                let case = format!(
+                    "{recorded:?} at_once={flush_at_once} after={flush_after} stale={stale}"
+                );
+                let real = Arc::new(StubJournalBackend::default());
+                let held = Arc::new(HeldRelease {
+                    real: Arc::clone(&real),
+                    entered: tokio::sync::Notify::new(),
+                    resume: tokio::sync::Notify::new(),
+                });
+                let journal = Arc::new(
+                    OrderJournal::new(held.clone(), &VenueId::new("test:venue"))
+                        .with_commit_bound(BOUND),
+                );
+                epoch(&journal, 6);
+                journal.gate().record(IncidentReason::UncleanStart);
+                journal.flush_pending().await;
+                let record = || {
+                    let journal = Arc::clone(&journal);
+                    async move {
+                        journal.gate().record(IncidentReason::VenueDiscrepancy);
+                        if flush_at_once {
+                            journal.flush_pending().await;
+                        }
+                    }
+                };
+                if recorded == Recorded::BeforeTheCheck {
+                    record().await;
+                }
+                let quoted = journal.gate().generation() - i64::from(stale);
+                let mut release = std::pin::pin!(journal.release(release_of(quoted)));
+                let (outcome, entered) = tokio::select! {
+                    biased;
+                    outcome = &mut release => (outcome, false),
+                    () = held.entered.notified() => {
+                        if recorded == Recorded::WhileHeld {
+                            record().await;
+                        }
+                        held.resume.notify_one();
+                        (release.await, true)
+                    },
+                };
+                match (recorded, stale) {
+                    (Recorded::BeforeTheCheck, _) => {
+                        assert_eq!(outcome, Err(ReleaseRefusal::AwaitsBalanceRelease), "{case}")
+                    },
+                    (_, true) => assert!(
+                        matches!(outcome, Err(ReleaseRefusal::Stale { .. })),
+                        "{case}: {outcome:?}"
+                    ),
+                    (Recorded::WhileHeld, false) => {
+                        let receipt = outcome.unwrap();
+                        assert!(!receipt.fence_open, "{case}");
+                        assert_eq!(receipt.counts.incidents_released, 1, "{case}");
+                    },
+                    (Recorded::AfterTheRelease, false) => {
+                        assert!(outcome.unwrap().fence_open, "{case}")
+                    },
+                }
+                assert_eq!(entered, recorded != Recorded::BeforeTheCheck && !stale, "{case}");
+                assert_eq!(real.releases().len(), usize::from(entered), "{case}");
+                // The one occurrence, where the schedule has not made it yet.
+                if recorded == Recorded::AfterTheRelease
+                    || (recorded == Recorded::WhileHeld && stale)
+                {
+                    record().await;
+                }
+                if flush_after {
+                    journal.flush_pending().await;
+                }
+                journal.flush_pending().await;
+                let discrepancy: Vec<_> = real
+                    .incidents()
+                    .into_iter()
+                    .filter(|row| row.incident.reason == IncidentReason::VenueDiscrepancy)
+                    .collect();
+                assert_eq!(discrepancy.len(), 1, "{case}");
+                assert!(discrepancy[0].released_by.is_none(), "{case}");
+                assert_eq!(discrepancy[0].incident.count, 1, "{case}: one occurrence");
+                if entered {
+                    assert!(discrepancy[0].incident.last_generation > quoted, "{case}");
+                }
+                assert!(reasons(&journal).contains(&IncidentReason::VenueDiscrepancy), "{case}");
+                assert!(journal.gate().fenced() && !journal.latch_set(), "{case}");
+                let releases = real.releases().len();
+                // A permit up front: a release that wrongly reached the
+                // backend would complete and fail below, never hang.
+                held.resume.notify_one();
+                let last = journal.release(release_of(journal.gate().generation())).await;
+                assert_eq!(last, Err(ReleaseRefusal::AwaitsBalanceRelease), "{case}");
+                assert_eq!(real.releases().len(), releases, "{case}");
+            }
+        }
+        assert_eq!(schedules, 24);
     }
 
     /// A release whose transaction fails changes nothing: the fence stays

@@ -31,7 +31,8 @@ impl PgVenueLedger {
     /// One page, at most 1,000 trades and ten statements, the pre-read already
     /// under the server bounds. A duplicate page without cursor progress is
     /// BEGIN, the bounds, one read and ROLLBACK: no bump, no rotation update.
-    /// An opted changed page adds one exact generation statement.
+    /// An opted changed page adds one exact generation statement, and new
+    /// fills of an order with no governed leg add one invalidation statement.
     pub async fn record_trades(
         &self,
         key: &OrderKey,
@@ -86,6 +87,9 @@ impl PgVenueLedger {
             }
             if !planned.new_fills.is_empty() {
                 self.insert_fills(&mut tx,key,&planned.new_fills).await?;
+                if !matches!(planned.order.owner,OrderOwner::Leg {..}) {
+                    self.invalidate_unattributed(&mut tx,key,&planned.new_fills).await?;
+                }
             }
             self.statement();
             let updated=sqlx::query("UPDATE venue_orders SET fills_qty=$1,executed_cum=$2,trades_cursor=$3,
@@ -240,6 +244,31 @@ impl PgVenueLedger {
             .bind(key.venue.as_str()).bind(&key.account_scope).bind(&key.symbol).bind(key.exchange_order_id.to_string())
             .bind(self.tenant_id).bind(ids).bind(prices).bind(quantities).bind(quotes).bind(commissions).bind(assets)
             .bind(times).bind(recorded).execute(&mut **tx).await.map_err(trade_error)?;
+        Ok(())
+    }
+
+    /// ADR-0056 step 8l-3 (PLAN-r4 §6.10): new fills of an order with no
+    /// governed leg invalidate the UTC month of each one's venue time, in one
+    /// idempotent statement. Leg fills add none: their effect on every cash
+    /// conclusion is derived at read time.
+    async fn invalidate_unattributed(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        key: &OrderKey,
+        fills: &[StoredTrade],
+    ) -> Result<(), LedgerError> {
+        let ids: Vec<_> = fills.iter().map(|_| uuid::Uuid::now_v7()).collect();
+        let trades: Vec<_> = fills.iter().map(|f| f.trade_id.to_string()).collect();
+        let times: Vec<_> = fills.iter().map(|f| f.trade_time).collect();
+        self.statement();
+        sqlx::query("INSERT INTO accounting_invalidations (invalidation_id,tenant_id,venue_id,month,reason,
+            evidence_key,account_scope,symbol,exchange_order_id,trade_id,trade_time)
+            SELECT u.id,$1,$2,date_trunc('month',u.time AT TIME ZONE 'UTC')::date,'unattributed_fill',
+                $3||'/'||$4||'/'||u.trade,$3,$4,$5,u.trade,u.time
+            FROM UNNEST($6::uuid[],$7::text[],$8::timestamptz[]) AS u(id,trade,time) ON CONFLICT DO NOTHING")
+            .bind(self.tenant_id).bind(key.venue.as_str()).bind(&key.account_scope).bind(&key.symbol)
+            .bind(key.exchange_order_id.to_string()).bind(ids).bind(trades).bind(times)
+            .execute(&mut **tx).await.map_err(backend)?;
         Ok(())
     }
 }

@@ -290,3 +290,35 @@ fn journal(row: &PgRow, scope: Scope<'_>, order: &SpotOrderRecord) -> Result<Fac
         _ => Fact::Contradiction(Divergence::Journal),
     })
 }
+
+/// The 8k-2 detector's operated listing from this witness's subset and keyed
+/// facts. Any contradiction stays a contradiction; nothing is dropped.
+pub(super) fn listing(
+    operated: Operated<'_>,
+    facts: Vec<OrderFact>,
+) -> crate::balance_reconciliation::Listing {
+    use crate::balance_reconciliation::{Attribution, Listing, OperatedList, OperatedOrder};
+    Listing {
+        orders: facts
+            .into_iter()
+            .map(|fact| OperatedOrder {
+                symbol: fact.symbol,
+                order_id: fact.order_id,
+                attribution: match fact.fact {
+                    Fact::Absent => Attribution::Absent,
+                    Fact::Discovered => Attribution::Discovered,
+                    Fact::Unauthored => Attribution::Unauthored,
+                    Fact::Ledger { intent_id } => Attribution::Ledger { intent_id },
+                    Fact::Contradiction(_) => Attribution::Contradiction,
+                },
+            })
+            .collect(),
+        lists: operated
+            .lists
+            .iter()
+            .map(|list| OperatedList { order_list_id: list.order_list_id })
+            .collect(),
+        unrelated_orders: operated.unrelated_orders,
+        unrelated_lists: operated.unrelated_lists,
+    }
+}

@@ -22,6 +22,9 @@ mod c8_attribution;
 #[path = "pg_tests/restart_lookup.rs"]
 pub(super) mod restart_lookup;
 
+#[path = "pg_tests/reconciliation.rs"]
+pub(crate) mod reconciliation;
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Result<()> {
@@ -56,7 +59,7 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
         ).await.map_err(|e| anyhow!("bootstrap: {e:?}"))?;
         ensure!(trace.issued() == 6, "bootstrap SQL count");
         restore::existing_pause(
-            &pool, tenant, &mut rows, &clock, Instant::now() + Duration::from_secs(2), &trace,
+            &pool, tenant, rows.pause.as_mut(), &clock, Instant::now() + Duration::from_secs(2), &trace,
         ).await.map_err(|e| anyhow!("restore: {e:?}"))?;
         ensure!(trace.issued() == 6, "absent pause issues no SQL");
         let budget = SharedBudget::from_rows(rows, start.predecessor.unclean_reason().is_some())
@@ -143,7 +146,7 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
         ClockOwner::check_triple(&triple.receipts)
             .map_err(|e| anyhow!("triple provenance: {e:?}"))?;
         ensure!(matches!(&triple.receipts[1].body, InventoryBody::OpenOrders(o)
-                if o.len() == 2 && o.iter().any(|o| o.symbol == "zzzQQQ"))
+                if o.len() == 2 && o.iter().all(|o| o.symbol == "BTCUSDT"))
             && matches!(&triple.receipts[2].body, InventoryBody::OpenOrderLists(l)
                 if l.len() == 1 && l[0].orders.len() == 1),
             "every row and raw symbol kept");
@@ -164,15 +167,15 @@ async fn actual_bootstrap_time_sample_and_closing(pool: PgPool) -> anyhow::Resul
         ensure!(venue.connections() == 3 && budget.handoffs()
             .map_err(|e| anyhow!("handoffs: {e:?}"))? == 6,
             "one TIME, one accepted triple and two charged rejected ACCOUNT reads");
-        eprintln!("C8_INVENTORY_GUARDED time=1 inventory=3 superseded_account=2 handoffs=6 weight_before_faults=107 weight_total=147 no_venue_orders=true");
+        eprintln!("C8_INVENTORY_GUARDED time=1 inventory=3 superseded_account=2 handoffs=6 weight_before_faults=33 weight_total=73 no_venue_orders=true");
         superseded_owned_order(
             owner, &clock, body_deadline, &mut lookup_control_http, &mut lookup_control_slot,
         ).await?;
         ensure!(budget.handoffs().map_err(|e| anyhow!("{e:?}"))? == 7,
             "one new charged lookup survives supersession");
-        // 400 - (107 + 2 * 20 + 4) = 249: twelve ACCOUNT reservations,
-        // then exactly nine unit weights. No fresh lease or refund on EOF.
-        verify_budget_remaining(&budget, &clock, 12, 9)?;
+        // 400 - (33 + 2 * 20 + 4) = 323: sixteen ACCOUNT reservations,
+        // then exactly three unit weights. No fresh lease or refund on EOF.
+        verify_budget_remaining(&budget, &clock, 16, 3)?;
         eprintln!("C8_LOOKUP_CLOCK_CONTROL superseded_http_400=1 retained_lookup_weight=4 connections=1");
 
         Ok::<_, anyhow::Error>(())
@@ -339,9 +342,16 @@ pub(crate) async fn run_held_inventory_rehearsal(
         ensure!(start.predecessor.unclean_reason().is_some());
         ensure!(matches!(bootstrap::production_input(), Err(BudgetError::PrerequisiteRefusal)));
         let restore_trace = Trace::default();
-        restore::existing_pause(pool, tenant, &mut rows, &clock, deadline, &restore_trace)
-            .await
-            .map_err(|e| anyhow!("held pause: {e:?}"))?;
+        restore::existing_pause(
+            pool,
+            tenant,
+            rows.pause.as_mut(),
+            &clock,
+            deadline,
+            &restore_trace,
+        )
+        .await
+        .map_err(|e| anyhow!("held pause: {e:?}"))?;
         ensure!(restore_trace.issued() == 0, "empty fixture has no restored pause");
         let budget =
             SharedBudget::from_rows(rows, true).map_err(|e| anyhow!("held budget: {e:?}"))?;
@@ -429,8 +439,8 @@ pub(crate) async fn run_held_inventory_rehearsal(
         let selected = c8_attribution::select(scope, orders, lists)
             .map_err(|e| anyhow!("operated subset: {e:?}"))?;
         ensure!(
-            selected.unrelated_orders == 1 && selected.unrelated_lists == 1,
-            "unrelated pair and list kept, never parsed as another asset"
+            selected.unrelated_orders == 0 && selected.unrelated_lists == 1,
+            "scoped orders carry no unrelated pair; its list kept, never parsed as another asset"
         );
         ensure!(
             selected.lists
@@ -634,7 +644,7 @@ pub(crate) async fn run_held_inventory_rehearsal(
                 && counters() == lookup_before,
             "one lookup handoff, no retry and no SQL during that request"
         );
-        verify_budget_remaining(&budget, &clock, 14, 9)?;
+        verify_budget_remaining(&budget, &clock, 18, 3)?;
         Ok::<_, anyhow::Error>(HeldLookupWitness {
             sample,
             lookup_sample: lookup.mark.sample,
@@ -693,7 +703,7 @@ pub(crate) async fn run_held_inventory_rehearsal(
 }
 
 fn verify_triple_budget(budget: &SharedBudget, clock: &NativeClock) -> anyhow::Result<()> {
-    verify_budget_remaining(budget, clock, 14, 13)
+    verify_budget_remaining(budget, clock, 18, 7)
 }
 
 fn verify_budget_remaining(

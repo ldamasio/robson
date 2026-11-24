@@ -95,15 +95,14 @@ async fn setup(pool: &PgPool) -> Result<Uuid> {
     let tenant = Uuid::now_v7();
     sqlx::query("INSERT INTO accounting_state(tenant_id,venue_id,budget_model) VALUES($1,'binance:spot','hwm_v1')")
         .bind(tenant).execute(pool).await?;
-    sqlx::query(
-        "INSERT INTO venue_accounts(venue_id,account_scope,tenant_id,uid,bound_at,cutover_id)
-         VALUES('binance:spot',$1,$2,'local-fixture',now(),$3)",
-    )
-    .bind(SCOPE)
-    .bind(tenant)
-    .bind(Uuid::now_v7())
-    .execute(pool)
-    .await?;
+    // Bound to a cutover run of the tenant (M56's foreign key).
+    sqlx::query(include_str!("../../tests/fixtures/bound_venue_account.sql"))
+        .bind("binance:spot")
+        .bind(SCOPE)
+        .bind(tenant)
+        .bind("local-fixture")
+        .execute(pool)
+        .await?;
     sqlx::query(
         "CREATE INDEX idx_leg_routes_spot_scope_position
           ON public.leg_routes(account_scope,position_id) WHERE venue_id='binance:spot'",
@@ -562,17 +561,14 @@ struct R2AuditAnchor {
 }
 
 async fn r2_seed_decoy_account(pool: &PgPool, tenant: Uuid) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO public.venue_accounts
-          (venue_id,account_scope,tenant_id,uid,bound_at,cutover_id)
-         VALUES ('binance:spot',$1,$2,$3,now(),$4)",
-    )
-    .bind(R2_DECOY_SCOPE)
-    .bind(tenant)
-    .bind(R2_DECOY_UID)
-    .bind(Uuid::now_v7())
-    .execute(pool)
-    .await?;
+    // Bound to the tenant's cutover run, which setup() created (M56).
+    sqlx::query(include_str!("../../tests/fixtures/bound_venue_account.sql"))
+        .bind("binance:spot")
+        .bind(R2_DECOY_SCOPE)
+        .bind(tenant)
+        .bind(R2_DECOY_UID)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

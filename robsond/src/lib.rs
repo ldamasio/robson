@@ -46,6 +46,16 @@ extern crate self as robsond;
 
 pub mod api;
 pub mod auth;
+#[cfg(feature = "postgres")]
+#[cfg_attr(
+    not(all(test, feature = "crash-points")),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "8k-2 detector: no production caller until 8k-1 transport and 8k-3 consequences"
+    )
+)]
+mod balance_reconciliation;
 mod capability;
 pub mod circuit_breaker;
 pub mod config;
@@ -82,7 +92,16 @@ pub mod stop;
 pub mod venue;
 
 #[cfg(feature = "postgres")]
+mod balance_accounting;
+// ADR-0056 step 8p-2: a balance-account daemon's month boundaries.
+#[cfg(feature = "postgres")]
+mod boundary;
+// ADR-0056 step 8m-3: the cutover report, read only; 8m-4 and 8m-6 call it.
+#[cfg(feature = "postgres")]
 pub mod budget_basis_alarm;
+#[cfg(feature = "postgres")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod cutover_report;
 #[cfg(feature = "postgres")]
 pub mod db_session;
 #[cfg(feature = "postgres")]

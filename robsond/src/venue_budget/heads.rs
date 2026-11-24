@@ -16,8 +16,29 @@ use robson_exec::{
     clock_records::{RawClockCapture, TICK_MAX},
     venue_clock::TickCapture,
 };
+use tokio::sync::Notify;
+use uuid::Uuid;
 
 use super::BudgetError;
+
+/// The latest 418/429 a pause row must cover (PLAN §6.5): a fresh UUIDv7, its
+/// status, the head capture's end tick (its clock domain), the checked
+/// duration in seconds and an audit wall-clock end. Replaced only by one that
+/// ends no earlier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PauseObservation {
+    pub(crate) id: Uuid,
+    pub(crate) status: i16,
+    pub(crate) observed: TickCapture,
+    pub(crate) seconds: u64,
+    pub(crate) end: TickCapture,
+    pub(crate) until: Option<DateTime<chrono::Utc>>,
+}
+
+/// Registers the restriction level at start, at 0 (PLAN §6.11).
+pub(crate) fn register_level() {
+    LazyLock::force(&LEVEL);
+}
 
 #[derive(Clone, Copy)]
 struct Observation {
@@ -44,6 +65,9 @@ pub(super) struct Heads {
     pause: Option<TickCapture>,
     unresolved: bool,
     pending: bool,
+    observation: Option<PauseObservation>,
+    /// Wakes the pause keeper at each new observation.
+    pub(super) wake: std::sync::Arc<Notify>,
 }
 
 fn after(now: TickCapture, seconds: u64) -> Result<TickCapture, BudgetError> {
@@ -108,6 +132,8 @@ impl Heads {
         LEVEL.set(LEVEL.get().max(i64::from(observed_level)));
         if matches!(status, 418 | 429) {
             self.pending = true;
+            // Every 418/429 wakes the keeper, a shorter one included.
+            self.wake.notify_one();
         }
         let Some(head) = head else {
             if matches!(status, 418 | 429)
@@ -180,10 +206,21 @@ impl Heads {
                     .map(|seconds| seconds.max(60)),
                 None => Some(60),
             };
-            match seconds.and_then(|seconds| after(now, seconds).ok()) {
-                Some(end) => match self.pause {
+            match seconds.and_then(|seconds| Some((seconds, after(now, seconds).ok()?))) {
+                Some((seconds, end)) => match self.pause {
                     Some(old) if end.elapsed_since(&old).is_err() => {},
-                    _ => self.pause = Some(end),
+                    _ => {
+                        self.pause = Some(end);
+                        let wall = head.wall_seconds.saturating_add_unsigned(seconds);
+                        self.observation = Some(PauseObservation {
+                            id: Uuid::now_v7(),
+                            status: i16::try_from(status).unwrap_or(429),
+                            observed: now,
+                            seconds,
+                            end,
+                            until: DateTime::from_timestamp(wall, 0),
+                        });
+                    },
                 },
                 None => self.unresolved = true,
             }
@@ -212,7 +249,9 @@ impl Heads {
             .map(|value| value.severity)
             .max()
             .unwrap_or(0);
-        LEVEL.set(if self.pending || self.unresolved {
+        // A landed 418/429 still blocks every send, so still pages, to its end.
+        let paused = self.pause.is_some_and(|end| now.elapsed_since(&end).is_err());
+        LEVEL.set(if self.pending || self.unresolved || paused {
             3
         } else {
             i64::from(level)
@@ -232,5 +271,16 @@ impl Heads {
     }
     pub(super) fn pending(&self) -> bool {
         self.pending || self.unresolved
+    }
+    /// The observation the keeper must persist while a 418/429 is pending.
+    pub(super) fn pending_observation(&self) -> Option<PauseObservation> {
+        self.observation.filter(|_| self.pending)
+    }
+    /// A landed row covering `id` clears the pending pause only while `id` is
+    /// still the latest observation; `unresolved` is never cleared.
+    pub(super) fn acknowledge(&mut self, id: Uuid) {
+        if self.observation.is_some_and(|observation| observation.id == id) {
+            self.pending = false;
+        }
     }
 }

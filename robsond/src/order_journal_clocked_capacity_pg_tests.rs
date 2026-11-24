@@ -167,7 +167,10 @@ async fn run_schedule(
     let mut entered0 = Box::pin(backend0.commit_clocked(&batch0, &input0));
     let mut entered1 = Box::pin(backend1.commit_clocked(&batch1, &input1));
 
-    let witness_deadline = Instant::now() + Duration::from_millis(200);
+    // The witness only observes each writer queued behind the held row; a
+    // loaded runner can take longer than 200 ms to show it (CI run
+    // 44921877471), so it allows 5 s. The order is fixed by the polls.
+    let witness_deadline = Instant::now() + Duration::from_secs(5);
     tokio::select! {
         early = &mut entered0 => anyhow::bail!("first writer finished behind held venue row: {early:?}"),
         observed = wait_on(pool, pid0, holder, None, witness_deadline) => observed?,
