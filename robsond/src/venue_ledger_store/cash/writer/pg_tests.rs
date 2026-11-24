@@ -270,6 +270,30 @@ async fn r11_4_only_opening_and_voiding_bump_the_version(pool: PgPool) -> Result
     Ok(())
 }
 
+/// 8m-2a: a conclusion takes the cutover certificate's key right after its
+/// bounds, before its row lock. While completion holds the key it refuses at
+/// its lock bound with nothing written; after completion the observation
+/// concludes and bumps once.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn a_conclusion_waits_for_completion(pool: PgPool) -> Result<()> {
+    use crate::balance_accounting::certificate_tests::Completion;
+    let rig = Rig::new(&pool, true).await?;
+    let (version, open) = (rig.version(&pool).await?, count_open(&pool, &rig).await?);
+    let completion = Completion::hold(&pool).await?;
+    let attempt = rig.attempt(&pool, at(60_000), dec!(1050)).await?;
+    let refused = rig.writer(&pool).conclude(&attempt).await;
+    ensure!(
+        matches!(&refused, Err(CashRefusal::Ledger(LedgerError::Backend(_)))),
+        "{refused:?}"
+    );
+    ensure!((rig.version(&pool).await?, count_open(&pool, &rig).await?) == (version, open));
+    completion.release().await?;
+    let done = rig.conclude(&pool, at(60_000), dec!(1050)).await?;
+    ensure!(done.bumped.is_some() && rig.version(&pool).await? == version + 1, "{done:?}");
+    Ok(())
+}
+
 /// v16:494-495: a clean observation voids extra cash, never missing cash.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
@@ -958,6 +982,7 @@ fn shape(trace: &[String]) -> Vec<&'static str> {
             "BEGIN" => "begin",
             "COMMIT" => "commit",
             sql if sql == BOUNDS => "bounds",
+            sql if sql == robson_eventlog::certificate::PARTICIPATE => "key",
             sql if sql == ACCOUNTING_ROWS => "lock",
             sql if sql.starts_with("WITH locked AS (") => "bump",
             sql if sql.contains("UPDATE public.spot_order_set_generation") => "cas",
@@ -990,16 +1015,17 @@ async fn proxied(pool: &PgPool) -> Result<(DbProxy, PgPool)> {
     Ok((proxy, proxied))
 }
 
-/// PLAN-r4 §6.4 / §7.2: each branch's exact statements, at most nine, by
-/// proxy trace; then, at §7.2's cardinality with the barrier embedded, every
-/// conclusion holds the rows well inside 400 ms.
+/// PLAN-r4 §6.4 / §7.2: each branch's exact statements, at most ten with the
+/// certificate's key (8m-2a), by proxy trace; then, at §7.2's cardinality
+/// with the barrier embedded, every conclusion holds the rows well inside
+/// 400 ms.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
-async fn cash_conclusion_is_at_most_nine_statements_within_its_bound(pool: PgPool) -> Result<()> {
+async fn cash_conclusion_is_at_most_ten_statements_within_its_bound(pool: PgPool) -> Result<()> {
     let (proxy, through) = proxied(&pool).await?;
     let rig = Rig::new(&pool, true).await?;
-    let head = ["begin", "bounds", "lock", "context"];
-    let bumped = ["begin", "bounds", "lock", "context", "bump", "cas"];
+    let head = ["begin", "bounds", "key", "lock", "context"];
+    let bumped = ["begin", "bounds", "key", "lock", "context", "bump", "cas"];
     let cases: [(i64, Decimal, Vec<&str>); 8] = [
         (1, dec!(1000), [&head[..], &["checkpoint", "commit"]].concat()),
         (2, dec!(1050), [&bumped[..], &["open", "commit"]].concat()),
@@ -1015,10 +1041,10 @@ async fn cash_conclusion_is_at_most_nine_statements_within_its_bound(pool: PgPoo
         proxy.enable_exact_query_trace(16);
         rig.writer(&through).conclude(&attempt).await?;
         let trace = proxy.query_trace();
-        ensure!(shape(&trace) == expected && trace.len() <= 9, "{n}: {:?}", shape(&trace));
+        ensure!(shape(&trace) == expected && trace.len() <= 10, "{n}: {:?}", shape(&trace));
     }
-    // Late evidence in both missing sightings, then re-detection: nine; and
-    // late evidence voiding the new one, then a clean observation: nine.
+    // Late evidence in both missing sightings, then re-detection: ten; and
+    // late evidence voiding the new one, then a clean observation: ten.
     for n in [6, 8] {
         rig.book.fill(&pool, &Fill::foreign(at(n * 60_000 + 100))).await?;
     }
@@ -1479,6 +1505,7 @@ async fn the_balance_epoch_start_adds_only_the_row_lock(pool: PgPool) -> Result<
     };
     let unclean = [
         "BEGIN",
+        "SELECT pg_advisory_xact_lock_shared(1380057174, 14445)",
         "SELECT epoch_id, epoch_seq, marker_version",
         "INSERT INTO process_epochs (epoch_id,",
         "UPDATE order_intents SET uncertain_generation",
@@ -1486,7 +1513,9 @@ async fn the_balance_epoch_start_adds_only_the_row_lock(pool: PgPool) -> Result<
         "SELECT reason, first_at, last_at,",
         "COMMIT",
     ];
-    let clean = [unclean[0], unclean[1], unclean[2], unclean[5], unclean[6]];
+    let clean = [
+        unclean[0], unclean[1], unclean[2], unclean[3], unclean[6], unclean[7],
+    ];
     let (usdm, balance) = (Uuid::now_v7(), Book::new(&pool).await?.tenant);
     for (round, expected) in [&unclean[..], &clean[..]].into_iter().enumerate() {
         if round == 1 {
@@ -1508,7 +1537,8 @@ async fn the_balance_epoch_start_adds_only_the_row_lock(pool: PgPool) -> Result<
             balance_trace.len() == usdm_trace.len() + 1,
             "balance {round}: {balance_trace:?}"
         );
-        ensure!(balance_trace.remove(1) == ACCOUNTING_ROWS && balance_trace == usdm_trace);
+        // The row lock right after the certificate's key (8m-2a).
+        ensure!(balance_trace.remove(2) == ACCOUNTING_ROWS && balance_trace == usdm_trace);
     }
     Ok(())
 }

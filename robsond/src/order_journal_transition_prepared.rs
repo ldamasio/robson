@@ -563,9 +563,10 @@ fn assert_trace(wire: &Wire, prefixes: &[&str]) {
 }
 
 const READ: &str = "SELECT";
-const WRITER_FENCE: [&str; 3] = [
+const WRITER_FENCE: [&str; 4] = [
     "BEGIN",
     "SELECT set_config('lock_timeout'",
+    "SELECT pg_advisory_xact_lock_shared",
     "UPDATE accounting_state",
 ];
 

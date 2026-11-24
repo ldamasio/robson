@@ -358,7 +358,8 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
         let ack = work.persist().await?.context("one changed projected commit")?;
         let write_sql = current_ledger.statements_total() - before;
         let version_delta = ack.accounting_version - accounting;
-        ensure!(write_sql == 9 && version_delta == 1);
+        // With the certificate's key before the bump (8m-2a).
+        ensure!(write_sql == 10 && version_delta == 1);
         let held_after_commit = receiver.pending() == Some(evidence);
         ensure!(held_after_commit, "a commit alone retires nothing");
         blocker.adopt_commit(ack.accounting_version).await?;
@@ -378,7 +379,7 @@ async fn projected_native_order_advances_execution_after_restart(pool: PgPool) -
         let (changed, commit) = receiver.replay_original(&record, evidence).await?;
         let duplicate_sql = current_ledger.statements_total() - before;
         let duplicate_commits = usize::from(commit);
-        ensure!(!changed && duplicate_commits == 0 && duplicate_sql == 4);
+        ensure!(!changed && duplicate_commits == 0 && duplicate_sql == 5);
         ensure!(receiver.pending() == Some(evidence));
         ensure!(
             support::snapshot(&fixture).await == committed

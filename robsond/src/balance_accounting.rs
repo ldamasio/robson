@@ -9,12 +9,20 @@
 //! input. A missing CAS row refuses, and the caller rolls its whole
 //! transaction back. A position account (USD-M) builds no context, so its
 //! statements are the ones it always sent.
+//!
+//! Every bump here is a certification input's write, so it runs under the
+//! cutover certificate's shared key (ADR-0056 step 8m-2a, 8m PLAN-r4 §6.7):
+//! [`BalanceAccounting::advance`] takes it as its first statement; a writer
+//! that took it earlier, before a row lock of its own, passes its
+//! [`Participating`] proof to [`BalanceAccounting::advance_participating`] or
+//! [`BalanceAccounting::advance_from`], so the key is taken once.
 use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, PoisonError, RwLock},
 };
 
+use robson_eventlog::certificate::{participate, Participating};
 use robson_exec::{
     order_journal::DEFAULT_ACCOUNT_SCOPE,
     venue::{AccountKind, VenueId},
@@ -29,6 +37,10 @@ use crate::spot_order_set_store::JournalGeneration;
 #[cfg(test)]
 #[path = "balance_accounting_pg_tests.rs"]
 mod pg_tests;
+
+#[cfg(test)]
+#[path = "certificate_participation_pg_tests.rs"]
+pub(crate) mod certificate_tests;
 
 /// The ledger's transaction-local server bounds, the first statement after
 /// `BEGIN` of every transaction this context opens (PLAN-r4 §7.2).
@@ -99,6 +111,15 @@ pub(crate) enum AccountingRefusal {
     NoAccountingRow,
     #[error("balance accounting refused: stale order-set generation")]
     StaleGeneration,
+    #[error("balance accounting refused: the venue's version is not the expected one")]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "advance_from's refusal; 8m-4's tx2b and 8l-5 call it"
+        )
+    )]
+    VersionMoved,
 }
 
 impl BalanceAccounting {
@@ -128,15 +149,58 @@ impl BalanceAccounting {
         }
     }
 
-    /// The bump and, when a generation is installed, its CAS: two statements
-    /// on the caller's transaction, right after its bounds, on the cell's
-    /// generation as read once here. The context venue's new version; `None`
-    /// when the tenant has no row of it and nothing is installed. On any
-    /// error the caller must not commit.
+    /// The certificate's shared key, the bump and, when a generation is
+    /// installed, its CAS: three statements on the caller's transaction, right
+    /// after its bounds, on the cell's generation as read once here. The
+    /// context venue's new version; `None` when the tenant has no row of it
+    /// and nothing is installed. On any error the caller must not commit.
     pub(crate) async fn advance(
         &self,
         connection: &mut PgConnection,
     ) -> Result<Option<i64>, AccountingRefusal> {
+        let generation = self.installed()?;
+        let _key = participate(&mut *connection).await?;
+        self.bump_and_advance(connection, generation.as_ref()).await
+    }
+
+    /// [`Self::advance`] on a transaction that already holds the key: the bump
+    /// and the CAS.
+    pub(crate) async fn advance_participating(
+        &self,
+        connection: &mut PgConnection,
+        _key: &Participating,
+    ) -> Result<Option<i64>, AccountingRefusal> {
+        let generation = self.installed()?;
+        self.bump_and_advance(connection, generation.as_ref()).await
+    }
+
+    /// The conditional variant on a transaction that holds the key (8m-4's
+    /// tx2b bumps from v₁ + 1; offered to 8l-5's conditional bump): every row
+    /// of the tenant bumped in order, the context venue's required at
+    /// `expected` before it, then the CAS. Its new version, `expected + 1`;
+    /// `VersionMoved` otherwise, and the caller must not commit.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "8m-4's tx2b and 8l-5's conditional bump call it")
+    )]
+    pub(crate) async fn advance_from(
+        &self,
+        connection: &mut PgConnection,
+        _key: &Participating,
+        expected: i64,
+    ) -> Result<i64, AccountingRefusal> {
+        let generation = self.installed()?;
+        let version = self.bump(connection).await?.ok_or(AccountingRefusal::NoAccountingRow)?;
+        if Some(version) != expected.checked_add(1) {
+            return Err(AccountingRefusal::VersionMoved);
+        }
+        self.advance_generation(connection, generation.as_ref(), Some(version)).await?;
+        Ok(version)
+    }
+
+    /// The cell's generation, refused before any statement unless it is this
+    /// context's.
+    fn installed(&self) -> Result<Option<JournalGeneration>, AccountingRefusal> {
         let generation = self.generation.current();
         if generation.as_ref().is_some_and(|installed| {
             !installed.is_valid()
@@ -146,8 +210,16 @@ impl BalanceAccounting {
         }) {
             return Err(AccountingRefusal::Binding);
         }
+        Ok(generation)
+    }
+
+    async fn bump_and_advance(
+        &self,
+        connection: &mut PgConnection,
+        generation: Option<&JournalGeneration>,
+    ) -> Result<Option<i64>, AccountingRefusal> {
         let version = self.bump(connection).await?;
-        self.advance_generation(connection, generation.as_ref(), version).await?;
+        self.advance_generation(connection, generation, version).await?;
         Ok(version)
     }
 
@@ -194,7 +266,8 @@ impl BalanceAccounting {
     }
 }
 
-/// The projector's step: the bounds, then [`BalanceAccounting::advance`].
+/// The projector's step: the bounds, then [`BalanceAccounting::advance`] (the
+/// certificate's key, the bump, the CAS).
 impl AccountingStep for BalanceAccounting {
     fn run<'c>(
         &'c self,

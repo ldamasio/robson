@@ -1,6 +1,7 @@
 //! Flagged journal statements, isolated to keep the legacy debug frame small.
 use std::time::{Duration, Instant};
 
+use robson_eventlog::certificate::{participate, Participating};
 use robson_exec::order_journal::{CommitFailure, JournalBatch};
 use sqlx::{pool::PoolConnection, Connection, PgConnection, Postgres, Transaction};
 use tracing::Instrument as _;
@@ -107,19 +108,21 @@ impl PgJournalBackend {
         self
     }
 
-    /// Right after its bounds, a balance account's incident, suspension and
-    /// release transaction bumps the accounting version and advances the
-    /// generation in the owner's cell (ADR-0056 step 8l-4): two statements,
-    /// one when none is installed. The legacy journal sends nothing here.
+    /// After its bounds and the certificate's key, a balance account's
+    /// incident, suspension and release transaction bumps the accounting
+    /// version and advances the generation in the owner's cell (ADR-0056 step
+    /// 8l-4): two statements, one when none is installed. The legacy journal
+    /// sends nothing here.
     pub(super) async fn advance_auxiliary(
         &self,
         tx: &mut Transaction<'_, Postgres>,
+        key: &Participating,
     ) -> Result<(), String> {
         if !self.balance_account {
             return Ok(());
         }
         BalanceAccounting::for_journal(self.tenant_id, &self.accounting_generation)
-            .advance(tx)
+            .advance_participating(tx, key)
             .await
             .map(drop)
             .map_err(|error| error.to_string())
@@ -186,6 +189,9 @@ impl PgJournalBackend {
             )
             .await
             .map_err(known)?;
+        // The certificate's shared key before the row lock (8m PLAN-r4 §6.7),
+        // its wait bounded by the bounds above.
+        let _key = participate(tx).await.map_err(known)?;
         let version = sqlx::query_scalar::<_, i64>(
             "UPDATE accounting_state SET version = version + 1 WHERE tenant_id = $1 AND venue_id = $2 RETURNING version",
         ).bind(self.tenant_id).bind(venue_id).fetch_optional(&mut **tx)

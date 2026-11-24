@@ -16,8 +16,10 @@ async fn ensure_accounting_row_is_idempotent_and_keeps_the_stored_model(pool: Pg
     assert_eq!(first, replay);
     assert_eq!(first.version, 0);
     assert_eq!(first.budget_model, MonthlyBudgetModel::HwmV1);
-    assert_eq!(ledger.statements_total(), 10);
-    assert_eq!(proxy.stats().statements - before, 10);
+    // Six each: BEGIN, bounds, the certificate's key (8m-2a), insert, read,
+    // COMMIT.
+    assert_eq!(ledger.statements_total(), 12);
+    assert_eq!(proxy.stats().statements - before, 12);
     assert_eq!(version(&pool, tenant, SPOT).await, 0);
 }
 
@@ -176,7 +178,7 @@ async fn concurrent_preparation_keeps_one_model_and_one_route(pool: PgPool) {
         }
         assert!(rows.iter().all(|row| row == &rows[0]));
         assert_eq!(rows[0].version, 0);
-        assert_eq!(ledger.statements_total(), 5 * delays.len() as u64);
+        assert_eq!(ledger.statements_total(), 6 * delays.len() as u64);
         seed_account(&pool, other, SPOT).await;
         let position = Uuid::now_v7();
         let mut tasks = Vec::new();

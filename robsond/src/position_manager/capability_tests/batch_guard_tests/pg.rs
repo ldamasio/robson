@@ -136,25 +136,28 @@ async fn balance_refusal_full_caller_sql_bounds_include_failed_commit_cleanup(po
             .await
             .unwrap()
             .unwrap();
+        // Each audit append is seven with the certificate's try-lock (8m-2a):
+        // BEGIN, the try-lock, the sequence, the claim, the event, the stream
+        // state, COMMIT.
         let tail = match stage {
-            "sequence" => 3,
-            "idempotency" => 4,
-            "event" => 5,
-            "stream_update" => 6,
-            "deferred_commit" => 7,
+            "sequence" => 4,
+            "idempotency" => 5,
+            "event" => 6,
+            "stream_update" => 7,
+            "deferred_commit" => 8,
             "earlier_commit" => {
                 if prefix == 0 {
-                    7
+                    8
                 } else {
-                    14
+                    16
                 }
             },
-            _ => 6,
+            _ => 7,
         };
         let expected = if stage == "earlier_commit" {
-            prefix * 6 + tail
+            prefix * 7 + tail
         } else {
-            (prefix * 6 + tail) * legs
+            (prefix * 7 + tail) * legs
         };
         let trace = proxy.query_trace();
         assert_eq!(proxy.query_trace_dropped(), 0);
@@ -343,11 +346,12 @@ async fn mixed_balance_tick_preserves_and_counts_the_earlier_domain_event(pool: 
             .unwrap();
         let trace = proxy.query_trace();
         assert_eq!(proxy.query_trace_dropped(), 0);
-        // Earlier monitor event: append transaction 6 + envelope SELECT 1;
-        // its projector is audit-only (no SQL). Refusal: Failed append 6,
-        // plus SQLx cleanup ROLLBACK after a rejected final COMMIT.
-        let earlier_sql = 7;
-        let refusal_sql = if failed_commit { 7 } else { 6 };
+        // Earlier monitor event: append transaction 7 (8m-2a's try-lock) +
+        // envelope SELECT 1; its projector is audit-only (no SQL). Refusal:
+        // Failed append 7, plus SQLx cleanup ROLLBACK after a rejected final
+        // COMMIT.
+        let earlier_sql = 8;
+        let refusal_sql = if failed_commit { 8 } else { 7 };
         assert_eq!(proxy.stats().statements - before, earlier_sql + refusal_sql, "{trace:?}");
         drop(ready);
         unchanged(&f, &earlier).await;

@@ -310,14 +310,14 @@ async fn the_planned_statements_are_the_ones_sent_on_spot(pool: PgPool) {
                 batch.statements(),
                 if kind == IntentKind::Entry {
                     if outcome {
-                        9
+                        10
                     } else {
-                        8
+                        9
                     }
                 } else if outcome {
-                    8
+                    9
                 } else {
-                    7
+                    8
                 }
             );
         }
@@ -377,7 +377,7 @@ async fn a_balance_commit_counts_every_statement_as_operation_io(pool: PgPool) {
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
-async fn a_usdm_commit_issues_exactly_its_pre_8e_statements(pool: PgPool) {
+async fn a_usdm_commit_issues_its_pre_8e_statements_and_the_key(pool: PgPool) {
     let tenant = Uuid::now_v7();
     seed_account(&pool, tenant, VenueId::BINANCE_USDM).await;
     let (proxy, proxied) = through_proxy(&pool).await;
@@ -403,9 +403,10 @@ async fn a_usdm_commit_issues_exactly_its_pre_8e_statements(pool: PgPool) {
             }
         })
         .await;
-        assert_eq!(proxy.stats().statements - before, 9);
+        // Two commits, each with the certificate's key (8m-2a).
+        assert_eq!(proxy.stats().statements - before, 11);
     }
-    assert_eq!(journal.statements_total(), 18);
+    assert_eq!(journal.statements_total(), 22);
     assert_eq!(version(&pool, tenant, VenueId::BINANCE_USDM).await, 0);
     for table in [
         "spot_intent_clock",

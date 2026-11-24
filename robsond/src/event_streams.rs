@@ -374,11 +374,12 @@ pub(crate) async fn repair_position_stream(
     }
 }
 
-/// The clear: one autocommit statement, or on a balance-account daemon one
-/// transaction of six (ADR-0056 step 8l-4): `BEGIN`, the bounds, the
-/// accounting bump, the generation CAS, the clear and `COMMIT`, dropped raw
-/// on any failure. A failure before `COMMIT` leaves nothing of it; an
-/// unanswered `COMMIT` may have landed all of it (PLAN-r4 §7.1).
+/// The clear, under the cutover certificate's shared key (ADR-0056 step
+/// 8m-2a): `BEGIN`, the key, the clear, `COMMIT`; or on a balance-account
+/// daemon one transaction of seven (ADR-0056 step 8l-4): `BEGIN`, the bounds,
+/// the key, the accounting bump, the generation CAS, the clear and `COMMIT`,
+/// dropped raw on any failure. A failure before `COMMIT` leaves nothing of
+/// it; an unanswered `COMMIT` may have landed all of it (PLAN-r4 §7.1).
 #[cfg(feature = "postgres")]
 async fn clear_suspension(
     pool: &sqlx::PgPool,
@@ -390,7 +391,8 @@ async fn clear_suspension(
     const CLEAR: &str = "UPDATE stream_suspensions SET cleared_at = NOW(), repair_error = NULL \
                          WHERE suspension_id = $1";
     let Some(accounting) = accounting else {
-        let cleared = sqlx::query(CLEAR).bind(suspension_id).execute(pool).await;
+        let clear = sqlx::query(CLEAR).bind(suspension_id);
+        let cleared = robson_eventlog::certificate::execute_participating(pool, clear).await;
         return cleared.map(drop).map_err(|error| error.to_string());
     };
     let clear = async {
@@ -412,10 +414,13 @@ async fn record_repair_error(
     suspension_id: Uuid,
     error: &str,
 ) -> Result<(), String> {
-    sqlx::query("UPDATE stream_suspensions SET repair_error = $2 WHERE suspension_id = $1")
-        .bind(suspension_id)
-        .bind(error)
-        .execute(pool)
+    // The suspension is a certification input: under the certificate's
+    // shared key, as the clear (ADR-0056 step 8m-2a).
+    let record =
+        sqlx::query("UPDATE stream_suspensions SET repair_error = $2 WHERE suspension_id = $1")
+            .bind(suspension_id)
+            .bind(error);
+    robson_eventlog::certificate::execute_participating(pool, record)
         .await
         .map(drop)
         .map_err(|error| error.to_string())
@@ -504,13 +509,12 @@ async fn repair_under_lock(
             }
             applied += 1;
         }
-        sqlx::query(
+        let progress = sqlx::query(
             "UPDATE stream_suspensions SET repaired_through_seq = $2 WHERE suspension_id = $1",
         )
         .bind(suspended.suspension_id)
-        .bind(last)
-        .execute(pool)
-        .await?;
+        .bind(last);
+        robson_eventlog::certificate::execute_participating(pool, progress).await?;
         streams.note_repaired_through(stream_key, last);
         robson_exec::crash_point!(REPAIR_AFTER_PAGE);
         cursor = last;

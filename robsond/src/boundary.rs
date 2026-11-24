@@ -18,7 +18,11 @@
 use std::{future::Future, time::Duration};
 
 use chrono::{DateTime, Datelike as _, Utc};
-use robson_eventlog::{append::append_event_tx, ActorType, EventEnvelope, EventLogError};
+use robson_eventlog::{
+    append::append_event_tx,
+    certificate::{participate, Participating},
+    ActorType, EventEnvelope, EventLogError,
+};
 use robson_exec::order_journal::OrderJournal;
 use robson_projector::apply::apply_month_boundary_reset_on;
 use rust_decimal::Decimal;
@@ -94,13 +98,16 @@ pub(crate) fn io(kind: u64) -> tracing::Span {
     tracing::info_span!(target: "robson_operation", "operation_io", io_kind = kind)
 }
 
-/// `BEGIN` and the ledger's bounds, the head of every transaction that
-/// writes here. 8m-2a's shared certificate key goes right after the bounds
-/// (8m PLAN-r4 §6.7), where `advance` then finds it taken.
-async fn begin(held: &mut LedgerConnection) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
+/// `BEGIN`, the ledger's bounds and the certificate's shared key (8m PLAN-r4
+/// §6.7), the head of every transaction that writes here: the key comes
+/// before any row lock, and `advance_participating` finds it taken.
+async fn begin(
+    held: &mut LedgerConnection,
+) -> Result<(Transaction<'_, Postgres>, Participating), sqlx::Error> {
     let mut tx = held.connection().begin().instrument(io(2)).await?;
     sqlx::query(BOUNDS).execute(&mut *tx).instrument(io(1)).await?;
-    Ok(tx)
+    let key = participate(&mut tx).await?;
+    Ok((tx, key))
 }
 
 async fn bounded<T, E: Into<Failure>>(
@@ -130,8 +137,8 @@ pub(crate) async fn read_month(
 }
 
 /// The pending rows of every boundary after the certified activation basis's
-/// `as_of`, up to `now`, in one transaction: `BEGIN`, the bounds, `advance`
-/// (the bump, and the CAS when a generation is installed), the insert, then
+/// `as_of`, up to `now`, in one transaction: `BEGIN`, the bounds, the key,
+/// the bump and the CAS when a generation is installed, the insert, then
 /// `COMMIT`, or `ROLLBACK` when nothing is new, so no version moves without a
 /// row (§6.2, §7.2). How many it wrote.
 pub(crate) async fn write_pending(
@@ -141,8 +148,8 @@ pub(crate) async fn write_pending(
 ) -> Result<usize, Failure> {
     bounded(async {
         let mut held = LedgerConnection::new(pool.acquire().await?);
-        let mut tx = begin(&mut held).await?;
-        accounting.advance(&mut tx).await?;
+        let (mut tx, key) = begin(&mut held).await?;
+        accounting.advance_participating(&mut tx, &key).await?;
         let written = sqlx::query(PENDING)
             .bind(accounting.tenant_id)
             .bind(accounting.venue.as_str())
@@ -166,10 +173,10 @@ pub(crate) async fn write_pending(
 /// 8p's reset of `now`'s month at basis 0 and carried risk 0, if the month's
 /// view still finds it due in its append's own transaction (§6.2): under the
 /// month's stream lock, never on a suspended stream; `BEGIN`, the bounds, the
-/// guard, the append with the month's command id, `COMMIT`. An event already
-/// stored under that id, whose apply was lost, is not appended again but
-/// applied. The apply fetches the event and runs 8l-4b's accounting step and
-/// write (the projector's owned-connection entry, not PLAN-r3 §6.6's pooled
+/// key, the guard, the append with the month's command id, `COMMIT`. An event
+/// already stored under that id, whose apply was lost, is not appended again
+/// but applied. The apply fetches the event and runs 8l-4b's accounting step
+/// and write (the projector's owned-connection entry, not PLAN-r3 §6.6's pooled
 /// apply) on one connection within the client deadline, so a late one, its
 /// `COMMIT` unanswered included, retires that connection raw; any failure
 /// suspends the stream and records it. Whether it applied one.
@@ -200,7 +207,7 @@ pub(crate) async fn zero_reset(
             .with_command_id(reset_command_id(accounting.venue.as_str(), year, month));
     let append = bounded(async {
         let mut held = LedgerConnection::new(pool.acquire().await?);
-        let mut tx = begin(&mut held).await?;
+        let (mut tx, _key) = begin(&mut held).await?;
         let appended = match read_month(&mut *tx, accounting, now).await?.0 {
             false => None,
             true => match append_event_tx(&mut tx, &key, None, stored).await {

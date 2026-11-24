@@ -45,9 +45,9 @@ async fn spot_phase_evidence_preserves_the_native_active_order_predicate(pool: P
         ),
         "{result:?}"
     );
-    // BEGIN, the server bounds and the pre-read; the refusal retires the
-    // connection raw, without a ROLLBACK.
-    assert_eq!(f.ledger.statements_total() - statements, 3);
+    // BEGIN, the server bounds, the certificate's key (8m-2a) and the
+    // pre-read; the refusal retires the connection raw, without a ROLLBACK.
+    assert_eq!(f.ledger.statements_total() - statements, 4);
 
     const EVIDENCE: &str = "SELECT status,phase,NOT terminal FROM venue_orders
         WHERE tenant_id=$1 AND venue_id=$2 AND account_scope=$3 AND symbol=$4 AND exchange_order_id=$5";
@@ -112,9 +112,49 @@ async fn spot_writer_refuses_to_reuse_an_existing_contradictory_phase(pool: PgPo
         ),
         "{result:?}"
     );
-    // BEGIN, the server bounds and the pre-read; the refusal retires the
-    // connection raw, without a ROLLBACK.
-    assert_eq!(f.ledger.statements_total() - statements, 3);
+    // BEGIN, the server bounds, the certificate's key (8m-2a) and the
+    // pre-read; the refusal retires the connection raw, without a ROLLBACK.
+    assert_eq!(f.ledger.statements_total() - statements, 4);
+}
+
+/// Completion's stand-in (8m-2a): the cutover certificate's key exclusive
+/// until `COMMIT`.
+async fn hold(pool: &PgPool) -> sqlx::PgConnection {
+    use sqlx::Connection as _;
+    let mut held = sqlx::PgConnection::connect_with(&pool.connect_options()).await.unwrap();
+    sqlx::query("BEGIN").execute(&mut held).await.unwrap();
+    sqlx::query(robson_eventlog::certificate::EXCLUSIVE)
+        .execute(&mut held)
+        .await
+        .unwrap();
+    held
+}
+
+async fn release(mut held: sqlx::PgConnection) {
+    sqlx::query("COMMIT").execute(&mut held).await.unwrap();
+}
+
+/// 8m-2a: an order write takes the cutover certificate's key right after its
+/// bounds. While completion holds it the write refuses at its lock bound with
+/// nothing written; after completion it lands and bumps once.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn an_order_write_waits_for_completion(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let link = f.link(LegOrderKind::Sell);
+    let r = record();
+    let (version, before) = (f.version(&pool).await, snapshot(&pool).await);
+    let completion = hold(&pool).await;
+    let refused = f.ledger.record_order(&r, &link, seen(1)).await;
+    assert!(
+        matches!(refused, Err(robson_exec::venue_ledger::LedgerError::Backend(_))),
+        "{refused:?}"
+    );
+    assert_eq!(f.version(&pool).await, version);
+    assert_eq!(snapshot(&pool).await, before);
+    release(completion).await;
+    assert!(f.ledger.record_order(&r, &link, seen(1)).await.unwrap().changed);
+    assert_eq!(f.version(&pool).await, version + 1);
 }
 
 #[sqlx::test(migrations = "../migrations")]
@@ -126,20 +166,21 @@ async fn order_and_contribution_are_atomic_and_replay_is_one_read(pool: PgPool) 
     let version = f.version(&pool).await;
     let n = f.ledger.statements_total();
     assert!(f.ledger.record_order(&r, &link, seen(1)).await.unwrap().changed);
-    assert_eq!(f.ledger.statements_total() - n, 8);
+    // With the certificate's key before the bump (8m-2a).
+    assert_eq!(f.ledger.statements_total() - n, 9);
     assert_eq!(f.version(&pool).await, version + 1);
     assert_eq!(f.consumed(&pool).await, Decimal::from(2));
     let before = snapshot(&pool).await;
     let n = f.ledger.statements_total();
     assert!(!f.ledger.record_order(&r, &link, seen(99)).await.unwrap().changed);
-    // BEGIN, the server bounds, one read and ROLLBACK.
-    assert_eq!(f.ledger.statements_total() - n, 4);
+    // BEGIN, the server bounds, the certificate's key, one read and ROLLBACK.
+    assert_eq!(f.ledger.statements_total() - n, 5);
     assert_eq!(snapshot(&pool).await, before);
     r.executed_qty = Decimal::from(3);
     r.cumulative_quote_qty = Some(Decimal::from(300));
     let n = f.ledger.statements_total();
     f.ledger.record_order(&r, &link, seen(2)).await.unwrap();
-    assert_eq!(f.ledger.statements_total() - n, 8);
+    assert_eq!(f.ledger.statements_total() - n, 9);
     assert_eq!(f.consumed(&pool).await, Decimal::from(3));
     assert_eq!(f.version(&pool).await, version + 2);
     assert_eq!(
@@ -168,7 +209,7 @@ async fn definite_commit_rejection_rolls_back_every_effect(pool: PgPool) {
         Err(LedgerError::Backend(_))
     ));
     retired(&pool, pid).await;
-    wire_count(&ledger, &proxy, wire, 8);
+    wire_count(&ledger, &proxy, wire, 9);
     assert_eq!(snapshot(&pool).await, before);
     execute(&pool, "DROP TRIGGER reject_order_commit ON venue_orders").await;
     assert!(
@@ -206,7 +247,7 @@ async fn zero_and_omitted_stop_placeholders_converge_on_real_rows(pool: PgPool) 
                 link.client_order_id = r.client_order_id.clone();
                 let n = f.ledger.statements_total();
                 f.ledger.record_order(&r, &link, seen(1)).await.unwrap();
-                assert_eq!(f.ledger.statements_total() - n, 7);
+                assert_eq!(f.ledger.statements_total() - n, 8);
                 let before = snapshot(&pool).await;
                 r.stop_price = (!zero_first).then_some(Decimal::ZERO);
                 assert!(!f.ledger.record_order(&r, &link, seen(2)).await.unwrap().changed);
@@ -675,12 +716,12 @@ async fn lost_commit_ack_is_uncertain_and_replay_does_not_bump(pool: PgPool) {
         Err(LedgerError::Uncertain(_))
     ));
     retired(&pool, pid).await;
-    wire_count(&ledger, &proxy, wire, 8);
+    wire_count(&ledger, &proxy, wire, 9);
     assert_eq!(f.consumed(&pool).await, Decimal::from(2));
     let before = snapshot(&pool).await;
     let n = ledger.statements_total();
     assert!(!ledger.record_order(&record(), &link, seen(2)).await.unwrap().changed);
-    assert_eq!(ledger.statements_total() - n, 4);
+    assert_eq!(ledger.statements_total() - n, 5);
     assert_eq!(snapshot(&pool).await, before);
     assert_eq!(proxy.stats().commit_acks_dropped, 1);
 }
@@ -770,7 +811,7 @@ async fn cancellation_during_leg_update_rolls_back_and_retires_connection(pool: 
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     retired(&pool, pid).await;
-    wire_count(&ledger, &proxy, wire, 7);
+    wire_count(&ledger, &proxy, wire, 8);
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if snapshot(&pool).await == before {
@@ -904,7 +945,7 @@ async fn stalled_leg_write_is_bounded_atomic_and_pool_remains_usable(pool: PgPoo
     ));
     assert!(start.elapsed() < Duration::from_millis(2500));
     retired(&pool, pid).await;
-    wire_count(&ledger, &proxy, wire, 7);
+    wire_count(&ledger, &proxy, wire, 8);
     assert_eq!(snapshot(&pool).await, before);
     execute(&pool, "DROP TRIGGER stall_leg_write ON balance_legs").await;
     ledger
@@ -922,7 +963,9 @@ async fn wire_statement_counts_match_the_counter_and_replay_contract(pool: PgPoo
     let (proxy, proxied) = through_proxy(&pool).await;
     let ledger = PgVenueLedger::new(&proxied, f.tenant);
     let mut r = record();
-    for (seen_at, expected) in [(1, 8), (2, 4), (3, 7)] {
+    // A write takes the certificate's key before its bump (8m-2a); the
+    // replay's one read does not.
+    for (seen_at, expected) in [(1, 9), (2, 5), (3, 8)] {
         if seen_at == 3 {
             r.update_time_ms = Some(123);
         }
@@ -1295,7 +1338,7 @@ async fn locked_noop_rollback_is_counted_once_even_when_its_ack_is_lost(pool: Pg
             .await
             .unwrap();
         }
-        wire_count(&ledger, &proxy, wire, 6);
+        wire_count(&ledger, &proxy, wire, 7);
         assert_eq!(
             proxy
                 .query_trace()

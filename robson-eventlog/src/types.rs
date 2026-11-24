@@ -167,6 +167,12 @@ pub enum EventLogError {
 
     #[error("Invalid event: {0}")]
     InvalidEvent(String),
+
+    /// The cutover certificate's completion holds or waits for its key (8m
+    /// PLAN-r4 §6.7): the append took nothing, wrote nothing and may be
+    /// retried. Certain, unlike a database error.
+    #[error("the cutover certificate is completing; nothing was appended")]
+    CertificateInProgress,
 }
 
 pub type Result<T> = std::result::Result<T, EventLogError>;

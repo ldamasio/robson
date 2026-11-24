@@ -534,11 +534,11 @@ async fn clocked_transaction_declares_read_committed_despite_session_default(
     let trace = wire.proxy.query_trace();
     ensure!(
         wire.proxy.query_trace_dropped() == 0
-            && trace.len() == 7
+            && trace.len() == 8
             && trace[0] == "BEGIN ISOLATION LEVEL READ COMMITTED"
-            && trace[5].trim_start().starts_with(HELPER)
-            && is_commit(&trace[6]),
-        "explicit transaction isolation replaced BEGIN in the same seven statements: {trace:?}"
+            && trace[6].trim_start().starts_with(HELPER)
+            && is_commit(&trace[7]),
+        "explicit transaction isolation replaced BEGIN in the same eight statements: {trace:?}"
     );
     ensure!(wire.identity().is_ok(), "the original session was retained");
     Ok(())

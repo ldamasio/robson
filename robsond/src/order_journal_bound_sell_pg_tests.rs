@@ -88,8 +88,8 @@ async fn persisted_order_set_journal_bound_protection_replays_and_retains_inacti
     let id = j.intent.intent_id;
     insist(store.commit(&j).await)?;
     let trace = proxy.query_trace();
-    ensure!(trace.len() == 6 && proxy.query_trace_dropped() == 0);
-    ensure!(trace[4].contains("UPDATE public.spot_order_set_generation g") && trace[5] == "COMMIT");
+    ensure!(trace.len() == 7 && proxy.query_trace_dropped() == 0);
+    ensure!(trace[5].contains("UPDATE public.spot_order_set_generation g") && trace[6] == "COMMIT");
     let active = member(&pool, &g, id).await?;
     ensure!(active.0 == "leg" && active.1.as_deref() == Some(SYMBOL));
     ensure!(active.2 == Some(position) && active.3 == Some(position) && active.4 && !active.5);

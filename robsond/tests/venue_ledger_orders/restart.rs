@@ -591,7 +591,8 @@ async fn old_owner(
     proxy.set_mode(ProxyMode::DropCommitAckOf("UPDATE venue_orders"));
     let before = ledger.statements_total();
     ensure!(matches!(work.persist().await, Err(LedgerError::Uncertain(_))));
-    ensure!(ledger.statements_total() - before == 9 && proxy.stats().commit_acks_dropped == 1);
+    // With the certificate's key before the bump (8m-2a).
+    ensure!(ledger.statements_total() - before == 10 && proxy.stats().commit_acks_dropped == 1);
     ensure!(
         receiver.pending() == Some(evidence),
         "lost native reply keeps the observation pending"

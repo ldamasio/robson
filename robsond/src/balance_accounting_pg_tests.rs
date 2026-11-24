@@ -37,7 +37,7 @@ use crate::{
 };
 
 const SPOT: &str = VenueId::BINANCE_SPOT;
-const BEGIN_TX: [&str; 4] = ["begin", "bounds", "bump", "cas"];
+const BEGIN_TX: [&str; 5] = ["begin", "bounds", "key", "bump", "cas"];
 
 /// An accounting row of `venue` for `tenant_id`, at version 0.
 async fn account(pool: &PgPool, tenant_id: Uuid, venue: &str) {
@@ -232,6 +232,7 @@ async fn traced<T>(proxy: &DbProxy, work: impl Future<Output = T>) -> (T, Vec<&'
             "COMMIT" => "commit",
             "ROLLBACK" => "rollback",
             sql if sql.starts_with("SELECT set_config('lock_timeout'") => "bounds",
+            sql if sql == robson_eventlog::certificate::PARTICIPATE => "key",
             sql if sql.starts_with("WITH locked AS (") => "bump",
             sql if sql.contains("UPDATE public.spot_order_set_generation") => "cas",
             sql if sql.starts_with("UPDATE positions_current") => "positions",
@@ -332,11 +333,11 @@ async fn auxiliary(backend: &PgJournalBackend, write: &str) -> Result<(), String
 }
 
 /// A balance journal's incident, suspension and release each add the bump
-/// and the CAS right after main's bounds (6, 6, 8), move the version once and
-/// keep the generation current; with none installed only the bump is added
-/// (5, 5, 7); the legacy (USD-M) journal sends exactly its statements (3, 3,
-/// 5) and moves nothing. A non-trading journal's are the plain balance
-/// journal's (PS-1).
+/// and the CAS right after main's bounds and the certificate's key (7, 7, 9),
+/// move the version once and keep the generation current; with none installed
+/// only the bump is added (6, 6, 8); the legacy (USD-M) journal sends its
+/// statements and the key (4, 4, 6) and moves nothing. A non-trading
+/// journal's are the plain balance journal's (PS-1).
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn balance_journal_writers_add_the_bump_and_the_cas(pool: PgPool) {
@@ -355,10 +356,10 @@ async fn balance_journal_writers_add_the_bump_and_the_cas(pool: PgPool) {
         .with_balance_account(true)
         .non_trading();
     let journals: [(&PgJournalBackend, &BalanceAccounting, &[&str]); 4] = [
-        (&opted, &installed, &["bounds", "bump", "cas"]),
-        (&plain, &unopted, &["bounds", "bump"]),
-        (&legacy, &unopted, &[]),
-        (&non_trading, &unopted, &["bounds", "bump"]),
+        (&opted, &installed, &["bounds", "key", "bump", "cas"]),
+        (&plain, &unopted, &["bounds", "key", "bump"]),
+        (&legacy, &unopted, &["key"]),
+        (&non_trading, &unopted, &["bounds", "key", "bump"]),
     ];
     for (backend, accounting, added) in journals {
         backend.check_ready().await.unwrap();
@@ -372,7 +373,7 @@ async fn balance_journal_writers_add_the_bump_and_the_cas(pool: PgPool) {
             let (written, shape) = traced(&proxy, auxiliary(backend, write)).await;
             written.unwrap_or_else(|error| panic!("{write}: {error}"));
             assert_eq!(shape, [&["begin"][..], added, body, &["commit"][..]].concat(), "{write}");
-            let moved = i64::from(!added.is_empty());
+            let moved = i64::from(added.contains(&"bump"));
             let expected = (version + moved, generation.map(|g| g + moved));
             assert_eq!(versions(&pool, accounting).await, expected, "{write}");
         }
@@ -418,10 +419,10 @@ async fn balance_release_bumps_the_version(pool: PgPool) {
 }
 
 /// On a balance daemon the startup repair clears a suspension in one
-/// transaction of six (BEGIN, bounds, bump, CAS, the clear, COMMIT) and only
-/// then lets the stream take appends; on USD-M the clear stays one
-/// autocommit statement and moves nothing; a stale generation keeps the
-/// suspension on record and in memory.
+/// transaction of seven (BEGIN, bounds, the certificate's key, bump, CAS, the
+/// clear, COMMIT) and only then lets the stream take appends; on USD-M the
+/// clear is BEGIN, the key, the clear, COMMIT (8m-2a) and moves nothing; a
+/// stale generation keeps the suspension on record and in memory.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn suspension_clear_bumps_and_advances_the_generation(pool: PgPool) {
@@ -433,8 +434,8 @@ async fn suspension_clear_bumps_and_advances_the_generation(pool: PgPool) {
     let repair = repair_position_stream(&proxied, tenant, &streams, &key, &entry, Some(&installed));
     let (outcome, shape) = traced(&proxy, repair).await;
     assert_eq!(outcome, RepairOutcome::Cleared { applied: 0 });
-    let tail = ["begin", "bounds", "bump", "cas", "clear", "commit"];
-    assert_eq!(shape[shape.len() - 6..], tail, "{shape:?}");
+    let tail = ["begin", "bounds", "key", "bump", "cas", "clear", "commit"];
+    assert_eq!(shape[shape.len() - 7..], tail, "{shape:?}");
     assert_eq!(shape.iter().filter(|s| **s == "begin").count(), 1, "{shape:?}");
     assert_eq!(versions(&pool, &installed).await, (1, Some(1)));
     assert!(qualifies(&pool, &installed).await);
@@ -444,12 +445,9 @@ async fn suspension_clear_bumps_and_advances_the_generation(pool: PgPool) {
     let repair = repair_position_stream(&proxied, tenant, &streams, &key, &entry, None);
     let (outcome, shape) = traced(&proxy, repair).await;
     assert_eq!(outcome, RepairOutcome::Cleared { applied: 0 });
-    assert_eq!(shape.last(), Some(&"clear"), "{shape:?}");
+    assert_eq!(shape[shape.len() - 4..], ["begin", "key", "clear", "commit"], "{shape:?}");
     assert_eq!(shape.iter().filter(|s| **s == "clear").count(), 1, "{shape:?}");
-    assert!(
-        !shape.iter().any(|s| ["begin", "bounds", "bump", "cas"].contains(s)),
-        "{shape:?}"
-    );
+    assert!(!shape.iter().any(|s| ["bounds", "bump", "cas"].contains(s)), "{shape:?}");
     assert_eq!(versions(&pool, &installed).await, (1, Some(1)));
     assert!(cleared(&pool, &entry).await && !streams.is_suspended(&key));
 
@@ -1032,12 +1030,13 @@ async fn month(pool: &PgPool, at: DateTime<Utc>) -> (Decimal, Decimal, String) {
 }
 
 /// Balance daemon: each autocommit `monthly_state` path is one transaction of
-/// six (BEGIN, bounds, one bump, CAS, the write, COMMIT); the counter fallback
-/// is 6 + 7 = 13; each transaction bumps once and keeps the generation
-/// current. Without an installed generation it is one statement shorter.
+/// seven (BEGIN, bounds, the certificate's key, one bump, CAS, the write,
+/// COMMIT); the counter fallback is 7 + 8 = 15; each transaction bumps once
+/// and keeps the generation current. Without an installed generation it is
+/// one statement shorter.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
-async fn balance_projector_sends_six_per_path_and_thirteen_on_the_fallback(pool: PgPool) {
+async fn balance_projector_sends_seven_per_path_and_fifteen_on_the_fallback(pool: PgPool) {
     let installed = seed(&pool, true).await;
     let (proxy, proxied) = through_proxy(&pool).await;
     let may = Utc.with_ymd_and_hms(2027, 5, 2, 0, 0, 10).unwrap();
@@ -1067,7 +1066,7 @@ async fn balance_projector_sends_six_per_path_and_thirteen_on_the_fallback(pool:
     let applied = apply_event_to_projections_with(&proxied, &event, projector_step(Some(&unopted)));
     let (applied, shape) = traced(&proxy, applied).await;
     applied.unwrap();
-    assert_eq!(shape, ["begin", "bounds", "bump", "monthly", "commit"]);
+    assert_eq!(shape, ["begin", "bounds", "key", "bump", "monthly", "commit"]);
     assert_eq!(versions(&pool, &unopted).await, (1, None));
 }
 

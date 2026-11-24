@@ -10,6 +10,13 @@
 //! or counts the `unclean_start` incident; the same transaction reads every
 //! incident no release covered. The daemon seeds the fence from that before
 //! any venue request (design §3).
+//!
+//! The epoch and its stamping are certification inputs: the insert's
+//! transaction takes the cutover certificate's shared key first, on every
+//! venue, and the clean-stop marker runs in a transaction that takes it
+//! (ADR-0056 step 8m-2a, 8m PLAN-r4 §6.7). A start while completion holds the
+//! key waits for its `COMMIT`, within the insert's bound, and is ordered after
+//! it.
 
 use std::{future::Future, time::Duration};
 
@@ -137,6 +144,7 @@ async fn insert(
     balance: bool,
 ) -> DaemonResult<EpochStart> {
     let mut tx = pool.begin().await?;
+    let _key = robson_eventlog::certificate::participate(&mut tx).await?;
     if balance {
         sqlx::query(crate::balance_accounting::ACCOUNTING_ROWS)
             .bind(tenant_id)
@@ -264,13 +272,14 @@ impl IncidentRecord {
 /// never written while an incident of the epoch's tenant is open on record,
 /// whatever this process's memory says (ADR-0056 step 7, PR F): the stop's
 /// own check reads memory, and this one reads the record in the same
-/// statement.
+/// statement. It runs under the certificate's shared key: `BEGIN`, the key,
+/// the update, `COMMIT`.
 ///
 /// # Errors
 /// The update failed, or found no unmarked row for the epoch, or an incident
 /// is open on record.
 pub async fn mark_clean_stop(pool: &PgPool, epoch: Epoch) -> Result<(), String> {
-    let marked = sqlx::query(
+    let mark = sqlx::query(
         "UPDATE process_epochs SET clean_stop_at = NOW(), marker_version = $2
          WHERE epoch_id = $1 AND clean_stop_at IS NULL
            AND NOT EXISTS (
@@ -280,10 +289,10 @@ pub async fn mark_clean_stop(pool: &PgPool, epoch: Epoch) -> Result<(), String> 
            )",
     )
     .bind(epoch.epoch_id)
-    .bind(MARKER_VERSION)
-    .execute(pool)
-    .await
-    .map_err(|error| error.to_string())?;
+    .bind(MARKER_VERSION);
+    let marked = robson_eventlog::certificate::execute_participating(pool, mark)
+        .await
+        .map_err(|error| error.to_string())?;
     if marked.rows_affected() == 1 {
         Ok(())
     } else {

@@ -21,8 +21,14 @@ use crate::{
 /// # Returns
 /// Event ID of appended event (or existing event if idempotent duplicate)
 ///
+/// Its first statement takes the cutover certificate's key shared without
+/// waiting (8m PLAN-r4 §6.7): while completion holds or waits for it the
+/// append rolls back with nothing written. [`append_event_tx`] takes no key:
+/// its caller's transaction participates.
+///
 /// # Errors
 /// - `ConcurrentModification` if expected_seq doesn't match
+/// - `CertificateInProgress`, certain: nothing was written
 /// - `Database` on SQL errors
 pub async fn append_event(
     pool: &PgPool,
@@ -37,6 +43,17 @@ pub async fn append_event(
         )
         .await?;
     let mut rollback_observation = RollbackObservation::new();
+    if crate::certificate::try_participate(&mut tx).await?.is_none() {
+        rollback_observation.disarm();
+        // Nothing was written whether or not the rollback is answered.
+        let _ = tx
+            .rollback()
+            .instrument(
+                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 4_u64),
+            )
+            .await;
+        return Err(EventLogError::CertificateInProgress);
+    }
     let event_id = append_event_tx(&mut tx, stream_key, expected_seq, event).await?;
     tx.commit()
         .instrument(
@@ -50,6 +67,8 @@ pub async fn append_event(
 /// Append event within an existing transaction
 ///
 /// Use this when you need to append event + update projections atomically.
+/// The caller's transaction takes the certificate key first
+/// ([`crate::certificate::participate`]).
 pub async fn append_event_tx(
     tx: &mut Transaction<'_, Postgres>,
     stream_key: &str,

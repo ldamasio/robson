@@ -2255,24 +2255,24 @@ mod tests {
     async fn each_order_path_issues_its_reviewed_statement_count() {
         let rig = journal_rig();
         rig.executor.execute(vec![entry_action()]).await.unwrap();
-        assert_eq!(rig.journal.operation_statements_max(), 9, "entry");
+        assert_eq!(rig.journal.operation_statements_max(), 11, "entry");
 
         let rig = journal_rig();
         let position = rig.active_position(None).await;
         rig.executor.execute(vec![exit_action(position.id, dec!(0.1))]).await.unwrap();
-        assert_eq!(rig.journal.operation_statements_max(), 9, "exit");
+        assert_eq!(rig.journal.operation_statements_max(), 11, "exit");
 
         let rig = journal_rig();
         let position = rig.active_position(None).await;
         rig.exchange.set_trading_rules(lot_rules(dec!(0.001)));
         rig.exchange.set_rules_rejections_next(1);
         rig.executor.execute(vec![exit_action(position.id, dec!(0.1))]).await.unwrap();
-        assert_eq!(rig.journal.operation_statements_max(), 13, "exit with one retry");
+        assert_eq!(rig.journal.operation_statements_max(), 16, "exit with one retry");
 
         let rig = journal_rig();
         let position = rig.active_position(None).await;
         let old = rig.placed_stop(position.id).await;
-        assert_eq!(rig.journal.operation_statements_max(), 9, "stop");
+        assert_eq!(rig.journal.operation_statements_max(), 11, "stop");
         rig.executor
             .execute(vec![EngineAction::ReplaceInsuranceStop {
                 position_id: position.id,
@@ -2284,7 +2284,7 @@ mod tests {
             }])
             .await
             .unwrap();
-        assert_eq!(rig.journal.operation_statements_max(), 18, "replacement");
+        assert_eq!(rig.journal.operation_statements_max(), 22, "replacement");
 
         let rig = journal_rig();
         let position = rig.active_position(None).await;
@@ -2292,7 +2292,7 @@ mod tests {
         rig.exchange.set_rules_rejections_next(1);
         rig.backend.fail_commit(1, Some(JournalFault::Known));
         rig.executor.execute(vec![exit_action(position.id, dec!(0.1))]).await.unwrap();
-        assert_eq!(rig.journal.operation_statements_max(), 22, "exit with a replaced retry");
+        assert_eq!(rig.journal.operation_statements_max(), 27, "exit with a replaced retry");
 
         // The worst reviewed case: a replaced retry on a placement that then
         // withdraws both stops, because the leg left `Active` meanwhile.
@@ -2330,7 +2330,7 @@ mod tests {
             }])
             .await
             .unwrap();
-        assert_eq!(rig.journal.operation_statements_max(), 40, "the worst reviewed case");
+        assert_eq!(rig.journal.operation_statements_max(), 49, "the worst reviewed case");
         assert_eq!(rig.journal.operations_over_statement_bound(), 0);
         assert_eq!(rig.journal.operations_over_statement_bound(), 0);
     }

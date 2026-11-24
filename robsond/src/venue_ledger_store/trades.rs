@@ -28,9 +28,10 @@ pub(super) const TRADE_GENERATION: &str =
     include_str!("../spot_order_set_store/trade_generation.sql");
 
 impl PgVenueLedger {
-    /// One page, at most 1,000 trades and ten statements, the pre-read already
-    /// under the server bounds. A duplicate page without cursor progress is
-    /// BEGIN, the bounds, one read and ROLLBACK: no bump, no rotation update.
+    /// One page, at most 1,000 trades and eleven statements, the pre-read
+    /// already under the server bounds and the certificate's key. A duplicate
+    /// page without cursor progress is BEGIN, the bounds, the key, one read and
+    /// ROLLBACK: no bump, no rotation update.
     /// An opted changed page adds one exact generation statement, and new
     /// fills of an order with no governed leg add one invalidation statement.
     pub async fn record_trades(
@@ -56,6 +57,10 @@ impl PgVenueLedger {
             self.statement();
             let mut tx=held.connection().begin().await.map_err(backend)?;
             self.timeouts(&mut tx).await?;
+            // The certificate's shared key right after the bounds, before any read
+            // or row lock (8m PLAN-r4 §6.7).
+            self.statement();
+            let _key = robson_eventlog::certificate::participate(&mut tx).await.map_err(backend)?;
             let (before,existing)=self.read_trade_context(&mut tx,key,&ids).await?;
             let proposed=plan_trades(&before,self.tenant_id,page,&existing,recorded_at)?;
             if !proposed.changed {

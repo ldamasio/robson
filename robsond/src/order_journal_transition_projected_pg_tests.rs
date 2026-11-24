@@ -128,12 +128,12 @@ async fn projected_first_cancel_lost_ack_is_one_atomic_observed_write(pool: PgPo
     ensure!(matches!(result, Err(CommitFailure::Uncertain(_))));
     ensure!(wire.proxy.stats().commit_acks_dropped == 1);
     let trace = wire.proxy.query_trace();
-    ensure!(trace.len() == 7 && trace[5].contains("spot_order_set_cancel_members"));
+    ensure!(trace.len() == 8 && trace[6].contains("spot_order_set_cancel_members"));
     wire.retires(&pool).await?;
     leg.assert_bare_cancel(&pool, &cancel).await?;
     assert_projected(&pool, &binding, &cancel, transition, version + 1, false, 1).await?;
     eprintln!(
-        "Projected first cancel: 7 physical commands, native COMMIT landed without acknowledgement"
+        "Projected first cancel: 8 physical commands, native COMMIT landed without acknowledgement"
     );
     Ok(())
 }
@@ -498,7 +498,7 @@ async fn projected_first_cancel_retires_a_blocked_commit_with_all_writes_absent(
     ensure!(matches!(result, Err(CommitFailure::Uncertain(_))));
     let trace = wire.proxy.query_trace();
     ensure!(
-        trace.len() == 6 && trace[5].contains("spot_order_set_cancel_members"),
+        trace.len() == 7 && trace[6].contains("spot_order_set_cancel_members"),
         "{trace:?}"
     );
     wire.retires(&pool).await?;

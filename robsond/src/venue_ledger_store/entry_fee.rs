@@ -53,9 +53,10 @@ struct EntryFeeContext {
 
 impl PgVenueLedger {
     /// Make the leg's entry commission B final once its terminal entry's fill
-    /// set is complete and corroborates Q and C. No runtime caller yet. Four
-    /// statements when nothing changes (BEGIN, the bounds, one read,
-    /// ROLLBACK); a finalization is seven statements, eight when opted.
+    /// set is complete and corroborates Q and C. No runtime caller yet. Five
+    /// statements when nothing changes (BEGIN, the bounds, the certificate's
+    /// key, one read, ROLLBACK); a finalization is eight statements, nine when
+    /// opted.
     /// `base_asset` comes from the Spot rules: the ledger stores none.
     /// Returns the plan acted on; `Finalize` was committed.
     pub async fn finalize_entry_fee(
@@ -83,6 +84,10 @@ impl PgVenueLedger {
             self.statement();
             let mut tx = held.connection().begin().await.map_err(backend)?;
             self.timeouts(&mut tx).await?;
+            // The certificate's shared key right after the bounds, before any read
+            // or row lock (8m PLAN-r4 §6.7).
+            self.statement();
+            let _key = robson_eventlog::certificate::participate(&mut tx).await.map_err(backend)?;
             let before = self.read_entry_fee(&mut tx, position_id, base_asset).await?;
             // Consistency only: the Spot rules are the authority on the asset.
             if !before.symbol.starts_with(base_asset) {

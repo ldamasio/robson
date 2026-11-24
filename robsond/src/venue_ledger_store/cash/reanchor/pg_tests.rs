@@ -339,7 +339,7 @@ async fn o1_and_o2_qualify_on_two_statements(pool: PgPool) -> Result<()> {
     ensure!((done.mode, done.version, done.flows) == ("attested", 4, 0), "{done:?}");
     ensure!(done.delta == Some(dec!(0.005)) && f.version(&pool).await? == 4);
     let counted = (end.statements - start.statements, end.connections - start.connections);
-    ensure!(counted == (8, 3), "{counted:?}");
+    ensure!(counted == (9, 3), "{counted:?}");
     println!("REANCHOR_PRE_READS statements=2 connections=2 trace={}", trace.len());
     println!("REANCHOR_COMMAND_COUNTS statements={} connections={}", counted.0, counted.1);
     Ok(())

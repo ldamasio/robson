@@ -403,14 +403,15 @@ async fn capability_denial_audit_wire_counts_include_failure_cleanup(pool: sqlx:
         .await
         .unwrap();
     sqlx::raw_sql("CREATE FUNCTION capability_audit_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'capability fixture fault' USING ERRCODE = '23514'; END $$").execute(&pool).await.unwrap();
+    // Each with the append's certificate try-lock after BEGIN (8m-2a).
     let cases = [
-        ("success", "", 6),
-        ("sequence", "CREATE TRIGGER capability_fail BEFORE INSERT ON stream_state FOR EACH ROW EXECUTE FUNCTION capability_audit_fault()", 3),
-        ("idempotency", "CREATE TRIGGER capability_fail BEFORE INSERT ON event_idempotency FOR EACH ROW EXECUTE FUNCTION capability_audit_fault()", 4),
-        ("event", "CREATE TRIGGER capability_fail BEFORE INSERT ON event_log FOR EACH ROW EXECUTE FUNCTION capability_audit_fault()", 5),
-        ("stream_update", "CREATE TRIGGER capability_fail BEFORE UPDATE OF last_event_id ON stream_state FOR EACH ROW EXECUTE FUNCTION capability_audit_fault()", 6),
-        ("deferred_commit", "CREATE CONSTRAINT TRIGGER capability_fail AFTER INSERT ON event_log DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION capability_audit_fault()", 7),
-        ("lost_commit", "", 6),
+        ("success", "", 7),
+        ("sequence", "CREATE TRIGGER capability_fail BEFORE INSERT ON stream_state FOR EACH ROW EXECUTE FUNCTION capability_audit_fault()", 4),
+        ("idempotency", "CREATE TRIGGER capability_fail BEFORE INSERT ON event_idempotency FOR EACH ROW EXECUTE FUNCTION capability_audit_fault()", 5),
+        ("event", "CREATE TRIGGER capability_fail BEFORE INSERT ON event_log FOR EACH ROW EXECUTE FUNCTION capability_audit_fault()", 6),
+        ("stream_update", "CREATE TRIGGER capability_fail BEFORE UPDATE OF last_event_id ON stream_state FOR EACH ROW EXECUTE FUNCTION capability_audit_fault()", 7),
+        ("deferred_commit", "CREATE CONSTRAINT TRIGGER capability_fail AFTER INSERT ON event_log DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION capability_audit_fault()", 8),
+        ("lost_commit", "", 7),
     ];
     for autonomous in [false, true] {
         for (stage, ddl, expected) in cases {

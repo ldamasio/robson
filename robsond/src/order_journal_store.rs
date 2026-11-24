@@ -34,6 +34,7 @@ mod transition;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use robson_eventlog::certificate::participate;
 use robson_exec::{
     gate::Incident,
     order_journal::{
@@ -611,6 +612,9 @@ impl JournalBackend for PgJournalBackend {
             .await
             .map_err(known)?;
         let mut rollback_observation = RollbackObservation::new();
+        // The certificate's shared key first (8m PLAN-r4 §6.7): an intent is
+        // a certification input on every venue.
+        let _key = participate(&mut tx).await.map_err(known)?;
         self.write(batch, &mut tx).await?;
         // Sent and not answered: the row may exist.
         tx.commit()
@@ -644,7 +648,8 @@ impl JournalBackend for PgJournalBackend {
         self.bound_auxiliary(&mut tx, COMMIT_BOUND, started)
             .await
             .map_err(CommitFailure::Known)?;
-        self.advance_auxiliary(&mut tx).await.map_err(CommitFailure::Known)?;
+        let key = participate(&mut tx).await.map_err(known)?;
+        self.advance_auxiliary(&mut tx, &key).await.map_err(CommitFailure::Known)?;
         // An open suspension of the stream, or this one replayed, stands.
         sqlx::query(
             r#"
@@ -698,7 +703,8 @@ impl JournalBackend for PgJournalBackend {
         self.bound_auxiliary(&mut tx, COMMIT_BOUND, started)
             .await
             .map_err(CommitFailure::Known)?;
-        self.advance_auxiliary(&mut tx).await.map_err(CommitFailure::Known)?;
+        let key = participate(&mut tx).await.map_err(known)?;
+        self.advance_auxiliary(&mut tx, &key).await.map_err(CommitFailure::Known)?;
         // Every value only grows, so a replay or a reordering converges. A
         // released row does not conflict: this opens a new one.
         sqlx::query(
@@ -742,11 +748,12 @@ impl JournalBackend for PgJournalBackend {
         Ok(())
     }
 
-    /// One transaction of five statements, `BEGIN` and `COMMIT` included
-    /// (design §2.8): tombstone, release, decision. The decision comes last,
-    /// with what the two before it did; the incidents' reference to it is
-    /// checked at the commit. A balance account's has eight: its bounds, then
-    /// its accounting bump and generation CAS (seven with none installed).
+    /// One transaction of six statements, `BEGIN` and `COMMIT` included
+    /// (design §2.8): the certificate's shared key, tombstone, release,
+    /// decision. The decision comes last, with what the two before it did; the
+    /// incidents' reference to it is checked at the commit. A balance
+    /// account's has nine: its bounds, the key, then its accounting bump and
+    /// generation CAS (eight with none installed).
     async fn release(&self, release: &ReleaseRecord) -> Result<ReleaseCounts, String> {
         let started = Instant::now();
         let error = |e: sqlx::Error| e.to_string();
@@ -766,7 +773,8 @@ impl JournalBackend for PgJournalBackend {
             .map_err(error)?;
         let mut rollback_observation = self.rollback_observation();
         self.bound_auxiliary(&mut tx, RELEASE_BOUND, started).await?;
-        self.advance_auxiliary(&mut tx).await?;
+        let key = participate(&mut tx).await.map_err(error)?;
+        self.advance_auxiliary(&mut tx, &key).await?;
         // A row with no `uncertain_at` is never tombstoned, nor one with an
         // outcome, proven unsent, or already disposed of.
         let tombstoned = sqlx::query(
@@ -963,6 +971,7 @@ pub async fn record_disposition(
         )
         .await?;
     let mut rollback_observation = RollbackObservation::new();
+    let _key = participate(&mut tx).await?;
     let row = sqlx::query_as::<_, (String, Option<String>, bool, bool, Value)>(
         r#"
         SELECT client_order_id, cancels_order_id, venue_outcome IS NOT NULL, not_sent, params

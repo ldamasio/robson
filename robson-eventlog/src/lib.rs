@@ -31,6 +31,7 @@
 //! ```
 
 pub mod append;
+pub mod certificate;
 pub mod idempotency;
 pub mod query;
 pub mod types;

@@ -15,6 +15,9 @@ const BOUNDS: &str = "SELECT set_config('lock_timeout', $1, true)";
 /// generation installed there is no CAS, and with no accounting row it moves
 /// nothing.
 const BUMP: &str = "WITH locked AS (";
+/// The cutover certificate's shared key, right after the bounds and before
+/// the bump (ADR-0056 step 8m-2a), and the legacy journal's first statement.
+const KEY: &str = robson_eventlog::certificate::PARTICIPATE;
 
 fn incident() -> Incident {
     Incident {
@@ -80,9 +83,9 @@ async fn traced(
 }
 
 const WRITES: [(&str, usize); 3] = [
-    ("recovery_incidents", 3),
-    ("stream_suspensions", 3),
-    ("order_intents", 5),
+    ("recovery_incidents", 4),
+    ("stream_suspensions", 4),
+    ("order_intents", 6),
 ];
 
 #[sqlx::test(migrations = "../migrations")]
@@ -100,13 +103,15 @@ async fn balance_auxiliary_transactions_send_their_bounds_first(pool: PgPool) {
         assert_eq!(trace.len(), legacy_statements + 2, "{table}: {trace:?}");
         assert_eq!(trace[0], "BEGIN", "{table}: {trace:?}");
         assert!(trace[1].starts_with(BOUNDS), "{table}: bounds not first: {trace:?}");
-        assert!(trace[2].starts_with(BUMP), "{table}: no bump after the bounds: {trace:?}");
+        assert_eq!(trace[2], KEY, "{table}: no key after the bounds: {trace:?}");
+        assert!(trace[3].starts_with(BUMP), "{table}: no bump after the key: {trace:?}");
         assert_eq!(trace.last().map(String::as_str), Some("COMMIT"), "{table}: {trace:?}");
         // The legacy journal's transaction is the same minus the bounds and
-        // the bump.
+        // the bump: BEGIN, then the key.
         let (result, trace) = traced(&proxy, &legacy, table).await;
         result.unwrap_or_else(|error| panic!("legacy {table}: {error}"));
         assert_eq!(trace.len(), legacy_statements, "legacy {table}: {trace:?}");
+        assert_eq!(trace[1], KEY, "legacy {table}: {trace:?}");
         assert!(
             !trace.iter().any(|sql| sql.contains("set_config")),
             "legacy {table} must stay unbounded: {trace:?}"
@@ -160,12 +165,13 @@ async fn balance_auxiliary_lock_waits_end_at_the_server_bound_and_retire_raw(poo
             proxy.query_trace().iter().map(|sql| sql.trim().to_owned()).collect();
         // The statement that waited never executed: the table lock stops it in
         // its Parse, and the proxy counts executed statements only. Nothing
-        // follows the bounds and the accounting bump, not even a ROLLBACK,
-        // since the connection is dropped raw.
-        assert_eq!(trace.len(), 3, "{table}: {trace:?}");
+        // follows the bounds, the key and the accounting bump, not even a
+        // ROLLBACK, since the connection is dropped raw.
+        assert_eq!(trace.len(), 4, "{table}: {trace:?}");
         assert_eq!(trace[0], "BEGIN", "{table}: {trace:?}");
         assert!(trace[1].starts_with(BOUNDS), "{table}: {trace:?}");
-        assert!(trace[2].starts_with(BUMP), "{table}: {trace:?}");
+        assert_eq!(trace[2], KEY, "{table}: {trace:?}");
+        assert!(trace[3].starts_with(BUMP), "{table}: {trace:?}");
     }
     // Each raw retirement gave back its pool permit.
     backend.check_ready().await.unwrap();

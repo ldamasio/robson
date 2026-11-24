@@ -8037,7 +8037,7 @@ mod tests {
         assert!(what.contains(&"POST /fapi/v1/order"), "{what:?}");
         assert!(what.contains(&"POST /fapi/v1/algoOrder"), "the stop: {what:?}");
         assert_every_mutation_under(&exchange, OperationKind::Signal);
-        assert_eq!(journal.operation_statements_max(), 18, "entry and stop, one operation");
+        assert_eq!(journal.operation_statements_max(), 22, "entry and stop, one operation");
     }
 
     /// A request dropped while its operation is in flight, as when the client

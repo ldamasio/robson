@@ -256,11 +256,11 @@ async fn real_close_protection_journal_and_tail_have_separate_wire_counts(pool: 
         .unwrap_or(0);
     let source_counts_match =
         (after_close.statements - before.statements, after_close.commits - before.commits)
-            == (11, 1)
+            == (12, 1)
             && (
                 after_protection.statements - after_close.statements,
                 after_protection.commits - after_close.commits,
-            ) == (9 + h, 2)
+            ) == (11 + h, 2)
             && (
                 after_tail.statements - after_protection.statements,
                 after_tail.commits - after_protection.commits,
@@ -320,22 +320,23 @@ async fn real_close_protection_journal_and_tail_have_separate_wire_counts(pool: 
     let h = history_months(history_window);
     eprintln!("SCAN_PHASE_PARSES close={} protection={} tail={} whole={}; history shares the already-prepared net SELECT", parse_close-parse_before, parse_protection-parse_close, parse_tail-parse_protection, parse_tail-parse_before);
     assert_parse_delta("cached idle tail", parse_protection, parse_tail, 0);
+    // 8m-2a: the append's try-lock and each journal commit's key, one each.
     assert_wire_delta(
-        "close append+projection9 plus MonthlyHalt read2",
+        "close append+projection10 plus MonthlyHalt read2",
         before,
         after_close,
-        11,
+        12,
         1,
     );
     assert_wire_delta(
         "orphan history plus cancel journal",
         after_close,
         after_protection,
-        9 + h,
+        11 + h,
         2,
     );
     assert_wire_delta("idle tail", after_protection, after_tail, 2, 0);
-    assert_wire_delta("whole positive close+protection+tail", before, after_tail, 22 + h, 3);
+    assert_wire_delta("whole positive close+protection+tail", before, after_tail, 25 + h, 3);
     assert_activity(
         "close prefix+append+MonthlyHalt",
         ports_before,

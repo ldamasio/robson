@@ -133,6 +133,8 @@ impl PgVenueLedger {
 
     /// Cutover preparation only (8m): an existing model is returned unchanged,
     /// so the caller can detect a mismatch. Existence is not certification.
+    /// The row is a certification input: the insert runs under the
+    /// certificate's shared key, taken right after the bounds (8m-2a).
     pub async fn ensure_accounting_row(
         &self,
         venue: &VenueId,
@@ -145,6 +147,8 @@ impl PgVenueLedger {
             self.statement();
             let mut tx = write.connection().begin().await.map_err(backend)?;
             self.timeouts(&mut tx).await?;
+            self.statement();
+            let _key = robson_eventlog::certificate::participate(&mut tx).await.map_err(backend)?;
             self.statement();
             sqlx::query("INSERT INTO accounting_state (tenant_id, venue_id, budget_model) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
                 .bind(self.tenant_id).bind(venue.as_str()).bind(model.as_str()).execute(&mut *tx).await.map_err(backend)?;

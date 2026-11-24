@@ -230,7 +230,8 @@ impl CashReanchor {
         let mut held = LedgerConnection::new(self.pool.acquire().await.map_err(unavailable)?);
         let mut tx = held.connection().begin().await.map_err(unavailable)?;
         sqlx::query(BOUNDS).execute(&mut *tx).await.map_err(unavailable)?;
-        // 8m-2a: `participate()` goes here, before the row lock (8m PLAN-r4 §6.7).
+        // `advance` takes the certificate's shared key first, before the bump
+        // takes the rows (8m PLAN-r4 §6.7).
         let version = accounting.advance(&mut tx).await.map_err(|refusal| match refusal {
             AccountingRefusal::Database(_) => ReanchorRefusal::Unavailable,
             _ => ReanchorRefusal::StaleGeneration,

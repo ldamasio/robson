@@ -190,9 +190,10 @@ async fn contend(
         job_result? == 1 && job_duration < COMMIT_BOUND,
         "legacy500 operation did not commit"
     );
+    // Each journal transaction takes the certificate's key after BEGIN (8m-2a).
     let expected = match work {
-        Work::Intent => 4,
-        Work::Incident => 3,
+        Work::Intent => 5,
+        Work::Incident => 4,
     };
     let journal_after = journal_proxy.stats();
     ensure!(
@@ -204,18 +205,19 @@ async fn contend(
             && journal_proxy.autocommit_acks_dropped() == 0
             && journal_proxy.query_trace_dropped() == 0
             && f.proxy.query_trace_dropped() == 0,
-        "coexistence separate actual actor54/journal4or3 inventory"
+        "coexistence separate actual actor54/journal5or4 inventory"
     );
     let trace = journal_proxy.query_trace();
     ensure!(
         trace.len() as u64 == expected
             && trace[0] == "BEGIN"
             && trace.last().is_some_and(|v| v == "COMMIT")
-            && trace[1].contains(match work {
+            && trace[1].starts_with("SELECT pg_advisory_xact_lock_shared(")
+            && trace[2].contains(match work {
                 Work::Intent => "INSERT INTO order_intents",
                 Work::Incident => "INSERT INTO recovery_incidents",
             })
-            && (!matches!(work, Work::Intent) || trace[2].contains("INSERT INTO submit_attempts")),
+            && (!matches!(work, Work::Intent) || trace[3].contains("INSERT INTO submit_attempts")),
         "actual journal statement identities/order"
     );
     let mut received = Vec::with_capacity(52);

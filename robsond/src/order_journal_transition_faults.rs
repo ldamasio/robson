@@ -128,6 +128,7 @@ impl Wire {
         let expected = [
             "BEGIN",
             "SELECT set_config('lock_timeout'",
+            "SELECT pg_advisory_xact_lock_shared",
             "UPDATE accounting_state",
             "INSERT INTO order_intents",
             "INSERT INTO balance_transitions",
@@ -255,7 +256,7 @@ async fn first_cancel_rejected_transition_leaves_no_fresh_journal(pool: PgPool) 
         before,
         "first_cancel_rejected_transition_leaves_no_fresh_journal"
     );
-    wire.assert_prefix(5);
+    wire.assert_prefix(6);
     Ok(())
 }
 
@@ -281,7 +282,7 @@ async fn first_cancel_refuses_missing_original_and_wrong_route(pool: PgPool) -> 
             "{result:?}"
         );
         wire.retires(&pool).await?;
-        wire.assert_prefix(5);
+        wire.assert_prefix(6);
         assert_eq!(durable(&pool, leg.tenant).await?, before);
     }
     Ok(())
@@ -313,7 +314,7 @@ async fn first_cancel_lost_commit_ack_never_returns_receipt(pool: PgPool) -> Res
         matches!(&result, Err(CommitFailure::Uncertain(_))),
         "first_cancel_lost_commit_ack_never_returns_receipt: {result:?}"
     );
-    wire.assert_prefix(6);
+    wire.assert_prefix(7);
     Ok(())
 }
 
@@ -341,7 +342,7 @@ async fn first_cancel_native_commit_rejection_rolls_back_both_rows(pool: PgPool)
         "{result:?}"
     );
     wire.retires(&pool).await?;
-    wire.assert_prefix(6);
+    wire.assert_prefix(7);
     assert_eq!(durable(&pool, leg.tenant).await?, before);
     Ok(())
 }
@@ -363,7 +364,7 @@ async fn first_cancel_deadline_before_commit_discards_the_owned_connection(
         .scope(slot, wire.store.commit_first_cancel(&intent, request(Uuid::now_v7(), version)));
     let verify = async {
         timeout(Duration::from_millis(400), reached).await??;
-        wire.assert_prefix(5);
+        wire.assert_prefix(6);
         let actual: String = sqlx::query_scalar(
             "SELECT state FROM pg_stat_activity
             WHERE pid=$1 AND backend_start::text=$2 AND datname=current_database()",
@@ -388,7 +389,7 @@ async fn first_cancel_deadline_before_commit_discards_the_owned_connection(
     );
     assert!(release.send(()).is_err(), "expired F future remained runnable");
     wire.retires(&pool).await?;
-    wire.assert_prefix(5);
+    wire.assert_prefix(6);
     assert_eq!(durable(&pool, leg.tenant).await?, before);
     let replacement: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&wire.store.pool)
@@ -417,7 +418,7 @@ async fn first_cancel_barrier_and_expired_timer_ready_together_forbid_commit(
         result = &mut apply => anyhow::bail!("unexpected completion before COMMIT barrier: {result:?}"),
         reached = timeout(Duration::from_millis(400), reached) => reached??,
     }
-    wire.assert_prefix(5);
+    wire.assert_prefix(6);
     // Keep the driver future unpolled while the real transaction stays open.
     // At the next poll both its barrier and outer timeout are ready.
     tokio::time::sleep(COMMIT_BOUND + Duration::from_millis(10)).await;
@@ -431,7 +432,7 @@ async fn first_cancel_barrier_and_expired_timer_ready_together_forbid_commit(
         "first_cancel_barrier_and_expired_timer_ready_together_forbid_commit"
     );
     wire.retires(&pool).await?;
-    wire.assert_prefix(5);
+    wire.assert_prefix(6);
     assert_eq!(durable(&pool, leg.tenant).await?, before);
     Ok(())
 }
@@ -449,7 +450,7 @@ async fn first_cancel_fresh_claim_refuses_spent_id_and_already_bound_open_row(
     let writer = Wire::new(&pool, leg.tenant).await?;
     let result = writer.store.commit_first_cancel(&intent, request(transition, version)).await;
     assert!(result.is_ok(), "{result:?}");
-    writer.assert_prefix(6);
+    writer.assert_prefix(7);
     let before = durable(&pool, leg.tenant).await?;
     let version = version + 1;
 
@@ -462,7 +463,7 @@ async fn first_cancel_fresh_claim_refuses_spent_id_and_already_bound_open_row(
         .await;
     assert_eq!(result, Err(CommitFailure::IdSpent));
     wire.retires(&pool).await?;
-    wire.assert_prefix(4);
+    wire.assert_prefix(5);
     assert_eq!(durable(&pool, leg.tenant).await?, before);
 
     let fresh = leg.cancel_intent();
@@ -478,8 +479,8 @@ async fn first_cancel_fresh_claim_refuses_spent_id_and_already_bound_open_row(
     );
     wire.retires(&pool).await?;
     let trace = wire.proxy.query_trace();
-    assert_eq!(trace.len(), 5);
-    assert_eq!(wire.proxy.stats().statements - wire.baseline, 5);
+    assert_eq!(trace.len(), 6);
+    assert_eq!(wire.proxy.stats().statements - wire.baseline, 6);
     assert!(trace.last().unwrap().trim_start().starts_with("UPDATE balance_transitions"));
     assert_eq!(durable(&pool, leg.tenant).await?, before);
     Ok(())
@@ -515,7 +516,7 @@ async fn compete(
     let primary = PAUSE.scope(slot, winner.store.commit_first_cancel(&winner_intent, winning));
     let contender = async {
         timeout(Duration::from_millis(380), reached).await??;
-        winner.assert_prefix(5);
+        winner.assert_prefix(6);
         let secondary = loser.store.commit_first_cancel(&loser_intent, losing);
         tokio::pin!(secondary);
         let blocked = async {
@@ -555,9 +556,9 @@ async fn compete(
         matches!(&refused, Err(CommitFailure::Known(reason)) if reason.contains("stale first-cancel accounting version")),
         "{refused:?}"
     );
-    winner.assert_prefix(6);
+    winner.assert_prefix(7);
     loser.retires(pool).await?;
-    loser.assert_prefix(3);
+    loser.assert_prefix(4);
     let final_state = durable(pool, leg.tenant).await?;
     let expected_kind = match winner_kind {
         TransitionKind::Exit => "exit",

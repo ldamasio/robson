@@ -138,19 +138,21 @@ pub const DISCARDED_CAPACITY: usize = 4096;
 ///
 /// | Operation | Statements |
 /// |---|---|
-/// | Entry (pre-send commit, result) | 9 |
-/// | Exit, stop or sweep close (one quantisation retry adds 4) | 9, 13 |
-/// | The same with a refused retry replaced by a fresh intent | 22 |
-/// | Cancel | 9 |
-/// | Stop placement with its predecessor's cancel | 31 |
-/// | Software exit: cancel, then exit | 31 |
-/// | Placement that withdraws both stops | 40 |
+/// | Entry (pre-send commit, result) | 11 |
+/// | Exit, stop or sweep close (one quantisation retry adds 5) | 11, 16 |
+/// | The same with a refused retry replaced by a fresh intent | 27 |
+/// | Cancel | 11 |
+/// | Stop placement with its predecessor's cancel | 38 |
+/// | Software exit: cancel, then exit | 38 |
+/// | Placement that withdraws both stops | 49 |
 ///
+/// Each commit counts the cutover certificate's shared key, one statement
+/// (ADR-0056 step 8m-2a, v16:2227 "statement bounds are raised by one").
 /// Above the guardrails' default review threshold of 15, on purpose: the
 /// writes are few and small, each ordered pair is one order's durability, and
 /// the alternative is folding them into one statement per commit, which saves
 /// statements but not commits.
-pub const OPERATION_STATEMENT_BOUND: u32 = 40;
+pub const OPERATION_STATEMENT_BOUND: u32 = 49;
 /// The operated account: one per venue until a venue has several.
 pub const DEFAULT_ACCOUNT_SCOPE: &str = "operated";
 
@@ -345,11 +347,12 @@ pub struct JournalBatch {
 
 impl JournalBatch {
     /// Statements this batch is charged, for one transaction: `BEGIN`, the
-    /// intent, the attempts, the outcome, `COMMIT`. What it plans to run, not a
-    /// measure of what reached the database.
+    /// certificate's shared key (8m-2a), the intent, the attempts, the
+    /// outcome, `COMMIT`. What it plans to run, not a measure of what reached
+    /// the database.
     pub fn statements(&self) -> u32 {
         let attempts = u32::from(!self.attempts.is_empty());
-        3 + attempts
+        4 + attempts
             + u32::from(self.outcome.is_some())
             + self
                 .balance
@@ -378,10 +381,12 @@ pub struct StreamSuspensionRow {
     pub suspended_at: DateTime<Utc>,
 }
 
-/// Statements a suspension's write is charged: `BEGIN`, the insert, `COMMIT`.
-const SUSPENSION_STATEMENTS: u32 = 3;
-/// Statements an incident's upsert is charged: `BEGIN`, the upsert, `COMMIT`.
-const INCIDENT_STATEMENTS: u32 = 3;
+/// Statements a suspension's write is charged: `BEGIN`, the certificate's
+/// shared key (8m-2a), the insert, `COMMIT`.
+const SUSPENSION_STATEMENTS: u32 = 4;
+/// Statements an incident's upsert is charged: `BEGIN`, the certificate's
+/// shared key (8m-2a), the upsert, `COMMIT`.
+const INCIDENT_STATEMENTS: u32 = 4;
 /// How long a release's transaction may take before it is reported unknown.
 pub const RELEASE_BOUND: Duration = Duration::from_secs(10);
 
@@ -4072,7 +4077,7 @@ mod tests {
             journal.finish_success(&intent, None).await;
         })
         .await;
-        assert_eq!(entry.journal_statements(), 9, "an order");
+        assert_eq!(entry.journal_statements(), 11, "an order");
 
         let ((), retried) = in_op(&journal, async {
             let intent = journal.open_intent(spec("x", IntentKind::Exit));
@@ -4081,11 +4086,11 @@ mod tests {
             journal.finish_failed(&intent).await;
         })
         .await;
-        assert_eq!(retried.journal_statements(), 13, "one quantisation retry");
+        assert_eq!(retried.journal_statements(), 16, "one quantisation retry");
 
         let (_, cancel) =
             in_op(&journal, journal.journaled_cancel(None, "77", async { Ok(cancelled()) })).await;
-        assert_eq!(cancel.journal_statements(), 9, "a cancel");
+        assert_eq!(cancel.journal_statements(), 11, "a cancel");
     }
 
     #[tokio::test]
@@ -4099,11 +4104,11 @@ mod tests {
             }
         })
         .await;
-        assert_eq!(operation.journal_statements(), 45);
+        assert_eq!(operation.journal_statements(), 55);
         assert_eq!(journal.operations_over_statement_bound(), 0, "counted when it ends");
         drop(operation);
         assert_eq!(journal.operations_over_statement_bound(), 1);
-        assert_eq!(journal.operation_statements_max(), 45);
+        assert_eq!(journal.operation_statements_max(), 55);
     }
 
     /// A refused retry with one request out may be replaced, once; the refused
@@ -4889,7 +4894,7 @@ mod tests {
                 assert!(!other, "another entry's ticket is not this one's");
             })
             .await;
-        assert_eq!(journal.operation_statements_max(), 18, "entry 9 and stop 9");
+        assert_eq!(journal.operation_statements_max(), 22, "entry 11 and stop 11");
     }
 
     /// The choke point knows a permit by its gate: one from another journal,
