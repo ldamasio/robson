@@ -18,7 +18,7 @@ rust_decimal = { workspace = true }
 async-trait = { workspace = true }
 # FakeSpotVenue: request signatures, and its per-connection service.
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 tower-service = "0.3"
 
 # Local dependencies
