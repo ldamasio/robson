@@ -1,88 +1,23 @@
 <script lang="ts">
-  import { goto } from '$app/navigation';
-  import { browser } from '$app/env';
-  // ADR-0054: optional dynamic public values are declared in src/env.ts.
-  import * as env from '$app/env/public';
-  import type { Snippet } from 'svelte';
-  import NavBar from '$design/components/NavBar.svelte';
-  import RiskDisclaimer from '$design/components/RiskDisclaimer.svelte';
-  import { authToken, isNearExpiry, silentRefreshGoogleToken } from '$stores/auth';
-  import { mutationPending } from '$stores/mutation';
+  import { goto } from "$app/navigation";
+  import type { Snippet } from "svelte";
+  import NavBar from "$design/components/NavBar.svelte";
+  import RiskDisclaimer from "$design/components/RiskDisclaimer.svelte";
+  import { session } from "$stores/auth";
+  import { mutationPending } from "$stores/mutation";
 
   let { children }: { children: Snippet } = $props();
-  let checked = $state(false);
-  let hasToken = $state(false);
-
-  // ADR-0054: reactive to the auth store (not a one-shot sessionStorage
-  // read under the old `robson_api_token` key) so a token cleared
-  // mid-session — e.g. by `apiFetch`'s 401 handling when a silent refresh
-  // fails — redirects to /login without waiting for a full navigation to
-  // re-evaluate this guard.
-  const unsubscribeAuth = authToken.subscribe((token) => {
-    hasToken = Boolean(token);
-    checked = true;
-  });
-
-  // Periodic silent-refresh: every few minutes, check whether the cached
-  // Google ID token is close to expiry and, if so, refresh it in the
-  // background (no visible click) so an open tab doesn't hit a hard 401
-  // mid-action. If the silent refresh fails, the next API call's own
-  // 401 handling (see `apiFetch`) takes over and redirects to /login.
-  const REFRESH_CHECK_INTERVAL_MS = 3 * 60 * 1000;
-
-  /** Read the store's current value synchronously (subscribe + immediately
-   *  unsubscribe) without needing a component-level reactive binding. */
-  function currentToken(): string | null {
-    let value: string | null = null;
-    const unsub = authToken.subscribe((t) => (value = t));
-    unsub();
-    return value;
-  }
-
-  // `$effect`, not `onMount` — see the login page's own note
-  // (frontend/src/routes/login/+page.svelte) on a Rollup/Vite
-  // production-build bug that silently drops `onMount`-registered
-  // callbacks from the shipped bundle in this app. Verified this same
-  // interval is retained in the compiled output as `$effect`, where it
-  // was not as `onMount`.
-  $effect(() => {
-    if (!browser) return;
-    const refreshTimer = setInterval(() => {
-      const token = currentToken();
-      if (token && isNearExpiry(token)) {
-        void silentRefreshGoogleToken(env.PUBLIC_GOOGLE_WEB_CLIENT_ID ?? '');
-      }
-    }, REFRESH_CHECK_INTERVAL_MS);
-    return () => clearInterval(refreshTimer);
-  });
-
-  // `$effect` cleanup, not `onDestroy` — this project's adapter-static
-  // build (`ssr = false` + `prerender = true`, see src/routes/+layout.ts)
-  // resolves `import { onDestroy } from 'svelte'` to the package's
-  // *server* conditional export in the shipped browser bundle instead of
-  // the client one. Server-side `onDestroy` isn't a no-op like server-side
-  // `onMount` is: it dereferences a server-only render context that's
-  // `null` in the browser, throwing `Cannot read properties of null
-  // (reading 'r')` the instant this component mounts — confirmed via a
-  // full unminified stack trace (`onDestroy` at `svelte/src/index-server.js`),
-  // not just a hunch. An `$effect` that only returns a cleanup function is
-  // the exact same semantics (runs once on mount, cleanup on unmount) and
-  // compiles through Svelte's rune machinery instead of this package
-  // import, so it isn't subject to the same resolution bug.
-  $effect(() => {
-    return () => {
-      unsubscribeAuth();
-    };
-  });
 
   $effect(() => {
-    if (checked && !hasToken) {
-      void goto(`/login?redirect=${encodeURIComponent(window.location.pathname)}`);
+    if ($session.initialized && !$session.authenticated) {
+      void goto(
+        `/login?redirect=${encodeURIComponent(window.location.pathname)}`,
+      );
     }
   });
 </script>
 
-{#if checked && hasToken}
+{#if $session.initialized && $session.authenticated}
   <!-- Guardrail 4: while any mutation is pending the whole surface, navigation
        included, is inert and covered, so nothing can be submitted twice. -->
   <div class="surface" inert={$mutationPending} aria-busy={$mutationPending}>
@@ -91,7 +26,9 @@
     <RiskDisclaimer />
   </div>
   {#if $mutationPending}
-    <div class="mutation-freeze" role="status" aria-live="polite">PROCESSING…</div>
+    <div class="mutation-freeze" role="status" aria-live="polite">
+      PROCESSING…
+    </div>
   {/if}
 {/if}
 

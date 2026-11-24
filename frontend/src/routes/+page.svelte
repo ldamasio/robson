@@ -1,13 +1,15 @@
 <script lang="ts">
-  import { browser } from '$app/env';
-  import { goto } from '$app/navigation';
-  import { authToken } from '$stores/auth';
-  import { get } from 'svelte/store';
+  import { browser } from "$app/env";
+  import { goto } from "$app/navigation";
+  import { session } from "$stores/auth";
 
   if (browser) {
-    queueMicrotask(() => {
-      const token = get(authToken);
-      void goto(token ? '/dashboard' : '/login', { replaceState: true });
+    const unsubscribe = session.subscribe((current) => {
+      if (!current.initialized) return;
+      unsubscribe();
+      void goto(current.authenticated ? "/dashboard" : "/login", {
+        replaceState: true,
+      });
     });
   }
 </script>
@@ -19,7 +21,8 @@
 
 <noscript>
   <p style="padding:2rem;font-family:system-ui;color:#fff;background:#07080A;">
-    JavaScript is required to use this application.
-    Please go to <a href="/login">/login</a>.
+    JavaScript is required to use this application. Please go to <a
+      href="/login">/login</a
+    >.
   </p>
 </noscript>

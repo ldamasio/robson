@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Robson",
+  "version": "0.1.0",
+  "identifier": "br.ia.rbx.robson",
+  "build": {
+    "beforeDevCommand": "pnpm dev:tauri-web",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "pnpm build:tauri-web",
+    "frontendDist": "../build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Robson",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 360,
+        "minHeight": 640,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; font-src 'self' https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; script-src 'self' 'wasm-unsafe-eval'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Finance",
+    "shortDescription": "RBX governed execution console",
+    "longDescription": "Robson is the RBX governed execution and risk-management console.",
+    "android": {
+      "minSdkVersion": 28
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "mobile": [
+        {
+          "scheme": ["br.ia.rbx.robson"],
+          "host": "oauth",
+          "pathPrefix": ["/callback"],
+          "appLink": false
+        }
+      ],
+      "desktop": {
+        "schemes": ["br.ia.rbx.robson"]
+      }
+    }
+  }
+}

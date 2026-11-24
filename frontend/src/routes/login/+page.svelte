@@ -1,101 +1,130 @@
 <script lang="ts">
-  import { goto } from '$app/navigation';
-  import { browser } from '$app/env';
-  // ADR-0054: optional dynamic public values are declared in src/env.ts.
-  import * as env from '$app/env/public';
-  import Card from '$design/components/Card.svelte';
-  import Stack from '$design/components/Stack.svelte';
-  import { setToken } from '$stores/auth';
-  import { robsonApi } from '$api/robson';
-  import { _ } from 'svelte-i18n';
+  import { browser } from "$app/env";
+  import * as env from "$app/env/public";
+  import { goto } from "$app/navigation";
+  import { _ } from "svelte-i18n";
+  import Card from "$design/components/Card.svelte";
+  import Stack from "$design/components/Stack.svelte";
+  import {
+    beginNativeOidcLogin,
+    isNativeRuntime,
+    onNativeAuthError,
+    onNativeAuthSession,
+  } from "#lib/auth/native.ts";
+  import {
+    beginWebOidcLogin,
+    resolveOidcConfig,
+    sanitizeReturnPath,
+  } from "#lib/auth/oidc.ts";
+  import { webAuthMode } from "$stores/auth";
 
-  let error = $state('');
+  let error = $state("");
   let loading = $state(false);
-  let buttonContainer: HTMLDivElement | undefined = $state();
 
-  // ADR-0054: Google Identity Services (GIS) replaces the pasted-token
-  // form. GIS runs entirely client-side — it hands the ID token straight
-  // to this callback — so there is no OAuth callback server involved,
-  // which is exactly the constraint ADR-0025 amends around (see
-  // docs/adr/ADR-0025-frontend-auth-bearer-token.md and the new ADR).
-  async function handleCredentialResponse(response: { credential?: string }) {
-    error = '';
-    if (!response.credential) {
-      error = $_('login.connectionFailed');
-      return;
+  const identityConfiguration = (() => {
+    try {
+      return { config: resolveOidcConfig(env), invalid: false };
+    } catch {
+      return { config: null, invalid: true };
     }
+  })();
+  const native = browser && isNativeRuntime();
+  const usesBff = !native && webAuthMode() === "bff";
+  const configured = usesBff || Boolean(identityConfiguration.config);
+
+  function returnPath(): string {
+    if (!browser) return "/dashboard";
+    return sanitizeReturnPath(
+      new URLSearchParams(window.location.search).get("redirect") ??
+        "/dashboard",
+    );
+  }
+
+  function bffLoginUrl(): string {
+    const configuredUrl = env.PUBLIC_RBX_BFF_LOGIN_URL?.trim();
+    const base = env.PUBLIC_ROBSON_API_BASE?.trim() || window.location.origin;
+    const url = new URL(configuredUrl || "/oidc/login", base);
+    url.searchParams.set("return_to", returnPath());
+    return url.toString();
+  }
+
+  async function handleLogin(): Promise<void> {
+    error = "";
     loading = true;
     try {
-      setToken(response.credential);
-      await robsonApi.health();
-      const params = new URLSearchParams(window.location.search);
-      const redirect = params.get('redirect') ?? '/dashboard';
-      void goto(redirect);
-    } catch (e) {
-      error = e instanceof Error && e.message ? e.message : $_('login.connectionFailed');
-    } finally {
+      if (usesBff) {
+        window.location.assign(bffLoginUrl());
+        return;
+      }
+      const config = identityConfiguration.config;
+      if (!config) throw new Error($_("login.notConfigured"));
+      if (native) {
+        await beginNativeOidcLogin(
+          { ...config, apiBase: env.PUBLIC_ROBSON_API_BASE ?? "" },
+          returnPath(),
+        );
+        return;
+      }
+      await beginWebOidcLogin(config, returnPath());
+    } catch (reason) {
       loading = false;
+      error =
+        reason instanceof Error ? reason.message : $_("login.connectionFailed");
     }
   }
 
-  // NOTE: `$effect`, not `onMount`. In this component (and reproduced in
-  // an isolated, from-scratch test route too), Rollup's tree-shaking
-  // silently removed the equivalent `onMount(...)` callback from the
-  // shipped production bundle — no build error, the button just never
-  // rendered. Disabling Rollup's treeshake entirely made it survive,
-  // confirming tree-shaking as the mechanism, but none of Rollup's
-  // documented, targeted `treeshake` sub-options fixed it, and why some
-  // other `onMount` usages in this app are/aren't affected is not fully
-  // understood. `$effect` is confirmed present in the built output and
-  // working end-to-end (real browser, real GIS button) — don't change
-  // this back to `onMount` without re-verifying the compiled bundle.
   $effect(() => {
-    if (!browser) return;
-
-    // Loaded client-side only ($effect bodies never run during
-    // SSR/prerender), so this never touches the static build.
-    const script = document.createElement('script');
-    script.src = 'https://accounts.google.com/gsi/client';
-    script.async = true;
-    script.defer = true;
-    script.onload = () => {
-      if (!window.google?.accounts?.id || !buttonContainer) return;
-      window.google.accounts.id.initialize({
-        client_id: env.PUBLIC_GOOGLE_WEB_CLIENT_ID ?? '',
-        callback: handleCredentialResponse,
+    if (!native) return;
+    let cancelled = false;
+    let cleanupSession: (() => void) | undefined;
+    let cleanupError: (() => void) | undefined;
+    void onNativeAuthSession((nativeSession) => {
+      if (cancelled || !nativeSession.authenticated) return;
+      loading = false;
+      void goto(nativeSession.returnPath ?? "/dashboard", {
+        replaceState: true,
       });
-      window.google.accounts.id.renderButton(buttonContainer, {
-        type: 'standard',
-        theme: 'filled_black',
-        size: 'large',
-        text: 'signin_with',
-        shape: 'rectangular',
-      });
-    };
-    script.onerror = () => {
-      error = $_('login.connectionFailed');
-    };
-    document.head.appendChild(script);
-
+    }).then((cleanup) => {
+      if (cancelled) cleanup();
+      else cleanupSession = cleanup;
+    });
+    void onNativeAuthError((message) => {
+      if (cancelled) return;
+      loading = false;
+      error = message || $_("login.connectionFailed");
+    }).then((cleanup) => {
+      if (cancelled) cleanup();
+      else cleanupError = cleanup;
+    });
     return () => {
-      script.remove();
+      cancelled = true;
+      cleanupSession?.();
+      cleanupError?.();
     };
   });
 </script>
 
 <svelte:head>
-  <title>{$_('login.pageTitle')}</title>
+  <title>{$_("login.pageTitle")}</title>
 </svelte:head>
 
 <div class="login-page">
   <Card padding={7}>
     <Stack gap={5}>
       <img src="/brand/rbx-mark.svg" alt="RBX" width="48" height="48" />
-      <h1>{$_('login.title')}</h1>
-      <p>{$_('login.description')}</p>
-      <div class="google-button" bind:this={buttonContainer} aria-live="polite"></div>
-      {#if loading}
-        <p class="status">{$_('login.signingIn')}</p>
+      <h1>{$_("login.title")}</h1>
+      <p>{$_("login.description")}</p>
+      <button
+        class="google-button"
+        type="button"
+        disabled={loading || !configured}
+        onclick={handleLogin}
+      >
+        {loading ? $_("login.signingIn") : $_("login.signIn")}
+      </button>
+      <p class="provider-note">{$_("login.identityProvider")}</p>
+      {#if identityConfiguration.invalid || !configured}
+        <p class="error">{$_("login.notConfigured")}</p>
       {/if}
       {#if error}
         <p class="error">{error}</p>
@@ -120,11 +149,26 @@
   }
   .google-button {
     min-height: 44px;
-    display: flex;
-    justify-content: flex-start;
+    width: 100%;
+    border: 1px solid var(--cyan-signal);
+    border-radius: var(--radius-sm);
+    background: var(--cyan-signal);
+    color: var(--bg-0);
+    cursor: pointer;
+    font: 500 var(--text-base) var(--font-sans);
+    padding: var(--s-3) var(--s-5);
   }
-  .status {
-    font-size: var(--text-sm);
+  .google-button:hover:not(:disabled) {
+    background: var(--cyan-brand);
+    border-color: var(--cyan-brand);
+  }
+  .google-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+  .provider-note {
+    font-size: var(--text-xs);
+    text-align: center;
   }
   .error {
     color: var(--fg-error, #ff4444);

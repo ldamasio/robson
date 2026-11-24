@@ -2,16 +2,17 @@
 // Mapped to actual robsond endpoints (v2 API).
 
 import { browser } from "$app/env";
-import { get as getStore } from "svelte/store";
-import { authToken, clearAuth, silentRefreshGoogleToken } from "$stores/auth";
+import { clearAuth, currentAccessToken, webAuthMode } from "$stores/auth";
 import * as env from "$app/env/public";
+import {
+  isNativeRuntime,
+  nativeApiRequest,
+  onNativeStreamEvent,
+  startNativeEventStream,
+  stopNativeEventStream,
+} from "#lib/auth/native.ts";
 
 const API_BASE: string = env.PUBLIC_ROBSON_API_BASE ?? "";
-// ADR-0054: src/env.ts declares both public values as dynamic and optional,
-// retaining empty-string defaults in CI and fresh clones. Configured values
-// stay on SvelteKit's dynamic public path and retain the existing Docker
-// PUBLIC_* build arguments used by this static deployment.
-const GOOGLE_WEB_CLIENT_ID: string = env.PUBLIC_GOOGLE_WEB_CLIENT_ID ?? "";
 
 // --- Backend response types (match robsond serde output) ---
 
@@ -224,6 +225,16 @@ export type EventHistoryResponse = {
   events: SseEvent[];
 };
 
+export type AuthSessionResponse = {
+  auth_method: "rbx_oidc" | string;
+  issuer: string;
+  subject: string;
+  client_id: string;
+  tenant_id: string | null;
+  roles: string[];
+  permissions: string[];
+};
+
 export type FundingState =
   | "QUOTED"
   | "CONVERTING"
@@ -309,23 +320,24 @@ type EventSourceLike = {
 
 // --- Helpers ---
 
-function getToken(): string | null {
-  if (!browser) return null;
-  return getStore(authToken);
-}
+async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  if (browser && isNativeRuntime()) {
+    const response = await nativeApiRequest(path, init);
+    if (response.status === 401) clearAuth();
+    if (response.status < 200 || response.status >= 300) {
+      throw new ApiError(
+        path,
+        response.status,
+        response.statusText,
+        response.body,
+      );
+    }
+    if (response.status === 204 || response.body.length === 0)
+      return undefined as T;
+    return JSON.parse(response.body) as T;
+  }
 
-// ADR-0054: a Google ID token is valid for ~1h, so a request can land just
-// past expiry mid-session. On a 401, try one silent refresh
-// (`google.accounts.id.prompt()`, no visible click) and retry the request
-// once before giving up — this is what lets a long-lived tab keep working
-// without an interruption most of the time. `isRetry` bounds this to a
-// single attempt per call so a persistently-401ing endpoint can't loop.
-async function apiFetch<T>(
-  path: string,
-  init?: RequestInit,
-  isRetry = false,
-): Promise<T> {
-  const token = getToken();
+  const token = browser ? currentAccessToken() : null;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(init?.headers as Record<string, string>),
@@ -334,18 +346,14 @@ async function apiFetch<T>(
     headers["Authorization"] = `Bearer ${token}`;
   }
 
-  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers,
+    credentials:
+      browser && webAuthMode() === "bff" ? "include" : init?.credentials,
+  });
 
-  if (res.status === 401 && !isRetry && browser) {
-    const refreshed = await silentRefreshGoogleToken(GOOGLE_WEB_CLIENT_ID);
-    if (refreshed) {
-      return apiFetch<T>(path, init, true);
-    }
-    // Silent refresh couldn't produce a fresh credential — fall back to
-    // the normal expired-session handling: drop the dead token so the
-    // (authed) layout's reactive guard redirects to /login.
-    clearAuth();
-  }
+  if (res.status === 401 && browser) clearAuth();
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -369,7 +377,9 @@ function requireNumber(value: unknown, field: string): number {
   return n;
 }
 
-export function normalizeEntryPreview(raw: Record<string, unknown>): EntryPreview {
+export function normalizeEntryPreview(
+  raw: Record<string, unknown>,
+): EntryPreview {
   const a = raw.analysis as Record<string, unknown> | null | undefined;
   const z = raw.sizing as Record<string, unknown> | null | undefined;
   return {
@@ -393,7 +403,8 @@ export function normalizeEntryPreview(raw: Record<string, unknown>): EntryPrevie
           quantity: toNumber(z.quantity) ?? 0,
           notional: toNumber(z.notional) ?? 0,
           planned_risk: toNumber(z.planned_risk) ?? 0,
-          planned_risk_pct_of_capital: toNumber(z.planned_risk_pct_of_capital) ?? 0,
+          planned_risk_pct_of_capital:
+            toNumber(z.planned_risk_pct_of_capital) ?? 0,
           executable_trigger: toNumber(z.executable_trigger),
           executable_span: toNumber(z.executable_span),
         }
@@ -422,7 +433,8 @@ function normalizePosition(raw: unknown): Position {
     entry_filled_at:
       p.entry_filled_at == null ? null : String(p.entry_filled_at),
     tech_stop_distance: toNumber(p.tech_stop_distance),
-    tech_stop_method: p.tech_stop_method == null ? null : String(p.tech_stop_method),
+    tech_stop_method:
+      p.tech_stop_method == null ? null : String(p.tech_stop_method),
     tech_stop_level_n: toNumber(p.tech_stop_level_n),
     tech_stop_confidence:
       p.tech_stop_confidence == null ? null : String(p.tech_stop_confidence),
@@ -580,7 +592,6 @@ export function connectEventStream(
 ): () => void {
   if (!browser) return () => {};
 
-  const token = getToken();
   const url = `${API_BASE}/events`;
 
   // Test mock factory takes precedence (no real fetch in tests)
@@ -592,7 +603,16 @@ export function connectEventStream(
 
   const source = factory
     ? factory(url)
-    : new FetchEventSource(url, token, onReconnect, onStale, onActivity, onOpen);
+    : isNativeRuntime()
+      ? new NativeEventSource(onReconnect, onStale, onActivity, onOpen)
+      : new FetchEventSource(
+          url,
+          currentAccessToken(),
+          onReconnect,
+          onStale,
+          onActivity,
+          onOpen,
+        );
 
   source.onmessage = (msg) => {
     try {
@@ -608,6 +628,74 @@ export function connectEventStream(
   return () => source.close();
 }
 
+/** Tauri SSE adapter. The Rust host owns both the bearer token and the HTTP
+ * connection, then emits only application event payloads into the webview. */
+class NativeEventSource implements EventSourceLike {
+  onmessage: ((this: EventSource, ev: MessageEvent) => unknown) | null = null;
+  onerror: ((this: EventSource, ev: Event) => unknown) | null = null;
+
+  private readonly streamId = crypto.randomUUID();
+  private closed = false;
+  private cleanups: Array<() => void> = [];
+
+  constructor(
+    private readonly onReconnect?: () => void,
+    private readonly onStale?: (staleSecs: number) => void,
+    private readonly onActivity?: () => void,
+    private readonly onOpen?: () => void,
+  ) {
+    void this.start();
+  }
+
+  private async start(): Promise<void> {
+    try {
+      const listeners = await Promise.all([
+        onNativeStreamEvent("rbx://sse-message", (payload) => {
+          if (payload.streamId !== this.streamId || !payload.data) return;
+          this.onmessage?.call(
+            {} as EventSource,
+            new MessageEvent("message", { data: payload.data }),
+          );
+        }),
+        onNativeStreamEvent("rbx://sse-error", (payload) => {
+          if (payload.streamId === this.streamId) {
+            this.onerror?.call({} as EventSource, new Event("error"));
+          }
+        }),
+        onNativeStreamEvent("rbx://sse-reconnect", (payload) => {
+          if (payload.streamId === this.streamId) this.onReconnect?.();
+        }),
+        onNativeStreamEvent("rbx://sse-stale", (payload) => {
+          if (payload.streamId === this.streamId) {
+            this.onStale?.(payload.staleSecs ?? 45);
+          }
+        }),
+        onNativeStreamEvent("rbx://sse-activity", (payload) => {
+          if (payload.streamId === this.streamId) this.onActivity?.();
+        }),
+      ]);
+      if (this.closed) {
+        listeners.forEach((cleanup) => cleanup());
+        return;
+      }
+      this.cleanups = listeners;
+      await startNativeEventStream(this.streamId);
+      if (!this.closed) this.onOpen?.();
+    } catch {
+      if (!this.closed)
+        this.onerror?.call({} as EventSource, new Event("error"));
+    }
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.cleanups.forEach((cleanup) => cleanup());
+    this.cleanups = [];
+    void stopNativeEventStream(this.streamId).catch(() => {});
+  }
+}
+
 /** Fetch-based SSE client — sends Bearer token via header, not query param.
  *  Reconnects automatically with exponential backoff on any disconnect. */
 export class FetchEventSource implements EventSourceLike {
@@ -618,20 +706,11 @@ export class FetchEventSource implements EventSourceLike {
   private closed = false;
   private retries = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  // ADR-0054: bounds the 401 silent-refresh attempt to once per outage,
-  // mirroring `apiFetch`'s `isRetry` — otherwise a genuinely expired
-  // session (refresh declined/unavailable) would retry a doomed GIS
-  // prompt on every reconnect, in addition to the connection backoff.
-  private triedSilentRefreshOn401 = false;
   private static readonly MAX_RECONNECT_MS = 30_000;
   private static readonly READ_IDLE_TIMEOUT_MS = 45_000;
 
   constructor(
     url: string,
-    // ADR-0054: intentionally NOT stored — a Google ID token can be
-    // refreshed mid-connection (silent refresh, ~1h lifetime), so every
-    // (re)connect re-reads the current token from the auth store via
-    // `getToken()` instead of closing over the value captured here.
     _initialToken: string | null,
     // Fires only when a stream is re-established after a failure; callers
     // use it to refetch state they may have missed.
@@ -660,10 +739,7 @@ export class FetchEventSource implements EventSourceLike {
   }
 
   private async connect(url: string): Promise<void> {
-    // Re-read at connect time (not passed in) so a token refreshed since
-    // the last attempt — or since this client was constructed — is picked
-    // up on every reconnect, not just the first connection.
-    const token = getToken();
+    const token = currentAccessToken();
     const headers: Record<string, string> = { Accept: `text/event-stream` };
     if (token) headers[`Authorization`] = `Bearer ${token}`;
 
@@ -690,26 +766,13 @@ export class FetchEventSource implements EventSourceLike {
       const res = await fetch(url, {
         headers,
         signal: this.currentController.signal,
+        credentials: webAuthMode() === "bff" ? "include" : undefined,
       });
 
-      // ADR-0054: a plain reconnect-with-backoff is right for transient
-      // network/server errors, but a 401 means this specific credential is
-      // dead — reconnecting with the *same* (or an equally-expired) token
-      // would just loop 401s forever. Try one silent refresh first; if that
-      // can't produce a fresh credential either, stop retrying so the
-      // normal expired-session UI takes over instead of churning quietly.
-      if (!this.closed && res.status === 401 && !this.triedSilentRefreshOn401) {
-        this.triedSilentRefreshOn401 = true;
+      if (!this.closed && res.status === 401) {
         clearIdle();
-        const refreshed = await silentRefreshGoogleToken(GOOGLE_WEB_CLIENT_ID);
-        if (!this.closed) {
-          if (refreshed) {
-            this.connect(url);
-          } else {
-            clearAuth();
-            this.onerror?.call({} as EventSource, new Event(`error`));
-          }
-        }
+        clearAuth();
+        this.onerror?.call({} as EventSource, new Event(`error`));
         return;
       }
 
@@ -726,7 +789,6 @@ export class FetchEventSource implements EventSourceLike {
       this.onOpen?.();
       if (this.retries > 0) this.onReconnect?.();
       this.retries = 0; // reset backoff on successful stream start
-      this.triedSilentRefreshOn401 = false; // this credential just proved itself good
       const decoder = new TextDecoder();
       let buf = ``;
       resetIdle();
@@ -789,6 +851,8 @@ export class FetchEventSource implements EventSourceLike {
 
 export const robsonApi = {
   health: () => apiFetch<{ status: string }>("/health"),
+
+  authSession: () => apiFetch<AuthSessionResponse>("/auth/session"),
 
   getStatus: async () =>
     normalizeStatus(await apiFetch<StatusResponse>("/status")),
