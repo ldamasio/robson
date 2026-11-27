@@ -5,7 +5,7 @@
 pub mod bounded_migration;
 mod init;
 
-pub use init::init_minimal_data;
+pub use init::{init_minimal_data, CERTIFICATE_PARTICIPATE};
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 

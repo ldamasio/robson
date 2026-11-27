@@ -42,6 +42,10 @@ mod pg_tests;
 #[path = "certificate_participation_pg_tests.rs"]
 pub(crate) mod certificate_tests;
 
+#[cfg(test)]
+#[path = "certificate_projector_pg_tests.rs"]
+mod certificate_projector_tests;
+
 /// The ledger's transaction-local server bounds, the first statement after
 /// `BEGIN` of every transaction this context opens (PLAN-r4 §7.2).
 pub(crate) const BOUNDS: &str = "SELECT set_config('lock_timeout', '300ms', true), set_config('statement_timeout', '1s', true), set_config('idle_in_transaction_session_timeout', '1s', true)";

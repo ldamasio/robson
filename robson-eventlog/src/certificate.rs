@@ -72,8 +72,9 @@ pub(crate) async fn try_participate(
 
 /// A write that was one autocommit statement, made a participant: `BEGIN`,
 /// the key, the statement, `COMMIT`. A failure before `COMMIT` drops the
-/// transaction, which SQLx rolls back; an unanswered `COMMIT` may have landed
-/// it, as the autocommit statement's unanswered reply could.
+/// transaction, which SQLx rolls back (counted, like every other writer's, as
+/// a queued rollback); an unanswered `COMMIT` may have landed it, as the
+/// autocommit statement's unanswered reply could.
 ///
 /// # Errors
 /// Any of the four statements failed.
@@ -84,9 +85,11 @@ pub async fn execute_participating<'q>(
     let io =
         |kind: u64| tracing::info_span!(target: "robson_operation", "operation_io", io_kind = kind);
     let mut tx = pool.begin().instrument(io(2)).await?;
+    let mut rollback_observation = crate::append::RollbackObservation::new();
     let _key = participate(&mut tx).await?;
     let written = query.execute(&mut *tx).instrument(statement()).await?;
     tx.commit().instrument(io(3)).await?;
+    rollback_observation.disarm();
     Ok(written)
 }
 

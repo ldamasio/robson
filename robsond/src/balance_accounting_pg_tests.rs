@@ -38,6 +38,8 @@ use crate::{
 
 const SPOT: &str = VenueId::BINANCE_SPOT;
 const BEGIN_TX: [&str; 5] = ["begin", "bounds", "key", "bump", "cas"];
+/// A formerly autocommit `positions_current` write on any venue (8m-2b).
+const KEYED_POSITIONS: [&str; 4] = ["begin", "key", "positions", "commit"];
 
 /// An accounting row of `venue` for `tenant_id`, at version 0.
 async fn account(pool: &PgPool, tenant_id: Uuid, venue: &str) {
@@ -1031,24 +1033,30 @@ async fn month(pool: &PgPool, at: DateTime<Utc>) -> (Decimal, Decimal, String) {
 
 /// Balance daemon: each autocommit `monthly_state` path is one transaction of
 /// seven (BEGIN, bounds, the certificate's key, one bump, CAS, the write,
-/// COMMIT); the counter fallback is 7 + 8 = 15; each transaction bumps once
-/// and keeps the generation current. Without an installed generation it is
-/// one statement shorter.
+/// COMMIT); the `positions_current` write before a fill's or a close's is its
+/// own key-only transaction of four (8m-2b), so 4 + 7 = 11, and the counter
+/// fallback 4 + 7 + 8 = 19 (8m PLAN-r4 §7.2); each `monthly_state`
+/// transaction bumps once and keeps the generation current, the positions
+/// write bumps nothing. Without an installed generation it is one statement
+/// shorter.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
-async fn balance_projector_sends_seven_per_path_and_fifteen_on_the_fallback(pool: PgPool) {
+async fn balance_projector_sends_seven_eleven_and_nineteen_on_the_fallback(pool: PgPool) {
     let installed = seed(&pool, true).await;
     let (proxy, proxied) = through_proxy(&pool).await;
     let may = Utc.with_ymd_and_hms(2027, 5, 2, 0, 0, 10).unwrap();
     let tx = [&BEGIN_TX[..], &["monthly", "commit"][..]].concat();
     let fallback = [&BEGIN_TX[..], &["lock", "monthly", "commit"][..]].concat();
+    let positions = KEYED_POSITIONS;
     let cases = [
         (reset(april(), "10000"), tx.clone(), 1),
         (recalibration(april(), "9000"), tx.clone(), 1),
-        (fill(april()), [&["positions"][..], &tx[..]].concat(), 1),
-        (losing_close(april()), [&["positions"][..], &tx[..]].concat(), 1),
-        (fill(may), [&["positions"][..], &tx[..], &fallback[..]].concat(), 2),
+        (fill(april()), [&positions[..], &tx[..]].concat(), 1),
+        (losing_close(april()), [&positions[..], &tx[..]].concat(), 1),
+        (fill(may), [&positions[..], &tx[..], &fallback[..]].concat(), 2),
     ];
+    let lengths: Vec<usize> = cases.iter().map(|(_, shape, _)| shape.len()).collect();
+    assert_eq!(lengths, [7, 7, 11, 11, 19]);
     let step = projector_step(Some(&installed));
     for (event, expected, bumps) in cases {
         let (version, generation) = versions(&pool, &installed).await;
@@ -1070,13 +1078,15 @@ async fn balance_projector_sends_seven_per_path_and_fifteen_on_the_fallback(pool
     assert_eq!(versions(&pool, &unopted).await, (1, None));
 }
 
-/// USD-M (a position account) gets no context from the daemon, and every
-/// `monthly_state` path sends exactly its pre-8l statements: one autocommit
-/// write, or the counter fallback's five; no accounting row of the tenant
-/// moves.
+/// USD-M (a position account) gets no context from the daemon, and each
+/// formerly autocommit `positions_current` or `monthly_state` write is its own
+/// key-only transaction (BEGIN, the certificate's key, the write, COMMIT;
+/// 8m-2b, v16:2227): reset or recalibration 1 → 4, fill or close 2 → 8, and
+/// the May fallback, whose transaction gains the key before its `LOCK TABLE`,
+/// 6 → 13 (8m PLAN-r4 §7.2); no accounting row of the tenant moves.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
-async fn a_usdm_projector_issues_its_pre_8l_statements(pool: PgPool) {
+async fn a_usdm_projector_takes_the_key_in_every_write(pool: PgPool) {
     let tenant_id = Uuid::now_v7();
     let usdm = VenueId::new(VenueId::BINANCE_USDM);
     sqlx::query(
@@ -1094,13 +1104,17 @@ async fn a_usdm_projector_issues_its_pre_8l_statements(pool: PgPool) {
     let step = projector_step(accounting.as_ref());
     let (proxy, proxied) = through_proxy(&pool).await;
     let may = Utc.with_ymd_and_hms(2027, 5, 2, 0, 0, 10).unwrap();
-    let cases: [(EventEnvelope, &[&str]); 5] = [
-        (reset(april(), "10000"), &["monthly"]),
-        (recalibration(april(), "9000"), &["monthly"]),
-        (fill(april()), &["positions", "monthly"]),
-        (losing_close(april()), &["positions", "monthly"]),
-        (fill(may), &["positions", "monthly", "begin", "lock", "monthly", "commit"]),
+    let monthly = ["begin", "key", "monthly", "commit"];
+    let fallback = ["begin", "key", "lock", "monthly", "commit"];
+    let cases = [
+        (reset(april(), "10000"), monthly.to_vec()),
+        (recalibration(april(), "9000"), monthly.to_vec()),
+        (fill(april()), [&KEYED_POSITIONS[..], &monthly[..]].concat()),
+        (losing_close(april()), [&KEYED_POSITIONS[..], &monthly[..]].concat()),
+        (fill(may), [&KEYED_POSITIONS[..], &monthly[..], &fallback[..]].concat()),
     ];
+    let lengths: Vec<usize> = cases.iter().map(|(_, shape)| shape.len()).collect();
+    assert_eq!(lengths, [4, 4, 8, 8, 13]);
     for (event, expected) in cases {
         let applied = apply_event_to_projections_with(&proxied, &event, step);
         let (applied, shape) = traced(&proxy, applied).await;

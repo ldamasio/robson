@@ -192,11 +192,13 @@ async fn close_survives_failure(pool: sqlx::PgPool, append_fails: bool) {
             1 + u64::from((at.year(), at.month()) != (since.year(), since.month()))
         })
         .unwrap_or(0);
-    // 8m-2a: the append's try-lock, one statement.
+    // 8m-2a: the append's try-lock, one statement. 8m-2b: the refused
+    // projector write, formerly autocommit, is BEGIN, key, write and the
+    // rollback its dropped transaction queues.
     let expected_scan = if append_fails {
         (10 + h, 0)
     } else {
-        (13 + h, 1)
+        (16 + h, 1)
     };
     let primary_ok = first_scan.as_ref().is_ok_and(|count| *count == 1)
         && (after_scan.statements - before.statements, after_scan.commits - before.commits)
@@ -305,9 +307,8 @@ async fn close_survives_failure(pool: sqlx::PgPool, append_fails: bool) {
         after_flush.commits - before_flush.commits
     );
     assert_eq!(
-        production_first[8],
-        u64::from(append_fails),
-        "append error queues rollback; projection error is autocommit"
+        production_first[8], 1,
+        "either error queues one rollback: the append's, or (8m-2b) the participating projector write's"
     );
     assert_eq!(production_after_flush[4], 0, "single-origin late work remains complete");
     assert_production_io(

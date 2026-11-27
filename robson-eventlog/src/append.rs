@@ -247,18 +247,18 @@ async fn update_stream_state(
 
 // The public SQLx Transaction Drop queues rollback while open. This only counts
 // that application cleanup request; it never claims server acknowledgement.
-struct RollbackObservation {
+pub(crate) struct RollbackObservation {
     origin: tracing::Span,
     armed: bool,
 }
 impl RollbackObservation {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             origin: tracing::Span::current(),
             armed: true,
         }
     }
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 }
