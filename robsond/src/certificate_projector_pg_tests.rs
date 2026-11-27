@@ -619,9 +619,10 @@ fn calls(text: &str, name: &str, from: usize, to: usize, form: Form) -> Vec<usiz
             // A raw identifier's `r#` belongs to the name.
             let raw = text[..i].ends_with("r#") && !text[..i - 2].ends_with(|c: char| is_ident(c));
             let before = text[..if raw { i - 2 } else { i }].trim_end();
+            let definition =
+                before.strip_suffix("fn").is_some_and(|prefix| !prefix.ends_with(is_ident));
             text[open_paren(text, i + name.len())..].starts_with('(')
-                && !(before.ends_with("fn")
-                    && !before[..before.len() - 2].ends_with(|c: char| is_ident(c)))
+                && !definition
                 && match form {
                     Form::Free => !before.ends_with('.'),
                     Form::Method => true,
@@ -3327,14 +3328,10 @@ const CONNECTORS: [Entry; 1] = [entry(
 /// connects or acquires one (`options.connect()`, `pool.acquire()`, a
 /// reviewed [`CONNECTORS`] call).
 fn fresh(text: &str, body: usize, at: usize, name: &str) -> bool {
-    let Some(u) = uses(text, name, body, at)
-        .into_iter()
-        .filter(|&u| {
-            let head: Vec<&str> = text[statement(text, u).0..u].split_whitespace().collect();
-            head == ["let"] || head == ["let", "mut"]
-        })
-        .next_back()
-    else {
+    let Some(u) = uses(text, name, body, at).into_iter().rfind(|&u| {
+        let head: Vec<&str> = text[statement(text, u).0..u].split_whitespace().collect();
+        head == ["let"] || head == ["let", "mut"]
+    }) else {
         return false;
     };
     let init = &text[u + name.len()..statement(text, u).1.min(text.len())];
@@ -3397,8 +3394,7 @@ fn pool_param(text: &str, fn_start: usize, body: usize, name: &str) -> bool {
         let ty = ty.split([',', ')']).next().unwrap_or("");
         let token = ty
             .split(|c: char| c.is_whitespace() || c == '&')
-            .filter(|t| !t.is_empty() && !t.starts_with('\'') && *t != "mut")
-            .next_back()
+            .rfind(|t| !t.is_empty() && !t.starts_with('\'') && *t != "mut")
             .unwrap_or("");
         let last = token.split('<').next().unwrap_or("").rsplit("::").next().unwrap_or("");
         last == "PgPool" || last == "Pool"
