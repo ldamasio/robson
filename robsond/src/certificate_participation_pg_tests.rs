@@ -85,6 +85,11 @@ impl Completion {
         snapshot(&mut self.0, tenant_id).await
     }
 
+    /// Completion's own session, for a read inside its window (8m-2b).
+    pub(crate) fn connection(&mut self) -> &mut PgConnection {
+        &mut self.0
+    }
+
     pub(crate) async fn release(mut self) -> Result<()> {
         sqlx::query("COMMIT").execute(&mut self.0).await?;
         self.0.close().await?;
@@ -236,7 +241,7 @@ fn release() -> ReleaseRecord {
 }
 
 /// A USD-M intent with no attempt, as the legacy journal writes it.
-fn usdm_batch() -> JournalBatch {
+pub(crate) fn usdm_batch() -> JournalBatch {
     let intent_id = Uuid::now_v7();
     JournalBatch {
         intent: IntentRow {

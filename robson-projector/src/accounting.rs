@@ -10,7 +10,9 @@ use sqlx::PgConnection;
 /// accounting row of the tenant in (tenant, venue) order and, when one is
 /// installed, its order-set generation's exact CAS. The daemon supplies it;
 /// an error rolls the whole write back. A position account supplies none, and
-/// its writes keep their autocommit statements.
+/// each of its writes takes only the cutover certificate's shared key in its
+/// own transaction (ADR-0056 step 8m-2b): `BEGIN`, the key, the statement,
+/// `COMMIT`.
 pub trait AccountingStep: Send + Sync {
     fn run<'c>(
         &'c self,

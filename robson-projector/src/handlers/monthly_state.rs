@@ -14,12 +14,12 @@
 use std::convert::TryFrom;
 
 use chrono::{DateTime, Datelike, Utc};
-use robson_eventlog::EventEnvelope;
+use robson_eventlog::{certificate::participate, EventEnvelope};
 use rust_decimal::Decimal;
 use sqlx::{
     postgres::{PgArguments, PgQueryResult},
     query::Query,
-    Acquire, PgExecutor, PgPool, Postgres,
+    Acquire, PgConnection, PgExecutor, PgPool, Postgres,
 };
 use tracing::Instrument as _;
 
@@ -38,24 +38,31 @@ const INHERIT_BUDGET_MODEL: &str = r#"COALESCE(
     'hwm_v1'
 )"#;
 
-/// One `monthly_state` statement: autocommit, as it always was, or on a
-/// balance-account daemon (ADR-0056 step 8l-4) `BEGIN`, the daemon's
-/// accounting step, the statement and `COMMIT`, so the accounting rows are
-/// taken before `monthly_state` and a refused step writes nothing. `on` is
-/// the pool, or (8p-2) a connection its caller owns and retires.
+/// The step every `monthly_state` transaction takes first, right after
+/// `BEGIN`: on a balance-account daemon its accounting step (ADR-0056 step
+/// 8l-4), whose `advance` takes the cutover certificate's shared key before
+/// the accounting rows; otherwise the key alone (8m-2b, 8m PLAN-r4 §6.7). A
+/// refused step writes nothing.
+async fn step(
+    connection: &mut PgConnection,
+    accounting: Option<&dyn AccountingStep>,
+) -> Result<()> {
+    match accounting {
+        Some(step) => step.run(connection).await.map_err(ProjectionError::Accounting),
+        None => participate(connection).await.map(drop).map_err(ProjectionError::from),
+    }
+}
+
+/// One `monthly_state` statement, formerly autocommit, as one transaction:
+/// `BEGIN`, [`step`], the statement and `COMMIT`, so the key and, on a
+/// balance-account daemon, the accounting rows are taken before
+/// `monthly_state`. `on` is the pool, or (8p-2) a connection its caller owns
+/// and retires.
 async fn write<'c>(
     on: impl Acquire<'c, Database = Postgres> + PgExecutor<'c>,
     accounting: Option<&dyn AccountingStep>,
     statement: Query<'_, Postgres, PgArguments>,
 ) -> Result<PgQueryResult> {
-    let Some(step) = accounting else {
-        return Ok(statement
-            .execute(on)
-            .instrument(
-                tracing::info_span!(target: "robson_operation", "operation_io", io_kind = 1_u64),
-            )
-            .await?);
-    };
     let mut tx = on
         .begin()
         .instrument(
@@ -63,7 +70,7 @@ async fn write<'c>(
         )
         .await?;
     let mut rollback_observation = RollbackObservation::new();
-    step.run(&mut tx).await.map_err(ProjectionError::Accounting)?;
+    step(&mut tx, accounting).await?;
     let written = statement
         .execute(&mut *tx)
         .instrument(
@@ -197,8 +204,9 @@ pub(crate) async fn handle_capital_base_recalibrated(
 /// A writer may be inserting the row right now, where the first UPDATE cannot
 /// see it. Wait for it and look again, so the counter is not lost to a row that
 /// commits a moment later. Only events before the month's first row take this
-/// path. On a balance-account daemon each of the two transactions takes the
-/// accounting step first (ADR-0056 step 8l-4).
+/// path. Each of the two transactions takes [`step`] first: the accounting
+/// step on a balance-account daemon (ADR-0056 step 8l-4), else the
+/// certificate's key alone (8m-2b), before `LOCK TABLE`.
 async fn add_to_month_counters(
     pool: &PgPool,
     accounting: Option<&dyn AccountingStep>,
@@ -229,9 +237,7 @@ async fn add_to_month_counters(
         )
         .await?;
     let mut rollback_observation = RollbackObservation::new();
-    if let Some(step) = accounting {
-        step.run(&mut tx).await.map_err(ProjectionError::Accounting)?;
-    }
+    step(&mut tx, accounting).await?;
     sqlx::query("LOCK TABLE monthly_state IN SHARE ROW EXCLUSIVE MODE")
         .execute(&mut *tx)
         .instrument(

@@ -2,37 +2,26 @@
 //!
 //! Seeds tenant/account/strategy rows for system startup.
 
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use tracing::info;
 use uuid::Uuid;
 
 use super::Result;
 
-/// Initialize minimal data for the system to start.
-///
-/// Creates tenant/account/strategy rows if they don't exist.
-///
-/// Idempotency contract (robson#231): the ArgoCD migrate hook runs
-/// `robsond db init --tenant-id $PROJECTION_TENANT_ID` on **every** sync,
-/// without an account id. The bootstrap identity is therefore the tenant:
-/// when the tenant already owns a strategy, that strategy's account is the
-/// bootstrap account and nothing is written. Only a tenant with no strategy
-/// at all gets a new account, a new strategy and one `STRATEGY_CREATED`
-/// event. Previously a fresh account id was minted per run, so every deploy
-/// appended a strategy row and a creation event.
-pub async fn init_minimal_data(
-    pool: &PgPool,
-    tenant_id: Option<Uuid>,
+/// The cutover certificate's shared key (ADR-0056 step 8m-2b, 8m PLAN-r4
+/// §6.7), byte for byte `robson_eventlog::certificate::PARTICIPATE`, which a
+/// robsond test pins: this crate does not depend on the event log.
+pub const CERTIFICATE_PARTICIPATE: &str = "SELECT pg_advisory_xact_lock_shared(1380057174, 14445)";
+
+/// The bootstrap identity, resolved before minting anything. With an explicit
+/// account the check is per (tenant, account); without one the tenant's
+/// oldest strategy wins, which is the row the first run created.
+async fn existing_strategy(
+    tx: &mut PgConnection,
+    tenant_id: Uuid,
     account_id: Option<Uuid>,
-) -> Result<(Uuid, Uuid)> {
-    let tenant_id = tenant_id.unwrap_or_else(Uuid::now_v7);
-
-    let mut tx = pool.begin().await?;
-
-    // Resolve the bootstrap identity before minting anything. With an
-    // explicit account the check is per (tenant, account); without one the
-    // tenant's oldest strategy wins, which is the row the first run created.
-    let existing: Option<(Uuid, Uuid)> = match account_id {
+) -> Result<Option<(Uuid, Uuid)>> {
+    Ok(match account_id {
         Some(account_id) => {
             sqlx::query_as(
                 r#"
@@ -60,15 +49,56 @@ pub async fn init_minimal_data(
             .fetch_optional(&mut *tx)
             .await?
         },
-    };
+    })
+}
 
-    if let Some((strategy_id, account_id)) = existing {
-        info!(
-            "Strategy {} already exists for tenant={}, account={}; nothing to seed",
-            strategy_id, tenant_id, account_id
-        );
-        tx.commit().await?;
-        return Ok((tenant_id, account_id));
+async fn nothing_to_seed(
+    tx: Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    (strategy_id, account_id): (Uuid, Uuid),
+) -> Result<(Uuid, Uuid)> {
+    info!(
+        "Strategy {} already exists for tenant={}, account={}; nothing to seed",
+        strategy_id, tenant_id, account_id
+    );
+    tx.commit().await?;
+    Ok((tenant_id, account_id))
+}
+
+/// Initialize minimal data for the system to start.
+///
+/// Creates tenant/account/strategy rows if they don't exist.
+///
+/// Idempotency contract (robson#231): the ArgoCD migrate hook runs
+/// `robsond db init --tenant-id $PROJECTION_TENANT_ID` on **every** sync,
+/// without an account id. The bootstrap identity is therefore the tenant:
+/// when the tenant already owns a strategy, that strategy's account is the
+/// bootstrap account and nothing is written. Only a tenant with no strategy
+/// at all gets a new account, a new strategy and one `STRATEGY_CREATED`
+/// event. Previously a fresh account id was minted per run, so every deploy
+/// appended a strategy row and a creation event.
+pub async fn init_minimal_data(
+    pool: &PgPool,
+    tenant_id: Option<Uuid>,
+    account_id: Option<Uuid>,
+) -> Result<(Uuid, Uuid)> {
+    let tenant_id = tenant_id.unwrap_or_else(Uuid::now_v7);
+
+    let mut tx = pool.begin().await?;
+    if let Some(existing) = existing_strategy(&mut tx, tenant_id, account_id).await? {
+        return nothing_to_seed(tx, tenant_id, existing).await;
+    }
+    tx.commit().await?;
+
+    // The seed writes `event_log`, a certification input: its own
+    // transaction takes the cutover certificate's shared key as its first
+    // statement (ADR-0056 step 8m-2b, 8m PLAN-r4 §6.7) and repeats the check
+    // under it. A run that finds its strategy (every ArgoCD sync) stays the
+    // read-only transaction above and takes no key.
+    let mut tx = pool.begin().await?;
+    sqlx::query(CERTIFICATE_PARTICIPATE).execute(&mut *tx).await?;
+    if let Some(existing) = existing_strategy(&mut tx, tenant_id, account_id).await? {
+        return nothing_to_seed(tx, tenant_id, existing).await;
     }
 
     let account_id = account_id.unwrap_or_else(Uuid::now_v7);

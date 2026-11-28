@@ -39,15 +39,17 @@ impl CardinalitySample {
         })
     }
     fn expected_statements(&self) -> u64 {
-        // Per close: append/apply10 + halt2. Per orphan: before/result5+6.
-        // 8m-2a: the append's try-lock and each journal commit's key.
-        12 * u64::from(self.n) + 11 * u64::from(self.n) + self.predicted_months() + 2
+        // Per close: append/apply16 + halt2. Per orphan: before/result5+6.
+        // 8m-2a: the append's try-lock and each journal commit's key. 8m-2b
+        // (§7.2, USD-M fill or close 2 -> 8): the close's two projector writes,
+        // formerly autocommit, are each BEGIN, key, write, COMMIT.
+        18 * u64::from(self.n) + 11 * u64::from(self.n) + self.predicted_months() + 2
     }
     fn primary_matches(&self) -> bool {
         matches!(&self.result, Ok(value) if *value == usize::from(self.n))
             && self.after.statements - self.before.statements == self.expected_statements()
             && self.production[0] == self.expected_statements()
-            && self.after.commits - self.before.commits == 3 * u64::from(self.n)
+            && self.after.commits - self.before.commits == 5 * u64::from(self.n)
     }
     fn assert_after_pool_close(self) {
         let h = history_months(self.window);
@@ -57,8 +59,8 @@ impl CardinalitySample {
             "multi-leg close + orphan journal + tail",
             self.before,
             self.after,
-            23 * u64::from(self.n) + h + 2,
-            3 * u64::from(self.n),
+            29 * u64::from(self.n) + h + 2,
+            5 * u64::from(self.n),
         );
         assert_production_io(
             "multi-leg full scan",
@@ -67,7 +69,7 @@ impl CardinalitySample {
             0,
         );
         assert_eq!(self.production[4], 0, "complete causal attribution");
-        assert_eq!(self.production[7], 3 * u64::from(self.n));
+        assert_eq!(self.production[7], 5 * u64::from(self.n));
         assert_eq!(self.production[8], 0);
         let mut actual = self.lookups;
         let mut expected = self.expected_lookups;
@@ -192,11 +194,13 @@ async fn cardinality_sample(
     let h = window.map_or(0, |(at, since, _)| {
         1 + u64::from((at.year(), at.month()) != (since.year(), since.month()))
     });
-    let expected = 23 * u64::from(n) + h + 2;
+    // As `expected_statements` (8m-2b: the close's two projector writes are
+    // each BEGIN, key, write, COMMIT).
+    let expected = 29 * u64::from(n) + h + 2;
     let next = if matches!(&result,Ok(value) if *value==usize::from(n))
         && after.statements - before.statements == expected
         && production[0] == expected
-        && after.commits - before.commits == 3 * u64::from(n)
+        && after.commits - before.commits == 5 * u64::from(n)
     {
         Some(worker.scan_and_reconcile().with_subscriber(probe.dispatch()).await)
     } else {

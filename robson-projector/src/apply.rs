@@ -212,13 +212,19 @@ pub fn is_repairable_position_event(event_type: &str) -> bool {
 ///
 /// This is idempotent and safe for replay - handlers use UPSERT
 /// and check sequence numbers to prevent double-application.
+///
+/// Every `positions_current` and `monthly_state` write takes the cutover
+/// certificate's shared key before any row lock (ADR-0056 step 8m-2b): the
+/// projector supplies that key-only step itself, so no caller can omit it.
 pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
     apply_event_to_projections_with(pool, envelope, None).await
 }
 
 /// [`apply_event_to_projections`] on a balance-account daemon (ADR-0056 step
 /// 8l-4): each `monthly_state` write is one transaction that runs `accounting`
-/// before it. `None` is exactly [`apply_event_to_projections`].
+/// (which takes the certificate's key) before it; `positions_current` writes
+/// take the key alone on every venue. `None` is exactly
+/// [`apply_event_to_projections`].
 pub async fn apply_event_to_projections_with(
     pool: &PgPool,
     envelope: &EventEnvelope,
